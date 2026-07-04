@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Omni Agent</title>
+  <script>
+    // Apply the saved theme before first paint to avoid a flash of the wrong colors.
+    (function () {
+      try { if (localStorage.getItem('omni-theme') === 'light') document.documentElement.classList.add('light'); } catch (e) {}
+    })();
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['ui-sans-serif', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Roboto', '"Helvetica Neue"', 'Arial', 'sans-serif'],
+            serif: ['ui-serif', 'Georgia', 'Cambria', '"Times New Roman"', 'serif'],
+            mono: ['"Cascadia Code"', '"JetBrains Mono"', 'Consolas', 'ui-monospace', 'monospace'],
+          },
+          // Every palette slot resolves to a CSS variable so the light/dark
+          // switch only flips variables. NOTE: `cyan` is the primary accent
+          // slot (now Claude terracotta) — it keeps its historical name so
+          // existing class usage keeps working.
+          colors: {
+            term: {
+              bg: 'rgb(var(--term-bg) / <alpha-value>)',
+              panel: 'rgb(var(--term-panel) / <alpha-value>)',
+              line: 'rgb(var(--term-line) / <alpha-value>)',
+              muted: 'rgb(var(--term-muted) / <alpha-value>)',
+              green: 'rgb(var(--term-green) / <alpha-value>)',
+              magenta: 'rgb(var(--term-magenta) / <alpha-value>)',
+              orange: 'rgb(var(--term-orange) / <alpha-value>)',
+              cyan: 'rgb(var(--term-cyan) / <alpha-value>)',
+              red: 'rgb(var(--term-red) / <alpha-value>)',
+              gray: 'rgb(var(--term-gray) / <alpha-value>)',
+              text: 'rgb(var(--term-text) / <alpha-value>)',
+            },
+          },
+        },
+      },
+    };
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      /* Claude dark: warm charcoal surfaces, cream text, terracotta accent */
+      --term-bg: 38 38 36;        /* #262624 */
+      --term-panel: 48 48 46;     /* #30302E */
+      --term-line: 64 62 58;      /* #403E3A */
+      --term-muted: 157 154 145;  /* #9D9A91 */
+      --term-text: 237 235 227;   /* #EDEBE3 */
+      --term-green: 133 165 113;
+      --term-magenta: 140 169 198;
+      --term-orange: 217 164 91;
+      --term-cyan: 217 119 87;    /* accent — Claude terracotta #D97757 */
+      --term-red: 229 117 106;
+      --term-gray: 138 135 127;
+      --shimmer-base: 146 143 135;
+      --shimmer-hi: 253 252 248;
+      --shimmer-glow: rgba(255, 255, 255, .16);
+    }
+    html.light {
+      color-scheme: light;
+      /* Claude light: ivory / pampas surfaces, near-black text */
+      --term-bg: 250 249 245;     /* #FAF9F5 */
+      --term-panel: 240 238 229;  /* #F0EEE5 */
+      --term-line: 223 220 209;   /* #DFDCD1 */
+      --term-muted: 110 107 99;   /* #6E6B63 */
+      --term-text: 20 20 19;      /* #141413 */
+      --term-green: 92 130 74;
+      --term-magenta: 90 122 156;
+      --term-orange: 158 108 33;
+      --term-cyan: 192 91 57;     /* accent — terracotta, darkened for contrast */
+      --term-red: 193 65 54;
+      --term-gray: 131 128 120;
+      --shimmer-base: 168 165 155;
+      --shimmer-hi: 66 63 55;
+      --shimmer-glow: rgba(0, 0, 0, .05);
+    }
+    html, body { background: rgb(var(--term-bg)); }
+    /* smooth hovers + buttery theme switches everywhere */
+    *, ::before, ::after { transition: background-color .2s ease, border-color .2s ease, color .2s ease, opacity .2s ease, box-shadow .2s ease; }
+    ::selection { background: rgb(var(--term-cyan) / .3); }
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgb(var(--term-line)); border-radius: 8px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgb(var(--term-muted) / .55); }
+
+    /* Glowing liquid-silver sweep for in-progress thinking text. */
+    .shimmer {
+      background-image: linear-gradient(90deg,
+        rgb(var(--shimmer-base)) 0%, rgb(var(--shimmer-base)) 32%,
+        rgb(var(--shimmer-hi)) 50%,
+        rgb(var(--shimmer-base)) 68%, rgb(var(--shimmer-base)) 100%);
+      background-size: 200% 100%;
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent;
+      animation: shimmer 2.4s linear infinite;
+      filter: drop-shadow(0 0 7px var(--shimmer-glow));
+    }
+    @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: 0% 0; } }
+
+    .msg-enter { animation: rise .28s cubic-bezier(.21, 1.02, .47, 1); }
+    @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    .thought-text { color: rgb(var(--term-muted)); }
+
+    /* --- agent step lines (thinking / tool calls), Claude Code CLI style --- */
+    .step-head {
+      display: flex; align-items: baseline; gap: 8px; width: 100%;
+      text-align: left; padding: 2px 6px; border-radius: 8px;
+    }
+    .step-head[data-expandable] { cursor: pointer; }
+    .step-head[data-expandable]:hover { background: rgb(var(--term-line) / .4); }
+    /* smooth expand/collapse via the grid-rows trick (needs its own transition
+       because the global * rule whitelists only color/background/etc.) */
+    .step-detail {
+      display: grid; grid-template-rows: 0fr;
+      transition: grid-template-rows .22s cubic-bezier(.4, 0, .2, 1);
+    }
+    .step-detail.open { grid-template-rows: 1fr; }
+    .step-detail > .step-detail-inner { overflow: hidden; min-height: 0; }
+    .caret { transition: transform .18s ease; }
+    .caret.open { transform: rotate(90deg); }
+    .tree-row:hover { background: rgb(var(--term-line) / .45); }
+    .tree-row.active { background: rgb(var(--term-line) / .8); }
+    #fileViewer pre { white-space: pre-wrap; word-break: break-word; }
+
+    /* markdown (final answers) */
+    .markdown { overflow-wrap: break-word; }
+    .markdown > :first-child { margin-top: 0; }
+    .markdown > :last-child { margin-bottom: 0; }
+    .markdown p { margin: .5em 0; }
+    .markdown h1, .markdown h2, .markdown h3, .markdown h4 {
+      font-family: ui-serif, Georgia, Cambria, 'Times New Roman', serif;
+      font-weight: 600; line-height: 1.3; margin: 1em 0 .45em;
+    }
+    .markdown h1 { font-size: 1.35em; }
+    .markdown h2 { font-size: 1.2em; }
+    .markdown h3 { font-size: 1.08em; }
+    .markdown ul { list-style: disc; padding-left: 1.4em; margin: .5em 0; }
+    .markdown ol { list-style: decimal; padding-left: 1.4em; margin: .5em 0; }
+    .markdown li { margin: .18em 0; }
+    .markdown a { color: rgb(var(--term-cyan)); text-decoration: underline; text-underline-offset: 2px; }
+    .markdown blockquote { border-left: 3px solid rgb(var(--term-line)); padding-left: .9em; margin: .5em 0; color: rgb(var(--term-muted)); }
+    .markdown code { background: rgb(var(--term-panel)); border: 1px solid rgb(var(--term-line) / .7); padding: 1px 5px; border-radius: 6px; font-size: .85em; }
+    .markdown pre { background: rgb(var(--term-panel)); padding: 12px; border-radius: 12px; overflow-x: auto; border: 1px solid rgb(var(--term-line)); margin: .6em 0; }
+    .markdown pre code { background: transparent; border: 0; padding: 0; }
+    .markdown table { border-collapse: collapse; margin: .6em 0; }
+    .markdown th, .markdown td { border: 1px solid rgb(var(--term-line)); padding: 4px 10px; }
+    .markdown hr { border: 0; border-top: 1px solid rgb(var(--term-line)); margin: 1em 0; }
+  </style>
+</head>
+<body class="h-full font-sans text-[13px] text-term-text antialiased">
+
+  <!-- ============ START / SESSION SELECT SCREEN ============ -->
+  <div id="startScreen" class="absolute inset-0 z-30 flex items-center justify-center bg-term-bg">
+    <button id="themeToggleStart" title="Toggle light / dark mode"
+      class="absolute right-4 top-4 grid h-9 w-9 place-items-center rounded-full border border-term-line text-term-muted hover:bg-term-panel hover:text-term-text"></button>
+
+    <div class="w-[560px] max-w-[94vw] rounded-3xl border border-term-line bg-term-panel p-8 shadow-xl">
+      <div class="mb-6 flex items-center gap-3">
+        <div class="grid h-10 w-10 place-items-center rounded-2xl bg-term-cyan font-serif text-lg italic text-white">O</div>
+        <div>
+          <h1 class="font-serif text-xl text-term-text">Omni Agent</h1>
+          <p class="text-[12px] text-term-muted">Select a workspace to begin.</p>
+        </div>
+      </div>
+
+      <div class="mb-6">
+        <div class="mb-1.5 flex items-center justify-between">
+          <span class="text-[11px] uppercase tracking-wider text-term-muted">Project workspace</span>
+          <div class="flex items-center gap-3">
+            <button id="importFolderBtn" class="text-[11px] text-term-cyan hover:underline">import from folder</button>
+            <button id="newProjectBtn" class="text-[11px] text-term-cyan hover:underline">+ new project</button>
+          </div>
+        </div>
+        <select id="projectSelect" class="w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan"></select>
+
+        <div id="newProjectBox" class="mt-2 hidden gap-2">
+          <input id="newProjectInput" placeholder="new-project-name" class="flex-1 rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
+          <button id="createProjectConfirm" class="rounded-xl bg-term-cyan/15 px-4 py-2.5 font-medium text-term-cyan hover:bg-term-cyan/25">create</button>
+        </div>
+
+        <div id="importFolderBox" class="mt-2 hidden flex-col gap-2">
+          <div class="flex items-center gap-2">
+            <input id="importSourcePath" placeholder="No folder selected" readonly
+              class="flex-1 cursor-default rounded-xl border border-term-line bg-term-bg px-3 py-2.5 text-term-muted" />
+            <button id="importBrowseBtn" class="rounded-xl border border-term-line px-4 py-2.5 hover:bg-term-line/60 hover:text-term-text">browse…</button>
+          </div>
+          <div class="flex items-center gap-2">
+            <input id="importProjectNameInput" placeholder="new-project-name" class="flex-1 rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
+            <button id="importConfirmBtn" class="rounded-xl bg-term-cyan/15 px-4 py-2.5 font-medium text-term-cyan hover:bg-term-cyan/25">import &amp; copy in</button>
+          </div>
+          <p class="text-[10.5px] leading-4 text-term-muted">Copies the folder into the agent's own workspace — your original files are never edited directly. Use "export changes" later (in the workspace panel) to apply the exact changes back out, after you approve them.</p>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between">
+        <span id="startError" class="text-[11px] text-term-red"></span>
+        <button id="startSessionBtn" class="rounded-full bg-term-cyan px-6 py-2.5 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">
+          Start session
+        </button>
+      </div>
+      <p class="mt-5 text-center text-[10.5px] text-term-muted">A Docker sandbox is started for the selected workspace.</p>
+    </div>
+  </div>
+
+  <!-- ============ MAIN APP ============ -->
+  <div id="app" class="hidden h-full w-full flex">
+
+    <!-- LEFT: FILE TREE -->
+    <aside class="w-72 shrink-0 flex flex-col border-r border-term-line bg-term-panel">
+      <div class="flex items-center justify-between border-b border-term-line px-3 py-2.5">
+        <div class="min-w-0">
+          <div class="text-[10px] uppercase tracking-wider text-term-muted">workspace</div>
+          <div id="treeProjectName" class="truncate font-serif text-[14px] text-term-text">—</div>
+        </div>
+        <div class="flex items-center gap-1 shrink-0">
+          <button id="exportWorkspaceBtn" title="Export changes to a folder" class="rounded-full px-2 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">⇪</button>
+          <button id="refreshTreeBtn" title="Refresh" class="rounded-full px-2 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">⟳</button>
+        </div>
+      </div>
+      <div id="importBanner" class="hidden border-b border-term-line px-3 py-2 text-[10px] text-term-muted">
+        imported from <span id="importSourceLabel" class="text-term-text"></span>
+      </div>
+      <div id="fileTree" class="flex-1 overflow-auto px-1.5 py-2 text-[12px] leading-5"></div>
+      <div class="border-t border-term-line px-3 py-2 text-[10px] text-term-muted">
+        <span id="treeFileCount">0</span> files · click a file to view
+      </div>
+    </aside>
+
+    <!-- RIGHT: CHAT -->
+    <main class="flex-1 flex flex-col min-w-0 bg-term-bg">
+      <!-- top bar -->
+      <header class="flex h-12 items-center gap-3 border-b border-term-line bg-term-panel px-4">
+        <div class="flex items-center gap-2 min-w-0">
+          <span class="h-2 w-2 shrink-0 rounded-full bg-term-green"></span>
+          <span id="projectBadge" class="truncate font-serif text-[14px] text-term-text">project</span>
+        </div>
+        <div class="ml-auto flex items-center gap-3 text-[11px] text-term-muted">
+          <span class="tabular-nums" title="Total agent steps this session">steps <span id="statSteps" class="text-term-text">0</span></span>
+          <span class="tabular-nums" title="Consecutive tool calls in the current leg">tools <span id="statTools" class="text-term-text">0</span></span>
+          <span class="tabular-nums" title="Approx. context size (chars)">ctx <span id="statCtx" class="text-term-text">0</span></span>
+          <span class="tabular-nums" title="Memory compactions so far">resets <span id="statResets" class="text-term-text">0</span></span>
+          <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60">plan —</button>
+          <button id="themeToggle" title="Toggle light / dark mode" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text"></button>
+          <button id="changeSessionBtn" class="rounded-full border border-term-line px-3 py-1 hover:bg-term-line/60 hover:text-term-text">change</button>
+        </div>
+      </header>
+
+      <!-- tab bar -->
+      <div class="flex items-center border-b border-term-line bg-term-panel px-3 py-1.5">
+        <div class="flex items-center gap-0.5 rounded-full border border-term-line/70 bg-term-bg/60 p-0.5">
+          <button id="tabChat" class="tab-btn rounded-full px-3.5 py-1 text-[12px] hover:text-term-text">Chat</button>
+          <button id="tabPlan" class="tab-btn rounded-full px-3.5 py-1 text-[12px] hover:text-term-text">Plan</button>
+          <button id="tabGraph" class="tab-btn rounded-full px-3.5 py-1 text-[12px] hover:text-term-text">Knowledge Graph</button>
+        </div>
+      </div>
+
+      <!-- CHAT TAB -->
+      <div id="chatTab" class="flex-1 flex flex-col min-h-0">
+        <!-- transcript (padding centers a readable column, like claude.ai) -->
+        <div id="chat" class="flex-1 overflow-y-auto py-4 space-y-1 px-[max(20px,calc((100%-52rem)/2))]"></div>
+
+        <!-- memory summary banner -->
+        <div id="memoryBanner" class="hidden mb-2 rounded-xl border border-term-orange/40 bg-term-orange/10 px-3 py-2 text-[11px] text-term-orange mx-[max(20px,calc((100%-52rem)/2))]">
+          <span class="font-semibold">Resumed from memory:</span> <span id="memoryBannerText"></span>
+        </div>
+
+        <!-- input bar -->
+        <footer class="border-t border-term-line bg-term-panel px-4 py-3">
+          <div class="mx-auto w-full max-w-[52rem]">
+            <div class="flex items-end gap-2 rounded-2xl border border-term-line bg-term-bg px-3 py-2 shadow-sm focus-within:border-term-cyan/60">
+              <textarea id="input" rows="2" placeholder="Describe a task for the agent…"
+                class="flex-1 resize-none bg-transparent px-1 py-1 text-[13.5px] leading-6 outline-none placeholder:text-term-muted/70"></textarea>
+              <button id="sendBtn" title="Send (Enter)" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-term-cyan text-white shadow-sm hover:opacity-90 disabled:opacity-40">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+              </button>
+              <button id="stopBtn" title="Stop the agent" class="hidden h-9 w-9 shrink-0 place-items-center rounded-full bg-term-red text-white shadow-sm hover:opacity-90">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+              </button>
+            </div>
+            <div class="mt-1.5 flex items-center justify-between px-1 text-[10.5px] text-term-muted">
+              <span id="hint">ready</span>
+              <span>Enter to send · Shift+Enter for newline · Docker sandbox</span>
+            </div>
+          </div>
+        </footer>
+      </div>
+
+      <!-- PLAN TAB -->
+      <div id="planTab" class="hidden flex-1 flex-col min-h-0 overflow-hidden"></div>
+
+      <!-- GRAPH TAB -->
+      <div id="graphTab" class="hidden flex-1 flex min-h-0">
+        <div id="graphContainer" class="flex-1 relative bg-term-bg"></div>
+        <!-- graph sidebar: legend + info -->
+        <div class="w-64 shrink-0 border-l border-term-line bg-term-panel flex flex-col overflow-hidden">
+          <div class="px-3 py-2 border-b border-term-line">
+            <input id="graphSearch" type="text" placeholder="Search nodes…" autocomplete="off"
+              class="w-full rounded-xl border border-term-line bg-term-bg px-2.5 py-1.5 text-[12px] outline-none focus:border-term-cyan" />
+          </div>
+          <div id="graphInfo" class="px-3 py-2 border-b border-term-line min-h-[120px] text-[12px] text-term-text">
+            <span class="text-term-muted italic">Click a node to inspect it</span>
+          </div>
+          <div class="px-3 py-1 border-b border-term-line text-[10px] uppercase tracking-wider text-term-muted">communities</div>
+          <div id="graphLegend" class="flex-1 overflow-y-auto px-2 py-1"></div>
+          <div id="graphStats" class="px-3 py-2 border-t border-term-line text-[10px] text-term-muted"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ============ FILE VIEWER MODAL ============ -->
+  <div id="fileViewer" class="hidden absolute inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+    <div class="flex h-[82vh] w-[80vw] max-w-[1100px] flex-col rounded-3xl border border-term-line bg-term-panel shadow-2xl">
+      <div class="flex items-center justify-between border-b border-term-line px-5 py-3">
+        <div class="min-w-0">
+          <div class="text-[10px] uppercase tracking-wider text-term-muted">file</div>
+          <div id="viewerPath" class="truncate font-mono text-term-text">—</div>
+        </div>
+        <div class="flex items-center gap-3">
+          <span id="viewerSize" class="text-[11px] text-term-muted"></span>
+          <button id="viewerClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
+        </div>
+      </div>
+      <div class="flex-1 overflow-auto rounded-b-3xl bg-term-bg p-4">
+        <pre id="viewerContent" class="font-mono text-[12px] leading-5 text-term-text"></pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ EXPORT WORKSPACE MODAL ============ -->
+  <div id="exportModal" class="hidden absolute inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+    <div class="flex max-h-[82vh] w-[640px] max-w-[92vw] flex-col rounded-3xl border border-term-line bg-term-panel shadow-2xl">
+      <div class="flex items-center justify-between border-b border-term-line px-5 py-3.5">
+        <div class="min-w-0">
+          <div class="text-[10px] uppercase tracking-wider text-term-muted">export changes to</div>
+          <div id="exportTargetPath" class="truncate font-mono text-[12.5px] text-term-text">—</div>
+        </div>
+        <button id="exportModalClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
+      </div>
+      <div class="flex-1 overflow-y-auto px-5 py-3 text-[12px]">
+        <div id="exportDiffSummary" class="mb-3 text-term-muted">Computing changes…</div>
+        <div id="exportDiffList" class="space-y-3"></div>
+      </div>
+      <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
+        <span id="exportError" class="text-[11px] text-term-red"></span>
+        <div class="flex items-center gap-2">
+          <button id="exportCancelBtn" class="rounded-full border border-term-line px-4 py-2 text-term-muted hover:bg-term-line/60 hover:text-term-text">cancel</button>
+          <button id="exportApproveBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">approve &amp; export</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

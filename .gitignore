@@ -1,0 +1,16 @@
+# Agent/tooling config
+.claude/
+.opencode/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Graphify output
+graphify-out/
+
+# Keep the folders, ignore their contents
+workspace/*
+!workspace/.gitkeep
+memory/*
+!memory/.gitkeep

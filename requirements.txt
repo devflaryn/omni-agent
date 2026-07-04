@@ -1,0 +1,6 @@
+requests==2.31.0
+questionary==2.0.1
+rich==13.7.0
+textual
+pillow
+pywebview

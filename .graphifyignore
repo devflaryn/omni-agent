@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# OpenCode internals
+.opencode/
+.claude/
+
+# Agent workspace
+workspace/
+
+# Graphify output
+graphify-out/
+
+# Build artifacts
+dist/
+build/
+
+# Python
+.venv/
+__pycache__/
+
+# Logs
+logs/
+*.log
+
+# Documents
+*.md
+*.txt
+*.html
+
+Dockerfile
