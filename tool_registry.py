@@ -31,23 +31,28 @@ class ToolRegistry:
 
     def get_tool_prompt(self, allowed_tools=None):
         """
-        Generates the system prompt segment that lists available tools with
-        detailed, structured definitions: WHAT IT DOES, WHEN TO USE,
-        PARAMETERS, and OUTPUT FORMAT.
+        Generates the system prompt segment listing available tools. Each entry
+        is compact — name, what it does, when to use it, params and output — with
+        the call format stated ONCE up front instead of repeated per tool (that
+        repetition was pure token overhead and, on smaller models, noise that
+        encouraged malformed calls).
         """
-        prompt = "AVAILABLE TOOLS:\n"
+        prompt = (
+            "AVAILABLE TOOLS\n"
+            'Call ONE tool per turn as JSON: {"type":"tool_call","tool":"<name>","args":{...}}. '
+            "Use only the args listed for that tool. Each entry below is: name — what it does; "
+            "When: when to pick it; Params: its arguments; Output: what you get back.\n"
+        )
         for name, data in self._tools.items():
             if allowed_tools is not None and name not in allowed_tools:
                 continue
 
-            prompt += f"\n### Tool: {name}\n"
-            prompt += f"WHAT IT DOES: {data['description']}\n"
+            prompt += f"\n### {name}\n{data['description']}\n"
             if data["when_to_use"]:
-                prompt += f"WHEN TO USE: {data['when_to_use']}\n"
-            prompt += f"PARAMETERS (JSON): {json.dumps(data['params'])}\n"
+                prompt += f"When: {data['when_to_use']}\n"
+            prompt += f"Params: {json.dumps(data['params'])}\n"
             if data["output"]:
-                prompt += f"OUTPUT: {data['output']}\n"
-            prompt += f'To call this tool, output exactly: {{"type": "tool_call", "tool": "{name}", "args": <parameters>}}\n'
+                prompt += f"Output: {data['output']}\n"
 
         prompt += "\nEND OF TOOL LIST.\n"
         return prompt

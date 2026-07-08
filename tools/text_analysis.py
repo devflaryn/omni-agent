@@ -75,12 +75,55 @@ def tail_file(filepath, num_lines=100):
     total = count_res["stdout"].strip() if count_res["returncode"] == 0 else "?"
     cmd = f"tail -n {num_lines} /workspace/{filepath}"
     res = run_cmd(cmd, timeout=60)
-    if res["returncode"] == 0:
-        out = f"--- Last {num_lines} lines of {filepath} (Total lines: {total}) ---\n"
-        out += res["stdout"]
+    if res["returncode"] != 0:
+        return res
+    out = f"--- Last {num_lines} lines of {filepath} (Total lines: {total}) ---\n"
+    out += res["stdout"]
     return {"stdout": out}
-    return res
 
+
+
+@registry.register(
+    name="grep_directory",
+    description=(
+        "Recursively searches a directory tree for lines matching a regex, across ANY file type — "
+        "not just smali (that's search_smali) and not just one file (that's grep_file). "
+        "This is the general search tool for large codebases: find a string/pattern anywhere in a "
+        "decompiled or jadx-decompiled app — smali, Java, XML resources, AndroidManifest, JSON/JS/HTML "
+        "assets, native strings dumped to text, config files. "
+        "Use include_glob to restrict to certain files (e.g. '*.java', '*.xml') and exclude_glob to skip "
+        "noise (e.g. '*.png'). Results are paginated with skip/max_lines."
+    ),
+    params_schema={
+        "directory": "string (directory to search under, relative to /workspace, e.g. 'app_jadx/sources')",
+        "pattern": "string (regex pattern to match, e.g. 'https?://|api_key|Base64')",
+        "include_glob": "string (optional, only search files matching this glob, e.g. '*.java' or '*.xml')",
+        "exclude_glob": "string (optional, skip files matching this glob, e.g. '*.png')",
+        "max_lines": "integer (optional, max matching lines to return, default 100)",
+        "skip": "integer (optional, matches to skip for pagination, default 0)",
+        "case_insensitive": "boolean (optional, default true)"
+    },
+    output="Each match as 'filepath:linenum: line'. A pagination hint gives the next skip value if more matches exist. If nothing matches, says '(no matches found)'.",
+    when_to_use="Use this to search across a whole decompiled/jadx tree or any mixed-file-type folder. For smali-only searches search_smali is a shortcut; for a single known file use grep_file. Restrict with include_glob on big trees to keep it fast."
+)
+def grep_directory(directory, pattern, include_glob=None, exclude_glob=None,
+                   max_lines=100, skip=0, case_insensitive=True):
+    directory = normalize_path(directory)
+    ci_flag = "-i " if case_insensitive in (True, "true", "True", 1, "1") else ""
+    inc = f"--include={include_glob!r} " if include_glob else ""
+    exc = f"--exclude={exclude_glob!r} " if exclude_glob else ""
+    base = f"grep -rnE {ci_flag}{inc}{exc}'{pattern}' /workspace/{directory}"
+    cmd = build_paginated_command(base, max_lines=max_lines, skip=skip)
+    res = run_cmd(cmd, timeout=180)
+    if res["returncode"] == 0 or res.get("stdout"):
+        out = f"--- grep -r '{pattern}' in {directory} ---\n"
+        out += res.get("stdout", "") or "(no matches found)\n"
+        res["stdout"] = out
+        return append_page_hint(res, skip, max_lines)
+    # grep exit 1 = no matches (not an error); >1 = real error
+    if res.get("returncode") == 1:
+        return {"stdout": f"--- grep -r '{pattern}' in {directory} ---\n(no matches found)\n"}
+    return res
 
 
 @registry.register(

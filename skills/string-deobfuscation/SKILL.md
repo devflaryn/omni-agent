@@ -13,7 +13,7 @@ This agent works statically — it reads and patches code but cannot execute the
 Try the obvious thing first: `search_smali` or `query_code_graph(query_type="string_refs")` for the plaintext value you expect. If it's genuinely not a plain literal, you'll see the check instead reference a byte array (`fill-array-data`), a call to a small static helper class (commonly named `a`, `b`, `aa` after R8 obfuscation), or a native JNI call.
 
 ## Step 2 — Find the decrypt/decode routine
-- If it's a Java/smali helper: `search_smali` for calls to the same helper method from many different call sites — a shared string-decoder is usually called dozens of times across the app, which is itself a strong signal you found it. `read_file_chunk` its body.
+- If it's a Java/smali helper: `search_smali` for calls to the same helper method from many different call sites — a shared string-decoder is usually called dozens of times across the app, which is itself a strong signal you found it. `read_file_chunk` its body. If the smali is hard to follow, `jadx_decompile` (with `deobf=true`) the app and read the helper as Java — a decrypt loop is far more legible in Java than in smali; then `grep_directory` the jadx `sources/` tree for the plaintext once you understand the algorithm.
 - If it's native: use `rabin2_info`/`nm_symbols` to find the JNI function, then `ghidra_decompile` it for C-like pseudocode — much easier to read than raw disassembly for crypto-shaped code (loops with XOR/shift/table lookups).
 
 ## Step 3 — Work out the algorithm by reading, not running

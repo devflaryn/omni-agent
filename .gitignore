@@ -9,6 +9,19 @@ __pycache__/
 # Graphify output
 graphify-out/
 
+# LLM provider config (contains API keys)
+llm_config.json
+
+# omnidroid emulator service — runtime state bootstrapped next to the exe
+# (keep tools/omnidroid/omnidroid.exe + HOWTO.md tracked; ignore the rest)
+tools/omnidroid/configs/
+tools/omnidroid/accounts/
+tools/omnidroid/qemu/
+tools/omnidroid/runtime/
+tools/omnidroid/instances/
+# QEMU disk images are never committed (see tools/omnidroid/HOWTO.md §9/§10)
+*.qcow2
+
 # Keep the folders, ignore their contents
 workspace/*
 !workspace/.gitkeep

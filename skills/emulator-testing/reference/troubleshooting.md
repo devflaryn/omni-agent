@@ -1,5 +1,19 @@
 # Emulator Testing — Troubleshooting Reference
 
+> The default backend is `qemu` (driven by `qemu-manager.exe`). Those issues are covered first; the LDPlayer / AVD sections below apply only when you pass `backend="ldplayer"` or `backend="avd"`.
+
+## qemu backend: "Could not find qemu-manager.exe"
+`ensure_emulator_running` (default `backend="qemu"`) shells out to `qemu-manager.exe`. It's expected at the **project root** (next to `agent.py`). If it's elsewhere, set the `QEMU_MANAGER_PATH` environment variable to its full path and restart the agent process. On non-Windows hosts the binary is named `qemu-manager` (no `.exe`) and QEMU is taken from the host `PATH` — see `qemu-manager.md` → Platform notes.
+
+## qemu backend: launch fails with `no_base_image` / exit code 4
+The `qemu` backend boots a fresh overlay off `base.qcow2`, which must sit next to `qemu-manager.exe`. It is NOT downloaded automatically — it's the one thing you provide: an Android-x86 / Bliss OS x86_64 image with the game pre-installed and **ADB-over-TCP enabled** (adbd on tcp 5555, the Android-x86/Bliss default). See `qemu-manager.md` → Requirements. Until it's in place, use `backend="ldplayer"` or `backend="avd"` instead.
+
+## qemu backend: first launch is slow / seems to hang
+The very first `launch` on a machine downloads a portable QEMU build (and, on first adb use, Google's platform-tools) into `runtime/` next to the exe — this can take a few minutes on a slow connection. This is one-time; later launches reuse the cache. The tool's launch timeout is already generous (10 min). A genuine failure surfaces as exit code 3 (runtime download/extraction) with a message — check the internet connection and the URLs/checksums in `manifest.json`.
+
+## qemu backend: `BOOT_TIMEOUT` even though QEMU started
+QEMU's forwarded adb port accepts TCP as soon as the VM starts, before Android is actually up, so a timeout here means Android didn't reach `sys.boot_completed=1` in time, not that adb is unreachable. Options: raise `boot_timeout` (a cold first boot of a fresh overlay is the slowest); watch the boot live via any VNC viewer on `127.0.0.1:<vnc_port>` (the port is printed in the launch log); or read `instances/<session>/qemu.log` next to the exe (exit code 5 = QEMU died on launch, e.g. virtualization disabled or a corrupt base image). On Windows enable the *Windows Hypervisor Platform* feature for WHPX acceleration — without it QEMU falls back to slow TCG.
+
 ## "Could not find an Android SDK with both adb.exe and emulator.exe" from ensure_emulator_running
 The tool auto-detects the SDK from (in order): `$ANDROID_SDK_ROOT`, `$ANDROID_HOME`, then `%LOCALAPPDATA%\Android\Sdk` (Android Studio's default install location on Windows). If none of those has both `platform-tools\adb.exe` and `emulator\emulator.exe`:
 - Confirm Android Studio is actually installed and has downloaded the SDK (Settings → Languages & Frameworks → Android SDK shows the install path).

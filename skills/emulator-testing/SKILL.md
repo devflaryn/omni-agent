@@ -2,7 +2,7 @@
 name: emulator-testing
 description: Actually run a built/signed APK on a persistent Android emulator, watch what happens with automatic smart screenshot capture, pull logcat, and get a Markdown report describing what the test found — so patches can be verified by observation, not just by verify_apk's structural checks.
 when_to_use: Use this skill any time you've built and signed a modified APK and want to confirm it actually WORKS — launches without crashing, the patched check is really bypassed at runtime, a new feature renders correctly — rather than only trusting that the build succeeded. Also use it when the user reports a bug/crash and wants you to reproduce and diagnose it.
-allowed-tools: ensure_emulator_running, install_apk_on_emulator, launch_app_on_emulator, adb_shell, get_logcat, take_emulator_screenshot, record_and_capture_keyframes, analyze_keyframes, generate_test_report, run_apk_test_session
+allowed-tools: ensure_emulator_running, install_apk_on_emulator, launch_app_on_emulator, adb_shell, get_logcat, take_emulator_screenshot, record_and_capture_keyframes, analyze_keyframes, generate_test_report, run_apk_test_session, stop_emulator
 ---
 
 # Emulator Testing Skill
@@ -10,20 +10,24 @@ allowed-tools: ensure_emulator_running, install_apk_on_emulator, launch_app_on_e
 `verify_apk` only checks that an APK is structurally valid (signed, aligned, has the required files) — it says nothing about whether the app actually runs correctly. This skill closes that gap by actually installing and launching the app on a real emulator and observing it.
 
 ## Architecture: the emulator runs on Windows, not in the sandbox
-Unlike every other tool in this project, the emulator tools do NOT go through the Linux Docker sandbox. The Android emulator runs NATIVELY on this Windows machine (Android Studio's `emulator.exe`/`adb.exe`, auto-detected from `ANDROID_SDK_ROOT`/`ANDROID_HOME` or Android Studio's default `%LOCALAPPDATA%\Android\Sdk`). That means real hardware acceleration (no KVM/software-virtualization concerns), and a normal visible emulator window you can interact with or minimize like any other app.
+Unlike every other tool in this project, the emulator tools do NOT go through the Linux Docker sandbox. The Android emulator runs NATIVELY on this Windows machine.
+
+**Backends.** The default backend is `qemu`: a self-contained headless QEMU / Android-x86 (Bliss OS) runner driven through the bundled `qemu-manager.exe` at the project root (see `qemu-manager.md` for its full CLI). It requires NO separately installed emulator — on first use it downloads a portable QEMU build and Google's `adb` into `runtime/` next to the exe, then boots a fresh thin overlay off `base.qcow2` per session and forwards the guest's `adbd` to a loopback port. These tools call it for lifecycle (`launch` / `wait-boot` / `stop`) and read the guest's adb serial out of `qemu-manager status`, then use that serial with an ordinary host `adb.exe` for everything else — so all the screenshot/logcat/keyframe steps below are backend-agnostic. Two fallback backends remain for hosts already set up for them: `ldplayer` (LDPlayer via `ldconsole.exe`, strong arm64-v8a translation) and `avd` (Android Studio's `emulator.exe`, auto-detected from `ANDROID_SDK_ROOT`/`ANDROID_HOME` or `%LOCALAPPDATA%\Android\Sdk`).
+
+> The `qemu` backend needs `base.qcow2` (an Android-x86/Bliss OS image with ADB-over-TCP enabled) sitting next to `qemu-manager.exe`. If a call fails with a missing-base-image error (exit code 4), that file isn't in place yet — see `qemu-manager.md` → Requirements. Override the exe location with the `QEMU_MANAGER_PATH` env var if it isn't at the project root.
 
 **Screenshots are window-state-independent by design.** `take_emulator_screenshot` and `record_and_capture_keyframes` both use `adb exec-out screencap -p`, which reads the emulated device's own framebuffer over the ADB protocol — the exact same mechanism used to screenshot a real phone. This does NOT look at the host desktop/window at all, so it keeps working correctly whether the emulator window is focused, in the background, or minimized. Never substitute a desktop window-capture approach (BitBlt/PrintWindow/mss on the emulator's Qt window) here — that class of approach reliably breaks or returns a blank image for a minimized window, which is exactly the failure mode this design avoids.
 
 ## The one emulator, reused
-Every tool here targets the SAME persistent virtual device (`avd_name`, default `omniagent_avd`) — it is created once if missing and REUSED on every later call, never recreated. By default, `ensure_emulator_running` also resets it (kills any running instance, `-wipe-data`) on every call, so each test starts from a clean factory state without the overhead of building a new virtual device from scratch. This matches "always fresh, never a duplicate VM."
+Every tool here targets the SAME persistent virtual device/session (the `device_name` param — for the default `qemu` backend this is the qemu-manager session id, default `omniagent`; for `ldplayer`/`avd` it's the instance/AVD name, `omniagent_ld`/`omniagent_avd`). It is created once if missing and REUSED on every later call, never duplicated. By default, `ensure_emulator_running` also resets it on every call — qemu via `launch --force` (a brand-new overlay off `base.qcow2`, the old one discarded), LDPlayer via quit+recreate, AVD via `-wipe-data` — so each test starts from a clean state without the overhead of building a new VM from scratch. This matches "always fresh, never a duplicate VM." When you're done, `stop_emulator` tears the session down (qemu VMs run detached and outlive the agent, so stop them to free RAM/CPU; add `purge=true` to also delete the overlay disk).
 
 ## Step 1 — The fast path: one call
 For the common case ("test this APK and tell me how it performs"), call `run_apk_test_session(apk_path, package_name, ...)`. It runs the entire pipeline — boot/reset the emulator, install, launch, watch the screen for `duration_seconds`, describe what it saw, and write a report — and returns the report path. Then `read_file_chunk` that report and go to Step 5.
 
 ## Step 2 — The granular path (when you need control)
 If you need to interleave manual actions (e.g. tap through a login flow) or re-run just one stage, drive the pipeline yourself:
-1. `ensure_emulator_running(avd_name=..., reset=true)` — wait for `BOOT_OK` in its output before continuing. If it errors that no SDK could be found, see `reference/troubleshooting.md`.
-2. `install_apk_on_emulator(apk_path)` — watch for `INSTALL_FAILED_NO_MATCHING_ABIS`, which means the APK's native libraries don't match the emulator's system image architecture (see `reference/troubleshooting.md`).
+1. `ensure_emulator_running(reset=true)` — defaults to the `qemu` backend; wait for `BOOT_OK` in its output before continuing. The FIRST launch on a machine downloads the portable QEMU runtime (a few minutes) — that's normal, not a hang. If it errors that `qemu-manager.exe` or `base.qcow2` can't be found, see `reference/troubleshooting.md`.
+2. `install_apk_on_emulator(apk_path)` — watch for `INSTALL_FAILED_NO_MATCHING_ABIS`, which means the APK's native libraries don't match the guest architecture (see `reference/troubleshooting.md`).
 3. `launch_app_on_emulator(package_name)` (or with a specific `activity`).
 4. Optionally drive the app manually with `adb_shell` (`input tap X Y`, `input keyevent 4` for back, `input text "..."` ) between capturing windows.
 5. `record_and_capture_keyframes(session_name, duration_seconds=...)` around whatever window you want observed.
@@ -45,6 +49,6 @@ If you need to interleave manual actions (e.g. tap through a login flow) or re-r
 
 ## Critical Rules
 - Reset is on by default for a reason — don't set `reset=false` unless you deliberately want to preserve state between two calls (e.g. installing an app once, then running multiple short capture sessions against it without reinstalling).
-- Match `system_image` to what the target APK's native libraries actually need — see `reference/troubleshooting.md` for the ABI mismatch symptom and fix.
+- ABI matters for native libraries. On the `qemu` backend the guest architecture is whatever `base.qcow2` is (typically x86_64 Android-x86/Bliss, which has an ARM native-bridge but can't run every arm64-v8a lib); on `avd` you pick it via `system_image`. If an install fails with `INSTALL_FAILED_NO_MATCHING_ABIS`, see `reference/troubleshooting.md` — options include trying the `ldplayer` backend, whose ARM translation covers more arm64-v8a code.
 - `duration_seconds` should cover the actual moment you care about — a 5-second window won't catch a slow crash on a 15-second cold start. Err longer for a first test of an unfamiliar app.
 - The primary agent loop is text-only — it can't view the keyframe PNGs directly. The vision descriptions in the generated report ARE its eyes; don't skip `analyze_keyframes` and expect to reason about screen content from the raw image paths alone.

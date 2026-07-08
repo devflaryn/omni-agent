@@ -46,6 +46,17 @@ RUN printf '#!/bin/sh\nexec java -cp /usr/local/bin/apktool.jar com.android.tool
     printf '#!/bin/sh\nexec java -cp /usr/local/bin/apktool.jar com.android.tools.smali.smali.Main "$@"\n' > /usr/local/bin/smali && \
     chmod +x /usr/local/bin/smali
 
+# Install jadx — the standard Android decompiler that turns DEX bytecode into
+# readable Java (far easier to read than smali, especially for obfuscated
+# apps), with optional identifier de-obfuscation. Exposed as `jadx` on PATH
+# and used by the jadx_decompile tool in tools/apk_tools.py.
+RUN JADX_VERSION=1.5.0 && \
+    wget -q "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" \
+        -O /tmp/jadx.zip && \
+    unzip -q /tmp/jadx.zip -d /opt/jadx && \
+    rm /tmp/jadx.zip && \
+    ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx
+
 # Install Ghidra headless analyzer
 # Downloads the latest stable release, extracts to /opt/ghidra
 RUN GHIDRA_VERSION=11.3.2 && \
@@ -58,8 +69,9 @@ RUN GHIDRA_VERSION=11.3.2 && \
     chmod +x /opt/ghidra/support/analyzeHeadless
 
 # NOTE: the Android emulator itself is NOT installed here. It runs natively on
-# the Windows host (Android Studio / the SDK's emulator.exe), not inside this
-# Linux sandbox — see tools/android_emulator.py, which shells out directly to
-# the host's adb.exe/emulator.exe instead of going through docker exec.
+# the Windows host — by default via the bundled qemu-manager.exe (headless
+# QEMU/Android-x86), or optionally LDPlayer / Android Studio's emulator.exe —
+# not inside this Linux sandbox. See tools/android_emulator.py, which shells
+# out directly to the host's adb.exe instead of going through docker exec.
 
 WORKDIR /workspace

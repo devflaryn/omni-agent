@@ -35,8 +35,8 @@ def unzip_apk(apk_filename, output_dir):
     name="decompile_apk",
     description="Decompiles an APK using apktool to get readable AndroidManifest.xml and smali source code. Use this ONLY when you need to edit smali, XML resources, or AndroidManifest.xml. For whole-file edits (lib folders, assets, .so files) use unzip_apk instead.",
     params_schema={"apk_filename": "string", "output_dir": "string", "no_resources": "boolean (optional, set to true if you get framework resource errors)"},
-    output="apktool's decompile log showing each resource/smali file being decoded. The output_dir will contain AndroidManifest.xml, smali/ folders, res/, and apktool.yml. Can take several minutes on large APKs.",
-    when_to_use="Use this when you need to READ or EDIT Dalvik bytecode (smali), AndroidManifest.xml, or XML resources. If you only need to swap/delete whole files (like .so libs), unzip_apk is much faster."
+    output="apktool's decompile log showing each resource/smali file being decoded. The output_dir will contain AndroidManifest.xml, smali/ folders, res/, and apktool.yml. Can take several minutes on large APKs. NEXT STEP for anything non-trivial: run build_code_graph on output_dir ONCE, then navigate with query_code_graph — do NOT start reading smali files one by one.",
+    when_to_use="Use this when you need to READ or EDIT Dalvik bytecode (smali), AndroidManifest.xml, or XML resources. If you only need to swap/delete whole files (like .so libs), unzip_apk is much faster. Right after decompiling a real app, build_code_graph on the output dir so you can query_code_graph instead of sweeping thousands of smali files."
 )
 def decompile_apk(apk_filename, output_dir, no_resources=False):
     apk_filename = normalize_path(apk_filename)
@@ -44,6 +44,47 @@ def decompile_apk(apk_filename, output_dir, no_resources=False):
     res_flag = "-r " if no_resources else ""
     cmd = f"apktool d {res_flag}-f /workspace/{apk_filename} -o /workspace/{output_dir}"
     return run_cmd(cmd, timeout=420)  # apktool on large APKs can take several minutes
+
+
+@registry.register(
+    name="jadx_decompile",
+    description=(
+        "Decompiles an APK (or a .dex/.jar) to READABLE JAVA source using jadx. "
+        "This is for UNDERSTANDING code, not for rebuilding — jadx Java is much easier to read than smali, "
+        "especially in large or obfuscated apps. Use it to reverse-engineer app logic, then make the actual "
+        "edit in smali via decompile_apk + patch_smali_method (you cannot recompile jadx's Java back into the APK). "
+        "Set deobf=true to have jadx rename obfuscated a/b/c identifiers to stable readable names — very helpful on "
+        "R8/ProGuard-obfuscated apps. Output goes to output_dir/sources (Java) and output_dir/resources. "
+        "Read individual .java files with read_file_chunk, or search across them with grep_directory / find_files."
+    ),
+    params_schema={
+        "apk_filename": "string (path to the APK/.dex/.jar, relative or absolute starting with /workspace)",
+        "output_dir": "string (directory to write decompiled Java + resources to)",
+        "deobf": "boolean (optional, default false; true renames obfuscated identifiers to stable readable names)",
+        "no_resources": "boolean (optional, default false; true skips resource decoding for a faster, Java-only run)",
+        "single_class": "string (optional; decompile only this fully-qualified class, e.g. 'com.example.Foo', for a fast targeted look)"
+    },
+    output="jadx's decompile log (it keeps going past individual class errors, which is normal for obfuscated apps). The output_dir gets a 'sources/' tree of .java files (by package) and, unless no_resources, a 'resources/' tree. Can take several minutes on large APKs; the first pass is the slow one.",
+    when_to_use="Use this to READ an app's Java/Kotlin logic when smali is too tedious — tracing a feature, understanding an obfuscated check, or getting oriented in a large codebase. Pair with grep_directory to search the Java. For the edit itself, still use decompile_apk (smali) + build_apk, since jadx output isn't recompilable."
+)
+def jadx_decompile(apk_filename, output_dir, deobf=False, no_resources=False, single_class=None):
+    apk_filename = normalize_path(apk_filename)
+    output_dir = normalize_path(output_dir)
+    flags = []
+    if deobf in (True, "true", "True", 1, "1"):
+        flags.append("--deobf")
+    if no_resources in (True, "true", "True", 1, "1"):
+        flags.append("--no-res")
+    if single_class:
+        # jadx matches on the fully-qualified class name; keep it as-is.
+        flags.append(f"--single-class {single_class}")
+    flag_str = (" ".join(flags) + " ") if flags else ""
+    # --show-bad-code keeps partially-decompiled methods instead of dropping them,
+    # which matters on obfuscated apps where some methods fail to fully decompile.
+    cmd = (
+        f"jadx {flag_str}--show-bad-code -d /workspace/{output_dir} /workspace/{apk_filename}"
+    )
+    return run_cmd(cmd, timeout=600)
 
 
 # ---------------------------------------------------------------------------

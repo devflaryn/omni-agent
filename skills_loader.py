@@ -95,23 +95,19 @@ def get_skills_prompt():
     skills = load_skills()
     if not skills:
         return ""
-    prompt = "\nAVAILABLE SKILLS:\n"
+    prompt = "\nAVAILABLE SKILLS\n"
     prompt += (
-        "Skills are specialized, detailed workflows bundled as folders under ./skills/. "
-        "Call use_skill with a skill name to load that skill's full step-by-step instructions. "
-        "If a skill lists bundled resources below, its instructions will tell you when to pull "
-        "one in with read_skill_resource — do not guess a resource's contents ahead of time.\n"
+        "Skills are detailed, battle-tested workflows under ./skills/. When a task matches a "
+        'skill\'s "When" line, load it with {"type":"tool_call","tool":"use_skill","args":'
+        '{"skill_name":"<name>"}} and follow its steps. Only load the ONE skill that fits (this '
+        "index is all you need to choose). A skill's own instructions say when to pull a bundled "
+        "resource via read_skill_resource — don't guess a resource's contents.\n"
     )
     for name, s in skills.items():
-        prompt += f"\n### Skill: {name}\n"
-        prompt += f"Description: {s['description']}\n"
+        prompt += f"\n### {name}\n{s['description']}\n"
         if s["when_to_use"]:
-            prompt += f"When to use: {s['when_to_use']}\n"
-        if s["allowed_tools"]:
-            prompt += f"Primary tools used: {', '.join(s['allowed_tools'])}\n"
+            prompt += f"When: {s['when_to_use']}\n"
         if s["resources"]:
-            prompt += f"Bundled resources (load on demand via read_skill_resource): {', '.join(s['resources'])}\n"
-        prompt += 'To load this skill, output: {"type": "tool_call", "tool": "use_skill", "args": {"skill_name": "' + name + '"}}\n'
+            prompt += f"Resources: {', '.join(s['resources'])}\n"
     prompt += "\nEND OF SKILL LIST.\n"
-    prompt += "IMPORTANT: When a task matches a skill's 'when to use' description, call use_skill to load that skill's instructions and follow them step by step.\n"
     return prompt

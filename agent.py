@@ -1,5 +1,6 @@
 import os
 import sys
+import base64
 import datetime
 import json
 import glob
@@ -8,6 +9,7 @@ import threading
 import uuid
 import shutil
 import hashlib
+import zipfile
 import webview
 
 # On Windows the default console/file encoding is cp1252, which can't handle
@@ -19,7 +21,14 @@ if sys.platform == "win32":
             _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
-from llm import ask_llm, get_full_system_prompt
+from llm import (
+    ask_llm,
+    get_full_system_prompt,
+    list_providers,
+    get_effective_config,
+    save_config,
+    test_connection,
+)
 from docker_sandbox import setup_sandbox
 from tool_registry import registry
 import planning
@@ -39,6 +48,80 @@ SOFT_TOOL_NUDGE = 200
 MAX_CONSECUTIVE_TOOLS = 400
 MAX_SUMMARY_RESETS = 8
 LOOP_REPEAT_THRESHOLD = 3
+
+# --- Chat persistence + UI memory safety -------------------------------------
+# The full conversation (LLM messages) and a replayable UI transcript are saved
+# per project so the chat survives a webview refresh, a renderer crash, or a full
+# app restart — and the agent can continue from where it left off.
+CONVERSATION_FILENAME = "conversation.json"
+TRANSCRIPT_FILENAME = "transcript.json"
+# The workspace file tree is expensive to rebuild + re-render (a decompiled APK
+# is thousands of files). Rebuilding it after every tool call is what overloads
+# the webview. Refresh it at most this often during a run (a final forced
+# refresh still fires when the run ends).
+TREE_REFRESH_MIN_INTERVAL = 4.0  # seconds
+# The webview renderer (WebView2/Chromium) OOMs if the chat DOM accumulates the
+# raw text of every tool result over a long run. We only ever SHOW a bounded
+# slice in the UI (the agent keeps the full text in its own context/messages).
+UI_RESULT_CAP = 16000        # max chars of a single tool result shown in the UI
+UI_THOUGHT_CAP = 16000       # max chars of a single "thought" block shown in the UI
+UI_TEXT_CAP = 40000          # max chars of any other renderable field (answer, user msg)
+# Keep only the most recent renderable events in the persisted/replayed transcript.
+TRANSCRIPT_MAX_EVENTS = 500
+# Event types that make up the visible chat and are persisted for replay.
+RENDERABLE_EVENT_TYPES = {"user_message", "thought", "tool_result", "final_answer", "system", "error"}
+
+
+def _ui_trunc(text, cap):
+    """Cap text shown in the UI. The full text still lives in the agent's own
+    message history — this only limits what crosses into the DOM, so a long run
+    can't OOM the webview renderer."""
+    if text is None:
+        return text
+    text = str(text)
+    if len(text) <= cap:
+        return text
+    return text[:cap] + f"\n\n… [truncated {len(text) - cap:,} more chars — full output is retained in the agent's context]"
+
+
+def _cap_transcript(transcript):
+    """Return the last TRANSCRIPT_MAX_EVENTS events with their text fields capped,
+    so the persisted/replayed transcript stays bounded no matter how it was built."""
+    out = []
+    for e in transcript[-TRANSCRIPT_MAX_EVENTS:]:
+        e = dict(e)
+        if "result" in e:
+            e["result"] = _ui_trunc(e["result"], UI_RESULT_CAP)
+        if e.get("type") == "thought" and "text" in e:
+            e["text"] = _ui_trunc(e["text"], UI_THOUGHT_CAP)
+        if "content" in e:
+            e["content"] = _ui_trunc(e["content"], UI_TEXT_CAP)
+        out.append(e)
+    return out
+
+
+def _write_json_atomic(path, data):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+# --- Code-graph guard --------------------------------------------------------
+# Reading this many files in a row with no code-graph/search call in between is
+# the "sweeping thousands of scripts" anti-pattern on big decompiled apps. When
+# it happens, nudge the model toward build_code_graph / query_code_graph /
+# grep_directory instead. Bounded per task so it can't spam.
+GRAPH_NUDGE_THRESHOLD = 12
+MAX_GRAPH_NUDGES = 4
+# Tools that count as actually NAVIGATING (graph queries or content search) —
+# using any of these resets the file-sweep counter.
+NAVIGATION_TOOLS = {"build_code_graph", "query_code_graph", "grep_directory",
+                    "search_smali", "grep_file", "find_files"}
 
 # --- Plan-and-execute workflow -----------------------------------------------
 # Tools allowed to run BEFORE a plan exists for the current task (creating or
@@ -197,6 +280,18 @@ def execute_tool(tool_data, last_tool_call=None, repeat_threshold=LOOP_REPEAT_TH
     return feedback
 
 
+def _tree_signature(tree):
+    """A cheap content signature of the file tree, used to skip re-emitting an
+    unchanged tree to the UI. Structural (paths + sizes), so it changes iff a
+    file is added/removed/resized."""
+    try:
+        return hashlib.md5(
+            json.dumps(tree, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return None
+
+
 def build_file_tree(project_name):
     """Builds a nested file-tree dict of a project workspace (host side)."""
     root = os.path.join(WORKSPACE_DIR, project_name)
@@ -235,24 +330,99 @@ def build_file_tree(project_name):
     return walk(root, "", 0)
 
 
-def read_project_file(project_name, rel_path):
-    """Reads a file from the project workspace (host side) for the frontend viewer."""
+# Viewer preview types. Images are shipped to the frontend as base64 data URIs
+# (the webview can't fetch workspace files over HTTP); zip-based archives get a
+# listing so the viewer can render a browsable explorer instead of mojibake.
+_VIEWER_IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".ico": "image/x-icon", ".svg": "image/svg+xml",
+}
+_VIEWER_ARCHIVE_EXTS = {".zip", ".apk", ".jar", ".aar", ".xapk", ".apks"}
+_VIEWER_TEXT_CAP = 2_000_000       # 2MB text cap for the viewer
+_VIEWER_IMAGE_CAP = 20_000_000     # refuse to inline images bigger than this
+_VIEWER_MAX_ARCHIVE_ENTRIES = 20_000
+
+
+def _resolve_project_file(project_name, rel_path):
+    """Normalizes rel_path and sandboxes it inside the project root.
+    Returns (full_path, rel, None) or (None, None, error)."""
     if not rel_path:
-        return {"ok": False, "error": "No path provided."}
-    # Normalize and prevent escaping the project root.
+        return None, None, "No path provided."
     rel = rel_path.lstrip("/").lstrip("\\")
     root = os.path.abspath(os.path.join(WORKSPACE_DIR, project_name))
     full = os.path.abspath(os.path.join(root, rel))
     if not full.startswith(root + os.sep) and full != root:
-        return {"ok": False, "error": "Path outside workspace."}
+        return None, None, "Path outside workspace."
     if not os.path.isfile(full):
-        return {"ok": False, "error": "Not a file or does not exist."}
+        return None, None, "Not a file or does not exist."
+    return full, rel, None
+
+
+def read_project_file(project_name, rel_path):
+    """Reads a file from the project workspace (host side) for the frontend
+    viewer. Returns a typed payload: kind="image" (base64 + mime),
+    kind="archive" (zip/apk entry listing), or kind="text" (the default)."""
+    full, rel, err = _resolve_project_file(project_name, rel_path)
+    if err:
+        return {"ok": False, "error": err}
+    ext = os.path.splitext(full)[1].lower()
     try:
         size = os.path.getsize(full)
+        if ext in _VIEWER_IMAGE_MIME:
+            if size > _VIEWER_IMAGE_CAP:
+                return {"ok": False, "error": f"Image too large to preview ({size:,} bytes)."}
+            with open(full, "rb") as f:
+                data = base64.b64encode(f.read()).decode("ascii")
+            return {"ok": True, "kind": "image", "path": rel, "size": size,
+                    "mime": _VIEWER_IMAGE_MIME[ext], "data": data}
+        if ext in _VIEWER_ARCHIVE_EXTS and zipfile.is_zipfile(full):
+            with zipfile.ZipFile(full) as zf:
+                infos = zf.infolist()
+            entries = [{"name": i.filename, "size": i.file_size, "dir": i.is_dir()}
+                       for i in infos[:_VIEWER_MAX_ARCHIVE_ENTRIES]]
+            return {"ok": True, "kind": "archive", "path": rel, "size": size,
+                    "entries": entries, "entry_count": len(infos),
+                    "truncated": len(infos) > _VIEWER_MAX_ARCHIVE_ENTRIES}
         with open(full, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(2_000_000)  # 2MB cap for the viewer
-        return {"ok": True, "path": rel, "size": size, "content": content, "truncated": size > 2_000_000}
-    except OSError as e:
+            content = f.read(_VIEWER_TEXT_CAP)
+        return {"ok": True, "kind": "text", "path": rel, "size": size, "content": content,
+                "truncated": size > _VIEWER_TEXT_CAP}
+    except (OSError, zipfile.BadZipFile) as e:
+        return {"ok": False, "error": str(e)}
+
+
+def read_project_archive_member(project_name, rel_path, member):
+    """Reads a single entry out of a zip-based archive (zip/apk/jar/…) in the
+    workspace, for previewing inside the frontend's archive explorer. Entries
+    get the same typed treatment as read_project_file (image or text)."""
+    full, rel, err = _resolve_project_file(project_name, rel_path)
+    if err:
+        return {"ok": False, "error": err}
+    if not member:
+        return {"ok": False, "error": "No archive entry provided."}
+    try:
+        with zipfile.ZipFile(full) as zf:
+            try:
+                info = zf.getinfo(member)
+            except KeyError:
+                return {"ok": False, "error": "Entry not found in archive."}
+            if info.is_dir():
+                return {"ok": False, "error": "Entry is a directory."}
+            ext = os.path.splitext(member)[1].lower()
+            if ext in _VIEWER_IMAGE_MIME:
+                if info.file_size > _VIEWER_IMAGE_CAP:
+                    return {"ok": False, "error": f"Image too large to preview ({info.file_size:,} bytes)."}
+                with zf.open(info) as f:
+                    data = base64.b64encode(f.read()).decode("ascii")
+                return {"ok": True, "kind": "image", "path": f"{rel} › {member}",
+                        "size": info.file_size, "mime": _VIEWER_IMAGE_MIME[ext], "data": data}
+            with zf.open(info) as f:
+                raw = f.read(_VIEWER_TEXT_CAP)
+            return {"ok": True, "kind": "text", "path": f"{rel} › {member}",
+                    "size": info.file_size, "content": raw.decode("utf-8", errors="replace"),
+                    "truncated": info.file_size > _VIEWER_TEXT_CAP}
+    except (OSError, zipfile.BadZipFile) as e:
         return {"ok": False, "error": str(e)}
 
 
@@ -340,6 +510,22 @@ class AgentApi:
 
     # --- helpers -------------------------------------------------------------
     def _emit(self, event):
+        # Record renderable events into the session transcript so the chat can be
+        # replayed after a webview refresh / renderer crash / app restart. Cap the
+        # stored text fields and the list length so the transcript can't grow
+        # without bound (the full text always stays in the LLM messages).
+        if self.session is not None and event.get("type") in RENDERABLE_EVENT_TYPES:
+            stored = dict(event)
+            if "result" in stored:
+                stored["result"] = _ui_trunc(stored["result"], UI_RESULT_CAP)
+            if stored.get("type") == "thought" and "text" in stored:
+                stored["text"] = _ui_trunc(stored["text"], UI_THOUGHT_CAP)
+            if "content" in stored:
+                stored["content"] = _ui_trunc(stored["content"], UI_TEXT_CAP)
+            tr = self.session.setdefault("transcript", [])
+            tr.append(stored)
+            if len(tr) > TRANSCRIPT_MAX_EVENTS:
+                del tr[:len(tr) - TRANSCRIPT_MAX_EVENTS]
         if self._window is None:
             return
         try:
@@ -348,10 +534,73 @@ class AgentApi:
         except Exception:
             pass
 
-    def _refresh_tree(self):
+    # --- chat persistence ----------------------------------------------------
+    def _persist_session(self):
+        """Save the current conversation (LLM messages) + UI transcript to the
+        project's memory dir so it survives a refresh / crash / app restart.
+        Best-effort — never raises into the agent loop."""
+        s = self.session
+        if not s:
+            return
+        mem = s.get("memory_dir")
+        if not mem:
+            return
+        try:
+            os.makedirs(mem, exist_ok=True)
+        except OSError:
+            return
+        _write_json_atomic(os.path.join(mem, CONVERSATION_FILENAME), {
+            "project": s.get("project"),
+            "original_task": s.get("original_task"),
+            "messages": s.get("messages", []),
+            "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        })
+        _write_json_atomic(os.path.join(mem, TRANSCRIPT_FILENAME), _cap_transcript(s.get("transcript", [])))
+
+    def _load_persisted(self, memory_dir):
+        """Returns (messages_or_None, transcript_list, original_task) previously
+        saved for this project, or (None, [], None) if there's nothing usable."""
+        conv_path = os.path.join(memory_dir, CONVERSATION_FILENAME)
+        tr_path = os.path.join(memory_dir, TRANSCRIPT_FILENAME)
+        messages, transcript, original_task = None, [], None
+        try:
+            if os.path.isfile(conv_path):
+                with open(conv_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                msgs = data.get("messages")
+                if isinstance(msgs, list) and any(m.get("role") != "system" for m in msgs):
+                    messages = msgs
+                    original_task = data.get("original_task")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            messages, original_task = None, None
+        try:
+            if os.path.isfile(tr_path):
+                with open(tr_path, "r", encoding="utf-8") as f:
+                    tr = json.load(f)
+                if isinstance(tr, list):
+                    transcript = tr[-TRANSCRIPT_MAX_EVENTS:]
+        except (OSError, json.JSONDecodeError):
+            transcript = []
+        return messages, transcript, original_task
+
+    def _refresh_tree(self, force=False):
+        """Rebuild + push the workspace file tree to the UI. Throttled: during a
+        run (many tool calls) this is skipped unless TREE_REFRESH_MIN_INTERVAL has
+        passed, and the emit is skipped entirely when the tree is unchanged (the
+        common case — reads/queries don't alter files). Pass force=True at
+        genuine end-of-run points (done, upload) to always push the latest tree."""
         if not self.session:
             return
-        self._emit({"type": "file_tree", "tree": build_file_tree(self.session["project"])})
+        now = time.time()
+        if not force and (now - self.session.get("_last_tree_emit", 0)) < TREE_REFRESH_MIN_INTERVAL:
+            return
+        self.session["_last_tree_emit"] = now
+        tree = build_file_tree(self.session["project"])
+        sig = _tree_signature(tree)
+        if not force and sig is not None and sig == self.session.get("_last_tree_sig"):
+            return  # nothing changed — don't re-serialize + re-render the tree
+        self.session["_last_tree_sig"] = sig
+        self._emit({"type": "file_tree", "tree": tree})
 
     def _refresh_system_prompt(self):
         """Re-derives messages[0] (the system message) from the session's
@@ -395,6 +644,32 @@ class AgentApi:
             return {"ok": False, "error": "Project name contains invalid characters."}
         project_dir = os.path.join(WORKSPACE_DIR, name)
         os.makedirs(project_dir, exist_ok=True)
+        return {"ok": True, "project": name}
+
+    def delete_workspace(self, name):
+        """Permanently removes a project's workspace files AND its saved
+        conversation/transcript memory. Refuses if that project has a live
+        session — end it first. This is irreversible; the frontend confirms
+        with the user before calling."""
+        name = (name or "").strip()
+        if not name:
+            return {"ok": False, "error": "Project name cannot be empty."}
+        if any(c in name for c in ('/', '\\', ':', '*', '?', '"', '<', '>', '|')):
+            return {"ok": False, "error": "Project name contains invalid characters."}
+        if self.session and self.session.get("project") == name:
+            return {"ok": False, "error": f"'{name}' has an active session — end it before deleting."}
+
+        project_dir = os.path.join(WORKSPACE_DIR, name)
+        memory_dir = os.path.join(MEMORY_DIR, name)
+        if not os.path.isdir(project_dir) and not os.path.isdir(memory_dir):
+            return {"ok": False, "error": f"Project '{name}' not found."}
+
+        for target in (project_dir, memory_dir):
+            if os.path.isdir(target):
+                try:
+                    shutil.rmtree(target)
+                except OSError as e:
+                    return {"ok": False, "error": f"Failed to delete '{name}': {e}"}
         return {"ok": True, "project": name}
 
     # --- workspace import / export -------------------------------------------
@@ -548,6 +823,62 @@ class AgentApi:
             "memory_summary": self.session.get("last_summary", ""),
         }
 
+    # --- LLM provider settings (exposed to the settings UI) ------------------
+    # These read/write llm_config.json via the llm module and don't need an
+    # active session, so the provider can be configured from the start screen
+    # too. The API key is returned to the (local, single-user) webview so the
+    # field can prefill; it never leaves this machine.
+    def get_llm_config(self):
+        try:
+            eff = get_effective_config()
+            return {
+                "ok": True,
+                "config": {
+                    "provider": eff["provider"],
+                    "model": eff["model"],
+                    "base_url": eff["base_url"],
+                    "api_key": eff["api_key"],
+                    "max_tokens": eff["max_tokens"],
+                },
+                "providers": list_providers(),
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def save_llm_config(self, cfg):
+        if not isinstance(cfg, dict):
+            return {"ok": False, "error": "Invalid config."}
+        provider = (cfg.get("provider") or "").strip()
+        valid = {p["id"] for p in list_providers()}
+        if provider not in valid:
+            return {"ok": False, "error": f"Unknown provider '{provider}'."}
+        ok = save_config({
+            "provider": provider,
+            "api_key": (cfg.get("api_key") or "").strip(),
+            "model": (cfg.get("model") or "").strip(),
+            "base_url": (cfg.get("base_url") or "").strip(),
+            "max_tokens": cfg.get("max_tokens"),
+        })
+        if not ok:
+            return {"ok": False, "error": "Failed to write llm_config.json (check file permissions)."}
+        eff = get_effective_config()
+        return {"ok": True, "provider": eff["provider"], "model": eff["model"], "label": eff["label"]}
+
+    def test_llm_config(self, cfg):
+        try:
+            overrides = None
+            if isinstance(cfg, dict):
+                overrides = {
+                    "provider": ((cfg.get("provider") or "").strip() or None),
+                    "api_key": cfg.get("api_key"),
+                    "model": cfg.get("model"),
+                    "base_url": cfg.get("base_url"),
+                    "max_tokens": cfg.get("max_tokens"),
+                }
+            return test_connection(overrides)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def start_session(self, project_name):
         project_dir = os.path.join(WORKSPACE_DIR, project_name)
         memory_dir = os.path.join(MEMORY_DIR, project_name)
@@ -563,18 +894,31 @@ class AgentApi:
             return {"ok": False, "error": f"Docker sandbox failed to start: {e}"}
         self._emit({"type": "log", "content": "[Sandbox] Container is ready."})
 
-        summaries = sorted(glob.glob(os.path.join(memory_dir, "summary_*.txt")))
         base_system_prompt = get_full_system_prompt()
-        messages = [{"role": "system", "content": base_system_prompt}]
 
+        # Prefer restoring the full prior conversation (so the agent can CONTINUE
+        # from the old chat). Fall back to the latest memory summary only if there
+        # is no saved conversation for this project.
+        saved_messages, saved_transcript, saved_task = self._load_persisted(memory_dir)
         last_summary_text = None
-        if summaries:
-            try:
-                with open(summaries[-1], "r", encoding="utf-8") as f:
-                    last_summary_text = f.read()
-                messages.append({"role": "assistant", "content": f"[MEMORY SUMMARY]: {last_summary_text}"})
-            except OSError:
-                last_summary_text = None
+        if saved_messages is not None:
+            messages = saved_messages
+            # Always refresh the system prompt to the current one (tools/skills may
+            # have changed since it was saved); keep the rest of the history.
+            if messages and messages[0].get("role") == "system":
+                messages[0] = {"role": "system", "content": base_system_prompt}
+            else:
+                messages.insert(0, {"role": "system", "content": base_system_prompt})
+        else:
+            messages = [{"role": "system", "content": base_system_prompt}]
+            summaries = sorted(glob.glob(os.path.join(memory_dir, "summary_*.txt")))
+            if summaries:
+                try:
+                    with open(summaries[-1], "r", encoding="utf-8") as f:
+                        last_summary_text = f.read()
+                    messages.append({"role": "assistant", "content": f"[MEMORY SUMMARY]: {last_summary_text}"})
+                except OSError:
+                    last_summary_text = None
 
         self.session = {
             "project": project_name,
@@ -582,7 +926,8 @@ class AgentApi:
             "base_system_prompt": base_system_prompt,
             "memory_dir": memory_dir,
             "last_summary": last_summary_text or "",
-            "original_task": None,
+            "transcript": saved_transcript,
+            "original_task": saved_task,
             "step_count": 0,
             "last_tool_call": None,
             "consecutive_tools": 0,
@@ -590,9 +935,11 @@ class AgentApi:
             "max_consecutive_tools": MAX_CONSECUTIVE_TOOLS,
             "loop_repeat_threshold": LOOP_REPEAT_THRESHOLD,
             "summary_resets": 0,
-            "needs_plan": True,
+            "needs_plan": saved_task is None,
             "tools_since_plan_touch": 0,
             "_plan_touch_nudge_sent": False,
+            "reads_since_nav": 0,
+            "graph_nudges_sent": 0,
         }
 
         # Plan-and-execute: resume a previous in-progress plan for this
@@ -607,17 +954,68 @@ class AgentApi:
         else:
             planning.clear_active_plan(notify=False)
 
-        tree = build_file_tree(project_name)
-        self._emit({"type": "session_started",
-                    "project": project_name,
-                    "memory_summary": last_summary_text or "",
-                    "file_tree": tree,
-                    "import_source": _read_import_meta(project_dir)})
-        # Now that self.session is fully built, push the (possibly resumed)
-        # plan to the GUI and fold it into the live system prompt.
+        self._emit_session_started()
+        return {"ok": True, "project": project_name}
+
+    def _emit_session_started(self):
+        """Push the current session to the GUI (used on a fresh start AND when
+        reconnecting after a webview refresh). Includes the replayable transcript
+        so the chat is rebuilt exactly, then folds the live plan into the prompt."""
+        s = self.session
+        if not s:
+            return
+        project = s["project"]
+        self._emit({
+            "type": "session_started",
+            "project": project,
+            "memory_summary": s.get("last_summary", ""),
+            "file_tree": build_file_tree(project),
+            "import_source": _read_import_meta(os.path.join(WORKSPACE_DIR, project)),
+            "transcript": s.get("transcript", []),
+            "busy": self._busy,
+        })
         active_plan = planning.get_active_plan()
         self._on_plan_update(active_plan.to_dict() if active_plan else None)
-        return {"ok": True, "project": project_name}
+
+    def restore_session(self):
+        """Re-attach the frontend to a still-live backend session after a webview
+        refresh or renderer crash — replays the transcript instead of dropping to
+        the start screen. Returns {active:false} if there's no live session."""
+        if not self.session:
+            return {"ok": True, "active": False}
+        self._emit_session_started()
+        return {"ok": True, "active": True, "project": self.session["project"]}
+
+    def clear_chat(self):
+        """Start a FRESH conversation for the same workspace: reset the message
+        history, transcript and per-task counters, and wipe the saved conversation
+        — but DO NOT touch memory summaries, the plan, or any files on disk."""
+        if not self.session:
+            return {"ok": False, "error": "No active session."}
+        with self._lock:
+            if self._busy:
+                return {"ok": False, "error": "Agent is working. Stop it before clearing the chat."}
+        s = self.session
+        s["messages"] = [{"role": "system", "content": s["base_system_prompt"]}]
+        s["transcript"] = []
+        s["original_task"] = None
+        s["last_tool_call"] = None
+        s["step_count"] = 0
+        s["consecutive_tools"] = 0
+        s["summary_resets"] = 0
+        s["tools_since_plan_touch"] = 0
+        s["_plan_touch_nudge_sent"] = False
+        s["reads_since_nav"] = 0
+        s["graph_nudges_sent"] = 0
+        s["_nudge_sent"] = False
+        s["plan_gate_retries"] = 0
+        # A fresh chat only needs a new plan if there isn't an in-progress one.
+        active_plan = planning.get_active_plan()
+        s["needs_plan"] = active_plan is None or active_plan.is_complete()
+        # Fold the (unchanged) live plan back into the fresh system prompt.
+        self._refresh_system_prompt()
+        self._persist_session()
+        return {"ok": True}
 
     def send_message(self, text):
         if not self.session:
@@ -635,6 +1033,8 @@ class AgentApi:
         self.session["last_tool_call"] = None
         self.session["consecutive_tools"] = 0
         self.session["summary_resets"] = 0
+        self.session["reads_since_nav"] = 0
+        self.session["graph_nudges_sent"] = 0
 
         # Plan-and-execute: a genuinely NEW task (no active plan, or the
         # previous one is fully done) must be planned before any tool runs.
@@ -649,6 +1049,9 @@ class AgentApi:
         self.session["_plan_touch_nudge_sent"] = False
 
         self._emit({"type": "user_message", "content": text})
+        # Persist immediately so the user's message survives even if the app is
+        # closed / crashes mid-generation.
+        self._persist_session()
         self._thread = threading.Thread(target=self._run_agent_loop, daemon=True)
         self._thread.start()
         return {"ok": True}
@@ -670,19 +1073,136 @@ class AgentApi:
             return {"ok": False, "error": "No active session."}
         return read_project_file(self.session["project"], rel_path)
 
-    def get_code_graph(self):
-        """Reads the chunked code knowledge graph from the project workspace
-        and returns vis-network-ready nodes/edges/legend for the frontend
-        visualization. Returns an error if no graph has been built yet.
+    def read_archive_member(self, rel_path, member):
+        if not self.session:
+            return {"ok": False, "error": "No active session."}
+        return read_project_archive_member(self.session["project"], rel_path, member)
+
+    def upload_files(self, dest_dir=""):
+        """Opens a native multi-select file picker and copies the chosen host
+        files into the current project's workspace (optionally into a subfolder
+        dest_dir, relative to the project root). Returns the refreshed file tree
+        so the frontend updates immediately. Existing files of the same name are
+        overwritten (an upload of a newer copy)."""
+        if not self.session:
+            return {"ok": False, "error": "No active session."}
+        if self._window is None:
+            return {"ok": False, "error": "Window not ready."}
+
+        # Resolve + sandbox the destination to inside the project root.
+        project = self.session["project"]
+        root = os.path.abspath(os.path.join(WORKSPACE_DIR, project))
+        rel = (dest_dir or "").strip().lstrip("/").lstrip("\\").replace("\\", "/")
+        dest_abs = os.path.abspath(os.path.join(root, *rel.split("/"))) if rel else root
+        if dest_abs != root and not dest_abs.startswith(root + os.sep):
+            return {"ok": False, "error": "Destination is outside the workspace."}
+
+        try:
+            result = self._window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=True)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not result:
+            return {"ok": True, "cancelled": True, "copied": [], "skipped": []}
+
+        paths = list(result) if isinstance(result, (list, tuple)) else [result]
+        try:
+            os.makedirs(dest_abs, exist_ok=True)
+        except OSError as e:
+            return {"ok": False, "error": f"Could not create destination folder: {e}"}
+
+        copied, skipped = [], []
+        for src in paths:
+            name = os.path.basename(src)
+            try:
+                if not os.path.isfile(src):
+                    skipped.append({"name": name, "reason": "not a file"})
+                    continue
+                shutil.copy2(src, os.path.join(dest_abs, name))
+                copied.append(f"{rel + '/' if rel else ''}{name}")
+            except OSError as e:
+                skipped.append({"name": name, "reason": str(e)})
+
+        self._refresh_tree(force=True)
+        return {"ok": True, "cancelled": False, "copied": copied, "skipped": skipped,
+                "dest": rel or "(workspace root)", "tree": build_file_tree(project)}
+
+    def get_code_graph(self, graph_id=None):
+        """Reads a chunked code knowledge graph from the project workspace and
+        returns vis-network-ready nodes/edges/legend for the frontend, plus the
+        list of ALL built graphs so the UI can offer a per-version selector.
+
+        Graphs are namespaced under .codegraph/<graph_id>/ (see _kg_indexer.py),
+        so one workspace can hold several — e.g. two app versions built
+        separately for a diff. `graph_id` picks which to render; without it the
+        most recently built graph is shown. A legacy flat graph (built before
+        namespacing) is still read, listed as '(default)'.
         """
         if not self.session:
             return {"ok": False, "error": "No active session."}
         project = self.session["project"]
-        graph_dir = os.path.join(WORKSPACE_DIR, project, ".codegraph")
-        manifest_path = os.path.join(graph_dir, "manifest.json")
-        if not os.path.isfile(manifest_path):
+        cg_root = os.path.join(WORKSPACE_DIR, project, ".codegraph")
+
+        # Enumerate the available graphs (id -> directory + summary for the UI).
+        dirs = {}
+        graphs = []
+        index = {}
+        index_path = os.path.join(cg_root, "graphs.json")
+        if os.path.isfile(index_path):
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    index = loaded
+            except Exception:
+                index = {}
+        for gid, info in index.items():
+            gdir = os.path.join(cg_root, gid)
+            if os.path.isfile(os.path.join(gdir, "manifest.json")):
+                info = info or {}
+                dirs[gid] = gdir
+                graphs.append({
+                    "id": gid, "root": info.get("root", ""),
+                    "classes": info.get("classes", 0), "methods": info.get("methods", 0),
+                    "built_at": info.get("built_at", ""), "built_at_ts": info.get("built_at_ts", 0),
+                })
+        # Legacy flat graph (pre-namespacing): read in place, listed as "(default)".
+        # Pull its real counts from meta.json so the selector/auto-pick can tell
+        # whether it actually has nodes (a graphs.json index predates it).
+        if not dirs and os.path.isfile(os.path.join(cg_root, "manifest.json")):
+            dirs["(default)"] = cg_root
+            legacy_meta = {}
+            legacy_meta_path = os.path.join(cg_root, "meta.json")
+            if os.path.isfile(legacy_meta_path):
+                try:
+                    with open(legacy_meta_path, "r", encoding="utf-8") as f:
+                        legacy_meta = json.load(f)
+                except Exception:
+                    legacy_meta = {}
+            graphs.append({
+                "id": "(default)", "root": legacy_meta.get("root", ""),
+                "classes": legacy_meta.get("classes", 0), "methods": legacy_meta.get("methods", 0),
+                "built_at": legacy_meta.get("built_at", ""), "built_at_ts": legacy_meta.get("built_at_ts", 0),
+            })
+
+        if not dirs:
             return {"ok": False, "error": "No knowledge graph found. Ask the agent to run build_code_graph on a decompiled directory first."}
+
+        graphs.sort(key=lambda g: g.get("built_at_ts", 0), reverse=True)
+        # Honor an explicit pick; otherwise auto-select the most-recently-built graph
+        # that actually HAS classes. Without this, an empty build (wrong dir, a
+        # not-yet-decompiled folder, or a native-only .so index) — which still gets
+        # registered in graphs.json — would shadow a good graph purely because it's
+        # newer, leaving the Graph tab stuck on "no nodes". Fall back to the newest
+        # graph only when every graph is empty.
+        if graph_id and graph_id in dirs:
+            chosen = graph_id
+        else:
+            non_empty = [g for g in graphs if g.get("classes", 0) > 0]
+            chosen = (non_empty[0]["id"] if non_empty else graphs[0]["id"])
+        graph_dir = dirs[chosen]
+
         try:
+            manifest_path = os.path.join(graph_dir, "manifest.json")
             with open(manifest_path, "r", encoding="utf-8") as f:
                 manifest = json.load(f)
             meta_path = os.path.join(graph_dir, "meta.json")
@@ -708,9 +1228,9 @@ class AgentApi:
 
             # Build visualization data (same logic as _kg_query.py graph_data)
             data = self._build_viz_data(classes, callers, meta)
-            return {"ok": True, "graph": data}
+            return {"ok": True, "graph": data, "graphs": graphs, "graph_id": chosen}
         except Exception as e:
-            return {"ok": False, "error": f"Failed to read graph: {e}"}
+            return {"ok": False, "error": f"Failed to read graph: {e}", "graphs": graphs, "graph_id": chosen}
 
     def _build_viz_data(self, classes, callers, meta, max_nodes=600):
         """Build vis-network nodes/edges/legend from class + caller data."""
@@ -791,6 +1311,7 @@ class AgentApi:
 
     def end_session(self):
         self.stop()
+        self._persist_session()
         planning.clear_active_plan(notify=False)
         planning.set_context(None, notify_callback=None)
         self.session = None
@@ -798,6 +1319,7 @@ class AgentApi:
         return {"ok": True}
 
     def exit_app(self):
+        self._persist_session()
         if self._window is not None:
             try:
                 self._window.destroy()
@@ -854,7 +1376,7 @@ class AgentApi:
                 time_str = _fmt_elapsed(elapsed_ms)
 
                 self._emit({"type": "thought", "time": time_str, "elapsed_ms": elapsed_ms,
-                            "text": thought_process,
+                            "text": _ui_trunc(thought_process, UI_THOUGHT_CAP),
                             "thought_chars": len(thought_process)})
 
                 if response_type == "tool_call":
@@ -937,11 +1459,42 @@ class AgentApi:
                                 "reflect it (or plan_add_task if you've discovered new work) before continuing."
                             )})
 
+                    # Code-graph guard: catch the "sweeping files one by one"
+                    # anti-pattern. Any navigation tool (graph query or content
+                    # search) resets the counter; a long run of pure
+                    # read_file_chunk with no navigation triggers a bounded nudge
+                    # toward build_code_graph / query_code_graph / grep_directory.
+                    if tool_name in NAVIGATION_TOOLS:
+                        s["reads_since_nav"] = 0
+                    elif tool_name == "read_file_chunk":
+                        s["reads_since_nav"] = s.get("reads_since_nav", 0) + 1
+                        if (s["reads_since_nav"] >= GRAPH_NUDGE_THRESHOLD
+                                and s.get("graph_nudges_sent", 0) < MAX_GRAPH_NUDGES):
+                            s["reads_since_nav"] = 0
+                            s["graph_nudges_sent"] = s.get("graph_nudges_sent", 0) + 1
+                            self._emit({"type": "system", "content": (
+                                "SYSTEM GUARD: many files read one-by-one without using the code "
+                                "graph — steering to build_code_graph / query_code_graph.")})
+                            s["messages"].append({"role": "user", "content": (
+                                "[SYSTEM] You've read many files individually without building or "
+                                "querying the code graph or running a search. On a decompiled app this "
+                                "exhausts context fast and is the wrong approach. STOP reading files one "
+                                "by one and NAVIGATE instead: for smali, call build_code_graph once, then "
+                                "query_code_graph (string_refs / callers / callees / class / hierarchy) "
+                                "to jump straight to the exact file:line you need; to search any tree "
+                                "(smali, Java, XML, assets) use grep_directory / search_smali / find_files. "
+                                "Then read_file_chunk ONLY the specific slice those point you to. If you "
+                                "genuinely have a reason to keep reading these particular files, continue."
+                            )})
+
+                    # NOTE: the raw tool output is deliberately NOT sent to the UI
+                    # — the chat shows only the action, never its output (the full
+                    # output stays in the agent's own message context below). This
+                    # is also what keeps the webview from OOMing on long runs.
                     self._emit({"type": "tool_result",
                                 "id": tool_id,
                                 "tool": tool_name,
                                 "args": tool_args,
-                                "result": tool_feedback,
                                 "step": s["step_count"],
                                 "consecutive_tools": s["consecutive_tools"],
                                 "is_loop_warning": is_loop_warning,
@@ -1000,7 +1553,10 @@ class AgentApi:
         finally:
             with self._lock:
                 self._busy = False
-            self._refresh_tree()
+            self._refresh_tree(force=True)  # push the final tree state once, at the end
+            # Save the conversation + transcript so a refresh / restart can
+            # restore this chat and continue from here.
+            self._persist_session()
             self._emit({"type": "done"})
 
 

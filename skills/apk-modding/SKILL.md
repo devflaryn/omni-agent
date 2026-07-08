@@ -15,6 +15,8 @@ Check for: number of .dex files, native .so libraries (and which ABIs), assets, 
 
 ## Step 2 — Choose Your Approach
 
+> Understanding the app first? If you need to READ and trace the app's logic before editing (large or obfuscated app, unclear where the target is), `jadx_decompile` gives readable Java (use `deobf=true` on obfuscated apps) — much faster to reason about than smali. Then search it with `grep_directory` / `find_files`. Make the actual EDIT in smali below, since jadx output isn't recompilable.
+
 ### Approach A: Whole-file edits (fast, no smali needed)
 Use this when you only need to swap/delete/replace whole files (e.g. remove an architecture, replace a .so, change an asset).
 1. `unzip_apk` to extract raw contents

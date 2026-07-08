@@ -16,15 +16,62 @@ def list_directory(directory="."):
     return run_cmd(cmd)
 
 @registry.register(
+    name="find_files",
+    description=(
+        "Recursively finds files (and folders) by name pattern anywhere under a directory. "
+        "Use this to locate a file in a large decompiled/jadx tree when you know its name but not its path "
+        "(e.g. find 'MainActivity.smali', all '*.so', every 'AndroidManifest.xml', or classes named '*Login*'). "
+        "Much faster than list_directory-ing folder by folder. The pattern is a shell glob matched against the "
+        "file NAME only (not the full path)."
+    ),
+    params_schema={
+        "name_pattern": "string (glob against the filename, e.g. '*.so', 'MainActivity.smali', '*Login*')",
+        "directory": "string (optional, directory to search under, relative to /workspace, default '.')",
+        "type": "string (optional, 'f' for files only, 'd' for directories only, omit for both)",
+        "max_results": "integer (optional, default 200)"
+    },
+    output="One matching path per line (relative to /workspace). Capped at max_results. Says so if nothing matches.",
+    when_to_use="Use this to locate files by name in a big tree (which .dex has a class, where a .so lives, finding a specific smali/java/xml file) instead of walking directories manually. To search file CONTENTS instead of names, use grep_directory / search_smali."
+)
+def find_files(name_pattern, directory=".", type=None, max_results=200):
+    directory = normalize_path(directory)
+    try:
+        max_results = int(max_results)
+    except (TypeError, ValueError):
+        max_results = 200
+    type_flag = ""
+    if type in ("f", "d"):
+        type_flag = f"-type {type} "
+    # -iname for case-insensitive name matching; strip the /workspace/ prefix so
+    # results are workspace-relative like every other tool's paths.
+    cmd = (
+        f"find /workspace/{directory} {type_flag}-iname '{name_pattern}' 2>/dev/null "
+        f"| sed 's#^/workspace/##' | head -n {max_results}"
+    )
+    res = run_cmd(cmd, timeout=90)
+    if res.get("returncode") == 0 and not res.get("stdout", "").strip():
+        return {"stdout": f"(no files matching '{name_pattern}' under {directory})"}
+    return res
+
+
+@registry.register(
     name="read_file_chunk",
-    description="Reads a specific chunk of lines from a text file. Use this for large files (smali, decompiled C, scripts) to avoid context overflow. Always check total lines and continue with the next chunk if needed.",
+    description=(
+        "Reads a specific chunk of lines from a text file. Use this for large files (smali, decompiled C, "
+        "scripts) to avoid context overflow. Always check total lines and continue with the next chunk if "
+        "needed. IMPORTANT: this is for reading the ONE slice you've already pinpointed — NOT for exploring "
+        "a decompiled app by opening file after file. In a decompiled/large tree, first build_code_graph + "
+        "query_code_graph (smali) or grep_directory / find_files / search_smali to locate the exact file:line, "
+        "then read just that slice here. Reading many files in a row to 'understand the app' will blow your "
+        "context and is the wrong approach."
+    ),
     params_schema={
         "filepath": "string (path relative to workspace or absolute)",
         "start_line": "integer (1-indexed, default 1)",
         "num_lines": "integer (number of lines to read, e.g., 100, default 150)"
     },
     output="A header showing the line range and TOTAL line count of the file, followed by the raw text of those lines. If the file continues, a hint tells you the next start_line to use.",
-    when_to_use="Use this to read the contents of any text file. For huge files, read in chunks of ~150 lines and page through with start_line. For logs where the interesting part is at the end, prefer tail_file."
+    when_to_use="Use this to read a SPECIFIC slice a graph query (query_code_graph) or a search (grep_directory/search_smali/find_files) already pointed you to. For huge files, page through with start_line in ~150-line chunks. For logs where the interesting part is at the end, prefer tail_file. If you find yourself about to read a series of files just to figure out where something is, stop and use build_code_graph/query_code_graph or a search instead."
 )
 def read_file_chunk(filepath, start_line=1, num_lines=150):
     filepath = normalize_path(filepath)

@@ -11,29 +11,45 @@ read_file_chunk etc. inside the sandbox, and an APK built by
 build_apk/sign_apk in the sandbox is still reachable here for
 install_apk_on_emulator).
 
-TWO BACKENDS, same tool interface:
-  - "ldplayer" (DEFAULT) — LDPlayer, driven via its ldconsole.exe automation
-    tool for lifecycle (create/reset/launch an instance) plus standard adb
-    for everything else. LDPlayer ships its own ARM/ARM64 translation layer,
-    which matters a lot here: a real x86_64-only AVD system image often
-    cannot run arm64-v8a native libraries AT ALL (INSTALL_FAILED_NO_MATCHING_ABIS
-    or a runtime crash on first native call), whereas LDPlayer's translation
-    handles a lot of arm64-v8a code that a stock AVD just can't run, at much
-    better speed than a true arm64-v8a AVD system image would manage without
-    hardware ARM acceleration. This is why it's the default now.
+THREE BACKENDS, same tool interface:
+  - "qemu" (DEFAULT) — the self-contained headless **omnidroid** emulator
+    service, a QEMU/Bliss-OS (Android 13, x86_64, libndk ARM translation)
+    runner driven through the bundled `qemu-manager.exe` engine (identical to
+    `tools/omnidroid/omnidroid.exe`; see tools/omnidroid/HOWTO.md). It needs no
+    separately installed emulator: on first use it self-bootstraps its config,
+    downloads a portable QEMU, and auto-registers the base image from its images
+    dir. It is a *per-account* model — each fresh test instance is a named
+    account created from an immutable base as a disposable copy-on-write overlay
+    plus its own /data disk, with three fixed loopback ports derived from the
+    account index (adb 16001+i, QMP 17001+i, VNC 18001+i). These tools drive it
+    for lifecycle (create / start --wait / stop / remove) and derive the guest's
+    adb serial from the `--json` payload of `start`/`list`, so the adb-based
+    tools below (screenshot, logcat, keyframes) work against it unchanged. APK
+    install + launch go THROUGH the service (`omni install` / `omni run-app`)
+    because provisioned accounts are locked-down kiosks (Lock Task Mode, device
+    owner) — `omni install` also sets the APK as the kiosk's launch target so it
+    actually starts under that lockdown.
+  - "ldplayer" — LDPlayer, driven via its ldconsole.exe automation tool for
+    lifecycle plus standard adb for everything else. It ships its own ARM/ARM64
+    translation layer, which handles a lot of arm64-v8a native code that a
+    stock x86_64 image can't. Kept as a fallback for hosts where LDPlayer is
+    already set up.
   - "avd" — the original Android Studio / SDK emulator.exe + avdmanager path,
-    kept as a fallback for anyone who doesn't have LDPlayer installed, or
-    specifically wants a "reference" Android Studio system image.
-Every tool below takes a `backend` parameter (default "ldplayer") and a
-`device_name` override (defaults to a fixed, always-reused name per backend:
-'omniagent_ld' for LDPlayer, 'omniagent_avd' for the AVD backend).
+    kept as a fallback for anyone who wants a "reference" Android Studio image.
+Every tool below takes a `backend` parameter (default "qemu") and a
+`device_name` override — for qemu this is the omnidroid ACCOUNT NAME (default
+'omniagent'); for the other backends it's the persistent instance/AVD name
+('omniagent_ld' for LDPlayer, 'omniagent_avd' for the AVD backend).
 
-One emulator, reused: for either backend, the SAME device_name is targeted on
-every call. It's created once if missing, and on every call with reset=True
-(the default) it's brought back to a fresh state before use — LDPlayer via a
-full quit+recreate of the instance (see reference/troubleshooting.md in the
-emulator-testing skill for the tradeoffs), the AVD backend via -wipe-data.
-Never a second device created alongside the reused one.
+One emulator, reused: for every backend the SAME device_name/account is
+targeted on each call. On every call with reset=True (the default) it is
+brought back to a fresh state before use — qemu by REMOVING the old account and
+CREATING a brand new one from the base (a truly fresh overlay + /data, the old
+account's data discarded), LDPlayer via a full quit+recreate of the instance,
+the AVD backend via -wipe-data. Never a second device created alongside the
+reused one. NOTE (qemu): a fresh account's first boot runs one-time provisioning
++ dexopt (~3–15 min); pass reset=False to reuse an already-provisioned account
+and just reinstall the APK, which is the fast path for iterating on a build.
 
 Screenshot capture is window-state-independent: record_and_capture_keyframes
 and take_emulator_screenshot both use `adb exec-out screencap -p`, which
@@ -55,12 +71,19 @@ from tool_registry import registry
 from tools.common import resolve_workspace_path, find_android_sdk_tools, find_ldplayer_tools
 from tools._emulator_frame_capture import capture_keyframes
 from tools._emulator_vision_analyze import analyze_session
-from llm import CLINE_API_URL, API_KEY, MODEL_NAME
+from llm import get_openai_endpoint_config
 
-_DEFAULT_BACKEND = "ldplayer"
+_DEFAULT_BACKEND = "qemu"
 _DEFAULT_AVD = "omniagent_avd"
 _DEFAULT_LDPLAYER_INSTANCE = "omniagent_ld"
+_DEFAULT_QEMU_SESSION = "omniagent"
 _DEFAULT_SYSTEM_IMAGE = "system-images;android-33;google_apis;x86_64"
+_DEFAULT_QEMU_MODE = "playable"
+
+# omnidroid's account-name rule (see tools/omnidroid/HOWTO.md §5): the name must
+# match [A-Za-z0-9_-]+ exactly (no dots, no globs, no paths). Bounded to 64 to
+# stay well inside filesystem limits.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def _truthy(v):
@@ -89,7 +112,289 @@ def _run(cmd_list, timeout=30, input_text=None):
 
 
 def _default_device_name(backend):
-    return _DEFAULT_LDPLAYER_INSTANCE if backend == "ldplayer" else _DEFAULT_AVD
+    if backend == "qemu":
+        return _DEFAULT_QEMU_SESSION
+    if backend == "ldplayer":
+        return _DEFAULT_LDPLAYER_INSTANCE
+    return _DEFAULT_AVD
+
+
+def _validate_session_id(sid):
+    """Returns an error string if sid isn't a valid omnidroid account name, else None."""
+    if not sid or not _SESSION_ID_RE.match(sid):
+        return (
+            f"Invalid qemu account name {sid!r} — omnidroid account names must match "
+            "[A-Za-z0-9_-]+ (letters, digits, '_' or '-'; no dots, spaces, or slashes)."
+        )
+    return None
+
+
+# --------------------------------------------------------------------------
+# omnidroid qemu-manager.exe control helpers (DEFAULT backend)
+# --------------------------------------------------------------------------
+#
+# qemu-manager is the frozen omnidroid engine (tools/omnidroid/HOWTO.md documents
+# it). The lifecycle commands we use (create/start/stop/remove/list) accept a
+# `--json` flag that prints exactly one machine-readable JSON line on stdout with
+# all human progress on stderr; errors become {"ok": false, "error": ...} with
+# exit 1. We drive those for lifecycle, read the guest's adb serial out of the
+# JSON, and reuse the ordinary host adb.exe for screenshots/logcat/shell — the
+# same code path the other backends use. APK install/launch go back through the
+# service (`omni install` / `omni run-app`) since provisioned accounts are locked
+# kiosks; those subcommands are plain-text (no --json).
+
+def _find_qemu_manager():
+    """Locate the omnidroid engine executable. Returns (exe_path, project_dir).
+
+    The canonical binary for every emulator call is tools/omnidroid/omnidroid.exe
+    (the omnidroid emulator service; byte-identical to the root qemu-manager.exe,
+    which is kept only as a fallback). project_dir is the folder the executable
+    lives in — the same folder the frozen exe self-bootstraps next to (configs/,
+    accounts/, ./qemu on Windows), so any adb it downloads and the account state
+    all resolve there. Override the exe location with the QEMU_MANAGER_PATH env
+    var."""
+    is_nt = os.name == "nt"
+    tools_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(tools_dir)
+    candidates = []
+    env = os.environ.get("QEMU_MANAGER_PATH")
+    if env:
+        candidates.append(env)
+    # Primary: the bundled omnidroid service exe under tools/omnidroid/.
+    candidates.append(os.path.join(tools_dir, "omnidroid",
+                                   "omnidroid.exe" if is_nt else "omnidroid"))
+    # Fallback: the identical engine shipped at the project root.
+    candidates.append(os.path.join(repo_root,
+                                   "qemu-manager.exe" if is_nt else "qemu-manager"))
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            return cand, os.path.dirname(os.path.abspath(cand))
+    from shutil import which
+    found = which("omnidroid") or which("qemu-manager")
+    if found:
+        return found, os.path.dirname(os.path.abspath(found))
+    omnidroid_path = os.path.join(tools_dir, "omnidroid",
+                                  "omnidroid.exe" if is_nt else "omnidroid")
+    raise RuntimeError(
+        "Could not find the omnidroid engine. Looked in: "
+        + ", ".join(c for c in candidates if c)
+        + f", and on PATH. Place omnidroid.exe at {omnidroid_path}, "
+        "or set the QEMU_MANAGER_PATH environment variable to its full path."
+    )
+
+
+def _parse_json_object(text):
+    """qemu-manager --json prints one JSON value (object for create/start/stop,
+    array for list) on stdout, but self-bootstrap can emit a few `[config] ...`
+    progress lines before it. Parse defensively: try the whole thing, then the
+    last line that parses as JSON, then a bracket-slice fallback."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line and line[0] in "{[":
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    for open_c, close_c in (("{", "}"), ("[", "]")):
+        start, end = text.find(open_c), text.rfind(close_c)
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except ValueError:
+                pass
+    return None
+
+
+def _run_qemu(args, timeout=60):
+    """Run a qemu-manager subcommand. Returns (parsed_json_or_None, raw_result,
+    project_dir). The frozen exe self-locates its project dir (its own folder),
+    so we do NOT pass --project-dir (avoids any argparse global-vs-subcommand
+    placement ambiguity) and simply rely on that documented default."""
+    exe, project_dir = _find_qemu_manager()
+    res = _run([exe] + list(args), timeout=timeout)
+    parsed = _parse_json_object(res.get("stdout"))
+    return parsed, res, project_dir
+
+
+def _qemu_extract_session(parsed, name):
+    """Pull the dict describing one account out of any omnidroid --json shape:
+    `create`/`start`/`stop` put the fields (including "name") at top level;
+    `list --json` is an array of such dicts. Match on the account "name"."""
+    if isinstance(parsed, list):
+        for s in parsed:
+            if isinstance(s, dict) and s.get("name") == name:
+                return s
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    # A single-account payload (create/start/stop) — only claim it if it is
+    # actually about this account, or if it self-identifies with adb fields and
+    # carries no conflicting name.
+    if parsed.get("name") == name:
+        return parsed
+    if "name" not in parsed and any(k in parsed for k in ("adb_serial", "adb_port")):
+        return parsed
+    return None
+
+
+def _qemu_serial_from(sess):
+    if not isinstance(sess, dict):
+        return None
+    if sess.get("adb_serial"):
+        return sess["adb_serial"]
+    if sess.get("serial"):
+        return sess["serial"]
+    port = sess.get("adb_port")
+    if port:
+        return f"127.0.0.1:{port}"
+    return None
+
+
+def _qemu_is_running(sess):
+    if not isinstance(sess, dict):
+        return False
+    if "running" in sess:
+        return bool(sess["running"])
+    status = str(sess.get("status") or sess.get("state") or "").lower()
+    return status == "running"
+
+
+def _qemu_adb(project_dir):
+    """Resolve an adb.exe for the qemu backend. Prefer any platform-tools the
+    omnidroid engine downloaded next to itself, then a host Android SDK's adb,
+    then bare PATH adb (the engine requires adb on PATH, so this last one is the
+    common case on Windows)."""
+    exe = "adb.exe" if os.name == "nt" else "adb"
+    for sub in (("qemu", "platform-tools"), ("runtime", "tools", "platform-tools"),
+                ("platform-tools",)):
+        cand = os.path.join(project_dir, *sub, exe)
+        if os.path.isfile(cand):
+            return cand
+    try:
+        return find_android_sdk_tools()["adb"]
+    except RuntimeError:
+        pass
+    from shutil import which
+    return which("adb") or which("adb.exe") or "adb"
+
+
+def _qemu_get_account(name):
+    """Look the account up via `list --json`. Returns its dict or None (and
+    re-raises RuntimeError only if the engine can't be found)."""
+    parsed, _res, _pd = _run_qemu(["list", "--json"], timeout=30)
+    return _qemu_extract_session(parsed, name)
+
+
+def _qemu_create(name, boot_timeout, log):
+    """Create disks for a fresh account (no boot — the first `start` provisions).
+    Returns None on success or an {"error": ...} dict on failure."""
+    log.append(f"Creating account '{name}' (disks only; first boot provisions)...")
+    try:
+        parsed, res, _pd = _run_qemu(["create", name, "--no-provision", "--json"], timeout=600)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    if res.get("error"):
+        return {"error": res["error"]}
+    if not (isinstance(parsed, dict) and parsed.get("ok", False)):
+        detail = (res.get("stdout") or res.get("stderr") or "").strip()[:800]
+        return {"error": f"omnidroid create failed. Output:\n{detail}"}
+    return None
+
+
+def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
+    err = _validate_session_id(name)
+    if err:
+        return {"error": err}
+    log = []
+
+    try:
+        acct = _qemu_get_account(name)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    exists = acct is not None
+    running = exists and _qemu_is_running(acct)
+
+    # reset=True -> a truly fresh instance: destroy any old account, recreate it.
+    if reset:
+        if exists:
+            log.append(f"Removing existing account '{name}' for a fresh instance (DESTRUCTIVE)...")
+            try:
+                _parsed_rm, res_rm, _pd = _run_qemu(["remove", name, "--json"], timeout=180)
+            except RuntimeError as e:
+                return {"error": str(e)}
+            if res_rm.get("error"):
+                return {"error": res_rm["error"]}
+            exists = running = False
+        err = _qemu_create(name, boot_timeout, log)
+        if err:
+            return err
+        exists, running = True, False
+    elif not exists:
+        # reset=False but nothing to reuse yet — create it once.
+        err = _qemu_create(name, boot_timeout, log)
+        if err:
+            return err
+        exists = True
+
+    # Reuse an already-running, already-provisioned account as-is.
+    if running and not reset:
+        serial = _qemu_serial_from(acct)
+        log.append(f"Account '{name}' already running; reusing (reset=false). serial={serial or 'unknown'}")
+        adb = _qemu_adb(_find_qemu_manager()[1])
+        if serial:
+            _run([adb, "connect", serial], timeout=10)
+        log.append(f"BOOT_OK (serial={serial or 'unknown'})")
+        return {"stdout": "\n".join(log)}
+
+    # Cold-boot and block until Android reports boot_completed. A just-created
+    # account provisions + dexopts on this first boot, which the engine bounds at
+    # ~1500 s — give at least that so we don't time out mid-provision.
+    wait_timeout = max(boot_timeout, 1500) if reset else boot_timeout
+    args = ["start", name, "--wait", "--timeout", str(wait_timeout), "--json"]
+    if mode:
+        args += ["--mode", mode]
+    if mem:
+        args += ["--mem", str(mem)]
+    log.append(
+        f"Starting account '{name}' headless (wait up to {wait_timeout}s"
+        + (", first boot provisions" if reset else "") + ")..."
+    )
+    try:
+        parsed_s, res_s, project_dir = _run_qemu(args, timeout=wait_timeout + 120)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    if res_s.get("error"):
+        return {"error": res_s["error"]}
+    if not (isinstance(parsed_s, dict) and parsed_s.get("ok", False)):
+        detail = (res_s.get("stdout") or res_s.get("stderr") or "").strip()[:800]
+        return {"error": f"omnidroid start did not succeed. Output:\n{detail}"}
+
+    serial = _qemu_serial_from(parsed_s)
+    log.append(
+        f"Started (pid={parsed_s.get('pid')}, adb_port={parsed_s.get('adb_port')}, "
+        f"vnc_port={parsed_s.get('vnc_port')}, serial={serial})."
+    )
+    booted = parsed_s.get("booted", True)
+    if not booted:
+        log.append(f"BOOT_TIMEOUT after {wait_timeout}s (start returned booted=false).")
+        return {"stdout": "\n".join(log)}
+
+    # Idempotent adb connect so the adb-based tools can reach the guest.
+    adb = _qemu_adb(project_dir)
+    if serial:
+        _run([adb, "connect", serial], timeout=10)
+    bridge = parsed_s.get("native_bridge_ok")
+    if bridge is False:
+        log.append("WARNING: libndk ARM bridge did NOT verify — arm64-only APKs may fail to run.")
+    log.append(f"BOOT_OK (serial={serial or 'unknown'})")
+    return {"stdout": "\n".join(log)}
 
 
 # --------------------------------------------------------------------------
@@ -192,6 +497,32 @@ def _resolve_serial(backend, device_name=None):
     instance's index across a recreate, so nothing about the serial is
     cached between calls)."""
     device_name = device_name or _default_device_name(backend)
+
+    if backend == "qemu":
+        err = _validate_session_id(device_name)
+        if err:
+            return None, {"error": err}
+        try:
+            parsed, res, project_dir = _run_qemu(["list", "--json"], timeout=30)
+        except RuntimeError as e:
+            return None, {"error": str(e)}
+        sess = _qemu_extract_session(parsed, device_name)
+        if sess is None:
+            return None, {"error": (
+                f"qemu account '{device_name}' not found. Call ensure_emulator_running first. "
+                f"(omnidroid list: {(res.get('stdout') or res.get('stderr') or '').strip()[:300]})"
+            )}
+        if not _qemu_is_running(sess):
+            return None, {"error": f"qemu account '{device_name}' is not running. Call ensure_emulator_running first."}
+        serial = _qemu_serial_from(sess)
+        if not serial:
+            return None, {"error": (
+                f"qemu account '{device_name}' has no adb endpoint yet — it may still be booting. "
+                "Re-run ensure_emulator_running (or wait for boot) and retry."
+            )}
+        adb = _qemu_adb(project_dir)
+        _run([adb, "connect", serial], timeout=10)
+        return adb, serial
 
     if backend == "ldplayer":
         try:
@@ -408,32 +739,40 @@ def _ensure_avd_running(device_name, system_image, device_profile, reset, boot_t
     name="ensure_emulator_running",
     description=(
         "Boots the project's Android emulator, running NATIVELY on this Windows machine (NOT inside "
-        "the Linux sandbox). Two backends: 'ldplayer' (DEFAULT — LDPlayer, which ships its own "
-        "ARM/ARM64 translation layer; use this for APKs with arm64-v8a native libraries, since a "
-        "stock x86_64 AVD system image often can't run those at all) or 'avd' (the Android Studio SDK "
-        "emulator.exe path). Creates the device once if it doesn't exist yet, and reuses that SAME "
-        "device on every later call — this never creates a second/duplicate virtual device. By "
-        "default (reset=true) it also resets it to a clean state before use — LDPlayer via a full "
-        "quit+recreate of the instance, the AVD backend via -wipe-data. Waits for the device to "
-        "finish booting before returning."
+        "the Linux sandbox). Three backends: 'qemu' (DEFAULT — the self-contained headless omnidroid "
+        "emulator service driven through the bundled qemu-manager.exe engine; needs NO separately "
+        "installed emulator, self-bootstraps a portable QEMU + its base image on first use, and models "
+        "each fresh test instance as a named ACCOUNT — an immutable base + disposable overlay/data), "
+        "'ldplayer' (LDPlayer via ldconsole.exe — good arm64-v8a translation, if you have it "
+        "installed), or 'avd' (the Android Studio SDK emulator.exe path). Creates the device/account "
+        "once if needed and reuses that SAME one on every later call — never a second/duplicate "
+        "device. By default (reset=true) it first brings the device to a clean state — qemu by "
+        "REMOVING the old account and CREATING a brand new one from the base, LDPlayer via "
+        "quit+recreate, AVD via -wipe-data. Waits for Android to finish booting before returning. "
+        "NOTE (qemu): a fresh account's first boot runs one-time provisioning + dexopt (~3–15 min); "
+        "pass reset=false to reuse an already-provisioned account (fast, ~35 s cold boot)."
     ),
     params_schema={
-        "backend": "string (optional, default 'ldplayer' — 'ldplayer' or 'avd')",
-        "device_name": "string (optional — the persistent device name; always reused, never duplicated. Defaults to 'omniagent_ld' for backend='ldplayer' or 'omniagent_avd' for backend='avd')",
+        "backend": "string (optional, default 'qemu' — 'qemu', 'ldplayer', or 'avd')",
+        "device_name": "string (optional — the persistent device/account name; always reused, never duplicated. For qemu this is the omnidroid account name, must match [A-Za-z0-9_-]+ (default 'omniagent'); defaults to 'omniagent_ld' for 'ldplayer' or 'omniagent_avd' for 'avd')",
         "system_image": "string (optional, AVD backend only, default 'system-images;android-33;google_apis;x86_64'; only used the first time an AVD is created)",
         "device_profile": "string (optional, AVD backend only, default 'pixel_5' — an avdmanager device profile name)",
-        "reset": "boolean (optional, default true — bring the device back to a clean state before use; set false to resume the existing running/saved instance as-is)",
-        "boot_timeout": "integer (optional, default 300 seconds)",
-        "headless": "boolean (optional, AVD backend only, default false — LDPlayer doesn't support a true headless launch via automation, but its window can be freely minimized without affecting screenshot capture either way)"
+        "reset": "boolean (optional, default true — bring the device back to a clean state before use; for qemu this removes+recreates the account (fresh instance, re-provisions on first boot). Set false to reuse the existing running/provisioned account/instance as-is (much faster on qemu).",
+        "boot_timeout": "integer (optional, default 300 seconds; on qemu a freshly-created account waits up to 1500 s to cover first-boot provisioning regardless of this value)",
+        "mode": "string (optional, qemu backend only, default 'playable' — RAM/CPU tier: 'playable' (4G/4c), 'hard' (3G/4c), or 'brutal' (2G/2c))",
+        "ram_mb": "integer (optional, qemu backend only — override guest RAM in MB, passed as --mem; overrides the mode's RAM. Engine defaults to the mode's tier if omitted)",
+        "cpus": "integer (optional — IGNORED on the qemu backend (vCPU count is set by 'mode'); accepted for backend compatibility only)",
+        "headless": "boolean (optional, AVD backend only, default false — the qemu backend is always headless (view it over VNC); LDPlayer's window can be freely minimized without affecting screenshot capture either way)"
     },
-    output="A log of what happened (device creation/reset if needed, the launch action, boot wait progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
-    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly — it always targets the same virtual device and (by default) resets it to a clean state each time rather than creating a new one. Prefer the default 'ldplayer' backend for APKs with arm64-v8a native code."
+    output="A log of what happened (account/device creation/reset if needed, the launch action, boot wait progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
+    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly — it always targets the same virtual device/account and (by default) resets it to a clean state each time rather than creating a new one. The default 'qemu' backend is self-contained (no Android Studio / LDPlayer install required)."
 )
 def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_image=_DEFAULT_SYSTEM_IMAGE,
-                             device_profile="pixel_5", reset=True, boot_timeout=300, headless=False):
+                             device_profile="pixel_5", reset=True, boot_timeout=300, headless=False,
+                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE):
     backend = (backend or _DEFAULT_BACKEND).strip().lower()
-    if backend not in ("ldplayer", "avd"):
-        return {"error": "backend must be 'ldplayer' or 'avd'."}
+    if backend not in ("qemu", "ldplayer", "avd"):
+        return {"error": "backend must be 'qemu', 'ldplayer', or 'avd'."}
     device_name = device_name or _default_device_name(backend)
     reset = _truthy(reset)
     try:
@@ -441,6 +780,11 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     except (TypeError, ValueError):
         boot_timeout = 300
 
+    if backend == "qemu":
+        mode = (mode or _DEFAULT_QEMU_MODE).strip().lower()
+        if mode not in ("playable", "hard", "brutal"):
+            return {"error": "mode must be 'playable', 'hard', or 'brutal'."}
+        return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb)
     if backend == "ldplayer":
         return _ensure_ldplayer_running(device_name, reset, boot_timeout)
     return _ensure_avd_running(device_name, system_image, device_profile, reset, boot_timeout, _truthy(headless))
@@ -457,7 +801,7 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     ),
     params_schema={
         "command": "string (the command to run after 'adb shell', e.g. 'input keyevent 4' or 'pm list packages -3')",
-        "backend": "string (optional, default 'ldplayer' — must match whichever backend ensure_emulator_running booted)",
+        "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)",
         "timeout_seconds": "integer (optional, default 30, max 180)"
     },
@@ -478,27 +822,56 @@ def adb_shell(command, backend=_DEFAULT_BACKEND, device_name=None, timeout_secon
 
 @registry.register(
     name="install_apk_on_emulator",
-    description="Installs an APK onto the running emulator via 'adb install'. Replaces an existing install of the same package by default, and grants all runtime permissions automatically so the app doesn't get stuck on a permission dialog during an unattended test.",
+    description=(
+        "Installs an APK onto the running emulator. On the default 'qemu' (omnidroid) backend this "
+        "goes through the service ('omni install <account> <apk>'), which installs the APK AND sets it "
+        "as the locked kiosk's launch target so it actually starts under Lock Task Mode — the kiosk "
+        "launches it the moment the install completes (so a separate launch step is usually not "
+        "needed). On 'ldplayer'/'avd' it uses plain 'adb install': replaces an existing install of the "
+        "same package by default and grants all runtime permissions automatically so the app doesn't "
+        "get stuck on a permission dialog during an unattended test."
+    ),
     params_schema={
         "apk_path": "string (path to the .apk, relative to /workspace, e.g. 'modified.apk')",
-        "backend": "string (optional, default 'ldplayer' — must match whichever backend ensure_emulator_running booted)",
+        "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)",
-        "replace": "boolean (optional, default true — adds -r to allow reinstalling over an existing install)",
-        "grant_permissions": "boolean (optional, default true — adds -g to auto-grant all runtime permissions)"
+        "replace": "boolean (optional, default true — adb backends only: adds -r to allow reinstalling over an existing install)",
+        "grant_permissions": "boolean (optional, default true — adb backends only: adds -g to auto-grant all runtime permissions; on qemu the device-owner kiosk handles permissions)"
     },
-    output="adb install's output — 'Success' on success, or the specific INSTALL_FAILED_* error (e.g. INSTALL_FAILED_NO_MATCHING_ABIS if the APK's native libraries don't match the emulator's supported architectures — try backend='ldplayer' if you're on 'avd' and hitting this with an arm64-v8a APK).",
+    output="On qemu: the service's install output (ending in the kiosk launching the app). On adb backends: adb install's output — 'Success', or the specific INSTALL_FAILED_* error (e.g. INSTALL_FAILED_NO_MATCHING_ABIS if the APK's native libraries don't match the emulator's supported architectures — the qemu base ships libndk ARM translation and handles arm64-v8a; on 'avd' try backend='qemu' or 'ldplayer' for arm64-only APKs).",
     when_to_use="Call this after ensure_emulator_running, before launch_app_on_emulator, any time you have a newly built/signed APK to test."
 )
 def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None, replace=True, grant_permissions=True):
-    adb, serial_or_err = _resolve_serial(backend, device_name)
-    if adb is None:
-        return serial_or_err
+    backend = (backend or _DEFAULT_BACKEND).strip().lower()
     try:
         host_apk_path = resolve_workspace_path(apk_path)
     except RuntimeError as e:
         return {"error": str(e)}
     if not os.path.isfile(host_apk_path):
         return {"error": f"APK not found at resolved path: {host_apk_path}"}
+
+    if backend == "qemu":
+        # Route through the service so it records the APK, sets it as the kiosk's
+        # launch target, and launches it under Lock Task Mode. `omni install` is
+        # plain-text (no --json) and handles reinstall itself.
+        name = device_name or _default_device_name("qemu")
+        err = _validate_session_id(name)
+        if err:
+            return {"error": err}
+        try:
+            _parsed, res, _pd = _run_qemu(["install", name, host_apk_path], timeout=180)
+        except RuntimeError as e:
+            return {"error": str(e)}
+        if res.get("error"):
+            return {"error": res["error"]}
+        out = (res.get("stdout") or res.get("stderr") or "").strip()
+        if res.get("returncode", 0) != 0:
+            return {"error": f"omnidroid install failed (exit {res.get('returncode')}):\n{out[:800]}"}
+        return {"stdout": out or "Installed via omnidroid; kiosk launching the app."}
+
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
     args = [adb, "-s", serial_or_err, "install"]
     if _truthy(replace):
         args.append("-r")
@@ -510,17 +883,42 @@ def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None
 
 @registry.register(
     name="launch_app_on_emulator",
-    description="Launches an installed app on the emulator. Without an activity, uses 'monkey' to fire the app's default launcher intent (works without knowing the exact activity name); with an activity, starts that exact component via 'am start'.",
+    description=(
+        "Launches an installed app on the emulator. On the default 'qemu' (omnidroid) backend it uses "
+        "the service ('omni run-app <account> <package>'), which launches the package as the locked "
+        "kiosk allows — note install_apk_on_emulator already auto-launches the freshly installed APK on "
+        "qemu, so this is mainly to re-launch it. On 'ldplayer'/'avd', without an activity it uses "
+        "'monkey' to fire the app's default launcher intent (works without knowing the exact activity "
+        "name); with an activity, it starts that exact component via 'am start'. The 'activity' "
+        "argument is only honored on the adb backends."
+    ),
     params_schema={
         "package_name": "string (the app's package name, e.g. 'com.example.app' — find it with search_smali/grep_file on AndroidManifest.xml, or 'adb_shell pm list packages' after installing)",
-        "activity": "string (optional, fully-qualified activity class, e.g. '.MainActivity' or 'com.example.app.MainActivity' — omit to just launch the default launcher activity)",
-        "backend": "string (optional, default 'ldplayer' — must match whichever backend ensure_emulator_running booted)",
+        "activity": "string (optional, adb backends only, fully-qualified activity class, e.g. '.MainActivity' — omit to just launch the default launcher activity; ignored on qemu)",
+        "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)"
     },
-    output="adb's launch output — for the monkey path, a short log ending in the injected launch event; for am start, the ComponentInfo/status of the started activity, or an error if the package/activity doesn't exist or isn't exported.",
+    output="adb's launch output — for the monkey path, a short log ending in the injected launch event; for am start, the ComponentInfo/status of the started activity, or an error if the package/activity doesn't exist or isn't exported. On qemu: the service's run-app output.",
     when_to_use="Call this after install_apk_on_emulator, right before record_and_capture_keyframes so the capture window covers the app's actual startup."
 )
 def launch_app_on_emulator(package_name, activity=None, backend=_DEFAULT_BACKEND, device_name=None):
+    backend = (backend or _DEFAULT_BACKEND).strip().lower()
+    if backend == "qemu":
+        name = device_name or _default_device_name("qemu")
+        err = _validate_session_id(name)
+        if err:
+            return {"error": err}
+        try:
+            _parsed, res, _pd = _run_qemu(["run-app", name, package_name], timeout=60)
+        except RuntimeError as e:
+            return {"error": str(e)}
+        if res.get("error"):
+            return {"error": res["error"]}
+        out = (res.get("stdout") or res.get("stderr") or "").strip()
+        if res.get("returncode", 0) != 0:
+            return {"error": f"omnidroid run-app failed (exit {res.get('returncode')}):\n{out[:800]}"}
+        return {"stdout": out or f"Requested launch of {package_name} via omnidroid."}
+
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -544,7 +942,7 @@ def launch_app_on_emulator(package_name, activity=None, backend=_DEFAULT_BACKEND
         "max_lines": "integer (optional, default 300 — the LAST N matching lines are returned)",
         "clear_first": "boolean (optional, default false — if true, clears the buffer and returns immediately instead of dumping)",
         "priority": "string (optional, e.g. 'E' for error-and-above, 'W' for warning-and-above — passed as adb logcat's '*:PRIORITY' filter)",
-        "backend": "string (optional, default 'ldplayer' — must match whichever backend ensure_emulator_running booted)",
+        "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)"
     },
     output="The requested logcat lines (most recent last), or a confirmation message if clear_first was used.",
@@ -589,7 +987,7 @@ def get_logcat(filter_pattern=None, max_lines=300, clear_first=False, priority=N
     ),
     params_schema={
         "label": "string (optional, a short label prefixed to the saved filename, e.g. 'after_login_tap')",
-        "backend": "string (optional, default 'ldplayer' — must match whichever backend ensure_emulator_running booted)",
+        "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)"
     },
     output="The saved file's /workspace-relative path and size in bytes.",
@@ -641,7 +1039,7 @@ def take_emulator_screenshot(label=None, backend=_DEFAULT_BACKEND, device_name=N
         "black_threshold": "number (optional, default 10 — a frame with average brightness below this is flagged black_screen even if the raw diff was modest)",
         "sample_scale_w": "integer (optional, default 160 — frames are downscaled to this width before diffing, for speed; this does not affect the resolution of the SAVED keyframe PNGs, which are always full-resolution)",
         "capture_logcat": "boolean (optional, default true — clear logcat before starting and dump it to logcat.txt in the session folder when done)",
-        "backend": "string (optional, default 'ldplayer' — must match whichever backend ensure_emulator_running booted)",
+        "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)"
     },
     output="A summary: how many raw samples were taken, how many keyframes were kept, and for each keyframe its index, timestamp, diff score, and whether it was flagged as a black screen. The actual images are NOT returned here (they're saved to disk) — use analyze_keyframes to get a description of each one.",
@@ -717,12 +1115,16 @@ def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt
         return {"error": str(e)}
     if not os.path.isdir(session_dir):
         return {"error": f"No session directory found at {session_dir} — run record_and_capture_keyframes first."}
+    # Route the "api" vision backend through whatever OpenAI-compatible provider
+    # the user has configured in LLM Settings (falls back to the legacy Cline
+    # endpoint when the active provider isn't OpenAI-compatible, e.g. Claude).
+    _vis = get_openai_endpoint_config()
     cfg = {
         "backend": backend,
         "prompt": prompt,
-        "cline_api_url": CLINE_API_URL,
-        "cline_api_key": API_KEY,
-        "cline_model": MODEL_NAME,
+        "cline_api_url": _vis["url"],
+        "cline_api_key": _vis["key"],
+        "cline_model": _vis["model"],
         "ollama_url": "http://localhost:11434",
         "ollama_model": ollama_model,
     }
@@ -812,16 +1214,19 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
         "and tell me how it performs' in a single call; use the individual tools instead when you "
         "need finer control (e.g. re-running analyze_keyframes with a different vision backend, or "
         "driving the app interactively with adb_shell between capture windows). Defaults to the "
-        "'ldplayer' emulator backend (better arm64-v8a native library support on an x86_64 host)."
+        "self-contained 'qemu' emulator backend (no Android Studio / LDPlayer install required)."
     ),
     params_schema={
         "apk_path": "string (path to the .apk to test, relative to /workspace)",
         "package_name": "string (the app's package name, needed to launch it and label the report)",
         "activity": "string (optional, specific activity to launch; omit to use the default launcher activity)",
-        "backend": "string (optional, default 'ldplayer' — 'ldplayer' or 'avd', see ensure_emulator_running)",
-        "device_name": "string (optional — the persistent, reused device name; defaults per backend)",
+        "backend": "string (optional, default 'qemu' — 'qemu', 'ldplayer', or 'avd', see ensure_emulator_running)",
+        "device_name": "string (optional — the persistent, reused device/account name; defaults per backend)",
         "system_image": "string (optional, AVD backend only, default 'system-images;android-33;google_apis;x86_64'; only used the first time this AVD is created)",
         "device_profile": "string (optional, AVD backend only, default 'pixel_5')",
+        "mode": "string (optional, qemu backend only, default 'playable' — RAM/CPU tier: 'playable'/'hard'/'brutal')",
+        "ram_mb": "integer (optional, qemu backend only — override guest RAM in MB (--mem); defaults to the mode's tier)",
+        "cpus": "integer (optional — IGNORED on qemu (vCPUs come from 'mode'); accepted for backend compatibility)",
         "duration_seconds": "number (optional, default 20 — how long to watch the screen after launch)",
         "vision_backend": "string (optional, default 'auto' — 'auto', 'api', or 'ollama', see analyze_keyframes)",
         "ollama_model": "string (optional, default 'llava')",
@@ -834,11 +1239,15 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
 def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT_BACKEND, device_name=None,
                           system_image=_DEFAULT_SYSTEM_IMAGE, device_profile="pixel_5",
                           duration_seconds=20, vision_backend="auto", ollama_model="llava",
-                          reset=True, boot_timeout=300):
+                          reset=True, boot_timeout=300, ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE):
     session_name = f"{package_name.replace('.', '_')}_{int(time.time())}"
     log = []
 
-    boot_res = ensure_emulator_running(backend, device_name, system_image, device_profile, reset, boot_timeout)
+    boot_res = ensure_emulator_running(
+        backend=backend, device_name=device_name, system_image=system_image,
+        device_profile=device_profile, reset=reset, boot_timeout=boot_timeout,
+        ram_mb=ram_mb, cpus=cpus, mode=mode,
+    )
     log.append("[ensure_emulator_running]\n" + (boot_res.get("stdout") or boot_res.get("error") or ""))
     if "BOOT_OK" not in (boot_res.get("stdout") or ""):
         return {"stdout": "Emulator failed to boot -- aborting test session.\n\n" + "\n\n".join(log)[:4000]}
@@ -862,3 +1271,66 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     report_path = f"/workspace/test_reports/{session_name}.md"
     summary = f"Test session '{session_name}' complete.\nReport: {report_path}\n\n" + "\n\n".join(log)
     return {"stdout": summary[:6000] + f"\n\n[Read the full report with read_file_chunk on {report_path}]"}
+
+
+@registry.register(
+    name="stop_emulator",
+    description=(
+        "Stops the running emulator/account. For the default 'qemu' (omnidroid) backend this powers the "
+        "instance OFF via the service ('omni stop': in-guest shutdown -> QMP quit -> hard kill), and "
+        "with purge=true instead REMOVES the account entirely (deletes its overlay + /data + state so "
+        "the next ensure_emulator_running builds a completely fresh, re-provisioned instance). For "
+        "'ldplayer' it quits the instance via ldconsole; for 'avd' it sends 'adb emu kill'. qemu VMs "
+        "run DETACHED and survive the agent process exiting, so call this when you're done testing to "
+        "free RAM/CPU."
+    ),
+    params_schema={
+        "backend": "string (optional, default 'qemu' — must match whichever backend you booted)",
+        "device_name": "string (optional — must match the device_name/account name you booted, if overridden)",
+        "purge": "boolean (optional, default false — qemu backend only: instead of just powering off, REMOVE the account (DESTRUCTIVE: deletes its /data + state)"
+    },
+    output="The service's stop/remove output (or the ldconsole/adb output for the other backends). Stopping something that isn't running is not an error.",
+    when_to_use="Call when finished testing to release the emulator, or before a fresh run if you want an explicit teardown. Not required between run_apk_test_session calls — reset=true already builds a fresh account each time."
+)
+def stop_emulator(backend=_DEFAULT_BACKEND, device_name=None, purge=False):
+    backend = (backend or _DEFAULT_BACKEND).strip().lower()
+    if backend not in ("qemu", "ldplayer", "avd"):
+        return {"error": "backend must be 'qemu', 'ldplayer', or 'avd'."}
+    device_name = device_name or _default_device_name(backend)
+
+    if backend == "qemu":
+        err = _validate_session_id(device_name)
+        if err:
+            return {"error": err}
+        # purge -> remove the whole account; otherwise just power it off.
+        args = ["remove", device_name, "--json"] if _truthy(purge) else ["stop", device_name, "--json"]
+        try:
+            parsed, res, _pd = _run_qemu(args, timeout=180)
+        except RuntimeError as e:
+            return {"error": str(e)}
+        if res.get("error"):
+            return {"error": res["error"]}
+        out = (res.get("stdout") or res.get("stderr") or "").strip()
+        if isinstance(parsed, dict) and not parsed.get("ok", True):
+            detail = parsed.get("error") or out
+            # An account that doesn't exist is already "stopped"/"removed" as far
+            # as a teardown call is concerned — treat it as a benign no-op.
+            if "no such account" in detail.lower():
+                return {"stdout": f"Account '{device_name}' does not exist (nothing to {args[0]})."}
+            return {"error": f"omnidroid {args[0]} failed: {detail[:500]}"}
+        return {"stdout": out or ("Removed." if _truthy(purge) else "Stopped.")}
+
+    if backend == "ldplayer":
+        try:
+            ld = find_ldplayer_tools()
+        except RuntimeError as e:
+            return {"error": str(e)}
+        res = _run([ld["ldconsole"], "quit", "--name", device_name], timeout=30)
+        return {"stdout": f"Requested LDPlayer quit for '{device_name}'. ldconsole: {res.get('stdout') or res.get('error') or 'ok'}"}
+
+    # backend == "avd"
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    res = _run([adb, "-s", serial_or_err, "emu", "kill"], timeout=15)
+    return {"stdout": f"Sent 'emu kill' to {serial_or_err}. adb: {res.get('stdout') or res.get('error') or 'ok'}"}

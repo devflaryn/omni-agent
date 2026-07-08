@@ -2,16 +2,22 @@
 
 Fast, targeted inspection of ELF binaries (.so libraries) without forcing a
 full-binary analysis that would hang on 100MB+ stripped shared libraries.
-Includes: objdump, radare2, readelf, rabin2, nm, strings, targeted
-disassembly, Ghidra headless decompilation, and a directory mapper.
+Includes: strings, rabin2, nm, objdump, readelf, targeted radare2, targeted
+range disassembly, and Ghidra headless decompilation to C pseudocode.
 
 Reorganized out of the original ``reverse_engineering.py`` so all binary
 inspection tooling lives in one focused, readable module.
 """
+import base64
+import hashlib
+import os
 
 from tool_registry import registry
 from tools.common import normalize_path, build_paginated_command, append_page_hint
 from docker_sandbox import run_cmd
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_GHIDRA_SCRIPT_PATH = os.path.join(_HERE, "_ghidra_decompile.py")
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +201,92 @@ def disassemble_range(binary_path, start_address, stop_address):
         f"/workspace/{binary_path}"
     )
     return run_cmd(cmd, timeout=120)
+
+
+# ---------------------------------------------------------------------------
+# Ghidra headless decompilation (raw asm -> readable C pseudocode)
+# ---------------------------------------------------------------------------
+
+@registry.register(
+    name="ghidra_decompile",
+    description=(
+        "Decompiles native function(s) in a .so to C-like pseudocode using Ghidra's headless analyzer. "
+        "This is the single most useful tool for UNDERSTANDING obfuscated or crypto-shaped native code — "
+        "loops with XOR/shift/table lookups, multi-branch checks, string decryptors — that are painful to "
+        "follow in raw disassembly. "
+        "Pass function_name as a case-insensitive substring of the symbol to decompile (e.g. 'checkLicense', "
+        "'JNI_OnLoad', 'Java_com_example'); matching functions are returned as C. "
+        "Leave function_name empty to instead LIST every function name in the binary so you can pick one "
+        "(useful when the target isn't obvious). "
+        "IMPORTANT: the FIRST call on a given binary is slow (2-5 min) while Ghidra builds and caches its "
+        "analysis database under /workspace/.ghidra_proj; later calls on the same .so reuse that cache and "
+        "are fast. Raise timeout_seconds for very large libraries."
+    ),
+    params_schema={
+        "binary_path": "string (path to the .so file, relative to /workspace, e.g. 'lib/arm64-v8a/libfoo.so')",
+        "function_name": "string (optional, case-insensitive substring of the function/symbol name to decompile; empty = list all function names instead)",
+        "max_functions": "integer (optional, max matching functions to decompile in one call, default 5)",
+        "timeout_seconds": "integer (optional, default 360; raise for large binaries whose first-time analysis is slow)"
+    },
+    output="C pseudocode for each matching function, each prefixed with '// ==== <name> @ <address> ===='. If function_name is empty, a list of function names instead. Ghidra's own analysis logging is stripped out; only the decompiled payload is returned. If nothing matches, a hint tells you to list names or use rabin2_info.",
+    when_to_use="Use this when disassembly (disassemble_range/radare2_cmd) is too hard to follow and you need to understand what a native function actually DOES — reverse-engineering an obfuscated check, a string-decryption routine, or complex branch logic. For simple symbol/string listing, rabin2_info/extract_strings are faster; reach for Ghidra when you need to read the logic."
+)
+def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_seconds=360):
+    binary_path = normalize_path(binary_path)
+    try:
+        timeout_seconds = max(60, min(int(timeout_seconds), 1800))
+    except (TypeError, ValueError):
+        timeout_seconds = 360
+    try:
+        max_functions = max(1, min(int(max_functions), 25))
+    except (TypeError, ValueError):
+        max_functions = 5
+
+    target = (function_name or "").strip()
+
+    # Ship the Ghidra Jython post-script into the sandbox (base64, same trick
+    # write_file / the code-graph scripts use to dodge shell-escaping issues).
+    try:
+        with open(_GHIDRA_SCRIPT_PATH, encoding="utf-8") as fh:
+            script = fh.read()
+    except OSError as e:
+        return {"error": f"Could not read the bundled Ghidra script: {e}"}
+    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+
+    # One cached Ghidra project per binary so re-analysis only happens once.
+    proj_dir = "/workspace/.ghidra_proj"
+    proj_name = "gp_" + hashlib.md5(binary_path.encode("utf-8")).hexdigest()[:12]
+    b64_target = base64.b64encode(target.encode("utf-8")).decode("ascii")
+
+    # -import on the first run (analyze + cache); -process -noanalysis on later
+    # runs to reuse the cached analysis database and stay fast.
+    cmd = (
+        f"set -e; mkdir -p {proj_dir}; "
+        f"echo '{b64_script}' | base64 -d > /tmp/_ghidra_decompile.py; "
+        f"TARGET=$(echo '{b64_target}' | base64 -d); "
+        f"if [ -f {proj_dir}/{proj_name}.gpr ]; then "
+        f"  MODE=\"-process $(basename /workspace/{binary_path}) -noanalysis\"; "
+        f"else "
+        f"  MODE=\"-import /workspace/{binary_path}\"; "
+        f"fi; "
+        f"/opt/ghidra/support/analyzeHeadless {proj_dir} {proj_name} $MODE "
+        f"-scriptPath /tmp -postScript _ghidra_decompile.py \"$TARGET\" \"{max_functions}\" 2>&1"
+    )
+    res = run_cmd(cmd, timeout=timeout_seconds)
+    out = res.get("stdout", "") or ""
+
+    # Strip Ghidra's verbose logging: keep only our marked payload.
+    if "GHIDRA_DECOMPILE_BEGIN" in out and "GHIDRA_DECOMPILE_END" in out:
+        core = out.split("GHIDRA_DECOMPILE_BEGIN", 1)[1].split("GHIDRA_DECOMPILE_END", 1)[0].strip()
+        return {"stdout": core}
+
+    # No markers => Ghidra failed before the script ran (bad path, OOM, timeout).
+    if res.get("error"):
+        return res
+    detail = (out or res.get("stderr", "")).strip()
+    return {"error": (
+        "Ghidra did not produce decompiler output. This usually means the binary path is wrong, "
+        "the .so isn't a valid ELF, or analysis ran out of time/memory. "
+        "Raise timeout_seconds and confirm the path with inspect_apk/list_directory.\n\n"
+        f"Ghidra output (tail):\n{detail[-1500:]}"
+    )}

@@ -2,7 +2,7 @@
 """Code knowledge-graph query engine (runs INSIDE the Docker sandbox).
 
 Usage:
-    python3 _kg_query.py <query_type> [name] [limit]
+    python3 _kg_query.py <query_type> [name] [limit] [graph_id] [graph_id_b]
 
 query_type:
     stats          - graph summary + biggest classes
@@ -15,18 +15,36 @@ query_type:
     hierarchy      - superclass chain + direct subclasses + interfaces
     so_symbols     - exported/imported symbols of native .so libs
     graph_data     - returns nodes/edges/legend JSON for visualization
+    graphs         - list every built graph namespace (id, root, counts, built_at)
+    diff           - compare two graphs (graph_id vs graph_id_b): classes/methods
+                     added/removed/changed + string-literal and native-symbol deltas
 
-Reads from the chunked graph files in /workspace/.codegraph/ (meta.json,
-manifest.json, classes_*.json, callers.json, subclasses.json,
-string_refs_*.json, so_symbols.json) — never loads the whole graph at once.
+NAMED GRAPHS
+------------
+Graphs live in per-namespace subdirs /workspace/.codegraph/<graph_id>/ so several
+can coexist (e.g. two app versions). If <graph_id> is omitted, the most recently
+built graph is used. A legacy flat graph at /workspace/.codegraph/ (built before
+namespacing) is still read as graph_id '(default)'.
+
+Reads only the chunked shards it needs — never the whole graph at once.
 """
 import sys
 import os
 import json
 
-GRAPH_DIR = "/workspace/.codegraph"
-META_PATH = os.path.join(GRAPH_DIR, "meta.json")
-MANIFEST_PATH = os.path.join(GRAPH_DIR, "manifest.json")
+WORKSPACE = os.environ.get("CODEGRAPH_WORKSPACE", "/workspace")
+GRAPH_ROOT = os.path.join(WORKSPACE, ".codegraph")
+GRAPH_INDEX_PATH = os.path.join(GRAPH_ROOT, "graphs.json")
+
+
+def _sanitize_graph_id(gid):
+    """Mirror the indexer's slug rule so a requested id maps to the same dir."""
+    import re
+    gid = (gid or "").strip().replace("\\", "/")
+    gid = gid.split("/")[-1]
+    gid = re.sub(r"[^A-Za-z0-9._-]+", "_", gid)
+    gid = gid.strip("._-")
+    return gid[:64] or "default"
 
 
 def _load_json(path):
@@ -37,29 +55,55 @@ def _load_json(path):
         return None
 
 
-def _load_manifest():
-    return _load_json(MANIFEST_PATH)
+def _load_index():
+    idx = _load_json(GRAPH_INDEX_PATH)
+    return idx if isinstance(idx, dict) else {}
 
 
-def _load_meta():
-    return _load_json(META_PATH)
+def _resolve_graph_dir(requested, idx):
+    """Return (graph_id, graph_dir) for a requested id (or the most recent graph
+    when none is given). Falls back to a legacy flat graph at the root. Returns
+    (id, None) when the requested/most-recent graph has no manifest."""
+    if requested:
+        gid = _sanitize_graph_id(requested)
+        gdir = os.path.join(GRAPH_ROOT, gid)
+        if os.path.isfile(os.path.join(gdir, "manifest.json")):
+            return gid, gdir
+        return gid, None
+    if idx:
+        gid = max(idx, key=lambda k: idx[k].get("built_at_ts", 0))
+        gdir = os.path.join(GRAPH_ROOT, gid)
+        if os.path.isfile(os.path.join(gdir, "manifest.json")):
+            return gid, gdir
+    # Legacy flat layout (built before namespacing).
+    if os.path.isfile(os.path.join(GRAPH_ROOT, "manifest.json")):
+        return "(default)", GRAPH_ROOT
+    return "", None
 
 
-def _load_all_classes(manifest):
+def _load_manifest(graph_dir):
+    return _load_json(os.path.join(graph_dir, "manifest.json"))
+
+
+def _load_meta(graph_dir):
+    return _load_json(os.path.join(graph_dir, "meta.json")) or {}
+
+
+def _load_all_classes(graph_dir, manifest):
     """Load and merge all class shards into one dict."""
     classes = {}
     for shard_name in manifest.get("class_shards", []):
-        shard = _load_json(os.path.join(GRAPH_DIR, shard_name))
+        shard = _load_json(os.path.join(graph_dir, shard_name))
         if isinstance(shard, dict):
             classes.update(shard)
     return classes
 
 
-def _load_all_string_refs(manifest):
+def _load_all_string_refs(graph_dir, manifest):
     """Load and merge all string_ref shards into one list."""
     refs = []
     for shard_name in manifest.get("string_ref_shards", []):
-        shard = _load_json(os.path.join(GRAPH_DIR, shard_name))
+        shard = _load_json(os.path.join(graph_dir, shard_name))
         if isinstance(shard, list):
             refs.extend(shard)
     return refs
@@ -86,10 +130,8 @@ _PALETTE = [
 ]
 
 
-def _build_graph_data(manifest, classes, callers, max_nodes=600):
+def _build_graph_data(meta, classes, callers, max_nodes=600):
     """Build vis-network-ready nodes/edges/legend for visualization."""
-    meta = _load_meta() or {}
-
     # Determine communities by top-level package (first segment after L)
     pkg_groups = {}
     for cname in classes:
@@ -200,6 +242,156 @@ def _build_graph_data(manifest, classes, callers, max_nodes=600):
     }
 
 
+def _method_signature(mi):
+    """A change-detection fingerprint for a method: its ordered call targets +
+    string literals. Two versions of a method with the same fingerprint are
+    treated as unchanged even if line numbers shifted."""
+    return (tuple(mi.get("calls", [])), tuple(mi.get("strings", [])))
+
+
+def _cmd_diff(id_a, id_b, limit, idx, out):
+    """Compare two graphs and describe what changed. Leads with class/method
+    structure, then string-literal and native-symbol deltas (which survive
+    obfuscation better than class names — important for renamed/minified apps)."""
+    if not id_a or not id_b:
+        out.append("diff needs two graph ids: pass graph_id (A) and graph_id_b (B).")
+        out.append("Available graphs: %s" % (", ".join(sorted(idx.keys())) or "(none — build_code_graph first)"))
+        return
+    gid_a, dir_a = _resolve_graph_dir(id_a, idx)
+    gid_b, dir_b = _resolve_graph_dir(id_b, idx)
+    if dir_a is None or dir_b is None:
+        missing = []
+        if dir_a is None:
+            missing.append(gid_a)
+        if dir_b is None:
+            missing.append(gid_b)
+        out.append("No graph found for: %s" % ", ".join(missing))
+        out.append("Available graphs: %s" % (", ".join(sorted(idx.keys())) or "(none)"))
+        return
+
+    man_a, man_b = _load_manifest(dir_a), _load_manifest(dir_b)
+    meta_a, meta_b = _load_meta(dir_a), _load_meta(dir_b)
+    classes_a = _load_all_classes(dir_a, man_a)
+    classes_b = _load_all_classes(dir_b, man_b)
+
+    set_a, set_b = set(classes_a), set(classes_b)
+    added = sorted(set_b - set_a)
+    removed = sorted(set_a - set_b)
+    common = set_a & set_b
+
+    changed = []  # (class, +methods, -methods, changed_bodies)
+    for c in common:
+        ma = classes_a[c].get("methods", {})
+        mb = classes_b[c].get("methods", {})
+        na, nb = set(ma), set(mb)
+        m_added = nb - na
+        m_removed = na - nb
+        body_changed = 0
+        for m in (na & nb):
+            if _method_signature(ma[m]) != _method_signature(mb[m]):
+                body_changed += 1
+        if m_added or m_removed or body_changed:
+            changed.append((c, len(m_added), len(m_removed), body_changed))
+    changed.sort(key=lambda t: (t[1] + t[2] + t[3]), reverse=True)
+
+    # String-literal delta (stable across obfuscation).
+    str_a = set(r.get("string", "") for r in _load_all_string_refs(dir_a, man_a))
+    str_b = set(r.get("string", "") for r in _load_all_string_refs(dir_b, man_b))
+    str_added = sorted(str_b - str_a)
+    str_removed = sorted(str_a - str_b)
+
+    # Native symbol delta, per shared .so (matched by path).
+    so_a = _load_json(os.path.join(dir_a, "so_symbols.json")) or {}
+    so_b = _load_json(os.path.join(dir_b, "so_symbols.json")) or {}
+    so_libs_added = sorted(set(so_b) - set(so_a))
+    so_libs_removed = sorted(set(so_a) - set(so_b))
+    so_export_changes = []  # (lib, +exports, -exports)
+    for lib in sorted(set(so_a) & set(so_b)):
+        ea, eb = set(so_a[lib].get("exports", [])), set(so_b[lib].get("exports", []))
+        add_e, rem_e = eb - ea, ea - eb
+        if add_e or rem_e:
+            so_export_changes.append((lib, sorted(add_e), sorted(rem_e)))
+
+    # --- Report --------------------------------------------------------------
+    out.append("Diff  A='%s' (%s)  ->  B='%s' (%s)"
+               % (gid_a, meta_a.get("root", "?"), gid_b, meta_b.get("root", "?")))
+    out.append("  A: classes=%s methods=%s string_refs=%s so_files=%s"
+               % (meta_a.get("classes", len(classes_a)), meta_a.get("methods", 0),
+                  meta_a.get("string_refs", 0), meta_a.get("so_files", 0)))
+    out.append("  B: classes=%s methods=%s string_refs=%s so_files=%s"
+               % (meta_b.get("classes", len(classes_b)), meta_b.get("methods", 0),
+                  meta_b.get("string_refs", 0), meta_b.get("so_files", 0)))
+    out.append("")
+    out.append("CLASSES: +%d added  -%d removed  ~%d changed  (=%d common)"
+               % (len(added), len(removed), len(changed), len(common)))
+
+    # Heavy obfuscation heuristic: if almost every class is add+remove, names were
+    # renamed between builds — steer the reader toward the stable signals.
+    if common and (len(added) + len(removed)) > 4 * len(common):
+        out.append("  (note: class names differ heavily between builds — likely re-obfuscated. "
+                   "Rely on the STRING and NATIVE SYMBOL deltas below, which survive renaming.)")
+    elif not common and (added or removed):
+        # No shared descriptors at all. For smali this means a full rename; for
+        # general source it usually means the two graphs were built from DIFFERENT
+        # root directories (so paths, and thus descriptors, don't line up). Either
+        # way the STRING / NATIVE deltas below are the reliable comparison.
+        out.append("  (note: the two graphs share NO class descriptors. If these are general-source "
+                   "graphs built from different root dirs, that's expected — descriptors are path-based. "
+                   "Compare using the STRING and NATIVE SYMBOL deltas below, which are path-independent.)")
+
+    for label, items in (("added classes", added), ("removed classes", removed)):
+        if items:
+            out.append("  %s (showing up to %d):" % (label, limit))
+            for c in items[:limit]:
+                src = classes_b.get(c) or classes_a.get(c) or {}
+                out.append("    %s  (%s)" % (c, src.get("file", "")))
+            if len(items) > limit:
+                out.append("    ... %d more." % (len(items) - limit))
+    if changed:
+        out.append("  changed classes (showing up to %d, most-changed first):" % limit)
+        for c, ap, rp, bc in changed[:limit]:
+            out.append("    %s  (+%d/-%d methods, ~%d bodies)  (%s)"
+                       % (c, ap, rp, bc, classes_b.get(c, {}).get("file", "")))
+        if len(changed) > limit:
+            out.append("    ... %d more changed classes." % (len(changed) - limit))
+
+    out.append("")
+    out.append("STRING LITERALS: +%d added  -%d removed" % (len(str_added), len(str_removed)))
+    for label, items in (("added strings", str_added), ("removed strings", str_removed)):
+        if items:
+            out.append("  %s (showing up to %d):" % (label, limit))
+            for st in items[:limit]:
+                out.append('    "%s"' % (st[:80]))
+            if len(items) > limit:
+                out.append("    ... %d more." % (len(items) - limit))
+
+    out.append("")
+    out.append("NATIVE SYMBOLS: +%d libs added  -%d libs removed  ~%d libs with export changes"
+               % (len(so_libs_added), len(so_libs_removed), len(so_export_changes)))
+    for label, items in (("added .so", so_libs_added), ("removed .so", so_libs_removed)):
+        if items:
+            out.append("  %s: %s" % (label, ", ".join(items[:limit])))
+    for lib, add_e, rem_e in so_export_changes[:limit]:
+        out.append("  %s: +%d/-%d exports" % (lib, len(add_e), len(rem_e)))
+        for s in add_e[:min(limit, 10)]:
+            out.append("      + %s" % s)
+        for s in rem_e[:min(limit, 10)]:
+            out.append("      - %s" % s)
+
+
+def _cmd_graphs(idx, out):
+    if not idx:
+        out.append("No graphs built yet. Run build_code_graph (its graph_id defaults to a slug of root_dir).")
+        return
+    out.append("Built graphs (%d):" % len(idx))
+    for gid in sorted(idx, key=lambda k: idx[k].get("built_at_ts", 0), reverse=True):
+        g = idx[gid]
+        out.append("  %-24s root=%s  classes=%s methods=%s string_refs=%s so_files=%s  built=%s"
+                   % (gid, g.get("root", "?"), g.get("classes", 0), g.get("methods", 0),
+                      g.get("string_refs", 0), g.get("so_files", 0), g.get("built_at", "?")))
+    out.append("Query one with graph_id=<id>; compare two with diff_code_graphs.")
+
+
 def main():
     qtype = sys.argv[1] if len(sys.argv) > 1 else "stats"
     name = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -207,32 +399,61 @@ def main():
         limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 40
     except Exception:
         limit = 40
+    req_id = sys.argv[4] if len(sys.argv) > 4 else ""
+    req_id_b = sys.argv[5] if len(sys.argv) > 5 else ""
 
-    manifest = _load_manifest()
-    if not manifest:
-        print("[code_graph] No graph manifest found at %s" % MANIFEST_PATH)
-        print("[code_graph] Run build_code_graph first.")
+    idx = _load_index()
+    out = []
+
+    # Whole-registry queries first (they don't target a single graph).
+    if qtype == "graphs":
+        _cmd_graphs(idx, out)
+        print("\n".join(out))
+        return
+    if qtype == "diff":
+        _cmd_diff(req_id, req_id_b, limit, idx, out)
+        print("\n".join(out))
+        return
+
+    # Resolve which single graph this query targets.
+    gid, graph_dir = _resolve_graph_dir(req_id, idx)
+    if graph_dir is None:
+        if req_id:
+            print("[code_graph] No graph named '%s'." % gid)
+        else:
+            print("[code_graph] No graph built yet.")
+        avail = ", ".join(sorted(idx.keys())) if idx else "(none)"
+        print("[code_graph] Available graphs: %s" % avail)
+        print("[code_graph] Run build_code_graph first, or pass a valid graph_id.")
         sys.exit(0)
 
-    meta = _load_meta() or {}
-    callers = _load_json(os.path.join(GRAPH_DIR, manifest.get("files", {}).get("callers", "callers.json"))) or {}
-    subclasses = _load_json(os.path.join(GRAPH_DIR, manifest.get("files", {}).get("subclasses", "subclasses.json"))) or {}
-    so_symbols = _load_json(os.path.join(GRAPH_DIR, manifest.get("files", {}).get("so_symbols", "so_symbols.json"))) or {}
-    out = []
+    manifest = _load_manifest(graph_dir)
+    if not manifest:
+        print("[code_graph] Graph '%s' has no manifest. Rebuild with build_code_graph." % gid)
+        sys.exit(0)
+
+    meta = _load_meta(graph_dir)
+    callers = _load_json(os.path.join(graph_dir, manifest.get("files", {}).get("callers", "callers.json"))) or {}
+    subclasses = _load_json(os.path.join(graph_dir, manifest.get("files", {}).get("subclasses", "subclasses.json"))) or {}
+    so_symbols = _load_json(os.path.join(graph_dir, manifest.get("files", {}).get("so_symbols", "so_symbols.json"))) or {}
 
     # graph_data is a special query that returns compact JSON for visualization
     if qtype == "graph_data":
-        classes = _load_all_classes(manifest)
-        data = _build_graph_data(manifest, classes, callers, max_nodes=limit * 10 if limit > 40 else 600)
+        classes = _load_all_classes(graph_dir, manifest)
+        data = _build_graph_data(meta, classes, callers, max_nodes=limit * 10 if limit > 40 else 600)
         print(json.dumps(data, separators=(",", ":")))
         return
+
+    # A gentle multi-graph hint on the human-readable queries.
+    multi = len(idx) > 1
+    hint = "  [graph '%s'; %d graphs exist - pass graph_id to target another]" % (gid, len(idx)) if multi else "  [graph '%s']" % gid
 
     # For queries that need classes, load them lazily
     classes = None
     string_refs = None
 
     if qtype == "stats":
-        out.append("Graph stats for %s:" % meta.get("root", "?"))
+        out.append("Graph stats for %s (root %s):%s" % (gid, meta.get("root", "?"), hint))
         out.append("  smali_files=%s classes=%s methods=%s fields=%s call_edges=%s string_refs=%s so_files=%s so_symbols=%s"
                    % (meta.get("smali_files", 0), meta.get("classes", 0), meta.get("methods", 0),
                       meta.get("fields", 0), meta.get("edges", 0), meta.get("string_refs", 0),
@@ -240,23 +461,23 @@ def main():
         out.append("  built_at=%s" % meta.get("built_at", "?"))
         out.append("  class_shards=%d string_ref_shards=%d" % (len(manifest.get("class_shards", [])), len(manifest.get("string_ref_shards", []))))
         out.append("Top classes by method count:")
-        classes = _load_all_classes(manifest)
+        classes = _load_all_classes(graph_dir, manifest)
         ranked = sorted(classes.items(), key=lambda kv: len(kv[1]["methods"]), reverse=True)[:10]
         for cname, c in ranked:
             out.append("  %4d methods  %s  (%s)" % (len(c["methods"]), cname, c["file"]))
 
     elif qtype == "search_classes":
-        classes = _load_all_classes(manifest)
+        classes = _load_all_classes(graph_dir, manifest)
         n = name.lower()
         ms = [c for c in classes if n in c.lower()]
-        out.append("Classes matching '%s' (%d found, showing up to %d):" % (name, len(ms), limit))
+        out.append("Classes matching '%s' in graph '%s' (%d found, showing up to %d):" % (name, gid, len(ms), limit))
         for c in ms[:limit]:
             out.append("  %s  ->  %s  (%d methods)" % (c, classes[c]["file"], len(classes[c]["methods"])))
         if len(ms) > limit:
             out.append("  ... %d more. Narrow your search." % (len(ms) - limit))
 
     elif qtype == "class":
-        classes = _load_all_classes(manifest)
+        classes = _load_all_classes(graph_dir, manifest)
         c = find_class(name, classes)
         if not c:
             out.append("No class matched '%s'. Try search_classes first." % name)
@@ -281,7 +502,7 @@ def main():
                 out.append("    ... %d more methods." % (len(info["methods"]) - limit))
 
     elif qtype == "method":
-        classes = _load_all_classes(manifest)
+        classes = _load_all_classes(graph_dir, manifest)
         found = []
         if "->" in name:
             for cname, info in classes.items():
@@ -319,7 +540,7 @@ def main():
         out.append("Total caller edges: %d" % total)
 
     elif qtype == "callees":
-        classes = _load_all_classes(manifest)
+        classes = _load_all_classes(graph_dir, manifest)
         if "->" in name:
             cname, _, m = name.partition("->")
             info = classes.get(cname)
@@ -345,7 +566,7 @@ def main():
                     out.append("  %s @line %d -> %s" % (src, ln, dst))
 
     elif qtype == "string_refs":
-        string_refs = _load_all_string_refs(manifest)
+        string_refs = _load_all_string_refs(graph_dir, manifest)
         n = name.lower()
         refs = [r for r in string_refs if n in r["string"].lower()]
         out.append("String references matching '%s' (%d found, showing up to %d):" % (name, len(refs), limit))
@@ -354,7 +575,7 @@ def main():
             out.append('  "%s"  @ %s:%d  in %s' % (disp, r["file"], r["line"], r["holder"]))
 
     elif qtype == "hierarchy":
-        classes = _load_all_classes(manifest)
+        classes = _load_all_classes(graph_dir, manifest)
         c = find_class(name, classes)
         if not c or isinstance(c, list):
             out.append("No single class matched '%s'." % name)
@@ -407,7 +628,7 @@ def main():
             out.append("Total matching symbols shown: %d" % cnt)
 
     else:
-        out.append("Unknown query_type '%s'. Valid: stats, search_classes, class, method, callers, callees, string_refs, hierarchy, so_symbols, graph_data." % qtype)
+        out.append("Unknown query_type '%s'. Valid: stats, search_classes, class, method, callers, callees, string_refs, hierarchy, so_symbols, graph_data, graphs, diff." % qtype)
 
     print("\n".join(out))
 

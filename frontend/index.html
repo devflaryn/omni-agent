@@ -10,42 +10,21 @@
       try { if (localStorage.getItem('omni-theme') === 'light') document.documentElement.classList.add('light'); } catch (e) {}
     })();
   </script>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-  <script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          fontFamily: {
-            sans: ['ui-sans-serif', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Roboto', '"Helvetica Neue"', 'Arial', 'sans-serif'],
-            serif: ['ui-serif', 'Georgia', 'Cambria', '"Times New Roman"', 'serif'],
-            mono: ['"Cascadia Code"', '"JetBrains Mono"', 'Consolas', 'ui-monospace', 'monospace'],
-          },
-          // Every palette slot resolves to a CSS variable so the light/dark
-          // switch only flips variables. NOTE: `cyan` is the primary accent
-          // slot (now Claude terracotta) — it keeps its historical name so
-          // existing class usage keeps working.
-          colors: {
-            term: {
-              bg: 'rgb(var(--term-bg) / <alpha-value>)',
-              panel: 'rgb(var(--term-panel) / <alpha-value>)',
-              line: 'rgb(var(--term-line) / <alpha-value>)',
-              muted: 'rgb(var(--term-muted) / <alpha-value>)',
-              green: 'rgb(var(--term-green) / <alpha-value>)',
-              magenta: 'rgb(var(--term-magenta) / <alpha-value>)',
-              orange: 'rgb(var(--term-orange) / <alpha-value>)',
-              cyan: 'rgb(var(--term-cyan) / <alpha-value>)',
-              red: 'rgb(var(--term-red) / <alpha-value>)',
-              gray: 'rgb(var(--term-gray) / <alpha-value>)',
-              text: 'rgb(var(--term-text) / <alpha-value>)',
-            },
-          },
-        },
-      },
-    };
-  </script>
+  <!-- Precompiled Tailwind (was the Play CDN, whose runtime JIT re-scanned the
+       whole DOM on every mutation — a constant CPU/memory tax while the agent
+       streams chat rows). Theme config lives in frontend/tailwind.config.js;
+       rebuild after adding new utility classes:
+       npx tailwindcss@3 -c tailwind.config.js -i tailwind.input.css -o tailwind.css --minify -->
+  <link rel="stylesheet" href="tailwind.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <!-- Knowledge-graph renderers, vendored locally (were unpkg CDN). A packaged
+       desktop app can't depend on unpkg being reachable — an offline/flaky CDN
+       used to leave the Graph tab stuck on "library failed to load" for BOTH the
+       2D and 3D views. vis-network (2D canvas) exposes `vis`; 3d-force-graph
+       (3D/WebGL, bundles three.js) exposes `ForceGraph3D`. -->
+  <script defer src="vendor/vis-network.min.js"></script>
+  <script defer src="vendor/3d-force-graph.min.js"></script>
   <style>
     :root {
       color-scheme: dark;
@@ -84,15 +63,21 @@
       --shimmer-glow: rgba(0, 0, 0, .05);
     }
     html, body { background: rgb(var(--term-bg)); }
-    /* smooth hovers + buttery theme switches everywhere */
-    *, ::before, ::after { transition: background-color .2s ease, border-color .2s ease, color .2s ease, opacity .2s ease, box-shadow .2s ease; }
+    /* Smooth hovers on interactive elements only. (This used to be a universal
+       `*` rule, which made every style/class change in a 1000+ row chat DOM a
+       transition candidate and dominated style-recalc time.) */
+    button, a, input, select, textarea, label, .tree-row, .group-head, .step-head {
+      transition: background-color .2s ease, border-color .2s ease, color .2s ease, opacity .2s ease;
+    }
     ::selection { background: rgb(var(--term-cyan) / .3); }
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgb(var(--term-line)); border-radius: 8px; }
     ::-webkit-scrollbar-thumb:hover { background: rgb(var(--term-muted) / .55); }
 
-    /* Glowing liquid-silver sweep for in-progress thinking text. */
+    /* Liquid-silver sweep for in-progress thinking text. No filter here: an
+       animated drop-shadow forced a full repaint of the line every frame for
+       the whole duration of every thinking phase. */
     .shimmer {
       background-image: linear-gradient(90deg,
         rgb(var(--shimmer-base)) 0%, rgb(var(--shimmer-base)) 32%,
@@ -102,9 +87,13 @@
       -webkit-background-clip: text; background-clip: text;
       color: transparent;
       animation: shimmer 2.4s linear infinite;
-      filter: drop-shadow(0 0 7px var(--shimmer-glow));
     }
     @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: 0% 0; } }
+
+    /* Offscreen chat rows skip layout + paint entirely; `auto` keeps each
+       row's last rendered size so scroll position stays stable. This is what
+       keeps a full 1400-row transcript cheap to live with. */
+    #chat > * { content-visibility: auto; contain-intrinsic-size: auto 32px; }
 
     .msg-enter { animation: rise .28s cubic-bezier(.21, 1.02, .47, 1); }
     @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -154,6 +143,25 @@
     .markdown table { border-collapse: collapse; margin: .6em 0; }
     .markdown th, .markdown td { border: 1px solid rgb(var(--term-line)); padding: 4px 10px; }
     .markdown hr { border: 0; border-top: 1px solid rgb(var(--term-line)); margin: 1em 0; }
+
+    /* inline chat formatting (user prompts + agent thoughts): Discord/WhatsApp
+       style bold/italic/strike/code, without the full markdown block elements */
+    .msg-fmt strong { font-weight: 600; }
+    .msg-fmt em { font-style: italic; }
+    .msg-fmt del { text-decoration: line-through; opacity: .8; }
+    .msg-fmt u { text-decoration: underline; text-underline-offset: 2px; }
+    .msg-fmt code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: rgb(var(--term-panel)); border: 1px solid rgb(var(--term-line) / .7);
+      padding: 1px 5px; border-radius: 6px; font-size: .85em;
+    }
+    .msg-fmt pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: rgb(var(--term-panel)); border: 1px solid rgb(var(--term-line));
+      padding: 10px 12px; border-radius: 10px; margin: .4em 0;
+      overflow-x: auto; white-space: pre; font-size: .85em; line-height: 1.5;
+    }
+    .msg-fmt pre code { background: transparent; border: 0; padding: 0; font-size: 1em; }
   </style>
 </head>
 <body class="h-full font-sans text-[13px] text-term-text antialiased">
@@ -162,6 +170,10 @@
   <div id="startScreen" class="absolute inset-0 z-30 flex items-center justify-center bg-term-bg">
     <button id="themeToggleStart" title="Toggle light / dark mode"
       class="absolute right-4 top-4 grid h-9 w-9 place-items-center rounded-full border border-term-line text-term-muted hover:bg-term-panel hover:text-term-text"></button>
+    <button id="llmSettingsBtnStart" title="LLM provider settings" style="right:3.75rem"
+      class="absolute top-4 grid h-9 w-9 place-items-center rounded-full border border-term-line text-term-muted hover:bg-term-panel hover:text-term-text">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+    </button>
 
     <div class="w-[560px] max-w-[94vw] rounded-3xl border border-term-line bg-term-panel p-8 shadow-xl">
       <div class="mb-6 flex items-center gap-3">
@@ -180,7 +192,10 @@
             <button id="newProjectBtn" class="text-[11px] text-term-cyan hover:underline">+ new project</button>
           </div>
         </div>
-        <select id="projectSelect" class="w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan"></select>
+        <div class="flex items-center gap-2">
+          <select id="projectSelect" class="w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan"></select>
+          <button id="deleteProjectBtn" title="Delete selected workspace" class="shrink-0 rounded-xl border border-term-line px-3 py-2.5 text-term-muted hover:border-term-red hover:text-term-red">delete</button>
+        </div>
 
         <div id="newProjectBox" class="mt-2 hidden gap-2">
           <input id="newProjectInput" placeholder="new-project-name" class="flex-1 rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
@@ -222,6 +237,9 @@
           <div id="treeProjectName" class="truncate font-serif text-[14px] text-term-text">—</div>
         </div>
         <div class="flex items-center gap-1 shrink-0">
+          <button id="uploadFilesBtn" title="Upload files into the workspace" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          </button>
           <button id="exportWorkspaceBtn" title="Export changes to a folder" class="rounded-full px-2 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">⇪</button>
           <button id="refreshTreeBtn" title="Refresh" class="rounded-full px-2 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">⟳</button>
         </div>
@@ -249,6 +267,9 @@
           <span class="tabular-nums" title="Approx. context size (chars)">ctx <span id="statCtx" class="text-term-text">0</span></span>
           <span class="tabular-nums" title="Memory compactions so far">resets <span id="statResets" class="text-term-text">0</span></span>
           <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60">plan —</button>
+          <button id="llmSettingsBtn" title="LLM provider settings" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+          </button>
           <button id="themeToggle" title="Toggle light / dark mode" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text"></button>
           <button id="changeSessionBtn" class="rounded-full border border-term-line px-3 py-1 hover:bg-term-line/60 hover:text-term-text">change</button>
         </div>
@@ -266,18 +287,18 @@
       <!-- CHAT TAB -->
       <div id="chatTab" class="flex-1 flex flex-col min-h-0">
         <!-- transcript (padding centers a readable column, like claude.ai) -->
-        <div id="chat" class="flex-1 overflow-y-auto py-4 space-y-1 px-[max(20px,calc((100%-52rem)/2))]"></div>
+        <div id="chat" class="flex-1 overflow-y-auto py-4 space-y-1 px-[max(20px,calc((100%-64rem)/2))]"></div>
 
         <!-- memory summary banner -->
-        <div id="memoryBanner" class="hidden mb-2 rounded-xl border border-term-orange/40 bg-term-orange/10 px-3 py-2 text-[11px] text-term-orange mx-[max(20px,calc((100%-52rem)/2))]">
+        <div id="memoryBanner" class="hidden mb-2 rounded-xl border border-term-orange/40 bg-term-orange/10 px-3 py-2 text-[11px] text-term-orange mx-[max(20px,calc((100%-64rem)/2))]">
           <span class="font-semibold">Resumed from memory:</span> <span id="memoryBannerText"></span>
         </div>
 
         <!-- input bar -->
         <footer class="border-t border-term-line bg-term-panel px-4 py-3">
-          <div class="mx-auto w-full max-w-[52rem]">
+          <div class="w-full">
             <div class="flex items-end gap-2 rounded-2xl border border-term-line bg-term-bg px-3 py-2 shadow-sm focus-within:border-term-cyan/60">
-              <textarea id="input" rows="2" placeholder="Describe a task for the agent…"
+              <textarea id="input" rows="1" placeholder="Describe a task for the agent…"
                 class="flex-1 resize-none bg-transparent px-1 py-1 text-[13.5px] leading-6 outline-none placeholder:text-term-muted/70"></textarea>
               <button id="sendBtn" title="Send (Enter)" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-term-cyan text-white shadow-sm hover:opacity-90 disabled:opacity-40">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
@@ -288,7 +309,7 @@
             </div>
             <div class="mt-1.5 flex items-center justify-between px-1 text-[10.5px] text-term-muted">
               <span id="hint">ready</span>
-              <span>Enter to send · Shift+Enter for newline · Docker sandbox</span>
+              <span>Enter to send · Shift+Enter for newline · /clear resets chat</span>
             </div>
           </div>
         </footer>
@@ -302,9 +323,17 @@
         <div id="graphContainer" class="flex-1 relative bg-term-bg"></div>
         <!-- graph sidebar: legend + info -->
         <div class="w-64 shrink-0 border-l border-term-line bg-term-panel flex flex-col overflow-hidden">
-          <div class="px-3 py-2 border-b border-term-line">
+          <!-- per-version graph selector (shown only when >1 graph has been built) -->
+          <div id="graphSelectRow" class="hidden items-center gap-2 px-3 py-2 border-b border-term-line">
+            <span class="shrink-0 text-[10px] uppercase tracking-wider text-term-muted">graph</span>
+            <select id="graphSelect" title="Which built graph to view — build each app version separately to compare"
+              class="min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-2 py-1 text-[12px] outline-none focus:border-term-cyan"></select>
+          </div>
+          <div class="flex items-center gap-2 px-3 py-2 border-b border-term-line">
             <input id="graphSearch" type="text" placeholder="Search nodes…" autocomplete="off"
-              class="w-full rounded-xl border border-term-line bg-term-bg px-2.5 py-1.5 text-[12px] outline-none focus:border-term-cyan" />
+              class="flex-1 rounded-xl border border-term-line bg-term-bg px-2.5 py-1.5 text-[12px] outline-none focus:border-term-cyan" />
+            <button id="graphModeToggle" title="Toggle 2D / 3D view — drag to orbit, scroll to zoom in 3D"
+              class="shrink-0 rounded-lg border border-term-cyan px-2 py-1 text-[11px] font-semibold text-term-cyan hover:bg-term-line/60">3D</button>
           </div>
           <div id="graphInfo" class="px-3 py-2 border-b border-term-line min-h-[120px] text-[12px] text-term-text">
             <span class="text-term-muted italic">Click a node to inspect it</span>
@@ -326,12 +355,17 @@
           <div id="viewerPath" class="truncate font-mono text-term-text">—</div>
         </div>
         <div class="flex items-center gap-3">
+          <button id="viewerBack" class="hidden rounded-full px-2.5 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text">← archive</button>
           <span id="viewerSize" class="text-[11px] text-term-muted"></span>
           <button id="viewerClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
         </div>
       </div>
       <div class="flex-1 overflow-auto rounded-b-3xl bg-term-bg p-4">
         <pre id="viewerContent" class="font-mono text-[12px] leading-5 text-term-text"></pre>
+        <div id="viewerImage" class="hidden h-full items-center justify-center">
+          <img class="max-h-full max-w-full rounded-lg object-contain" alt="" />
+        </div>
+        <div id="viewerArchive" class="hidden font-mono text-[12px] leading-5 text-term-text"></div>
       </div>
     </div>
   </div>
@@ -355,6 +389,56 @@
         <div class="flex items-center gap-2">
           <button id="exportCancelBtn" class="rounded-full border border-term-line px-4 py-2 text-term-muted hover:bg-term-line/60 hover:text-term-text">cancel</button>
           <button id="exportApproveBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">approve &amp; export</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ LLM SETTINGS MODAL ============ -->
+  <div id="llmModal" class="hidden absolute inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+    <div class="flex max-h-[82vh] w-[640px] max-w-[94vw] flex-col rounded-3xl border border-term-line bg-term-panel shadow-2xl">
+      <div class="flex items-center justify-between border-b border-term-line px-5 py-3.5">
+        <div class="min-w-0">
+          <div class="text-[10px] uppercase tracking-wider text-term-muted">model provider</div>
+          <div class="font-serif text-[14px] text-term-text">LLM Settings</div>
+        </div>
+        <button id="llmModalClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
+      </div>
+
+      <div class="flex-1 overflow-y-auto px-5 py-4 text-[12px]">
+        <div class="mb-1.5 text-[10px] uppercase tracking-wider text-term-muted">provider</div>
+        <div id="llmProviderTabs" class="mb-3 flex items-center gap-1.5" style="flex-wrap:wrap"></div>
+        <div id="llmProviderNotes" class="mb-3 text-[11px] text-term-muted"></div>
+
+        <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">API key</label>
+        <input id="llmKey" type="password" autocomplete="off" spellcheck="false"
+          class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+
+        <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">model</label>
+        <input id="llmModel" type="text" autocomplete="off" spellcheck="false" placeholder="model id"
+          class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+
+        <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">base URL</label>
+        <input id="llmBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://…/v1"
+          class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+
+        <div id="llmMaxTokensRow" class="mb-3 hidden">
+          <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">max output tokens</label>
+          <input id="llmMaxTokens" type="number" min="256" placeholder="8192" style="width:160px"
+            class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+        </div>
+
+        <div class="flex items-center gap-2">
+          <button id="llmTestBtn" class="rounded-full border border-term-line px-4 py-2 text-term-text hover:bg-term-line/60">test connection</button>
+          <span id="llmTestResult" class="text-[11px] text-term-muted"></span>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
+        <span id="llmError" class="text-[11px] text-term-red"></span>
+        <div class="flex items-center gap-2">
+          <button id="llmCancelBtn" class="rounded-full border border-term-line px-4 py-2 text-term-muted hover:bg-term-line/60 hover:text-term-text">cancel</button>
+          <button id="llmSaveBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">save</button>
         </div>
       </div>
     </div>
