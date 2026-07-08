@@ -28,6 +28,8 @@ from llm import (
     get_effective_config,
     save_config,
     test_connection,
+    extract_json_action,
+    strip_reasoning,
 )
 from docker_sandbox import setup_sandbox
 from tool_registry import registry
@@ -48,6 +50,9 @@ SOFT_TOOL_NUDGE = 200
 MAX_CONSECUTIVE_TOOLS = 400
 MAX_SUMMARY_RESETS = 8
 LOOP_REPEAT_THRESHOLD = 3
+# How many corrective re-asks a malformed (non-JSON) LLM reply gets before the
+# loop salvages the reply as prose instead of aborting the whole run.
+MAX_PARSE_RETRIES = 2
 
 # --- Chat persistence + UI memory safety -------------------------------------
 # The full conversation (LLM messages) and a replayable UI transcript are saved
@@ -212,18 +217,9 @@ def summarize_memory(messages, memory_dir, original_task=None):
 
 def parse_response(response_text):
     """Parses the LLM JSON response and returns a (type, payload) tuple."""
-    text = response_text.strip()
-
-    start_idx = text.find("{")
-    end_idx = text.rfind("}")
-
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        text = text[start_idx:end_idx + 1]
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return ("error", f"LLM returned non-JSON content: {response_text[:300]}")
+    data = extract_json_action(response_text or "")
+    if data is None:
+        return ("error", f"LLM returned non-JSON content: {(response_text or '')[:300]}")
 
     response_type = data.get("type")
 
@@ -1354,16 +1350,21 @@ class AgentApi:
 
                 response_type, payload = parse_response(raw_response)
 
-                if response_type == "error":
-                    self._emit({"type": "system", "content": "Response was not valid JSON — retrying..."})
-                    retry_messages = s["messages"] + [
-                        {"role": "assistant", "content": raw_response},
-                        {"role": "user",
-                         "content": "Your last response was not valid JSON. You MUST respond with a raw JSON object only — no markdown, no prose. Use {\"type\": \"tool_call\", ...} or {\"type\": \"final_answer\", \"content\": \"...\"}."}
-                    ]
+                # A malformed reply gets bounded correction retries. The failed
+                # attempt stays in the message history so the model can see what
+                # it did wrong (the old copy-list approach threw that away, so
+                # every retry started from the same state that just failed).
+                parse_retries = 0
+                while response_type == "error" and parse_retries < MAX_PARSE_RETRIES and not self._stop:
+                    parse_retries += 1
+                    self._emit({"type": "system",
+                                "content": f"Response was not valid JSON — retrying ({parse_retries}/{MAX_PARSE_RETRIES})..."})
+                    s["messages"].append({"role": "assistant", "content": raw_response})
+                    s["messages"].append({"role": "user",
+                                          "content": "Your last response was not valid JSON. You MUST respond with a raw JSON object only — no markdown, no prose. Use {\"type\": \"tool_call\", \"tool\": \"<name>\", \"args\": { ... }} or {\"type\": \"final_answer\", \"content\": \"...\"}."})
                     self._emit({"type": "thinking_start"})
                     start_time = time.time()
-                    raw_response = ask_llm(retry_messages)
+                    raw_response = ask_llm(s["messages"])
                     elapsed_ms += int((time.time() - start_time) * 1000)
                     self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
                     response_type, payload = parse_response(raw_response)
@@ -1525,8 +1526,21 @@ class AgentApi:
                                 "time": time_str})
                     break
                 else:
-                    self._emit({"type": "system", "content": f"Parse error: {payload}"})
+                    # Still malformed after the retries. The reply usually
+                    # contains a usable prose answer — surface it instead of
+                    # silently killing the run.
                     s["step_count"] += 1
+                    s["last_tool_call"] = None
+                    salvage = strip_reasoning(raw_response)
+                    if salvage:
+                        self._emit({"type": "system",
+                                    "content": "Model kept replying outside the JSON protocol — showing its reply as-is. You can tell it to continue."})
+                        self._emit({"type": "final_answer",
+                                    "content": salvage,
+                                    "steps": s["step_count"],
+                                    "time": time_str})
+                    else:
+                        self._emit({"type": "system", "content": f"Parse error: {payload}"})
                     break
 
                 if self._stop:

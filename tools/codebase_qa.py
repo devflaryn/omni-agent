@@ -30,7 +30,7 @@ registry.
 """
 import json
 
-from llm import ask_llm
+from llm import ask_llm, extract_json_action, strip_reasoning
 from tool_registry import registry
 
 # --- The sub-agent's toolbox -------------------------------------------------
@@ -105,21 +105,14 @@ concise and specific; if the workspace genuinely doesn't contain enough to answe
 def _parse_subagent_response(response_text):
     """Parse the sub-agent's JSON reply into a (type, payload) tuple.
 
-    Mirrors agent.parse_response's tolerance (grabs the outermost {...}, treats a
-    stray {tool/args} object as a tool_call) but is kept local so this module
-    depends only on llm + tool_registry, never on agent.py (which pulls in the
-    whole webview app and would be a circular import at load time)."""
-    text = (response_text or "").strip()
-    start_idx = text.find("{")
-    end_idx = text.rfind("}")
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        text = text[start_idx:end_idx + 1]
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+    Mirrors agent.parse_response's tolerance (llm.extract_json_action digs the
+    action out of think-blocks/fences/prose, a stray {tool/args} object counts
+    as a tool_call) but is kept local so this module depends only on llm +
+    tool_registry, never on agent.py (which pulls in the whole webview app and
+    would be a circular import at load time)."""
+    data = extract_json_action(response_text or "")
+    if data is None:
         return ("error", f"non-JSON content: {(response_text or '')[:300]}")
-    if not isinstance(data, dict):
-        return ("error", f"expected a JSON object: {(response_text or '')[:300]}")
 
     response_type = data.get("type")
     if response_type not in ("tool_call", "final_answer") and ("args" in data or "tool" in data):
@@ -288,6 +281,7 @@ def ask_codebase(question, context="", max_steps=DEFAULT_MAX_STEPS):
     steps = 0
     last_sig = None
     repeats = 0
+    parse_errors = 0
 
     while steps < max_steps:
         raw = ask_llm(messages, temperature=SUBAGENT_TEMPERATURE)
@@ -298,11 +292,22 @@ def ask_codebase(question, context="", max_steps=DEFAULT_MAX_STEPS):
             return _format_answer(payload, tools_used, steps)
 
         if rtype == "error":
+            # Bounded: a model that never returns valid JSON must not spin
+            # here forever (this branch doesn't consume a step). Salvage its
+            # prose as the answer instead.
+            parse_errors += 1
+            if parse_errors >= 3:
+                salvage = strip_reasoning(raw)
+                return _format_answer(
+                    salvage or f"[investigation failed: model kept replying outside the JSON protocol — {payload}]",
+                    tools_used, steps,
+                )
             messages.append({"role": "user", "content": (
                 "Your last reply was not valid JSON. Respond with a single raw JSON object only — either "
                 '{"type": "tool_call", "tool": "...", "args": {...}} or {"type": "final_answer", "content": "..."}.'
             )})
             continue
+        parse_errors = 0
 
         # tool_call
         tool_name = payload.get("tool")

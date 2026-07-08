@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import requests
 from tool_registry import registry
@@ -277,6 +278,85 @@ def get_openai_endpoint_config():
     return {"url": CLINE_API_URL, "key": API_KEY, "model": MODEL_NAME}
 
 
+# --- robust JSON action extraction -------------------------------------------
+# Reasoning models (GLM, DeepSeek-R1, etc.) rarely return the bare JSON object
+# the system prompt demands: they prepend <think> blocks, wrap the JSON in
+# ```json fences, or write prose that itself contains braces. A naive
+# first-"{"-to-last-"}" slice breaks on all of those, so the agent loop and the
+# codebase-QA sub-agent both extract actions through here instead.
+
+_THINK_BLOCK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_THINK_TAIL_RE = re.compile(r"^.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+def strip_reasoning(text):
+    """Remove <think>/<thinking> blocks from a reply. Also handles a reply that
+    starts mid-thought and only has the closing tag (some proxies drop the
+    opening tag when the block spans a stream boundary)."""
+    if not text:
+        return ""
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    if re.search(r"</think(?:ing)?>", cleaned, re.IGNORECASE):
+        cleaned = _THINK_TAIL_RE.sub("", cleaned, count=1)
+    return cleaned.strip()
+
+
+def _json_candidates(text):
+    """Yield every parseable JSON value in `text`, scanning from each '{'.
+    raw_decode tolerates trailing text, so prose after the object is fine."""
+    decoder = json.JSONDecoder()
+    idx = 0
+    while True:
+        start = text.find("{", idx)
+        if start == -1:
+            return
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except ValueError:
+            idx = start + 1
+            continue
+        yield obj
+        idx = end
+
+
+def extract_json_action(text):
+    """Find the agent-action JSON object in a raw LLM reply, or None.
+
+    Tolerates reasoning prose before/after the JSON, <think> blocks, markdown
+    code fences, stray braces inside the prose, and trailing commas. Prefers an
+    object that looks like an action ({"type": ...} / {"tool": ...}) over any
+    other JSON the reply happens to contain."""
+    if not text:
+        return None
+    cleaned = strip_reasoning(text)
+
+    # Fenced blocks first — when the model uses a fence, its content is the
+    # intended payload even if the surrounding prose also has braces. Then the
+    # stripped reply, then (last resort) the raw reply including think blocks.
+    sources = [m.group(1) for m in _FENCE_RE.finditer(cleaned)]
+    sources.append(cleaned)
+    if cleaned != text:
+        sources.append(text)
+
+    fallback = None
+    for source in sources:
+        attempts = [source]
+        defused = _TRAILING_COMMA_RE.sub(r"\1", source)
+        if defused != source:
+            attempts.append(defused)
+        for attempt in attempts:
+            for obj in _json_candidates(attempt):
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") in ("tool_call", "final_answer") or "tool" in obj or "args" in obj:
+                    return obj
+                if fallback is None:
+                    fallback = obj
+    return fallback
+
+
 # --- request helpers ---------------------------------------------------------
 def _error_response(message):
     return json.dumps({
@@ -324,6 +404,12 @@ def _openai_request(cfg, messages, temperature):
 
             message = choices[0].get("message", {})
             content = message.get("content")
+            # Some OpenAI-compatible servers return content as a list of typed
+            # blocks instead of a plain string.
+            if isinstance(content, list):
+                content = "".join(
+                    b.get("text", "") for b in content if isinstance(b, dict)
+                ) or None
             finish = choices[0].get("finish_reason") or choices[0].get("native_finish_reason")
 
             # Native function-calling: content is null, tool call is in tool_calls.
