@@ -30,3 +30,6 @@ memory/*
 
 # Runtime: last-used/recent picked workspace folders (Part 2 redesign)
 agent_workspaces.json
+
+# Test fixtures: large APK binaries are NOT committed (see test-assets/README.md)
+test-assets/*.apk
