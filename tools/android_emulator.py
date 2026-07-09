@@ -65,6 +65,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 
 from tool_registry import registry
@@ -74,6 +75,10 @@ from tools._emulator_vision_analyze import analyze_session
 from llm import get_openai_endpoint_config
 
 _DEFAULT_BACKEND = "qemu"
+
+# Frozen omnidroid contract version this harness codes against (omnidroid-api.md
+# v1). The qemu backend does a `version --json` handshake and warns on mismatch.
+_EXPECTED_CONTRACT = "1.0"
 _DEFAULT_AVD = "omniagent_avd"
 _DEFAULT_LDPLAYER_INSTANCE = "omniagent_ld"
 _DEFAULT_QEMU_SESSION = "omniagent"
@@ -213,12 +218,15 @@ def _parse_json_object(text):
 
 
 def _run_qemu(args, timeout=60):
-    """Run a qemu-manager subcommand. Returns (parsed_json_or_None, raw_result,
+    """Run an omnidroid subcommand. Returns (parsed_json_or_None, raw_result,
     project_dir). The frozen exe self-locates its project dir (its own folder),
     so we do NOT pass --project-dir (avoids any argparse global-vs-subcommand
-    placement ambiguity) and simply rely on that documented default."""
+    placement ambiguity) and simply rely on that documented default. If the
+    resolved engine is a `.py` (e.g. QEMU_MANAGER_PATH points at the source
+    checkout's manager/omni.py), it is run with the current interpreter."""
     exe, project_dir = _find_qemu_manager()
-    res = _run([exe] + list(args), timeout=timeout)
+    prefix = [sys.executable, exe] if exe.endswith(".py") else [exe]
+    res = _run(prefix + list(args), timeout=timeout)
     parsed = _parse_json_object(res.get("stdout"))
     return parsed, res, project_dir
 
@@ -292,6 +300,38 @@ def _qemu_get_account(name):
     return _qemu_extract_session(parsed, name)
 
 
+def _is_arm_abi(abi):
+    return bool(abi and str(abi).startswith(("arm", "armeabi")))
+
+
+def _qemu_account_arch(name, default="x86"):
+    """The account's arch token ('x86' | 'arm') from `list --json` (contract
+    §6.4). Determines which ABI path a test must exercise: x86 accounts run an
+    arm APK via libndk TRANSLATION; arm accounts run it NATIVELY."""
+    try:
+        acct = _qemu_get_account(name)
+        if isinstance(acct, dict) and acct.get("arch") in ("x86", "arm"):
+            return acct["arch"]
+    except RuntimeError:
+        pass
+    return default
+
+
+def _qemu_contract_check():
+    """Contract handshake (omnidroid-api.md §4). Returns (ok, info) where ok is
+    True only if the engine reports the expected contract AND is arch_aware.
+    Non-fatal: callers WARN + degrade on mismatch (an old engine also can't do
+    the ABI-safe install, which then fails loudly on its own)."""
+    try:
+        parsed, _res, _pd = _run_qemu(["version", "--json"], timeout=30)
+    except RuntimeError:
+        return False, {"error": "engine_not_found"}
+    if not (isinstance(parsed, dict) and parsed.get("ok")):
+        return False, {"error": "no_version", "raw": parsed}
+    ok = parsed.get("contract") == _EXPECTED_CONTRACT and parsed.get("arch_aware") is True
+    return ok, parsed
+
+
 def _qemu_create(name, boot_timeout, log):
     """Create disks for a fresh account (no boot — the first `start` provisions).
     Returns None on success or an {"error": ...} dict on failure."""
@@ -313,6 +353,19 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
     if err:
         return {"error": err}
     log = []
+
+    # Contract handshake FIRST (omnidroid-api.md §4). Warn + degrade on a
+    # mismatch rather than aborting — but make it loud, because an engine that
+    # isn't arch-aware also can't do the ABI-safe install this harness relies on.
+    ok_contract, ver = _qemu_contract_check()
+    if ok_contract:
+        log.append(f"Engine contract {ver.get('contract')} (arch_aware, host {ver.get('host_arch')}).")
+    else:
+        log.append(
+            "WARNING: engine does not report the expected contract "
+            f"{_EXPECTED_CONTRACT}/arch_aware ({ver}). The ABI-safe install "
+            "path may not work — update omnidroid (see omnidroid-api.md)."
+        )
 
     try:
         acct = _qemu_get_account(name)
@@ -824,24 +877,30 @@ def adb_shell(command, backend=_DEFAULT_BACKEND, device_name=None, timeout_secon
     name="install_apk_on_emulator",
     description=(
         "Installs an APK onto the running emulator. On the default 'qemu' (omnidroid) backend this "
-        "goes through the service ('omni install <account> <apk>'), which installs the APK AND sets it "
-        "as the locked kiosk's launch target so it actually starts under Lock Task Mode — the kiosk "
-        "launches it the moment the install completes (so a separate launch step is usually not "
-        "needed). On 'ldplayer'/'avd' it uses plain 'adb install': replaces an existing install of the "
-        "same package by default and grants all runtime permissions automatically so the app doesn't "
-        "get stuck on a permission dialog during an unattended test."
+        "goes through the service ('omni install <account> <apk> --json'), which installs the APK AND "
+        "sets it as the locked kiosk's launch target so it starts under Lock Task Mode. It is ABI-SAFE "
+        "(omnidroid-api.md §5): a fat APK on an x86 account is installed as arm64-v8a so it exercises "
+        "libndk ARM TRANSLATION (the real production path) instead of silently running native x86_64 "
+        "and bypassing the bridge; on an arm account it runs native. The tool then reads "
+        "native_bridge_used/abi_installed from the JSON and ASSERTS the intended path was actually "
+        "exercised — a wrong ABI (e.g. forcing abi='x86_64' on an x86 account) FAILS with an "
+        "'ABI CONTRACT VIOLATION' error rather than passing silently. On 'ldplayer'/'avd' it uses plain "
+        "'adb install' (-r/-g)."
     ),
     params_schema={
         "apk_path": "string (path to the .apk, relative to /workspace, e.g. 'modified.apk')",
         "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)",
         "replace": "boolean (optional, default true — adb backends only: adds -r to allow reinstalling over an existing install)",
-        "grant_permissions": "boolean (optional, default true — adb backends only: adds -g to auto-grant all runtime permissions; on qemu the device-owner kiosk handles permissions)"
+        "grant_permissions": "boolean (optional, default true — adb backends only: adds -g to auto-grant all runtime permissions; on qemu the device-owner kiosk handles permissions)",
+        "abi": "string (optional, qemu backend only — force a specific install ABI. Default: arm64-v8a on x86 accounts (exercise translation), none on arm accounts (native). Set to 'x86_64' to DELIBERATELY test the native/wrong path — on an x86 account that trips the ABI-contract assertion and FAILS, which is the intended guard.)",
+        "require_translation": "boolean (optional, qemu backend, default true — on x86 accounts pass --require-translation so the engine itself also rejects a non-translated install)"
     },
-    output="On qemu: the service's install output (ending in the kiosk launching the app). On adb backends: adb install's output — 'Success', or the specific INSTALL_FAILED_* error (e.g. INSTALL_FAILED_NO_MATCHING_ABIS if the APK's native libraries don't match the emulator's supported architectures — the qemu base ships libndk ARM translation and handles arm64-v8a; on 'avd' try backend='qemu' or 'ldplayer' for arm64-only APKs).",
-    when_to_use="Call this after ensure_emulator_running, before launch_app_on_emulator, any time you have a newly built/signed APK to test."
+    output="On qemu: an ABI-checked confirmation ('...native_bridge_used=<bool> — intended path exercised') on success, or an error — 'ABI CONTRACT VIOLATION ...' / 'omnidroid install failed (abi_not_translated ...)' — when the wrong ABI path was taken (this fails the test). On adb backends: adb install's output ('Success' or INSTALL_FAILED_*).",
+    when_to_use="Call this after ensure_emulator_running, before launch_app_on_emulator, any time you have a newly built/signed APK to test. On qemu it guarantees the arm-translation path is what gets tested on x86."
 )
-def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None, replace=True, grant_permissions=True):
+def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None, replace=True,
+                            grant_permissions=True, abi=None, require_translation=True):
     backend = (backend or _DEFAULT_BACKEND).strip().lower()
     try:
         host_apk_path = resolve_workspace_path(apk_path)
@@ -852,22 +911,55 @@ def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None
 
     if backend == "qemu":
         # Route through the service so it records the APK, sets it as the kiosk's
-        # launch target, and launches it under Lock Task Mode. `omni install` is
-        # plain-text (no --json) and handles reinstall itself.
+        # launch target, and launches it under Lock Task Mode. ABI-SAFE per the
+        # frozen contract (omnidroid-api.md §5): a fat APK on an x86 account must
+        # exercise libndk ARM TRANSLATION (not run native x86_64 and bypass it);
+        # an arm account runs it NATIVE. We install via `--json`, then ASSERT the
+        # intended path was actually exercised — a wrong ABI FAILS the test.
         name = device_name or _default_device_name("qemu")
         err = _validate_session_id(name)
         if err:
             return {"error": err}
+        arch = _qemu_account_arch(name)
+        expect_bridge = (arch == "x86")   # x86 -> translation; arm -> native
+        argv = ["install", name, host_apk_path, "--json"]
+        if abi:                           # explicit override (e.g. "x86_64" forces the WRONG path)
+            argv += ["--abi", str(abi)]
+        elif arch == "arm":               # arm account: no pin, run native
+            argv += ["--no-abi-pin"]
+        # else x86 default: the engine implicitly pins arm64-v8a (translation).
+        # Demand translation on the default x86 path; when the caller deliberately
+        # forces a NON-arm ABI, skip it so the failure surfaces via our assertion
+        # below with a clear, agent-side message.
+        if expect_bridge and _truthy(require_translation) and not (abi and not _is_arm_abi(abi)):
+            argv += ["--require-translation"]
         try:
-            _parsed, res, _pd = _run_qemu(["install", name, host_apk_path], timeout=180)
+            parsed, res, _pd = _run_qemu(argv, timeout=600)
         except RuntimeError as e:
             return {"error": str(e)}
         if res.get("error"):
             return {"error": res["error"]}
-        out = (res.get("stdout") or res.get("stderr") or "").strip()
-        if res.get("returncode", 0) != 0:
-            return {"error": f"omnidroid install failed (exit {res.get('returncode')}):\n{out[:800]}"}
-        return {"stdout": out or "Installed via omnidroid; kiosk launching the app."}
+        # Contract error (abi_not_translated / install_failed) => ok=false: the
+        # test FAILS here; it does NOT proceed to a passing report.
+        if not (isinstance(parsed, dict) and parsed.get("ok")):
+            code = parsed.get("error") if isinstance(parsed, dict) else None
+            detail = (parsed.get("message") if isinstance(parsed, dict) else None) \
+                or (res.get("stdout") or res.get("stderr") or "").strip()
+            return {"error": f"omnidroid install failed ({code or 'unknown'}): {str(detail)[:800]}"}
+        nbu = bool(parsed.get("native_bridge_used"))
+        abi_installed = parsed.get("abi_installed")
+        # ASSERT the intended ABI path was actually exercised.
+        if nbu != expect_bridge:
+            want = ("ARM translation via libndk (native_bridge_used=true)" if expect_bridge
+                    else "native execution (native_bridge_used=false)")
+            return {"error": (
+                f"ABI CONTRACT VIOLATION on {arch} account '{name}': installed as abi={abi_installed} "
+                f"with native_bridge_used={nbu}, but this account's intended path is {want}. "
+                f"The APK was NOT tested on the intended path — failing the test.")}
+        return {"stdout": (
+            f"Installed {parsed.get('package')} on {arch} account '{name}': abi={abi_installed}, "
+            f"native_bridge_used={nbu} — intended path exercised "
+            f"({'ARM translation' if expect_bridge else 'native'}). Kiosk launching the app.")}
 
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
@@ -1231,15 +1323,17 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
         "vision_backend": "string (optional, default 'auto' — 'auto', 'api', or 'ollama', see analyze_keyframes)",
         "ollama_model": "string (optional, default 'llava')",
         "reset": "boolean (optional, default true — reset the emulator to a clean state before this test)",
-        "boot_timeout": "integer (optional, default 300 seconds)"
+        "boot_timeout": "integer (optional, default 300 seconds)",
+        "abi": "string (optional, qemu backend — force the install ABI. Default exercises the intended path per account arch (x86 -> arm64-v8a translation, arm -> native). 'x86_64' on an x86 account deliberately trips the ABI-contract guard and FAILS the session.)"
     },
-    output="A summary of each pipeline stage plus the path to the generated Markdown report — read that report with read_file_chunk for the full picture (keyframe descriptions + logcat).",
+    output="A summary of each pipeline stage plus the path to the generated Markdown report — read that report with read_file_chunk for the full picture (keyframe descriptions + logcat). If the ABI-safe install fails/violates the contract, the session ABORTS with an 'install FAILED' summary and no pass is emitted.",
     when_to_use="Use this as the default way to test a freshly built/signed APK end-to-end. Fall back to the individual tools (ensure_emulator_running, install_apk_on_emulator, etc.) if you need to interleave manual adb_shell actions between steps, or re-run just one stage."
 )
 def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT_BACKEND, device_name=None,
                           system_image=_DEFAULT_SYSTEM_IMAGE, device_profile="pixel_5",
                           duration_seconds=20, vision_backend="auto", ollama_model="llava",
-                          reset=True, boot_timeout=300, ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE):
+                          reset=True, boot_timeout=300, ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE,
+                          abi=None, require_translation=True):
     session_name = f"{package_name.replace('.', '_')}_{int(time.time())}"
     log = []
 
@@ -1252,8 +1346,15 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     if "BOOT_OK" not in (boot_res.get("stdout") or ""):
         return {"stdout": "Emulator failed to boot -- aborting test session.\n\n" + "\n\n".join(log)[:4000]}
 
-    install_res = install_apk_on_emulator(apk_path, backend=backend, device_name=device_name)
+    install_res = install_apk_on_emulator(apk_path, backend=backend, device_name=device_name,
+                                          abi=abi, require_translation=require_translation)
     log.append("[install_apk_on_emulator]\n" + (install_res.get("stdout") or install_res.get("error") or ""))
+    # ABI-safety gate (Finding B, client side): a failed or ABI-violating install
+    # must FAIL the whole session — never fall through to a report that reads as a
+    # pass while the app was tested on the wrong (native x86_64) path.
+    if install_res.get("error"):
+        return {"stdout": "APK install FAILED (ABI-contract violation or install error) -- aborting "
+                          "test session; NOT emitting a pass.\n\n" + "\n\n".join(log)[:4000]}
 
     launch_res = launch_app_on_emulator(package_name, activity, backend=backend, device_name=device_name)
     log.append("[launch_app_on_emulator]\n" + (launch_res.get("stdout") or launch_res.get("error") or ""))
