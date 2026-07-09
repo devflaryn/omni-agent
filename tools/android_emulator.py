@@ -146,43 +146,60 @@ def _validate_session_id(sid):
 # service (`omni install` / `omni run-app`) since provisioned accounts are locked
 # kiosks; those subcommands are plain-text (no --json).
 
-def _find_qemu_manager():
-    """Locate the omnidroid engine executable. Returns (exe_path, project_dir).
+def _engine_project_dir(path):
+    """Where the engine's config/accounts/qemu live for a resolved engine path.
+    For a source checkout `<repo>/manager/omni.py` that is the REPO ROOT (the
+    engine's _app_root() is manager/..); for a frozen exe it's the exe's own
+    folder (it self-bootstraps configs/accounts next to itself)."""
+    ap = os.path.abspath(path)
+    parent = os.path.dirname(ap)
+    if os.path.basename(ap) == "omni.py" and os.path.basename(parent) == "manager":
+        return os.path.dirname(parent)          # repo root
+    return parent
 
-    The canonical binary for every emulator call is tools/omnidroid/omnidroid.exe
-    (the omnidroid emulator service; byte-identical to the root qemu-manager.exe,
-    which is kept only as a fallback). project_dir is the folder the executable
-    lives in — the same folder the frozen exe self-bootstraps next to (configs/,
-    accounts/, ./qemu on Windows), so any adb it downloads and the account state
-    all resolve there. Override the exe location with the QEMU_MANAGER_PATH env
-    var."""
+
+def _find_qemu_manager():
+    """Locate the omnidroid engine. Returns (engine_path, project_dir).
+
+    Resolution order (DEV agent calls omnidroid from the canonical checkout the
+    SAME way omni-executor does — architecture principle: omnidroid is the hub):
+      1. QEMU_MANAGER_PATH env override (a .py or an exe).
+      2. **Canonical sibling checkout** `<Omni Apps>/omnidroid/manager/omni.py`
+         — the arch-aware, contract-compliant engine whose config points at the
+         external images dir (OmniImages). Run with the current interpreter.
+      3. Bundled `tools/omnidroid/omnidroid.exe` — the shipping fallback. NOTE:
+         the currently bundled exe is a STALE pre-contract build with a stale
+         config (see HANDOFF "omni-executor packaging" / bundle rebuild TODO);
+         it is intentionally NOT preferred over the canonical checkout.
+      4. Root `qemu-manager.exe`, then PATH.
+    """
     is_nt = os.name == "nt"
     tools_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(tools_dir)
+    repo_root = os.path.dirname(tools_dir)               # omni-agent/
+    workspace_root = os.path.dirname(repo_root)          # Omni Apps/
     candidates = []
     env = os.environ.get("QEMU_MANAGER_PATH")
     if env:
         candidates.append(env)
-    # Primary: the bundled omnidroid service exe under tools/omnidroid/.
+    # Canonical hub: the omnidroid checkout that sits beside omni-agent.
+    candidates.append(os.path.join(workspace_root, "omnidroid", "manager", "omni.py"))
+    # Shipping fallback: the bundled service exe (stale until the bundle is rebuilt).
     candidates.append(os.path.join(tools_dir, "omnidroid",
                                    "omnidroid.exe" if is_nt else "omnidroid"))
-    # Fallback: the identical engine shipped at the project root.
     candidates.append(os.path.join(repo_root,
                                    "qemu-manager.exe" if is_nt else "qemu-manager"))
     for cand in candidates:
         if cand and os.path.isfile(cand):
-            return cand, os.path.dirname(os.path.abspath(cand))
+            return cand, _engine_project_dir(cand)
     from shutil import which
     found = which("omnidroid") or which("qemu-manager")
     if found:
-        return found, os.path.dirname(os.path.abspath(found))
-    omnidroid_path = os.path.join(tools_dir, "omnidroid",
-                                  "omnidroid.exe" if is_nt else "omnidroid")
+        return found, _engine_project_dir(found)
     raise RuntimeError(
         "Could not find the omnidroid engine. Looked in: "
         + ", ".join(c for c in candidates if c)
-        + f", and on PATH. Place omnidroid.exe at {omnidroid_path}, "
-        "or set the QEMU_MANAGER_PATH environment variable to its full path."
+        + ", and on PATH. Point QEMU_MANAGER_PATH at the canonical "
+        "omnidroid/manager/omni.py (or a built omnidroid.exe)."
     )
 
 
@@ -330,6 +347,20 @@ def _qemu_contract_check():
     return ok, parsed
 
 
+def _qemu_readiness_check():
+    """`doctor --json` preflight. Returns (ready, report). Used to FAIL FAST on a
+    missing base image (our current deferred state: no base download_url set) so
+    the caller returns a clear terminal error instead of the agent looping on
+    'the download may be in progress' — enforcing the never-hang rule."""
+    try:
+        parsed, _res, _pd = _run_qemu(["doctor", "--json"], timeout=60)
+    except RuntimeError as e:
+        return False, {"error": str(e)}
+    if isinstance(parsed, dict):
+        return bool(parsed.get("ready")), parsed
+    return False, {"error": "doctor returned no JSON"}
+
+
 def _qemu_create(name, boot_timeout, log):
     """Create disks for a fresh account (no boot — the first `start` provisions).
     Returns None on success or an {"error": ...} dict on failure."""
@@ -352,6 +383,15 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
         return {"error": err}
     log = []
 
+    # Which engine + config are we actually driving? Surface it so a path/config
+    # mismatch is diagnosable at a glance (this is exactly the class of bug where
+    # the agent invoked a stale bundled engine pointing at the wrong images_dir).
+    try:
+        _exe, _pdir = _find_qemu_manager()
+        log.append(f"omnidroid engine: {_exe}")
+    except RuntimeError as e:
+        return {"error": str(e)}
+
     # Contract handshake FIRST (omnidroid-api.md §4). Warn + degrade on a
     # mismatch rather than aborting — but make it loud, because an engine that
     # isn't arch-aware also can't do the ABI-safe install this harness relies on.
@@ -364,6 +404,26 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
             f"{_EXPECTED_CONTRACT}/arch_aware ({ver}). The ABI-safe install "
             "path may not work — update omnidroid (see omnidroid-api.md)."
         )
+
+    # READINESS PREFLIGHT — FAIL FAST, NEVER LOOP. If the base image is missing
+    # (our current deferred state has no base download_url), this is a permanent
+    # condition, not a transient "download in progress": return a hard terminal
+    # error the caller must not retry, with the exact images_dir + fix.
+    ready, rep = _qemu_readiness_check()
+    if not ready:
+        images_dir = rep.get("images_dir", "<unknown>")
+        missing = rep.get("missing_files") or []
+        return {"error": (
+            "FATAL: omnidroid is not ready — the base image is missing and there "
+            "is no configured base download source. This is NOT a transient "
+            "condition (nothing is downloading); DO NOT retry ensure_emulator_running.\n"
+            f"  engine   : {_exe}\n"
+            f"  config   : {rep.get('config', '<unknown>')}\n"
+            f"  images_dir: {images_dir}\n"
+            f"  missing  : {', '.join(missing) if missing else '(see doctor)'}\n"
+            "Fix: place base_x86.qcow2 + base_x86.kernel + base_x86.initrd.img "
+            f"in {images_dir} (or set a base download URL), then run again."
+        )}
 
     try:
         acct = _qemu_get_account(name)
