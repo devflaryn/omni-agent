@@ -55,7 +55,7 @@ import sys
 import time
 
 from tool_registry import registry
-from tools.common import resolve_workspace_path, find_android_sdk_tools, find_ldplayer_tools
+from tools.common import resolve_workspace_path, find_android_sdk_tools
 from tools._emulator_frame_capture import capture_keyframes
 from tools._emulator_vision_analyze import analyze_session
 from llm import get_openai_endpoint_config
@@ -161,17 +161,19 @@ def _engine_project_dir(path):
 def _find_qemu_manager():
     """Locate the omnidroid engine. Returns (engine_path, project_dir).
 
-    Resolution order (DEV agent calls omnidroid from the canonical checkout the
-    SAME way omni-executor does — architecture principle: omnidroid is the hub):
-      1. QEMU_MANAGER_PATH env override (a .py or an exe).
-      2. **Canonical sibling checkout** `<Omni Apps>/omnidroid/manager/omni.py`
-         — the arch-aware, contract-compliant engine whose config points at the
-         external images dir (OmniImages). Run with the current interpreter.
-      3. Bundled `tools/omnidroid/omnidroid.exe` — the shipping fallback. NOTE:
-         the currently bundled exe is a STALE pre-contract build with a stale
-         config (see HANDOFF "omni-executor packaging" / bundle rebuild TODO);
-         it is intentionally NOT preferred over the canonical checkout.
+    Resolution order — the agent is SELF-CONTAINED: it funnels through its own
+    bundled omnidroid service (tools/omnidroid), which is rebuilt from the
+    canonical engine (contract-compliant, clean config -> OmniImages, own ./qemu).
+      1. QEMU_MANAGER_PATH env override (a .py or an exe) — explicit override.
+      2. **Bundled `tools/omnidroid/omnidroid.exe`** — the agent's own engine.
+      3. Canonical sibling checkout `<Omni Apps>/omnidroid/manager/omni.py` —
+         dev fallback when the bundle isn't present (run with this interpreter).
       4. Root `qemu-manager.exe`, then PATH.
+    Staleness is caught LOUDLY, never silently: _ensure_qemu_running logs which
+    engine it drives, the version handshake flags a contract mismatch, and the
+    doctor preflight FAILS FAST on a missing base (no download-wait loop). When
+    the engine changes, rebuild the bundle (build-exe.ps1 -> copy exe + config +
+    qemu into tools/omnidroid) — see HANDOFF "bundled engine rebuild".
     """
     is_nt = os.name == "nt"
     tools_dir = os.path.dirname(os.path.abspath(__file__))
@@ -181,11 +183,11 @@ def _find_qemu_manager():
     env = os.environ.get("QEMU_MANAGER_PATH")
     if env:
         candidates.append(env)
-    # Canonical hub: the omnidroid checkout that sits beside omni-agent.
-    candidates.append(os.path.join(workspace_root, "omnidroid", "manager", "omni.py"))
-    # Shipping fallback: the bundled service exe (stale until the bundle is rebuilt).
+    # The agent's own bundled service engine (self-contained).
     candidates.append(os.path.join(tools_dir, "omnidroid",
                                    "omnidroid.exe" if is_nt else "omnidroid"))
+    # Dev fallback: the canonical omnidroid checkout beside omni-agent.
+    candidates.append(os.path.join(workspace_root, "omnidroid", "manager", "omni.py"))
     candidates.append(os.path.join(repo_root,
                                    "qemu-manager.exe" if is_nt else "qemu-manager"))
     for cand in candidates:
@@ -506,99 +508,6 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
         log.append("WARNING: libndk ARM bridge did NOT verify — arm64-only APKs may fail to run.")
     log.append(f"BOOT_OK (serial={serial or 'unknown'})")
     return {"stdout": "\n".join(log)}
-
-
-# --------------------------------------------------------------------------
-# LDPlayer control (ldconsole.exe) helpers
-# --------------------------------------------------------------------------
-
-def _ld_list_instances(ldconsole):
-    """Parses `ldconsole.exe list2` (index,title,top_hwnd,bind_hwnd,
-    android_started,pid,vbox_pid,width,height,dpi) into a list of dicts."""
-    res = _run([ldconsole, "list2"], timeout=15)
-    instances = []
-    for line in (res.get("stdout") or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        try:
-            idx = int(parts[0])
-        except ValueError:
-            continue
-        instances.append({
-            "index": idx,
-            "name": parts[1],
-            "android_started": parts[4] == "1",
-            "pid": parts[5] if len(parts) > 5 else None,        # dnplayer.exe launcher process
-            "vbox_pid": parts[6] if len(parts) > 6 else None,   # the actual VM process — its adb port is discovered from THIS pid
-        })
-    return instances
-
-
-def _ld_find_instance(ldconsole, name):
-    for inst in _ld_list_instances(ldconsole):
-        if inst["name"] == name:
-            return inst
-    return None
-
-
-def _ld_discover_port(vbox_pid, index):
-    """Finds the TCP port LDPlayer actually bound for this instance's ADB
-    bridge, by looking at which port its VM process (vbox_pid) is LISTENING
-    on via Windows' netstat.
-
-    This is used INSTEAD OF a fixed port formula on purpose: the commonly
-    cited "5555 + 2*index" scheme (used by older LDPlayer 4.x automation
-    guides) does NOT hold for every LDPlayer 9.x install — verified
-    empirically against a real install where the actual bound port was a
-    completely different value discoverable only this way. Falls back to
-    the classic formula only if netstat-based discovery finds nothing (e.g.
-    running under a restricted account without netstat access).
-    """
-    if vbox_pid:
-        try:
-            res = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=15)
-            candidates = []
-            for line in res.stdout.splitlines():
-                parts = line.split()
-                if len(parts) < 4 or parts[0] != "TCP" or parts[-2] != "LISTENING":
-                    continue
-                if parts[-1] != str(vbox_pid):
-                    continue
-                addr = parts[1]
-                if ":" not in addr:
-                    continue
-                try:
-                    candidates.append(int(addr.rsplit(":", 1)[1]))
-                except ValueError:
-                    continue
-            if candidates:
-                # Prefer a port that actually looks like an adb-ish port if
-                # there are several; otherwise just take whatever was found.
-                for p in candidates:
-                    if p == 2222 or 5555 <= p <= 5700:
-                        return p
-                return candidates[0]
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-    return 5555 + index * 2
-
-
-def _resolve_adb_path(ldplayer_adb=None):
-    """Prefer the Android SDK's adb.exe (more consistently up to date);
-    fall back to LDPlayer's own bundled adb.exe if the SDK isn't found."""
-    try:
-        return find_android_sdk_tools()["adb"], None
-    except RuntimeError as sdk_err:
-        if ldplayer_adb:
-            return ldplayer_adb, None
-        return None, {"error": (
-            "No adb.exe found: neither the Android SDK's platform-tools nor LDPlayer's own bundled "
-            f"adb.exe are available. ({sdk_err})"
-        )}
 
 
 def _resolve_serial(backend, device_name=None):
