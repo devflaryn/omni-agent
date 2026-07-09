@@ -21,22 +21,44 @@ def get_workspace_host_path():
 
 
 def setup_sandbox(project_workspace_dir):
-    """Builds and starts the Docker sandbox if it isn't running, attaching the specific project workspace."""
-    global _workspace_host_path
-    print(f"[Docker] Checking sandbox environment for workspace: {project_workspace_dir}...")
+    """Build the sandbox image and (re)start the container with
+    project_workspace_dir BIND-MOUNTED at /workspace.
 
-    # Ensure the project workspace folder exists. All project files live here directly.
+    project_workspace_dir is the folder the USER PICKED at runtime — its own
+    project root, mounted directly (no copy-in). Selecting a different folder
+    just calls this again to re-run the container against the new mount. All
+    build/test dependencies live in the container, so nothing installs on the
+    host. Raises RuntimeError with an actionable message on any failure (Docker
+    missing/stopped, image build, a non-Docker-shareable path, container start)
+    rather than killing the process."""
+    global _workspace_host_path
     os.makedirs(project_workspace_dir, exist_ok=True)
     _workspace_host_path = os.path.abspath(project_workspace_dir)
+    print(f"[Docker] Preparing sandbox for workspace: {_workspace_host_path}")
 
     try:
-        print("[Docker] Ensuring image is up to date (will use cache if unchanged)...")
+        print("[Docker] Building image (cached if unchanged)...")
         subprocess.run(["docker", "build", "-t", IMAGE_NAME, "."], check=True)
 
-        # Check if container is running. If it is, kill it so we can mount the NEW project workspace
-        subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], stderr=subprocess.DEVNULL)
+        # One-line PREFLIGHT: is the picked host folder Docker-shareable? Docker
+        # Desktop only bind-mounts folders on shared drives; an unshared path
+        # otherwise fails with a cryptic mount error when the real container
+        # starts. A quick throwaway run surfaces a clear message instead.
+        pf = subprocess.run(
+            ["docker", "run", "--rm", "-v", f"{_workspace_host_path}:/pf",
+             IMAGE_NAME, "test", "-d", "/pf"],
+            capture_output=True, text=True)
+        if pf.returncode != 0:
+            raise RuntimeError(
+                f"The selected folder is not Docker-shareable:\n  {_workspace_host_path}\n"
+                "Enable file sharing for its drive in Docker Desktop "
+                "(Settings -> Resources -> File Sharing), or pick a folder on a "
+                f"shared drive.\nDocker said: {(pf.stderr or pf.stdout).strip()[:300]}")
 
-        print(f"[Docker] Starting sandbox container for this project: {CONTAINER_NAME}")
+        # Kill any prior container so we can mount the NEW picked folder.
+        subprocess.run(["docker", "rm", "-f", CONTAINER_NAME], stderr=subprocess.DEVNULL)
+        print(f"[Docker] Starting container {CONTAINER_NAME} "
+              f"(mount {_workspace_host_path} -> /workspace)")
         subprocess.run([
             "docker", "run", "-d",
             "--name", CONTAINER_NAME,
@@ -46,10 +68,11 @@ def setup_sandbox(project_workspace_dir):
         ], check=True)
 
     except FileNotFoundError:
-        print("\n[ERROR] Docker is not installed or not running.")
-        print("Please ensure Docker Desktop is installed and currently running on your Windows machine.")
-        print("You can download it from: https://docs.docker.com/desktop/install/windows-install/")
-        exit(1)
+        raise RuntimeError(
+            "Docker is not installed or not running. Install and start Docker "
+            "Desktop, then try again: https://docs.docker.com/desktop/")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Docker sandbox build/start failed: {e}")
 
 DEFAULT_TIMEOUT = 60  # seconds; callers can override for long-running tools
 

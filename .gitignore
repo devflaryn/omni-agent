@@ -27,3 +27,6 @@ workspace/*
 !workspace/.gitkeep
 memory/*
 !memory/.gitkeep
+
+# Runtime: last-used/recent picked workspace folders (Part 2 redesign)
+agent_workspaces.json

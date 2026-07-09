@@ -843,14 +843,22 @@ function onSessionEnded() {
 // ---------- start screen ----------
 async function loadStartScreen() {
   try {
-    const projects = await pywebview.api.get_projects();
+    // A "project" is now a host folder you picked. get_projects returns the
+    // recently-used folders {label, path} + the last-used default.
+    const res = await pywebview.api.get_projects();
+    const recent = (res && res.recent) || [];
     const projSel = $('projectSelect');
     projSel.innerHTML = '';
-    projects.forEach(p => {
-      const o = document.createElement('option'); o.value = p; o.textContent = p; projSel.appendChild(o);
+    recent.forEach(r => {
+      const o = document.createElement('option');
+      o.value = r.path; o.textContent = r.label + '  —  ' + r.path; o.title = r.path;
+      projSel.appendChild(o);
     });
-    if (!projects.length) {
-      const o = document.createElement('option'); o.textContent = '(no projects yet)'; projSel.appendChild(o);
+    if (!recent.length) {
+      const o = document.createElement('option'); o.value = '';
+      o.textContent = '(no folders yet — click “Select folder”)'; projSel.appendChild(o);
+    } else if (res.last) {
+      projSel.value = res.last;
     }
   } catch (e) {
     $('startError').textContent = 'Failed to load: ' + e;
@@ -859,18 +867,39 @@ async function loadStartScreen() {
 
 async function startSession() {
   $('startError').textContent = '';
-  const project = $('projectSelect').value;
-  if (!project || project.startsWith('(')) {
-    $('startError').textContent = 'Pick a valid project.'; return;
+  const path = $('projectSelect').value;   // value is now an absolute folder path
+  if (!path || path.startsWith('(')) {
+    $('startError').textContent = 'Select a workspace folder first.'; return;
   }
   const btn = $('startSessionBtn'); btn.disabled = true; btn.textContent = 'Starting sandbox…';
   try {
-    const res = await pywebview.api.start_session(project);
+    const res = await pywebview.api.start_session(path);
     if (!res.ok) $('startError').textContent = res.error || 'Failed to start session.';
   } catch (e) {
     $('startError').textContent = '' + e;
   } finally {
     btn.disabled = false; btn.textContent = 'Start session';
+  }
+}
+
+// Pick a NEW workspace folder from the device (native dialog), mount it into the
+// container, then start the session on it. The picked folder is the project root.
+async function pickWorkspaceAndStart() {
+  $('startError').textContent = '';
+  const btn = $('newProjectBtn');
+  const prev = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Selecting + mounting…'; }
+  try {
+    const res = await pywebview.api.select_workspace();   // native picker + bind-mount
+    if (res && res.cancelled) return;
+    if (!res || !res.ok) { $('startError').textContent = (res && res.error) || 'Could not select folder.'; return; }
+    await loadStartScreen();
+    $('projectSelect').value = res.path;
+    await startSession();
+  } catch (e) {
+    $('startError').textContent = '' + e;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = prev; }
   }
 }
 
@@ -1614,13 +1643,9 @@ async function init() {
     if (st && st.active) await pywebview.api.restore_session();
   } catch (e) { /* stay on the start screen */ }
 
-  $('newProjectBtn').addEventListener('click', () => {
-    $('importFolderBox').classList.add('hidden'); $('importFolderBox').classList.remove('flex');
-    const box = $('newProjectBox');
-    box.classList.toggle('hidden');
-    box.classList.toggle('flex');
-    if (!box.classList.contains('hidden')) $('newProjectInput').focus();
-  });
+  // "Select folder": pick a host folder at runtime, mount it, and start on it.
+  // No fixed workspace, no copy-in. (Import-from-folder button was removed.)
+  $('newProjectBtn').addEventListener('click', pickWorkspaceAndStart);
   $('createProjectConfirm').addEventListener('click', async () => {
     const name = $('newProjectInput').value.trim();
     if (!name) return;
@@ -1635,16 +1660,16 @@ async function init() {
 
   $('deleteProjectBtn').addEventListener('click', async () => {
     $('startError').textContent = '';
-    const project = $('projectSelect').value;
-    if (!project || project.startsWith('(')) {
-      $('startError').textContent = 'Pick a valid project to delete.'; return;
+    const path = $('projectSelect').value;
+    if (!path || path.startsWith('(')) {
+      $('startError').textContent = 'Select a workspace folder to forget.'; return;
     }
-    if (!confirm(`Delete workspace "${project}"?\n\nThis permanently removes its files and saved conversation. This cannot be undone.`)) return;
+    if (!confirm(`Forget workspace "${path}"?\n\nThis removes it from the recent list and deletes its saved chat. Your folder on disk is NOT touched.`)) return;
     const btn = $('deleteProjectBtn'); btn.disabled = true;
     try {
-      const res = await pywebview.api.delete_workspace(project);
+      const res = await pywebview.api.delete_workspace(path);
       if (res.ok) await loadStartScreen();
-      else $('startError').textContent = res.error || 'Failed to delete workspace.';
+      else $('startError').textContent = res.error || 'Failed to forget workspace.';
     } catch (e) {
       $('startError').textContent = '' + e;
     } finally {
@@ -1652,14 +1677,8 @@ async function init() {
     }
   });
 
-  $('importFolderBtn').addEventListener('click', () => {
-    $('newProjectBox').classList.add('hidden'); $('newProjectBox').classList.remove('flex');
-    const box = $('importFolderBox');
-    box.classList.toggle('hidden');
-    box.classList.toggle('flex');
-  });
-  $('importBrowseBtn').addEventListener('click', browseImportFolder);
-  $('importConfirmBtn').addEventListener('click', confirmImport);
+  // Import-from-folder is gone (the picked folder is mounted + edited in place,
+  // no copy). The "Select folder" button above is the single entry point.
 
   $('startSessionBtn').addEventListener('click', startSession);
 

@@ -186,15 +186,14 @@
 
       <div class="mb-6">
         <div class="mb-1.5 flex items-center justify-between">
-          <span class="text-[11px] uppercase tracking-wider text-term-muted">Project workspace</span>
+          <span class="text-[11px] uppercase tracking-wider text-term-muted">Workspace folder</span>
           <div class="flex items-center gap-3">
-            <button id="importFolderBtn" class="text-[11px] text-term-cyan hover:underline">import from folder</button>
-            <button id="newProjectBtn" class="text-[11px] text-term-cyan hover:underline">+ new project</button>
+            <button id="newProjectBtn" class="text-[11px] text-term-cyan hover:underline">Select folder…</button>
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <select id="projectSelect" class="w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan"></select>
-          <button id="deleteProjectBtn" title="Delete selected workspace" class="shrink-0 rounded-xl border border-term-line px-3 py-2.5 text-term-muted hover:border-term-red hover:text-term-red">delete</button>
+          <select id="projectSelect" title="Recently used workspace folders" class="w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan"></select>
+          <button id="deleteProjectBtn" title="Forget this folder (removes it from the list + its saved chat; does NOT delete the folder)" class="shrink-0 rounded-xl border border-term-line px-3 py-2.5 text-term-muted hover:border-term-red hover:text-term-red">forget</button>
         </div>
 
         <div id="newProjectBox" class="mt-2 hidden gap-2">

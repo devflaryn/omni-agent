@@ -36,8 +36,84 @@ from tool_registry import registry
 import planning
 import tools  # Triggers the __init__.py which loads all tool categories
 
-WORKSPACE_DIR = "./workspace"
 MEMORY_DIR = "./memory"
+
+# --- Workspace selection (Part 2 redesign) -----------------------------------
+# There is NO fixed workspace folder any more. The user PICKS a host folder at
+# runtime (native folder dialog); that folder IS the project root (no
+# project-subfolder layer) and is bind-mounted straight into the Docker
+# sandbox. The last-used pick is persisted so it's the default next launch, but
+# the user can always re-pick. Conversation/memory is kept OUTSIDE the picked
+# folder, under MEMORY_DIR keyed by the folder's absolute path.
+_WS_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "agent_workspaces.json")
+_active_workspace = None  # abspath of the currently selected folder, or None
+
+
+def _load_ws_settings():
+    try:
+        with open(_WS_SETTINGS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_ws_settings(d):
+    try:
+        with open(_WS_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except OSError as e:
+        print(f"[WARNING] Could not persist workspace settings: {e}")
+
+
+def _ws_label(path):
+    return os.path.basename(os.path.normpath(path)) or path
+
+
+def set_active_workspace(path):
+    """Make `path` the active workspace root and persist it as last-used + in
+    the recent list. Returns its abspath."""
+    global _active_workspace
+    ap = os.path.abspath(path)
+    _active_workspace = ap
+    s = _load_ws_settings()
+    s["last"] = ap
+    recent = [r for r in s.get("recent", [])
+              if isinstance(r, dict) and r.get("path") != ap]
+    recent.insert(0, {"label": _ws_label(ap), "path": ap})
+    s["recent"] = recent[:12]
+    _save_ws_settings(s)
+    return ap
+
+
+def active_workspace():
+    """The active workspace root (abspath). On a fresh process, falls back to
+    the persisted last-used folder if it still exists. Raises RuntimeError if
+    nothing has ever been picked (the caller surfaces 'pick a folder first')."""
+    global _active_workspace
+    if _active_workspace:
+        return _active_workspace
+    last = _load_ws_settings().get("last")
+    if last and os.path.isdir(last):
+        _active_workspace = os.path.abspath(last)
+        return _active_workspace
+    raise RuntimeError("No workspace selected yet — pick a folder first.")
+
+
+def _project_root(project=None):
+    """Absolute host root of the active project. The PICKED FOLDER IS THE ROOT
+    (no project-subfolder layer). `project` is accepted for call-site
+    compatibility but ignored — there is one active picked folder."""
+    return active_workspace()
+
+
+def _memory_dir_for(root):
+    """Per-folder conversation/memory dir, kept OUTSIDE the picked folder and
+    keyed by its absolute path so two same-named folders never collide."""
+    ap = os.path.abspath(root)
+    key = _ws_label(ap) + "-" + hashlib.md5(ap.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(MEMORY_DIR, key)
 MAX_STEPS_BEFORE_SUMMARY = 500
 # The target model has a 1M-token context window (~4M chars at 4 chars/token).
 # Only reset once we've consumed most of it, leaving headroom for the system
@@ -289,8 +365,12 @@ def _tree_signature(tree):
 
 
 def build_file_tree(project_name):
-    """Builds a nested file-tree dict of a project workspace (host side)."""
-    root = os.path.join(WORKSPACE_DIR, project_name)
+    """Builds a nested file-tree dict of the active workspace (host side).
+    The picked folder is the root (no project-subfolder layer)."""
+    try:
+        root = _project_root(project_name)
+    except RuntimeError:
+        return {"name": project_name or "workspace", "path": "", "type": "dir", "children": []}
 
     def walk(path, rel, depth):
         name = os.path.basename(path) or project_name
@@ -346,8 +426,12 @@ def _resolve_project_file(project_name, rel_path):
     if not rel_path:
         return None, None, "No path provided."
     rel = rel_path.lstrip("/").lstrip("\\")
-    root = os.path.abspath(os.path.join(WORKSPACE_DIR, project_name))
+    try:
+        root = os.path.abspath(_project_root(project_name))
+    except RuntimeError as e:
+        return None, None, str(e)
     full = os.path.abspath(os.path.join(root, rel))
+    # Traversal guard anchored to the PICKED root: never resolve outside it.
     if not full.startswith(root + os.sep) and full != root:
         return None, None, "Path outside workspace."
     if not os.path.isfile(full):
@@ -624,49 +708,65 @@ class AgentApi:
 
     # --- public API (called from JS) ----------------------------------------
     def get_projects(self):
-        os.makedirs(WORKSPACE_DIR, exist_ok=True)
+        """Recently-used workspace folders (label + abspath), most-recent first,
+        plus the persisted last-used default. A 'project' is now just a host
+        folder you picked (no fixed workspace dir)."""
+        s = _load_ws_settings()
+        recent = [r for r in s.get("recent", [])
+                  if isinstance(r, dict) and r.get("path") and os.path.isdir(r["path"])]
+        return {"ok": True, "recent": recent, "last": s.get("last")}
+
+    def select_workspace(self, path=None):
+        """Pick (or accept) a host folder to use as the workspace ROOT: validate
+        it, persist it as last-used, and bind-mount it into the Docker sandbox
+        (the mount step also runs the Docker-shareable preflight). Selecting a
+        new folder re-runs the container against the new mount. Pass an explicit
+        `path` to skip the dialog (recent list / automation)."""
+        if not path:
+            picked = self.pick_folder()
+            if not picked.get("ok"):
+                return picked
+            path = picked.get("path")
+            if not path:
+                return {"ok": True, "cancelled": True}
+        if not os.path.isdir(path):
+            return {"ok": False, "error": f"Not a folder: {path}"}
+        root = set_active_workspace(path)
+        self._emit({"type": "log", "content": f"[Sandbox] Mounting {root} into the container..."})
         try:
-            projects = [d for d in os.listdir(WORKSPACE_DIR) if os.path.isdir(os.path.join(WORKSPACE_DIR, d))]
-        except OSError:
-            projects = []
-        projects.sort()
-        return projects
+            setup_sandbox(root)   # bind-mount + Docker-shareable preflight
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "path": root, "label": _ws_label(root)}
 
     def create_project(self, name):
-        name = (name or "").strip()
-        if not name:
-            return {"ok": False, "error": "Project name cannot be empty."}
-        if any(c in name for c in ('/', '\\', ':', '*', '?', '"', '<', '>', '|')):
-            return {"ok": False, "error": "Project name contains invalid characters."}
-        project_dir = os.path.join(WORKSPACE_DIR, name)
-        os.makedirs(project_dir, exist_ok=True)
-        return {"ok": True, "project": name}
+        """Deprecated in the picked-folder model — kept so old UI calls fail
+        cleanly instead of tracebacking."""
+        return {"ok": False,
+                "error": "Projects are folders now — use 'Select workspace folder' to pick one."}
 
-    def delete_workspace(self, name):
-        """Permanently removes a project's workspace files AND its saved
-        conversation/transcript memory. Refuses if that project has a live
-        session — end it first. This is irreversible; the frontend confirms
-        with the user before calling."""
-        name = (name or "").strip()
-        if not name:
-            return {"ok": False, "error": "Project name cannot be empty."}
-        if any(c in name for c in ('/', '\\', ':', '*', '?', '"', '<', '>', '|')):
-            return {"ok": False, "error": "Project name contains invalid characters."}
-        if self.session and self.session.get("project") == name:
-            return {"ok": False, "error": f"'{name}' has an active session — end it before deleting."}
-
-        project_dir = os.path.join(WORKSPACE_DIR, name)
-        memory_dir = os.path.join(MEMORY_DIR, name)
-        if not os.path.isdir(project_dir) and not os.path.isdir(memory_dir):
-            return {"ok": False, "error": f"Project '{name}' not found."}
-
-        for target in (project_dir, memory_dir):
-            if os.path.isdir(target):
-                try:
-                    shutil.rmtree(target)
-                except OSError as e:
-                    return {"ok": False, "error": f"Failed to delete '{name}': {e}"}
-        return {"ok": True, "project": name}
+    def delete_workspace(self, path=None):
+        """Forget a workspace: drop it from the recent list and delete its
+        agent-side conversation/memory. Does NOT touch the user's picked folder
+        on disk — that is their real project."""
+        path = (path or "").strip()
+        if not path:
+            return {"ok": False, "error": "No workspace path given."}
+        ap = os.path.abspath(path)
+        if self.session and self.session.get("root") == ap:
+            return {"ok": False, "error": "That workspace has an active session — end it first."}
+        s = _load_ws_settings()
+        s["recent"] = [r for r in s.get("recent", []) if r.get("path") != ap]
+        if s.get("last") == ap:
+            s["last"] = s["recent"][0]["path"] if s["recent"] else None
+        _save_ws_settings(s)
+        mem = _memory_dir_for(ap)
+        if os.path.isdir(mem):
+            try:
+                shutil.rmtree(mem)
+            except OSError as e:
+                return {"ok": False, "error": f"Removed from list but memory cleanup failed: {e}"}
+        return {"ok": True, "path": ap}
 
     # --- workspace import / export -------------------------------------------
     def pick_folder(self):
@@ -684,55 +784,20 @@ class AgentApi:
         path = result[0] if isinstance(result, (list, tuple)) else result
         return {"ok": True, "path": path}
 
-    def import_workspace(self, project_name, source_path):
-        """Creates a NEW project by copying an external folder's contents
-        into it — the agent only ever edits this copy, inside the sandbox,
-        never the original folder directly. Records a content-hash baseline
-        at copy time so compute_export_diff/export_workspace can later apply
-        an exact diff back out, rather than a blind overwrite."""
-        project_name = (project_name or "").strip()
-        if not project_name:
-            return {"ok": False, "error": "Project name cannot be empty."}
-        if any(c in project_name for c in ('/', '\\', ':', '*', '?', '"', '<', '>', '|')):
-            return {"ok": False, "error": "Project name contains invalid characters."}
-        if not source_path or not os.path.isdir(source_path):
-            return {"ok": False, "error": f"Source folder not found: {source_path}"}
-
-        project_dir = os.path.join(WORKSPACE_DIR, project_name)
-        if os.path.exists(project_dir) and os.listdir(project_dir):
-            return {"ok": False, "error": f"Project '{project_name}' already exists and isn't empty — choose a new project name for this import."}
-
-        try:
-            os.makedirs(project_dir, exist_ok=True)
-            for entry in os.listdir(source_path):
-                src = os.path.join(source_path, entry)
-                dst = os.path.join(project_dir, entry)
-                if os.path.isdir(src):
-                    shutil.copytree(src, dst)
-                else:
-                    shutil.copy2(src, dst)
-        except OSError as e:
-            return {"ok": False, "error": f"Copy failed: {e}"}
-
-        baseline = _snapshot_baseline(project_dir)
-        meta = {
-            "source_path": os.path.abspath(source_path),
-            "imported_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "baseline": baseline,
-        }
-        try:
-            with open(os.path.join(project_dir, IMPORT_META_FILENAME), "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2)
-        except OSError as e:
-            return {"ok": False, "error": f"Copied {len(baseline)} file(s) but failed to save import metadata: {e}"}
-
-        return {"ok": True, "project": project_name, "file_count": len(baseline)}
+    def import_workspace(self, project_name=None, source_path=None):
+        """Deprecated: the agent no longer copies an external folder into a fixed
+        workspace. Pick the folder directly with select_workspace — it is
+        mounted into the container and edited in place, so there is nothing to
+        copy in or export back out."""
+        return {"ok": False,
+                "error": "Import/copy is gone — pick the folder itself with "
+                         "'Select workspace folder'; it is mounted and edited in place."}
 
     def get_import_status(self, project_name=None):
-        project_name = project_name or (self.session["project"] if self.session else None)
-        if not project_name:
-            return {"ok": False, "error": "No project specified and no active session."}
-        meta = _read_import_meta(os.path.join(WORKSPACE_DIR, project_name))
+        try:
+            meta = _read_import_meta(_project_root(project_name))
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
         if meta is None:
             return {"ok": True, "imported": False}
         return {"ok": True, "imported": True, **meta}
@@ -745,9 +810,12 @@ class AgentApi:
         project_name = project_name or (self.session["project"] if self.session else None)
         if not project_name:
             return {"ok": False, "error": "No project specified and no active session."}
-        project_dir = os.path.join(WORKSPACE_DIR, project_name)
+        try:
+            project_dir = _project_root(project_name)
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
         if not os.path.isdir(project_dir):
-            return {"ok": False, "error": f"Project '{project_name}' not found."}
+            return {"ok": False, "error": "Workspace folder no longer exists."}
 
         meta_path = os.path.join(project_dir, IMPORT_META_FILENAME)
         baseline = {}
@@ -774,9 +842,12 @@ class AgentApi:
         project_name = project_name or (self.session["project"] if self.session else None)
         if not project_name:
             return {"ok": False, "error": "No project specified and no active session."}
-        project_dir = os.path.join(WORKSPACE_DIR, project_name)
+        try:
+            project_dir = _project_root(project_name)
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
         if not os.path.isdir(project_dir):
-            return {"ok": False, "error": f"Project '{project_name}' not found."}
+            return {"ok": False, "error": "Workspace folder no longer exists."}
         if not target_path:
             return {"ok": False, "error": "No target folder given."}
         try:
@@ -875,19 +946,33 @@ class AgentApi:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def start_session(self, project_name):
-        project_dir = os.path.join(WORKSPACE_DIR, project_name)
-        memory_dir = os.path.join(MEMORY_DIR, project_name)
-        os.makedirs(project_dir, exist_ok=True)
+    def start_session(self, project=None):
+        # `project` may be an absolute folder path (recent list / just-picked
+        # folder) or None (use the active/last-used workspace).
+        if project and os.path.isdir(project):
+            set_active_workspace(project)
+        try:
+            root = active_workspace()
+        except RuntimeError as e:
+            return {"ok": False, "error": str(e)}
+        project_name = _ws_label(root)
+        memory_dir = _memory_dir_for(root)
         os.makedirs(memory_dir, exist_ok=True)
 
-        self._emit({"type": "log", "content": f"[Sandbox] Preparing Docker environment for '{project_name}'..."})
+        # Ensure the picked folder is mounted. Skip if select_workspace already
+        # mounted this exact root (avoids rebuilding/re-running the container
+        # twice for the same folder).
         try:
-            setup_sandbox(project_dir)
-        except SystemExit as e:
-            return {"ok": False, "error": f"Docker sandbox failed to start (exit {e}). Is Docker Desktop running?"}
-        except Exception as e:
-            return {"ok": False, "error": f"Docker sandbox failed to start: {e}"}
+            from docker_sandbox import get_workspace_host_path
+            already_mounted = (get_workspace_host_path() == root)
+        except Exception:
+            already_mounted = False
+        if not already_mounted:
+            self._emit({"type": "log", "content": f"[Sandbox] Mounting {root} into the container..."})
+            try:
+                setup_sandbox(root)
+            except Exception as e:
+                return {"ok": False, "error": f"Docker sandbox failed to start: {e}"}
         self._emit({"type": "log", "content": "[Sandbox] Container is ready."})
 
         base_system_prompt = get_full_system_prompt()
@@ -918,6 +1003,7 @@ class AgentApi:
 
         self.session = {
             "project": project_name,
+            "root": root,
             "messages": messages,
             "base_system_prompt": base_system_prompt,
             "memory_dir": memory_dir,
@@ -951,7 +1037,7 @@ class AgentApi:
             planning.clear_active_plan(notify=False)
 
         self._emit_session_started()
-        return {"ok": True, "project": project_name}
+        return {"ok": True, "project": project_name, "root": root}
 
     def _emit_session_started(self):
         """Push the current session to the GUI (used on a fresh start AND when
@@ -966,7 +1052,7 @@ class AgentApi:
             "project": project,
             "memory_summary": s.get("last_summary", ""),
             "file_tree": build_file_tree(project),
-            "import_source": _read_import_meta(os.path.join(WORKSPACE_DIR, project)),
+            "import_source": _read_import_meta(s.get("root", "")),
             "transcript": s.get("transcript", []),
             "busy": self._busy,
         })
@@ -1085,9 +1171,8 @@ class AgentApi:
         if self._window is None:
             return {"ok": False, "error": "Window not ready."}
 
-        # Resolve + sandbox the destination to inside the project root.
-        project = self.session["project"]
-        root = os.path.abspath(os.path.join(WORKSPACE_DIR, project))
+        # Resolve + sandbox the destination to inside the PICKED project root.
+        root = os.path.abspath(self.session.get("root") or _project_root())
         rel = (dest_dir or "").strip().lstrip("/").lstrip("\\").replace("\\", "/")
         dest_abs = os.path.abspath(os.path.join(root, *rel.split("/"))) if rel else root
         if dest_abs != root and not dest_abs.startswith(root + os.sep):
@@ -1135,8 +1220,7 @@ class AgentApi:
         """
         if not self.session:
             return {"ok": False, "error": "No active session."}
-        project = self.session["project"]
-        cg_root = os.path.join(WORKSPACE_DIR, project, ".codegraph")
+        cg_root = os.path.join(self.session.get("root") or _project_root(), ".codegraph")
 
         # Enumerate the available graphs (id -> directory + summary for the UI).
         dirs = {}
