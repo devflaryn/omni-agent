@@ -61,11 +61,50 @@ def _sanitize_graph_id(gid):
     return gid[:64] or "default"
 
 
+def _fs_path(path):
+    r"""Return a filesystem path safe to open/create even when it exceeds the
+    260-char MAX_PATH limit.
+
+    On Windows, deeply nested decompiled trees (e.g. smali under long
+    com/google/... packages) routinely blow past MAX_PATH; unless the host has
+    long-path support turned on, os.walk/open then fail and the whole build
+    dies. Prefixing an absolute path with the extended-length marker (\\?\)
+    lifts that limit regardless of the OS setting. No-op on POSIX (the Docker
+    sandbox) and for paths that are already prefixed."""
+    if os.name != "nt" or not path:
+        return path
+    if path.startswith("\\\\?\\"):
+        return path
+    ap = os.path.abspath(path)
+    if ap.startswith("\\\\"):            # UNC \\server\share -> \\?\UNC\server\share
+        return "\\\\?\\UNC\\" + ap[2:]
+    return "\\\\?\\" + ap
+
+
+def _strip_ext_prefix(p):
+    r"""Drop a Windows extended-length prefix from an already slash-normalized
+    path (\\?\ becomes //?/ after replacing backslashes), so stripped
+    descriptors stay clean and comparable to WORKSPACE."""
+    if p.startswith("//?/UNC/"):
+        return "//" + p[len("//?/UNC/"):]
+    if p.startswith("//?/"):
+        return p[len("//?/"):]
+    return p
+
+
 def strip_workspace(path):
     # Normalize to forward slashes so descriptors/shard keys are separator-stable
     # regardless of host OS (the sandbox is Linux; host unit tests run on Windows).
-    path = path.replace("\\", "/")
-    prefix = WORKSPACE.replace("\\", "/").rstrip("/") + "/"
+    # Also drop any extended-length prefix so a \\?\-walked path still matches
+    # the (unprefixed) WORKSPACE root.
+    path = _strip_ext_prefix(path.replace("\\", "/"))
+    base = _strip_ext_prefix(WORKSPACE.replace("\\", "/").rstrip("/"))
+    if path == base:
+        # The root IS the workspace itself (a whole-workspace build) — record it
+        # as "." rather than the full absolute path, so the graph index / UI
+        # selector reads cleanly instead of showing a giant host path.
+        return "."
+    prefix = base + "/"
     if path.startswith(prefix):
         return path[len(prefix):]
     return path
@@ -90,9 +129,9 @@ def _shard_key(descriptor):
 def _write_json(path, data):
     """Write JSON with compact separators to keep file sizes small."""
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
+    with open(_fs_path(tmp), "w", encoding="utf-8") as fh:
         json.dump(data, fh, separators=(",", ":"), ensure_ascii=False)
-    os.replace(tmp, path)
+    os.replace(_fs_path(tmp), _fs_path(path))
 
 
 # --- Smali parsing (unchanged semantics, factored into a helper) -------------
@@ -109,7 +148,7 @@ def _parse_smali_file(path, rel, classes, calls, string_refs):
     This is the exact original smali logic, just extracted so main() can dispatch
     smali and general-source files through their own parsers."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        with open(_fs_path(path), encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
     except Exception:
         return
@@ -243,7 +282,7 @@ def _skip_source(full_path, fname):
     if low.endswith((".min.js", ".min.css", ".bundle.js", ".map", ".d.ts")):
         return True
     try:
-        if os.path.getsize(full_path) > _SOURCE_MAX_BYTES:
+        if os.path.getsize(_fs_path(full_path)) > _SOURCE_MAX_BYTES:
             return True
     except OSError:
         return True
@@ -568,7 +607,7 @@ def _parse_ruby(rel, lines, classes, source_methods, defindex, string_refs):
 
 def _parse_source_file(path, rel, kind, classes, source_methods, defindex, string_refs):
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        with open(_fs_path(path), encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
     except Exception:
         return
@@ -607,7 +646,7 @@ def _update_graph_index(graph_id, root, meta):
     discoverable (by the query engine, the diff tool and the frontend selector)."""
     idx = {}
     try:
-        with open(GRAPH_INDEX_PATH, encoding="utf-8") as fh:
+        with open(_fs_path(GRAPH_INDEX_PATH), encoding="utf-8") as fh:
             loaded = json.load(fh)
         if isinstance(loaded, dict):
             idx = loaded
@@ -639,17 +678,20 @@ def main():
     meta_path = os.path.join(graph_dir, "meta.json")
     manifest_path = os.path.join(graph_dir, "manifest.json")
 
-    if not os.path.isdir(root):
+    if not os.path.isdir(_fs_path(root)):
         print("[code_graph] ERROR: root dir does not exist: %s" % root)
         sys.exit(0)
 
     # Collect indexable files in ONE walk: smali (Android) + ordinary source
     # (any large codebase). Skip vendored / build / VCS dirs and obviously
     # non-source blobs so a big repo doesn't drown the graph in noise.
+    # Walk the extended-length root so deeply nested trees (long smali package
+    # paths on Windows) are reachable even without OS long-path support; the
+    # yielded paths carry the prefix and strip_workspace() removes it again.
     smali_files = []
     source_files = []   # (path, kind)
     lang_counts = {}
-    for dp, dns, fn in os.walk(root):
+    for dp, dns, fn in os.walk(_fs_path(root)):
         dns[:] = [d for d in dns if d not in _SKIP_DIRS]
         for f in fn:
             full = os.path.join(dp, f)
@@ -672,7 +714,7 @@ def main():
             with open(manifest_path, encoding="utf-8") as fh:
                 manifest = json.load(fh)
             graph_mtime = manifest.get("built_at_ts", 0)
-            newest = max((os.path.getmtime(p) for p in indexed_paths), default=0)
+            newest = max((os.path.getmtime(_fs_path(p)) for p in indexed_paths), default=0)
             cached_count = manifest.get("indexed_count", manifest.get("smali_count"))
             if graph_mtime >= newest and cached_count == indexed_count:
                 with open(meta_path, encoding="utf-8") as fh:
@@ -720,7 +762,7 @@ def main():
     so_symbols = {}
     if include_so:
         so_files = []
-        for dp, _dn, fn in os.walk(root):
+        for dp, _dn, fn in os.walk(_fs_path(root)):
             for f in fn:
                 if f.endswith(".so"):
                     so_files.append(os.path.join(dp, f))
@@ -752,14 +794,14 @@ def main():
     so_sym_count = sum(len(v["exports"]) + len(v["imports"]) for v in so_symbols.values())
 
     # --- Write chunked graph files -------------------------------------------
-    os.makedirs(graph_dir, exist_ok=True)
+    os.makedirs(_fs_path(graph_dir), exist_ok=True)
 
     # Clean old files WITHIN THIS NAMESPACE only (other graphs are untouched),
     # including any legacy single graph.json.
-    for old in os.listdir(graph_dir):
+    for old in os.listdir(_fs_path(graph_dir)):
         if old.endswith(".json") or old.endswith(".json.tmp"):
             try:
-                os.remove(os.path.join(graph_dir, old))
+                os.remove(_fs_path(os.path.join(graph_dir, old)))
             except OSError:
                 pass
 

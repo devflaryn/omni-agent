@@ -2,7 +2,7 @@
 name: ssl-pinning-bypass
 description: Find and neutralize certificate/SSL pinning in an Android APK so the app accepts a proxy or self-signed certificate — covers Java TrustManager/HostnameVerifier code, OkHttp CertificatePinner, network_security_config.xml, and native pinning.
 when_to_use: Use this skill when the user wants to intercept/proxy an app's HTTPS traffic, needs to bypass "certificate pinning" or "SSL pinning" errors, or reports that a modified/re-signed APK fails to connect only over HTTPS (a strong signal of pinning rather than signature verification).
-allowed-tools: decompile_apk, search_smali, grep_file, read_file_chunk, write_file, patch_smali_method, build_apk, sign_apk, verify_apk
+allowed-tools: decode_apk, search_smali, grep_file, read_file_chunk, write_file, patch_smali_method, recompile_apk, sign_apk, verify_apk
 ---
 
 # SSL / Certificate Pinning Bypass Skill
@@ -10,7 +10,7 @@ allowed-tools: decompile_apk, search_smali, grep_file, read_file_chunk, write_fi
 Android apps validate TLS certificates in up to four independent places. You must check ALL of them — patching only one usually still leaves the connection blocked.
 
 ## Step 1 — Decompile
-`decompile_apk` is required — pinning logic lives in smali and in XML resources, not in whole files you could just swap. If the app is large, build a code graph first (see `code-graph-analysis`) so `string_refs` and `search_smali` stay fast.
+`decode_apk` is required — pinning logic lives in smali and in XML resources, not in whole files you could just swap. If the app is large, build a code graph first (see `code-graph-analysis`) so `string_refs` and `search_smali` stay fast.
 
 ## Step 2 — Sweep all four pinning surfaces
 Load `reference/pinning-search-patterns.md` for the exact `search_smali` patterns and example bypass smali for each of:
@@ -31,7 +31,7 @@ Check the AndroidManifest for `android:networkSecurityConfig="@xml/..."` with `g
 If strings like `X509`, `SSL_CTX`, `pin`, or specific certificate hashes show up in a `.so` (`extract_strings`), the check is native — switch to the `native-patching` skill to force the verification function to return success.
 
 ## Step 5 — Rebuild, sign, verify
-`build_apk` → `sign_apk` → `verify_apk` (see `apk-modding`).
+`recompile_apk` → `sign_apk` → `verify_apk` (see `apk-modding`).
 
 ## Critical Rules
 - Patch ALL FOUR surfaces you find evidence of, not just the first one. Apps commonly combine an OkHttp `CertificatePinner` with a `network_security_config.xml` fallback.

@@ -149,22 +149,28 @@ function formatInline(text) {
 
 // ---------- event renderers ----------
 function renderUserMessage(content) {
+  if (currentGroup) completeGroup(currentGroup); // settle/collapse any lingering group
   currentGroup = null; // a new user turn starts a fresh set of action groups
   const el = document.createElement('div');
-  el.className = 'py-1';
+  el.className = 'py-1 user-row';
   el.innerHTML = `
-    <div class="mb-0.5 text-[10px] text-term-muted"><span class="text-term-green">user</span> <span>${nowTime()}</span></div>
-    <div class="msg-fmt whitespace-pre-wrap text-term-text">${formatInline(content)}</div>`;
+    <div class="msg-meta mb-0.5 text-[10px] text-term-muted"><span class="text-term-green">user</span> <span>${nowTime()}</span></div>
+    <div class="user-bubble msg-fmt whitespace-pre-wrap text-term-text">${formatInline(content)}</div>`;
   appendRow(el);
 }
 
-// ---------- agent activity: thought messages + action groups ----------
-// The model's reasoning is printed as a real, white message. The action(s) it
-// takes after that thought are grouped beneath it: the group shows the CURRENT
-// action as a header, and clicking the header reveals the earlier actions in
-// that same group. Actions NEVER show their raw tool output (that lives only in
-// the agent's own context). A thought WITH text starts a new group; a turn with
-// no narration just adds its action to the current group.
+// ---------- agent activity: explanation messages + action groups ----------
+// The model's per-subtask "explanation" is printed as a real, white message,
+// then the tool calls it makes are grouped beneath it in a widget whose header
+// is a live count summary ("Ran N tools · read N files · changed N files"),
+// NOT the latest tool. While the group is active the title shimmers silver and
+// the widget is auto-expanded as a short, self-scrolling list (newest call at
+// the bottom, always kept in view). Actions NEVER show their raw tool output.
+// When the next explanation (a 'thought' event WITH text) arrives, that group
+// is "completed": the title plays a one-shot wave then settles solid and the
+// widget collapses (still clickable to re-open); a fresh group then opens under
+// the new explanation. A tool call with no explanation just extends the current
+// group — so a run reads as: explanation, [group], next explanation, [group], …
 
 const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 let spinFrame = 0;
@@ -209,51 +215,132 @@ function startThinking() {
   thinkingEl = el;
 }
 
-// A thought arrived. Print it as a real white message, then (if it had actual
-// narration) open a fresh action group beneath it. Empty-thought turns fall
-// through so their action attaches to the current group.
+// An explanation arrived (as a 'thought' event). Complete the current action
+// group — its silver title settles solid and it collapses — then print the
+// explanation as a real white message and leave currentGroup null so the NEXT
+// tool call opens a fresh group folded beneath this explanation. Events with no
+// text fall through, so their action just extends the current group.
 function finishThinking(ev) {
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
   const text = (ev.text || '').trim();
   if (!text) return;
-  const dur = fmtDuration(ev.elapsed_ms) || '0s';
+  if (currentGroup) completeGroup(currentGroup);
+  currentGroup = null;
   const el = document.createElement('div');
   el.className = 'py-1';
-  el.innerHTML = `
-    <div class="mb-0.5 text-[10px] text-term-muted"><span class="text-term-magenta">✻ thought</span> <span>${dur}</span></div>
-    <div class="msg-fmt whitespace-pre-wrap text-term-text leading-6">${formatInline(text)}</div>`;
+  // No label/meta — the explanation reads as a plain assistant line so the whole
+  // run flows like one continuous chat, with the action group folded beneath it.
+  el.innerHTML =
+    `<div class="msg-fmt whitespace-pre-wrap text-term-text leading-6">${formatInline(text)}</div>`;
   appendRow(el);
-  startActionGroup();
   scrollDown();
+}
+
+// Which tools count as "reading a file" vs "changing a file" for the group's
+// summary title ("Ran N tools · read N files · changed N files"). Files are
+// deduped by path, so touching the same file twice still counts once.
+const READ_FILE_TOOLS = new Set([
+  'read_file_chunk', 'read_binary_range', 'tail_file', 'grep_file', 'read_archive_member',
+]);
+const CHANGE_FILE_TOOLS = new Set([
+  'write_file', 'replace_in_file', 'delete_path', 'move_file', 'duplicate_file',
+  'patch_smali_method', 'insert_smali_code', 'assemble_dex',
+  'patch_binary_string', 'binary_patch', 'nop_function', 'patch_function_return',
+  'patch_at_offset_with_bytes', 'patch_bytes_at_offset',
+  'replace_file_in_apk', 'recompile_apk', 'sign_apk',
+  'assemble_and_patch', 'compile_c_and_patch',
+]);
+
+// The workspace path a tool operates on, used to dedupe file counts. Mirrors the
+// arg keys the backend tools actually use (filepath / file_path / so_path / …).
+function toolPathKey(args) {
+  if (!args || typeof args !== 'object') return null;
+  return args.filepath || args.file_path || args.path || args.so_path || args.smali_file
+    || args.dex_path || args.apk_filename || args.apk_path || args.output_apk
+    || args.destination || args.source || args.output || args.out_path || args.target || null;
+}
+
+// The count summary shown as the group's title. Pluralized, tools first.
+function groupTitleText(g) {
+  const plur = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+  const parts = [`Ran ${plur(g.n, 'tool')}`];
+  if (g.readFiles.size) parts.push(`read ${plur(g.readFiles.size, 'file')}`);
+  if (g.changedFiles.size) parts.push(`changed ${plur(g.changedFiles.size, 'file')}`);
+  return parts.join(' · ');
+}
+function updateGroupTitle(g) { g.titleEl.textContent = groupTitleText(g); }
+
+// Keep the newest tool calls visible: pin the group's scroll region to the
+// bottom (rows are appended there). rAF-batched so a burst of calls costs one
+// layout; during replay it's set synchronously since there's no live paint.
+function scrollGroupToBottom(g) {
+  if (replaying) { g.scrollEl.scrollTop = g.scrollEl.scrollHeight; return; }
+  requestAnimationFrame(() => { g.scrollEl.scrollTop = g.scrollEl.scrollHeight; });
+}
+
+function setGroupOpen(g, open) {
+  g.open = open;
+  g.bodyEl.classList.toggle('open', open);
+  g.caret.classList.toggle('open', open);
+  if (open) scrollGroupToBottom(g);
+}
+
+// A group is "done" when the next explanation (or the final answer / run end)
+// arrives: freeze any live row, settle the silver title into a solid color via
+// a one-shot wave, and collapse the widget. It stays clickable to re-expand.
+function completeGroup(g) {
+  if (!g || g.completed) return;
+  g.completed = true;
+  if (g.liveEv && g.liveRow) {
+    g.liveRow.innerHTML = actionInner(g.liveEv, 'interrupted');
+    g.liveId = null; g.liveEv = null; g.liveRow = null;
+  }
+  // A group that never ran a tool (an explanation with no actions) leaves nothing
+  // worth showing — drop it so no empty "Ran 0 tools" widget lingers.
+  if (g.n === 0) { g.el.remove(); if (currentGroup === g) currentGroup = null; return; }
+  g.titleEl.classList.remove('shimmer');
+  if (!replaying) {
+    g.titleEl.classList.add('group-title-wave');
+    g.titleEl.addEventListener('animationend',
+      () => g.titleEl.classList.remove('group-title-wave'), { once: true });
+  }
+  g.metaEl.textContent = fmtElapsed(Date.now() - g.startTs);
+  setGroupOpen(g, false);
 }
 
 function startActionGroup() {
   const el = document.createElement('div');
   el.className = 'action-group ml-2 mb-1.5 border-l-2 border-term-line/60 pl-2';
+  // The title carries a live count summary (silver-shimmering while the group is
+  // active); the body is a short, self-scrolling container so a long burst of
+  // tool calls never fills the whole chat — newest calls sit at the bottom.
   el.innerHTML = `
     <button type="button" class="group-head flex w-full items-center gap-2 rounded-lg px-1.5 py-0.5 text-left font-mono text-[12px] leading-5 hover:bg-term-line/30">
-      <span class="group-caret caret invisible shrink-0 select-none text-[9px] leading-none text-term-muted">▶</span>
-      <span class="group-current min-w-0 flex-1 truncate"></span>
+      <span class="group-caret caret shrink-0 select-none text-[9px] leading-none text-term-muted">▶</span>
+      <span class="group-title min-w-0 flex-1 truncate text-term-text"></span>
       <span class="group-meta ml-auto shrink-0 text-[10.5px] tabular-nums text-term-muted"></span>
-      <span class="group-count shrink-0 text-[10px] text-term-muted"></span>
     </button>
-    <div class="group-past step-detail"><div class="step-detail-inner space-y-px py-0.5 pl-5 font-mono text-[12px] text-term-muted"></div></div>`;
-  const head = el.querySelector('.group-head');
-  const past = el.querySelector('.group-past');
-  const pastInner = el.querySelector('.step-detail-inner');
-  const caret = el.querySelector('.group-caret');
-  head.addEventListener('click', () => {
-    if (!pastInner.children.length) return; // nothing to reveal (single action)
-    const open = past.classList.toggle('open');
-    caret.classList.toggle('open', open);
-  });
-  currentGroup = {
-    el, past, pastInner, caret,
-    current: el.querySelector('.group-current'),
-    meta: el.querySelector('.group-meta'),
-    count: el.querySelector('.group-count'),
-    liveId: null, liveEv: null, n: 0,
+    <div class="group-body"><div class="group-body-clip"><div class="group-scroll">
+      <div class="group-list space-y-px py-0.5 pl-5 font-mono text-[12px] text-term-muted"></div>
+    </div></div></div>`;
+  const g = {
+    el,
+    head: el.querySelector('.group-head'),
+    titleEl: el.querySelector('.group-title'),
+    metaEl: el.querySelector('.group-meta'),
+    bodyEl: el.querySelector('.group-body'),
+    scrollEl: el.querySelector('.group-scroll'),
+    listEl: el.querySelector('.group-list'),
+    caret: el.querySelector('.group-caret'),
+    n: 0, readFiles: new Set(), changedFiles: new Set(),
+    liveId: null, liveEv: null, liveRow: null,
+    startTs: Date.now(), completed: false, open: true,
   };
+  g.titleEl.classList.add('shimmer'); // active → silver sweep until completed
+  g.head.addEventListener('click', () => setGroupOpen(g, !g.open));
+  currentGroup = g;
+  updateGroupTitle(g);
+  setGroupOpen(g, true); // auto-expanded while the group is the live one
   appendRow(el);
 }
 
@@ -271,28 +358,24 @@ function actionInner(ev, state) {
     (state === 'warn' ? ' <span class="text-term-red">loop warning</span>' : '');
 }
 
-// Put an action into the current group's header, demoting the previous header
-// action into the (collapsible, newest-first) past list.
+// Append one action row to the BOTTOM of the current group's list (newest
+// last), bump the running count summary, and keep the scroll pinned to the
+// bottom so the most recent calls stay visible.
 function pushAction(ev, state) {
   if (!currentGroup) startActionGroup(); // safety: an action before any thought
   const g = currentGroup;
-  if (g.n > 0) {
-    const row = document.createElement('div');
-    row.className = 'truncate';
-    row.innerHTML = g.current.innerHTML;
-    g.pastInner.insertBefore(row, g.pastInner.firstChild);
-  }
-  g.current.innerHTML = actionInner(ev, state);
-  if (state === 'live') registerSpinners(g.current);
-  g.meta.textContent = (state === 'live') ? '' : (fmtDuration(ev.run_ms) || '');
-  g.liveId = (state === 'live') ? ev.id : null;
-  g.liveEv = (state === 'live') ? ev : null;
+  const row = document.createElement('div');
+  row.className = 'group-row truncate';
+  row.innerHTML = actionInner(ev, state);
+  g.listEl.appendChild(row);
+  if (state === 'live') { registerSpinners(row); g.liveId = ev.id; g.liveEv = ev; g.liveRow = row; }
   g.n += 1;
-  const hidden = g.n - 1;
-  if (hidden > 0) {
-    g.caret.classList.remove('invisible');
-    g.count.textContent = `+${hidden}`;
-  }
+  const key = toolPathKey(ev.args) || `${ev.tool}#${g.n}`;
+  if (READ_FILE_TOOLS.has(ev.tool)) g.readFiles.add(key);
+  else if (CHANGE_FILE_TOOLS.has(ev.tool)) g.changedFiles.add(key);
+  updateGroupTitle(g);
+  if (g.open) scrollGroupToBottom(g);
+  return row;
 }
 
 function startTool(ev) {
@@ -302,12 +385,12 @@ function startTool(ev) {
 
 function finishTool(ev) {
   const state = ev.is_loop_warning ? 'warn' : 'done';
-  if (currentGroup && currentGroup.liveId === ev.id) {
-    // finalize the live header action in place (no demotion)
-    currentGroup.current.innerHTML = actionInner(ev, state);
-    currentGroup.meta.textContent = fmtDuration(ev.run_ms) || '';
-    currentGroup.liveId = null;
-    currentGroup.liveEv = null;
+  const g = currentGroup;
+  if (g && g.liveId === ev.id && g.liveRow) {
+    // finalize the live row in place (already counted when it started)
+    g.liveRow.innerHTML = actionInner(ev, state);
+    g.liveId = null; g.liveEv = null; g.liveRow = null;
+    if (g.open) scrollGroupToBottom(g);
   } else {
     // replay (no prior tool_running) or id mismatch: add as a finalized action
     pushAction(ev, state);
@@ -315,23 +398,32 @@ function finishTool(ev) {
   scrollDown();
 }
 
-// Freeze any still-live spinner when a run ends (done / stop / session change).
+// End of a run (done / stop / session change): complete the current group so
+// its silver title settles solid and it collapses (freezing any live row).
 function finalizeLiveLines() {
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
-  if (currentGroup && currentGroup.liveEv) {
-    currentGroup.current.innerHTML = actionInner(currentGroup.liveEv, 'interrupted');
-    currentGroup.meta.textContent = '';
-    currentGroup.liveId = null;
-    currentGroup.liveEv = null;
-  }
+  if (currentGroup) completeGroup(currentGroup);
 }
 
 function argSummary(args) {
   if (!args || typeof args !== 'object') return '';
-  const p = args.path || args.file_path || args.filepath || args.dir_path || args.input_dir || args.directory;
+  // APK lifecycle tools each name the APK they operate on with one of these keys
+  // (inspect_apk/unzip_apk/decode_apk/jadx_decompile/sign_apk/verify_apk use
+  // apk_filename; recompile_apk uses output_apk; get_apk_signature_hash and
+  // the emulator/test tools use apk_path). Surface it first so the action line
+  // always shows WHICH apk is affected in parentheses.
+  const apk = args.apk_filename || args.apk_path || args.output_apk || args.original_apk;
+  if (apk) return `(${apk})`;
+  // Otherwise fall back to whatever file/dir the tool works on (decompiled_dir
+  // covers search_smali/search_java; manifest_path covers extract_manifest_info).
+  const p = args.path || args.file_path || args.filepath || args.so_path
+    || args.dex_path || args.smali_path || args.manifest_path || args.decompiled_dir
+    || args.input_dir || args.output_dir || args.dir_path || args.directory
+    || args.target || args.output || args.out_path || args.destination;
   if (p) return `(${p})`;
   if (args.command) { const c = String(args.command); return c.length > 40 ? `(${c.slice(0, 40)}…)` : `(${c})`; }
   if (args.query) return `(${args.query})`;
+  if (args.pattern) return `(${args.pattern})`;
   if (args.content) return `(content: ${String(args.content).length} chars)`;
   if (args.source && args.destination) return `(${args.source} → ${args.destination})`;
   return '';
@@ -347,11 +439,31 @@ function renderFinalAnswer(ev) {
   appendRow(el);
 }
 
+// System messages surface as auto-dismissing toasts in the bottom-right
+// corner instead of cluttering the transcript. Each hides itself after 10s.
 function renderSystem(content) {
+  const host = document.getElementById('toasts');
+  if (!host) return; // fall back to nothing if the container isn't present
+
   const el = document.createElement('div');
-  el.className = 'px-2 py-1 text-[11px] text-term-muted';
-  el.innerHTML = `<span class="text-term-gray">sys</span> ${escapeHtml(content)}`;
-  appendRow(el);
+  el.className = 'toast';
+  el.innerHTML = `
+    <span class="toast-label">sys</span>
+    <span class="toast-msg">${escapeHtml(content)}</span>
+    <button class="toast-close" title="Dismiss" aria-label="Dismiss">×</button>`;
+
+  let removed = false;
+  const dismiss = () => {
+    if (removed) return;
+    removed = true;
+    clearTimeout(timer);
+    el.classList.add('toast-out');
+    el.addEventListener('animationend', () => el.remove(), { once: true });
+  };
+  el.querySelector('.toast-close').addEventListener('click', dismiss);
+
+  const timer = setTimeout(dismiss, 10000);
+  host.appendChild(el);
 }
 
 function renderLog(content) {
@@ -371,8 +483,12 @@ function renderError(content) {
 
 function renderStatus(ev) {
   setStatus('statSteps', ev.step_count);
-  setStatus('statTools', ev.consecutive_tools);
-  setStatus('statCtx', ev.ctx_chars.toLocaleString());
+  // Prefer the cumulative tools-used count (persisted across reopen); fall back to
+  // the per-leg consecutive count for any older event that lacks it.
+  const tools = (ev.tools_used !== undefined && ev.tools_used !== null) ? ev.tools_used : ev.consecutive_tools;
+  setStatus('statTools', tools);
+  const ctx = (ev.ctx_chars !== undefined && ev.ctx_chars !== null) ? ev.ctx_chars : 0;
+  setStatus('statCtx', Number(ctx).toLocaleString());
   setStatus('statResets', ev.summary_resets);
 }
 
@@ -394,18 +510,104 @@ function planStatusColor(status) {
 function renderPlanBadge(plan) {
   const badge = $('planBadge');
   if (!badge) return;
-  if (!plan || !plan.items || !plan.items.length) {
+  const hasItems = plan && plan.items && plan.items.length;
+  const hasPhases = plan && plan.phases && plan.phases.length;
+  if (!hasItems && !hasPhases) {
     badge.textContent = 'plan —';
     return;
   }
-  const { done, total } = plan.progress;
-  badge.textContent = `plan ${done}/${total}`;
+  if (hasItems) {
+    const { done, total } = plan.progress;
+    badge.textContent = `plan ${done}/${total}`;
+  } else {
+    // Mission laid out (phases) but no steps added yet — show phase progress.
+    const done = plan.phases.filter(p => p.status === 'completed' || p.status === 'skipped').length;
+    badge.textContent = `plan ${done}/${plan.phases.length}φ`;
+  }
+}
+
+// The terminal outcome pill (active plans show nothing here).
+function planOutcomeChip(outcome) {
+  if (!outcome || outcome === 'active') return '';
+  const color = {
+    completed: 'text-term-green border-term-green/40',
+    partial: 'text-term-cyan border-term-cyan/40',
+    blocked: 'text-term-red border-term-red/40',
+    needs_different_approach: 'text-term-red border-term-red/40',
+  }[outcome] || 'text-term-muted border-term-line';
+  return `<span class="ml-2 rounded-full border px-2 py-0.5 text-[10px] ${color}">${escapeHtml(outcome.replace(/_/g, ' '))}</span>`;
+}
+
+// The persistent "which LLM is active right now" badge in the header. Updated
+// live by 'active_llm' events (the provider serving requests can change when the
+// fallback chain moves after an error) and populated on load via get_active_llm.
+function setActiveLlm(info) {
+  const label = $('activeLlmLabel');
+  const badge = $('activeLlmBadge');
+  if (!label || !badge) return;
+  if (!info || (!info.name && !info.label && !info.model)) {
+    label.textContent = 'LLM —';
+    badge.title = 'No LLM configured — click to add one';
+    return;
+  }
+  const name = info.name || info.label || 'LLM';
+  label.textContent = name + (info.model ? ` · ${info.model}` : '');
+  const provider = (info.label && info.label !== name) ? ` (${info.label})` : '';
+  badge.title = `Active LLM: ${name}${provider}${info.model ? ' · ' + info.model : ''}`
+    + ' — click to open provider settings';
+}
+
+async function refreshActiveLlm() {
+  try {
+    const res = await pywebview.api.get_active_llm();
+    if (res && res.ok) setActiveLlm(res.active);
+  } catch (e) { /* non-fatal: the badge just keeps its current text */ }
+}
+
+// One step row, with its evidence fields folded in when present.
+function _planStepRow(it, plan) {
+  const active = it.id === plan.active_item_id;
+  const contentClass = it.status === 'completed' ? 'line-through text-term-muted' :
+    it.status === 'skipped' ? 'line-through text-term-muted/70' : 'text-term-text';
+  const detail = [
+    it.purpose ? ['purpose', it.purpose] : null,
+    it.expected ? ['expect', it.expected] : null,
+    it.verification ? ['verify', it.verification] : null,
+    it.fallback ? ['fallback', it.fallback] : null,
+  ].filter(Boolean);
+  const detailHtml = detail.length ? `
+    <div class="text-[11px] text-term-muted mt-1 space-y-0.5">
+      ${detail.map(([k, v]) => `<div><span class="text-term-muted/70">${k}:</span> ${escapeHtml(v)}</div>`).join('')}
+    </div>` : '';
+  return `
+    <div class="flex items-start gap-2 rounded-lg px-2 py-1.5 ${active ? 'bg-term-cyan/10 border border-term-cyan/30' : 'border border-transparent'}">
+      <span class="${planStatusColor(it.status)} shrink-0 mt-0.5 text-[13px]">${planStatusIcon(it.status)}</span>
+      <div class="min-w-0 flex-1">
+        <div class="${contentClass} text-[13px] leading-5">${escapeHtml(it.content)}</div>
+        ${it.notes ? `<div class="text-[11px] text-term-muted mt-0.5">${escapeHtml(it.notes)}</div>` : ''}
+        ${detailHtml}
+      </div>
+      <span class="text-[10px] text-term-muted shrink-0 mt-0.5">${escapeHtml(it.status.replace('_', ' '))}</span>
+    </div>`;
+}
+
+function _planBullets(label, values) {
+  if (!values || !values.length) return '';
+  return `
+    <div class="mt-2">
+      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">${label}</div>
+      <ul class="text-[12px] text-term-text/90 space-y-0.5">
+        ${values.map(v => `<li class="flex gap-1.5"><span class="text-term-muted">•</span><span>${escapeHtml(v)}</span></li>`).join('')}
+      </ul>
+    </div>`;
 }
 
 function renderPlanTab(plan) {
   const root = $('planTab');
   if (!root) return;
-  if (!plan || !plan.items || !plan.items.length) {
+  const hasItems = plan && plan.items && plan.items.length;
+  const hasPhases = plan && plan.phases && plan.phases.length;
+  if (!plan || (!hasItems && !hasPhases)) {
     root.innerHTML = `
       <div class="flex-1 flex items-center justify-center p-6">
         <div class="text-center text-term-muted italic max-w-sm">
@@ -417,30 +619,51 @@ function renderPlanTab(plan) {
   }
   const { done, total } = plan.progress;
   const pct = total ? Math.round((done / total) * 100) : 0;
-  const rows = plan.items.map(it => {
-    const active = it.id === plan.active_item_id;
-    const contentClass = it.status === 'completed' ? 'line-through text-term-muted' :
-      it.status === 'skipped' ? 'line-through text-term-muted/70' : 'text-term-text';
-    return `
-      <div class="flex items-start gap-2 rounded-lg px-2 py-1.5 ${active ? 'bg-term-cyan/10 border border-term-cyan/30' : 'border border-transparent'}">
-        <span class="${planStatusColor(it.status)} shrink-0 mt-0.5 text-[13px]">${planStatusIcon(it.status)}</span>
-        <div class="min-w-0 flex-1">
-          <div class="${contentClass} text-[13px] leading-5">${escapeHtml(it.content)}</div>
-          ${it.notes ? `<div class="text-[11px] text-term-muted mt-0.5">${escapeHtml(it.notes)}</div>` : ''}
-        </div>
-        <span class="text-[10px] text-term-muted shrink-0 mt-0.5">${escapeHtml(it.status.replace('_', ' '))}</span>
-      </div>`;
-  }).join('');
-  root.innerHTML = `
-    <div class="px-4 py-3 border-b border-term-line shrink-0">
-      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-1">current task</div>
-      <div class="text-term-text text-[13px] mb-2">${escapeHtml(plan.task)}</div>
-      <div class="h-1.5 rounded-full bg-term-line overflow-hidden">
-        <div class="h-full bg-term-cyan transition-all" style="width:${pct}%"></div>
+
+  const phasesHtml = hasPhases ? `
+    <div class="mt-2">
+      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">phases</div>
+      <div class="space-y-0.5">
+        ${plan.phases.map(p => {
+          const cur = p.id === plan.current_phase_id;
+          return `<div class="flex items-start gap-2 text-[12px] ${cur ? 'text-term-cyan' : ''}">
+            <span class="${planStatusColor(p.status)} shrink-0 text-[12px]">${planStatusIcon(p.status)}</span>
+            <span class="min-w-0 flex-1 ${p.status === 'completed' ? 'text-term-muted' : ''}">${escapeHtml(p.title)}${p.note ? ` <span class="text-term-muted">— ${escapeHtml(p.note)}</span>` : ''}</span>
+            ${cur ? '<span class="text-[9px] uppercase tracking-wider text-term-cyan shrink-0">current</span>' : ''}
+          </div>`;
+        }).join('')}
       </div>
-      <div class="text-[10px] text-term-muted mt-1">${done}/${total} tasks complete (${pct}%)</div>
+    </div>` : '';
+
+  const rows = hasItems ? plan.items.map(it => _planStepRow(it, plan)).join('') :
+    `<div class="text-[12px] text-term-muted italic px-2 py-3">No steps in the current phase yet.</div>`;
+
+  const nextHtml = plan.next_action ? `
+    <div class="px-4 py-2.5 border-t border-term-line shrink-0 bg-term-cyan/5">
+      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">next action</div>
+      <div class="text-[13px] text-term-text">${escapeHtml(plan.next_action)}</div>
+    </div>` : '';
+
+  // Header + steps share one scroll region: with long criteria/phases the
+  // header alone can exceed the viewport, so it can't be a fixed shrink-0 bar.
+  root.innerHTML = `
+    <div class="flex-1 min-h-0 overflow-y-auto">
+      <div class="px-4 py-3 border-b border-term-line">
+        <div class="text-[10px] uppercase tracking-wider text-term-muted mb-1">current task ${planOutcomeChip(plan.outcome)}</div>
+        <div class="text-term-text text-[13px] mb-2">${escapeHtml(plan.task)}${plan.outcome_note ? ` <span class="text-term-muted">— ${escapeHtml(plan.outcome_note)}</span>` : ''}</div>
+        <div class="h-1.5 rounded-full bg-term-line overflow-hidden">
+          <div class="h-full bg-term-cyan transition-all" style="width:${pct}%"></div>
+        </div>
+        <div class="text-[10px] text-term-muted mt-1">${done}/${total} steps complete (${pct}%)${plan.replans && plan.replans.length ? ` · replanned ${plan.replans.length}×` : ''}</div>
+        ${_planBullets('success criteria', plan.success_criteria)}
+        ${_planBullets('constraints', plan.constraints)}
+        ${_planBullets('unknowns', plan.unknowns)}
+        ${_planBullets('assumptions', plan.assumptions)}
+        ${phasesHtml}
+      </div>
+      <div class="px-2 py-2 space-y-0.5">${rows}</div>
     </div>
-    <div class="flex-1 overflow-y-auto px-2 py-2 space-y-0.5">${rows}</div>`;
+    ${nextHtml}`;
 }
 
 function renderPlan(plan) {
@@ -713,6 +936,7 @@ window.__agent = {
       case 'tool_running': startTool(ev); break;
       case 'tool_result': finishTool(ev); break;
       case 'final_answer': renderFinalAnswer(ev); break;
+      case 'active_llm': setActiveLlm(ev); break;
       case 'system': renderSystem(ev.content); break;
       case 'log': renderLog(ev.content); break;
       case 'error': renderError(ev.content); break;
@@ -742,7 +966,7 @@ function onDone() {
   // the run may have changed the knowledge graph: rebuild it now if it's on
   // screen, otherwise just mark it stale so the next visit refetches
   graphLoaded = false;
-  if (activeTab === 'graph') loadGraph();
+  if (activeTab === 'graph') { if (compareMode) renderCompare(comparePanes[0] && comparePanes[0].sel.value, comparePanes[1] && comparePanes[1].sel.value); else loadGraph(); }
 }
 
 // Upload files from the host machine into the current project's workspace via a
@@ -784,6 +1008,9 @@ function onSessionStarted(ev) {
   $('treeProjectName').textContent = ev.project;
   $('chat').innerHTML = '';
   resetActivityState();
+  // Zero the header stats up front; a 'status' event fired right after this (when
+  // the project has saved history) restores the real steps / tools / ctx / resets.
+  setStatus('statSteps', 0); setStatus('statTools', 0); setStatus('statCtx', 0); setStatus('statResets', 0);
   expandedDirs.clear(); // a new/re-opened workspace starts with nothing expanded
   autoScroll = true;
   setBusy(!!ev.busy);
@@ -1048,34 +1275,145 @@ async function approveExport() {
   }
 }
 
-// ---------- LLM provider settings ----------
-let _llmProviders = [];   // preset metadata from the backend
-let _llmSaved = null;     // the currently-saved effective config
-let _llmActiveProvider = null; // which provider tab is selected in the modal
+// ---------- LLM provider settings (multiple providers + fallback order) ----------
+let _llmProviders = [];        // preset metadata from the backend
+let _llmConfigs = [];          // ordered list of saved providers (order = fallback priority)
+let _llmActiveProvider = null; // provider selected in the edit form
+let _llmEditingId = null;      // id being edited in the form, or null when adding
+let _llmDragId = null;         // id of the row currently being dragged
 
 function _llmProvider(id) { return _llmProviders.find(p => p.id === id) || null; }
 
 async function openLlmModal() {
   $('llmError').textContent = '';
   $('llmTestResult').textContent = '';
+  $('llmListStatus').textContent = '';
   $('llmModal').classList.remove('hidden');
+  llmShowList();
   try {
-    const res = await pywebview.api.get_llm_config();
+    const res = await pywebview.api.get_llm_configs();
     if (!res || !res.ok) {
-      $('llmError').textContent = (res && res.error) || 'Failed to load LLM config.';
+      $('llmListStatus').className = 'text-[11px] text-term-red';
+      $('llmListStatus').textContent = (res && res.error) || 'Failed to load LLM configs.';
       return;
     }
     _llmProviders = res.providers || [];
-    _llmSaved = res.config || {};
-    renderLlmTabs();
-    selectLlmProvider(_llmSaved.provider, true);
+    _llmConfigs = (res.configs || []).map(c => ({ ...c }));
+    renderLlmList();
   } catch (e) {
-    $('llmError').textContent = '' + e;
+    $('llmListStatus').className = 'text-[11px] text-term-red';
+    $('llmListStatus').textContent = '' + e;
   }
 }
 
 function closeLlmModal() { $('llmModal').classList.add('hidden'); }
 
+// ----- switch between the list view and the add/edit form -----
+function llmShowList() {
+  $('llmModalTitle').textContent = 'LLM Providers';
+  $('llmListView').style.display = 'flex';
+  $('llmEditView').style.display = 'none';
+}
+function llmShowEdit() {
+  $('llmModalTitle').textContent = _llmEditingId ? 'Edit provider' : 'Add provider';
+  $('llmListView').style.display = 'none';
+  $('llmEditView').style.display = 'flex';
+}
+
+// ----- list of saved providers (drag to reorder = change fallback priority) -----
+function renderLlmList() {
+  const wrap = $('llmList');
+  wrap.innerHTML = '';
+  $('llmListEmpty').classList.toggle('hidden', _llmConfigs.length > 0);
+  _llmConfigs.forEach((c, idx) => wrap.appendChild(_llmRow(c, idx)));
+}
+
+function _llmRow(c, idx) {
+  const prov = _llmProvider(c.provider);
+  const label = (prov && prov.label) || c.label || c.provider;
+  const row = document.createElement('div');
+  row.className = 'flex items-center gap-2 rounded-xl border border-term-line bg-term-bg px-3 py-2';
+  row.dataset.id = c.id;
+  row.draggable = true;
+
+  const handle = document.createElement('span');
+  handle.textContent = '⠿';
+  handle.title = 'drag to reorder';
+  handle.className = 'text-term-muted';
+  handle.style.cursor = 'grab';
+  row.appendChild(handle);
+
+  const mid = document.createElement('div');
+  mid.className = 'min-w-0';
+  mid.style.flex = '1 1 auto';
+  const title = document.createElement('div');
+  title.className = 'text-term-text';
+  title.textContent = c.name || label;
+  if (idx === 0) {
+    const badge = document.createElement('span');
+    badge.textContent = 'primary';
+    badge.className = 'ml-2 rounded-full border border-term-line text-[10px] text-term-muted';
+    badge.style.padding = '1px 6px';
+    title.appendChild(badge);
+  }
+  const sub = document.createElement('div');
+  sub.className = 'text-[11px] text-term-muted';
+  sub.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+  // Decoupled view: a shared key POOL + a separate model LADDER.
+  const keys = Array.isArray(c.api_keys) && c.api_keys.length ? c.api_keys : (c.api_key ? [c.api_key] : []);
+  const models = Array.isArray(c.models) && c.models.length ? c.models : (c.model ? [c.model] : []);
+  const nKeys = keys.length;
+  const keyPart = (prov && prov.requires_key)
+    ? (nKeys ? ` · ${nKeys} key${nKeys === 1 ? '' : 's'}` : ' · ⚠ no key')
+    : '';
+  const modelPart = models.length
+    ? (models.length === 1 ? ` · ${models[0]}` : ` · ${models.length} models: ${models.join(', ')}`)
+    : ' · default model';
+  const vision = Array.isArray(c.vision_models) ? c.vision_models : (c.vision_model ? [c.vision_model] : []);
+  const visionPart = vision.length ? ` · ${vision.length} vision` : '';
+  sub.textContent = `${label}${modelPart}${visionPart}${keyPart}`;
+  mid.appendChild(title); mid.appendChild(sub);
+  row.appendChild(mid);
+
+  const editBtn = document.createElement('button');
+  editBtn.textContent = 'edit';
+  editBtn.className = 'rounded-full border border-term-line px-3 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text';
+  editBtn.addEventListener('click', () => llmEditEntry(c.id));
+  row.appendChild(editBtn);
+
+  const delBtn = document.createElement('button');
+  delBtn.textContent = '✕';
+  delBtn.title = 'remove';
+  delBtn.className = 'rounded-full border border-term-line px-2 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text';
+  delBtn.addEventListener('click', () => llmDeleteEntry(c.id));
+  row.appendChild(delBtn);
+
+  // HTML5 drag-and-drop reorder. Order in _llmConfigs IS the fallback priority.
+  row.addEventListener('dragstart', () => { _llmDragId = c.id; row.style.opacity = '0.4'; });
+  row.addEventListener('dragend', () => { _llmDragId = null; row.style.opacity = ''; });
+  row.addEventListener('dragover', (e) => { e.preventDefault(); });
+  row.addEventListener('drop', (e) => { e.preventDefault(); llmReorder(_llmDragId, c.id); });
+  return row;
+}
+
+function llmReorder(srcId, dstId) {
+  if (!srcId || srcId === dstId) return;
+  const from = _llmConfigs.findIndex(c => c.id === srcId);
+  const to = _llmConfigs.findIndex(c => c.id === dstId);
+  if (from < 0 || to < 0) return;
+  const [moved] = _llmConfigs.splice(from, 1);
+  _llmConfigs.splice(to, 0, moved);
+  renderLlmList();
+  persistLlmConfigs('order updated');
+}
+
+function llmDeleteEntry(id) {
+  _llmConfigs = _llmConfigs.filter(c => c.id !== id);
+  renderLlmList();
+  persistLlmConfigs('provider removed');
+}
+
+// ----- add / edit form -----
 function renderLlmTabs() {
   const wrap = $('llmProviderTabs');
   wrap.innerHTML = '';
@@ -1085,15 +1423,204 @@ function renderLlmTabs() {
     b.dataset.pid = p.id;
     b.textContent = p.label;
     b.className = 'rounded-full border px-3 py-1 text-[12px] border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
-    b.addEventListener('click', () => selectLlmProvider(p.id, false));
+    b.addEventListener('click', () => selectLlmProvider(p.id, null));
     wrap.appendChild(b);
   });
 }
 
-// Populate the form for a provider. `useSaved` keeps the saved key/model/base
-// URL only when this is the provider that's actually saved; switching to a
-// different provider tab shows that provider's fresh defaults instead.
-function selectLlmProvider(id, useSaved) {
+// ---- list editors for the decoupled key pool + model / vision ladders ----
+// Each is a small add/remove/(reorder) list of one-line inputs. The array is the
+// initial render source; live edits stay in the DOM inputs and are read back at
+// save/add/move time (so a half-typed row isn't lost on re-render).
+const _LLM_KEY_OPTS = { placeholder: 'nvapi-… / sk-…', emptyText: '(no keys yet — click “add key”)' };
+const _LLM_MODEL_OPTS = { ordered: true, placeholder: 'e.g. deepseek-ai/deepseek-v4-pro', emptyText: '(no models yet — click “add model”)' };
+const _LLM_VISION_OPTS = { ordered: true, placeholder: 'e.g. meta/llama-3.2-90b-vision-instruct', emptyText: '(none — optional; add if you need image reasoning)' };
+
+function _readListEditor(containerId) {
+  return Array.from(document.querySelectorAll('#' + containerId + ' input.llm-list-input'))
+    .map(inp => inp.value.trim()).filter(Boolean);
+}
+
+function _miniBtn(label, title, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = label;
+  b.title = title || '';
+  b.className = 'shrink-0 rounded-lg border border-term-line px-2 py-1 text-[11px] leading-none text-term-muted hover:bg-term-line/60 hover:text-term-text';
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function _renderListEditor(containerId, values, opts) {
+  opts = opts || {};
+  const host = $(containerId);
+  if (!host) return;
+  host.innerHTML = '';
+  (values || []).forEach((val, i) => {
+    const row = document.createElement('div');
+    row.className = 'flex items-center gap-1.5';
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
+    inp.placeholder = opts.placeholder || '';
+    inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
+    row.appendChild(inp);
+    if (opts.ordered) {
+      const up = _miniBtn('↑', 'move up (higher priority)', () => _moveListItem(containerId, i, -1, opts));
+      const down = _miniBtn('↓', 'move down', () => _moveListItem(containerId, i, +1, opts));
+      if (i === 0) { up.disabled = true; up.classList.add('opacity-30'); }
+      if (i === (values.length - 1)) { down.disabled = true; down.classList.add('opacity-30'); }
+      row.appendChild(up); row.appendChild(down);
+    }
+    row.appendChild(_miniBtn('✕', 'remove', () => {
+      const cur = _readListEditor(containerId); cur.splice(i, 1); _renderListEditor(containerId, cur, opts);
+    }));
+    host.appendChild(row);
+  });
+  if (!values || !values.length) {
+    const empty = document.createElement('div');
+    empty.className = 'text-[11px] italic text-term-muted';
+    empty.textContent = opts.emptyText || '(none)';
+    host.appendChild(empty);
+  }
+}
+
+function _moveListItem(containerId, i, dir, opts) {
+  const cur = _readListEditor(containerId);
+  const j = i + dir;
+  if (j < 0 || j >= cur.length) return;
+  const tmp = cur[i]; cur[i] = cur[j]; cur[j] = tmp;
+  _renderListEditor(containerId, cur, opts);
+}
+
+function _addListItem(containerId, opts) {
+  const cur = _readListEditor(containerId);
+  cur.push('');
+  _renderListEditor(containerId, cur, opts);
+  const inputs = document.querySelectorAll('#' + containerId + ' input.llm-list-input');
+  if (inputs.length) inputs[inputs.length - 1].focus();
+}
+
+// ---- text-model ladder editor (per-model reasoning) ----------------------
+// The text-model ladder is richer than the generic list editor: besides ordering,
+// each model carries its OWN reasoning override so a mixed ladder (GLM + DeepSeek V4
+// + …) can reason correctly per family. Each model is a small card — the id input
+// (+ reorder/remove) on top, then two compact selects (effort + style) that default
+// to "inherit"/"auto" (unset -> the provider's Advanced defaults apply). We read the
+// models AND their overrides back together at save time.
+const _LLM_EFFORT_OPTS = [
+  ['', 'reasoning: inherit'],
+  ['off', 'reasoning: off'],
+  ['minimal', 'reasoning: minimal'],
+  ['low', 'reasoning: low'],
+  ['medium', 'reasoning: medium'],
+  ['high', 'reasoning: high'],
+  ['max', 'reasoning: max'],
+];
+const _LLM_STYLE_OPTS = [
+  ['', 'style: auto'],
+  ['openai', 'style: OpenAI effort'],
+  ['thinking', 'style: GLM thinking'],
+  ['chat_template', 'style: chat-template'],
+  ['deepseek_v4', 'style: DeepSeek V4'],
+  ['system', 'style: Nemotron'],
+  ['none', 'style: none'],
+];
+
+function _miniSelect(extraCls, options, value) {
+  const sel = document.createElement('select');
+  sel.className = extraCls + ' flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2 py-1 text-[10px] text-term-muted outline-none focus:border-term-cyan';
+  options.forEach(([v, label]) => {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = label;
+    if (v === (value || '')) o.selected = true;
+    sel.appendChild(o);
+  });
+  return sel;
+}
+
+// Read the model ladder back as {models:[id...], settings:{id:{reasoning_effort,
+// reasoning_style}}}. Blank rows are dropped; only non-default overrides are kept.
+function _readModelLadder(containerId) {
+  const models = [];
+  const settings = {};
+  document.querySelectorAll('#' + containerId + ' .llm-model-row').forEach(row => {
+    const id = row.querySelector('input.llm-list-input').value.trim();
+    if (!id) return;
+    models.push(id);
+    const eff = row.querySelector('select.llm-model-effort').value;
+    const sty = row.querySelector('select.llm-model-style').value;
+    const s = {};
+    if (eff) s.reasoning_effort = eff;
+    if (sty) s.reasoning_style = sty;
+    if (Object.keys(s).length) settings[id] = s;
+  });
+  return { models, settings };
+}
+
+function _renderModelLadder(containerId, models, modelSettings) {
+  const host = $(containerId);
+  if (!host) return;
+  modelSettings = modelSettings || {};
+  host.innerHTML = '';
+  const list = models || [];
+  list.forEach((val, i) => {
+    const s = modelSettings[val] || {};
+    const card = document.createElement('div');
+    card.className = 'llm-model-row flex flex-col gap-1.5 rounded-lg border border-term-line/70 p-1.5';
+    const top = document.createElement('div');
+    top.className = 'flex items-center gap-1.5';
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
+    inp.placeholder = _LLM_MODEL_OPTS.placeholder;
+    inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
+    top.appendChild(inp);
+    const up = _miniBtn('↑', 'move up (higher priority)', () => _moveModelLadder(containerId, i, -1));
+    const down = _miniBtn('↓', 'move down', () => _moveModelLadder(containerId, i, +1));
+    if (i === 0) { up.disabled = true; up.classList.add('opacity-30'); }
+    if (i === list.length - 1) { down.disabled = true; down.classList.add('opacity-30'); }
+    top.appendChild(up); top.appendChild(down);
+    top.appendChild(_miniBtn('✕', 'remove', () => {
+      const cur = _readModelLadder(containerId);
+      cur.models.splice(i, 1);
+      delete cur.settings[val];
+      _renderModelLadder(containerId, cur.models, cur.settings);
+    }));
+    card.appendChild(top);
+    const bottom = document.createElement('div');
+    bottom.className = 'flex items-center gap-1.5';
+    bottom.appendChild(_miniSelect('llm-model-effort', _LLM_EFFORT_OPTS, s.reasoning_effort));
+    bottom.appendChild(_miniSelect('llm-model-style', _LLM_STYLE_OPTS, s.reasoning_style));
+    card.appendChild(bottom);
+    host.appendChild(card);
+  });
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'text-[11px] italic text-term-muted';
+    empty.textContent = _LLM_MODEL_OPTS.emptyText;
+    host.appendChild(empty);
+  }
+}
+
+function _moveModelLadder(containerId, i, dir) {
+  const cur = _readModelLadder(containerId);
+  const j = i + dir;
+  if (j < 0 || j >= cur.models.length) return;
+  const t = cur.models[i]; cur.models[i] = cur.models[j]; cur.models[j] = t;
+  _renderModelLadder(containerId, cur.models, cur.settings);
+}
+
+function _addModelLadder(containerId) {
+  const cur = _readModelLadder(containerId);
+  cur.models.push('');
+  _renderModelLadder(containerId, cur.models, cur.settings);
+  const inputs = document.querySelectorAll('#' + containerId + ' input.llm-list-input');
+  if (inputs.length) inputs[inputs.length - 1].focus();
+}
+
+// Fill the form for a provider. `existing` is the saved entry being edited (its
+// key/model/base URL are kept only when it matches the selected provider);
+// switching provider tabs otherwise shows that provider's fresh defaults.
+function selectLlmProvider(id, existing) {
   const p = _llmProvider(id) || _llmProviders[0];
   if (!p) return;
   _llmActiveProvider = p.id;
@@ -1105,30 +1632,96 @@ function selectLlmProvider(id, useSaved) {
       : 'border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text');
   }
 
-  const savedThis = !!(useSaved && _llmSaved && _llmSaved.provider === p.id);
-  $('llmKey').value = savedThis ? (_llmSaved.api_key || '') : '';
-  $('llmModel').value = savedThis ? (_llmSaved.model || p.default_model || '') : (p.default_model || '');
-  $('llmBaseUrl').value = savedThis ? (_llmSaved.base_url || p.base_url || '') : (p.base_url || '');
-  $('llmKey').placeholder = p.requires_key ? (p.key_hint || 'API key') : (p.key_hint || 'not required for this provider');
+  const use = (existing && existing.provider === p.id) ? existing : null;
+  // Decoupled: a key POOL + a text-model LADDER + a vision-model LADDER, each an
+  // add/remove(/reorder) list editor.
+  const keyPool = use ? (Array.isArray(use.api_keys) && use.api_keys.length ? use.api_keys : (use.api_key ? [use.api_key] : [])) : [];
+  const modelLadder = use
+    ? (Array.isArray(use.models) && use.models.length ? use.models : (use.model ? [use.model] : []))
+    : (p.default_model ? [p.default_model] : []);
+  const visionLadder = use ? (Array.isArray(use.vision_models) ? use.vision_models : (use.vision_model ? [use.vision_model] : [])) : [];
+  _renderListEditor('llmKeysList', keyPool, _LLM_KEY_OPTS);
+  _renderModelLadder('llmModelsList', modelLadder, use ? (use.model_settings || {}) : {});
+  _renderListEditor('llmVisionList', visionLadder, _LLM_VISION_OPTS);
+  $('llmBaseUrl').value = use ? (use.base_url || p.base_url || '') : (p.base_url || '');
   $('llmProviderNotes').textContent = p.notes || '';
 
-  const showMax = p.protocol === 'anthropic';
-  $('llmMaxTokensRow').classList.toggle('hidden', !showMax);
-  $('llmMaxTokens').value = (showMax && savedThis && _llmSaved.max_tokens) ? _llmSaved.max_tokens : '';
+  $('llmMaxTokens').value = (use && use.max_tokens) ? use.max_tokens : '';
+
+  // Advanced options
+  $('llmReasoning').value = use ? (use.reasoning_effort || '') : '';
+  $('llmReasoningStyle').value = use ? (use.reasoning_style || '') : '';
+  $('llmTemperature').value = (use && use.temperature !== null && use.temperature !== undefined) ? use.temperature : '';
+  $('llmContextWindow').value = (use && use.context_window) ? use.context_window : '';
 
   $('llmTestResult').textContent = '';
   $('llmError').textContent = '';
 }
 
+// Switch the edit form between the Basic and Advanced panes.
+function llmSubtab(pane) {
+  const advanced = pane === 'advanced';
+  $('llmPaneBasic').classList.toggle('hidden', advanced);
+  $('llmPaneAdvanced').classList.toggle('hidden', !advanced);
+  const on = 'rounded-full border px-3 py-1 text-[12px] bg-term-cyan text-white border-term-cyan';
+  const off = 'rounded-full border px-3 py-1 text-[12px] border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
+  $('llmSubtabBasic').className = advanced ? off : on;
+  $('llmSubtabAdvanced').className = advanced ? on : off;
+}
+
+function llmAddEntry() {
+  _llmEditingId = null;
+  renderLlmTabs();
+  llmSubtab('basic');
+  $('llmName').value = '';
+  const first = _llmProviders[0];
+  selectLlmProvider(first ? first.id : null, null);
+  llmShowEdit();
+  $('llmName').focus();
+}
+
+function llmEditEntry(id) {
+  const c = _llmConfigs.find(x => x.id === id);
+  if (!c) return;
+  _llmEditingId = id;
+  renderLlmTabs();
+  llmSubtab('basic');
+  $('llmName').value = c.name || '';
+  selectLlmProvider(c.provider, c);
+  llmShowEdit();
+}
+
 function _llmFormValues() {
+  const p = _llmProvider(_llmActiveProvider);
+  // Read the decoupled pool/ladders from the list editors. Keep the singular
+  // api_key/model as the FIRST of each for older code paths / tests.
+  const apiKeys = _readListEditor('llmKeysList');
+  const ladder = _readModelLadder('llmModelsList');
+  const models = ladder.models;
+  const visionModels = _readListEditor('llmVisionList');
   const v = {
+    id: _llmEditingId || undefined,
+    name: $('llmName').value.trim(),
     provider: _llmActiveProvider,
-    api_key: $('llmKey').value.trim(),
-    model: $('llmModel').value.trim(),
+    api_keys: apiKeys,
+    models: models,
+    model_settings: ladder.settings,
+    vision_models: visionModels,
+    api_key: apiKeys[0] || '',
+    model: models[0] || '',
     base_url: $('llmBaseUrl').value.trim(),
   };
   const mt = $('llmMaxTokens').value.trim();
   if (mt) v.max_tokens = parseInt(mt, 10);
+  // Advanced options
+  const reasoning = $('llmReasoning').value;
+  v.reasoning_effort = reasoning || '';
+  v.reasoning_style = $('llmReasoningStyle').value || '';
+  const temp = $('llmTemperature').value.trim();
+  v.temperature = temp === '' ? null : parseFloat(temp);
+  const ctx = $('llmContextWindow').value.trim();
+  if (ctx) v.context_window = parseInt(ctx, 10);
+  if (!v.name) v.name = (p && p.label) || v.provider;
   return v;
 }
 
@@ -1154,22 +1747,80 @@ async function testLlmConnection() {
   }
 }
 
-async function saveLlmConfig() {
+// Save the form into the in-memory list (add new or update existing), persist,
+// then return to the list.
+async function saveLlmEntry() {
   $('llmError').textContent = '';
+  const v = _llmFormValues();
+  if (!v.provider) { $('llmError').textContent = 'Pick a provider first.'; return; }
   const btn = $('llmSaveBtn');
   btn.disabled = true; btn.textContent = 'saving…';
   try {
-    const res = await pywebview.api.save_llm_config(_llmFormValues());
-    if (res && res.ok) {
-      closeLlmModal();
-      if (session) renderSystem(`LLM provider set to ${res.label} · ${res.model}. New messages will use it.`);
+    if (_llmEditingId) {
+      const i = _llmConfigs.findIndex(c => c.id === _llmEditingId);
+      if (i >= 0) _llmConfigs[i] = { ...(_llmConfigs[i]), ...v };
+      else _llmConfigs.push(v);
     } else {
-      $('llmError').textContent = (res && res.error) || 'Save failed.';
+      v.id = 'new-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      _llmConfigs.push(v);
     }
-  } catch (e) {
-    $('llmError').textContent = '' + e;
+    const ok = await persistLlmConfigs(_llmEditingId ? 'provider updated' : 'provider added');
+    if (ok) llmShowList();
+    else $('llmError').textContent = $('llmListStatus').textContent || 'Save failed.';
   } finally {
-    btn.disabled = false; btn.textContent = 'save';
+    btn.disabled = false; btn.textContent = 'save to list';
+  }
+}
+
+// Persist the whole ordered list to the backend, then re-sync from what was
+// actually stored (so generated ids / minimized fields become authoritative).
+// Returns true on success.
+async function persistLlmConfigs(statusMsg) {
+  try {
+    const payload = _llmConfigs.map(c => ({
+      id: (c.id && !String(c.id).startsWith('new-')) ? c.id : undefined,
+      name: c.name,
+      provider: c.provider,
+      // Decoupled key pool + text/vision model ladders (with singular fallbacks).
+      api_keys: Array.isArray(c.api_keys) ? c.api_keys : (c.api_key ? [c.api_key] : []),
+      models: Array.isArray(c.models) ? c.models : (c.model ? [c.model] : []),
+      vision_models: Array.isArray(c.vision_models) ? c.vision_models : (c.vision_model ? [c.vision_model] : []),
+      // Per-model reasoning overrides {model_id: {reasoning_effort, reasoning_style}}.
+      model_settings: (c.model_settings && typeof c.model_settings === 'object') ? c.model_settings : {},
+      api_key: c.api_key,
+      model: c.model,
+      base_url: c.base_url,
+      max_tokens: c.max_tokens,
+      reasoning_effort: c.reasoning_effort,
+      reasoning_style: c.reasoning_style,
+      temperature: c.temperature,
+      context_window: c.context_window,
+    }));
+    const res = await pywebview.api.save_llm_configs(payload);
+    if (!res || !res.ok) {
+      $('llmListStatus').className = 'text-[11px] text-term-red';
+      $('llmListStatus').textContent = (res && res.error) || 'Save failed.';
+      return false;
+    }
+    const fresh = await pywebview.api.get_llm_configs();
+    if (fresh && fresh.ok) {
+      _llmConfigs = (fresh.configs || []).map(c => ({ ...c }));
+      _llmProviders = fresh.providers || _llmProviders;
+      renderLlmList();
+    }
+    $('llmListStatus').className = 'text-[11px] text-term-green';
+    $('llmListStatus').textContent = '✓ ' + (statusMsg || 'saved') + (res.primary
+      ? ` — primary: ${res.primary.name} (${res.primary.label} · ${res.primary.model})`
+      : ' — no providers left');
+    refreshActiveLlm();  // the primary/active provider may have changed
+    if (session && res.primary) {
+      renderSystem(`LLM providers saved. Primary: ${res.primary.name} · ${res.primary.model}. Fallbacks are used automatically if it errors.`);
+    }
+    return true;
+  } catch (e) {
+    $('llmListStatus').className = 'text-[11px] text-term-red';
+    $('llmListStatus').textContent = '' + e;
+    return false;
   }
 }
 
@@ -1242,6 +1893,11 @@ function cssVar(name, fallback) {
 function resetGraph() {
   if (graph2D) { graph2D.destroy(); graph2D = null; }
   if (graph3D) { try { graph3D._destructor(); } catch (e) {} graph3D = null; }
+  // Also drop any side-by-side compare panes and reset that mode/toggle, so a
+  // new session never inherits the previous one's compare view.
+  teardownCompare();
+  if (compareMode) { compareMode = false; setCompareButton(false); }
+  if (buildFormOpen) setBuildFormOpen(false);
   graph2DNodesDS = null;
   graphLoaded = false;
   _graphRaw = null;
@@ -1262,6 +1918,7 @@ function switchTab(tab) {
 
   allTabs.forEach(el => el.classList.add('hidden'));
   graphTab.classList.remove('flex');
+  planTab.classList.remove('flex');
   allBtns.forEach(btn => {
     btn.classList.remove('border-term-cyan', 'text-term-cyan');
     btn.classList.add('border-transparent', 'text-term-muted');
@@ -1275,13 +1932,16 @@ function switchTab(tab) {
     // Rebuilding the graph (fetch + layout) on every tab visit is expensive;
     // reuse it until a finished run invalidates it. The tab was hidden (and so
     // zero-size) while off-screen, so nudge the active engine to re-fit.
-    if (!graphLoaded) loadGraph();
+    if (compareMode) {
+      comparePanes.forEach(p => { if (p.net) setTimeout(() => { try { p.net.redraw(); p.net.fit(); } catch (e) {} }, 50); });
+    } else if (!graphLoaded) loadGraph();
     else {
       if (graph2D) setTimeout(() => { graph2D.redraw(); graph2D.fit(); }, 50);
       if (graph3D) setTimeout(() => { resizeGraph3D(); try { graph3D.zoomToFit(400, 60); } catch (e) {} }, 50);
     }
   } else if (tab === 'plan') {
     planTab.classList.remove('hidden');
+    planTab.classList.add('flex');
     tabPlan.classList.add('border-term-cyan', 'text-term-cyan');
     tabPlan.classList.remove('border-transparent', 'text-term-muted');
     renderPlanTab(currentPlan);
@@ -1334,6 +1994,9 @@ async function loadGraph(graphId) {
       $('graphStats').textContent = '';
       if (graph2D) { graph2D.destroy(); graph2D = null; }
       if (graph3D) { try { graph3D._destructor(); } catch (e) {} graph3D = null; }
+      // Show the same guidance front-and-center (the Build button is right there
+      // in the sidebar), instead of leaving a blank canvas.
+      showGraphError($('graphContainer'), res.error);
       graphLoaded = false;
       return;
     }
@@ -1371,6 +2034,255 @@ async function loadGraph(graphId) {
   } catch (e) {
     info.innerHTML = '<span class="text-term-red">Error: ' + escapeHtml('' + e) + '</span>';
   }
+}
+
+// ---------- manual graph build (Build button on the Graph tab) ----------
+// Building on demand fixes the "No knowledge graph found" dead-end: the user no
+// longer has to ask the agent to run build_code_graph. The backend indexes on
+// the host (no Docker round-trip) straight into <workspace>/.codegraph/<id>/,
+// which is exactly where this tab reads — so the folder always appears.
+let buildFormOpen = false;
+
+function setBuildFormOpen(open) {
+  buildFormOpen = open;
+  const form = $('graphBuildForm');
+  if (!form) return;
+  if (open) { form.classList.remove('hidden'); form.classList.add('flex'); populateBuildTargets(); }
+  else { form.classList.add('hidden'); form.classList.remove('flex'); }
+}
+
+async function populateBuildTargets() {
+  const sel = $('graphBuildTarget');
+  if (!sel) return;
+  sel.innerHTML = '';
+  // Whole workspace is always the default first option.
+  let rootLabel = '';
+  try {
+    const r = await pywebview.api.list_graph_build_targets();
+    if (r && r.root_label) rootLabel = r.root_label;
+    const opt0 = document.createElement('option');
+    opt0.value = '.';
+    opt0.textContent = '(whole workspace' + (rootLabel ? ' · ' + rootLabel : '') + ')';
+    sel.appendChild(opt0);
+    if (r && r.ok) for (const d of (r.dirs || [])) {
+      const o = document.createElement('option'); o.value = d; o.textContent = d; sel.appendChild(o);
+    }
+  } catch (e) {
+    const opt0 = document.createElement('option'); opt0.value = '.'; opt0.textContent = '(whole workspace)';
+    sel.appendChild(opt0);
+  }
+}
+
+async function runManualBuild() {
+  const target = ($('graphBuildTarget').value) || '.';
+  const name = $('graphBuildName').value.trim();
+  const so = $('graphBuildSo').checked;
+  const status = $('graphBuildStatus');
+  const btn = $('graphBuildRun');
+  btn.disabled = true;
+  status.className = 'text-[11px] text-term-muted';
+  status.textContent = 'Building… indexing files (this can take a moment).';
+  try {
+    const res = await pywebview.api.build_code_graph_ui(target, name, so, true);
+    if (!res || !res.ok) {
+      status.className = 'text-[11px] text-term-red';
+      status.textContent = 'Build failed: ' + escapeHtml((res && res.error) || 'unknown error');
+      return;
+    }
+    if (res.graphs) populateGraphSelect(res.graphs, res.graph_id);
+    currentGraphId = res.graph_id;
+    graphLoaded = false;
+    if (res.empty) {
+      status.className = 'text-[11px] text-term-orange';
+      status.textContent = 'Built "' + escapeHtml(res.graph_id) + '" but it has no indexable code — pick a folder that contains source.';
+      return;
+    }
+    status.className = 'text-[11px] text-term-green';
+    // Report HOW MUCH was indexed + WHERE the cache landed, so it's clear the
+    // (whole-workspace) build actually covered the tree and wrote .codegraph.
+    const c = res.counts || {};
+    const detail = (c.files || c.classes)
+      ? ' — ' + (c.files || 0) + ' files, ' + (c.classes || 0) + ' classes'
+      : '';
+    const where = res.cache_dir ? ' → ' + res.cache_dir + '/' : '';
+    status.textContent = 'Built graph "' + escapeHtml(res.graph_id) + '"' + escapeHtml(detail + where);
+    // If we were comparing, refresh that view; otherwise show the new graph.
+    if (compareMode) renderCompare();
+    else loadGraph(res.graph_id);
+    setTimeout(() => { if (buildFormOpen) setBuildFormOpen(false); }, 1400);
+  } catch (e) {
+    status.className = 'text-[11px] text-term-red';
+    status.textContent = 'Build error: ' + escapeHtml('' + e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteSelectedGraph() {
+  const sel = $('graphSelect');
+  const gid = sel && sel.value;
+  if (!gid) return;
+  if (!confirm('Delete graph "' + gid + '"?\n\nThis removes only the built graph instance — your files are not touched.')) return;
+  try {
+    const res = await pywebview.api.delete_code_graph(gid);
+    if (!res || !res.ok) { alert((res && res.error) || 'Delete failed.'); return; }
+    populateGraphSelect(res.graphs, null);
+    currentGraphId = null;
+    graphLoaded = false;
+    if (compareMode) renderCompare();
+    else loadGraph();
+  } catch (e) { alert('' + e); }
+}
+
+// ---------- multi-project compare (two graphs side by side) ----------
+// A "compare two directories" request produces two SEPARATE graph instances
+// (build each folder). Compare mode renders both at once in independent panes,
+// each with its own selector, so the two projects are shown separately rather
+// than merged into one graph.
+let compareMode = false;
+let comparePanes = [];
+
+function setCompareButton(on) {
+  const btn = $('graphCompareBtn');
+  if (!btn) return;
+  btn.classList.toggle('border-term-cyan', on);
+  btn.classList.toggle('text-term-cyan', on);
+  btn.classList.toggle('border-term-line', !on);
+  btn.classList.toggle('text-term-muted', !on);
+}
+
+function teardownCompare() {
+  for (const p of comparePanes) { if (p.net) { try { p.net.destroy(); } catch (e) {} p.net = null; } }
+  comparePanes = [];
+  const c = $('graphContainer');
+  if (c) c.classList.remove('flex');
+}
+
+async function toggleCompareMode() {
+  if (compareMode) {
+    compareMode = false;
+    setCompareButton(false);
+    teardownCompare();
+    graphLoaded = false;
+    loadGraph(currentGraphId);
+  } else {
+    compareMode = true;
+    setCompareButton(true);
+    await renderCompare();
+  }
+}
+
+async function renderCompare(idA, idB) {
+  const container = $('graphContainer');
+  if (!container) return;
+  // Discover which graphs exist (only non-empty ones are worth comparing).
+  let graphs = [];
+  try {
+    const res = await pywebview.api.get_code_graph(currentGraphId || null);
+    if (res && res.graphs) { populateGraphSelect(res.graphs, res.graph_id); graphs = res.graphs; }
+  } catch (e) {}
+  const usable = graphs.filter(g => (g.classes || 0) > 0);
+  // Retire the single-view engines before taking over the container.
+  if (graph2D) { graph2D.destroy(); graph2D = null; }
+  if (graph3D) { try { graph3D._destructor(); } catch (e) {} graph3D = null; }
+  teardownCompare();
+  $('graphLegend').innerHTML = '';
+  $('graphStats').textContent = '';
+  if (usable.length < 2) {
+    showGraphError(container,
+      'Compare needs two built graphs with data. Use “Build graph” to index a second ' +
+      'project folder (each folder becomes its own graph), then Compare.');
+    return;
+  }
+  const a = idA || usable[0].id;
+  const b = idB || (usable.find(g => g.id !== a) || usable[1]).id;
+  container.innerHTML = '';
+  container.classList.add('flex');
+  const paneA = makeComparePane(usable, a, true);   // left pane draws the divider
+  const paneB = makeComparePane(usable, b, false);
+  comparePanes = [paneA, paneB];
+  container.appendChild(paneA.el);
+  container.appendChild(paneB.el);
+  await drawComparePane(paneA, a);
+  await drawComparePane(paneB, b);
+}
+
+function makeComparePane(graphs, chosenId, withDivider) {
+  const el = document.createElement('div');
+  el.className = 'flex-1 min-w-0 flex flex-col' + (withDivider ? ' border-r border-term-line' : '');
+  const head = document.createElement('div');
+  head.className = 'flex items-center gap-2 px-2 py-1 border-b border-term-line bg-term-panel';
+  const sel = document.createElement('select');
+  sel.className = 'min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-1.5 py-0.5 text-[11px] outline-none focus:border-term-cyan';
+  for (const g of graphs) {
+    const o = document.createElement('option');
+    o.value = g.id;
+    o.textContent = g.id + (g.classes ? ' · ' + g.classes + ' cls' : '');
+    if (g.id === chosenId) o.selected = true;
+    sel.appendChild(o);
+  }
+  const stat = document.createElement('div');
+  stat.className = 'text-[10px] text-term-muted shrink-0';
+  head.append(sel, stat);
+  const canvas = document.createElement('div');
+  canvas.className = 'flex-1 relative bg-term-bg';
+  el.append(head, canvas);
+  const pane = { el, sel, stat, canvas, net: null };
+  sel.addEventListener('change', () => drawComparePane(pane, sel.value));
+  return pane;
+}
+
+async function drawComparePane(pane, graphId) {
+  pane.stat.textContent = '…';
+  if (pane.net) { try { pane.net.destroy(); } catch (e) {} pane.net = null; }
+  pane.canvas.innerHTML = '';
+  try {
+    const res = await pywebview.api.get_code_graph(graphId);
+    if (!res || !res.ok || !res.graph || !res.graph.nodes || !res.graph.nodes.length) {
+      pane.canvas.innerHTML =
+        '<div class="absolute inset-0 flex items-center justify-center p-4 text-center">' +
+        '<span class="text-term-muted text-[12px]">' +
+        escapeHtml((res && res.error) || 'This graph has no nodes.') + '</span></div>';
+      pane.stat.textContent = '';
+      return;
+    }
+    if (typeof vis === 'undefined') {
+      pane.canvas.innerHTML = '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-muted text-[12px]">2D graph library unavailable.</span></div>';
+      return;
+    }
+    pane.net = buildStandaloneNetwork(pane.canvas, res.graph);
+    const s = res.graph.stats;
+    pane.stat.textContent = s.total_nodes + 'n · ' + s.total_edges + 'e';
+  } catch (e) {
+    pane.canvas.innerHTML =
+      '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-red text-[12px]">' +
+      escapeHtml('' + e) + '</span></div>';
+  }
+}
+
+// A self-contained 2D network for a compare pane — deliberately does NOT touch
+// the single-view globals (graph2D / _graphRaw / sidebar), so two can coexist.
+function buildStandaloneNetwork(container, data) {
+  const labelColor = cssVar('--term-text', '#c9d1d9');
+  const nodes = data.nodes.map(n => ({
+    id: n.id, label: n.label, color: n.color, size: n.size,
+    font: { size: 9, color: labelColor }, title: n.title,
+  }));
+  const edges = data.edges.map((e, i) => ({
+    id: i, from: e.from, to: e.to, title: e.title, width: e.width, color: e.color,
+  }));
+  const net = new vis.Network(container, { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) }, {
+    physics: {
+      enabled: true, solver: 'forceAtlas2Based',
+      forceAtlas2Based: { gravitationalConstant: -60, centralGravity: 0.005, springLength: 110, springConstant: 0.08, damping: 0.4, avoidOverlap: 0.8 },
+      stabilization: { iterations: 150, fit: true },
+    },
+    interaction: { hover: true, tooltipDelay: 100, hideEdgesOnDrag: true },
+    nodes: { shape: 'dot', borderWidth: 1.5 },
+    edges: { smooth: { type: 'cubicBezier', forceDirection: 'none', roundness: 0.4 }, selectionWidth: 3 },
+  });
+  net.once('stabilizationIterationsDone', () => net.setOptions({ physics: { enabled: false } }));
+  return net;
 }
 
 // Coordinator: cache the data, rebuild the shared lookups + sidebar, then draw
@@ -1461,6 +2373,7 @@ function updateGraphModeButton() {
 }
 
 function toggleGraphMode() {
+  if (compareMode) return;  // compare panes are 2D-only; the toggle is a no-op there
   graphMode = (graphMode === '3d') ? '2d' : '3d';
   localStorage.setItem('omni-graph-mode', graphMode);
   if (_graphRaw) renderGraph(_graphRaw);  // re-render the cached graph in the new mode
@@ -1541,7 +2454,13 @@ function wireGraphSearch(data) {
 function resizeGraph3D() {
   if (!graph3D) return;
   const c = $('graphContainer');
-  graph3D.width(c.clientWidth || 800).height(c.clientHeight || 600);
+  const w = c.clientWidth, h = c.clientHeight;
+  // Only size to a REAL measured box. Falling back to a fixed 800x600 when the
+  // container is momentarily zero-size (during the tab show/hide transition)
+  // was making the canvas wider than its column on small screens, shoving the
+  // sidebar off-screen. If size isn't known yet, skip — the ResizeObserver /
+  // deferred calls below re-run this once layout settles.
+  if (w > 0 && h > 0) graph3D.width(w).height(h);
 }
 
 function focusNode3D(nodeId) {
@@ -1582,7 +2501,11 @@ function renderGraph3D(data, container) {
     // may be hidden — zoomToFit on a zero-size canvas is a no-op we retry on show.
     .onEngineStop(() => { try { if (activeTab === 'graph') graph3D.zoomToFit(500, 60); } catch (e) {} });
 
+  // Size now, then again once layout settles — the container may still be
+  // reporting a stale/zero box on this first synchronous pass.
   resizeGraph3D();
+  requestAnimationFrame(resizeGraph3D);
+  setTimeout(resizeGraph3D, 80);
 }
 
 // --- 2D (vis-network) ---
@@ -1638,6 +2561,7 @@ async function init() {
   // (e.g. after a webview refresh or an Out-of-Memory renderer reload) —
   // reconnect and replay the chat instead of dropping to the start screen.
   await loadStartScreen();
+  refreshActiveLlm();  // populate the active-LLM header badge from the current config
   try {
     const st = await pywebview.api.get_state();
     if (st && st.active) await pywebview.api.restore_session();
@@ -1704,9 +2628,17 @@ async function init() {
   $('tabGraph').addEventListener('click', () => switchTab('graph'));
   $('planBadge').addEventListener('click', () => switchTab('plan'));
   $('graphModeToggle').addEventListener('click', toggleGraphMode);
+  // Manual build controls (fixes the "no graph yet" dead-end + enables one graph
+  // per project for multi-project compare).
+  $('graphBuildBtn').addEventListener('click', () => setBuildFormOpen(!buildFormOpen));
+  $('graphBuildCancel').addEventListener('click', () => setBuildFormOpen(false));
+  $('graphBuildRun').addEventListener('click', runManualBuild);
+  $('graphCompareBtn').addEventListener('click', toggleCompareMode);
+  $('graphDeleteBtn').addEventListener('click', deleteSelectedGraph);
   // Switching the selector forces a reload of that specific graph (bypasses the
-  // graphLoaded cache, which only guards the first open of the tab).
-  $('graphSelect').addEventListener('change', (e) => loadGraph(e.target.value));
+  // graphLoaded cache, which only guards the first open of the tab). In compare
+  // mode the per-pane selectors handle switching instead.
+  $('graphSelect').addEventListener('change', (e) => { if (!compareMode) loadGraph(e.target.value); });
   updateGraphModeButton();
   // Keep the 3D canvas sized to its container (the graph tab is hidden while
   // off-screen, so it renders at zero size until the container gets dimensions).
@@ -1723,12 +2655,20 @@ async function init() {
   $('exportApproveBtn').addEventListener('click', approveExport);
   $('exportModal').addEventListener('click', (e) => { if (e.target.id === 'exportModal') closeExportModal(); });
 
+  $('activeLlmBadge').addEventListener('click', openLlmModal);
   $('llmSettingsBtn').addEventListener('click', openLlmModal);
   $('llmSettingsBtnStart').addEventListener('click', openLlmModal);
   $('llmModalClose').addEventListener('click', closeLlmModal);
-  $('llmCancelBtn').addEventListener('click', closeLlmModal);
-  $('llmSaveBtn').addEventListener('click', saveLlmConfig);
+  $('llmDoneBtn').addEventListener('click', closeLlmModal);
+  $('llmAddBtn').addEventListener('click', llmAddEntry);
+  $('llmBackBtn').addEventListener('click', () => { $('llmError').textContent = ''; llmShowList(); });
+  $('llmSaveBtn').addEventListener('click', saveLlmEntry);
   $('llmTestBtn').addEventListener('click', testLlmConnection);
+  $('llmSubtabBasic').addEventListener('click', () => llmSubtab('basic'));
+  $('llmSubtabAdvanced').addEventListener('click', () => llmSubtab('advanced'));
+  $('llmKeysAdd').addEventListener('click', () => _addListItem('llmKeysList', _LLM_KEY_OPTS));
+  $('llmModelsAdd').addEventListener('click', () => _addModelLadder('llmModelsList'));
+  $('llmVisionAdd').addEventListener('click', () => _addListItem('llmVisionList', _LLM_VISION_OPTS));
   $('llmModal').addEventListener('click', (e) => { if (e.target.id === 'llmModal') closeLlmModal(); });
 
   document.addEventListener('keydown', (e) => {

@@ -33,3 +33,32 @@ agent_workspaces.json
 
 # Test fixtures: large APK binaries are NOT committed (see test-assets/README.md)
 test-assets/*.apk
+
+# Local test scripts live here and are NOT pushed to GitHub.
+/tests/
+
+# ── Additional local state / junk ──────────────────────────────
+# Agent/tooling scratch (extra assistants + probe dirs)
+.codex/
+.agents/
+.test-memory-probe/
+# Editors / IDEs
+.vscode/
+.idea/
+# Python envs & caches
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+# Local env / secrets (llm_config.json already covered above)
+.env
+.env.*
+# Temp scratch dirs the sandbox creates next to the agent + stray run logs
+/tmp*/
+launch_out.txt
+*.log
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

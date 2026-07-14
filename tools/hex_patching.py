@@ -1,8 +1,10 @@
 """Binary patching tools.
 
-Low-level byte-patching of native .so libraries: hex writes at a file offset,
-plus a higher-level "replace a function's bytes" helper. These come into play
-after the binary_analysis tools have located a target symbol/address.
+Low-level byte-patching of native .so libraries: write known hex bytes at a
+known file offset, verified by reading them back (patch_bytes_at_offset). This
+comes into play after the binary_analysis tools have located a target
+symbol/address. For patching by locating a byte SEQUENCE (content) rather than
+an offset, see binary_patch in binary_editing.py.
 
 Reorganized out of the original ``reverse_engineering.py`` so patching
 tooling lives in one focused, readable module.
@@ -28,45 +30,26 @@ def _format_hex_bytes(new_hex_bytes):
 
 
 @registry.register(
-    name="hex_patch_file",
-    description="Patches a binary file by replacing bytes at a specific hex file offset using dd. Use this for small, precise patches in .so libraries after you know the exact offset.",
-    params_schema={
-        "filepath": "string (path to the binary)",
-        "hex_offset": "string (file offset, e.g., '0x10a40' or '00010a40')",
-        "new_hex_bytes": "string (even-length hex, e.g., '9090' for x86 NOPs or 'd503201f' for ARM64 NOP)"
-    },
-    output="The dd command output showing bytes written. On success the file is patched in-place at the given offset. Returns an error if the hex string has an odd length.",
-    when_to_use="Use this for small byte-level patches at a known FILE offset (not virtual address). To patch a whole function, use disassemble_patch_function which also verifies the write."
-)
-def hex_patch_file(filepath, hex_offset, new_hex_bytes):
-    filepath = normalize_path(filepath)
-    try:
-        formatted_bytes, _ = _format_hex_bytes(new_hex_bytes)
-    except ValueError as e:
-        return {"error": str(e)}
-
-    clean_offset = hex_offset.replace("0x", "")
-    cmd = f'echo -n -e "{formatted_bytes}" | dd of=/workspace/{filepath} bs=1 seek=$((16#{clean_offset})) conv=notrunc'
-    return run_cmd(cmd)
-
-
-@registry.register(
-    name="disassemble_patch_function",
+    name="patch_bytes_at_offset",
     description=(
-        "Replaces a function in a native .so library with new assembly/machine code. "
-        "Workflow: 1) find function address with rabin2_info or nm_symbols, 2) disassemble it with disassemble_range, "
-        "3) craft replacement bytes, 4) call this tool with the file offset and new hex bytes. "
-        "The tool writes the new bytes at the given offset and verifies the write."
+        "Writes raw hex bytes at a specific FILE OFFSET in a binary (.so or any file) and verifies the write "
+        "by reading the bytes back. This is the low-level offset-based patch primitive: you already know the "
+        "exact file offset and the exact bytes to write there. "
+        "Typical workflow: 1) find a function's address with rabin2_info or nm_symbols, 2) map it to a file "
+        "offset (readelf_info '-l'/'-S') and disassemble around it with disassemble_range, 3) craft the "
+        "replacement bytes (e.g. a NOP or a full function replacement), 4) call this with that offset and hex. "
+        "If instead you know the exact byte SEQUENCE to find-and-replace (rather than an offset), use "
+        "binary_patch, which locates the bytes by content and disambiguates multiple matches."
     ),
     params_schema={
-        "so_path": "string (path to .so inside /workspace, e.g. 'lib/arm64-v8a/libfoo.so')",
-        "file_offset": "string (hex file offset where patch starts, e.g. '0x1234')",
-        "new_hex_bytes": "string (even-length hex string of replacement bytes, e.g. 'd503201f' for ARM64 NOP)"
+        "so_path": "string (path to the binary inside /workspace, e.g. 'lib/arm64-v8a/libfoo.so')",
+        "file_offset": "string (hex file offset where the patch starts, e.g. '0x1234')",
+        "new_hex_bytes": "string (even-length hex string of replacement bytes, e.g. 'd503201f' for an ARM64 NOP)"
     },
     output="Writes the patch bytes, then reads them back as hex (xxd -p) so you can VERIFY the write succeeded. The echoed hex should match your new_hex_bytes.",
-    when_to_use="Use this to replace a function's bytes (e.g. NOP out a check). Workflow: find the function's file offset via rabin2_info/nm_symbols, disassemble with disassemble_range to understand it, then call this with the replacement bytes."
+    when_to_use="Use this to write known bytes at a known FILE offset (not a virtual address) and confirm the write — e.g. NOP out a check or drop in a full function replacement. To patch by locating a byte sequence instead of an offset, use binary_patch; for a symbol-name-driven return/NOP, use patch_function_return/nop_function."
 )
-def disassemble_patch_function(so_path, file_offset, new_hex_bytes):
+def patch_bytes_at_offset(so_path, file_offset, new_hex_bytes):
     so_path = normalize_path(so_path)
     clean_offset = file_offset.replace("0x", "")
 

@@ -24,6 +24,28 @@ def normalize_path(path):
     return path if path else "."
 
 
+def clean_hex(hex_str):
+    """Normalize a hex byte string ('1f 20', '\\x1f\\x20', '1F2003D5') to a
+    lowercase, contiguous hex string and return (cleaned, byte_count).
+
+    Accepts spaces and '\\x' escapes so callers can paste hex from a
+    disassembler in whatever shape it came in. Raises ValueError on odd length
+    or non-hex characters. Shared by the byte-level analysis/patching tools
+    (find_byte_sequence_in_so, patch_at_offset_with_bytes) so they all validate
+    hex the same way.
+    """
+    cleaned = (hex_str or "").replace("\\x", "").replace(" ", "").lower()
+    if not cleaned:
+        raise ValueError("empty hex string")
+    if len(cleaned) % 2 != 0:
+        raise ValueError("hex must have an even number of characters")
+    try:
+        bytes.fromhex(cleaned)
+    except ValueError:
+        raise ValueError("not a valid hex byte string")
+    return cleaned, len(cleaned) // 2
+
+
 def build_paginated_command(base_cmd, filter_pattern=None, max_lines=300, skip=0):
     """Append optional grep filtering + pagination to a base shell command.
 

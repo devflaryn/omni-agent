@@ -8,7 +8,7 @@ filesystem via tools.common.resolve_workspace_path (which maps a
 '/workspace/...'-style path onto the same bind-mounted directory the Linux
 sandbox sees at /workspace — so a screenshot saved here is still reachable by
 read_file_chunk etc. inside the sandbox, and an APK built by
-build_apk/sign_apk in the sandbox is still reachable here for
+recompile_apk/sign_apk in the sandbox is still reachable here for
 install_apk_on_emulator).
 
 ONE BACKEND: omnidroid (QEMU). Every "run the app on a VM" flow goes through the
@@ -39,12 +39,22 @@ call-compatibility but any value other than 'qemu' is coerced to omnidroid.
 default) it is REMOVED and re-CREATED fresh from the base (new overlay + /data).
 NOTE: a fresh account's first boot runs one-time provisioning + dexopt
 (~3–15 min); pass reset=False to reuse an already-provisioned account and just
-reinstall the APK — the fast path for iterating on a build.
+reinstall the APK — the fast path for iterating on a build. That opt-out exists
+ONLY on ensure_emulator_running (interactive iteration): run_apk_test_session
+FORCES reset=True and additionally VERIFIES the booted instance carries no
+third-party packages (uninstalling any leftover) before installing the APK
+under test, so every test session runs on a provably fresh instance.
 
-Screenshot capture is window-state-independent: record_and_capture_keyframes and
-take_emulator_screenshot both use `adb exec-out screencap -p`, which reads the
-guest framebuffer over ADB (the omnidroid instance is headless — viewable over
-its localhost VNC port — so there is no host window to capture anyway).
+Screenshot capture is window-state-independent. take_emulator_screenshot uses
+`adb exec-out screencap -p` (reads the guest framebuffer over ADB — the omnidroid
+instance is headless, so there is no host window to capture). record_and_capture_
+keyframes PREFERS the engine's millisecond-precise `omni capture` (it observes
+every VNC framebuffer update, so a loading screen shown for a few ms before a
+black screen is caught with the true delta_ms) and falls back to adb-screencap
+polling on an engine too old to advertise capture. Both paths feed the SAME
+crash/exit diagnostics (tools/_emulator_diagnostics.py) so a black screen is
+never confused with an app crash: crash/close is decided from the app's process
+lifecycle + `logcat -b all -v epoch`, black is only a visual flag.
 """
 import json
 import os
@@ -52,13 +62,19 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 
 from tool_registry import registry
 from tools.common import resolve_workspace_path, find_android_sdk_tools
 from tools._emulator_frame_capture import capture_keyframes
 from tools._emulator_vision_analyze import analyze_session
-from llm import get_openai_endpoint_config
+from tools._emulator_capture_contract import (
+    capture_capability, load_capture_result, summarize_capture,
+    normalize_capture_metadata, write_metadata_atomic,
+)
+from tools._emulator_diagnostics import analyze_logcat, merge_diagnostics, extract_crash_traces
+from llm import get_openai_endpoint_config, get_vision_endpoint_config, has_vision_model
 
 # omnidroid (QEMU against the base_x86/base_arm qcow2s, driven through the frozen
 # contract) is the ONE AND ONLY VM backend. The old Android SDK emulator
@@ -73,6 +89,9 @@ _DEFAULT_BACKEND = "qemu"
 # v1). The qemu backend does a `version --json` handshake and warns on mismatch.
 _EXPECTED_CONTRACT = "1.0"
 _DEFAULT_QEMU_SESSION = "omniagent"
+# Workspace subfolder the always-on dev auto-screenshot recorder writes into
+# (/workspace/screenshots/auto). read_auto_screenshots reads this by default.
+_AUTOCAP_SESSION = "auto"
 _DEFAULT_SYSTEM_IMAGE = None   # (removed) AVD-only; kept as a no-op for old callers
 _DEFAULT_QEMU_MODE = "playable"
 
@@ -363,12 +382,29 @@ def _qemu_readiness_check():
     return False, {"error": "doctor returned no JSON"}
 
 
-def _qemu_create(name, boot_timeout, log):
+def _dev_base_enabled(dev=None):
+    """Whether new omnidroid accounts should be created from the DEV base
+    (base-dev.qcow2: frida + root/frida-hiding devkit). True when the caller
+    passes dev=True OR the OMNI_USE_DEV_BASE env var is truthy. omni-agent is a
+    dev-only dependency, so it is the only thing that ever selects this base;
+    the shipped bases (base_x86/base_arm) never carry the devkit."""
+    if dev is not None:
+        return _truthy(dev)
+    return _truthy(os.environ.get("OMNI_USE_DEV_BASE", ""))
+
+
+def _qemu_create(name, boot_timeout, log, dev=False):
     """Create disks for a fresh account (no boot — the first `start` provisions).
-    Returns None on success or an {"error": ...} dict on failure."""
-    log.append(f"Creating account '{name}' (disks only; first boot provisions)...")
+    Returns None on success or an {"error": ...} dict on failure. When dev=True
+    the account is pinned to the 'dev' base (`create --base dev`) so it boots the
+    frida/root-hiding image instead of the production x86 base."""
+    tag = " on the DEV base (frida+root-hiding)" if dev else ""
+    log.append(f"Creating account '{name}'{tag} (disks only; first boot provisions)...")
+    argv = ["create", name, "--no-provision", "--json"]
+    if dev:
+        argv += ["--base", "dev"]
     try:
-        parsed, res, _pd = _run_qemu(["create", name, "--no-provision", "--json"], timeout=600)
+        parsed, res, _pd = _run_qemu(argv, timeout=600)
     except RuntimeError as e:
         return {"error": str(e)}
     if res.get("error"):
@@ -379,11 +415,54 @@ def _qemu_create(name, boot_timeout, log):
     return None
 
 
-def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
+def _autocap_workspace_dir():
+    """Where the always-on dev auto-screenshots land in the agent workspace:
+    /workspace/screenshots/auto/ (read them with read_auto_screenshots)."""
+    return resolve_workspace_path(f"screenshots/{_AUTOCAP_SESSION}")
+
+
+def _agent_ensure_autocap(name, log):
+    """Idempotently make sure the engine's always-on recorder is running and
+    pointed at the workspace. Safe to call on every ensure-emulator (dev only);
+    it never starts a second recorder. Best-effort — never fails the boot."""
+    try:
+        out_dir = _autocap_workspace_dir()
+    except RuntimeError as e:
+        log.append(f"[autocap] workspace path unresolved ({e}); skipping.")
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        parsed, res, _pd = _run_qemu(
+            ["autocap", name, "--ensure", "--out", out_dir, "--json"], timeout=60)
+    except RuntimeError as e:
+        log.append(f"[autocap] ensure failed: {e}")
+        return
+    if isinstance(parsed, dict) and parsed.get("running"):
+        state = "already ON" if parsed.get("already") else "STARTED"
+        log.append(f"[autocap] always-on screenshots {state} -> "
+                   f"/workspace/screenshots/{_AUTOCAP_SESSION}/ "
+                   f"(read them with read_auto_screenshots).")
+    else:
+        why = (parsed or {}).get("reason") or (res.get("stderr") or "")[:120]
+        log.append(f"[autocap] recorder not started ({why}).")
+
+
+def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
     err = _validate_session_id(name)
     if err:
         return {"error": err}
     log = []
+    if dev:
+        log.append("DEV BASE selected: new accounts boot base-dev.qcow2 "
+                   "(frida + root/frida-hiding devkit). Start frida with "
+                   "ensure_frida_server; hide it with hide_root_from_app.")
+        # Point the engine's own boot-time auto-start (and our later ensure) at
+        # the workspace so screenshots are captured automatically and readably,
+        # with no explicit start call needed. Set BEFORE `start` runs.
+        try:
+            os.environ["OMNI_AUTOCAP_DIR"] = _autocap_workspace_dir()
+        except RuntimeError:
+            pass
 
     # Which engine + config are we actually driving? Surface it so a path/config
     # mismatch is diagnosable at a glance (this is exactly the class of bug where
@@ -445,13 +524,13 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
             if res_rm.get("error"):
                 return {"error": res_rm["error"]}
             exists = running = False
-        err = _qemu_create(name, boot_timeout, log)
+        err = _qemu_create(name, boot_timeout, log, dev=dev)
         if err:
             return err
         exists, running = True, False
     elif not exists:
         # reset=False but nothing to reuse yet — create it once.
-        err = _qemu_create(name, boot_timeout, log)
+        err = _qemu_create(name, boot_timeout, log, dev=dev)
         if err:
             return err
         exists = True
@@ -463,6 +542,8 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
         adb = _qemu_adb(_find_qemu_manager()[1])
         if serial:
             _run([adb, "connect", serial], timeout=10)
+        if dev:
+            _agent_ensure_autocap(name, log)
         log.append(f"BOOT_OK (serial={serial or 'unknown'})")
         return {"stdout": "\n".join(log)}
 
@@ -506,6 +587,10 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem):
     bridge = parsed_s.get("native_bridge_ok")
     if bridge is False:
         log.append("WARNING: libndk ARM bridge did NOT verify — arm64-only APKs may fail to run.")
+    if dev:
+        # Engine already auto-starts the recorder on a dev --wait boot; this
+        # idempotent ensure just confirms it and repoints to the workspace.
+        _agent_ensure_autocap(name, log)
     log.append(f"BOOT_OK (serial={serial or 'unknown'})")
     return {"stdout": "\n".join(log)}
 
@@ -569,17 +654,19 @@ def _resolve_serial(backend, device_name=None):
         "mode": "string (optional, default 'playable' — RAM/CPU tier: 'playable' (4G/4c), 'hard' (3G/4c), or 'brutal' (2G/2c))",
         "ram_mb": "integer (optional — override guest RAM in MB, passed as --mem; overrides the mode's RAM. Engine defaults to the mode's tier if omitted)",
         "cpus": "integer (optional — IGNORED (vCPU count is set by 'mode'))",
-        "headless": "boolean (IGNORED — omnidroid instances are always headless; view over the instance's localhost VNC port)"
+        "headless": "boolean (IGNORED — omnidroid instances are always headless; view over the instance's localhost VNC port)",
+        "dev": "boolean (optional, default false — boot the DEV base (base-dev.qcow2): a remaster of the x86 base with frida-server + root/frida-hiding tools baked in, for reverse-engineering/runtime-hooking work. Requires `omni build-dev-base` to have produced the dev base. Also enablable globally via the OMNI_USE_DEV_BASE env var. Only affects a FRESH create (base is fixed per account); production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)"
     },
     output="A log of what happened (account creation/reset if needed, boot wait progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
-    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly — it always targets the same omnidroid account and (by default) resets it to a clean state each time. Fully self-contained (no Android Studio / SDK emulator / LDPlayer)."
+    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly — it always targets the same omnidroid account and (by default) resets it to a clean state each time. Fully self-contained (no Android Studio / SDK emulator / LDPlayer). Pass dev=true (or set OMNI_USE_DEV_BASE) to boot the frida/root-hiding dev base."
 )
 def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_image=_DEFAULT_SYSTEM_IMAGE,
                              device_profile="pixel_5", reset=True, boot_timeout=300, headless=False,
-                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE):
+                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, dev=None):
     backend = _coerce_backend(backend)   # omnidroid (qemu) only — never an AVD
     device_name = device_name or _default_device_name()
     reset = _truthy(reset)
+    dev = _dev_base_enabled(dev)
     try:
         boot_timeout = int(boot_timeout)
     except (TypeError, ValueError):
@@ -590,7 +677,7 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     # ALWAYS omnidroid: create/start an account on the base (base_x86 on x86,
     # base_arm on an arm64 host) via the frozen contract. system_image/
     # device_profile/headless are ignored (they were AVD-only).
-    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb)
+    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb, dev=dev)
 
 
 @registry.register(
@@ -794,13 +881,17 @@ def get_logcat(filter_pattern=None, max_lines=300, clear_first=False, priority=N
     if adb is None:
         return serial_or_err
     if _truthy(clear_first):
-        _run([adb, "-s", serial_or_err, "logcat", "-c"], timeout=15)
-        return {"stdout": "Logcat buffer cleared."}
+        # -b all: clear the crash + system/events buffers too, not just main.
+        _run([adb, "-s", serial_or_err, "logcat", "-b", "all", "-c"], timeout=15)
+        return {"stdout": "Logcat buffer cleared (all buffers)."}
     try:
         max_lines = int(max_lines)
     except (TypeError, ValueError):
         max_lines = 300
-    args = [adb, "-s", serial_or_err, "logcat", "-d"]
+    # -b all so a native crash (crash buffer) or a process-death event
+    # (am_proc_died in system/events) is actually in the dump — the plain main
+    # buffer misses both, which is exactly the evidence a crash hunt needs.
+    args = [adb, "-s", serial_or_err, "logcat", "-b", "all", "-d"]
     if priority:
         args.append(f"*:{priority}")
     res = _run(args, timeout=60)
@@ -814,6 +905,94 @@ def get_logcat(filter_pattern=None, max_lines=300, clear_first=False, priority=N
         lines = text.splitlines()
     tail = lines[-max_lines:]
     return {"stdout": "\n".join(tail) if tail else "(no matching log lines)"}
+
+
+# Crash/ANR/native-fault/process-death extraction lives in the shared
+# _emulator_diagnostics.extract_crash_traces (package-scoped, dedup'd, and it
+# also catches am_proc_died / low-memory kills). monitor_logcat calls that
+# directly — no local copy to drift out of sync.
+
+
+@registry.register(
+    name="monitor_logcat",
+    description=(
+        "Captures a real-time logcat WINDOW from the running emulator and returns ONLY the crash/ANR/"
+        "process-death stack traces found in it — not the whole buffer — so you get the signal (why it "
+        "crashed) without flooding context with routine log spam. It clears ALL buffers, watches for "
+        "duration_seconds while the app runs, then extracts every FATAL EXCEPTION, native fault "
+        "(SIGSEGV/abort/backtrace), ANR, and low-memory kill/process-death block with its stack trace, "
+        "and hands back the most recent ones. Reads all buffers (-b all) so native crashes (crash "
+        "buffer) and 'process has died' events (system/events buffer) are actually seen — the plain "
+        "main buffer misses both. Pass package_name to scope detection to YOUR app so an unrelated "
+        "system crash isn't misattributed. "
+        "Typical loop: launch_app_on_emulator, then monitor_logcat to see if/why it died, patch, repeat."
+    ),
+    params_schema={
+        "duration_seconds": "number (optional, default 15 — how long to watch after clearing the buffer; capped at 120)",
+        "max_traces": "integer (optional, default 5 — how many of the most recent crash/ANR blocks to return)",
+        "package_name": "string (optional but RECOMMENDED — scope crash/death detection to this app package so an unrelated process's crash isn't reported as yours)",
+        "extra_pattern": "string (optional, Python regex — if set, also returns the last matching lines when NO crash block is detected, e.g. a tag you're tracking)",
+        "clear_first": "boolean (optional, default true — clear the buffer before the window so only fresh events are captured)",
+        "backend": "string (optional, default 'qemu' — must match ensure_emulator_running's backend)",
+        "device_name": "string (optional — must match ensure_emulator_running's device_name if overridden)"
+    },
+    output="The most recent crash/ANR/process-death stack traces captured in the window, each as a self-contained block, with a count of how many were found. If none were detected, a note saying so (plus extra_pattern matches if you supplied one) — which usually means the app did NOT crash during the window.",
+    when_to_use="Use this right after launching or interacting with the app to find out if it crashed and get the exact stack trace to fix — it keeps only the traces, so it's safe on context. For a full/unfiltered buffer dump, or to just grep the log, use get_logcat instead."
+)
+def monitor_logcat(duration_seconds=15, max_traces=5, package_name=None, extra_pattern=None,
+                   clear_first=True, backend=_DEFAULT_BACKEND, device_name=None):
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    try:
+        duration_seconds = float(duration_seconds)
+    except (TypeError, ValueError):
+        duration_seconds = 15.0
+    duration_seconds = max(1.0, min(duration_seconds, 120.0))
+    try:
+        max_traces = int(max_traces)
+    except (TypeError, ValueError):
+        max_traces = 5
+    max_traces = max(1, min(max_traces, 20))
+
+    if _truthy(clear_first):
+        _run([adb, "-s", serial_or_err, "logcat", "-b", "all", "-c"], timeout=15)
+
+    # Watch the window, then dump what accumulated. subprocess.run captures
+    # all-or-nothing on timeout, so we sleep-then-dump rather than stream (the
+    # same approach record_and_capture_keyframes uses for its logcat capture).
+    # -b all -v epoch: include the crash + system/events buffers and epoch
+    # timestamps, so native faults and 'am_proc_died' are captured too.
+    time.sleep(duration_seconds)
+    res = _run([adb, "-s", serial_or_err, "logcat", "-b", "all", "-v", "epoch", "-d"], timeout=60)
+    if res.get("error"):
+        return res
+    text = res.get("stdout", "") or ""
+
+    # Shared analyzer (also detects ANR, native faults, and process death; dedups
+    # repeated tags; scopes to package_name when given).
+    blocks, total = extract_crash_traces(text, max_traces=max_traces, package_name=package_name)
+    header = f"=== monitor_logcat: watched {duration_seconds:.0f}s window ===\n"
+    if blocks:
+        shown = (
+            f"{header}Found {total} crash/ANR block(s); showing the most recent {len(blocks)}:\n\n"
+            + "\n\n----------\n\n".join(blocks)
+        )
+        return {"stdout": shown}
+
+    # No crash detected — usually good news. Optionally surface tracked lines.
+    note = header + "No crash/ANR/native-fault stack traces detected in this window (the app likely did NOT crash)."
+    if extra_pattern:
+        try:
+            pat = re.compile(extra_pattern, re.IGNORECASE)
+            matches = [l for l in text.splitlines() if pat.search(l)][-max_traces * 10:]
+            if matches:
+                note += f"\n\nLast lines matching '{extra_pattern}':\n" + "\n".join(matches)
+            else:
+                note += f"\n(No lines matched extra_pattern '{extra_pattern}' either.)"
+        except re.error as e:
+            note += f"\n(extra_pattern '{extra_pattern}' is not a valid regex: {e})"
+    return {"stdout": note}
 
 
 @registry.register(
@@ -858,36 +1037,205 @@ def take_emulator_screenshot(label=None, backend=_DEFAULT_BACKEND, device_name=N
     return {"stdout": f"Saved: /workspace/screenshots/manual/{fname} ({len(proc.stdout)} bytes)"}
 
 
+# --------------------------------------------------------------------------
+# Capture: engine (millisecond-precise VNC) with an adb-polling fallback, both
+# feeding the SAME crash/exit diagnostics so a black screen is never mistaken
+# for a crash (and vice versa).
+# --------------------------------------------------------------------------
+
+def _qemu_capture_capability():
+    """`version --json` handshake -> normalized capture capability. Returns a
+    dict; `supported` is False on any engine that predates the `capture` command
+    so callers transparently fall back to adb polling."""
+    try:
+        parsed, _res, _pd = _run_qemu(["version", "--json"], timeout=30)
+    except RuntimeError:
+        return {"supported": False}
+    return capture_capability(parsed if isinstance(parsed, dict) else {})
+
+
+def _adb_pidof(adb, serial, package):
+    """Current pid of `package` in the guest (first one), or None."""
+    if not package:
+        return None
+    res = _run([adb, "-s", serial, "shell", "pidof", package], timeout=10)
+    for tok in (res.get("stdout") or "").split():
+        if tok.isdigit():
+            return int(tok)
+    return None
+
+
+class _PidTracker(threading.Thread):
+    """Polls `pidof <package>` on a background thread during an adb-fallback
+    capture, timing when the app process STARTS and (the key crash/close signal)
+    DISAPPEARS. Events share the capture's monotonic start so they line up with
+    frame t_ms. Emits merge_diagnostics-shaped events (app_started/app_restarted/
+    app_exited)."""
+
+    def __init__(self, adb, serial, package, start_ns, interval=0.5):
+        super().__init__(name="agent-pid-tracker", daemon=True)
+        self.adb, self.serial, self.package = adb, serial, package
+        self.start_ns, self.interval = start_ns, interval
+        self._stop = threading.Event()
+        self.events = []
+        self.last_pid = None
+        self.ever_started = False
+
+    def _t_ms(self):
+        return max(0, int(round((time.monotonic_ns() - self.start_ns) / 1e6)))
+
+    def run(self):
+        while not self._stop.is_set():
+            pid = _adb_pidof(self.adb, self.serial, self.package)
+            t = self._t_ms()
+            if pid and self.last_pid is None:
+                self.events.append({"type": ("app_restarted" if self.ever_started
+                                             else "app_started"), "t_ms": t, "pid": pid})
+                self.ever_started = True
+            elif pid and self.last_pid and pid != self.last_pid:
+                self.events.append({"type": "app_restarted", "t_ms": t, "pid": pid})
+            elif not pid and self.last_pid is not None:
+                self.events.append({"type": "app_exited", "t_ms": t, "pid": self.last_pid})
+            self.last_pid = pid
+            self._stop.wait(self.interval)
+
+    def stop(self):
+        self._stop.set()
+
+
+def _capture_verdict(meta):
+    """One-line, plain-language verdict the TEXT-ONLY agent leads with: does the
+    evidence say the app CRASHED, was CLOSED/killed, is merely on a BLACK screen
+    while still alive, or ran fine? Crash/exit come from process+logcat evidence;
+    black is only a visual flag — they are reported independently."""
+    frames = meta.get("keyframes") or []
+    last = frames[-1] if frames else {}
+    last_black = bool(last.get("black_screen"))
+    if meta.get("crash_detected"):
+        crashes = meta.get("crashes") or []
+        why = (crashes[-1].get("summary") if crashes and isinstance(crashes[-1], dict) else "")
+        return "APP CRASHED during the capture window" + (f" — {why[:200]}" if why else "") \
+            + (". The final frame is also black (the crash blanked the screen)." if last_black else ".")
+    if meta.get("anr_detected"):
+        return "APP NOT RESPONDING (ANR) during the capture window."
+    if meta.get("exit_detected"):
+        return ("APP PROCESS EXITED/was CLOSED during the capture window (the app is no "
+                "longer running)" + (" and the screen is black" if last_black else "") + ".")
+    if meta.get("app_state") == "not_started":
+        return "The app process was NEVER seen running during the window (it did not start)."
+    if last_black:
+        state = meta.get("app_state")
+        if state == "running":
+            return ("Screen is BLACK but the app process is STILL ALIVE — this is NOT a crash "
+                    "(likely a render/surface/black-splash issue, not a process death).")
+        return "The final frame is BLACK; no crash/exit was detected in the process or logs."
+    return f"App ran through the window (app_state={meta.get('app_state', 'unknown')}); no crash/exit detected."
+
+
+def _apply_capture_diagnostics(session_dir, package_name, process_events, meta):
+    """Fold logcat + process-lifecycle evidence into `meta` so every keyframe
+    gets an app_state and crash/ANR/exit are detected INDEPENDENTLY of the
+    black-screen visual flag. Reads the session's logcat.txt (written as
+    `-b all -v epoch`), lets merge_diagnostics own per-frame app_state, then
+    writes the enriched metadata.json. Returns the enriched meta."""
+    logcat_path = os.path.join(session_dir, "logcat.txt")
+    logcat_text = ""
+    if os.path.isfile(logcat_path):
+        with open(logcat_path, encoding="utf-8", errors="replace") as f:
+            logcat_text = f.read()
+    known_pids = [e.get("pid") for e in (process_events or []) if e.get("pid")]
+    log_analysis = analyze_logcat(
+        logcat_text, package_name=package_name,
+        start_epoch_ms=meta.get("start_epoch_ms"), known_pids=known_pids)
+    # When scoping to a package, the agent's package-scoped logcat analysis is
+    # AUTHORITATIVE: drop the engine's BROAD crash flags/events (it flags any
+    # FATAL/signal in the whole log) so an unrelated app's crash isn't
+    # misattributed to ours. The engine's pid-lifecycle events stay — its poller
+    # already tracked THIS package — but its non-scoped 'app_crashed' is dropped;
+    # merge_diagnostics re-adds a package-scoped crash from log_analysis.
+    if package_name:
+        for k in ("crash_detected", "anr_detected", "exit_detected"):
+            meta[k] = False
+        meta["crashes"] = []
+        process_events = [e for e in (process_events or []) if e.get("type") != "app_crashed"]
+    # merge_diagnostics is authoritative for per-frame app_state — clear any
+    # engine guess to 'unknown' so its timeline walk decides cleanly.
+    for fr in meta.get("keyframes", []):
+        fr["app_state"] = "unknown"
+    meta = merge_diagnostics(meta, process_events or [], log_analysis,
+                             package_name=package_name)
+    write_metadata_atomic(os.path.join(session_dir, "metadata.json"), meta)
+    return meta
+
+
+def _capture_via_engine(name, session_dir, duration_seconds, package_name,
+                        change_percent, black_threshold, sample_scale_w):
+    """Run the engine's millisecond-precise `capture` and load its metadata.
+    Returns (meta_dict, None) on success or (None, error_string)."""
+    argv = ["capture", name, "--out", session_dir,
+            "--duration", str(duration_seconds),
+            "--change-percent", str(change_percent),
+            "--black-threshold", str(black_threshold),
+            "--sample-scale-w", str(int(sample_scale_w)), "--json"]
+    if package_name:
+        argv += ["--package", package_name]
+    try:
+        parsed, res, _pd = _run_qemu(argv, timeout=int(float(duration_seconds)) + 180)
+    except RuntimeError as e:
+        return None, str(e)
+    if res.get("error"):
+        return None, res["error"]
+    if not (isinstance(parsed, dict) and parsed.get("ok")):
+        detail = (parsed.get("message") if isinstance(parsed, dict) else None) \
+            or (res.get("stdout") or res.get("stderr") or "").strip()
+        return None, f"engine capture did not succeed: {str(detail)[:500]}"
+    try:
+        engine_path = _find_qemu_manager()[0]
+    except RuntimeError:
+        engine_path = None
+    meta = load_capture_result(session_dir, parsed, provider="omnidroid",
+                               engine_path=engine_path)
+    return meta, None
+
+
 @registry.register(
     name="record_and_capture_keyframes",
     description=(
-        "Watches the emulator's screen for a fixed duration, sampling screenshots at a fixed interval "
-        "via 'adb exec-out screencap -p' (window-state-independent — works even if the emulator "
-        "window is minimized), and keeps only the frames where the screen changed MEANINGFULLY — a "
-        "small looping loading animation (a spinner, a pulsing icon) does NOT trigger a new keyframe, "
-        "but a real page/screen transition does, and a transition into a black screen is always "
-        "flagged (a common crash signature). Also clears logcat right before starting and dumps it "
-        "right after finishing, so the exact same window is captured in both screenshots and logs. "
-        "Writes everything to /workspace/screenshots/<session_name>/ (each keyframe PNG + "
-        "metadata.json + logcat.txt) — call analyze_keyframes next to get plain-language descriptions "
-        "of each keyframe, then generate_test_report to assemble it all into a Markdown report."
+        "Watches the emulator's screen for a fixed duration and keeps only the frames where the screen "
+        "changed MEANINGFULLY — a small looping loading animation (a spinner, a pulsing icon) does NOT "
+        "trigger a new keyframe, but a real page/screen transition does, and a move into/out of a black "
+        "screen is always flagged. It also tracks the APP PROCESS and captures the full logcat window, "
+        "so it can tell 'the app CRASHED/closed' apart from 'the screen is black but the app is still "
+        "alive' — reported as an up-front VERDICT. "
+        "PREFERS the omnidroid engine's MILLISECOND-PRECISE capture: it observes EVERY VNC framebuffer "
+        "update (not a 1 Hz poll), so a loading screen shown for only a few milliseconds before a black "
+        "screen is caught as two keyframes with the true gap (delta_ms) between them; it falls back to "
+        "'adb exec-out screencap -p' polling on an engine too old to support capture. Logcat is captured "
+        "as '-b all -v epoch' (all buffers, epoch timestamps) and clears right before the window so the "
+        "screenshots and logs cover the exact same interval. "
+        "Writes /workspace/screenshots/<session_name>/ (keyframe PNGs + metadata.json + logcat.txt) — "
+        "call analyze_keyframes next for descriptions, then generate_test_report to assemble the report."
     ),
     params_schema={
         "session_name": "string (a name for this test session, e.g. 'login_flow_v2' — used as the output subfolder name)",
+        "package_name": "string (optional but RECOMMENDED — the app package, e.g. 'com.example.app'. Enables process-lifecycle tracking so a crash/close is distinguished from a black screen; also scopes crash detection to THIS app so an unrelated system crash isn't misattributed)",
         "duration_seconds": "number (optional, default 20 — how long to watch the screen)",
-        "interval_seconds": "number (optional, default 1.0 — how often to sample a frame)",
-        "change_threshold": "number (optional, default 14 — average per-pixel brightness difference (0-255 scale, on a downscaled grayscale frame) versus the last KEPT keyframe required to count as a real change)",
-        "black_threshold": "number (optional, default 10 — a frame with average brightness below this is flagged black_screen even if the raw diff was modest)",
-        "sample_scale_w": "integer (optional, default 160 — frames are downscaled to this width before diffing, for speed; this does not affect the resolution of the SAVED keyframe PNGs, which are always full-resolution)",
-        "capture_logcat": "boolean (optional, default true — clear logcat before starting and dump it to logcat.txt in the session folder when done)",
+        "interval_seconds": "number (optional, default 1.0 — adb-FALLBACK sampling period only; ignored by the engine path, which is event-driven at display rate)",
+        "change_threshold": "number (optional, default 14 — mean per-pixel delta (0-255) vs the last KEPT keyframe to count as a change; a sensitivity backstop)",
+        "black_threshold": "number (optional, default 10 — a frame with average brightness below this is flagged black_screen)",
+        "sample_scale_w": "integer (optional, default 160 — downscale width for change detection; does NOT affect the SAVED keyframe PNGs, which are full-resolution)",
+        "capture_logcat": "boolean (optional, default true — capture logcat for the window; the engine path always captures it)",
+        "auto_analyze": "boolean (optional, default true — right after capture, run the VISION model over the kept keyframes and include a plain-language description of each in the result, so you SEE what happened without a second call. Set false to skip (e.g. to capture fast and analyze later, or when no vision model is configured).",
+        "vision_max_frames": "integer (optional, default 16 — cap on how many kept keyframes get an auto vision call; first/last/black/crash/transition frames are prioritized).",
         "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)"
     },
-    output="A summary: how many raw samples were taken, how many keyframes were kept, and for each keyframe its index, timestamp, diff score, and whether it was flagged as a black screen. The actual images are NOT returned here (they're saved to disk) — use analyze_keyframes to get a description of each one.",
-    when_to_use="Call this after launch_app_on_emulator to watch what happens as the app starts/you interact with it. This is the tool for 'test how it performs' — it decides on its own which moments were visually significant instead of you polling take_emulator_screenshot on a schedule."
+    output="A VERDICT line first (crashed / exited / black-but-alive / ran-ok), the capture provider (omnidroid millisecond-precise vs adb polling), then per-keyframe index, timestamp t_ms and gap (+delta_ms), changed%, black-screen flag, app_state, and (when auto_analyze is on) a vision description of each kept frame. Full-resolution PNGs are also saved to disk.",
+    when_to_use="Call this after launch_app_on_emulator to watch what happens as the app starts/you interact with it. Pass package_name so it can tell a crash from a black screen. With auto_analyze on (default) it also describes each significant frame with the vision model, so you can reason over what actually rendered before the next step."
 )
-def record_and_capture_keyframes(session_name, duration_seconds=20, interval_seconds=1.0, change_threshold=14,
-                                  black_threshold=10, sample_scale_w=160, capture_logcat=True,
+def record_and_capture_keyframes(session_name, package_name=None, duration_seconds=20, interval_seconds=1.0,
+                                  change_threshold=14, black_threshold=10, sample_scale_w=160, capture_logcat=True,
+                                  auto_analyze=True, vision_max_frames=16,
                                   backend=_DEFAULT_BACKEND, device_name=None):
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
@@ -898,10 +1246,6 @@ def record_and_capture_keyframes(session_name, duration_seconds=20, interval_sec
         return {"error": str(e)}
     os.makedirs(session_dir, exist_ok=True)
 
-    do_logcat = _truthy(capture_logcat)
-    if do_logcat:
-        _run([adb, "-s", serial_or_err, "logcat", "-c"], timeout=15)
-
     try:
         duration_seconds = float(duration_seconds)
         interval_seconds = float(interval_seconds)
@@ -911,18 +1255,175 @@ def record_and_capture_keyframes(session_name, duration_seconds=20, interval_sec
     except (TypeError, ValueError):
         return {"error": "duration_seconds/interval_seconds/change_threshold/black_threshold/sample_scale_w must be numeric."}
 
+    device_name = device_name or _default_device_name()
+    # Change-detection percentage: derived from change_threshold's sensitivity so
+    # a caller who tuned that still influences both paths (engine expresses the
+    # scene threshold as % of changed pixels; 8% is the shared default).
+    change_percent = 8.0
+
+    # --- Preferred path: engine millisecond-precise VNC capture --------------
+    provider = "adb_fallback"
+    meta = None
+    engine_note = ""
+    cap = _qemu_capture_capability() if backend == "qemu" else {"supported": False}
+    if cap.get("supported"):
+        meta, err = _capture_via_engine(
+            device_name, session_dir, duration_seconds, package_name,
+            change_percent, black_threshold, sample_scale_w)
+        if meta is not None:
+            provider = "omnidroid"
+        else:
+            engine_note = (f"\n[note] engine capture was advertised but failed ({err}); "
+                           "fell back to adb screencap polling.")
+
+    # --- Fallback path: adb screencap polling + a background PID tracker ------
+    if meta is None:
+        do_logcat = _truthy(capture_logcat)
+        # -b all -v epoch: crash/exit lines (am_proc_died, 'has died') live in the
+        # system/crash buffers and analyze_logcat needs epoch timestamps to place
+        # them on the frame timeline. The old 'logcat -c' / 'logcat -d' (main
+        # buffer, brief format) captured neither — that was the logcat gap.
+        if do_logcat:
+            _run([adb, "-s", serial_or_err, "logcat", "-b", "all", "-c"], timeout=15)
+        start_ns = time.monotonic_ns()
+        start_epoch_ms = time.time_ns() // 1_000_000
+        tracker = None
+        if package_name:
+            tracker = _PidTracker(adb, serial_or_err, package_name, start_ns)
+            tracker.start()
+        try:
+            capture_keyframes(adb, session_dir, duration_seconds, interval_seconds,
+                              change_threshold, black_threshold, sample_scale_w,
+                              serial=serial_or_err, change_percent=change_percent,
+                              start_monotonic_ns=start_ns, start_epoch_ms=start_epoch_ms)
+        except Exception as e:
+            if tracker:
+                tracker.stop()
+            return {"error": f"Frame capture failed: {e}"}
+        if tracker:
+            tracker.stop()
+            tracker.join(timeout=2)
+        if do_logcat:
+            logcat_res = _run([adb, "-s", serial_or_err, "logcat", "-b", "all", "-v", "epoch", "-d"], timeout=45)
+            with open(os.path.join(session_dir, "logcat.txt"), "w", encoding="utf-8", errors="replace") as f:
+                f.write(logcat_res.get("stdout", ""))
+        # Reload the metadata the fallback wrote so both paths share the merge step.
+        meta_path = os.path.join(session_dir, "metadata.json")
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        meta = normalize_capture_metadata(meta, provider="adb_fallback")
+        meta["process_events"] = list(tracker.events) if tracker else []
+
+    # --- Shared: fold crash/exit diagnostics into every keyframe -------------
+    process_events = meta.get("process_events") or []
+    meta = _apply_capture_diagnostics(session_dir, package_name, process_events, meta)
+
+    verdict = _capture_verdict(meta)
+    body = summarize_capture(meta)
+    header = (f"VERDICT: {verdict}\n"
+              f"Capture provider: {'omnidroid (millisecond-precise, every display update)' if provider == 'omnidroid' else 'adb screencap polling (fallback)'}"
+              + (f" — every ~{interval_seconds:g}s" if provider != 'omnidroid' else "") + ".")
+    if not package_name:
+        header += ("\n[hint] pass package_name next time so a crash/close can be distinguished from a "
+                   "black screen with process-lifecycle evidence.")
+
+    # Auto-reason over the significant frames with the VISION model, so the caller
+    # SEES what each big on-screen change was (menu opened, dialog, crash screen)
+    # without a second tool call. Skipped when turned off or no vision model exists.
+    vision_block = ""
+    if _truthy(auto_analyze) and (meta.get("keyframes")):
+        if not has_vision_model():
+            vision_block = ("\n\n[vision] auto_analyze is on but no vision model is configured — "
+                            "add one in LLM Settings (provider → 'vision models') to describe frames.")
+        else:
+            try:
+                summary = _vision_analyze_session(session_dir, backend="auto",
+                                                  max_frames=int(vision_max_frames))
+                vision_block = "\n\nVISION (image-to-text) frame descriptions:\n" + summary
+            except Exception as e:
+                vision_block = f"\n\n[vision] auto analysis failed ({e}); run analyze_keyframes manually."
+    return {"stdout": f"{header}\n\n{body}{engine_note}{vision_block}"}
+
+
+# --------------------------------------------------------------------------
+# Always-on dev auto-screenshots (DEV BASE ONLY) — read side
+# --------------------------------------------------------------------------
+# The recorder is NOT toggled by the agent: the omnidroid engine auto-starts a
+# continuous `capture --auto` the moment a dev instance finishes booting (see
+# _agent_ensure_autocap / OMNI_AUTOCAP_DIR), so screenshots are ALWAYS being
+# captured to /workspace/screenshots/auto/ whenever a dev emulator is up. It
+# drops a keyframe on EVERY big on-screen change (a spinner stays below
+# threshold; a black->loading flip is always caught), flushes metadata.json
+# live, and names files frame_<idx>_t<elapsed>ms_+<gap>ms_w<HHMMSS_mmm>.png so an
+# INSTANT transition is distinguishable from one that TOOK TIME. This tool just
+# READS that always-on feed; there is nothing to start or stop.
+
+def _autocap_session_dir(session_name):
+    err = _validate_session_id(session_name)
+    if err:
+        raise ValueError(err)
+    return resolve_workspace_path(f"screenshots/{session_name}")
+
+
+@registry.register(
+    name="read_auto_screenshots",
+    description=(
+        "Reads the ALWAYS-ON auto-screenshot feed for the running dev emulator. You do NOT start or stop "
+        "anything — whenever a dev instance is up (ensure_emulator_running(dev=True)), omnidroid is already "
+        "capturing a full-resolution PNG on every big on-screen change into /workspace/screenshots/auto/. "
+        "This returns whether the recorder is currently running plus a per-keyframe list (index, elapsed "
+        "t_ms, gap +delta_ms since the previous kept frame, changed%, black-screen flag, reason, saved "
+        "filename), so you can see what has rendered so far while frames keep accumulating. A spinner stays "
+        "below threshold (not saved); a black->loading flip is always caught. Use since_index to see only "
+        "frames newer than the last one you saw. Filenames encode elapsed + gap-since-previous + wall-clock, "
+        "so an instant transition is distinguishable from one that took time."
+    ),
+    params_schema={
+        "session_name": "string (optional, default 'auto' — the always-on feed. Only change this if you pointed a capture at a different screenshots/<name> folder)",
+        "since_index": "integer (optional, default 0 — only report keyframes with index >= this, to poll for just the new ones)"
+    },
+    output="A running/stopped status line, counts (kept keyframes / display updates seen / elapsed ms), and one line per keyframe from since_index onward. Empty-but-running means nothing has changed on screen yet.",
+    when_to_use="Call any time the dev emulator is up to see the screens captured so far (e.g. between adb interactions, or right after launching an app) — no setup needed. For a package-scoped crash/exit VERDICT over a bounded window, use record_and_capture_keyframes; for one frame right now, take_emulator_screenshot."
+)
+def read_auto_screenshots(session_name=_AUTOCAP_SESSION, since_index=0):
     try:
-        summary = capture_keyframes(adb, session_dir, duration_seconds, interval_seconds,
-                                     change_threshold, black_threshold, sample_scale_w, serial=serial_or_err)
-    except Exception as e:
-        return {"error": f"Frame capture failed: {e}"}
+        session_dir = _autocap_session_dir(session_name)
+    except (ValueError, RuntimeError) as e:
+        return {"error": str(e)}
+    meta_path = os.path.join(session_dir, "metadata.json")
+    if not os.path.isfile(meta_path):
+        return {"error": (f"No auto-screenshot feed at /workspace/screenshots/{session_name}/ yet. "
+                          f"Make sure a DEV emulator is running (ensure_emulator_running(dev=True)); "
+                          f"the recorder auto-starts on a dev boot.")}
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as e:
+        return {"error": f"Could not read metadata.json (a live flush may be mid-write): {e}"}
+    try:
+        since_index = int(since_index)
+    except (TypeError, ValueError):
+        since_index = 0
 
-    if do_logcat:
-        logcat_res = _run([adb, "-s", serial_or_err, "logcat", "-d"], timeout=30)
-        with open(os.path.join(session_dir, "logcat.txt"), "w", encoding="utf-8", errors="replace") as f:
-            f.write(logcat_res.get("stdout", ""))
-
-    return {"stdout": summary}
+    frames = meta.get("keyframes") or []
+    shown = [fr for fr in frames if int(fr.get("index", 0)) >= since_index]
+    running = bool(meta.get("running"))
+    lines = [
+        f"Session '{session_name}': recorder is {'RUNNING' if running else 'STOPPED'}.",
+        f"Kept {meta.get('keyframe_count', len(frames))} keyframe(s) from "
+        f"{meta.get('samples_taken', 0)} display update(s) over {meta.get('duration_ms', 0)} ms."
+        + (f" Tracking {meta.get('package')}." if meta.get('package') else ""),
+    ]
+    if not shown:
+        lines.append(f"(no keyframes at/after index {since_index} yet"
+                     + (" — screen unchanged so far)" if running else ")"))
+    for fr in shown:
+        flag = " [BLACK]" if fr.get("black_screen") else ""
+        lines.append(
+            f"  frame {fr['index']}: t={fr['t_ms']}ms (+{fr['delta_ms']}ms) "
+            f"changed={fr.get('changed_percent', 0):.2f}% reason={fr.get('reason')}"
+            f" app={fr.get('app_state', 'unknown')}{flag} -> {fr.get('file')}")
+    return {"stdout": "\n".join(lines)}
 
 
 @registry.register(
@@ -944,33 +1445,43 @@ def record_and_capture_keyframes(session_name, duration_seconds=20, interval_sec
         "session_name": "string (must match a session_name already captured by record_and_capture_keyframes)",
         "backend": "string (optional: 'auto' (default, try API then Ollama), 'api' (GLM backend only), or 'ollama' (local Ollama only))",
         "ollama_model": "string (optional, default 'llava' — the local Ollama vision model to use, must already be pulled)",
-        "prompt": "string (optional — override the default screenshot-description prompt sent to the vision model)"
+        "prompt": "string (optional — override the default screenshot-description prompt sent to the vision model)",
+        "max_frames": "integer (optional, default 40 — cap on how many keyframes get a vision call, to bound cost/latency on long captures. The first/last frame and every black-screen, crash, and state-transition frame are ALWAYS analyzed; low-signal near-duplicate frames past the cap are skipped and noted. Set 0 for no cap.)"
     },
-    output="For each keyframe: which backend actually answered ('api' or 'ollama') and its description, or an error if both backends failed for that frame. Ends with an overall 'Analyzed N/M keyframe(s). Backend used: ...' summary line.",
+    output="For each keyframe: which backend actually answered ('api' or 'ollama') and its description, or an error if both backends failed for that frame. Ends with an overall 'Analyzed N/M keyframe(s). Backend used: ...' summary line (noting any frames skipped under the budget).",
     when_to_use="Call this after record_and_capture_keyframes, before generate_test_report, so the report includes descriptions instead of just raw image links."
 )
-def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt=None):
-    try:
-        session_dir = resolve_workspace_path(f"screenshots/{session_name}")
-    except RuntimeError as e:
-        return {"error": str(e)}
-    if not os.path.isdir(session_dir):
-        return {"error": f"No session directory found at {session_dir} — run record_and_capture_keyframes first."}
-    # Route the "api" vision backend through whatever OpenAI-compatible provider
-    # the user has configured in LLM Settings (falls back to the legacy Cline
-    # endpoint when the active provider isn't OpenAI-compatible, e.g. Claude).
-    _vis = get_openai_endpoint_config()
+def _vision_analyze_session(session_dir, backend="auto", ollama_model="llava", prompt=None, max_frames=40):
+    """Build the vision cfg (pointed at the configured VISION model) and describe
+    the session's keyframes. Shared by analyze_keyframes and the capture tool's
+    auto_analyze path. Returns the analyze_session summary string (or raises)."""
+    # Route the "api" vision backend through the configured VISION (image-to-text)
+    # model — a separate model from the main text LLM (the text model, e.g.
+    # DeepSeek, usually can't read images). Falls back to the text endpoint only if
+    # no vision model is set, then to local Ollama.
+    _vis = get_vision_endpoint_config() or get_openai_endpoint_config()
     cfg = {
         "backend": backend,
         "prompt": prompt,
+        "max_frames": max_frames,
         "cline_api_url": _vis["url"],
         "cline_api_key": _vis["key"],
         "cline_model": _vis["model"],
         "ollama_url": "http://localhost:11434",
         "ollama_model": ollama_model,
     }
+    return analyze_session(session_dir, cfg)
+
+
+def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt=None, max_frames=40):
     try:
-        summary = analyze_session(session_dir, cfg)
+        session_dir = resolve_workspace_path(f"screenshots/{session_name}")
+    except RuntimeError as e:
+        return {"error": str(e)}
+    if not os.path.isdir(session_dir):
+        return {"error": f"No session directory found at {session_dir} — run record_and_capture_keyframes first."}
+    try:
+        summary = _vision_analyze_session(session_dir, backend, ollama_model, prompt, max_frames)
     except FileNotFoundError:
         return {"error": f"metadata.json missing in {session_dir} — run record_and_capture_keyframes first."}
     return {"stdout": summary}
@@ -1015,18 +1526,56 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
             logcat_text = "\n".join(f.read().splitlines()[-400:])
 
     out = [f"# APK Test Report -- {session_name}"]
+    # Lead with the machine-readable VERDICT: this is the first (and sometimes
+    # only) thing the text-only agent reads, so crash-vs-black must be up top.
+    out.append("")
+    out.append("## Verdict")
+    out.append(f"**{_capture_verdict(meta)}**")
+    out.append("")
+    out.append(f"- app_state (final): `{meta.get('app_state', 'unknown')}`")
+    out.append(f"- crash_detected: `{bool(meta.get('crash_detected'))}`  |  "
+               f"anr_detected: `{bool(meta.get('anr_detected'))}`  |  "
+               f"exit_detected: `{bool(meta.get('exit_detected'))}`")
+    provider = meta.get("capture_provider", "unknown")
+    coverage = meta.get("coverage", "")
+    out.append(f"- capture: `{provider}`" + (f" ({coverage})" if coverage else "")
+               + f", timing precision `{meta.get('timestamp_precision', 'milliseconds')}`")
+    out.append("")
     if package_name:
         out.append(f"Package: {package_name}")
     if apk_path:
         out.append(f"APK: {apk_path}")
-    out.append(f"Duration: {meta.get('duration_seconds')}s (sampled every {meta.get('interval_seconds')}s)")
-    out.append(f"Samples taken: {meta.get('samples_taken')} / Keyframes kept: {len(meta.get('keyframes', []))}")
+    out.append(f"Duration: {meta.get('duration_ms', 0)} ms")
+    out.append(f"Samples/updates seen: {meta.get('samples_taken')} / Keyframes kept: {len(meta.get('keyframes', []))}")
     out.append(f"Vision backend used: {meta.get('vision_backend_used')}")
+
+    # Process-lifecycle timeline (start/exit/crash) — the evidence behind the
+    # verdict, with millisecond timing so a brief run-then-crash is visible.
+    events = [e for e in (meta.get("events") or []) if e.get("type") in
+              ("app_started", "app_restarted", "app_exited", "app_killed", "app_crashed", "anr")]
+    if events:
+        out.append("")
+        out.append("## Process timeline")
+        for e in events:
+            t = e.get("t_ms")
+            when = f"t={t}ms" if t is not None else "t=?"
+            line = f"- {when}  **{e.get('type')}**" + (f" (pid {e.get('pid')})" if e.get("pid") else "")
+            if e.get("summary"):
+                line += f" — {e['summary'][:200]}"
+            out.append(line)
+
     out.append("")
     out.append("## Keyframes")
     for kf in meta.get("keyframes", []):
-        flag = " **[BLACK SCREEN]**" if kf.get("black_screen") else ""
-        out.append(f"### Frame {kf['index']} -- t={kf['t_seconds']}s (diff={kf['diff_score']}){flag}")
+        flags = []
+        if kf.get("black_screen"):
+            flags.append("BLACK SCREEN")
+        if kf.get("crash"):
+            flags.append("CRASH")
+        flag = f" **[{' | '.join(flags)}]**" if flags else ""
+        out.append(
+            f"### Frame {kf['index']} -- t={kf.get('t_ms', 0)}ms (+{kf.get('delta_ms', 0)}ms since prev) "
+            f"changed={kf.get('changed_percent', 0)}% app_state={kf.get('app_state', 'unknown')}{flag}")
         out.append(f"![frame](../screenshots/{session_name}/{kf['file']})")
         desc = kf.get("vision_description")
         if desc:
@@ -1035,6 +1584,15 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
             err = kf.get("vision_error") or "not yet analyzed — run analyze_keyframes first"
             out.append(f"Description: (unavailable — {err})")
         out.append("")
+
+    # Crash/ANR stack traces first (the actionable part), then a raw log tail.
+    crashes = meta.get("crashes") or []
+    if crashes:
+        out.append("## Crash / ANR stack traces")
+        for c in crashes[-3:]:
+            out.append("```")
+            out.append((c.get("trace") or c.get("summary") or "").strip()[:6000])
+            out.append("```")
     out.append("## Logcat (last 400 lines captured during the test window)")
     out.append("```")
     out.append(logcat_text if logcat_text else "(no logcat captured)")
@@ -1046,6 +1604,53 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
     return {"stdout": f"Report written to /workspace/test_reports/{session_name}.md"}
 
 
+# Packages allowed to exist on a "fresh" instance. The omnidroid kiosk is a
+# /system app on the x86 base (invisible to `pm list packages -3`) but ships in
+# the provisioned /data pair on the arm base, so it is whitelisted explicitly.
+_FRESH_INSTANCE_WHITELIST = {"com.omni.kiosk"}
+
+
+def _verify_fresh_instance(backend=_DEFAULT_BACKEND, device_name=None):
+    """FRESHNESS GUARANTEE for APK test sessions: assert the booted instance has
+    NO third-party packages installed (beyond omnidroid's own kiosk). A truly
+    fresh account (remove + create from the immutable base) cannot have any; if
+    one somehow shows up anyway (an engine regression, a base with an app baked
+    into its /data), it is uninstalled here so the APK under test NEVER runs
+    beside leftovers from an earlier run. Returns {"stdout": ...} once the
+    instance is verified clean, or {"error": ...} when freshness could not be
+    verified/restored — in which case the session must ABORT rather than test
+    on a dirty instance."""
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    res = _run([adb, "-s", serial_or_err, "shell", "pm", "list", "packages", "-3"], timeout=30)
+    if res.get("error") or res.get("returncode", 0) != 0:
+        detail = res.get("error") or (res.get("stderr") or res.get("stdout") or "").strip()[:300]
+        return {"error": f"could not list installed packages to verify freshness: {detail}"}
+    leftovers = []
+    for line in (res.get("stdout") or "").splitlines():
+        line = line.strip()
+        if line.startswith("package:"):
+            pkg = line[len("package:"):].strip()
+            if pkg and pkg not in _FRESH_INSTANCE_WHITELIST:
+                leftovers.append(pkg)
+    if not leftovers:
+        return {"stdout": "Verified fresh: no third-party packages installed on the instance."}
+    removed, failed = [], []
+    for pkg in leftovers:
+        r = _run([adb, "-s", serial_or_err, "shell", "pm", "uninstall", pkg], timeout=60)
+        out = ((r.get("stdout") or "") + (r.get("stderr") or "")).strip()
+        if r.get("error") or "Success" not in out:
+            failed.append(f"{pkg} ({r.get('error') or out[:120] or 'no output'})")
+        else:
+            removed.append(pkg)
+    if failed:
+        return {"error": ("instance is NOT fresh and could not be cleaned — leftover package(s) "
+                          "survived uninstall: " + ", ".join(failed))}
+    return {"stdout": ("Instance had leftover third-party package(s) despite the reset — removed "
+                       + ", ".join(removed) + ". Now verified fresh.")}
+
+
 @registry.register(
     name="run_apk_test_session",
     description=(
@@ -1055,7 +1660,11 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
         "and tell me how it performs' in a single call; use the individual tools instead when you "
         "need finer control (e.g. re-running analyze_keyframes with a different vision backend, or "
         "driving the app interactively with adb_shell between capture windows). Defaults to the "
-        "self-contained 'qemu' emulator backend (no Android Studio / LDPlayer install required)."
+        "self-contained 'qemu' emulator backend (no Android Studio / LDPlayer install required). "
+        "FRESHNESS GUARANTEE: every session runs on a FRESH instance — the account is removed and "
+        "recreated from the immutable base (reset is FORCED true; passing reset=false is ignored), "
+        "and after boot the harness VERIFIES no third-party packages are installed (uninstalling any "
+        "leftover) before the APK under test goes on. Nothing from a previous run can be present."
     ),
     params_schema={
         "apk_path": "string (path to the .apk to test, relative to /workspace)",
@@ -1071,29 +1680,47 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
         "duration_seconds": "number (optional, default 20 — how long to watch the screen after launch)",
         "vision_backend": "string (optional, default 'auto' — 'auto', 'api', or 'ollama', see analyze_keyframes)",
         "ollama_model": "string (optional, default 'llava')",
-        "reset": "boolean (optional, default true — reset the emulator to a clean state before this test)",
+        "reset": "boolean (IGNORED — always coerced to true: a test session ALWAYS starts from a freshly recreated instance and verifies nothing is installed on it. Use the individual tools (ensure_emulator_running reset=false + install/launch) when you deliberately want to reuse a provisioned instance for fast iteration)",
         "boot_timeout": "integer (optional, default 300 seconds)",
-        "abi": "string (optional, qemu backend — force the install ABI. Default exercises the intended path per account arch (x86 -> arm64-v8a translation, arm -> native). 'x86_64' on an x86 account deliberately trips the ABI-contract guard and FAILS the session.)"
+        "abi": "string (optional, qemu backend — force the install ABI. Default exercises the intended path per account arch (x86 -> arm64-v8a translation, arm -> native). 'x86_64' on an x86 account deliberately trips the ABI-contract guard and FAILS the session.)",
+        "dev": "boolean (optional, default false — run the session on the DEV base (base-dev.qcow2: frida + root/frida-hiding tools) instead of the production x86 base. Also enablable via OMNI_USE_DEV_BASE. Use when the APK under test has frida/root detection and you need runtime hooking; call ensure_frida_server + hide_root_from_app between steps via the individual tools for full control.)"
     },
-    output="A summary of each pipeline stage plus the path to the generated Markdown report — read that report with read_file_chunk for the full picture (keyframe descriptions + logcat). If the ABI-safe install fails/violates the contract, the session ABORTS with an 'install FAILED' summary and no pass is emitted.",
+    output="A summary of each pipeline stage plus the path to the generated Markdown report — read that report with read_file_chunk for the full picture (keyframe descriptions + logcat). If the ABI-safe install fails/violates the contract, or the fresh-instance guarantee cannot be verified after boot, the session ABORTS with a FAILED summary and no pass is emitted.",
     when_to_use="Use this as the default way to test a freshly built/signed APK end-to-end. Fall back to the individual tools (ensure_emulator_running, install_apk_on_emulator, etc.) if you need to interleave manual adb_shell actions between steps, or re-run just one stage."
 )
 def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT_BACKEND, device_name=None,
                           system_image=_DEFAULT_SYSTEM_IMAGE, device_profile="pixel_5",
                           duration_seconds=20, vision_backend="auto", ollama_model="llava",
                           reset=True, boot_timeout=300, ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE,
-                          abi=None, require_translation=True):
+                          abi=None, require_translation=True, dev=None):
     session_name = f"{package_name.replace('.', '_')}_{int(time.time())}"
     log = []
+
+    # FRESHNESS GUARANTEE: a test session ALWAYS runs on a freshly recreated
+    # instance. `reset` is accepted only for call-compatibility — any falsy
+    # value is overridden so no caller can test on an instance that might still
+    # carry apps/state from an earlier run.
+    if not _truthy(reset):
+        log.append("[freshness] reset=false was requested but is IGNORED — "
+                   "run_apk_test_session always recreates the instance fresh.")
+    reset = True
 
     boot_res = ensure_emulator_running(
         backend=backend, device_name=device_name, system_image=system_image,
         device_profile=device_profile, reset=reset, boot_timeout=boot_timeout,
-        ram_mb=ram_mb, cpus=cpus, mode=mode,
+        ram_mb=ram_mb, cpus=cpus, mode=mode, dev=dev,
     )
     log.append("[ensure_emulator_running]\n" + (boot_res.get("stdout") or boot_res.get("error") or ""))
     if "BOOT_OK" not in (boot_res.get("stdout") or ""):
         return {"stdout": "Emulator failed to boot -- aborting test session.\n\n" + "\n\n".join(log)[:4000]}
+
+    # Verify (and if needed restore) the fresh-instance guarantee BEFORE the
+    # install: the APK under test must be the only third-party app present.
+    fresh_res = _verify_fresh_instance(backend=backend, device_name=device_name)
+    log.append("[verify_fresh_instance]\n" + (fresh_res.get("stdout") or fresh_res.get("error") or ""))
+    if fresh_res.get("error"):
+        return {"stdout": "Fresh-instance guarantee FAILED (could not verify a clean instance) -- "
+                          "aborting test session; NOT emitting a pass.\n\n" + "\n\n".join(log)[:4000]}
 
     install_res = install_apk_on_emulator(apk_path, backend=backend, device_name=device_name,
                                           abi=abi, require_translation=require_translation)
@@ -1108,7 +1735,10 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     launch_res = launch_app_on_emulator(package_name, activity, backend=backend, device_name=device_name)
     log.append("[launch_app_on_emulator]\n" + (launch_res.get("stdout") or launch_res.get("error") or ""))
 
-    capture_res = record_and_capture_keyframes(session_name, duration_seconds=duration_seconds,
+    # Pass package_name so capture tracks the process and can tell a CRASH from a
+    # black screen (the verdict flows into the report the text-only agent reads).
+    capture_res = record_and_capture_keyframes(session_name, package_name=package_name,
+                                                 duration_seconds=duration_seconds,
                                                  backend=backend, device_name=device_name)
     log.append("[record_and_capture_keyframes]\n" + (capture_res.get("stdout") or capture_res.get("error") or ""))
 
@@ -1119,7 +1749,15 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     log.append("[generate_test_report]\n" + (report_res.get("stdout") or report_res.get("error") or ""))
 
     report_path = f"/workspace/test_reports/{session_name}.md"
-    summary = f"Test session '{session_name}' complete.\nReport: {report_path}\n\n" + "\n\n".join(log)
+    # Surface the capture VERDICT in the one-shot summary too, so the model sees
+    # crash/exit/black up front without having to open the report first.
+    verdict_line = ""
+    for _l in (capture_res.get("stdout") or "").splitlines():
+        if _l.startswith("VERDICT:"):
+            verdict_line = _l + "\n"
+            break
+    summary = (f"Test session '{session_name}' complete.\n{verdict_line}Report: {report_path}\n\n"
+               + "\n\n".join(log))
     return {"stdout": summary[:6000] + f"\n\n[Read the full report with read_file_chunk on {report_path}]"}
 
 
@@ -1166,3 +1804,123 @@ def stop_emulator(backend=_DEFAULT_BACKEND, device_name=None, purge=False):
             return {"stdout": f"Account '{device_name}' does not exist (nothing to {args[0]})."}
         return {"error": f"omnidroid {args[0]} failed: {detail[:500]}"}
     return {"stdout": out or ("Removed." if _truthy(purge) else "Stopped.")}
+
+
+# --------------------------------------------------------------------------
+# DEV BASE (base-dev.qcow2) runtime helpers: frida + root/frida hiding. These
+# only work on an account booted from the dev base (ensure_emulator_running
+# dev=true / OMNI_USE_DEV_BASE). On a production account the devkit binaries are
+# absent and these return a clear "not a dev base" error.
+# --------------------------------------------------------------------------
+
+def _dev_manifest(adb, serial):
+    """Read /system/etc/omni-devkit/manifest.json from the guest -> dict, or
+    None if it isn't there (i.e. not a dev base)."""
+    r = _run([adb, "-s", serial, "shell", "cat",
+              "/system/etc/omni-devkit/manifest.json"], timeout=15)
+    txt = (r.get("stdout") or "").strip()
+    if not txt or "No such file" in txt or r.get("returncode", 1) != 0:
+        return None
+    try:
+        return json.loads(txt)
+    except ValueError:
+        return None
+
+
+def _adb_root(adb, serial):
+    """Restart adbd as root and reconnect (dev base is KernelSU/userdebug so
+    this succeeds). Best-effort; returns the root command's output."""
+    r = _run([adb, "-s", serial, "root"], timeout=20)
+    time.sleep(2)
+    _run([adb, "connect", serial], timeout=10)
+    return (r.get("stdout") or r.get("stderr") or "").strip()
+
+
+@registry.register(
+    name="ensure_frida_server",
+    description=(
+        "Starts the baked frida-server on a DEV-BASE account and sets up a host->guest port forward so "
+        "you can attach with the host frida tools. Only works on an account booted from the dev base "
+        "(ensure_emulator_running dev=true, or OMNI_USE_DEV_BASE=1). It runs `adb root`, launches the "
+        "hidden launcher `omni-fridad` in the guest (frida-server on a CUSTOM loopback port with a "
+        "randomized process name — not the well-known 27042/'frida-server', so a naive port/name scan "
+        "misses it), then `adb forward`s a host port onto that guest port. Returns the host endpoint to "
+        "pass to frida as `-H 127.0.0.1:<host_port>` (the guest port is loopback-only inside the VM, so "
+        "the forward is required). Idempotent: re-running reuses the running server."
+    ),
+    params_schema={
+        "device_name": "string (optional — the omnidroid dev account name; must match the one ensure_emulator_running(dev=true) created, default 'omniagent')",
+        "backend": "string (optional, default 'qemu' — omnidroid only)"
+    },
+    output="The host frida endpoint ('127.0.0.1:<host_port>') plus the guest port and server status, or an error if the account isn't a dev base (boot with dev=true / build the dev base with `omni build-dev-base`).",
+    when_to_use="Call after ensure_emulator_running(dev=true) + BOOT_OK, before attaching frida/objection to hook the app under test. Pair with hide_root_from_app to also hide root/frida from the target's detection."
+)
+def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    serial = serial_or_err
+    _adb_root(adb, serial)
+    manifest = _dev_manifest(adb, serial)
+    if manifest is None:
+        return {"error": (
+            "This account is not a DEV base (no /system/etc/omni-devkit/manifest.json). "
+            "Boot it with ensure_emulator_running(dev=true) (or set OMNI_USE_DEV_BASE=1), and make "
+            "sure `omni build-dev-base` has produced base-dev.qcow2.")}
+    guest_port = int(manifest.get("frida_port") or 27142)
+    # Start the hidden frida-server (idempotent — omni-fridad no-ops if already up).
+    start = _run([adb, "-s", serial, "shell", "omni-fridad"], timeout=40)
+    start_out = (start.get("stdout") or start.get("stderr") or "").strip()
+    # Forward a host port onto the guest's loopback frida port. tcp:0 asks adb to
+    # allocate a free host port and print it.
+    fwd = _run([adb, "-s", serial, "forward", "tcp:0", f"tcp:{guest_port}"], timeout=15)
+    host_port = (fwd.get("stdout") or "").strip()
+    if not host_port.isdigit():
+        # Fall back to a fixed host port if the allocator form isn't supported.
+        host_port = str(guest_port)
+        _run([adb, "-s", serial, "forward", f"tcp:{host_port}", f"tcp:{guest_port}"], timeout=15)
+    return {"stdout": (
+        f"frida-server up on dev account '{device_name or _default_device_name()}'.\n"
+        f"  guest port : 127.0.0.1:{guest_port} (loopback in the VM, hidden name)\n"
+        f"  host attach: frida -H 127.0.0.1:{host_port}   (adb-forwarded)\n"
+        f"  frida ver  : {manifest.get('frida_version')}\n"
+        f"  launcher   : {start_out}\n"
+        f"Tip: also run hide_root_from_app('<target.package>') so the app can't see root/frida.")}
+
+
+@registry.register(
+    name="hide_root_from_app",
+    description=(
+        "Best-effort hiding of ROOT and FRIDA from a target app's detection on a DEV-BASE account, via "
+        "the baked `omni-hide` helper. It resetprop-spoofs the classic root/emulator 'tells' (build "
+        "tags -> release-keys, verified-boot state -> green/locked, etc. — using the baked Magisk "
+        "resetprop applet) and, for the given package, requests KernelSU umount/denylist hiding where a "
+        "KernelSU control path exists. NOTE: ro.debuggable is deliberately left =1 (the omnidroid + "
+        "agent tooling rely on `adb root`), so a detector keying specifically on ro.debuggable still "
+        "sees it; and stock frida's worker thread names remain unless a patched frida-server-patched "
+        "was dropped into the base. Run this AFTER ensure_frida_server and BEFORE launching the target."
+    ),
+    params_schema={
+        "package_name": "string (optional — the target app package to hide root from; enables the per-app KernelSU denylist step. Omit to only apply the global prop spoofs.)",
+        "device_name": "string (optional — the omnidroid dev account name, default 'omniagent')",
+        "backend": "string (optional, default 'qemu' — omnidroid only)"
+    },
+    output="What omni-hide actually applied (resetprop keys set, KernelSU per-app result, frida sanity), or an error if the account isn't a dev base.",
+    when_to_use="Use when the APK under test has root/frida detection: call ensure_emulator_running(dev=true) -> ensure_frida_server -> hide_root_from_app('<pkg>') -> install/launch, then hook with frida."
+)
+def hide_root_from_app(package_name=None, device_name=None, backend=_DEFAULT_BACKEND):
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    serial = serial_or_err
+    _adb_root(adb, serial)
+    if _dev_manifest(adb, serial) is None:
+        return {"error": (
+            "This account is not a DEV base (omni-hide is absent). Boot with "
+            "ensure_emulator_running(dev=true) and build base-dev with `omni build-dev-base`.")}
+    args = [adb, "-s", serial, "shell", "omni-hide"]
+    if package_name:
+        args.append(str(package_name))
+    r = _run(args, timeout=60)
+    out = (r.get("stdout") or r.get("stderr") or "").strip()
+    return {"stdout": out or "omni-hide ran (no output)."}

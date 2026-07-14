@@ -2,13 +2,13 @@
 name: manifest-resource-editing
 description: Edit AndroidManifest.xml (permissions, exported flags, application attributes) and apktool-decoded resources (res/values, res/xml) safely.
 when_to_use: Use this skill when the user wants to add/remove a permission, change android:exported or android:debuggable, point the app at a network security config, edit strings.xml or another values resource, or otherwise change AndroidManifest.xml / res/*.xml content rather than smali logic.
-allowed-tools: decompile_apk, grep_file, read_file_chunk, write_file, list_directory, build_apk, sign_apk, verify_apk
+allowed-tools: decode_apk, grep_file, read_file_chunk, write_file, list_directory, recompile_apk, sign_apk, verify_apk
 ---
 
 # Manifest & Resource Editing Skill
 
 ## Step 1 — Decompile first, always
-`decompile_apk` (never `unzip_apk`) for any manifest or XML-resource edit. `unzip_apk` leaves `AndroidManifest.xml` in Android's compiled binary XML format, which is not human-editable; `decompile_apk` (via apktool) converts it to readable text XML and decodes `resources.arsc` into `res/values/*.xml`.
+`decode_apk` (never `unzip_apk`) for any manifest or XML-resource edit. `unzip_apk` leaves `AndroidManifest.xml` in Android's compiled binary XML format, which is not human-editable; `decode_apk` (via apktool) converts it to readable text XML and decodes `resources.arsc` into `res/values/*.xml`.
 
 ## Step 2 — Find the exact block to change
 Use `grep_file` on `AndroidManifest.xml` for the attribute or tag you're after:
@@ -30,10 +30,10 @@ There is no line-patch tool for XML — `write_file` replaces a file's entire co
 3. `list_directory` on `res/xml/` to confirm the file landed where expected before rebuilding.
 
 ## Step 4 — Rebuild, sign, verify
-`build_apk` (this is a decompile_apk-produced directory, so NEVER `repack_apk`) → `sign_apk` → `verify_apk`.
+`recompile_apk` (a `decode_apk`/apktool directory, which it rebuilds with apktool) → `sign_apk` → `verify_apk`.
 
 ## Critical Rules
-- Never hand-edit a binary `AndroidManifest.xml` extracted via `unzip_apk` — always `decompile_apk` first for manifest/resource work.
+- Never hand-edit a binary `AndroidManifest.xml` extracted via `unzip_apk` — always `decode_apk` first for manifest/resource work.
 - A resource referenced from the manifest (e.g. `@xml/network_security_config`) must exist with a matching filename under the right `res/` subfolder, or the app will fail at runtime with a resource-not-found error that apktool's build step won't catch for you.
 - Adding a permission to the manifest does not guarantee the app treats it as granted at runtime on API 23+ (runtime permissions) — if the app also does a runtime permission check in code, that's a smali-level change outside this skill's scope; treat it like any other behavioral check (see `signature-bypass` / `anti-debug-bypass` for the general pattern of patching a check's outcome).
 - Changing `android:debuggable` to `true` can help with dynamic analysis but also changes the APK's attack surface — flag this explicitly to the user rather than doing it silently as a side effect of an unrelated edit.

@@ -7,7 +7,7 @@ allowed-tools: extract_strings, rabin2_info, disassemble_range, readelf_info, as
 
 # Native Code Injection Skill
 
-`nop_function`, `patch_function_return`, `hex_patch_file`, and `disassemble_patch_function` (covered in `native-patching`) all write bytes that are either already known (a NOP) or trivially canned (return true/0/null). This skill is for when the new logic itself is non-trivial: a real comparison, a small loop, custom arithmetic — something you'd naturally write as code, not encode by hand.
+`nop_function`, `patch_function_return`, `patch_bytes_at_offset`, and `binary_patch` (covered in `native-patching`) all write bytes that are either already known (a NOP) or trivially canned (return true/0/null). This skill is for when the new logic itself is non-trivial: a real comparison, a small loop, custom arithmetic — something you'd naturally write as code, not encode by hand.
 
 ## Step 0 — Try the simple path first
 If `native-patching`'s canned patches (NOP / force-return-true / force-return-false) actually satisfy the goal, use those — they're simpler and have zero relocation risk. Reach for this skill only when the task genuinely needs new computed behavior.
@@ -43,5 +43,5 @@ Custom logic is often bigger than the trivial function it replaces. Options, in 
 ## Critical Rules
 - Back up the `.so` (`duplicate_file`) before any patch, same as `native-patching`.
 - Never try to "work around" a relocation error by guessing an address to hardcode — a hardcoded address will be wrong the moment the library is loaded at a different base (ASLR), and silently corrupts execution instead of failing loudly.
-- If the logic genuinely needs to call an existing function in the binary (not just do local computation), that's beyond what this tool supports (no linker means no way to correctly encode that call's target) — fall back to modifying the CALLER's logic instead (e.g. via `disassemble_patch_function`/`nop_function` around the call site) rather than trying to make the callee call out.
+- If the logic genuinely needs to call an existing function in the binary (not just do local computation), that's beyond what this tool supports (no linker means no way to correctly encode that call's target) — fall back to modifying the CALLER's logic instead (e.g. via `patch_bytes_at_offset`/`nop_function` around the call site) rather than trying to make the callee call out.
 - ARM64 instructions are 4-byte aligned; don't patch a partial instruction. x86/x86_64 instructions are variable-length — check the exact byte length of what you're overwriting with `disassemble_range` first.

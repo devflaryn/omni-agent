@@ -1,7 +1,7 @@
 """Higher-level native binary editing tools.
 
-These build on the low-level hex_patch_file / disassemble_patch_function tools
-in hex_patching.py, but operate at a higher level: patch strings by content,
+These build on the low-level patch_bytes_at_offset tool in hex_patching.py (and
+binary_patch below), but operate at a higher level: patch strings by content,
 NOP functions by name, force functions to return specific values — without
 needing to manually look up addresses first.
 
@@ -11,10 +11,24 @@ Common use cases:
   - Force a detection function to always return false (patch_function_return)
 """
 import base64
+import shlex
 
 from tool_registry import registry
 from tools.common import normalize_path, detect_elf_arch
 from docker_sandbox import run_cmd
+
+
+def _clean_hex(hex_str):
+    """Normalize a hex byte string ('1f 20', '\\x1f\\x20', '1F2003D5') to lowercase
+    contiguous hex and its byte count. Raises ValueError on odd length / bad hex."""
+    cleaned = (hex_str or "").replace("\\x", "").replace(" ", "").lower()
+    if len(cleaned) % 2 != 0:
+        raise ValueError("hex must have an even number of characters")
+    try:
+        bytes.fromhex(cleaned)
+    except ValueError:
+        raise ValueError("not a valid hex byte string")
+    return cleaned, len(cleaned) // 2
 
 
 # Architecture-specific patch bytes
@@ -123,7 +137,7 @@ def _find_symbol_offset(so_path, symbol_name):
         "The replacement string MUST be the same length or SHORTER than the original "
         "(shorter replacements are null-padded automatically). If the new string is longer, "
         "the tool returns an error — you cannot grow a string inside a binary without "
-        "breaking offsets. For longer replacements, use hex_patch_file at the string's offset."
+        "breaking offsets. For longer replacements, use patch_bytes_at_offset at the string's offset."
     ),
     params_schema={
         "so_path": "string (path to the .so file, relative to /workspace)",
@@ -131,7 +145,7 @@ def _find_symbol_offset(so_path, symbol_name):
         "new_string": "string (the replacement string — must be same length or shorter than old_string)"
     },
     output="On success: 'Replaced <old> with <new> at offset 0xNNNN in <file>. <N> byte(s) patched.' If the string is not found, or the new string is longer than the old, an error is returned.",
-    when_to_use="Use this to change hardcoded strings in a .so: URLs, server addresses, error messages, feature flags, log tags. If you need a LONGER string, you must find a code cave or use hex_patch_file manually."
+    when_to_use="Use this to change hardcoded strings in a .so: URLs, server addresses, error messages, feature flags, log tags. If you need a LONGER string, you must find a code cave or use patch_bytes_at_offset manually."
 )
 def patch_binary_string(so_path, old_string, new_string):
     so_path = normalize_path(so_path)
@@ -145,8 +159,9 @@ def patch_binary_string(so_path, old_string, new_string):
     script = (
         "import sys, base64\n"
         f"filepath = '/workspace/{so_path}'\n"
-        "old = base64.b64decode(sys.argv[0])\n"
-        "new = base64.b64decode(sys.argv[1])\n"
+        # argv[0] is '-' (the stdin-script placeholder); the real args start at [1].
+        "old = base64.b64decode(sys.argv[1])\n"
+        "new = base64.b64decode(sys.argv[2])\n"
         "with open(filepath, 'rb') as f:\n"
         "    data = f.read()\n"
         "idx = data.find(old)\n"
@@ -160,10 +175,122 @@ def patch_binary_string(so_path, old_string, new_string):
         f"print('Replaced ' + str(count) + ' occurrence(s) at offset 0x' + format(idx, 'x') + ' in {so_path}. ' + str(len(new)) + ' byte(s) patched per occurrence.')\n"
     )
     b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
-    cmd = f"echo '{b64_script}' | base64 -d | python3 '{b64_old}' '{b64_new}'"
-    # Fix: python3 args don't use single quotes for b64, pass directly
+    # base64 args are passed positionally after '-'; the script reads them from argv[1:].
     cmd = f"echo '{b64_script}' | base64 -d | python3 - {b64_old} {b64_new}"
     return run_cmd(cmd, timeout=30)
+
+
+@registry.register(
+    name="binary_patch",
+    description=(
+        "Locates a specific BYTE SEQUENCE inside a binary and overwrites it with new bytes — the precise, "
+        "disassembly-free way to flip a compiled control-flow instruction (e.g. turn a conditional branch into "
+        "an unconditional one, or a check into a NOP) when you already know the exact bytes from a disassembler. "
+        "Give find_hex (the bytes to locate) and replace_hex (the bytes to write). By default the replacement MUST "
+        "be the SAME length as find_hex — growing/shrinking a .so shifts every later offset and breaks mmap/loading, "
+        "so equal-length in-place patches are the safe default. "
+        "Disambiguation: if find_hex occurs more than once, pass offset= to anchor the exact location (the tool "
+        "verifies find_hex actually sits there before writing) or occurrence= to pick the Nth match. "
+        "The tool reports the offset patched and reads the bytes back so you can confirm the write."
+    ),
+    params_schema={
+        "filepath": "string (path to the binary, relative to /workspace)",
+        "find_hex": "string (hex byte sequence to locate, e.g. '1f2003d5' or '1f 20 03 d5'; whitespace/\\x ignored)",
+        "replace_hex": "string (hex bytes to write; same length as find_hex unless allow_length_change=true)",
+        "offset": "string (optional, anchor the patch at this file offset — '0x1a2b' hex or a decimal number; find_hex is verified to sit there before writing)",
+        "occurrence": "integer (optional, 1-based; when find_hex matches multiple places and no offset is given, patch the Nth match. Default 0 = require a unique match)",
+        "allow_length_change": "boolean (optional, default false; only set true if you understand it can break the binary's layout)"
+    },
+    output="On success: 'Patched N byte(s) at offset 0xNNNN in <file>.' with the original bytes, the new bytes, and a verification read-back. On failure: 'not found', an ambiguity report listing every matching offset (so you can pass offset=/occurrence=), a length-mismatch error, or an offset-verification mismatch showing the actual bytes there.",
+    when_to_use="Use this when you have the EXACT bytes to change (from disassemble_range/radare2_cmd/ghidra_decompile) and want a surgical in-place patch by content rather than by symbol — e.g. flipping a branch condition. If you only know a symbol name, patch_function_return/nop_function are higher-level; if you already know the file offset and just want to write bytes there, patch_bytes_at_offset is the minimal primitive."
+)
+def binary_patch(filepath, find_hex, replace_hex, offset=None, occurrence=0, allow_length_change=False):
+    filepath = normalize_path(filepath)
+    try:
+        find_clean, find_count = _clean_hex(find_hex or "")
+    except ValueError as e:
+        return {"error": f"find_hex invalid: {e}"}
+    try:
+        repl_clean, repl_count = _clean_hex(replace_hex or "")
+    except ValueError as e:
+        return {"error": f"replace_hex invalid: {e}"}
+    if find_count == 0:
+        return {"error": "find_hex must be a non-empty byte sequence to locate."}
+    if repl_count == 0:
+        return {"error": "replace_hex must be a non-empty byte sequence."}
+
+    allow_len = allow_length_change in (True, "true", "True", 1, "1")
+    if not allow_len and repl_count != find_count:
+        return {"error": (
+            f"replace_hex is {repl_count} byte(s) but find_hex is {find_count} byte(s). "
+            "Equal-length in-place patches are required by default — a different size shifts every later "
+            "offset and breaks the binary. Match the length, or pass allow_length_change=true only if you "
+            "understand the consequences."
+        )}
+
+    try:
+        occurrence = int(occurrence)
+    except (TypeError, ValueError):
+        occurrence = 0
+
+    # Normalize offset: '' -> none; '0x..' -> hex; else decimal.
+    off_arg = ""
+    if offset not in (None, "", False):
+        off_arg = str(offset).strip()
+
+    # Hex strings and the small integer/offset args are all shell-safe, so pass
+    # them straight through to a base64-shipped python patcher (same trick the
+    # other binary tools use to dodge shell-escaping). find_clean/repl_clean were
+    # normalized above.
+    script = (
+        "import sys\n"
+        f"fp = '/workspace/{filepath}'\n"
+        "find = bytes.fromhex(sys.argv[1])\n"
+        "repl = bytes.fromhex(sys.argv[2])\n"
+        "off_arg = sys.argv[3]\n"
+        "occ = int(sys.argv[4])\n"
+        "with open(fp, 'rb') as f:\n"
+        "    data = bytearray(f.read())\n"
+        "def find_all(buf, sub):\n"
+        "    idxs, start = [], 0\n"
+        "    while True:\n"
+        "        i = buf.find(sub, start)\n"
+        "        if i == -1: break\n"
+        "        idxs.append(i); start = i + 1\n"
+        "    return idxs\n"
+        "hits = find_all(data, find)\n"
+        "if off_arg:\n"
+        "    target = int(off_arg, 16) if off_arg.lower().startswith('0x') else int(off_arg)\n"
+        "    actual = bytes(data[target:target+len(find)])\n"
+        "    if actual != find:\n"
+        "        print('ERROR: bytes at offset ' + hex(target) + ' are ' + actual.hex() + ', not ' + find.hex() + '. Not patching.')\n"
+        "        sys.exit(1)\n"
+        "elif not hits:\n"
+        "    print('ERROR: byte sequence ' + find.hex() + ' not found in file.')\n"
+        "    sys.exit(1)\n"
+        "elif len(hits) == 1:\n"
+        "    target = hits[0]\n"
+        "elif occ >= 1 and occ <= len(hits):\n"
+        "    target = hits[occ-1]\n"
+        "else:\n"
+        "    offs = ', '.join(hex(h) for h in hits[:50])\n"
+        "    print('ERROR: byte sequence found at ' + str(len(hits)) + ' offsets: ' + offs)\n"
+        "    print('Pass offset=<one of these> or occurrence=<1..' + str(len(hits)) + '> to choose which to patch.')\n"
+        "    sys.exit(1)\n"
+        "orig = bytes(data[target:target+len(repl)])\n"
+        "data[target:target+len(find)] = repl\n"
+        "with open(fp, 'wb') as f:\n"
+        "    f.write(data)\n"
+        "with open(fp, 'rb') as f:\n"
+        "    f.seek(target); verify = f.read(len(repl))\n"
+        "print('Patched ' + str(len(repl)) + ' byte(s) at offset ' + hex(target) + ' in ' + fp.split('/workspace/')[-1] + '.')\n"
+        "print('Original bytes: ' + orig.hex())\n"
+        "print('New bytes:      ' + repl.hex())\n"
+        "print('Verification (read back): ' + verify.hex() + ('  OK' if verify == repl else '  MISMATCH!'))\n"
+    )
+    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    cmd = f"echo '{b64_script}' | base64 -d | python3 - {find_clean} {repl_clean} '{off_arg}' {occurrence}"
+    return run_cmd(cmd, timeout=60)
 
 
 @registry.register(
@@ -209,7 +336,7 @@ def nop_function(so_path, function_name, num_instructions=4):
     # Build N NOP instructions
     full_nop = nop_hex * num_instructions
 
-    # Patch using dd (same as disassemble_patch_function but we built the bytes ourselves)
+    # Patch using dd (same as patch_bytes_at_offset but we built the bytes ourselves)
     clean_offset = offset.replace("0x", "")
     byte_count = len(full_nop) // 2
     formatted = "\\x" + "\\x".join(full_nop[i:i+2] for i in range(0, len(full_nop), 2))
@@ -274,3 +401,148 @@ def patch_function_return(so_path, function_name, return_value="true"):
     res = run_cmd(cmd, timeout=30)
     stdout = res.get("stdout", "")
     return {"stdout": f"Patched {function_name} to return {return_value} at offset {offset} (arch: {arch}) in {so_path}.\nVerification (written bytes): {stdout}\nExpected: {patch_hex}"}
+
+
+# Robust offset-based patcher. Everything is done with plain Python file I/O
+# (open r+b, splice, write) rather than shell `dd ... seek=$((16#..))` arithmetic
+# — so it doesn't depend on the vaddr->file-offset segment mapping that
+# patch_function_return derives (that mapping breaks when a segment's file and
+# memory layout aren't 1:1) and it can't misfire on large/odd offsets. If the
+# file is an ELF and make_writable is on, it also flips PF_W on the PT_LOAD
+# segment that contains the offset (the on-disk equivalent of an mprotect
+# PROT_WRITE), reporting the previous flags so the change is reversible. Args
+# arrive via argv (shlex-quoted): path, decimal offset, hex bytes, '1'/'0'.
+_PATCH_AT_OFFSET_SCRIPT = r'''
+import sys, struct
+
+fp = sys.argv[1]
+offset = int(sys.argv[2])
+new = bytes.fromhex(sys.argv[3])
+make_writable = sys.argv[4] == "1"
+
+
+def make_seg_writable(data, off):
+    """Set PF_W on the PT_LOAD segment containing file offset `off`. Returns a
+    human-readable note. Parses program headers directly so it works for both
+    ELF32/ELF64 and either endianness, regardless of segment alignment."""
+    ei_class = data[4]
+    endian = "<" if data[5] == 1 else ">"
+    try:
+        if ei_class == 2:  # ELF64
+            e_phoff = struct.unpack_from(endian + "Q", data, 0x20)[0]
+            e_phentsize = struct.unpack_from(endian + "H", data, 0x36)[0]
+            e_phnum = struct.unpack_from(endian + "H", data, 0x38)[0]
+            for i in range(e_phnum):
+                ph = e_phoff + i * e_phentsize
+                if ph + 56 > len(data):
+                    break
+                p_type = struct.unpack_from(endian + "I", data, ph)[0]
+                p_flags = struct.unpack_from(endian + "I", data, ph + 4)[0]
+                p_offset = struct.unpack_from(endian + "Q", data, ph + 8)[0]
+                p_filesz = struct.unpack_from(endian + "Q", data, ph + 32)[0]
+                if p_type == 1 and p_offset <= off < p_offset + p_filesz:
+                    if p_flags & 0x2:
+                        return "PT_LOAD segment %d already writable (p_flags=0x%x); no protection change." % (i, p_flags)
+                    struct.pack_into(endian + "I", data, ph + 4, p_flags | 0x2)
+                    return "Made PT_LOAD segment %d writable: p_flags 0x%x -> 0x%x (PF_W added). To revert, restore p_flags to 0x%x." % (i, p_flags, p_flags | 0x2, p_flags)
+            return "Offset 0x%x is not inside any PT_LOAD segment; wrote bytes without changing segment protection." % off
+        else:  # ELF32
+            e_phoff = struct.unpack_from(endian + "I", data, 0x1C)[0]
+            e_phentsize = struct.unpack_from(endian + "H", data, 0x2A)[0]
+            e_phnum = struct.unpack_from(endian + "H", data, 0x2C)[0]
+            for i in range(e_phnum):
+                ph = e_phoff + i * e_phentsize
+                if ph + 32 > len(data):
+                    break
+                p_type = struct.unpack_from(endian + "I", data, ph)[0]
+                p_offset = struct.unpack_from(endian + "I", data, ph + 4)[0]
+                p_filesz = struct.unpack_from(endian + "I", data, ph + 16)[0]
+                p_flags = struct.unpack_from(endian + "I", data, ph + 24)[0]
+                if p_type == 1 and p_offset <= off < p_offset + p_filesz:
+                    if p_flags & 0x2:
+                        return "PT_LOAD segment %d already writable (p_flags=0x%x); no change." % (i, p_flags)
+                    struct.pack_into(endian + "I", data, ph + 24, p_flags | 0x2)
+                    return "Made PT_LOAD segment %d writable: p_flags 0x%x -> 0x%x (PF_W). Revert p_flags to 0x%x." % (i, p_flags, p_flags | 0x2, p_flags)
+            return "Offset 0x%x is not inside any PT_LOAD segment; segment protection unchanged." % off
+    except Exception as ex:
+        return "Note: could not adjust segment protection (%s); bytes still patched." % ex
+
+
+try:
+    with open(fp, "r+b") as f:
+        data = bytearray(f.read())
+        size = len(data)
+        if offset < 0 or offset + len(new) > size:
+            print("ERROR: offset 0x%x + %d byte(s) is out of range for file size %d (0x%x)." % (offset, len(new), size, size))
+            sys.exit(1)
+        prev = bytes(data[offset:offset + len(new)])
+        seg_note = ""
+        if bytes(data[:4]) == b"\x7fELF" and make_writable:
+            seg_note = make_seg_writable(data, offset)
+        data[offset:offset + len(new)] = new
+        f.seek(0)
+        f.write(data)
+        f.truncate()
+except OSError as e:
+    print("ERROR: cannot patch " + fp + ": " + str(e))
+    sys.exit(1)
+
+with open(fp, "rb") as f:
+    f.seek(offset)
+    verify = f.read(len(new))
+
+name = fp.split("/workspace/")[-1]
+print("Patched %d byte(s) at offset 0x%x (%d) in %s" % (len(new), offset, offset, name))
+print("Previous bytes (for rollback): " + prev.hex())
+print("New bytes:                     " + new.hex())
+print("Verify (read back):            " + verify.hex() + ("  OK" if verify == new else "  MISMATCH"))
+if seg_note:
+    print(seg_note)
+'''
+
+
+@registry.register(
+    name="patch_at_offset_with_bytes",
+    description=(
+        "Writes a hex byte sequence at a specific FILE OFFSET and returns the PREVIOUS bytes so the change is "
+        "reversible. This is the robust successor to patch_bytes_at_offset/patch_function_return for cases where "
+        "those fail: it patches with direct file I/O (no vaddr->offset segment math, no shell `dd` arithmetic), "
+        "so it works regardless of ELF segment alignment and doesn't misfire when a segment's file and memory "
+        "layout aren't 1:1. If the target is an ELF and make_writable is on (default), it also adds PF_W (write "
+        "permission) to the PT_LOAD segment containing the offset — the on-disk equivalent of mprotect "
+        "PROT_WRITE — and reports the old segment flags so you can revert. The offset may be decimal or "
+        "0x-prefixed hex; the tool verifies the offset is in range and reads the bytes back to confirm the write."
+    ),
+    params_schema={
+        "file_path": "string (path to the binary/file, relative to /workspace)",
+        "offset": "string or integer (file offset to patch at — decimal '4660' or 0x-hex '0x1234')",
+        "new_hex_bytes": "string (even-length hex bytes to write, e.g. 'c0035fd6'; whitespace/\\x ignored)",
+        "make_writable": "boolean (optional, default true; if the file is an ELF, add PF_W to the PT_LOAD segment containing the offset. Set false to leave segment permissions untouched)"
+    },
+    output="A confirmation line (bytes written, offset), the PREVIOUS bytes as hex (save these to roll back), the new bytes, a read-back verification (OK/MISMATCH), and — when make_writable applied to an ELF — a note of the segment whose p_flags changed and how to revert them. Errors if the offset is out of range.",
+    when_to_use="Use this when you know the exact FILE offset and bytes to write and want a robust, reversible patch — especially if patch_function_return/patch_bytes_at_offset failed on a binary with unusual segment layout, or you need the patched region marked writable. To locate an offset by content first, use find_byte_sequence_in_so; to patch by symbol name use patch_function_return."
+)
+def patch_at_offset_with_bytes(file_path, offset, new_hex_bytes, make_writable=True):
+    file_path = normalize_path(file_path)
+
+    o = str(offset).strip()
+    try:
+        off_int = int(o, 16) if o.lower().startswith("0x") else int(o)
+    except (ValueError, AttributeError):
+        return {"error": "offset must be a decimal number or a 0x-prefixed hex value, e.g. 4660 or '0x1234'."}
+    if off_int < 0:
+        return {"error": "offset must be non-negative."}
+
+    try:
+        clean, count = _clean_hex(new_hex_bytes or "")
+    except ValueError as e:
+        return {"error": f"new_hex_bytes invalid: {e}"}
+    if count == 0:
+        return {"error": "new_hex_bytes must be a non-empty hex byte sequence."}
+
+    mkw = make_writable in (True, "true", "True", 1, "1")
+    args = [f"/workspace/{file_path}", str(off_int), clean, "1" if mkw else "0"]
+    b64 = base64.b64encode(_PATCH_AT_OFFSET_SCRIPT.encode("utf-8")).decode("ascii")
+    arg_str = " ".join(shlex.quote(a) for a in args)
+    cmd = f"echo '{b64}' | base64 -d | python3 - {arg_str}"
+    return run_cmd(cmd, timeout=60)

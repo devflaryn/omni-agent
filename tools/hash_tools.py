@@ -51,3 +51,29 @@ def compare_files_sha256(file_a, file_b):
         f"echo \"SHA256 B (/workspace/{file_b}): $hash_b\""
     )
     return run_cmd(cmd, timeout=60)
+
+
+@registry.register(
+    name="compute_sha256",
+    description=(
+        "Computes the SHA256 hex digest of a SINGLE file in the workspace. Use this to record a file's "
+        "fingerprint — e.g. snapshot a .so/APK/artifact before patching so you can later prove whether (and "
+        "confirm that) it changed. To directly compare TWO files for equality in one call, use "
+        "compare_files_sha256 instead; to see WHICH bytes differ, use diff_binary_files."
+    ),
+    params_schema={
+        "file_path": "string (path to the file, relative to /workspace or absolute starting with /workspace)"
+    },
+    output="One line: 'SHA256 (/workspace/<path>): <64-hex-digest>'. An ERROR line if the file does not exist.",
+    when_to_use="Use this to get one file's SHA256 fingerprint to record or compare by hand. To compare two files directly use compare_files_sha256; to list byte-level differences use diff_binary_files."
+)
+def compute_sha256(file_path):
+    file_path = normalize_path(file_path)
+    cmd = (
+        f"if [ ! -f /workspace/{file_path} ]; then "
+        f"  echo 'ERROR: file not found: /workspace/{file_path}'; exit 1; "
+        f"fi; "
+        f"hash=$(sha256sum /workspace/{file_path} | cut -d' ' -f1); "
+        f"echo \"SHA256 (/workspace/{file_path}): $hash\""
+    )
+    return run_cmd(cmd, timeout=60)

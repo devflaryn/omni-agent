@@ -6,7 +6,7 @@ Canonical location for binary test fixtures the agent's tests reference.
 
 A **fat APK** (contains both `arm64-v8a` and `x86_64` native libraries — it is a
 Roblox build). It is the fixture for the ABI-contract test
-(`../test_abi_contract.py`) that guards **Finding B** (omnidroid-api.md §5):
+(`../tests/test_abi_contract.py`) that guards **Finding B** (omnidroid-api.md §5):
 
 - On an **x86** account it must install its **arm64-v8a** library and run
   through **libndk ARM translation** (`native_bridge_used=true`) — the real

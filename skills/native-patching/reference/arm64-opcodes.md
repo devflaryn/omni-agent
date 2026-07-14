@@ -1,6 +1,6 @@
 # ARM64 / x86 Common Patch Opcodes
 
-Use these as the `new_hex_bytes` argument to `disassemble_patch_function` or `hex_patch_file`. Always confirm the instruction width at the target offset with `disassemble_range` first — overwriting only part of a wider instruction will corrupt the one after it.
+Use these as the `new_hex_bytes` argument to `patch_bytes_at_offset` (or as `replace_hex` for `binary_patch`). Always confirm the instruction width at the target offset with `disassemble_range` first — overwriting only part of a wider instruction will corrupt the one after it.
 
 ## ARM64 (4 bytes per instruction)
 | Purpose | Hex bytes | Meaning |
@@ -23,4 +23,4 @@ Use these as the `new_hex_bytes` argument to `disassemble_patch_function` or `he
 ## Notes
 - ARM64 instructions are always 4 bytes aligned to 4-byte boundaries — never patch a partial instruction.
 - x86/x86_64 instructions are variable length — always check with `disassemble_range` how many bytes the instruction you're replacing actually occupies, and pad with NOPs (`90`) if your replacement is shorter.
-- After patching a function to always "return true"/"return false", also check whether the caller does anything with side effects (e.g. throws before returning) — a full function replacement via `disassemble_patch_function` covering the whole function body is safer than patching a single branch in ambiguous cases.
+- After patching a function to always "return true"/"return false", also check whether the caller does anything with side effects (e.g. throws before returning) — a full function replacement via `patch_bytes_at_offset` covering the whole function body is safer than patching a single branch in ambiguous cases.

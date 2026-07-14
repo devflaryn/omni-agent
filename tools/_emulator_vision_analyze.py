@@ -98,10 +98,42 @@ def _analyze_with_ollama(image_b64, prompt, cfg):
 
 _DEFAULT_PROMPT = (
     "You are looking at a screenshot from an Android app under test. Describe, in 2-3 "
-    "sentences, exactly what is on screen: what screen/page this looks like, any visible "
-    "error dialogs or crash messages, whether it's a blank/black screen, and anything that "
-    "looks broken (misaligned layout, missing images, garbled text)."
+    "sentences, exactly what is on screen: what screen/page this looks like, whether it's a "
+    "blank/black screen, and anything that looks broken (misaligned layout, missing images, "
+    "garbled text). IMPORTANT: explicitly call out any system CRASH/ANR dialog — e.g. "
+    "'<app> keeps stopping', '<app> isn't responding', 'Unfortunately, <app> has stopped', or "
+    "a Close app/Wait dialog — since that is direct visual evidence the app died, distinct from "
+    "a merely black screen."
 )
+
+# Frames worth spending a vision call on even under the cap: state changes and
+# failure states carry the most signal; a long tail of near-duplicate scene
+# changes does not.
+_PRIORITY_REASONS = {"baseline", "black_transition", "black_exit"}
+_DEFAULT_MAX_FRAMES = 40
+
+
+def _select_frames_for_vision(keyframes, max_frames):
+    """Pick which keyframes to describe when there are many, so vision cost stays
+    bounded without dropping the informative ones. Always keeps the FIRST and
+    LAST frame, every black-screen / crash / state-transition frame, then fills
+    the remaining budget with the rest in order. Returns (selected_set_of_ids,
+    skipped_count) where ids are (index) of chosen frames."""
+    if max_frames is None or max_frames <= 0 or len(keyframes) <= max_frames:
+        return {kf["index"] for kf in keyframes}, 0
+    chosen = set()
+    n = len(keyframes)
+    for pos, kf in enumerate(keyframes):
+        if (pos == 0 or pos == n - 1 or kf.get("black_screen") or kf.get("crash")
+                or kf.get("app_state") in ("crashed", "exited")
+                or kf.get("reason") in _PRIORITY_REASONS):
+            chosen.add(kf["index"])
+    # Fill remaining budget with the earliest not-yet-chosen frames.
+    for kf in keyframes:
+        if len(chosen) >= max_frames:
+            break
+        chosen.add(kf["index"])
+    return chosen, max(0, n - len(chosen))
 
 
 def analyze_session(session_dir, cfg):
@@ -109,14 +141,27 @@ def analyze_session(session_dir, cfg):
     descriptions back into that file. Returns a plain-text summary string."""
     backend = cfg.get("backend", "auto")
     prompt = cfg.get("prompt") or _DEFAULT_PROMPT
+    try:
+        max_frames = int(cfg.get("max_frames", _DEFAULT_MAX_FRAMES))
+    except (TypeError, ValueError):
+        max_frames = _DEFAULT_MAX_FRAMES
 
     meta_path = os.path.join(session_dir, "metadata.json")
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
 
+    keyframes = meta.get("keyframes", [])
+    selected_ids, skipped = _select_frames_for_vision(keyframes, max_frames)
+
     backend_used_overall = None
     summary_lines = []
-    for kf in meta.get("keyframes", []):
+    for kf in keyframes:
+        # Under the cap, describe only the high-signal frames; the rest keep
+        # their metadata (timing, black/crash flags) but get no vision call.
+        if kf["index"] not in selected_ids:
+            kf["vision_description"] = None
+            kf["vision_error"] = "skipped (frame-budget cap; not a state/failure frame)"
+            continue
         fpath = os.path.join(session_dir, kf["file"])
         try:
             with open(fpath, "rb") as f:
@@ -157,5 +202,9 @@ def analyze_session(session_dir, cfg):
         json.dump(meta, f, indent=2)
 
     analyzed = sum(1 for kf in meta["keyframes"] if kf.get("vision_description"))
-    header = f"Analyzed {analyzed}/{len(meta['keyframes'])} keyframe(s). Backend used: {backend_used_overall or 'NONE (all attempts failed)'}"
+    header = (f"Analyzed {analyzed}/{len(meta['keyframes'])} keyframe(s). "
+              f"Backend used: {backend_used_overall or 'NONE (all attempts failed)'}")
+    if skipped:
+        header += (f" ({skipped} low-signal frame(s) skipped under the {max_frames}-frame "
+                   "budget — first/last/black/crash/transition frames are always analyzed).")
     return "\n".join([header] + summary_lines)

@@ -116,6 +116,32 @@
     .step-detail > .step-detail-inner { overflow: hidden; min-height: 0; }
     .caret { transition: transform .18s ease; }
     .caret.open { transform: rotate(90deg); }
+
+    /* --- grouped tool-call widget (the "Ran N tools · read N files · changed N
+       files" summary). Active groups shimmer silver on the title and stay open
+       as a short self-scrolling list; on completion the title plays a one-shot
+       wave (then JS drops the class so it snaps to a solid color) and the body
+       collapses via the grid-rows trick. --- */
+    .group-body {
+      display: grid; grid-template-rows: 0fr;
+      transition: grid-template-rows .24s cubic-bezier(.4, 0, .2, 1);
+    }
+    .group-body.open { grid-template-rows: 1fr; }
+    .group-body-clip { overflow: hidden; min-height: 0; }
+    .group-scroll {
+      max-height: 10.5rem; overflow-y: auto; overscroll-behavior: contain;
+      border-radius: 8px;
+    }
+    .group-scroll::-webkit-scrollbar { width: 6px; }
+    .group-title-wave {
+      background-image: linear-gradient(90deg,
+        rgb(var(--shimmer-base)) 0%, rgb(var(--shimmer-hi)) 50%, rgb(var(--shimmer-base)) 100%);
+      background-size: 220% 100%;
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+      animation: group-title-wave .85s ease-out 1;
+    }
+    @keyframes group-title-wave { 0% { background-position: 180% 0; } 100% { background-position: -40% 0; } }
+
     .tree-row:hover { background: rgb(var(--term-line) / .45); }
     .tree-row.active { background: rgb(var(--term-line) / .8); }
     #fileViewer pre { white-space: pre-wrap; word-break: break-word; }
@@ -162,6 +188,52 @@
       overflow-x: auto; white-space: pre; font-size: .85em; line-height: 1.5;
     }
     .msg-fmt pre code { background: transparent; border: 0; padding: 0; font-size: 1em; }
+
+    /* --- chat alignment: user prompts hug the right in a bubble; the agent's
+       thoughts / actions / answers stay left-aligned and full width --- */
+    .user-row { display: flex; flex-direction: column; align-items: flex-end; }
+    .user-row .msg-meta { text-align: right; }
+    .user-bubble {
+      max-width: min(560px, 85%);
+      text-align: left;
+      overflow-wrap: break-word;
+      background: rgb(var(--term-panel));
+      border: 1px solid rgb(var(--term-line));
+      border-radius: 14px; border-top-right-radius: 4px;
+      padding: 7px 12px;
+    }
+
+    /* --- system toasts (bottom-right, auto-dismiss after 10s) --- */
+    #toasts {
+      position: fixed; right: 16px; bottom: 16px; z-index: 60;
+      display: flex; flex-direction: column-reverse; gap: 8px;
+      width: min(360px, calc(100vw - 32px));
+      pointer-events: none;
+    }
+    .toast {
+      pointer-events: auto;
+      display: flex; align-items: flex-start; gap: 8px;
+      background: rgb(var(--term-panel));
+      border: 1px solid rgb(var(--term-line));
+      border-left: 3px solid rgb(var(--term-cyan));
+      border-radius: 10px; padding: 10px 12px;
+      font-size: 12px; line-height: 1.45;
+      box-shadow: 0 6px 24px rgb(0 0 0 / .28);
+      animation: toast-in .28s cubic-bezier(.21, 1.02, .47, 1);
+    }
+    .toast.toast-out { animation: toast-out .25s ease forwards; }
+    .toast .toast-label {
+      color: rgb(var(--term-cyan)); font-weight: 600; font-size: 10px;
+      text-transform: uppercase; letter-spacing: .04em; margin-top: 1px;
+    }
+    .toast .toast-msg { flex: 1; min-width: 0; overflow-wrap: break-word; color: rgb(var(--term-muted)); }
+    .toast .toast-close {
+      cursor: pointer; background: none; border: 0; padding: 0 2px;
+      color: rgb(var(--term-muted)); opacity: .55; font-size: 14px; line-height: 1;
+    }
+    .toast .toast-close:hover { opacity: 1; }
+    @keyframes toast-in { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
+    @keyframes toast-out { to { opacity: 0; transform: translateX(16px); } }
   </style>
 </head>
 <body class="h-full font-sans text-[13px] text-term-text antialiased">
@@ -262,10 +334,14 @@
         </div>
         <div class="ml-auto flex items-center gap-3 text-[11px] text-term-muted">
           <span class="tabular-nums" title="Total agent steps this session">steps <span id="statSteps" class="text-term-text">0</span></span>
-          <span class="tabular-nums" title="Consecutive tool calls in the current leg">tools <span id="statTools" class="text-term-text">0</span></span>
+          <span class="tabular-nums" title="Total tools used in this chat (persists across reopen)">tools <span id="statTools" class="text-term-text">0</span></span>
           <span class="tabular-nums" title="Approx. context size (chars)">ctx <span id="statCtx" class="text-term-text">0</span></span>
           <span class="tabular-nums" title="Memory compactions so far">resets <span id="statResets" class="text-term-text">0</span></span>
           <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60">plan —</button>
+          <button id="activeLlmBadge" title="LLM currently in use — click to open provider settings" class="flex items-center gap-1.5 rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60" style="max-width:220px">
+            <span class="shrink-0">⚡</span>
+            <span id="activeLlmLabel" class="truncate">LLM —</span>
+          </button>
           <button id="llmSettingsBtn" title="LLM provider settings" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           </button>
@@ -319,14 +395,44 @@
 
       <!-- GRAPH TAB -->
       <div id="graphTab" class="hidden flex-1 flex min-h-0">
-        <div id="graphContainer" class="flex-1 relative bg-term-bg"></div>
+        <div id="graphContainer" class="flex-1 min-w-0 relative overflow-hidden bg-term-bg"></div>
         <!-- graph sidebar: legend + info -->
         <div class="w-64 shrink-0 border-l border-term-line bg-term-panel flex flex-col overflow-hidden">
+          <!-- build + compare controls (always available on the Graph tab) -->
+          <div class="flex flex-col gap-2 px-3 py-2 border-b border-term-line">
+            <div class="flex items-center gap-2">
+              <button id="graphBuildBtn" title="Build a knowledge graph for the whole workspace or a specific project folder"
+                class="flex-1 rounded-lg border border-term-cyan px-2 py-1 text-[11px] font-semibold text-term-cyan hover:bg-term-line/60">Build graph</button>
+              <button id="graphCompareBtn" title="Show two built graphs side by side (needs two projects built)"
+                class="flex-1 rounded-lg border border-term-line px-2 py-1 text-[11px] font-semibold text-term-muted hover:text-term-text hover:bg-term-line/60">Compare</button>
+            </div>
+            <!-- inline build form (hidden until Build is clicked) -->
+            <div id="graphBuildForm" class="hidden flex-col gap-2 rounded-lg border border-term-line bg-term-bg p-2">
+              <label class="text-[10px] uppercase tracking-wider text-term-muted">project / folder to index</label>
+              <select id="graphBuildTarget"
+                class="w-full rounded-lg border border-term-line bg-term-panel px-2 py-1 text-[12px] outline-none focus:border-term-cyan"></select>
+              <label class="text-[10px] uppercase tracking-wider text-term-muted">graph name (optional)</label>
+              <input id="graphBuildName" type="text" placeholder="auto from folder" autocomplete="off"
+                class="w-full rounded-lg border border-term-line bg-term-panel px-2 py-1 text-[12px] outline-none focus:border-term-cyan" />
+              <label class="flex items-center gap-1.5 text-[11px] text-term-muted cursor-pointer">
+                <input id="graphBuildSo" type="checkbox" class="accent-term-cyan" /> include native .so symbols
+              </label>
+              <div class="flex items-center gap-2">
+                <button id="graphBuildRun"
+                  class="flex-1 rounded-lg border border-term-cyan px-2 py-1 text-[11px] font-semibold text-term-cyan hover:bg-term-line/60">Build</button>
+                <button id="graphBuildCancel"
+                  class="rounded-lg border border-term-line px-2 py-1 text-[11px] text-term-muted hover:text-term-text">Cancel</button>
+              </div>
+              <div id="graphBuildStatus" class="text-[11px] text-term-muted"></div>
+            </div>
+          </div>
           <!-- per-version graph selector (shown only when >1 graph has been built) -->
           <div id="graphSelectRow" class="hidden items-center gap-2 px-3 py-2 border-b border-term-line">
             <span class="shrink-0 text-[10px] uppercase tracking-wider text-term-muted">graph</span>
             <select id="graphSelect" title="Which built graph to view — build each app version separately to compare"
               class="min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-2 py-1 text-[12px] outline-none focus:border-term-cyan"></select>
+            <button id="graphDeleteBtn" title="Delete the selected graph instance (does not touch your files)"
+              class="shrink-0 rounded-lg border border-term-line px-2 py-1 text-[11px] text-term-muted hover:text-term-text hover:bg-term-line/60">✕</button>
           </div>
           <div class="flex items-center gap-2 px-3 py-2 border-b border-term-line">
             <input id="graphSearch" type="text" placeholder="Search nodes…" autocomplete="off"
@@ -399,49 +505,180 @@
       <div class="flex items-center justify-between border-b border-term-line px-5 py-3.5">
         <div class="min-w-0">
           <div class="text-[10px] uppercase tracking-wider text-term-muted">model provider</div>
-          <div class="font-serif text-[14px] text-term-text">LLM Settings</div>
+          <div id="llmModalTitle" class="font-serif text-[14px] text-term-text">LLM Providers</div>
         </div>
         <button id="llmModalClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
       </div>
 
-      <div class="flex-1 overflow-y-auto px-5 py-4 text-[12px]">
-        <div class="mb-1.5 text-[10px] uppercase tracking-wider text-term-muted">provider</div>
-        <div id="llmProviderTabs" class="mb-3 flex items-center gap-1.5" style="flex-wrap:wrap"></div>
-        <div id="llmProviderNotes" class="mb-3 text-[11px] text-term-muted"></div>
-
-        <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">API key</label>
-        <input id="llmKey" type="password" autocomplete="off" spellcheck="false"
-          class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
-
-        <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">model</label>
-        <input id="llmModel" type="text" autocomplete="off" spellcheck="false" placeholder="model id"
-          class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
-
-        <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">base URL</label>
-        <input id="llmBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://…/v1"
-          class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
-
-        <div id="llmMaxTokensRow" class="mb-3 hidden">
-          <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">max output tokens</label>
-          <input id="llmMaxTokens" type="number" min="256" placeholder="8192" style="width:160px"
-            class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+      <!-- ===== LIST VIEW: configured providers, in fallback order ===== -->
+      <div id="llmListView" style="display:flex;flex-direction:column;flex:1 1 auto;min-height:0">
+        <div class="flex-1 overflow-y-auto px-5 py-4 text-[12px]" style="min-height:0">
+          <div class="mb-3 text-[11px] text-term-muted">
+            Requests try these providers top-to-bottom. If one fails (bad key, rate limit, outage), the next
+            is used automatically. Drag the ⠿ handle to reorder — the top provider is primary.
+          </div>
+          <div id="llmList" class="flex flex-col gap-2"></div>
+          <div id="llmListEmpty" class="hidden text-[11px] text-term-muted" style="padding:10px 0">
+            No providers configured yet — add one to get started.
+          </div>
+          <button id="llmAddBtn" class="mt-2 rounded-full border border-term-line px-4 py-2 text-term-text hover:bg-term-line/60">+ add new LLM</button>
         </div>
-
-        <div class="flex items-center gap-2">
-          <button id="llmTestBtn" class="rounded-full border border-term-line px-4 py-2 text-term-text hover:bg-term-line/60">test connection</button>
-          <span id="llmTestResult" class="text-[11px] text-term-muted"></span>
+        <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
+          <span id="llmListStatus" class="text-[11px] text-term-muted"></span>
+          <button id="llmDoneBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90">done</button>
         </div>
       </div>
 
-      <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
-        <span id="llmError" class="text-[11px] text-term-red"></span>
-        <div class="flex items-center gap-2">
-          <button id="llmCancelBtn" class="rounded-full border border-term-line px-4 py-2 text-term-muted hover:bg-term-line/60 hover:text-term-text">cancel</button>
-          <button id="llmSaveBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">save</button>
+      <!-- ===== EDIT VIEW: add / edit a single provider ===== -->
+      <div id="llmEditView" style="display:none;flex-direction:column;flex:1 1 auto;min-height:0">
+        <div class="flex-1 overflow-y-auto px-5 py-4 text-[12px]" style="min-height:0">
+          <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">display name</label>
+          <input id="llmName" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. Primary — Cline GLM"
+            class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
+
+          <div class="mb-1.5 text-[10px] uppercase tracking-wider text-term-muted">provider</div>
+          <div id="llmProviderTabs" class="mb-3 flex items-center gap-1.5" style="flex-wrap:wrap"></div>
+          <div id="llmProviderNotes" class="mb-3 text-[11px] text-term-muted"></div>
+
+          <!-- Basic / Advanced sub-tabs -->
+          <div id="llmSubtabs" class="mb-3 flex items-center gap-1.5">
+            <button id="llmSubtabBasic" type="button" data-pane="basic"
+              class="rounded-full border px-3 py-1 text-[12px] bg-term-cyan text-white border-term-cyan">Basic</button>
+            <button id="llmSubtabAdvanced" type="button" data-pane="advanced"
+              class="rounded-full border px-3 py-1 text-[12px] border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text">Advanced</button>
+          </div>
+
+          <!-- ===== Basic pane ===== -->
+          <div id="llmPaneBasic">
+            <div class="mb-1 flex items-center justify-between">
+              <label class="block text-[10px] uppercase tracking-wider text-term-muted">API keys — shared pool</label>
+              <button id="llmKeysAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add key</button>
+            </div>
+            <div id="llmKeysList" class="mb-1 flex flex-col gap-1.5"></div>
+            <div class="mb-3 text-[11px] text-term-muted">
+              A <span class="font-mono">shared pool</span> — any key can serve any model (text or vision). On a rate
+              limit (HTTP 429) the engine rotates to the next key without changing the model.
+            </div>
+
+            <div class="mb-1 flex items-center justify-between">
+              <label class="block text-[10px] uppercase tracking-wider text-term-muted">text models — fallback ladder</label>
+              <button id="llmModelsAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add model</button>
+            </div>
+            <div id="llmModelsList" class="mb-1 flex flex-col gap-1.5"></div>
+            <div class="mb-3 text-[11px] text-term-muted">
+              Text-to-text models in priority order (primary at the top — use ↑/↓ to reorder). The engine prefers the
+              top model and only falls to the next when it's unavailable/overloaded (503 / queue / timeout), returning
+              to the primary once it recovers. Keys and models are independent.
+              Each model has its own <span class="font-mono">reasoning</span> + <span class="font-mono">style</span> —
+              leave them on <span class="font-mono">inherit</span>/<span class="font-mono">auto</span> to use the
+              provider defaults (Advanced tab), or set them per model when they differ (e.g.
+              <span class="font-mono">glm-5.2</span> → thinking, <span class="font-mono">deepseek-v4</span> → its
+              none/high/max effort).
+            </div>
+
+            <div class="mb-1 flex items-center justify-between">
+              <label class="block text-[10px] uppercase tracking-wider text-term-muted">vision models — image-to-text</label>
+              <button id="llmVisionAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add vision model</button>
+            </div>
+            <div id="llmVisionList" class="mb-1 flex flex-col gap-1.5"></div>
+            <div class="mb-3 text-[11px] text-term-muted">
+              Separate image-to-text ladder for reasoning over screenshots (the <span class="font-mono">analyze_image</span>
+              tool + emulator frame analysis). Shares the same key pool. Leave empty if you don't need vision. e.g.
+              <span class="font-mono">meta/llama-3.2-90b-vision-instruct</span>.
+            </div>
+
+            <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">base URL</label>
+            <input id="llmBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://…/v1"
+              class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+          </div>
+
+          <!-- ===== Advanced pane ===== -->
+          <div id="llmPaneAdvanced" class="hidden">
+            <div class="mb-3 rounded-lg border border-term-line/70 bg-term-line/20 px-3 py-2 text-[11px] text-term-muted">
+              These reasoning fields are the provider's <span class="font-mono">defaults</span> — every model inherits
+              them unless you override that model in the <span class="font-mono">text models</span> list (Basic tab).
+              Set them per model there when a fallback ladder mixes families.
+            </div>
+            <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">reasoning effort (default)</label>
+            <select id="llmReasoning"
+              class="mb-1 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan">
+              <option value="">Off / None</option>
+              <option value="minimal">Minimal</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="max">Max (DeepSeek V4 think-max)</option>
+            </select>
+            <div class="mb-3 text-[11px] text-term-muted">
+              Turns on step-by-step reasoning where the provider supports it. Claude uses extended thinking (budget
+              scales with the level); OpenAI-compatible models use the <span class="font-mono">reasoning style</span>
+              below. DeepSeek V4 has exactly three modes — Off → <span class="font-mono">none</span>, any level →
+              <span class="font-mono">high</span>, Max → <span class="font-mono">max</span>. Leave Off for models that
+              don't support it.
+            </div>
+
+            <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">reasoning style (default)</label>
+            <select id="llmReasoningStyle"
+              class="mb-1 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan">
+              <option value="">Auto-detect (from model name)</option>
+              <option value="openai">OpenAI — reasoning_effort (o-series, GPT-5)</option>
+              <option value="thinking">GLM / Z.AI — thinking flag (GLM 4.x / 5.x)</option>
+              <option value="chat_template">Qwen / DeepSeek V3 — chat-template kwargs</option>
+              <option value="deepseek_v4">DeepSeek V4 — reasoning_effort none/high/max</option>
+              <option value="system">Nemotron — system directive</option>
+              <option value="none">None — model reasons on its own</option>
+            </select>
+            <div class="mb-3 text-[11px] text-term-muted">
+              Only for OpenAI-compatible providers (Claude ignores it). <span class="font-mono">Auto</span> picks by model
+              name — GLM → thinking, Nemotron → system, DeepSeek V4 → its none/high/max modes, Qwen/DeepSeek V3 →
+              chat-template, otherwise OpenAI. Set it explicitly if a model needs a specific one (e.g.
+              <span class="font-mono">glm-5.2</span> won't reason without the thinking flag). The effort level tunes the
+              OpenAI and DeepSeek V4 styles; the others are simply on/off.
+            </div>
+
+            <div class="mb-1">
+              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">temperature</label>
+              <input id="llmTemperature" type="number" step="0.1" min="0" max="2" placeholder="provider default" style="width:160px"
+                class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+            </div>
+            <div class="mb-3 text-[11px] text-term-muted">Blank = provider default. Ignored when reasoning is on (reasoning models reject it).</div>
+
+            <div id="llmMaxTokensRow" class="mb-1">
+              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">max output tokens</label>
+              <input id="llmMaxTokens" type="number" min="256" placeholder="provider default" style="width:160px"
+                class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+            </div>
+            <div class="mb-3 text-[11px] text-term-muted">
+              Blank = provider default; only sent when set. Reasoning tokens count against it — NIM DeepSeek V4 Pro
+              allows up to 16384, worth setting for Max reasoning so long thinking isn't truncated.
+            </div>
+
+            <div class="mb-1">
+              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">context window (tokens)</label>
+              <input id="llmContextWindow" type="number" min="1000" placeholder="1000000" style="width:200px"
+                class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+            </div>
+            <div class="mb-3 text-[11px] text-term-muted">The model's max context; the agent auto-summarizes as it approaches this to avoid overflow.</div>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <button id="llmTestBtn" class="rounded-full border border-term-line px-4 py-2 text-term-text hover:bg-term-line/60">test connection</button>
+            <span id="llmTestResult" class="text-[11px] text-term-muted"></span>
+          </div>
+        </div>
+        <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
+          <span id="llmError" class="text-[11px] text-term-red"></span>
+          <div class="flex items-center gap-2">
+            <button id="llmBackBtn" class="rounded-full border border-term-line px-4 py-2 text-term-muted hover:bg-term-line/60 hover:text-term-text">cancel</button>
+            <button id="llmSaveBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">save to list</button>
+          </div>
         </div>
       </div>
     </div>
   </div>
+
+  <!-- system message toasts (bottom-right, auto-dismiss) -->
+  <div id="toasts" aria-live="polite"></div>
 
   <script src="app.js"></script>
 </body>

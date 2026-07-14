@@ -2,7 +2,7 @@
 name: native-patching
 description: Targeted patching of native .so libraries — find a function, disassemble it, patch bytes, verify.
 when_to_use: Use this skill when the user needs to patch, NOP out, or modify behavior inside a native shared library (.so file) within an APK or standalone.
-allowed-tools: extract_strings, rabin2_info, nm_symbols, disassemble_range, ghidra_decompile, nop_function, patch_function_return, patch_binary_string, disassemble_patch_function, hex_patch_file, compare_files_sha256
+allowed-tools: extract_strings, rabin2_info, nm_symbols, disassemble_range, ghidra_decompile, nop_function, patch_function_return, patch_binary_string, patch_bytes_at_offset, binary_patch, compare_files_sha256
 ---
 
 # Native Library Patching Skill
@@ -30,7 +30,7 @@ Prefer the highest-level tool that does what you need — each one below finds t
 1. **Disable a function whose return value doesn't matter** (logging, telemetry, a flag-setter): `nop_function(so_path, function_name)`.
 2. **Force a check to always pass/fail** (license check, root/debug detection, tamper check): `patch_function_return(so_path, function_name, return_value="true"|"false"|"zero"|"null")`.
 3. **Change a hardcoded string** (URL, error message, feature flag) — same length or shorter only: `patch_binary_string(so_path, old_string, new_string)`.
-4. **Anything more specific than the above** (an exact byte sequence you worked out yourself, or a partial-function patch): `disassemble_patch_function` (preferred — verifies the write by reading bytes back) or `hex_patch_file` with the file offset and new hex bytes. `reference/arm64-opcodes.md` has the raw hex for common patterns if you're doing this by hand.
+4. **Anything more specific than the above** (an exact byte sequence you worked out yourself, or a partial-function patch): `patch_bytes_at_offset` when you have the file offset and the new hex bytes (it writes then reads back to verify), or `binary_patch` when you prefer to locate the exact byte SEQUENCE to find-and-replace (it disambiguates multiple matches). `reference/arm64-opcodes.md` has the raw hex for common patterns if you're doing this by hand.
 5. **The new logic needs to actually compute something** (not just NOP/return-a-constant/swap-a-string) — switch to the `native-code-injection` skill, which assembles real assembly or compiles freestanding C into correct machine code instead of you hand-encoding it.
 
 Always `duplicate_file` the .so to a backup path BEFORE any of the above.

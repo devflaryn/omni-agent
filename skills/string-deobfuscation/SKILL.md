@@ -2,7 +2,7 @@
 name: string-deobfuscation
 description: Recover or bypass checks guarded by encrypted/obfuscated string literals in ProGuard/R8-obfuscated or custom-packed Android code.
 when_to_use: Use this skill when a check you need to bypass compares against a string that isn't a plain literal in smali — e.g. it's built from a byte array, decrypted at runtime, or passed through an obfuscated helper class before use — and plain search_smali/string_refs for the plaintext value finds nothing.
-allowed-tools: decompile_apk, build_code_graph, query_code_graph, search_smali, read_file_chunk, ghidra_decompile, disassemble_range, patch_smali_method, hex_patch_file
+allowed-tools: decode_apk, build_code_graph, query_code_graph, search_smali, read_file_chunk, ghidra_decompile, disassemble_range, patch_smali_method, patch_bytes_at_offset
 ---
 
 # String Deobfuscation Skill

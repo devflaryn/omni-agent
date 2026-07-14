@@ -2,9 +2,9 @@
 by assembling real hand-written assembly, or compiling freestanding C, into
 raw machine code and patching it directly into a .so at a chosen file offset.
 
-These exist because hex_patch_file / disassemble_patch_function / nop_function
-/ patch_function_return only let you write bytes you already know, or force a
-function to return one canned constant. When the task needs genuinely NEW
+These exist because patch_bytes_at_offset / nop_function / patch_function_return
+only let you write bytes you already know, or force a function to return one
+canned constant. When the task needs genuinely NEW
 logic (a custom comparison, a small algorithm, a bespoke check) these tools
 let you express that logic as source code and get correctly encoded machine
 code for the target's actual CPU architecture, instead of hand-encoding

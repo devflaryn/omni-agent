@@ -1,8 +1,42 @@
 import subprocess
 import os
+import time
+import threading
 
 CONTAINER_NAME = "re_agent_sandbox"
 IMAGE_NAME = "re_sandbox_env"
+
+# --- Timeout decision hook ----------------------------------------------------
+# By default a command that outruns its timeout used to be hard-killed on the
+# spot. Instead, callers (the agent) can register a "decider": when a command
+# exceeds its timeout window we DON'T kill it — we ask the decider whether the
+# process looks genuinely stuck (kill it) or is just a long job still making
+# progress (keep waiting). The decider is called with:
+#     decider(display_command, elapsed_seconds, base_timeout, round_number)
+# and must return one of:
+#     ("kill", None)        -> stop the process now
+#     ("extend", seconds)   -> let it keep running for `seconds` more, then re-ask
+# With no decider registered, run_cmd falls back to the old behavior (kill +
+# timeout error), so tests and any non-agent caller are unaffected.
+_timeout_decider = None
+
+# Absolute backstop so a misbehaving decider can't extend a single command
+# forever — after this many decision rounds we kill regardless.
+_MAX_DECISION_ROUNDS = 1000
+
+
+def set_timeout_decider(fn):
+    """Register the callback consulted when a sandbox command exceeds its
+    timeout (see the module note above). Pass None to restore hard-kill."""
+    global _timeout_decider
+    _timeout_decider = fn
+
+
+def _kill_proc(proc):
+    try:
+        proc.kill()
+    except Exception:
+        pass
 
 # Absolute HOST path of the currently active project's workspace directory —
 # the same directory that's bind-mounted to /workspace inside the sandbox.
@@ -80,19 +114,83 @@ def run_cmd(command, timeout=DEFAULT_TIMEOUT):
     """
     Executes a shell command inside the docker sandbox.
     Returns a dictionary with stdout, stderr, and the return code.
-    Kills the command and returns an error dict if it exceeds `timeout` seconds.
+
+    On timeout the command is NOT killed outright: if a timeout decider is
+    registered (see set_timeout_decider) it is asked whether to kill the
+    still-running process or give it more time. Only when it decides to kill
+    (or no decider is registered) does the process get terminated and an error
+    dict returned.
     """
     cmd = ["docker", "exec", CONTAINER_NAME, "sh", "-c", command]
+    return _run_polling(cmd, timeout, display=command,
+                        timeout_msg=f"Command timed out after {{elapsed}}s. "
+                        "Try a lighter command or break the task into smaller steps.")
+
+
+def _run_polling(cmd, timeout, display, timeout_msg):
+    """Run `cmd` (a list, no shell) draining its output, waiting in `timeout`-
+    second windows. When a window elapses without the process finishing, consult
+    the registered timeout decider instead of killing immediately. Returns the
+    same shape as run_cmd. `display` is the human-readable command shown to the
+    decider; `timeout_msg` is the error text used when we do kill (a "{elapsed}"
+    placeholder is filled with the total seconds run)."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        # `docker` isn't installed / not on PATH. Return an error dict (with a
+        # non-zero returncode) instead of raising, so callers that fall back to
+        # a host-side path (e.g. build_code_graph) can do so cleanly.
+        return {"stdout": "", "stderr": "docker executable not found", "returncode": 127}
+    except OSError as e:
+        return {"stdout": "", "stderr": f"docker exec failed: {e}", "returncode": 1}
+
+    # Drain both pipes on a background thread so a chatty command can't deadlock
+    # by filling the OS pipe buffer while we wait. communicate() also returns the
+    # partial output captured so far once the process is killed.
+    captured = {}
+
+    def _drain():
+        out, err = proc.communicate()
+        captured["stdout"] = (out or b"").decode("utf-8", "replace")
+        captured["stderr"] = (err or b"").decode("utf-8", "replace")
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+
+    start = time.time()
+    window = timeout
+    rounds = 0
+    while True:
+        reader.join(window)
+        if not reader.is_alive():
+            # Process finished and its output has been fully drained.
+            return {
+                "stdout": captured.get("stdout", ""),
+                "stderr": captured.get("stderr", ""),
+                "returncode": proc.returncode,
+            }
+
+        elapsed = int(time.time() - start)
+        decider = _timeout_decider
+        rounds += 1
+
+        action, extra = ("kill", None)
+        if decider is not None and rounds <= _MAX_DECISION_ROUNDS:
+            try:
+                action, extra = decider(display, elapsed, timeout, rounds)
+            except Exception:
+                action, extra = ("kill", None)
+
+        if action == "extend" and isinstance(extra, (int, float)) and extra > 0:
+            window = float(extra)
+            continue
+
+        # Kill path: terminate, let the drain thread settle, return partial
+        # output plus a clear timeout error the agent can react to.
+        _kill_proc(proc)
+        reader.join(5)
         return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "stdout": "",
-            "stderr": "",
-            "error": f"Command timed out after {timeout}s. Try a lighter command or break the task into smaller steps."
+            "stdout": captured.get("stdout", ""),
+            "stderr": captured.get("stderr", ""),
+            "error": timeout_msg.format(elapsed=elapsed),
         }

@@ -2,12 +2,12 @@
 name: dex-multidex-handling
 description: Locate and edit a specific class inside a multidex APK (classes.dex, classes2.dex, ...) without a full apktool decompile.
 when_to_use: Use this skill when the target class/method is somewhere in a multidex APK and you want to make a targeted smali edit quickly, or when you need to figure out which of several .dex files actually contains a given class before deciding how to edit it.
-allowed-tools: inspect_apk, unzip_apk, list_dex_classes, disassemble_dex, patch_smali_method, insert_smali_code, assemble_dex, move_file, repack_apk, sign_apk, verify_apk
+allowed-tools: inspect_apk, unzip_apk, list_dex_classes, disassemble_dex, patch_smali_method, insert_smali_code, assemble_dex, move_file, recompile_apk, sign_apk, verify_apk
 ---
 
 # DEX / Multidex Handling Skill
 
-Full `decompile_apk` (apktool) processes every dex and every resource — correct but slow on large multidex apps when you only need one class. This skill is the fast path.
+Full `decode_apk` (apktool) processes every dex and every resource — correct but slow on large multidex apps when you only need one class. This skill is the fast path.
 
 ## Step 1 — Check how many dex files exist
 `inspect_apk` with `filter_pattern='.dex'` — you'll see `classes.dex`, and possibly `classes2.dex`, `classes3.dex`, etc.
@@ -29,11 +29,11 @@ Before disassembling anything, run `list_dex_classes` on EACH dex file and check
 ## Step 6 — Reassemble and put it back
 1. `assemble_dex` the edited smali directory back into a `.dex` file.
 2. Give the rebuilt dex the EXACT SAME FILENAME it originally had (e.g. `classes2.dex` stays `classes2.dex`) — `move_file` it over the old one inside the unzipped directory.
-3. `repack_apk` (this directory came from `unzip_apk`, so `repack_apk`, not `build_apk`).
+3. `recompile_apk` (this directory came from `unzip_apk`, so it auto-detects the raw tree and repacks it with zip).
 4. `sign_apk` → `verify_apk`.
 
 ## Critical Rules
 - ALWAYS run `list_dex_classes` before `disassemble_dex` — don't guess which dex holds the class, and don't disassemble every dex "just in case" on a large app.
 - Keep the exact original dex filename and its position implied by that name (`classes.dex` is always the primary dex; `classesN.dex` order matters for some legacy MultiDex configurations) — renaming or reordering can break the app's dex loading at startup.
 - If the class you need to edit is referenced (called) from other dex files but DEFINED in only one, you generally only need to patch the dex that DEFINES it — cross-dex calls resolve by class descriptor at the runtime verifier level, not by dex file identity.
-- If you end up needing to touch many classes across many dex files, that's a sign to switch to the full `decompile_apk` (`apk-modding`) workflow instead of chasing individual dex files one at a time.
+- If you end up needing to touch many classes across many dex files, that's a sign to switch to the full `decode_apk` (`apk-modding`) workflow instead of chasing individual dex files one at a time.

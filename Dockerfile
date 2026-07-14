@@ -10,6 +10,12 @@ RUN apt-get update && apt-get install -y \
     curl \
     default-jdk \
     binutils \
+    # LLVM's llvm-objdump gives clean ARM64 disassembly and resolves @plt call
+    # targets on stripped .so files — output the host's x86_64 binutils objdump
+    # can't produce for aarch64. Used by the llvm_objdump_disasm and
+    # analyze_function_calls tools in tools/binary_analysis.py. The package
+    # provides an unversioned /usr/bin/llvm-objdump symlink.
+    llvm \
     python3 \
     findutils \
     git \

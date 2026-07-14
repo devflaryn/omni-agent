@@ -38,6 +38,45 @@ def _run_script_in_sandbox(script_path, args, timeout):
     return run_script_in_sandbox(script_path, args, timeout)
 
 
+def _host_build_fallback(root_dir, inc, frc, gid):
+    """Build the graph directly on the HOST (no Docker) into the same
+    <workspace>/.codegraph/<gid>/ the Graph tab reads.
+
+    Used as a fallback when the sandbox build produced nothing — e.g. the
+    container isn't running or the bind mount didn't surface the .codegraph
+    directory on the host. That failure mode is exactly what leaves the Graph
+    tab stuck on "No knowledge graph found" even though the agent "built" one,
+    so we retry natively rather than silently succeeding with no on-disk graph.
+
+    Returns a result dict: {"stdout": ...} on success, else {"error": ...} with a
+    concrete reason (so a failure is diagnosable rather than a vague error)."""
+    import sys
+    import subprocess
+    from tools.common import resolve_workspace_path
+    try:
+        from docker_sandbox import get_workspace_host_path
+        host_root = get_workspace_host_path()
+    except Exception as e:
+        return {"error": "no host workspace is available for a host-side build (%s)" % e}
+    if not host_root or not os.path.isdir(host_root):
+        return {"error": "host workspace path is missing or not a directory: %r" % host_root}
+    target = resolve_workspace_path(root_dir)
+    env = dict(os.environ)
+    env["CODEGRAPH_WORKSPACE"] = host_root  # graphs land under <host_root>/.codegraph/
+    try:
+        proc = subprocess.run(
+            [sys.executable, _INDEXER_PATH, target, inc, frc, gid],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", env=env, timeout=1800)
+    except subprocess.TimeoutExpired:
+        return {"error": "host build timed out after 1800s (try a specific sub-directory instead of the whole workspace)"}
+    except Exception as e:
+        return {"error": "host indexer failed to run: %s" % e}
+    if proc.returncode == 0 and proc.stdout:
+        return {"stdout": proc.stdout}
+    return {"error": (proc.stderr or proc.stdout or "host build failed").strip()[:600]}
+
+
 def _slug(value):
     """Turn a root_dir or a user-supplied id into a safe graph-namespace slug.
 
@@ -87,6 +126,37 @@ def _auto_build_workspace_graph():
     return build_code_graph(".", include_so=True, force=False, graph_id=_AUTO_GRAPH_ID)
 
 
+def _looks_empty(stdout):
+    r"""True when an indexer run reported that it found NO classes/functions.
+
+    On Windows this is the tell-tale of the Docker mount's long-path problem:
+    Docker Desktop's file sharing can't serve host paths longer than 260 chars,
+    so a deeply nested smali tree is silently skipped inside the container and
+    the build comes back 'successful' but with 0 classes. We treat that as a
+    failure so the host fallback (which opens files via the extended-length
+    \\?\ API, where long paths work) gets a chance to actually index them."""
+    if not stdout:
+        return True
+    if "WARNING: 0 classes" in stdout:
+        return True
+    m = re.search(r"classes=(\d+)", stdout)
+    return bool(m) and int(m.group(1)) == 0
+
+
+def _sandbox_build(sandbox_root, inc, frc, gid):
+    """Run the indexer in the Docker sandbox. Returns {"stdout": ...} only when
+    it produced a REAL (non-empty) graph; otherwise None (so the caller falls
+    back to the host build)."""
+    try:
+        res = _run_script_in_sandbox(_INDEXER_PATH, [sandbox_root, inc, frc, gid], timeout=900)
+    except Exception:
+        return None
+    out = (res.get("stdout") if isinstance(res, dict) else "") or ""
+    if res.get("returncode") == 0 and out and not _looks_empty(out):
+        return {"stdout": out}
+    return None
+
+
 @registry.register(
     name="build_code_graph",
     description=(
@@ -114,10 +184,40 @@ def build_code_graph(root_dir, include_so=True, force=False, graph_id=None):
     inc = "1" if include_so in (True, "true", "True", 1, "1") else "0"
     frc = "1" if force in (True, "true", "True", 1, "1") else "0"
     gid = _resolve_graph_id(graph_id, root_dir)
-    res = _run_script_in_sandbox(_INDEXER_PATH, [sandbox_root, inc, frc, gid], timeout=900)
-    if res.get("returncode") == 0 and res.get("stdout"):
-        return {"stdout": res["stdout"]}
-    return res
+
+    host_err = None  # remember the host build's error text, for reporting
+
+    def try_host():
+        nonlocal host_err
+        fb = _host_build_fallback(root_dir, inc, frc, gid)
+        if fb and "stdout" in fb and not _looks_empty(fb["stdout"]):
+            return {"stdout": fb["stdout"]}
+        # Distinguish "ran but found nothing" from a hard error, for the message.
+        host_err = (fb or {}).get("error") or (
+            "indexed 0 files — is this a directory with source/smali?"
+            if fb and "stdout" in fb else "host build unavailable")
+        return None
+
+    # The agent host is Windows, where Docker Desktop's file sharing can't serve
+    # paths >260 chars and is slow over the bind mount — so the SANDBOX build
+    # routinely times out or comes back empty on big decompiled trees (the exact
+    # failure the user hit). Index on the HOST first there (long paths via \\?\,
+    # straight off local disk, same code path as the working "Build graph"
+    # button); use the sandbox only as a backstop. On non-Windows hosts, prefer
+    # the sandbox (nm there also fills in .so symbol tables).
+    if os.name == "nt":
+        r = try_host() or _sandbox_build(sandbox_root, inc, frc, gid)
+    else:
+        r = _sandbox_build(sandbox_root, inc, frc, gid) or try_host()
+    if r:
+        return r
+
+    # Nothing produced a graph — surface the most useful reason we have so the
+    # agent (and the user) sees WHY instead of a generic failure.
+    if host_err:
+        return {"error": "Could not build the code graph: %s" % host_err}
+    return {"error": "Could not build the code graph (sandbox produced no graph and no host "
+                     "workspace was available). Try the 'Build graph' button on the Graph tab."}
 
 
 @registry.register(

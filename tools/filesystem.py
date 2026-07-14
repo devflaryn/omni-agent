@@ -126,6 +126,61 @@ def write_file(filepath, content):
     return res
 
 @registry.register(
+    name="replace_in_file",
+    description=(
+        "Makes a SURGICAL find-and-replace edit in a text file WITHOUT rewriting the whole file — the "
+        "efficient way to change a few lines in a large source/config/smali/XML file. Give the exact "
+        "old_string to find and the new_string to put in its place. By default old_string must match EXACTLY "
+        "ONCE (include enough surrounding context — indentation, adjacent lines — to make it unique); if it "
+        "matches several places the edit is refused so you can't change the wrong one. Set replace_all=true to "
+        "replace every occurrence instead. old_string and new_string may span multiple lines (use real "
+        "newlines). This is far cheaper and safer than read_file_chunk + write_file for small edits."
+    ),
+    params_schema={
+        "filepath": "string (path to the text file, relative to /workspace)",
+        "old_string": "string (the exact text to find, including whitespace/indentation; make it unique unless replace_all=true)",
+        "new_string": "string (the replacement text; use '' to delete the matched text)",
+        "replace_all": "boolean (optional, default false — replace every occurrence instead of requiring a single unique match)"
+    },
+    output="On success: 'Replaced N occurrence(s) in <file>.' If old_string is not found, or matches more than once while replace_all is false, an error explains what to do (add more context, or set replace_all=true). The file is edited in place.",
+    when_to_use="Use this to change specific lines in an existing text file (Java, Kotlin, smali, XML, JSON, scripts, configs) — patching a value, a method call, a flag. For creating a file or replacing its entire contents use write_file; for replacing a whole smali method by name use patch_smali_method; for binary .so edits use binary_patch/patch_bytes_at_offset."
+)
+def replace_in_file(filepath, old_string, new_string, replace_all=False):
+    filepath = normalize_path(filepath)
+    if old_string is None or old_string == "":
+        return {"error": "old_string must be a non-empty string to search for."}
+    import base64
+    all_flag = "1" if replace_all in (True, "true", "True", 1, "1") else "0"
+    b64_old = base64.b64encode(old_string.encode("utf-8")).decode("ascii")
+    b64_new = base64.b64encode((new_string or "").encode("utf-8")).decode("ascii")
+    # Ship a python editor into the sandbox (base64 args, same trick as patch_smali_method)
+    # so arbitrary code/whitespace in the strings can't break shell quoting.
+    script = (
+        "import sys, base64\n"
+        f"fp = '/workspace/{filepath}'\n"
+        "old = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
+        "new = base64.b64decode(sys.argv[2]).decode('utf-8')\n"
+        "replace_all = sys.argv[3] == '1'\n"
+        "try:\n"
+        "    with open(fp, 'r', encoding='utf-8') as f:\n"
+        "        data = f.read()\n"
+        "except FileNotFoundError:\n"
+        "    print('ERROR: File not found: ' + fp); sys.exit(1)\n"
+        "count = data.count(old)\n"
+        "if count == 0:\n"
+        "    print('ERROR: old_string not found in ' + fp + '. Read the file to confirm the exact text (whitespace matters).'); sys.exit(1)\n"
+        "if count > 1 and not replace_all:\n"
+        "    print('ERROR: old_string matches ' + str(count) + ' places in ' + fp + '. Add surrounding context to make it unique, or set replace_all=true.'); sys.exit(1)\n"
+        "data = data.replace(old, new)\n"
+        "with open(fp, 'w', encoding='utf-8') as f:\n"
+        "    f.write(data)\n"
+        "print('Replaced ' + str(count) + ' occurrence(s) in ' + fp + '.')\n"
+    )
+    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    cmd = f"echo '{b64_script}' | base64 -d | python3 - {b64_old} {b64_new} {all_flag}"
+    return run_cmd(cmd, timeout=30)
+
+@registry.register(
     name="delete_path",
     description="Deletes a file or directory recursively inside the workspace. Use this to remove files the user asks you to remove, or to clean up temporary artifacts.",
     params_schema={"filepath": "string (path relative to workspace)"},

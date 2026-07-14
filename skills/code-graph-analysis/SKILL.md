@@ -10,7 +10,7 @@ allowed-tools: build_code_graph, query_code_graph, read_file_chunk
 When an APK is decompiled, it can produce thousands of .smali files. Reading them one by one wastes context and time. The code knowledge graph lets you query the entire codebase cheaply.
 
 ## Step 1 — Build the graph
-After decompiling an APK with `decompile_apk`, call:
+After decoding an APK with `decode_apk`, call:
 ```
 build_code_graph(root_dir="app_decompiled", include_so=true)
 ```

@@ -2,7 +2,7 @@
 name: anti-debug-bypass
 description: Detect and neutralize anti-debugger, anti-Frida, root-detection, and emulator-detection checks in an Android APK, in both smali and native code.
 when_to_use: Use this skill when the user reports an app crashes/exits/shows a warning specifically when attached to a debugger or Frida, when running as root, or when running on an emulator — or asks generally to "disable root detection" or "bypass Frida detection".
-allowed-tools: decompile_apk, build_code_graph, query_code_graph, search_smali, extract_strings, rabin2_info, disassemble_range, patch_smali_method, disassemble_patch_function, build_apk, sign_apk, verify_apk
+allowed-tools: decode_apk, build_code_graph, query_code_graph, search_smali, extract_strings, rabin2_info, disassemble_range, patch_smali_method, patch_bytes_at_offset, recompile_apk, sign_apk, verify_apk
 ---
 
 # Anti-Debug / Anti-Frida / Root-Detection Bypass Skill
@@ -10,7 +10,7 @@ allowed-tools: decompile_apk, build_code_graph, query_code_graph, search_smali, 
 These checks share a pattern: they detect a condition, then either throw, silently corrupt state, or call `System.exit`/`Process.killProcess`. The detector is often easy to find; the important part is tracing what it does AFTER detecting, since patching only the detector while missing a second kill-switch leaves the crash in place.
 
 ## Step 1 — Decompile and index
-`decompile_apk`, then `build_code_graph` if the app is large (see `code-graph-analysis`). Use `query_code_graph(query_type="string_refs", ...)` as your primary search tool — nearly all of these checks are anchored on a distinctive string.
+`decode_apk`, then `build_code_graph` if the app is large (see `code-graph-analysis`). Use `query_code_graph(query_type="string_refs", ...)` as your primary search tool — nearly all of these checks are anchored on a distinctive string.
 
 ## Step 2 — Search for detection patterns
 Load `reference/detection-patterns.md` for the full list of smali search patterns (debugger, Frida, root, emulator) and native `extract_strings`/`rabin2_info` filters. Work through each category — apps frequently combine two or three of these.
@@ -28,7 +28,7 @@ For every hit, `read_file_chunk` the surrounding method and look for what runs i
 - **Native checks** (ptrace-based, TracerPid, Frida server port scan): find the function with `rabin2_info -s`/`-i`, read it with `disassemble_range`, and switch to `native-patching` to force it to return "not detected".
 
 ## Step 5 — Rebuild, sign, verify
-`build_apk` → `sign_apk` → `verify_apk`.
+`recompile_apk` → `sign_apk` → `verify_apk`.
 
 ## Critical Rules
 - Checks frequently run on a background thread, in a loop (polling), or in native `JNI_OnLoad`/a JNI static initializer — not just in `onCreate`. If a patched app still exits a few seconds after launch, look for a background poller you missed.

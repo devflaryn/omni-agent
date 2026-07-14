@@ -1,7 +1,7 @@
 """DEX bytecode editing tools.
 
 These let the agent work directly with .dex files (Dalvik bytecode) — the
-compiled Java/Kotlin code inside an APK. While decompile_apk/build_apk handle
+compiled Java/Kotlin code inside an APK. While decode_apk/recompile_apk handle
 the full APK lifecycle, these tools operate on individual .dex files for
 targeted editing without a full decompile/rebuild cycle.
 
@@ -10,10 +10,10 @@ Workflow for editing a .dex:
   2. read_file_chunk   — read the smali you want to edit
   3. patch_smali_method or write_file — edit the smali
   4. assemble_dex      — smali files → new .dex
-  5. Replace the old .dex in the APK and repack/sign
+  5. Replace the old .dex in the APK and recompile/sign
 
 Or for a full APK edit (easier, uses apktool):
-  decompile_apk → edit smali → build_apk → sign_apk
+  decode_apk → edit smali → recompile_apk → sign_apk
 """
 import os
 import base64
@@ -49,15 +49,15 @@ def disassemble_dex(dex_path, output_dir):
     name="assemble_dex",
     description=(
         "Assembles .smali files back into a single .dex file using the smali assembler. "
-        "Use this AFTER editing smali files (from disassemble_dex or decompile_apk) to produce "
+        "Use this AFTER editing smali files (from disassemble_dex or decode_apk) to produce "
         "a new .dex that can be put back into an APK. The input is a directory containing .smali files."
     ),
     params_schema={
         "smali_dir": "string (directory containing .smali files, relative to /workspace)",
         "output_dex": "string (output .dex filename, relative to /workspace, e.g. 'classes_patched.dex')"
     },
-    output="smali assembler's log. On success, the output .dex file is created and ready to be placed back into an APK via repack_apk.",
-    when_to_use="Use this after editing smali files to rebuild the .dex. Then replace the old .dex in the APK (using repack_apk if the APK was unzipped, or build_apk if decompiled with apktool) and sign the result."
+    output="smali assembler's log. On success, the output .dex file is created and ready to be placed back into an APK via replace_file_in_apk or recompile_apk.",
+    when_to_use="Use this after editing smali files to rebuild the .dex. Then put the new .dex back into the APK (replace_file_in_apk for a single .dex swap, or recompile_apk to rebuild the whole directory) and sign the result."
 )
 def assemble_dex(smali_dir, output_dex):
     smali_dir = normalize_path(smali_dir)
