@@ -188,12 +188,14 @@ TIMEOUT_DECIDER_SYSTEM = (
     "single raw JSON object only — no prose, no markdown."
 )
 # The exact corrective message appended to the history on a JSON parse failure.
+# ONE consistent schema — do not introduce alias keys here (that confused models
+# further). Also forbids the <tool_call> tag shape that GLM/harmony models emit.
 JSON_CORRECTION_MSG = (
-    "Please correct your output to strictly valid JSON with keys: action, tool, arguments. "
-    "Respond with a single raw JSON object only — no markdown, no prose. "
-    'Use {"type": "tool_call", "tool": "<name>", "args": { ... }} for a tool call, or '
-    '{"type": "final_answer", "content": "..."} to finish. '
-    '(The aliases "action" for "type" and "arguments" for "args" are also accepted.)'
+    "Your last message was not a valid action. Respond with EXACTLY ONE raw JSON "
+    "object and nothing else — no markdown, no code fences, no prose, and do NOT "
+    "use <tool_call> or <function> tags. "
+    'For a tool call: {"type": "tool_call", "tool": "<name>", "args": { ... }}. '
+    'For the final answer: {"type": "final_answer", "content": "<text>"}.'
 )
 
 # --- Chat persistence + UI memory safety -------------------------------------
@@ -370,7 +372,7 @@ NARRATION_MIN_GAP = 3
 # default — steadier tool use and fewer malformed actions. A per-provider
 # temperature set in llm_config.json still overrides this (see _openai_request);
 # providers that ignore sampling (Anthropic, reasoning models) are unaffected.
-MAIN_LOOP_TEMPERATURE = 0.3
+MAIN_LOOP_TEMPERATURE = 0.15
 
 # Review gate: when the worker emits a final_answer, an INDEPENDENT reviewer
 # (tools/reviewer.run_review — separate isolated context, same model/key) checks
