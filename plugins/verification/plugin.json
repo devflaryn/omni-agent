@@ -1,0 +1,6 @@
+{
+  "name": "verification",
+  "version": "1.0.0",
+  "description": "Verification-before-completion, Superpowers-style: an on_final_answer hook that catches an answer claiming success (fixed/bypassed/works/patched) without an objective check behind it and sends it back to verify first, plus a read-only verifier subagent that independently re-checks a claim and a /verify-work command. Evidence before assertions.",
+  "enabled": true
+}

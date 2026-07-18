@@ -49,6 +49,9 @@ test-assets/*.apk
 .venv/
 venv/
 .pytest_cache/
+
+# Subagent-driven-development scratch (ledger, task briefs/reports)
+.superpowers/
 .mypy_cache/
 .ruff_cache/
 # Local env / secrets (llm_config.json already covered above)

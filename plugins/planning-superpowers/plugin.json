@@ -1,0 +1,6 @@
+{
+  "name": "planning-superpowers",
+  "version": "1.0.0",
+  "description": "Advanced planning, Superpowers-style: a brainstorm -> design -> plan -> verify workflow plus an architect subagent (returns a phased plan proposal) and a brainstormer subagent (pressure-tests requirements). Encodes the inspect-freely, plan-when-ready discipline.",
+  "enabled": true
+}

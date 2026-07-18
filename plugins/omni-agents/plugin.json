@@ -1,0 +1,6 @@
+{
+  "name": "omni-agents",
+  "version": "1.0.0",
+  "description": "First-party subagent personas for delegation: a general researcher, a native reverse-engineering analyst, and a focused implementer. Read agents fan out in parallel; the implementer runs serialized on the shared workspace.",
+  "enabled": true
+}

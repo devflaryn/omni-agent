@@ -2,8 +2,10 @@
 
 IMPORTANT ARCHITECTURE NOTE: unlike every other tool in this project, these
 do NOT go through docker_sandbox.run_cmd / the Linux sandbox. The emulator
-runs NATIVELY on the Windows host, so these tools shell out directly to host
-executables via subprocess, and read/write files directly on the host
+runs NATIVELY on the host machine (macOS / Linux / Windows), so these tools
+shell out directly to host executables via subprocess (resolved with
+OS-appropriate names, e.g. `adb` vs `adb.exe`), and read/write files directly
+on the host
 filesystem via tools.common.resolve_workspace_path (which maps a
 '/workspace/...'-style path onto the same bind-mounted directory the Linux
 sandbox sees at /workspace — so a screenshot saved here is still reachable by
@@ -95,6 +97,20 @@ _AUTOCAP_SESSION = "auto"
 _DEFAULT_SYSTEM_IMAGE = None   # (removed) AVD-only; kept as a no-op for old callers
 _DEFAULT_QEMU_MODE = "playable"
 
+# Dev base (arm devkit disk) layout — MUST match the engine (omnidroid manager
+# constants DEVKIT_MOUNT / DEVKIT_WORK). The dev environment is now base_arm PLUS
+# an extra vdc disk (base_arm_devkit.qcow2) carrying the android-arm64 frida-server,
+# Magisk, and the omni-* scripts. The engine mounts vdc read-only at DEVKIT_MOUNT
+# and stages the exec-capable copy at DEVKIT_WORK on start; root is Magisk (`su`),
+# NOT `adb root` (the LineageOS arm base is a 'user' build). See DEV-BASE.md.
+_DEVKIT_MOUNT = "/mnt/omni-devkit"
+_DEVKIT_WORK = "/data/local/tmp/omni-devkit"
+_DEVKIT_MANIFEST = _DEVKIT_WORK + "/manifest.json"
+_DEFAULT_FRIDA_PORT = 27142
+# frida-server on the dev base is android-arm64 (native — no libndk), so the host
+# binding must match this pinned version.
+_DEV_FRIDA_VERSION = "17.15.4"
+
 
 def _coerce_backend(backend):
     """omnidroid (qemu) is the only backend. Any other value (a legacy 'avd' /
@@ -105,7 +121,7 @@ def _coerce_backend(backend):
               f"(qemu) — the SDK emulator/AVD path was removed.", file=sys.stderr)
     return "qemu"
 
-# omnidroid's account-name rule (see tools/omnidroid/HOWTO.md §5): the name must
+# omnidroid's account-name rule (see omnidroid/HOWTO.md §5): the name must
 # match [A-Za-z0-9_-]+ exactly (no dots, no globs, no paths). Bounded to 64 to
 # stay well inside filesystem limits.
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -119,7 +135,7 @@ def _is_batch(path):
     return bool(path) and path.lower().endswith((".bat", ".cmd"))
 
 
-def _run(cmd_list, timeout=30, input_text=None):
+def _run(cmd_list, timeout=30, input_text=None, env=None):
     """Runs a host executable directly (no shell), handling .bat files
     (avdmanager/sdkmanager on Windows) which need a 'cmd /c' wrapper."""
     if cmd_list and _is_batch(cmd_list[0]):
@@ -127,7 +143,7 @@ def _run(cmd_list, timeout=30, input_text=None):
     try:
         proc = subprocess.run(
             cmd_list, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=timeout, input=input_text,
+            errors="replace", timeout=timeout, input=input_text, env=env,
         )
         return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     except subprocess.TimeoutExpired:
@@ -155,7 +171,7 @@ def _validate_session_id(sid):
 # omnidroid qemu-manager.exe control helpers (DEFAULT backend)
 # --------------------------------------------------------------------------
 #
-# qemu-manager is the frozen omnidroid engine (tools/omnidroid/HOWTO.md documents
+# qemu-manager is the omnidroid engine (omnidroid/HOWTO.md documents
 # it). The lifecycle commands we use (create/start/stop/remove/list) accept a
 # `--json` flag that prints exactly one machine-readable JSON line on stdout with
 # all human progress on stderr; errors become {"ok": false, "error": ...} with
@@ -180,19 +196,21 @@ def _engine_project_dir(path):
 def _find_qemu_manager():
     """Locate the omnidroid engine. Returns (engine_path, project_dir).
 
-    Resolution order — the agent is SELF-CONTAINED: it funnels through its own
-    bundled omnidroid service (tools/omnidroid), which is rebuilt from the
-    canonical engine (contract-compliant, clean config -> OmniImages, own ./qemu).
+    Resolution order — prefer the CANONICAL sibling checkout so the agent always
+    drives the current engine (thin username-keyed instances, accounts.json,
+    the RGBX colour fix, ...). A frozen bundle is only a fallback for a shipped
+    agent that has no sibling checkout.
       1. QEMU_MANAGER_PATH env override (a .py or an exe) — explicit override.
-      2. **Bundled `tools/omnidroid/omnidroid.exe`** — the agent's own engine.
-      3. Canonical sibling checkout `<Omni Apps>/omnidroid/manager/omni.py` —
-         dev fallback when the bundle isn't present (run with this interpreter).
-      4. Root `qemu-manager.exe`, then PATH.
-    Staleness is caught LOUDLY, never silently: _ensure_qemu_running logs which
-    engine it drives, the version handshake flags a contract mismatch, and the
-    doctor preflight FAILS FAST on a missing base (no download-wait loop). When
-    the engine changes, rebuild the bundle (build-exe.ps1 -> copy exe + config +
-    qemu into tools/omnidroid) — see HANDOFF "bundled engine rebuild".
+      2. **Canonical `<Omni Apps>/omnidroid/manager/omni.py`** — the live engine
+         (run with this interpreter). This is what a dev machine uses.
+      3. Bundled `tools/omnidroid/omnidroid(.exe)` — self-contained fallback for
+         a shipped agent with no canonical checkout beside it.
+      4. Root `qemu-manager(.exe)`, then PATH.
+    Staleness is caught LOUDLY: _ensure_qemu_running logs which engine it drives
+    and the version handshake flags a contract mismatch. A stale bundle can no
+    longer SHADOW the canonical engine — that was the bug where the agent kept
+    using an old build (pre-thin-instances) even though a current checkout sat
+    right beside it.
     """
     is_nt = os.name == "nt"
     tools_dir = os.path.dirname(os.path.abspath(__file__))
@@ -202,11 +220,11 @@ def _find_qemu_manager():
     env = os.environ.get("QEMU_MANAGER_PATH")
     if env:
         candidates.append(env)
-    # The agent's own bundled service engine (self-contained).
+    # Canonical checkout beside omni-agent — the live, current engine. Preferred.
+    candidates.append(os.path.join(workspace_root, "omnidroid", "manager", "omni.py"))
+    # Self-contained fallback: the agent's own bundled service engine.
     candidates.append(os.path.join(tools_dir, "omnidroid",
                                    "omnidroid.exe" if is_nt else "omnidroid"))
-    # Dev fallback: the canonical omnidroid checkout beside omni-agent.
-    candidates.append(os.path.join(workspace_root, "omnidroid", "manager", "omni.py"))
     candidates.append(os.path.join(repo_root,
                                    "qemu-manager.exe" if is_nt else "qemu-manager"))
     for cand in candidates:
@@ -253,6 +271,18 @@ def _parse_json_object(text):
     return None
 
 
+def _omni_env():
+    """Environment for every omnidroid call the AGENT makes.
+
+    The engine hides its dev base (frida + Magisk root) from `bases`/`use-base`/
+    `create` unless OMNI_DEV_MODE=1, so that the shipped product cannot list or
+    switch to it — customers must not reach a rooted image. omni-agent is the
+    devtool that base exists for, so it is the one caller that opts in."""
+    env = dict(os.environ)
+    env["OMNI_DEV_MODE"] = "1"
+    return env
+
+
 def _run_qemu(args, timeout=60):
     """Run an omnidroid subcommand. Returns (parsed_json_or_None, raw_result,
     project_dir). The frozen exe self-locates its project dir (its own folder),
@@ -262,7 +292,7 @@ def _run_qemu(args, timeout=60):
     checkout's manager/omni.py), it is run with the current interpreter."""
     exe, project_dir = _find_qemu_manager()
     prefix = [sys.executable, exe] if exe.endswith(".py") else [exe]
-    res = _run(prefix + list(args), timeout=timeout)
+    res = _run(prefix + list(args), timeout=timeout, env=_omni_env())
     parsed = _parse_json_object(res.get("stdout"))
     return parsed, res, project_dir
 
@@ -384,10 +414,11 @@ def _qemu_readiness_check():
 
 def _dev_base_enabled(dev=None):
     """Whether new omnidroid accounts should be created from the DEV base
-    (base-dev.qcow2: frida + root/frida-hiding devkit). True when the caller
-    passes dev=True OR the OMNI_USE_DEV_BASE env var is truthy. omni-agent is a
-    dev-only dependency, so it is the only thing that ever selects this base;
-    the shipped bases (base_x86/base_arm) never carry the devkit."""
+    (base_arm + the base_arm_devkit.qcow2 extra disk: frida + Magisk + omni
+    tools). True when the caller passes dev=True OR the OMNI_USE_DEV_BASE env var
+    is truthy. omni-agent is a dev-only dependency, so it is the only thing that
+    ever selects this base; the shipped bases (base_x86/base_arm) never carry the
+    devkit disk."""
     if dev is not None:
         return _truthy(dev)
     return _truthy(os.environ.get("OMNI_USE_DEV_BASE", ""))
@@ -396,8 +427,9 @@ def _dev_base_enabled(dev=None):
 def _qemu_create(name, boot_timeout, log, dev=False):
     """Create disks for a fresh account (no boot — the first `start` provisions).
     Returns None on success or an {"error": ...} dict on failure. When dev=True
-    the account is pinned to the 'dev' base (`create --base dev`) so it boots the
-    frida/root-hiding image instead of the production x86 base."""
+    the account is pinned to the 'dev' base (`create --base dev`) so it boots
+    base_arm with the frida/Magisk devkit disk attached instead of a production
+    base."""
     tag = " on the DEV base (frida+root-hiding)" if dev else ""
     log.append(f"Creating account '{name}'{tag} (disks only; first boot provisions)...")
     argv = ["create", name, "--no-provision", "--json"]
@@ -453,9 +485,10 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
         return {"error": err}
     log = []
     if dev:
-        log.append("DEV BASE selected: new accounts boot base-dev.qcow2 "
-                   "(frida + root/frida-hiding devkit). Start frida with "
-                   "ensure_frida_server; hide it with hide_root_from_app.")
+        log.append("DEV BASE selected: new accounts boot base_arm with the "
+                   "devkit disk (vdc: frida + Magisk + omni tools). Start frida "
+                   "with ensure_frida_server; hide it with hide_root_from_app. "
+                   "(Root needs a Magisk-patched boot: omni build-dev-base --patch-boot.)")
         # Point the engine's own boot-time auto-start (and our later ensure) at
         # the workspace so screenshots are captured automatically and readably,
         # with no explicit start call needed. Set BEFORE `start` runs.
@@ -655,7 +688,7 @@ def _resolve_serial(backend, device_name=None):
         "ram_mb": "integer (optional — override guest RAM in MB, passed as --mem; overrides the mode's RAM. Engine defaults to the mode's tier if omitted)",
         "cpus": "integer (optional — IGNORED (vCPU count is set by 'mode'))",
         "headless": "boolean (IGNORED — omnidroid instances are always headless; view over the instance's localhost VNC port)",
-        "dev": "boolean (optional, default false — boot the DEV base (base-dev.qcow2): a remaster of the x86 base with frida-server + root/frida-hiding tools baked in, for reverse-engineering/runtime-hooking work. Requires `omni build-dev-base` to have produced the dev base. Also enablable globally via the OMNI_USE_DEV_BASE env var. Only affects a FRESH create (base is fixed per account); production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)"
+        "dev": "boolean (optional, default false — boot the DEV base: base_arm plus the extra devkit disk (vdc = base_arm_devkit.qcow2) carrying an android-arm64 frida-server + Magisk + the omni-* tools, for reverse-engineering/runtime-hooking work. Requires `omni build-dev-base` to have produced the devkit disk (and `--patch-boot` to root it, so frida can attach). Also enablable globally via the OMNI_USE_DEV_BASE env var. Only affects a FRESH create (base is fixed per account); production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)"
     },
     output="A log of what happened (account creation/reset if needed, boot wait progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
     when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly — it always targets the same omnidroid account and (by default) resets it to a clean state each time. Fully self-contained (no Android Studio / SDK emulator / LDPlayer). Pass dev=true (or set OMNI_USE_DEV_BASE) to boot the frida/root-hiding dev base."
@@ -1221,7 +1254,7 @@ def _capture_via_engine(name, session_dir, duration_seconds, package_name,
         "package_name": "string (optional but RECOMMENDED — the app package, e.g. 'com.example.app'. Enables process-lifecycle tracking so a crash/close is distinguished from a black screen; also scopes crash detection to THIS app so an unrelated system crash isn't misattributed)",
         "duration_seconds": "number (optional, default 20 — how long to watch the screen)",
         "interval_seconds": "number (optional, default 1.0 — adb-FALLBACK sampling period only; ignored by the engine path, which is event-driven at display rate)",
-        "change_threshold": "number (optional, default 14 — mean per-pixel delta (0-255) vs the last KEPT keyframe to count as a change; a sensitivity backstop)",
+        "change_threshold": "number (optional, default 4 — mean per-pixel delta (0-255) vs the last KEPT keyframe to count as a change; a sensitivity backstop)",
         "black_threshold": "number (optional, default 10 — a frame with average brightness below this is flagged black_screen)",
         "sample_scale_w": "integer (optional, default 160 — downscale width for change detection; does NOT affect the SAVED keyframe PNGs, which are full-resolution)",
         "capture_logcat": "boolean (optional, default true — capture logcat for the window; the engine path always captures it)",
@@ -1234,7 +1267,7 @@ def _capture_via_engine(name, session_dir, duration_seconds, package_name,
     when_to_use="Call this after launch_app_on_emulator to watch what happens as the app starts/you interact with it. Pass package_name so it can tell a crash from a black screen. With auto_analyze on (default) it also describes each significant frame with the vision model, so you can reason over what actually rendered before the next step."
 )
 def record_and_capture_keyframes(session_name, package_name=None, duration_seconds=20, interval_seconds=1.0,
-                                  change_threshold=14, black_threshold=10, sample_scale_w=160, capture_logcat=True,
+                                  change_threshold=4, black_threshold=10, sample_scale_w=160, capture_logcat=True,
                                   auto_analyze=True, vision_max_frames=16,
                                   backend=_DEFAULT_BACKEND, device_name=None):
     adb, serial_or_err = _resolve_serial(backend, device_name)
@@ -1256,10 +1289,11 @@ def record_and_capture_keyframes(session_name, package_name=None, duration_secon
         return {"error": "duration_seconds/interval_seconds/change_threshold/black_threshold/sample_scale_w must be numeric."}
 
     device_name = device_name or _default_device_name()
-    # Change-detection percentage: derived from change_threshold's sensitivity so
-    # a caller who tuned that still influences both paths (engine expresses the
-    # scene threshold as % of changed pixels; 8% is the shared default).
-    change_percent = 8.0
+    # Scene threshold as % of changed pixels — the engine's units. 2% is the
+    # shared default across both capture paths: measured, it sits just above the
+    # ~1% noise floor of an animating spinner/progress bar while still catching a
+    # small popup (see omnidroid/manager/capture.py's DEFAULT_* rationale).
+    change_percent = 2.0
 
     # --- Preferred path: engine millisecond-precise VNC capture --------------
     provider = "adb_fallback"
@@ -1426,6 +1460,28 @@ def read_auto_screenshots(session_name=_AUTOCAP_SESSION, since_index=0):
     return {"stdout": "\n".join(lines)}
 
 
+def _vision_analyze_session(session_dir, backend="auto", ollama_model="llava", prompt=None, max_frames=40):
+    """Build the vision cfg (pointed at the configured VISION model) and describe
+    the session's keyframes. Shared by analyze_keyframes and the capture tool's
+    auto_analyze path. Returns the analyze_session summary string (or raises)."""
+    # Route the "api" vision backend through the configured VISION (image-to-text)
+    # model — a separate model from the main text LLM (the text model, e.g.
+    # DeepSeek, usually can't read images). Falls back to the text endpoint only if
+    # no vision model is set, then to local Ollama.
+    _vis = get_vision_endpoint_config() or get_openai_endpoint_config()
+    cfg = {
+        "backend": backend,
+        "prompt": prompt,
+        "max_frames": max_frames,
+        "cline_api_url": _vis["url"],
+        "cline_api_key": _vis["key"],
+        "cline_model": _vis["model"],
+        "ollama_url": "http://localhost:11434",
+        "ollama_model": ollama_model,
+    }
+    return analyze_session(session_dir, cfg)
+
+
 @registry.register(
     name="analyze_keyframes",
     description=(
@@ -1451,28 +1507,6 @@ def read_auto_screenshots(session_name=_AUTOCAP_SESSION, since_index=0):
     output="For each keyframe: which backend actually answered ('api' or 'ollama') and its description, or an error if both backends failed for that frame. Ends with an overall 'Analyzed N/M keyframe(s). Backend used: ...' summary line (noting any frames skipped under the budget).",
     when_to_use="Call this after record_and_capture_keyframes, before generate_test_report, so the report includes descriptions instead of just raw image links."
 )
-def _vision_analyze_session(session_dir, backend="auto", ollama_model="llava", prompt=None, max_frames=40):
-    """Build the vision cfg (pointed at the configured VISION model) and describe
-    the session's keyframes. Shared by analyze_keyframes and the capture tool's
-    auto_analyze path. Returns the analyze_session summary string (or raises)."""
-    # Route the "api" vision backend through the configured VISION (image-to-text)
-    # model — a separate model from the main text LLM (the text model, e.g.
-    # DeepSeek, usually can't read images). Falls back to the text endpoint only if
-    # no vision model is set, then to local Ollama.
-    _vis = get_vision_endpoint_config() or get_openai_endpoint_config()
-    cfg = {
-        "backend": backend,
-        "prompt": prompt,
-        "max_frames": max_frames,
-        "cline_api_url": _vis["url"],
-        "cline_api_key": _vis["key"],
-        "cline_model": _vis["model"],
-        "ollama_url": "http://localhost:11434",
-        "ollama_model": ollama_model,
-    }
-    return analyze_session(session_dir, cfg)
-
-
 def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt=None, max_frames=40):
     try:
         session_dir = resolve_workspace_path(f"screenshots/{session_name}")
@@ -1664,7 +1698,13 @@ def _verify_fresh_instance(backend=_DEFAULT_BACKEND, device_name=None):
         "FRESHNESS GUARANTEE: every session runs on a FRESH instance — the account is removed and "
         "recreated from the immutable base (reset is FORCED true; passing reset=false is ignored), "
         "and after boot the harness VERIFIES no third-party packages are installed (uninstalling any "
-        "leftover) before the APK under test goes on. Nothing from a previous run can be present."
+        "leftover) before the APK under test goes on. Nothing from a previous run can be present. "
+        "NOT for Roblox: this pipeline has NO concept of accounts, cookies, or the session bootstrap — "
+        "it does a plain install + launch_app_on_emulator (opens the app's own home/menu screen). Given a "
+        "Roblox cookie/place id, it will silently land on Roblox's own login screen while still reporting "
+        "install+launch as successful, on a throwaway 'omniagent'-named instance instead of one named for "
+        "the account. For any Roblox cookie-login/join scenario use launch_roblox_build (or "
+        "login_roblox_account + play_roblox) instead — never this."
     ),
     params_schema={
         "apk_path": "string (path to the .apk to test, relative to /workspace)",
@@ -1683,7 +1723,7 @@ def _verify_fresh_instance(backend=_DEFAULT_BACKEND, device_name=None):
         "reset": "boolean (IGNORED — always coerced to true: a test session ALWAYS starts from a freshly recreated instance and verifies nothing is installed on it. Use the individual tools (ensure_emulator_running reset=false + install/launch) when you deliberately want to reuse a provisioned instance for fast iteration)",
         "boot_timeout": "integer (optional, default 300 seconds)",
         "abi": "string (optional, qemu backend — force the install ABI. Default exercises the intended path per account arch (x86 -> arm64-v8a translation, arm -> native). 'x86_64' on an x86 account deliberately trips the ABI-contract guard and FAILS the session.)",
-        "dev": "boolean (optional, default false — run the session on the DEV base (base-dev.qcow2: frida + root/frida-hiding tools) instead of the production x86 base. Also enablable via OMNI_USE_DEV_BASE. Use when the APK under test has frida/root detection and you need runtime hooking; call ensure_frida_server + hide_root_from_app between steps via the individual tools for full control.)"
+        "dev": "boolean (optional, default false — run the session on the DEV base (base_arm + the vdc devkit disk: android-arm64 frida-server + Magisk + omni tools) instead of a production base. Also enablable via OMNI_USE_DEV_BASE. Use when the APK under test has frida/root detection and you need runtime hooking; call ensure_frida_server + hide_root_from_app between steps via the individual tools for full control.)"
     },
     output="A summary of each pipeline stage plus the path to the generated Markdown report — read that report with read_file_chunk for the full picture (keyframe descriptions + logcat). If the ABI-safe install fails/violates the contract, or the fresh-instance guarantee cannot be verified after boot, the session ABORTS with a FAILED summary and no pass is emitted.",
     when_to_use="Use this as the default way to test a freshly built/signed APK end-to-end. Fall back to the individual tools (ensure_emulator_running, install_apk_on_emulator, etc.) if you need to interleave manual adb_shell actions between steps, or re-run just one stage."
@@ -1807,52 +1847,155 @@ def stop_emulator(backend=_DEFAULT_BACKEND, device_name=None, purge=False):
 
 
 # --------------------------------------------------------------------------
-# DEV BASE (base-dev.qcow2) runtime helpers: frida + root/frida hiding. These
-# only work on an account booted from the dev base (ensure_emulator_running
-# dev=true / OMNI_USE_DEV_BASE). On a production account the devkit binaries are
-# absent and these return a clear "not a dev base" error.
+# DEV BASE runtime helpers: frida + root/frida/Magisk hiding. The dev base is
+# base_arm + the vdc devkit disk (base_arm_devkit.qcow2); root is Magisk (`su`)
+# from a patched boot. These only work on an account booted from the dev base
+# (ensure_emulator_running dev=true / OMNI_USE_DEV_BASE) whose boot is rooted. On
+# a production or un-rooted account they return a clear, specific error.
 # --------------------------------------------------------------------------
 
+# Magisk's su on this all-read-only LineageOS lives in Magisk's own tmpfs, NOT
+# in $PATH (a bare `su` is "inaccessible or not found"), so probe the known spots.
+# The dev /data template pre-grants shell (Forever), so a granted su returns uid 0
+# with no prompt.
+_SU_CANDIDATES = ("/debug_ramdisk/su", "/sbin/su", "su")
+_SU_CACHE = {}
+
+
+def _resolve_su(adb, serial):
+    """Working Magisk su path in the guest, or None if root is unavailable. Cached
+    per serial (the path is stable for a boot)."""
+    if serial in _SU_CACHE:
+        return _SU_CACHE[serial]
+    for cand in _SU_CANDIDATES:
+        # Must go through `sh -c` (matches _ensure_devkit_activated's own
+        # invocation below): MagiskSU's getopt permutes argv, so a bare
+        # trailing `-u` (as in `su 0 id -u`) is misread as an unrecognized su
+        # OPTION (usage/exit 2) instead of being passed to `id`.
+        r = _run([adb, "-s", serial, "shell", cand, "0", "sh", "-c", "id -u"],
+                 timeout=15)
+        if (r.get("stdout") or "").strip().splitlines()[-1:] == ["0"]:
+            _SU_CACHE[serial] = cand
+            return cand
+    return None
+
+
+def _su_available(adb, serial):
+    """True if Magisk root (`su`) works. The arm dev base is a LineageOS 'user'
+    build: `adb root` is disabled, so root comes ONLY from the Magisk-patched
+    boot. Returns False on an un-rooted (un-patched/ungranted) dev boot."""
+    return _resolve_su(adb, serial) is not None
+
+
+def _su_sh(adb, serial, script, timeout=45):
+    """Run a shell snippet as root via Magisk su. Returns the _run dict (or an
+    error dict if root is unavailable)."""
+    su = _resolve_su(adb, serial)
+    if not su:
+        return {"returncode": 1, "stdout": "", "stderr": "Magisk su unavailable"}
+    return _run([adb, "-s", serial, "shell", su, "0", "sh", "-c", script],
+                timeout=timeout)
+
+
+def _ensure_devkit_activated(adb, serial):
+    """Idempotently mount the vdc devkit disk (read-only) and stage the omni-*
+    tools + manifest into the exec-capable work dir. Mirrors the engine's
+    _devkit_activate so frida tools work even if the account was started out of
+    band. Needs Magisk root. Returns True if the manifest is present afterwards."""
+    if not _su_available(adb, serial):
+        return False
+    script = (
+        f"mkdir -p {_DEVKIT_MOUNT} {_DEVKIT_WORK}; "
+        f"{{ grep -q ' {_DEVKIT_MOUNT} ' /proc/mounts || "
+        f"mount -o ro /dev/block/vdc {_DEVKIT_MOUNT}; }}; "
+        f"cp {_DEVKIT_MOUNT}/omni-* {_DEVKIT_WORK}/ 2>/dev/null; "
+        f"cp {_DEVKIT_MOUNT}/manifest.json {_DEVKIT_WORK}/ 2>/dev/null; "
+        f"chmod 755 {_DEVKIT_WORK}/omni-* 2>/dev/null; "
+        f"[ -f {_DEVKIT_WORK}/manifest.json ] && echo OK || echo NO"
+    )
+    r = _su_sh(adb, serial, script)
+    return "OK" in (r.get("stdout") or "")
+
+
 def _dev_manifest(adb, serial):
-    """Read /system/etc/omni-devkit/manifest.json from the guest -> dict, or
-    None if it isn't there (i.e. not a dev base)."""
-    r = _run([adb, "-s", serial, "shell", "cat",
-              "/system/etc/omni-devkit/manifest.json"], timeout=15)
-    txt = (r.get("stdout") or "").strip()
-    if not txt or "No such file" in txt or r.get("returncode", 1) != 0:
-        return None
-    try:
-        return json.loads(txt)
-    except ValueError:
-        return None
+    """Return the dev devkit manifest dict, or None if this is not a dev base.
+    The manifest lives on the vdc devkit disk (arm dev base); it is read from the
+    activated work copy, falling back to the read-only mount. If the account is a
+    dev account but not yet activated (root present), activate it first."""
+    for path in (_DEVKIT_MANIFEST, f"{_DEVKIT_MOUNT}/manifest.json"):
+        r = _run([adb, "-s", serial, "shell", "cat", path], timeout=15)
+        txt = (r.get("stdout") or "").strip()
+        if txt and "No such file" not in txt and r.get("returncode", 1) == 0:
+            try:
+                return json.loads(txt)
+            except ValueError:
+                pass
+    # Not staged yet — try to activate (needs Magisk root), then re-read.
+    if _ensure_devkit_activated(adb, serial):
+        r = _run([adb, "-s", serial, "shell", "cat", _DEVKIT_MANIFEST], timeout=15)
+        txt = (r.get("stdout") or "").strip()
+        if txt and "No such file" not in txt:
+            try:
+                return json.loads(txt)
+            except ValueError:
+                return None
+    return None
+
+
+def _is_dev_account(adb, serial):
+    """Root-free dev-base signal: the devkit disk is attached as /dev/block/vdc.
+    True even before activation (used to give a precise 'dev but not rooted'
+    message instead of a generic 'not a dev base')."""
+    r = _run([adb, "-s", serial, "shell", "ls", "/dev/block/vdc"], timeout=10)
+    return "/dev/block/vdc" in (r.get("stdout") or "") and \
+        "No such" not in (r.get("stdout") or "")
 
 
 def _adb_root(adb, serial):
-    """Restart adbd as root and reconnect (dev base is KernelSU/userdebug so
-    this succeeds). Best-effort; returns the root command's output."""
-    r = _run([adb, "-s", serial, "root"], timeout=20)
-    time.sleep(2)
-    _run([adb, "connect", serial], timeout=10)
-    return (r.get("stdout") or r.get("stderr") or "").strip()
+    """Ensure root is available for the dev toolkit. The arm dev base roots via
+    Magisk (`su`), NOT `adb root` (it is a 'user' build). This activates the
+    devkit (mount vdc + stage tools) and returns a short status string. Kept
+    under this name for the frida_tools import."""
+    if not _su_available(adb, serial):
+        return ("no Magisk root (su unavailable) — the dev boot is not patched; "
+                "run `omni build-dev-base --patch-boot`")
+    _ensure_devkit_activated(adb, serial)
+    return "Magisk root OK; devkit activated"
+
+
+def _not_dev_base_error(adb, serial, tool):
+    """Precise error for a frida/hide call on a non-usable account: distinguish
+    'not a dev account' from 'dev account but not rooted (boot not patched)'."""
+    if _is_dev_account(adb, serial):
+        return {"error": (
+            f"This is a DEV account (the vdc devkit disk is attached) but it is "
+            f"NOT ROOTED — Magisk `su` is unavailable, so {tool} cannot run. The "
+            f"dev system boot is not Magisk-patched. Root it once with: "
+            f"`omni build-dev-base --patch-boot` (then recreate the account).")}
+    return {"error": (
+        f"This account is not a DEV base (no devkit disk / manifest). Boot it with "
+        f"ensure_emulator_running(dev=true) (or set OMNI_USE_DEV_BASE=1), and make "
+        f"sure `omni build-dev-base` has produced base_arm_devkit.qcow2.")}
 
 
 @registry.register(
     name="ensure_frida_server",
     description=(
-        "Starts the baked frida-server on a DEV-BASE account and sets up a host->guest port forward so "
+        "Starts the frida-server from the DEV-BASE devkit disk and sets up a host->guest port forward so "
         "you can attach with the host frida tools. Only works on an account booted from the dev base "
-        "(ensure_emulator_running dev=true, or OMNI_USE_DEV_BASE=1). It runs `adb root`, launches the "
-        "hidden launcher `omni-fridad` in the guest (frida-server on a CUSTOM loopback port with a "
-        "randomized process name — not the well-known 27042/'frida-server', so a naive port/name scan "
-        "misses it), then `adb forward`s a host port onto that guest port. Returns the host endpoint to "
-        "pass to frida as `-H 127.0.0.1:<host_port>` (the guest port is loopback-only inside the VM, so "
-        "the forward is required). Idempotent: re-running reuses the running server."
+        "(ensure_emulator_running dev=true, or OMNI_USE_DEV_BASE=1) whose boot is Magisk-rooted. It uses "
+        "Magisk `su` (the arm base is a 'user' build — `adb root` is unavailable), launches the hidden "
+        "launcher `omni-fridad` (android-arm64 frida-server on a CUSTOM loopback port with a randomized "
+        "process name — not the well-known 27042/'frida-server', so a naive port/name scan misses it), "
+        "then `adb forward`s a host port onto that guest port. Returns the host endpoint to pass to frida "
+        "as `-H 127.0.0.1:<host_port>` (the guest port is loopback-only inside the VM, so the forward is "
+        "required). Idempotent: re-running reuses the running server."
     ),
     params_schema={
         "device_name": "string (optional — the omnidroid dev account name; must match the one ensure_emulator_running(dev=true) created, default 'omniagent')",
         "backend": "string (optional, default 'qemu' — omnidroid only)"
     },
-    output="The host frida endpoint ('127.0.0.1:<host_port>') plus the guest port and server status, or an error if the account isn't a dev base (boot with dev=true / build the dev base with `omni build-dev-base`).",
+    output="The host frida endpoint ('127.0.0.1:<host_port>') plus the guest port and server status, or an error if the account isn't a dev base / isn't rooted (build the dev base + `--patch-boot` with `omni build-dev-base`).",
     when_to_use="Call after ensure_emulator_running(dev=true) + BOOT_OK, before attaching frida/objection to hook the app under test. Pair with hide_root_from_app to also hide root/frida from the target's detection."
 )
 def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
@@ -1860,16 +2003,13 @@ def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
     if adb is None:
         return serial_or_err
     serial = serial_or_err
-    _adb_root(adb, serial)
     manifest = _dev_manifest(adb, serial)
     if manifest is None:
-        return {"error": (
-            "This account is not a DEV base (no /system/etc/omni-devkit/manifest.json). "
-            "Boot it with ensure_emulator_running(dev=true) (or set OMNI_USE_DEV_BASE=1), and make "
-            "sure `omni build-dev-base` has produced base-dev.qcow2.")}
-    guest_port = int(manifest.get("frida_port") or 27142)
-    # Start the hidden frida-server (idempotent — omni-fridad no-ops if already up).
-    start = _run([adb, "-s", serial, "shell", "omni-fridad"], timeout=40)
+        return _not_dev_base_error(adb, serial, "frida-server")
+    guest_port = int(manifest.get("frida_port") or _DEFAULT_FRIDA_PORT)
+    # Start the hidden frida-server via Magisk su (idempotent — omni-fridad
+    # no-ops if already up). Runs from the devkit work dir.
+    start = _su_sh(adb, serial, f"{_DEVKIT_WORK}/omni-fridad", timeout=40)
     start_out = (start.get("stdout") or start.get("stderr") or "").strip()
     # Forward a host port onto the guest's loopback frida port. tcp:0 asks adb to
     # allocate a free host port and print it.
@@ -1880,7 +2020,7 @@ def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
         host_port = str(guest_port)
         _run([adb, "-s", serial, "forward", f"tcp:{host_port}", f"tcp:{guest_port}"], timeout=15)
     return {"stdout": (
-        f"frida-server up on dev account '{device_name or _default_device_name()}'.\n"
+        f"frida-server (arm64) up on dev account '{device_name or _default_device_name()}'.\n"
         f"  guest port : 127.0.0.1:{guest_port} (loopback in the VM, hidden name)\n"
         f"  host attach: frida -H 127.0.0.1:{host_port}   (adb-forwarded)\n"
         f"  frida ver  : {manifest.get('frida_version')}\n"
@@ -1891,21 +2031,20 @@ def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
 @registry.register(
     name="hide_root_from_app",
     description=(
-        "Best-effort hiding of ROOT and FRIDA from a target app's detection on a DEV-BASE account, via "
-        "the baked `omni-hide` helper. It resetprop-spoofs the classic root/emulator 'tells' (build "
-        "tags -> release-keys, verified-boot state -> green/locked, etc. — using the baked Magisk "
-        "resetprop applet) and, for the given package, requests KernelSU umount/denylist hiding where a "
-        "KernelSU control path exists. NOTE: ro.debuggable is deliberately left =1 (the omnidroid + "
-        "agent tooling rely on `adb root`), so a detector keying specifically on ro.debuggable still "
-        "sees it; and stock frida's worker thread names remain unless a patched frida-server-patched "
-        "was dropped into the base. Run this AFTER ensure_frida_server and BEFORE launching the target."
+        "Best-effort hiding of ROOT, MAGISK, and FRIDA from a target app's detection on a DEV-BASE "
+        "account, via the devkit `omni-hide` helper. It adds the package to the Magisk DenyList (Magisk "
+        "unmounts its modifications + hides su/daemon for that app; stronger with the Shamiko module) and "
+        "resetprop-spoofs the classic root/verified-boot 'tells' (build tags -> release-keys, "
+        "verifiedbootstate -> green/locked, ro.debuggable -> 0, etc.) using Magisk's resetprop applet. "
+        "Requires the dev boot to be Magisk-rooted. Run this AFTER ensure_frida_server and BEFORE "
+        "launching the target. One-time Zygisk/DenyList enablement is done by `omni-magisk-setup`."
     ),
     params_schema={
-        "package_name": "string (optional — the target app package to hide root from; enables the per-app KernelSU denylist step. Omit to only apply the global prop spoofs.)",
+        "package_name": "string (optional — the target app package to hide root/Magisk from; enables the per-app Magisk DenyList step. Omit to only apply the global prop spoofs.)",
         "device_name": "string (optional — the omnidroid dev account name, default 'omniagent')",
         "backend": "string (optional, default 'qemu' — omnidroid only)"
     },
-    output="What omni-hide actually applied (resetprop keys set, KernelSU per-app result, frida sanity), or an error if the account isn't a dev base.",
+    output="What omni-hide actually applied (resetprop keys set, Magisk DenyList result, frida sanity), or an error if the account isn't a dev base / isn't rooted.",
     when_to_use="Use when the APK under test has root/frida detection: call ensure_emulator_running(dev=true) -> ensure_frida_server -> hide_root_from_app('<pkg>') -> install/launch, then hook with frida."
 )
 def hide_root_from_app(package_name=None, device_name=None, backend=_DEFAULT_BACKEND):
@@ -1913,14 +2052,11 @@ def hide_root_from_app(package_name=None, device_name=None, backend=_DEFAULT_BAC
     if adb is None:
         return serial_or_err
     serial = serial_or_err
-    _adb_root(adb, serial)
     if _dev_manifest(adb, serial) is None:
-        return {"error": (
-            "This account is not a DEV base (omni-hide is absent). Boot with "
-            "ensure_emulator_running(dev=true) and build base-dev with `omni build-dev-base`.")}
-    args = [adb, "-s", serial, "shell", "omni-hide"]
+        return _not_dev_base_error(adb, serial, "omni-hide")
+    cmd = f"{_DEVKIT_WORK}/omni-hide"
     if package_name:
-        args.append(str(package_name))
-    r = _run(args, timeout=60)
+        cmd += f" {shlex.quote(str(package_name))}"
+    r = _su_sh(adb, serial, cmd, timeout=60)
     out = (r.get("stdout") or r.get("stderr") or "").strip()
     return {"stdout": out or "omni-hide ran (no output)."}

@@ -259,6 +259,12 @@ def lookup(tool_name, target_rel, extra=None, restore_dir=None):
             return None  # meta without its tree — treat as a miss
         if not _restore_tree(tar_path, restore_dir):
             return None  # restore failed -> miss -> caller runs the real command
+        # Guard against a degenerate/empty cached tree being served as a "hit"
+        # (which would look like the tool ran but produced nothing): if the
+        # restored dir has no contents, treat it as a miss so the real tool runs.
+        host = _host_path(restore_dir)
+        if not host or not os.path.isdir(host) or not os.listdir(host):
+            return None
 
     out = dict(result)
     label = os.path.basename(target_rel.rstrip("/\\")) or target_rel

@@ -88,6 +88,24 @@ function setStatus(id, val) {
 // content up to a max, then scrolls — so short prompts are compact and long
 // ones expand without a manual resize.
 const INPUT_MAX_H = 260;
+// ---------- light/dark theme toggle (header + start screen) ----------
+// The <head> boot script applies the saved choice before first paint; these
+// keep localStorage and the button icons (sun = switch to light, moon = switch
+// to dark) in sync with the <html class="light"> flag.
+const _THEME_SUN = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
+const _THEME_MOON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+function applyThemeIcons() {
+  const light = document.documentElement.classList.contains('light');
+  const icon = light ? _THEME_MOON : _THEME_SUN;
+  ['themeToggle', 'themeToggleStart'].forEach(id => { const b = $(id); if (b) b.innerHTML = icon; });
+}
+function toggleTheme() {
+  const el = document.documentElement;
+  el.classList.toggle('light');
+  try { localStorage.setItem('omni-theme', el.classList.contains('light') ? 'light' : 'dark'); } catch (e) {}
+  applyThemeIcons();
+}
+
 function autoGrowInput() {
   const ta = $('input');
   if (!ta) return;
@@ -538,30 +556,138 @@ function planOutcomeChip(outcome) {
   return `<span class="ml-2 rounded-full border px-2 py-0.5 text-[10px] ${color}">${escapeHtml(outcome.replace(/_/g, ' '))}</span>`;
 }
 
-// The persistent "which LLM is active right now" badge in the header. Updated
-// live by 'active_llm' events (the provider serving requests can change when the
-// fallback chain moves after an error) and populated on load via get_active_llm.
-function setActiveLlm(info) {
-  const label = $('activeLlmLabel');
-  const badge = $('activeLlmBadge');
-  if (!label || !badge) return;
-  if (!info || (!info.name && !info.label && !info.model)) {
-    label.textContent = 'LLM —';
-    badge.title = 'No LLM configured — click to add one';
-    return;
+// ---------- composer model selector + fallback indicator ----------
+// The dropdown under the input box picks the model requests START at. The engine
+// only ever falls back DOWNWARD from that selection (never to a model above it)
+// and returns to it as soon as it recovers. While a fallback is serving, the
+// dropdown shows the serving model with a small "fallback" badge — the user's
+// selection itself is unchanged.
+let _modelOptions = [];      // flattened rungs across providers, fallback order
+let _preferredModel = null;  // model id the user pinned (or the primary)
+let _activeModel = null;     // model that last answered (from 'active_llm' events)
+
+function _updateFallbackBadge() {
+  const sel = $('modelSelect');
+  const badge = $('fallbackBadge');
+  if (!sel || !badge) return;
+  const fellBack = !!(_activeModel && _preferredModel && _activeModel !== _preferredModel
+    && _modelOptions.some(m => m.model === _activeModel));
+  const shown = fellBack ? _activeModel
+    : (_preferredModel || (_modelOptions[0] && _modelOptions[0].model) || '');
+  if (shown && sel.value !== shown) sel.value = shown;
+  badge.classList.toggle('hidden', !fellBack);
+  if (fellBack) {
+    badge.title = `Fallback — "${_preferredModel}" is unavailable, temporarily using `
+      + `"${_activeModel}". Your selection is kept and retried automatically.`;
   }
-  const name = info.name || info.label || 'LLM';
-  label.textContent = name + (info.model ? ` · ${info.model}` : '');
-  const provider = (info.label && info.label !== name) ? ` (${info.label})` : '';
-  badge.title = `Active LLM: ${name}${provider}${info.model ? ' · ' + info.model : ''}`
-    + ' — click to open provider settings';
+  _syncModelTrigger();
 }
 
-async function refreshActiveLlm() {
+// Custom dropdown UI over the hidden #modelSelect. The native popup can't be
+// font-styled in the desktop webview, and a native select always sizes to its
+// widest option — the trigger button + menu here hug the selected name and use
+// the app's own font/colors. The select stays the source of truth: picking an
+// item sets its value and fires 'change' so onModelSelected runs unchanged.
+const _MODEL_CHECK_SVG = '<svg class="composer-model-check" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
+
+function _syncModelTrigger() {
+  const sel = $('modelSelect'), btn = $('modelSelectBtn'), label = $('modelSelectLabel');
+  if (!sel || !btn || !label) return;
+  const opt = sel.selectedOptions && sel.selectedOptions[0];
+  label.textContent = opt ? opt.textContent : (sel.value || '—');
+  btn.disabled = sel.disabled;
+  btn.title = (opt && opt.title) || '';
+}
+
+function _closeModelMenu() {
+  const menu = $('modelMenu');
+  if (!menu || menu.classList.contains('hidden')) return;
+  menu.classList.add('hidden');
+  $('modelSelectBtn').setAttribute('aria-expanded', 'false');
+}
+
+function _openModelMenu() {
+  const sel = $('modelSelect'), menu = $('modelMenu');
+  if (!sel || !menu || sel.disabled) return;
+  menu.innerHTML = '';
+  [...sel.options].forEach(o => {
+    const it = document.createElement('button');
+    it.type = 'button';
+    it.setAttribute('role', 'option');
+    it.className = 'composer-model-item' + (o.value === sel.value ? ' active' : '');
+    it.title = o.title || o.textContent;
+    const lbl = document.createElement('span');
+    lbl.className = 'composer-model-item-label';
+    lbl.textContent = o.textContent;
+    it.appendChild(lbl);
+    if (o.value === sel.value) it.insertAdjacentHTML('beforeend', _MODEL_CHECK_SVG);
+    it.addEventListener('click', () => {
+      _closeModelMenu();
+      if (o.value !== sel.value) { sel.value = o.value; sel.dispatchEvent(new Event('change')); }
+      _syncModelTrigger();
+    });
+    menu.appendChild(it);
+  });
+  menu.classList.remove('hidden');
+  $('modelSelectBtn').setAttribute('aria-expanded', 'true');
+  const act = menu.querySelector('.active');
+  if (act) act.scrollIntoView({ block: 'nearest' });
+}
+
+function _renderModelSelect() {
+  const sel = $('modelSelect');
+  if (!sel) return;
+  sel.innerHTML = '';
+  if (!_modelOptions.length) {
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = 'no models — open LLM settings';
+    sel.appendChild(o);
+    sel.disabled = true;
+    _updateFallbackBadge();
+    return;
+  }
+  sel.disabled = false;
+  // Prefix the provider name only when models come from more than one provider.
+  const names = new Set(_modelOptions.map(m => m.name));
+  _modelOptions.forEach(m => {
+    const o = document.createElement('option');
+    o.value = m.model;
+    o.textContent = names.size > 1 ? `${m.name} · ${m.model}` : m.model;
+    o.title = `${m.name} — ${m.model}`;
+    sel.appendChild(o);
+  });
+  _updateFallbackBadge();
+}
+
+async function refreshModelOptions() {
   try {
-    const res = await pywebview.api.get_active_llm();
-    if (res && res.ok) setActiveLlm(res.active);
-  } catch (e) { /* non-fatal: the badge just keeps its current text */ }
+    const res = await pywebview.api.get_model_options();
+    if (!res || !res.ok) return;
+    _modelOptions = res.options || [];
+    _preferredModel = (res.preferred && res.preferred.model)
+      || (_modelOptions.find(m => m.preferred) || {}).model || null;
+    if (res.active && res.active.model) _activeModel = res.active.model;
+    _renderModelSelect();
+  } catch (e) { /* non-fatal: the selector just keeps its current state */ }
+}
+
+function onActiveLlm(info) {
+  _activeModel = (info && info.model) || null;
+  _updateFallbackBadge();
+}
+
+async function onModelSelected() {
+  const sel = $('modelSelect');
+  const model = sel.value;
+  const opt = _modelOptions.find(m => m.model === model);
+  _preferredModel = model || null;
+  // Forget the stale active model so the dropdown shows the new pick; the next
+  // 'active_llm' event re-reports what's actually serving (and re-flags fallback).
+  _activeModel = null;
+  _updateFallbackBadge();
+  try {
+    await pywebview.api.set_preferred_model(opt ? (opt.config_id || '') : '', model);
+  } catch (e) { /* non-fatal */ }
 }
 
 // One step row, with its evidence fields folded in when present.
@@ -936,7 +1062,7 @@ window.__agent = {
       case 'tool_running': startTool(ev); break;
       case 'tool_result': finishTool(ev); break;
       case 'final_answer': renderFinalAnswer(ev); break;
-      case 'active_llm': setActiveLlm(ev); break;
+      case 'active_llm': onActiveLlm(ev); break;
       case 'system': renderSystem(ev.content); break;
       case 'log': renderLog(ev.content); break;
       case 'error': renderError(ev.content); break;
@@ -973,8 +1099,8 @@ function onDone() {
 // native OS file picker (the backend copies them in, then returns the fresh tree).
 async function uploadFiles() {
   if (!session) return;
-  const btn = $('uploadFilesBtn');
-  btn.disabled = true;
+  const btns = [$('uploadFilesBtn'), $('composerUploadBtn')].filter(Boolean);
+  btns.forEach(b => { b.disabled = true; });
   $('hint').textContent = 'choose files to upload…';
   try {
     const res = await pywebview.api.upload_files('');
@@ -993,7 +1119,7 @@ async function uploadFiles() {
   } catch (e) {
     $('hint').textContent = 'upload error: ' + e;
   } finally {
-    btn.disabled = false;
+    btns.forEach(b => { b.disabled = false; });
     // restore the idle hint a few seconds later, unless the agent is now working
     setTimeout(() => { if (!$('input').disabled) $('hint').textContent = 'ready'; }, 4000);
   }
@@ -1049,6 +1175,7 @@ function onSessionStarted(ev) {
     importBanner.classList.add('hidden');
   }
   renderFileTree(ev.file_tree);
+  refreshModelOptions(); // sync the composer's model selector with the config
   resetGraph(); // this session's graph may differ from the previous one's
   if (activeTab === 'graph') loadGraph();
   resetInputHeight();
@@ -1286,7 +1413,6 @@ function _llmProvider(id) { return _llmProviders.find(p => p.id === id) || null;
 
 async function openLlmModal() {
   $('llmError').textContent = '';
-  $('llmTestResult').textContent = '';
   $('llmListStatus').textContent = '';
   $('llmModal').classList.remove('hidden');
   llmShowList();
@@ -1500,31 +1626,81 @@ function _addListItem(containerId, opts) {
   if (inputs.length) inputs[inputs.length - 1].focus();
 }
 
-// ---- text-model ladder editor (per-model reasoning) ----------------------
-// The text-model ladder is richer than the generic list editor: besides ordering,
-// each model carries its OWN reasoning override so a mixed ladder (GLM + DeepSeek V4
-// + …) can reason correctly per family. Each model is a small card — the id input
-// (+ reorder/remove) on top, then two compact selects (effort + style) that default
-// to "inherit"/"auto" (unset -> the provider's Advanced defaults apply). We read the
-// models AND their overrides back together at save time.
-const _LLM_EFFORT_OPTS = [
-  ['', 'reasoning: inherit'],
-  ['off', 'reasoning: off'],
-  ['minimal', 'reasoning: minimal'],
-  ['low', 'reasoning: low'],
-  ['medium', 'reasoning: medium'],
-  ['high', 'reasoning: high'],
-  ['max', 'reasoning: max'],
-];
-const _LLM_STYLE_OPTS = [
-  ['', 'style: auto'],
-  ['openai', 'style: OpenAI effort'],
-  ['thinking', 'style: GLM thinking'],
-  ['chat_template', 'style: chat-template'],
-  ['deepseek_v4', 'style: DeepSeek V4'],
-  ['system', 'style: Nemotron'],
-  ['none', 'style: none'],
-];
+// ---- text-model ladder editor (drag-to-reorder + per-model ⚙ settings) ----
+// One row per model: [⠿ drag] [model id] [⚙] [✕]. The gear expands a panel with
+// that model's REASONING control — the right control is auto-detected from the
+// model name (GLM → thinking toggle, DeepSeek V4 → none/high/max effort,
+// Nemotron 3 → off/reduced/full, o-series/GPT → an effort level, Claude → its
+// thinking effort, DeepSeek R1 → nothing to configure) — plus a per-model "test"
+// button that probes exactly this key pool + model + reasoning. Only the effort
+// VALUE is stored (model_settings[model] = {reasoning_effort}); how it's encoded
+// on the wire is derived from the model name by the backend.
+
+const _REASONING_FAMILIES = {
+  openai: {
+    label: 'OpenAI-style — reasoning_effort level',
+    options: [['', 'Default'], ['off', 'Off'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['max', 'Max']],
+  },
+  thinking: {
+    label: 'GLM / Z.AI — thinking toggle',
+    options: [['', 'Default (on)'], ['off', 'Thinking off'], ['high', 'Thinking on']],
+  },
+  chat_template: {
+    label: 'Qwen / DeepSeek V3 / Kimi — thinking toggle',
+    options: [['', 'Default'], ['off', 'Thinking off'], ['high', 'Thinking on']],
+  },
+  deepseek_v4: {
+    label: 'DeepSeek V4 — effort: none / high / max',
+    options: [['', 'Default'], ['off', 'Off (none)'], ['high', 'High'], ['max', 'Max']],
+  },
+  nemotron3: {
+    label: 'Nemotron 3 — thinking mode',
+    options: [['', 'Default'], ['off', 'Off'], ['medium', 'Reduced (medium effort)'], ['high', 'Full thinking']],
+  },
+  system: {
+    label: 'Nemotron — "detailed thinking" directive',
+    options: [['', 'Default'], ['off', 'Off'], ['high', 'On']],
+  },
+  anthropic: {
+    label: 'Claude — extended-thinking effort',
+    options: [['', 'Default'], ['off', 'Off'], ['low', 'Low'], ['medium', 'Medium'], ['high', 'High'], ['max', 'Max']],
+  },
+  none: {
+    label: 'always reasons — nothing to configure',
+    options: null,
+  },
+};
+
+// JS mirror of llm.py's _auto_reasoning_style (+ the Anthropic protocol case).
+function detectReasoningFamily(model) {
+  const p = _llmProvider(_llmActiveProvider);
+  if (p && p.protocol === 'anthropic') return 'anthropic';
+  const m = (model || '').toLowerCase();
+  if (m.includes('glm')) return 'thinking';
+  if (m.includes('nemotron-3') || m.includes('nemotron3')) return 'nemotron3';
+  if (m.includes('nemotron')) return 'system';
+  if (m.includes('qwen3') || m.includes('qwen-3') || m.includes('kimi')) return 'chat_template';
+  if (m.includes('deepseek')) {
+    if (m.includes('r1')) return 'none';
+    if (m.includes('v4')) return 'deepseek_v4';
+    return 'chat_template';
+  }
+  return 'openai';
+}
+
+// Snap a stored effort onto the closest value this family's control offers, so a
+// saved level from another family (or an old config) still lands on a real option.
+function _coerceEffort(fam, eff) {
+  if (!eff) return '';
+  const def = _REASONING_FAMILIES[fam];
+  if (!def || !def.options) return '';
+  if (def.options.some(([v]) => v === eff)) return eff;
+  if (eff === 'off') return 'off';
+  if (fam === 'nemotron3') return (eff === 'minimal' || eff === 'low' || eff === 'medium') ? 'medium' : 'high';
+  if (fam === 'deepseek_v4') return eff === 'max' ? 'max' : 'high';
+  if (fam === 'openai' || fam === 'anthropic') return eff === 'minimal' ? 'low' : eff;
+  return 'high'; // toggle families: any ON level is just "on"
+}
 
 function _miniSelect(extraCls, options, value) {
   const sel = document.createElement('select');
@@ -1538,60 +1714,122 @@ function _miniSelect(extraCls, options, value) {
   return sel;
 }
 
-// Read the model ladder back as {models:[id...], settings:{id:{reasoning_effort,
-// reasoning_style}}}. Blank rows are dropped; only non-default overrides are kept.
+// Read the model ladder back as {models, settings, open}: the ordered ids, the
+// per-model {reasoning_effort} overrides, and which rows have their ⚙ panel open
+// (so a re-render doesn't slam panels shut). Blank rows are dropped.
 function _readModelLadder(containerId) {
   const models = [];
   const settings = {};
+  const open = new Set();
   document.querySelectorAll('#' + containerId + ' .llm-model-row').forEach(row => {
     const id = row.querySelector('input.llm-list-input').value.trim();
     if (!id) return;
     models.push(id);
-    const eff = row.querySelector('select.llm-model-effort').value;
-    const sty = row.querySelector('select.llm-model-style').value;
-    const s = {};
-    if (eff) s.reasoning_effort = eff;
-    if (sty) s.reasoning_style = sty;
-    if (Object.keys(s).length) settings[id] = s;
+    const effSel = row.querySelector('select.llm-model-effort');
+    const eff = effSel ? effSel.value : '';
+    if (eff) settings[id] = { reasoning_effort: eff };
+    if (row.classList.contains('open')) open.add(id);
   });
-  return { models, settings };
+  return { models, settings, open };
 }
 
-function _renderModelLadder(containerId, models, modelSettings) {
+let _llmModelDragIndex = null;
+
+function _modelRow(containerId, val, i, s, openPanel) {
+  const card = document.createElement('div');
+  card.className = 'llm-model-row rounded-lg border border-term-line/70' + (openPanel ? ' open' : '');
+
+  const top = document.createElement('div');
+  top.className = 'flex items-center gap-1.5 p-1.5';
+
+  const handle = document.createElement('span');
+  handle.textContent = '⠿';
+  handle.title = 'drag to reorder (top = primary)';
+  handle.className = 'shrink-0 select-none px-0.5 text-term-muted';
+  handle.style.cursor = 'grab';
+  handle.draggable = true;
+  handle.addEventListener('dragstart', (e) => {
+    _llmModelDragIndex = i;
+    card.style.opacity = '0.4';
+    if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', String(i)); }
+  });
+  handle.addEventListener('dragend', () => { _llmModelDragIndex = null; card.style.opacity = ''; });
+  card.addEventListener('dragover', (e) => e.preventDefault());
+  card.addEventListener('drop', (e) => {
+    e.preventDefault();
+    if (_llmModelDragIndex === null || _llmModelDragIndex === i) return;
+    const cur = _readModelLadder(containerId);
+    if (_llmModelDragIndex >= cur.models.length) return;
+    const [moved] = cur.models.splice(_llmModelDragIndex, 1);
+    cur.models.splice(Math.min(i, cur.models.length), 0, moved);
+    _llmModelDragIndex = null;
+    _renderModelLadder(containerId, cur.models, cur.settings, cur.open);
+  });
+
+  const inp = document.createElement('input');
+  inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
+  inp.placeholder = _LLM_MODEL_OPTS.placeholder;
+  inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
+  // A rename can change the model family — rebuild so the ⚙ panel shows the
+  // right reasoning control for the new name.
+  inp.addEventListener('change', () => {
+    const cur = _readModelLadder(containerId);
+    _renderModelLadder(containerId, cur.models, cur.settings, cur.open);
+  });
+
+  const gear = _miniBtn('⚙', 'reasoning & connection test for this model', () => {
+    const isOpen = card.classList.toggle('open');
+    panel.classList.toggle('hidden', !isOpen);
+  });
+  const del = _miniBtn('✕', 'remove', () => {
+    const cur = _readModelLadder(containerId);
+    const idx = cur.models.indexOf(val);
+    if (idx >= 0) cur.models.splice(idx, 1);
+    delete cur.settings[val];
+    _renderModelLadder(containerId, cur.models, cur.settings, cur.open);
+  });
+
+  top.append(handle, inp, gear, del);
+  card.appendChild(top);
+
+  // ---- ⚙ panel: auto-detected reasoning control + per-model test ----
+  const panel = document.createElement('div');
+  panel.className = 'flex flex-col gap-1.5 border-t border-term-line/60 p-2' + (openPanel ? '' : ' hidden');
+  const fam = detectReasoningFamily(val);
+  const famDef = _REASONING_FAMILIES[fam] || _REASONING_FAMILIES.openai;
+  const famLine = document.createElement('div');
+  famLine.className = 'text-[10px] text-term-muted';
+  famLine.textContent = 'detected: ' + famDef.label;
+  panel.appendChild(famLine);
+  if (famDef.options) {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'flex items-center gap-1.5';
+    const lab = document.createElement('span');
+    lab.className = 'shrink-0 text-[10px] uppercase tracking-wider text-term-muted';
+    lab.textContent = 'reasoning';
+    rowEl.append(lab, _miniSelect('llm-model-effort', famDef.options, _coerceEffort(fam, s.reasoning_effort)));
+    panel.appendChild(rowEl);
+  }
+  const testRow = document.createElement('div');
+  testRow.className = 'flex min-w-0 items-center gap-2';
+  testRow.appendChild(_miniBtn('test this model', 'send a tiny probe using this key pool + model + reasoning', () => _testModelRow(card)));
+  const result = document.createElement('span');
+  result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-muted';
+  testRow.appendChild(result);
+  panel.appendChild(testRow);
+  card.appendChild(panel);
+  return card;
+}
+
+function _renderModelLadder(containerId, models, modelSettings, openSet) {
   const host = $(containerId);
   if (!host) return;
   modelSettings = modelSettings || {};
+  openSet = openSet || new Set();
   host.innerHTML = '';
   const list = models || [];
   list.forEach((val, i) => {
-    const s = modelSettings[val] || {};
-    const card = document.createElement('div');
-    card.className = 'llm-model-row flex flex-col gap-1.5 rounded-lg border border-term-line/70 p-1.5';
-    const top = document.createElement('div');
-    top.className = 'flex items-center gap-1.5';
-    const inp = document.createElement('input');
-    inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
-    inp.placeholder = _LLM_MODEL_OPTS.placeholder;
-    inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
-    top.appendChild(inp);
-    const up = _miniBtn('↑', 'move up (higher priority)', () => _moveModelLadder(containerId, i, -1));
-    const down = _miniBtn('↓', 'move down', () => _moveModelLadder(containerId, i, +1));
-    if (i === 0) { up.disabled = true; up.classList.add('opacity-30'); }
-    if (i === list.length - 1) { down.disabled = true; down.classList.add('opacity-30'); }
-    top.appendChild(up); top.appendChild(down);
-    top.appendChild(_miniBtn('✕', 'remove', () => {
-      const cur = _readModelLadder(containerId);
-      cur.models.splice(i, 1);
-      delete cur.settings[val];
-      _renderModelLadder(containerId, cur.models, cur.settings);
-    }));
-    card.appendChild(top);
-    const bottom = document.createElement('div');
-    bottom.className = 'flex items-center gap-1.5';
-    bottom.appendChild(_miniSelect('llm-model-effort', _LLM_EFFORT_OPTS, s.reasoning_effort));
-    bottom.appendChild(_miniSelect('llm-model-style', _LLM_STYLE_OPTS, s.reasoning_style));
-    card.appendChild(bottom);
-    host.appendChild(card);
+    host.appendChild(_modelRow(containerId, val, i, modelSettings[val] || {}, openSet.has(val)));
   });
   if (!list.length) {
     const empty = document.createElement('div');
@@ -1601,20 +1839,56 @@ function _renderModelLadder(containerId, models, modelSettings) {
   }
 }
 
-function _moveModelLadder(containerId, i, dir) {
-  const cur = _readModelLadder(containerId);
-  const j = i + dir;
-  if (j < 0 || j >= cur.models.length) return;
-  const t = cur.models[i]; cur.models[i] = cur.models[j]; cur.models[j] = t;
-  _renderModelLadder(containerId, cur.models, cur.settings);
-}
-
 function _addModelLadder(containerId) {
   const cur = _readModelLadder(containerId);
   cur.models.push('');
-  _renderModelLadder(containerId, cur.models, cur.settings);
+  _renderModelLadder(containerId, cur.models, cur.settings, cur.open);
   const inputs = document.querySelectorAll('#' + containerId + ' input.llm-list-input');
   if (inputs.length) inputs[inputs.length - 1].focus();
+}
+
+// Probe exactly ONE rung: the shared key pool + this row's model + its reasoning.
+async function _testModelRow(card) {
+  const result = card.querySelector('.llm-model-test-result');
+  const model = card.querySelector('input.llm-list-input').value.trim();
+  if (!model) {
+    result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+    result.textContent = 'enter a model id first';
+    return;
+  }
+  const effSel = card.querySelector('select.llm-model-effort');
+  const eff = effSel ? effSel.value : '';
+  const keys = _readListEditor('llmKeysList');
+  const payload = {
+    provider: _llmActiveProvider,
+    api_keys: keys,
+    api_key: keys[0] || '',
+    models: [model],
+    model,
+    base_url: $('llmBaseUrl').value.trim(),
+    reasoning_effort: (eff && eff !== 'off') ? eff : '',
+  };
+  const mt = $('llmMaxTokens').value.trim();
+  if (mt) payload.max_tokens = parseInt(mt, 10);
+  const temp = $('llmTemperature').value.trim();
+  if (temp !== '') payload.temperature = parseFloat(temp);
+  result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-muted';
+  result.textContent = 'testing…';
+  result.title = '';
+  try {
+    const res = await pywebview.api.test_llm_config(payload);
+    if (res && res.ok) {
+      result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-green';
+      result.textContent = `✓ ${res.model}` + (res.reply ? ` — “${res.reply}”` : ' — reachable');
+    } else {
+      result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+      result.textContent = '✕ ' + ((res && res.error) || 'connection failed');
+      result.title = (res && res.error) || '';
+    }
+  } catch (e) {
+    result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+    result.textContent = '✕ ' + e;
+  }
 }
 
 // Fill the form for a provider. `existing` is the saved entry being edited (its
@@ -1647,32 +1921,15 @@ function selectLlmProvider(id, existing) {
   $('llmProviderNotes').textContent = p.notes || '';
 
   $('llmMaxTokens').value = (use && use.max_tokens) ? use.max_tokens : '';
-
-  // Advanced options
-  $('llmReasoning').value = use ? (use.reasoning_effort || '') : '';
-  $('llmReasoningStyle').value = use ? (use.reasoning_style || '') : '';
   $('llmTemperature').value = (use && use.temperature !== null && use.temperature !== undefined) ? use.temperature : '';
   $('llmContextWindow').value = (use && use.context_window) ? use.context_window : '';
 
-  $('llmTestResult').textContent = '';
   $('llmError').textContent = '';
-}
-
-// Switch the edit form between the Basic and Advanced panes.
-function llmSubtab(pane) {
-  const advanced = pane === 'advanced';
-  $('llmPaneBasic').classList.toggle('hidden', advanced);
-  $('llmPaneAdvanced').classList.toggle('hidden', !advanced);
-  const on = 'rounded-full border px-3 py-1 text-[12px] bg-term-cyan text-white border-term-cyan';
-  const off = 'rounded-full border px-3 py-1 text-[12px] border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
-  $('llmSubtabBasic').className = advanced ? off : on;
-  $('llmSubtabAdvanced').className = advanced ? on : off;
 }
 
 function llmAddEntry() {
   _llmEditingId = null;
   renderLlmTabs();
-  llmSubtab('basic');
   $('llmName').value = '';
   const first = _llmProviders[0];
   selectLlmProvider(first ? first.id : null, null);
@@ -1685,7 +1942,6 @@ function llmEditEntry(id) {
   if (!c) return;
   _llmEditingId = id;
   renderLlmTabs();
-  llmSubtab('basic');
   $('llmName').value = c.name || '';
   selectLlmProvider(c.provider, c);
   llmShowEdit();
@@ -1713,38 +1969,12 @@ function _llmFormValues() {
   };
   const mt = $('llmMaxTokens').value.trim();
   if (mt) v.max_tokens = parseInt(mt, 10);
-  // Advanced options
-  const reasoning = $('llmReasoning').value;
-  v.reasoning_effort = reasoning || '';
-  v.reasoning_style = $('llmReasoningStyle').value || '';
   const temp = $('llmTemperature').value.trim();
   v.temperature = temp === '' ? null : parseFloat(temp);
   const ctx = $('llmContextWindow').value.trim();
   if (ctx) v.context_window = parseInt(ctx, 10);
   if (!v.name) v.name = (p && p.label) || v.provider;
   return v;
-}
-
-async function testLlmConnection() {
-  const btn = $('llmTestBtn');
-  btn.disabled = true;
-  $('llmTestResult').className = 'text-[11px] text-term-muted';
-  $('llmTestResult').textContent = 'testing…';
-  try {
-    const res = await pywebview.api.test_llm_config(_llmFormValues());
-    if (res && res.ok) {
-      $('llmTestResult').className = 'text-[11px] text-term-green';
-      $('llmTestResult').textContent = `✓ ${res.provider} · ${res.model}` + (res.reply ? ` — “${res.reply}”` : ' — reachable');
-    } else {
-      $('llmTestResult').className = 'text-[11px] text-term-red';
-      $('llmTestResult').textContent = '✕ ' + ((res && res.error) || 'connection failed');
-    }
-  } catch (e) {
-    $('llmTestResult').className = 'text-[11px] text-term-red';
-    $('llmTestResult').textContent = '✕ ' + e;
-  } finally {
-    btn.disabled = false;
-  }
 }
 
 // Save the form into the in-memory list (add new or update existing), persist,
@@ -1812,7 +2042,7 @@ async function persistLlmConfigs(statusMsg) {
     $('llmListStatus').textContent = '✓ ' + (statusMsg || 'saved') + (res.primary
       ? ` — primary: ${res.primary.name} (${res.primary.label} · ${res.primary.model})`
       : ' — no providers left');
-    refreshActiveLlm();  // the primary/active provider may have changed
+    refreshModelOptions();  // the composer's model list / primary may have changed
     if (session && res.primary) {
       renderSystem(`LLM providers saved. Primary: ${res.primary.name} · ${res.primary.model}. Fallbacks are used automatically if it errors.`);
     }
@@ -2561,7 +2791,7 @@ async function init() {
   // (e.g. after a webview refresh or an Out-of-Memory renderer reload) —
   // reconnect and replay the chat instead of dropping to the start screen.
   await loadStartScreen();
-  refreshActiveLlm();  // populate the active-LLM header badge from the current config
+  refreshModelOptions();  // populate the composer's model selector from the config
   try {
     const st = await pywebview.api.get_state();
     if (st && st.active) await pywebview.api.restore_session();
@@ -2606,6 +2836,17 @@ async function init() {
 
   $('startSessionBtn').addEventListener('click', startSession);
 
+  $('themeToggle').addEventListener('click', toggleTheme);
+  $('themeToggleStart').addEventListener('click', toggleTheme);
+  applyThemeIcons();
+
+  $('modelSelectBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    if ($('modelMenu').classList.contains('hidden')) _openModelMenu(); else _closeModelMenu();
+  });
+  document.addEventListener('click', (e) => { if (!e.target.closest('.composer-model')) _closeModelMenu(); });
+  _syncModelTrigger();
+
   $('sendBtn').addEventListener('click', sendMessage);
   $('stopBtn').addEventListener('click', () => pywebview.api.stop());
   $('input').addEventListener('keydown', (e) => {
@@ -2620,6 +2861,7 @@ async function init() {
     if (r && r.ok) renderFileTree(r.tree);
   });
   $('uploadFilesBtn').addEventListener('click', uploadFiles);
+  $('composerUploadBtn').addEventListener('click', uploadFiles);
   $('changeSessionBtn').addEventListener('click', async () => {
     await pywebview.api.end_session();
   });
@@ -2655,7 +2897,7 @@ async function init() {
   $('exportApproveBtn').addEventListener('click', approveExport);
   $('exportModal').addEventListener('click', (e) => { if (e.target.id === 'exportModal') closeExportModal(); });
 
-  $('activeLlmBadge').addEventListener('click', openLlmModal);
+  $('modelSelect').addEventListener('change', onModelSelected);
   $('llmSettingsBtn').addEventListener('click', openLlmModal);
   $('llmSettingsBtnStart').addEventListener('click', openLlmModal);
   $('llmModalClose').addEventListener('click', closeLlmModal);
@@ -2663,9 +2905,6 @@ async function init() {
   $('llmAddBtn').addEventListener('click', llmAddEntry);
   $('llmBackBtn').addEventListener('click', () => { $('llmError').textContent = ''; llmShowList(); });
   $('llmSaveBtn').addEventListener('click', saveLlmEntry);
-  $('llmTestBtn').addEventListener('click', testLlmConnection);
-  $('llmSubtabBasic').addEventListener('click', () => llmSubtab('basic'));
-  $('llmSubtabAdvanced').addEventListener('click', () => llmSubtab('advanced'));
   $('llmKeysAdd').addEventListener('click', () => _addListItem('llmKeysList', _LLM_KEY_OPTS));
   $('llmModelsAdd').addEventListener('click', () => _addModelLadder('llmModelsList'));
   $('llmVisionAdd').addEventListener('click', () => _addListItem('llmVisionList', _LLM_VISION_OPTS));
@@ -2676,6 +2915,7 @@ async function init() {
       $('fileViewer').classList.add('hidden');
       closeExportModal();
       closeLlmModal();
+      _closeModelMenu();
     }
   });
 }

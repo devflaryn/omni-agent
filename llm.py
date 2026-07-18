@@ -89,15 +89,8 @@ PROVIDERS = {
         "default_model": "deepseek-ai/deepseek-v4-pro",
         "requires_key": True,
         "key_hint": "nvapi-...",
-        "notes": ("NVIDIA NIM (build.nvidia.com), OpenAI-compatible. Enter your 'nvapi-...' keys as a "
-                  "POOL (one per line) and your models as a separate LADDER (one per line, most "
-                  "capable first). Keys and models are INDEPENDENT — every key can serve every model "
-                  "(one NIM key handles DeepSeek, GLM, Nemotron, …). The engine rotates the KEY on a "
-                  "429 (rate limit) and switches the MODEL on a 503/queue/timeout, always preferring "
-                  "the top model and returning to it once it recovers. Reasoning style is auto-picked "
-                  "per model from its name (DeepSeek V4 → none/high/max, Nemotron → system directive, "
-                  "GLM → thinking flag, Qwen/DeepSeek V3 → chat template); set the Advanced effort to "
-                  "Off / High / Max."),
+        "notes": ("NVIDIA NIM (build.nvidia.com), OpenAI-compatible. Any key serves any model; "
+                  "reasoning is configured per model (⚙ on each model)."),
     },
     "claude": {
         "label": "Anthropic Claude",
@@ -155,10 +148,14 @@ to one domain — pick the tools and skills that fit the task in front of you.
 
 You run in a Linux Docker sandbox with the active project mounted at `/workspace`; all project files live there and \
 `/workspace/notes.md` is your scratchpad for persistent notes. Most tools run in the sandbox; the Android emulator \
-tools run on the Windows host instead (their descriptions say so)."""
+tools run on the host machine instead (their descriptions say so)."""
 
 
-def get_full_system_prompt():
+def get_static_system_prompt():
+    """The STATIC half of the system prompt: intro + behavioral contract +
+    skills. It deliberately EXCLUDES the tool list — tools are rendered
+    separately by render_tools_section() so progressive tool disclosure can vary
+    which schemas are shown per turn without rebuilding any of this."""
     base_prompt = DEFAULT_SYSTEM_PROMPT
 
     base_prompt += """
@@ -168,101 +165,112 @@ RESPONSE FORMAT (always valid JSON, nothing else):
 - Final answer: {"type": "final_answer", "content": "<text>"}
 Exactly ONE JSON object per turn — one tool at a time. No markdown, no code fences, no text outside the JSON.
 
-EXPLAINING YOUR WORK — the PLAN narrates the chat (subprocess-driven):
-- The chat is driven by your PLAN, not by ad-hoc notes. Break the work into subprocess STEPS (each step = one
-  coherent sub-process / subtask, e.g. "scan the workspace for data", "patch the license check", "rebuild & verify").
-  Give each step a short, first-person "explanation" — the sentence the USER sees when that sub-process begins,
-  e.g. "explanation": "Now I'll scan the workspace for the data.". Set it when you create the step (in plan_create
-  / plan_add_task).
-- STARTING a step narrates it: when you call plan_update_task with status="in_progress", that step's "explanation"
-  (or, if you left it blank, its description) is printed as a chat line and OPENS a new action group. Every tool
-  call you make afterwards is grouped quietly beneath it — until you start the NEXT step, which prints its line and
-  opens the next group. So the run reads as: step narration, [its group of calls], next step narration, [its group],
-  … and YOU decide where the splits fall and what each line says purely by how you shape the plan and when you mark
-  steps in_progress. Mark a step "in_progress" the moment you begin it and "completed" when it's done + verified.
-- One narration per sub-process — do NOT narrate every call. All the reads/searches/edits that carry out a step run
-  quietly inside its group; only starting a NEW step writes a new line. (Reading three parts of one file is ONE
-  step, not three lines. Decompiling a.apk then b.apk under "compare the two APKs" is ONE step.)
-- VOICE — casual and friendly, like chatting with a teammate. VARY how you open; don't start every line the same
-  way. "Let me…" is fine occasionally, but mix it up naturally: "I'll take a look at…", "Time to…", "Okay, let's
-  check…", "This file might tell us…", "Digging into the manifest now", "Worth checking…", a quick question, etc.
-  First person, light and relaxed — not stiff or formal, not a terse status log, and NOT "Let me…" every time.
-- The per-call "explanation" field still works as a SECONDARY option: use it for a quick aside, a change of
-  direction mid-step, or narration before a plan exists (your FIRST action — usually plan_create — should carry one
-  so the run opens with a line to the user). A tool_call that OMITS "explanation" and doesn't start a step just
-  extends the current group quietly. Don't double-narrate — if starting a step already prints a line, don't also add
-  a per-call explanation for the same thought.
-- final_answer takes no explanation. Keep ALL narration inside the plan steps / this field — never write prose
-  outside the JSON.
+EXPLAINING YOUR WORK — the PLAN narrates the chat:
+- Break work into subprocess/subtask STEPS (e.g. "scan the workspace", "patch the license check", "rebuild & verify").
+  Marking a step in_progress (plan_update_task) prints its first-person "explanation" (or its description) as a chat
+  line and OPENS an action group; every following tool call folds quietly under it until the NEXT step opens the next
+  group. YOU control where the splits fall by how you shape the plan. One narration per sub-process — never narrate
+  every call (reading three slices of one file is ONE step, not three lines).
+- VOICE: casual, first-person, friendly, like a teammate — and VARY your openers (not "Let me…" every time).
+- The per-call "explanation" field is the SECONDARY path: an aside, a mid-step pivot, or narration before a plan
+  exists (your first action — usually plan_create — should carry one so the run opens with a line). Don't double-
+  narrate. final_answer takes no explanation, and NEVER write prose outside the JSON.
 
-PLAN-AND-EXECUTE (adaptive & evidence-driven; the runtime expects it):
-- ORIENT FIRST, THEN PLAN. For any task beyond a one-line answer, briefly inspect the current state — what tools you
-  have, the constraints, what "done" objectively means, and the biggest unknowns — BEFORE writing the plan. Then call
-  `plan_create` FIRST (a hard requirement) with: the task summary, `success_criteria` (what done looks like),
-  `constraints` (hard boundaries), `phases` (the 3-6 high-level milestones = your stable mission plan), and the FIRST
-  phase's `steps`. A trivial question needing no tools can skip planning entirely.
-- THREE LAYERS, each revised on its own so you never rewrite the whole plan:
-    • MISSION (task + success_criteria + constraints) and PHASES are STABLE — set once, re-cut only on a real replan.
-    • STEPS are the small, bounded, current-phase actions — the layer that churns as you work.
-    • NEXT ACTION is exactly one precise, immediately-doable move — keep it current with `plan_set_next_action`.
-- MAKE IMPORTANT STEPS VERIFIABLE. For a step that matters, give it an action, a purpose (why), an expected result,
-  a verification method (the command/build/test/file:line/log that proves it), and a fallback (if it fails) — via the
-  fields on `plan_add_task`/`plan_update_task`. Small steps, one at a time: mark a step `in_progress` when you start,
-  `completed` ONLY once it's done AND its verification passed, `skipped` (with a note) when it proves unnecessary.
-- WORK IN SMALL INCREMENTS and prefer the smallest action that reduces uncertainty or moves the task forward; avoid
-  endless analysis, vague steps, over-planning, and inventing project details you haven't confirmed.
-- ADVANCE PHASES with `plan_advance_phase` when a milestone is genuinely reached, then add that phase's steps.
-- REPLAN, don't drift. Make a SCOPED edit (plan_add_task / plan_update_task / plan_reorder) for a normal
-  course-correction. Call `plan_replan` (with the reason) for a LARGER revision after a major failure, an invalidated
-  assumption, unexpected architecture, repeated unsuccessful attempts, or changed constraints — it PRESERVES completed
-  work and only re-cuts what's stale. Never blindly follow a plan the evidence has outdated.
-- DECLARE THE END STATE with `plan_set_outcome`: `completed` (criteria met AND verified — do this right before your
-  final answer), `partial` (note what's left), `blocked` (note the blocker), or `needs_different_approach` (note why).
-- `plan_view` shows ids and current state. An active plan is appended below as "CURRENT PLAN" — it is the source of
-  truth; keep it accurate and fix it rather than working ahead of it.
+PLAN & EXECUTE (adaptive, layered — the runtime expects it):
+- INSPECT FREELY, THEN PLAN. Analyze the workspace as much as you need FIRST — read, search, decompile, query the
+  code graph, load a skill — to build real understanding. There is NO limit on inspection and NO plan is required to
+  explore. Once you actually understand the task (tools, constraints, what "done" objectively means, the biggest
+  unknowns), call `plan_create` — task summary, `success_criteria`, `constraints`, `phases` (3-6 stable milestones),
+  and the first phase's `steps` — BEFORE you change anything (edit/patch/build). Plan when you're ready, not before;
+  a trivial one-line answer needs no plan.
+- THREE LAYERS, each revised on its own so you never rewrite the whole plan: MISSION (task+criteria+constraints) and
+  PHASES are STABLE (re-cut only on a real replan); STEPS are the small current-phase actions that churn; NEXT ACTION
+  is the one precise next move (`plan_set_next_action`).
+- STEPS ARE SMALL AND VERIFIABLE: give an important step a clear "done when…" check plus action / purpose / expected /
+  verification / fallback (fields on plan_add_task/plan_update_task). Work top-to-bottom, ONE step at a time: mark it
+  in_progress when you start, completed ONLY once done AND its verification passed, skipped (with a note) if moot.
+  Prefer the smallest action that reduces uncertainty; avoid over-planning and inventing unconfirmed details.
+- ADVANCE with `plan_advance_phase` at a real milestone. REPLAN, don't drift: a SCOPED edit (add/update/reorder) for a
+  course-correction; `plan_replan` (with reason) after a major failure / invalidated assumption / repeated dead ends —
+  it preserves completed work. End with `plan_set_outcome` (completed / partial / blocked / needs_different_approach)
+  right before your final answer. The live plan is appended below as "CURRENT PLAN" — it is the source of truth; keep
+  it accurate rather than working ahead of it.
 
-EVIDENCE-BASED WORKFLOW — plan, work ONE step, prove it, let it be reviewed:
-- PLANNER: make each plan step small and VERIFIABLE — give it a clear "done when…" check (e.g. "locate the
-  license check — done when I have its file:line"), not a vague goal. Work the plan top-to-bottom, one step
-  at a time: mark a step in_progress, finish it, mark it completed, then move on — don't run ahead of it.
-- EVIDENCE DISCIPLINE: back every important technical claim with something objective — a file:line, a
-  symbol/class/method name, a search hit, or a command/build/test/log output. Keep FACTS and GUESSES
-  separate: record a proven fact with record_finding (evidence is REQUIRED); record an unproven idea with
-  record_hypothesis (confidence + partial evidence), then update_hypothesis to confirm/refute it once you
-  know. Never state a guess as if it were established.
-- DURABLE MEMORY: the investigation memory (investigation_view) survives context resets — consult it to
-  avoid re-deriving what you already found. When something fails, log it with record_failed_attempt (what
-  you tried + why it failed). Do NOT re-run a failed approach without NEW evidence; otherwise switch
-  strategy. Record real forks in approach with record_decision.
-- VALIDATE CHANGES: a code/binary edit is NOT done until an objective check passes. After a patch, actually
-  build → package → sign → install → launch → test / inspect logs as the task warrants, then record the
-  outcome with record_test_result. Treat "it should work" as unverified.
-- REVIEWER: when you send a final_answer it is automatically checked by an INDEPENDENT reviewer for
-  unsupported claims, contradictions, and unfinished work. If it requests revisions, close the gaps with
-  concrete tool calls (verify the evidence, patch the missed path, run the validation) and answer again —
-  don't just resend the same answer. Before finalizing, do a CONTRADICTION CHECK yourself: actively look
-  for evidence you're WRONG (a second code path left unpatched, another .so that also loads the check, a
-  test that would fail), not just confirmation. You may also call review_conclusion to pressure-test an
-  important intermediate result before building on it.
+EVIDENCE & VALIDATION — prove it, don't assume it:
+- EVIDENCE: back every important claim with something objective (file:line, symbol/class/method, search hit, or
+  command/build/test/log output). Keep FACTS vs GUESSES separate — record_finding (evidence REQUIRED) for a proven
+  fact; record_hypothesis (confidence + partial evidence) for an idea, then update_hypothesis to confirm/refute it.
+  Never state a guess as established.
+- DURABLE MEMORY: investigation_view survives context resets — consult it instead of re-deriving. Log dead ends with
+  record_failed_attempt and do NOT re-run a failed approach without NEW evidence (switch strategy). record_decision at
+  real forks.
+- VALIDATE: a code/binary edit is NOT done until an objective check passes — build → sign → install → launch → test /
+  inspect logs as the task warrants, then record_test_result. "It should work" is unverified.
+- REVIEW: your final_answer is auto-checked by an independent reviewer for unsupported claims, contradictions and
+  unfinished work; on revise, close the gaps with real tool calls and answer again (don't resend). Before finalizing,
+  run your OWN contradiction check — hunt for a second unpatched code path, another .so loading the same check, a test
+  that would fail — not just confirmation. review_conclusion pressure-tests an intermediate result.
 
-BIG / UNFAMILIAR / OBFUSCATED CODEBASES — map first, then read (HARD RULE):
-- The moment you land in a large tree (a decompiled APK, OR any sizeable project), build a map BEFORE reading source.
-  The code graph works for smali AND ordinary source (Python, JS/TS, Java, Go, C/C++, Rust, ...). Either call
-  build_code_graph once on the relevant dir, or just call query_code_graph / ask_codebase — they AUTO-BUILD a
-  workspace graph if none exists yet. Then query_code_graph (string_refs / callers / callees / class / hierarchy)
-  jumps you to an exact file:line, and only THEN do you read_file_chunk that one slice.
-- Search, don't browse. Never open files one-by-one to "get oriented" — that burns context fast. find_files (by
-  name), grep_directory / search_smali (by content) and the code graph are how you locate things; read_file_chunk is
-  only for the specific slice a query already pinpointed.
-- Use ask_codebase for a "how/why/where does X work" question whose answer would otherwise cost many reads — it
-  investigates in an isolated context and returns just the answer.
-- For Android specifically: jadx_decompile gives readable Java/Kotlin (deobf=true on ProGuard/R8 apps) and
-  ghidra_decompile gives C pseudocode for native .so — both for UNDERSTANDING; make the actual edit in smali
-  (patch_smali_method) or on the .so. For obfuscated string checks no plaintext search finds, load the
-  string-deobfuscation skill; bypassing the check usually beats fully decrypting the string.
+BIG / OBFUSCATED CODEBASES — map first, then read (HARD RULE):
+- Landing in a large tree (decompiled APK or any big project): MAP before reading. The code knowledge graph
+  AUTO-BUILDS, so just call query_code_graph with a name — no query_type needed: `query_code_graph(name="isRooted")`
+  or `query_code_graph(name="/system/xbin/su")` searches ALL of string literals + methods + classes + native symbols
+  at once and lands you on exact file:line hits. Only THEN read_file_chunk that one slice, or drill in with a specific
+  query_type (string_refs / callers / callees / class / hierarchy). Search, don't browse — the graph, plus
+  find_files / grep_directory / search_smali, locate things; opening files one-by-one to "get oriented" burns context.
+- ask_codebase answers a "how/why/where does X work" question in an isolated context when it would otherwise cost many
+  reads.
+
+APK MODDING PLAYBOOK (the core mission — decode → map → understand → patch smallest → rebuild → verify):
+- READ with jadx_decompile (readable Java/Kotlin; deobf=true on ProGuard/R8). EDIT in smali (decode_apk →
+  patch_smali_method / insert_smali_code) or on the native .so — never rebuild from jadx output.
+- LOCATE the logic: `query_code_graph(name="<the check/string/method>")` searches everything and lands you on the
+  file:line — signature/root/license/anti-tamper checks are usually found by their strings. Then callers/callees trace
+  the guard. For a native check, ghidra_decompile gives C pseudocode and analyze_function_calls flags kill-switch/
+  anti-tamper imports.
+- PATCH THE SMALLEST THING that works: force a boolean check to return the safe value (smali, or native
+  patch_function_return / nop_function), rather than unwinding the whole routine. For obfuscated string checks no
+  plaintext search finds, load the string-deobfuscation skill — bypassing the check usually beats decrypting it.
+- LAYERED PROTECTIONS are the norm: expect the SAME defense in more than one place (Java AND native; a check plus an
+  integrity re-check). After patching one, look for the others before declaring success.
+- CONFIRM DYNAMICALLY when unsure: on the dev base, use frida (frida_trace / frida_run_script) to prove which check
+  fires and what flipping it does BEFORE committing a static patch — then bake the confirmed change into smali/.so.
+- SKILLS: the apk-modding / ssl-pinning-bypass / signature-bypass / anti-debug-bypass / string-deobfuscation skills
+  are battle-tested workflows — consult the matching one (use_skill) instead of improvising.
 """
 
-    return base_prompt + "\n" + get_skills_prompt() + "\n" + registry.get_tool_prompt()
+    prompt = base_prompt + "\n" + get_skills_prompt()
+    # Fold in the delegatable subagents (plugin-provided) so the planner can target
+    # them with a plan step's `delegate` field or dispatch_agents. Lazy import keeps
+    # llm import-light and avoids a plugins -> subagents -> llm cycle at load time;
+    # empty string when no plugins/agents are present, so lightweight setups are
+    # unaffected.
+    try:
+        from plugins import get_registry
+        reg = get_registry()
+        prompt += "\n" + reg.get_agents_prompt()
+        # Fold in the plugin-contributed workflow COMMANDS index (name + description).
+        # Only the index is shown; full bodies load on demand via use_command, so this
+        # stays tiny no matter how many commands plugins ship.
+        prompt += "\n" + reg.get_commands_prompt()
+    except Exception:
+        pass
+    return prompt
+
+
+def render_tools_section(active_groups=None):
+    """The AVAILABLE TOOLS section of the prompt, honoring progressive
+    disclosure. active_groups=None renders EVERY tool in full (legacy behavior,
+    used by isolated sub-agents/tests); a set renders core + active domain
+    toolsets in full and the rest as a compact one-line catalog."""
+    return registry.get_tool_prompt(active_groups=active_groups)
+
+
+def get_full_system_prompt(active_groups=None):
+    """Convenience: the whole prompt = static half + tool section. With
+    active_groups=None every tool is shown (used where the full surface is
+    wanted); pass a set for progressive disclosure."""
+    return get_static_system_prompt() + "\n" + render_tools_section(active_groups)
 
 
 # --- config load / save ------------------------------------------------------
@@ -303,14 +311,16 @@ _THINKING_BUDGETS = {"minimal": 1024, "low": 4096, "medium": 8192, "high": 16384
 # The effort level says WHETHER (and how hard) to reason; the style says how to
 # encode that in the request body:
 #   openai        -> reasoning_effort: <level>                     (o-series, GPT-5, many hosted APIs)
-#   thinking      -> thinking: {"type": "enabled"|"disabled"}      (GLM / Z.AI, incl. GLM 5.2 via Cline)
-#   chat_template -> chat_template_kwargs: {thinking, enable_thinking}  (Qwen3, DeepSeek V3.x & other vLLM/NIM)
+#   thinking      -> thinking: {"type": "enabled"|"disabled"}      (GLM / Z.AI, incl. GLM 5.2 via Cline;
+#                    on NVIDIA NIM the same toggle is mirrored into chat_template_kwargs)
+#   chat_template -> chat_template_kwargs: {thinking, enable_thinking}  (Qwen3, DeepSeek V3.x, Kimi & other vLLM/NIM)
 #   deepseek_v4   -> reasoning_effort: none|high|max + the same knobs in
 #                    chat_template_kwargs                          (DeepSeek V4 Pro/Flash on NIM/vLLM)
-#   system        -> prepend a "detailed thinking on/off" system line   (NVIDIA Nemotron)
+#   nemotron3     -> chat_template_kwargs: {enable_thinking, medium_effort}  (Nemotron 3 family)
+#   system        -> prepend a "detailed thinking on/off" system line   (older Llama-Nemotron)
 #   none          -> model always reasons (or can't toggle); send nothing special
 # "" / "auto" means: infer the style from the model name (_auto_reasoning_style).
-REASONING_STYLES = ("openai", "thinking", "chat_template", "deepseek_v4", "system", "none")
+REASONING_STYLES = ("openai", "thinking", "chat_template", "deepseek_v4", "nemotron3", "system", "none")
 
 
 def _norm_reasoning(value):
@@ -364,6 +374,8 @@ def _norm_model_settings(value, model_ids=None):
         sty = _norm_reasoning_style(s.get("reasoning_style"))
         if sty:
             entry["reasoning_style"] = sty
+        if isinstance(s.get("supports_native_tools"), bool):
+            entry["supports_native_tools"] = s["supports_native_tools"]
         if entry:
             out[model] = entry
     return out
@@ -379,8 +391,12 @@ def _auto_reasoning_style(model):
     if "glm" in m:
         return "thinking"
     if "nemotron" in m:
+        # Nemotron 3 switched from the "detailed thinking on/off" system directive
+        # to chat-template kwargs (enable_thinking / medium_effort / reasoning_budget).
+        if "nemotron-3" in m or "nemotron3" in m:
+            return "nemotron3"
         return "system"
-    if "qwen3" in m or "qwen-3" in m:
+    if "qwen3" in m or "qwen-3" in m or "kimi" in m:
         return "chat_template"
     if "deepseek" in m:
         # R1 always emits reasoning with no switch; V4 (Pro/Flash) has explicit
@@ -396,6 +412,17 @@ def _auto_reasoning_style(model):
 def _resolve_reasoning_style(cfg):
     """The explicit reasoning style if set, else the model-inferred one."""
     return _norm_reasoning_style(cfg.get("reasoning_style")) or _auto_reasoning_style(cfg.get("model"))
+
+
+def _supports_native_tools(cfg):
+    """Whether the active model should be sent an OpenAI `tools` array.
+    Per-model override (model_settings) wins; else the config-level default;
+    else False (the safe prose path)."""
+    model = cfg.get("model")
+    ms = (cfg.get("model_settings") or {}).get(model) or {}
+    if isinstance(ms.get("supports_native_tools"), bool):
+        return ms["supports_native_tools"]
+    return bool(cfg.get("supports_native_tools"))
 
 
 def _dsv4_effort(level):
@@ -435,8 +462,19 @@ def _apply_openai_reasoning(payload, cfg, messages):
         payload["chat_template_kwargs"] = kwargs
     elif style == "thinking":
         # GLM / Z.AI: an explicit switch. Send it for OFF too, so a model that
-        # reasons by default can still be turned off from the UI.
+        # reasons by default can still be turned off from the UI. NVIDIA NIM hosts
+        # GLM behind a Jinja chat template instead, so the same toggle is mirrored
+        # into chat_template_kwargs there (Z.AI/Cline never see the extra field).
         payload["thinking"] = {"type": "enabled" if on else "disabled"}
+        if cfg.get("provider") == "nvidia" or "nvidia" in (cfg.get("base_url") or ""):
+            payload["chat_template_kwargs"] = {"thinking": on, "enable_thinking": on}
+    elif style == "nemotron3":
+        # Nemotron 3 (Ultra/Super/Nano): reasoning via chat-template kwargs.
+        # medium_effort trims the trace; full thinking is the default when on.
+        kwargs = {"enable_thinking": on}
+        if on and level in ("minimal", "low", "medium"):
+            kwargs["medium_effort"] = True
+        payload["chat_template_kwargs"] = kwargs
     elif style == "chat_template":
         # vLLM / NIM Jinja templates read these kwargs; an unused key is ignored by
         # the template, so sending both common spellings is safe.
@@ -662,13 +700,7 @@ def load_configs():
     return collapsed
 
 
-def save_configs(configs):
-    """Persist the ordered list of config entries to llm_config.json (atomic)."""
-    if not isinstance(configs, list):
-        return False
-    entries = [_minimize_entry(c) for c in configs
-               if isinstance(c, dict) and c.get("provider")]
-    data = {"version": 2, "configs": entries}
+def _write_config_file(data):
     tmp = _CONFIG_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -677,6 +709,20 @@ def save_configs(configs):
         return True
     except OSError:
         return False
+
+
+def save_configs(configs):
+    """Persist the ordered list of config entries to llm_config.json (atomic).
+    Top-level extras (e.g. the user's preferred_model) are carried over."""
+    if not isinstance(configs, list):
+        return False
+    entries = [_minimize_entry(c) for c in configs
+               if isinstance(c, dict) and c.get("provider")]
+    data = {"version": 2, "configs": entries}
+    prev = _read_config_file()
+    if isinstance(prev, dict) and isinstance(prev.get("preferred_model"), dict):
+        data["preferred_model"] = prev["preferred_model"]
+    return _write_config_file(data)
 
 
 # Back-compat single-config helpers — operate on the PRIMARY (first) entry, for
@@ -815,6 +861,78 @@ _THINK_TAIL_RE = re.compile(r"^.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
+# Non-JSON tool-call shapes that reasoning/open models (esp. GLM, trained on
+# harmony/XML tool syntax) emit instead of the required JSON envelope. Handled as
+# a LAST RESORT in extract_json_action, after JSON salvage finds no action.
+_TAG_RE = re.compile(
+    r"<(?:tool_call|function_call|function)(?:\s+name\s*=\s*\"(?P<attr>[\w.]+)\")?"
+    r"(?:\s*=\s*(?P<eqname>[\w.]+))?\s*>(?P<body>.*?)</(?:tool_call|function_call|function)>",
+    re.DOTALL | re.IGNORECASE,
+)
+_LEADING_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)\s*(\{.*\})\s*$", re.DOTALL)
+_BARE_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)\s*$")
+
+
+def _coerce_args(raw):
+    """Pull an args dict out of a fragment: a JSON object if present, else {}."""
+    if not raw:
+        return {}
+    for obj in _json_candidates(raw):
+        if isinstance(obj, dict):
+            # A wrapper like {"name":..,"arguments":{..}} -> use its arguments.
+            if "arguments" in obj and isinstance(obj["arguments"], dict):
+                return obj["arguments"]
+            if "args" in obj and isinstance(obj["args"], dict):
+                return obj["args"]
+            return obj
+    return {}
+
+
+def _normalize_nonjson_action(text):
+    """Map a non-JSON tool-call shape onto the canonical action, or None.
+
+    Recognizes <tool_call>/<function_call>/<function=> tags (name via attribute,
+    `=name`, or a leading token inside the body), a bare `name\\n{json}` pair, and
+    a lone registered tool name. Only accepts a bare/leading name when it is a
+    REGISTERED tool, so ordinary prose starting with a word is not misread."""
+    if not text:
+        return None
+
+    m = _TAG_RE.search(text)
+    if m:
+        body = (m.group("body") or "").strip()
+        name = m.group("attr") or m.group("eqname")
+        args = _coerce_args(body)
+        if not name:
+            # Name may be a JSON "name" field, or the leading token of the body.
+            for obj in _json_candidates(body):
+                if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+                    name = obj["name"]
+                    # Flat convention {"name": <tool>, ...args} with no
+                    # arguments/args wrapper: _coerce_args returned the object
+                    # verbatim, so drop the consumed "name" key from args (but
+                    # never strip a real `name` PARAM that came via a wrapper).
+                    if (isinstance(args, dict) and args.get("name") == name
+                            and "arguments" not in obj and "args" not in obj):
+                        args = {k: v for k, v in args.items() if k != "name"}
+                    break
+            if not name:
+                lead = _BARE_NAME_RE.match(body)
+                if lead and registry.is_registered(lead.group(1)):
+                    name = lead.group(1)
+        if name:
+            return {"type": "tool_call", "tool": name, "args": args if isinstance(args, dict) else {}}
+
+    lead = _LEADING_NAME_RE.match(text)
+    if lead and registry.is_registered(lead.group(1)):
+        return {"type": "tool_call", "tool": lead.group(1), "args": _coerce_args(lead.group(2))}
+
+    bare = _BARE_NAME_RE.match(text)
+    if bare and registry.is_registered(bare.group(1)):
+        return {"type": "tool_call", "tool": bare.group(1), "args": {}}
+
+    return None
+
 
 def strip_reasoning(text):
     """Remove <think>/<thinking> blocks from a reply. Also handles a reply that
@@ -860,6 +978,12 @@ def _normalize_action(obj):
         obj["args"] = obj.get("arguments")
     if "tool" not in obj and isinstance(obj.get("name"), str) and obj.get("type") != "final_answer":
         obj["tool"] = obj["name"]
+    # A dict that only signals "action" via a bare tool/args key (no explicit
+    # type/action field) -- e.g. a raw {"name":.., "arguments":{..}} function-call
+    # body -- is still a tool call; without this the caller sees a dict with no
+    # "type" at all and treats it as unrecognized.
+    if "type" not in obj and "tool" in obj:
+        obj["type"] = "tool_call"
     return obj
 
 
@@ -906,6 +1030,13 @@ def extract_json_action(text):
                     return _normalize_action(obj)
                 if fallback is None:
                     fallback = obj
+
+    # No action-shaped JSON found in any source. Try the non-JSON tool-call
+    # shapes (harmony/XML tags, name-then-json, bare tool name) before falling
+    # back to any stray JSON object the reply happened to contain.
+    nonjson = _normalize_nonjson_action(cleaned)
+    if nonjson is not None:
+        return nonjson
     return fallback
 
 
@@ -996,6 +1127,17 @@ def _openai_request(cfg, messages, temperature):
     if not (reasoning_on and style == "openai"):
         cfg_temp = cfg.get("temperature")
         payload["temperature"] = cfg_temp if cfg_temp is not None else temperature
+    # Native function-calling: for models flagged supports_native_tools, offer the
+    # active-group tool schemas + final_answer and REQUIRE a structured call, so the
+    # model cannot emit free-text outside the protocol. Progressive disclosure is
+    # honored via active_groups. Providers not flagged keep the prose-JSON path.
+    if _supports_native_tools(cfg):
+        from tools import tool_schema
+        payload["tools"] = tool_schema.openai_tools_for(cfg.get("active_groups"))
+        payload["tool_choice"] = "required"
+    seed = cfg.get("seed")
+    if seed is not None:
+        payload["seed"] = seed
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
@@ -1062,7 +1204,15 @@ def _openai_request(cfg, messages, temperature):
                     args = json.loads(fn.get("arguments", "{}") or "{}")
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-                return {"ok": True, "content": json.dumps({"type": "tool_call", "tool": fn.get("name", ""), "args": args})}
+                if not isinstance(args, dict):
+                    args = {}
+                fname = fn.get("name", "")
+                # final_answer is offered as a tool so tool_choice can be "required";
+                # convert it back to the final-answer envelope the loop expects.
+                if fname == "final_answer":
+                    return {"ok": True, "content": json.dumps(
+                        {"type": "final_answer", "content": args.get("content", "")})}
+                return {"ok": True, "content": json.dumps({"type": "tool_call", "tool": fname, "args": args})}
 
             # Reasoning models (OpenRouter routes DeepSeek-R1, Cohere north, etc.)
             # sometimes leave `content` null and put the whole reply in `reasoning`
@@ -1145,6 +1295,27 @@ def _split_anthropic_messages(messages):
     return ("\n\n".join(system_parts), conv)
 
 
+def _anthropic_adaptive_model(model):
+    """Whether this Claude model uses ADAPTIVE thinking + the `effort` parameter
+    (Opus/Sonnet/Haiku 4.6+ and every 5-family model) instead of the deprecated
+    `budget_tokens`. Name-sniffed, same spirit as _auto_reasoning_style."""
+    m = (model or "").lower()
+    if "fable" in m or "mythos" in m:
+        return True
+    mt = re.search(r"(opus|sonnet|haiku)-(\d+)-(\d+)", m)
+    if mt:
+        return (int(mt.group(2)), int(mt.group(3))) >= (4, 6)
+    mt = re.search(r"(opus|sonnet|haiku)-(\d+)", m)
+    if mt:
+        return int(mt.group(2)) >= 5
+    return False
+
+
+# Our effort levels mapped onto Anthropic's `effort` enum (low/medium/high/max).
+_ANTHROPIC_EFFORT = {"minimal": "low", "low": "low", "medium": "medium",
+                     "high": "high", "max": "max"}
+
+
 def _anthropic_request(cfg, messages, temperature):
     """One Anthropic Messages API request. `temperature` is intentionally NOT
     sent — Claude Opus 4.7/4.8, Sonnet 5 and Fable 5 reject sampling params."""
@@ -1155,15 +1326,20 @@ def _anthropic_request(cfg, messages, temperature):
     url = base.rstrip("/") + "/messages"
     system_text, conv = _split_anthropic_messages(messages)
     payload = {"model": cfg["model"], "max_tokens": cfg["max_tokens"], "messages": conv}
-    # Advanced option: reasoning on -> enable extended thinking with a token budget
-    # mapped from the effort level. The API requires max_tokens > budget_tokens, so
-    # bump max_tokens if needed. (Sampling params stay omitted, as thinking requires.)
+    # Reasoning on -> extended thinking. Modern Claude (4.6+/5-family) uses
+    # ADAPTIVE thinking with a top-level `effort` level (budget_tokens is
+    # deprecated there); older models get the classic token budget, which the
+    # API requires max_tokens to exceed. (Sampling params stay omitted.)
     reasoning = cfg.get("reasoning_effort")
     if reasoning:
-        budget = _THINKING_BUDGETS.get(reasoning, 8192)
-        payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        if payload["max_tokens"] <= budget:
-            payload["max_tokens"] = budget + 1024
+        if _anthropic_adaptive_model(cfg["model"]):
+            payload["thinking"] = {"type": "adaptive"}
+            payload["effort"] = _ANTHROPIC_EFFORT.get(reasoning, "high")
+        else:
+            budget = _THINKING_BUDGETS.get(reasoning, 8192)
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            if payload["max_tokens"] <= budget:
+                payload["max_tokens"] = budget + 1024
     if system_text:
         payload["system"] = system_text
     headers = {
@@ -1484,6 +1660,82 @@ def get_active_provider():
             "label": chosen.get("label", ""), "model": model}
 
 
+# --- user-selected preferred model --------------------------------------------
+# The chat composer lets the user pick which model requests should START at. The
+# choice is persisted in llm_config.json (top-level "preferred_model") so it
+# survives restarts. Fallback is DOWNWARD-ONLY from the selection: rungs ABOVE it
+# are never tried, and the cooldown mechanic brings requests back to the selected
+# model as soon as it recovers. No selection = the full ladder from the top.
+def get_preferred_model():
+    """The user's pinned starting model, validated against the current config.
+    Returns {"config_id", "model"} or None (start from the primary)."""
+    data = _read_config_file()
+    pref = data.get("preferred_model") if isinstance(data, dict) else None
+    if not isinstance(pref, dict):
+        return None
+    model = (pref.get("model") or "").strip()
+    if not model:
+        return None
+    cid = (pref.get("config_id") or "").strip()
+    for c in get_effective_configs():
+        if model in (c.get("models") or []):
+            if not cid or c.get("id") == cid:
+                return {"config_id": c.get("id"), "model": model}
+    return None
+
+
+def set_preferred_model(config_id, model):
+    """Pin (or clear, with a falsy model) the starting model for requests."""
+    data = _read_config_file()
+    if not isinstance(data, dict) or not isinstance(data.get("configs"), list):
+        data = {"version": 2, "configs": [_minimize_entry(c) for c in load_configs()]}
+    model = (model or "").strip()
+    if model:
+        data["preferred_model"] = {"config_id": (config_id or "").strip(), "model": model}
+    else:
+        data.pop("preferred_model", None)
+    return _write_config_file(data)
+
+
+def list_model_options():
+    """Every text-model rung across all provider groups, flattened in fallback
+    order, for the composer's model selector. Marks the user's preferred rung
+    (defaulting to the primary when nothing is pinned)."""
+    pref = get_preferred_model()
+    out = []
+    for g in _build_groups(get_effective_configs()):
+        for m in g.get("models") or []:
+            out.append({
+                "config_id": m.get("id"),
+                "name": m.get("name") or g.get("label") or g.get("provider"),
+                "label": g.get("label") or g.get("provider"),
+                "model": m["model"],
+                "preferred": bool(pref and pref["model"] == m["model"]
+                                  and (not pref.get("config_id") or pref["config_id"] == m.get("id"))),
+            })
+    if out and not any(o["preferred"] for o in out):
+        out[0]["preferred"] = True
+    return out
+
+
+def _apply_preference(groups, pref):
+    """Trim the group list so requests START at the user's preferred rung and only
+    fall DOWNWARD from it (never up to a more-primary model). The preferred model
+    stays first in the trimmed ladder, so the existing cooldown logic naturally
+    returns to it as soon as it recovers."""
+    if not pref:
+        return groups
+    model = pref.get("model")
+    cid = pref.get("config_id")
+    for gi, g in enumerate(groups):
+        ids = [m["model"] for m in g.get("models") or []]
+        if model in ids and (not cid or any(m.get("id") == cid for m in g["models"])):
+            trimmed = dict(g)
+            trimmed["models"] = g["models"][ids.index(model):]
+            return [trimmed] + groups[gi + 1:]
+    return groups
+
+
 def _one_request(cfg, messages, temperature):
     if cfg["protocol"] == "anthropic":
         return _anthropic_request(cfg, messages, temperature)
@@ -1560,7 +1812,7 @@ def _model_label(group, m):
     return f"{name} · {model}"
 
 
-def _run_group(group, messages, temperature, ladder=None, track_active=True):
+def _run_group(group, messages, temperature, ladder=None, track_active=True, active_groups=None):
     """Serve one request from a single provider GROUP, recovering on the correct
     axis per failure kind: rotate the API KEY on a rate limit (429/auth), switch
     the MODEL on an unavailable/queued/slow model. Models are tried primary-first
@@ -1589,6 +1841,7 @@ def _run_group(group, messages, temperature, ladder=None, track_active=True):
             key = live[0]
             cfg = dict(m["cfg"])
             cfg["api_key"] = key
+            cfg["active_groups"] = active_groups
             res = _one_request(cfg, messages, temperature)
             if res.get("ok"):
                 _ACTIVE_KEY = key                       # shared key pool (text + vision)
@@ -1619,7 +1872,7 @@ def _run_group(group, messages, temperature, ladder=None, track_active=True):
     return {"ok": False, "errors": errors}
 
 
-def ask_llm(messages, temperature=0.7):
+def ask_llm(messages, temperature=0.7, active_groups=None):
     """Send the conversation to the configured LLM(s) and return the first
     successful reply's raw text.
 
@@ -1657,13 +1910,15 @@ def ask_llm(messages, temperature=0.7):
             cycle += 1
             continue
 
-        groups = _build_groups(configs)
+        # Start at the user's selected model (composer dropdown) and fall DOWNWARD
+        # only; re-read each cycle so changing the selection mid-run takes effect.
+        groups = _apply_preference(_build_groups(configs), get_preferred_model())
         errors = []
         all_keys_dead = True   # only meaningful if we never got a non-key failure
         for gi, group in enumerate(groups):
             if _stop_requested():
                 return _stopped_response()
-            res = _run_group(group, messages, temperature)
+            res = _run_group(group, messages, temperature, active_groups=active_groups)
             if res.get("ok"):
                 if gi > 0 or cycle > 0:
                     _notify_fallback(f"{_model_label(group, res['model'])} responded — continuing.")
@@ -1753,3 +2008,184 @@ def test_connection(overrides=None):
         return {"ok": True, "provider": cfg["label"], "model": cfg["model"], "reply": reply[:200]}
     return {"ok": False, "error": res.get("error", "unknown error"),
             "provider": cfg["label"], "model": cfg["model"]}
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible PASSTHROUGH proxy
+#
+# ask_llm() above is the AGENT's own path: it wraps replies into the agent's
+# JSON protocol (final_answer / tool_call envelopes) and loops forever on total
+# failure. That's wrong for a generic OpenAI client (opencode, Cursor, curl):
+# such a client sends its OWN system prompt, tools and params and expects a
+# STANDARD OpenAI chat-completions response back — native tool_calls intact, no
+# agent envelope, and a real error instead of an infinite hang.
+#
+# passthrough_chat() below reuses the SAME two-axis fallback engine (the provider
+# groups, shared key pool, model ladder, and per-key/per-model cooldowns from
+# _build_groups / _ordered_models / _live_keys) but relays the raw upstream
+# response and makes exactly ONE full pass over every provider/model/key before
+# returning an error — so a client never blocks for minutes.
+# ---------------------------------------------------------------------------
+
+def _openai_passthrough_request(cfg, client_payload):
+    """Relay ONE OpenAI chat-completions request to `cfg`'s endpoint and return
+    the upstream JSON verbatim. Unlike _openai_request this does NOT reshape the
+    reply into the agent protocol — tool_calls, usage and multi-choice output are
+    passed straight back. `client_payload` is the caller's OpenAI body; we override
+    only `model` (to this ladder rung), inject reasoning per the config, and attach
+    the key. Returns {'ok': True, 'data': <raw json>} or the same {'ok': False,
+    'error_kind', 'error'} shape the fallback engine already understands."""
+    if not cfg["base_url"]:
+        return {"ok": False, "error_kind": "server",
+                "error": f"No base URL set for {cfg['label']}."}
+
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    payload = dict(client_payload)
+    payload.pop("stream", None)          # we always call upstream non-streaming
+    payload.pop("stream_options", None)
+    payload["model"] = cfg["model"]      # pin to this rung of the ladder
+    messages = payload.get("messages") or []
+    messages, reasoning_on, style = _apply_openai_reasoning(payload, cfg, messages)
+    payload["messages"] = messages
+    # The OpenAI reasoning style rejects sampling params; every other style keeps
+    # whatever temperature the client sent (or none).
+    if reasoning_on and style == "openai":
+        payload.pop("temperature", None)
+    # Honor the client's own max_tokens; only fall back to the config's cap when the
+    # client didn't ask for one and the provider entry sets an explicit cap.
+    if "max_tokens" not in payload and cfg.get("max_tokens_set"):
+        payload["max_tokens"] = cfg["max_tokens"]
+
+    headers = {"Content-Type": "application/json"}
+    if cfg["api_key"]:
+        headers["Authorization"] = f"Bearer {cfg['api_key']}"
+
+    last_error = None
+    last_kind = None
+    for _ in range(MAX_RETRIES):
+        try:
+            response = requests.post(url, json=payload, headers=headers,
+                                     timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+            if response.status_code == 202:
+                response = _poll_queued_result(cfg, response)
+                if response is None:
+                    return {"ok": False, "error_kind": "queue",
+                            "error": f"{cfg['label']} queued the request (HTTP 202) and it wasn't ready."}
+            if response.status_code == 429:
+                return {"ok": False, "error_kind": "rate_limit",
+                        "error": f"{cfg['label']} rate-limited this key (HTTP 429): {response.text[:300]}"}
+            if not response.ok:
+                return {"ok": False, "error_kind": _classify_status(response.status_code),
+                        "error": f"{cfg['label']} HTTP {response.status_code}: {response.text[:800]}"}
+            try:
+                data = response.json()
+            except Exception:
+                return {"ok": False, "error_kind": "server",
+                        "error": f"Invalid JSON from {cfg['label']}:\n{response.text[:800]}"}
+            # Unwrap Cline's {"data": {...}} envelope, same as _openai_request.
+            if (isinstance(data, dict) and isinstance(data.get("data"), dict)
+                    and "choices" not in data and "choices" in data["data"]):
+                data = data["data"]
+            if not (isinstance(data, dict) and data.get("choices")):
+                return {"ok": False, "error_kind": "server",
+                        "error": f"No choices from {cfg['label']}:\n{json.dumps(data)[:800]}"}
+            return {"ok": True, "data": data}
+        except requests.exceptions.Timeout:
+            return {"ok": False, "error_kind": "timeout",
+                    "error": f"{cfg['label']} did not respond within {REQUEST_TIMEOUT}s."}
+        except requests.exceptions.ConnectionError as e:
+            last_error, last_kind = f"Connection error: {e}", "connection"
+        except Exception as e:
+            last_error, last_kind = str(e), "other"
+    return {"ok": False, "error_kind": last_kind or "server",
+            "error": last_error or "unknown error"}
+
+
+def _passthrough_ladder(group, requested_model):
+    """The group's text ladder in try-order. When the client asked for a model id
+    that this group actually serves, pin to just that one (respect an explicit
+    choice); otherwise use the full capability-ordered ladder so the proxy manages
+    the fallback itself."""
+    models = group.get("models") or []
+    if requested_model:
+        exact = [m for m in models if m["model"] == requested_model]
+        if exact:
+            return exact
+    return _ordered_models(models)
+
+
+def passthrough_chat(client_payload):
+    """Serve one OpenAI chat-completions request through the full fallback stack
+    and return the RAW upstream response. Reuses the two-axis engine — rotate the
+    KEY on a rate limit, switch the MODEL on an unavailable/queued/slow one, then
+    fall through to the next provider group — but makes a SINGLE pass (no forever
+    loop): a proxy client gets a real answer or a real error, never a hang.
+
+    Only OpenAI-protocol providers participate (a generic OpenAI client can't be
+    served the Anthropic Messages shape). Returns {'ok': True, 'data': <openai
+    response>, 'served': {'provider','model'}} or {'ok': False, 'error', 'status'}."""
+    global _ACTIVE_KEY
+    requested_model = (client_payload.get("model") or "").strip()
+    groups = [g for g in _build_groups(get_effective_configs()) if _one_group_is_openai(g)]
+    if not groups:
+        return {"ok": False, "status": 503,
+                "error": ("No OpenAI-compatible provider is configured. Add one in the agent's "
+                          "LLM Settings (the passthrough proxy can't serve Anthropic-only setups).")}
+    errors = []
+    for group in groups:
+        keys = group["keys"]
+        dead = set()
+        ladder = _passthrough_ladder(group, requested_model)
+        for m in ladder:
+            while True:
+                live = _live_keys(keys, dead)
+                if not live:
+                    break                       # every key throttled — next group
+                key = live[0]
+                cfg = dict(m["cfg"])
+                cfg["api_key"] = key
+                res = _openai_passthrough_request(cfg, client_payload)
+                if res.get("ok"):
+                    _ACTIVE_KEY = key
+                    _MODEL_COOLDOWN.pop(m["model"], None)
+                    data = res["data"]
+                    if isinstance(data, dict):
+                        data.setdefault("model", m["model"])
+                    return {"ok": True, "data": data,
+                            "served": {"provider": group.get("label") or group.get("provider"),
+                                       "model": m["model"]}}
+                kind = res.get("error_kind", "other")
+                errors.append(f"{_model_label(group, m)}: {res.get('error', 'unknown error')}")
+                if kind in _KEY_ERROR_KINDS:
+                    dead.add(key)
+                    _KEY_COOLDOWN[key] = time.monotonic() + KEY_COOLDOWN_SECONDS
+                    continue                    # same model, next key
+                if kind in _MODEL_COOLDOWN_KINDS:
+                    _MODEL_COOLDOWN[m["model"]] = time.monotonic() + MODEL_COOLDOWN_SECONDS
+                break                           # next model in the ladder
+    return {"ok": False, "status": 502,
+            "error": "All configured models/providers failed. " + " | ".join(errors[-4:] or ["unknown error"])}
+
+
+def _one_group_is_openai(group):
+    """A provider group serves the OpenAI protocol when its representative entry's
+    preset does (groups built from effective configs don't carry `protocol`, so
+    resolve it from the provider preset)."""
+    provider = group.get("provider")
+    preset = PROVIDERS.get(provider) or PROVIDERS.get("other", {})
+    return preset.get("protocol", "openai") == "openai"
+
+
+def list_passthrough_models():
+    """The union of configured TEXT model ids across every OpenAI-protocol group,
+    for the proxy's GET /v1/models listing (so a client can discover real ids)."""
+    seen, out = set(), []
+    for g in _build_groups(get_effective_configs()):
+        if not _one_group_is_openai(g):
+            continue
+        for m in g.get("models") or []:
+            mid = m["model"]
+            if mid and mid not in seen:
+                seen.add(mid)
+                out.append(mid)
+    return out

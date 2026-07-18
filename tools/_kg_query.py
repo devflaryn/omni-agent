@@ -392,9 +392,23 @@ def _cmd_graphs(idx, out):
     out.append("Query one with graph_id=<id>; compare two with diff_code_graphs.")
 
 
+_KNOWN_QTYPES = {
+    "search", "stats", "search_classes", "class", "method", "callers", "callees",
+    "string_refs", "hierarchy", "so_symbols", "graph_data", "graphs", "diff",
+}
+
+
 def main():
-    qtype = sys.argv[1] if len(sys.argv) > 1 else "stats"
+    qtype = sys.argv[1] if len(sys.argv) > 1 else ""
     name = sys.argv[2] if len(sys.argv) > 2 else ""
+    # Forgiving default: a bare name (or an unrecognized query_type given WITH a
+    # name) becomes a universal search; nothing at all becomes stats. So the model
+    # can just throw an identifier at the graph and get useful hits.
+    qtype = (qtype or "").strip()
+    if not qtype:
+        qtype = "search" if name else "stats"
+    elif qtype not in _KNOWN_QTYPES:
+        qtype = "search" if name else "stats"
     try:
         limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 40
     except Exception:
@@ -627,8 +641,76 @@ def main():
                     break
             out.append("Total matching symbols shown: %d" % cnt)
 
+    elif qtype == "search":
+        # UNIVERSAL search — the forgiving default. Given any identifier the model
+        # has in hand (a method name, a class fragment, a literal like
+        # "/system/xbin/su", a native symbol), search string literals + methods +
+        # classes + native symbols at once and return the best file:line hits, so
+        # the model never has to guess the right axis (string_refs vs method vs
+        # class) up front. Strings come first — they're how anti-tamper / root /
+        # license / pinning checks are usually located.
+        if not name:
+            out.append("search needs a name. Example: query_code_graph(query_type='search', name='isRooted').")
+            print("\n".join(out))
+            return
+        n = name.lower()
+        per = max(5, limit // 3)
+        classes = _load_all_classes(graph_dir, manifest)
+        string_refs = _load_all_string_refs(graph_dir, manifest)
+
+        str_hits = [r for r in string_refs if n in r["string"].lower()]
+        meth_hits = []
+        for cname, info in classes.items():
+            for m, mi in info["methods"].items():
+                if n in m.lower():
+                    meth_hits.append((cname, m, mi, info["file"]))
+        class_hits = [c for c in classes if n in c.lower()]
+        sym_hits = []  # (kind, sym, lib)
+        for p, s in so_symbols.items():
+            for sym in s.get("exports", []):
+                if n in sym.lower():
+                    sym_hits.append(("exp", sym, p))
+            for sym in s.get("imports", []):
+                if n in sym.lower():
+                    sym_hits.append(("imp", sym, p))
+
+        total = len(str_hits) + len(meth_hits) + len(class_hits) + len(sym_hits)
+        out.append("Search '%s' in graph '%s': %d hit(s) across strings/methods/classes/native.%s"
+                   % (name, gid, total, hint))
+        if total == 0:
+            out.append("  Nothing matched. Try a shorter/different substring, search_classes for a class name, "
+                       "or grep_directory/search_smali for a raw text/regex search of the files.")
+        if str_hits:
+            out.append("STRING LITERALS (%d) — where this text is referenced:" % len(str_hits))
+            for r in str_hits[:per]:
+                out.append('  "%s"  @ %s:%d  in %s' % (r["string"][:60], r["file"], r["line"], r["holder"]))
+            if len(str_hits) > per:
+                out.append("  ... %d more (query_type='string_refs' for all)." % (len(str_hits) - per))
+        if meth_hits:
+            out.append("METHODS (%d):" % len(meth_hits))
+            for cname, m, mi, f in meth_hits[:per]:
+                out.append("  %s->%s  @ %s:%d  (calls=%d strings=%d)"
+                           % (cname, m, f, mi["line"], len(mi["calls"]), len(mi["strings"])))
+            if len(meth_hits) > per:
+                out.append("  ... %d more (query_type='method' for all)." % (len(meth_hits) - per))
+        if class_hits:
+            out.append("CLASSES (%d):" % len(class_hits))
+            for c in class_hits[:per]:
+                out.append("  %s  ->  %s  (%d methods)" % (c, classes[c]["file"], len(classes[c]["methods"])))
+            if len(class_hits) > per:
+                out.append("  ... %d more (query_type='search_classes' for all)." % (len(class_hits) - per))
+        if sym_hits:
+            out.append("NATIVE SYMBOLS (%d):" % len(sym_hits))
+            for kind, sym, p in sym_hits[:per]:
+                out.append("  [%s] %s  (%s)" % (kind, sym, p))
+        out.append("Then read_file_chunk the exact file:line, or drill in with "
+                   "query_type='callers'/'callees'/'class' on a hit above.")
+
     else:
-        out.append("Unknown query_type '%s'. Valid: stats, search_classes, class, method, callers, callees, string_refs, hierarchy, so_symbols, graph_data, graphs, diff." % qtype)
+        out.append("Unknown query_type '%s'. Valid: search (default — searches everything), stats, "
+                   "search_classes, class, method, callers, callees, string_refs, hierarchy, so_symbols, "
+                   "graph_data, graphs, diff. Tip: just pass a name with no query_type to search everything."
+                   % qtype)
 
     print("\n".join(out))
 

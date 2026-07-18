@@ -13,6 +13,8 @@ import tools.dex_editing
 import tools.native_codegen
 import tools.android_emulator
 import tools.vision_tools
+import tools.roblox_session
+import tools.session_bootstrap
 import tools.frida_tools
 import tools.plan_tools
 import tools.investigation_tools
@@ -20,3 +22,6 @@ import tools.skill_tools
 import tools.codebase_qa
 import tools.reviewer
 import tools.web_tools
+import tools.meta_tools
+import tools.delegation_tools
+import tools.command_tools

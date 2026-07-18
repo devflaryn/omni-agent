@@ -203,6 +203,83 @@
       padding: 7px 12px;
     }
 
+    /* --- chat composer: one rounded surface (claude.ai style) — textarea on
+       top, controls docked on a row INSIDE the box (upload · status · model
+       picker · send/stop). Hand-written CSS on the theme vars instead of new
+       Tailwind utilities so the precompiled tailwind.css needs no rebuild. --- */
+    .composer {
+      border: 1px solid rgb(var(--term-line));
+      background: rgb(var(--term-panel));
+      border-radius: 20px;
+      padding: 10px 10px 8px 14px;
+      box-shadow: 0 6px 24px rgb(0 0 0 / .10);
+      transition: border-color .2s ease;
+    }
+    .composer:focus-within { border-color: rgb(var(--term-cyan) / .55); }
+    .composer-input {
+      display: block; width: 100%; resize: none;
+      background: transparent; border: 0; outline: none;
+      padding: 4px 2px 6px; font-size: 13.5px; line-height: 1.55;
+      color: rgb(var(--term-text));
+    }
+    .composer-input::placeholder { color: rgb(var(--term-muted) / .7); }
+    .composer-input:disabled { opacity: .55; }
+    .composer-row { display: flex; align-items: center; gap: 4px; margin-top: 2px; }
+    .composer-icon-btn {
+      display: grid; place-items: center; width: 30px; height: 30px;
+      flex-shrink: 0; border-radius: 9px; color: rgb(var(--term-muted));
+    }
+    .composer-icon-btn:hover { background: rgb(var(--term-line) / .6); color: rgb(var(--term-text)); }
+    .composer-icon-btn:disabled { opacity: .4; }
+    .composer-model { position: relative; display: flex; align-items: center; min-width: 0; }
+    /* the native select stays as the hidden state holder (its popup can't be
+       font-styled in the desktop webview, and a native select always sizes to
+       its WIDEST option); the button + menu below are the visible UI, and the
+       button hugs the selected name */
+    .composer-model > select { display: none; }
+    .composer-model-btn {
+      display: inline-flex; align-items: center; gap: 5px; min-width: 0;
+      max-width: 280px; padding: 5px 8px; border-radius: 9px;
+      background: transparent; border: 0; outline: none; cursor: pointer;
+      font-size: 12px; font-weight: 500; color: rgb(var(--term-text));
+    }
+    .composer-model-btn:hover { background: rgb(var(--term-line) / .5); }
+    .composer-model-btn:disabled { color: rgb(var(--term-muted)); cursor: default; }
+    .composer-model-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .composer-model-caret { flex-shrink: 0; color: rgb(var(--term-muted)); transition: transform .18s ease; }
+    .composer-model-btn[aria-expanded="true"] .composer-model-caret { transform: rotate(180deg); }
+    .composer-model-menu {
+      position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 50;
+      min-width: 200px; max-width: 340px; max-height: 264px; overflow-y: auto;
+      background: rgb(var(--term-panel)); border: 1px solid rgb(var(--term-line));
+      border-radius: 12px; padding: 4px;
+      box-shadow: 0 10px 32px rgb(0 0 0 / .3);
+    }
+    .composer-model-menu.hidden { display: none; }
+    .composer-model-item {
+      display: flex; align-items: center; gap: 8px; width: 100%;
+      padding: 6px 10px; border-radius: 8px; cursor: pointer;
+      background: none; border: 0; outline: none; text-align: left;
+      font-size: 12px; color: rgb(var(--term-text));
+    }
+    .composer-model-item:hover { background: rgb(var(--term-line) / .5); }
+    .composer-model-item.active { color: rgb(var(--term-cyan)); font-weight: 500; }
+    .composer-model-item-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .composer-model-check { flex-shrink: 0; }
+    /* display is controlled here (not by Tailwind's .grid/.hidden) so the JS
+       busy-toggle of `hidden` wins deterministically regardless of CSS order */
+    .composer-btn {
+      display: grid; place-items: center; width: 32px; height: 32px;
+      flex-shrink: 0; border-radius: 10px; color: #fff;
+      box-shadow: 0 1px 2px rgb(0 0 0 / .18);
+    }
+    .composer-btn.hidden { display: none; }
+    .composer-send { background: rgb(var(--term-cyan)); }
+    .composer-send:hover { opacity: .9; }
+    .composer-send:disabled { opacity: .4; }
+    .composer-stop { background: rgb(var(--term-red)); }
+    .composer-stop:hover { opacity: .9; }
+
     /* --- system toasts (bottom-right, auto-dismiss after 10s) --- */
     #toasts {
       position: fixed; right: 16px; bottom: 16px; z-index: 60;
@@ -338,10 +415,6 @@
           <span class="tabular-nums" title="Approx. context size (chars)">ctx <span id="statCtx" class="text-term-text">0</span></span>
           <span class="tabular-nums" title="Memory compactions so far">resets <span id="statResets" class="text-term-text">0</span></span>
           <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60">plan —</button>
-          <button id="activeLlmBadge" title="LLM currently in use — click to open provider settings" class="flex items-center gap-1.5 rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60" style="max-width:220px">
-            <span class="shrink-0">⚡</span>
-            <span id="activeLlmLabel" class="truncate">LLM —</span>
-          </button>
           <button id="llmSettingsBtn" title="LLM provider settings" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           </button>
@@ -369,22 +442,32 @@
           <span class="font-semibold">Resumed from memory:</span> <span id="memoryBannerText"></span>
         </div>
 
-        <!-- input bar -->
-        <footer class="border-t border-term-line bg-term-panel px-4 py-3">
-          <div class="w-full">
-            <div class="flex items-end gap-2 rounded-2xl border border-term-line bg-term-bg px-3 py-2 shadow-sm focus-within:border-term-cyan/60">
-              <textarea id="input" rows="1" placeholder="Describe a task for the agent…"
-                class="flex-1 resize-none bg-transparent px-1 py-1 text-[13.5px] leading-6 outline-none placeholder:text-term-muted/70"></textarea>
-              <button id="sendBtn" title="Send (Enter)" class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-term-cyan text-white shadow-sm hover:opacity-90 disabled:opacity-40">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        <!-- input bar: everything lives inside one rounded composer box -->
+        <footer class="bg-term-bg px-[max(20px,calc((100%-64rem)/2))] py-3">
+          <div class="composer">
+            <textarea id="input" rows="1" placeholder="Send a Message" class="composer-input"></textarea>
+            <div class="composer-row">
+              <button id="composerUploadBtn" title="Upload files into the workspace" class="composer-icon-btn">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
               </button>
-              <button id="stopBtn" title="Stop the agent" class="hidden h-9 w-9 shrink-0 place-items-center rounded-full bg-term-red text-white shadow-sm hover:opacity-90">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-              </button>
-            </div>
-            <div class="mt-1.5 flex items-center justify-between px-1 text-[10.5px] text-term-muted">
-              <span id="hint">ready</span>
-              <span>Enter to send · Shift+Enter for newline · /clear resets chat</span>
+              <span id="hint" class="min-w-0 truncate text-[11px] text-term-muted">ready</span>
+              <div class="ml-auto flex min-w-0 shrink-0 items-center gap-1.5">
+                <span id="fallbackBadge" class="hidden shrink-0 cursor-default rounded-full border border-term-orange/40 bg-term-orange/10 px-1.5 py-0.5 text-[10px] text-term-orange" title="">⤵ fallback</span>
+                <div class="composer-model" title="Model requests start at — on failure the engine falls back to the next model BELOW and returns here as soon as it recovers">
+                  <select id="modelSelect"></select>
+                  <button id="modelSelectBtn" type="button" aria-haspopup="listbox" aria-expanded="false" class="composer-model-btn">
+                    <span id="modelSelectLabel" class="composer-model-label">—</span>
+                    <svg class="composer-model-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                  </button>
+                  <div id="modelMenu" class="composer-model-menu hidden" role="listbox"></div>
+                </div>
+                <button id="sendBtn" title="Send (Enter)" class="composer-btn composer-send">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+                </button>
+                <button id="stopBtn" title="Stop the agent" class="composer-btn composer-stop hidden">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+                </button>
+              </div>
             </div>
           </div>
         </footer>
@@ -540,130 +623,47 @@
           <div id="llmProviderTabs" class="mb-3 flex items-center gap-1.5" style="flex-wrap:wrap"></div>
           <div id="llmProviderNotes" class="mb-3 text-[11px] text-term-muted"></div>
 
-          <!-- Basic / Advanced sub-tabs -->
-          <div id="llmSubtabs" class="mb-3 flex items-center gap-1.5">
-            <button id="llmSubtabBasic" type="button" data-pane="basic"
-              class="rounded-full border px-3 py-1 text-[12px] bg-term-cyan text-white border-term-cyan">Basic</button>
-            <button id="llmSubtabAdvanced" type="button" data-pane="advanced"
-              class="rounded-full border px-3 py-1 text-[12px] border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text">Advanced</button>
+          <div class="mb-1 flex items-center justify-between">
+            <label class="block text-[10px] uppercase tracking-wider text-term-muted">API keys — shared pool</label>
+            <button id="llmKeysAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add key</button>
           </div>
+          <div id="llmKeysList" class="mb-1 flex flex-col gap-1.5"></div>
+          <div class="mb-3 text-[11px] text-term-muted">Any key serves any model; rotated automatically on rate limits.</div>
 
-          <!-- ===== Basic pane ===== -->
-          <div id="llmPaneBasic">
-            <div class="mb-1 flex items-center justify-between">
-              <label class="block text-[10px] uppercase tracking-wider text-term-muted">API keys — shared pool</label>
-              <button id="llmKeysAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add key</button>
-            </div>
-            <div id="llmKeysList" class="mb-1 flex flex-col gap-1.5"></div>
-            <div class="mb-3 text-[11px] text-term-muted">
-              A <span class="font-mono">shared pool</span> — any key can serve any model (text or vision). On a rate
-              limit (HTTP 429) the engine rotates to the next key without changing the model.
-            </div>
-
-            <div class="mb-1 flex items-center justify-between">
-              <label class="block text-[10px] uppercase tracking-wider text-term-muted">text models — fallback ladder</label>
-              <button id="llmModelsAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add model</button>
-            </div>
-            <div id="llmModelsList" class="mb-1 flex flex-col gap-1.5"></div>
-            <div class="mb-3 text-[11px] text-term-muted">
-              Text-to-text models in priority order (primary at the top — use ↑/↓ to reorder). The engine prefers the
-              top model and only falls to the next when it's unavailable/overloaded (503 / queue / timeout), returning
-              to the primary once it recovers. Keys and models are independent.
-              Each model has its own <span class="font-mono">reasoning</span> + <span class="font-mono">style</span> —
-              leave them on <span class="font-mono">inherit</span>/<span class="font-mono">auto</span> to use the
-              provider defaults (Advanced tab), or set them per model when they differ (e.g.
-              <span class="font-mono">glm-5.2</span> → thinking, <span class="font-mono">deepseek-v4</span> → its
-              none/high/max effort).
-            </div>
-
-            <div class="mb-1 flex items-center justify-between">
-              <label class="block text-[10px] uppercase tracking-wider text-term-muted">vision models — image-to-text</label>
-              <button id="llmVisionAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add vision model</button>
-            </div>
-            <div id="llmVisionList" class="mb-1 flex flex-col gap-1.5"></div>
-            <div class="mb-3 text-[11px] text-term-muted">
-              Separate image-to-text ladder for reasoning over screenshots (the <span class="font-mono">analyze_image</span>
-              tool + emulator frame analysis). Shares the same key pool. Leave empty if you don't need vision. e.g.
-              <span class="font-mono">meta/llama-3.2-90b-vision-instruct</span>.
-            </div>
-
-            <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">base URL</label>
-            <input id="llmBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://…/v1"
-              class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+          <div class="mb-1 flex items-center justify-between">
+            <label class="block text-[10px] uppercase tracking-wider text-term-muted">text models — fallback order</label>
+            <button id="llmModelsAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add model</button>
           </div>
+          <div id="llmModelsList" class="mb-1 flex flex-col gap-1.5"></div>
+          <div class="mb-3 text-[11px] text-term-muted">Top = primary. Drag ⠿ to reorder · ⚙ for reasoning &amp; test.</div>
 
-          <!-- ===== Advanced pane ===== -->
-          <div id="llmPaneAdvanced" class="hidden">
-            <div class="mb-3 rounded-lg border border-term-line/70 bg-term-line/20 px-3 py-2 text-[11px] text-term-muted">
-              These reasoning fields are the provider's <span class="font-mono">defaults</span> — every model inherits
-              them unless you override that model in the <span class="font-mono">text models</span> list (Basic tab).
-              Set them per model there when a fallback ladder mixes families.
-            </div>
-            <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">reasoning effort (default)</label>
-            <select id="llmReasoning"
-              class="mb-1 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan">
-              <option value="">Off / None</option>
-              <option value="minimal">Minimal</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-              <option value="max">Max (DeepSeek V4 think-max)</option>
-            </select>
-            <div class="mb-3 text-[11px] text-term-muted">
-              Turns on step-by-step reasoning where the provider supports it. Claude uses extended thinking (budget
-              scales with the level); OpenAI-compatible models use the <span class="font-mono">reasoning style</span>
-              below. DeepSeek V4 has exactly three modes — Off → <span class="font-mono">none</span>, any level →
-              <span class="font-mono">high</span>, Max → <span class="font-mono">max</span>. Leave Off for models that
-              don't support it.
-            </div>
+          <div class="mb-1 flex items-center justify-between">
+            <label class="block text-[10px] uppercase tracking-wider text-term-muted">vision models — image-to-text</label>
+            <button id="llmVisionAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add vision model</button>
+          </div>
+          <div id="llmVisionList" class="mb-1 flex flex-col gap-1.5"></div>
+          <div class="mb-3 text-[11px] text-term-muted">Optional — used to analyze screenshots/images. Same key pool.</div>
 
-            <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">reasoning style (default)</label>
-            <select id="llmReasoningStyle"
-              class="mb-1 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan">
-              <option value="">Auto-detect (from model name)</option>
-              <option value="openai">OpenAI — reasoning_effort (o-series, GPT-5)</option>
-              <option value="thinking">GLM / Z.AI — thinking flag (GLM 4.x / 5.x)</option>
-              <option value="chat_template">Qwen / DeepSeek V3 — chat-template kwargs</option>
-              <option value="deepseek_v4">DeepSeek V4 — reasoning_effort none/high/max</option>
-              <option value="system">Nemotron — system directive</option>
-              <option value="none">None — model reasons on its own</option>
-            </select>
-            <div class="mb-3 text-[11px] text-term-muted">
-              Only for OpenAI-compatible providers (Claude ignores it). <span class="font-mono">Auto</span> picks by model
-              name — GLM → thinking, Nemotron → system, DeepSeek V4 → its none/high/max modes, Qwen/DeepSeek V3 →
-              chat-template, otherwise OpenAI. Set it explicitly if a model needs a specific one (e.g.
-              <span class="font-mono">glm-5.2</span> won't reason without the thinking flag). The effort level tunes the
-              OpenAI and DeepSeek V4 styles; the others are simply on/off.
-            </div>
+          <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">base URL</label>
+          <input id="llmBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://…/v1"
+            class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
 
-            <div class="mb-1">
-              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">temperature</label>
-              <input id="llmTemperature" type="number" step="0.1" min="0" max="2" placeholder="provider default" style="width:160px"
-                class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
-            </div>
-            <div class="mb-3 text-[11px] text-term-muted">Blank = provider default. Ignored when reasoning is on (reasoning models reject it).</div>
-
-            <div id="llmMaxTokensRow" class="mb-1">
+          <div class="mb-1 flex items-end gap-3" style="flex-wrap:wrap">
+            <div>
               <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">max output tokens</label>
-              <input id="llmMaxTokens" type="number" min="256" placeholder="provider default" style="width:160px"
-                class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+              <input id="llmMaxTokens" type="number" min="256" placeholder="default" style="width:130px"
+                class="rounded-xl border border-term-line bg-term-bg px-3 py-2 font-mono outline-none focus:border-term-cyan" />
             </div>
-            <div class="mb-3 text-[11px] text-term-muted">
-              Blank = provider default; only sent when set. Reasoning tokens count against it — NIM DeepSeek V4 Pro
-              allows up to 16384, worth setting for Max reasoning so long thinking isn't truncated.
+            <div>
+              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">context window</label>
+              <input id="llmContextWindow" type="number" min="1000" placeholder="1000000" style="width:130px"
+                class="rounded-xl border border-term-line bg-term-bg px-3 py-2 font-mono outline-none focus:border-term-cyan" />
             </div>
-
-            <div class="mb-1">
-              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">context window (tokens)</label>
-              <input id="llmContextWindow" type="number" min="1000" placeholder="1000000" style="width:200px"
-                class="rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
+            <div>
+              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">temperature</label>
+              <input id="llmTemperature" type="number" step="0.1" min="0" max="2" placeholder="default" style="width:110px"
+                class="rounded-xl border border-term-line bg-term-bg px-3 py-2 font-mono outline-none focus:border-term-cyan" />
             </div>
-            <div class="mb-3 text-[11px] text-term-muted">The model's max context; the agent auto-summarizes as it approaches this to avoid overflow.</div>
-          </div>
-
-          <div class="flex items-center gap-2">
-            <button id="llmTestBtn" class="rounded-full border border-term-line px-4 py-2 text-term-text hover:bg-term-line/60">test connection</button>
-            <span id="llmTestResult" class="text-[11px] text-term-muted"></span>
           </div>
         </div>
         <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">

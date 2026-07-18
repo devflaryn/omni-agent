@@ -8,7 +8,12 @@ RUN apt-get update && apt-get install -y \
     zip \
     wget \
     curl \
-    default-jdk \
+    # Ghidra 11.2+ REQUIRES JDK 21 (Ubuntu 22.04's default-jdk is JDK 17, which
+    # makes analyzeHeadless fail to launch — leaving an empty .ghidra_proj and no
+    # decompiler output). JDK 21 also runs apktool/baksmali/jadx/apksigner fine,
+    # so it's the single JDK for the whole sandbox. See JAVA_HOME below + the
+    # Ghidra install step.
+    openjdk-21-jdk \
     binutils \
     # LLVM's llvm-objdump gives clean ARM64 disassembly and resolves @plt call
     # targets on stripped .so files — output the host's x86_64 binutils objdump
@@ -45,12 +50,36 @@ RUN wget https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/li
     wget https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O /usr/local/bin/apktool.jar && \
     chmod +x /usr/local/bin/apktool.jar
 
-# Create baksmali/smali wrapper scripts using apktool's bundled smali library
-# apktool 2.9.3 bundles smali 2.5.x; we expose the main classes as standalone commands.
-RUN printf '#!/bin/sh\nexec java -cp /usr/local/bin/apktool.jar com.android.tools.smali.baksmali.Main "$@"\n' > /usr/local/bin/baksmali && \
+# Create baksmali/smali wrapper scripts using apktool's bundled smali library.
+#
+# apktool 2.9.3 bundles smali/baksmali as an internal DEPENDENCY, not a runnable
+# CLI: `com.android.tools.smali.baksmali.Main` (and the smali equivalent) is a
+# jcommander Command subclass with no main() — `java -cp apktool.jar
+# com.android.tools.smali.baksmali.Main ...` fails with "Main method not found
+# in class ...". BaksmaliShim/SmaliShim (docker/) call the same library entry
+# points apktool itself uses internally (Baksmali.disassembleDexFile,
+# brut.androlib.mod.SmaliMod.assembleSmaliFile), so these wrappers actually work.
+COPY docker/BaksmaliShim.java docker/SmaliShim.java /usr/local/lib/omni-shims/
+RUN cd /usr/local/lib/omni-shims && javac -cp /usr/local/bin/apktool.jar BaksmaliShim.java SmaliShim.java && \
+    printf '#!/bin/sh\nset -e\ncase "$1" in d|x|disassemble) shift ;; esac\ndex=""; outdir=""; api=26\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) outdir="$2"; shift 2 ;;\n    -a|--api-level) api="$2"; shift 2 ;;\n    *) dex="$1"; shift ;;\n  esac\ndone\nexec java -cp /usr/local/bin/apktool.jar:/usr/local/lib/omni-shims BaksmaliShim "$dex" "$outdir" "$api"\n' > /usr/local/bin/baksmali && \
     chmod +x /usr/local/bin/baksmali && \
-    printf '#!/bin/sh\nexec java -cp /usr/local/bin/apktool.jar com.android.tools.smali.smali.Main "$@"\n' > /usr/local/bin/smali && \
+    printf '#!/bin/sh\nset -e\ncase "$1" in a|assemble) shift ;; esac\nsmalidir=""; outdex=""; api=26\nwhile [ $# -gt 0 ]; do\n  case "$1" in\n    -o) outdex="$2"; shift 2 ;;\n    -a|--api-level) api="$2"; shift 2 ;;\n    *) smalidir="$1"; shift ;;\n  esac\ndone\nexec java -cp /usr/local/bin/apktool.jar:/usr/local/lib/omni-shims SmaliShim "$smalidir" "$outdex" "$api"\n' > /usr/local/bin/smali && \
     chmod +x /usr/local/bin/smali
+
+# Install APKEditor — a decode/build tool built on ARSCLib that correctly
+# handles APKs with MULTIPLE app-defined resource packages (e.g. Roblox, which
+# bundles a personasdk resource package alongside its main one). apktool has a
+# long-standing, still-open upstream limitation there (iBotPeaches/Apktool#2514):
+# it assumes package 0x7f is the only non-framework package, and aborts full
+# resource decoding with "Can't find framework resources for package of id: N"
+# on anything else. decode_apk automatically falls back to APKEditor for that
+# exact failure signature (see tools/apk_tools.py), which is what lets the
+# agent's own patched Roblox builds be decoded/rebuilt with a real (text)
+# AndroidManifest.xml instead of only the binary -r fallback.
+RUN wget -q https://github.com/REAndroid/APKEditor/releases/download/V1.4.9/APKEditor-1.4.9.jar \
+        -O /usr/local/bin/APKEditor.jar && \
+    printf '#!/bin/sh\nexec java -jar /usr/local/bin/APKEditor.jar "$@"\n' > /usr/local/bin/apkeditor && \
+    chmod +x /usr/local/bin/apkeditor
 
 # Install jadx — the standard Android decompiler that turns DEX bytecode into
 # readable Java (far easier to read than smali, especially for obfuscated
@@ -62,6 +91,15 @@ RUN JADX_VERSION=1.5.0 && \
     unzip -q /tmp/jadx.zip -d /opt/jadx && \
     rm /tmp/jadx.zip && \
     ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx
+
+# Ghidra's launch script picks the JVM from JAVA_HOME first; pin it to the JDK 21
+# we installed so analyzeHeadless always starts with a supported runtime. The
+# openjdk install dir is arch-specific (java-21-openjdk-amd64 on x86_64,
+# -arm64 on Apple-Silicon builds), so resolve it from the real `java` binary and
+# expose it under a STABLE path — never hardcode the arch suffix.
+RUN ln -sfn "$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")" /opt/java21
+ENV JAVA_HOME=/opt/java21
+ENV PATH=/opt/java21/bin:$PATH
 
 # Install Ghidra headless analyzer
 # Downloads the latest stable release, extracts to /opt/ghidra

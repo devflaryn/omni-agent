@@ -182,6 +182,7 @@ def patch_binary_string(so_path, old_string, new_string):
 
 @registry.register(
     name="binary_patch",
+    summary="find a byte SEQUENCE and overwrite it (search-and-replace by content; disambiguates multiple matches)",
     description=(
         "Locates a specific BYTE SEQUENCE inside a binary and overwrites it with new bytes — the precise, "
         "disassembly-free way to flip a compiled control-flow instruction (e.g. turn a conditional branch into "
@@ -503,6 +504,7 @@ if seg_note:
 
 @registry.register(
     name="patch_at_offset_with_bytes",
+    summary="write hex at a known offset, REVERSIBLE (returns old bytes) + marks segment writable — robust successor for odd ELF layouts",
     description=(
         "Writes a hex byte sequence at a specific FILE OFFSET and returns the PREVIOUS bytes so the change is "
         "reversible. This is the robust successor to patch_bytes_at_offset/patch_function_return for cases where "

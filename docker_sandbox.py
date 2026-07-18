@@ -42,8 +42,9 @@ def _kill_proc(proc):
 # the same directory that's bind-mounted to /workspace inside the sandbox.
 # Set by setup_sandbox(); read by tools that need real Python file I/O on the
 # host instead of going through docker exec (currently: the Android emulator
-# tools, since the emulator itself runs natively on Windows rather than
-# inside the Linux sandbox used for APK static analysis/patching).
+# tools, since the emulator itself runs natively on the host machine — macOS /
+# Linux / Windows — rather than inside the Linux sandbox used for APK static
+# analysis/patching).
 _workspace_host_path = None
 
 
@@ -110,10 +111,95 @@ def setup_sandbox(project_workspace_dir):
 
 DEFAULT_TIMEOUT = 60  # seconds; callers can override for long-running tools
 
+# Substrings in a docker-exec result that mean the SANDBOX ITSELF is unhealthy
+# (container stopped/corrupt or the daemon is unreachable) — as opposed to a
+# normal non-zero exit from the user's command. When we see one of these we try
+# to recover the container ONCE and, if that fails, return a clear actionable
+# error instead of an empty result the caller would mistake for "tool did nothing"
+# (e.g. decode_apk producing no folder). Kept narrow so a real command failure
+# (apktool exit 1 on a bad APK) is never mistaken for a sandbox failure.
+_SANDBOX_DOWN_SIGNS = (
+    "input/output error",              # corrupted container/overlay fs (Docker Desktop disk fault)
+    "no such container",               # container was removed
+    "is not running",                  # container stopped
+    "is restarting",                   # container crash-looping
+    "cannot connect to the docker daemon",  # Docker Desktop not running
+    "error response from daemon",      # generic daemon-level failure
+    "oci runtime exec failed",         # exec couldn't start
+)
+
+
+def _looks_like_sandbox_down(res):
+    """True when a docker-exec result indicates the sandbox/daemon is unhealthy
+    (not just a command that exited non-zero)."""
+    if not isinstance(res, dict):
+        return False
+    blob = ((res.get("stderr") or "") + "\n" + (res.get("error") or "")).lower()
+    # returncode 126/127 from `docker exec` itself (not the inner command) usually
+    # accompanies these messages; we key on the message text to stay precise.
+    return any(sign in blob for sign in _SANDBOX_DOWN_SIGNS)
+
+
+def container_running():
+    """True iff the sandbox container exists AND is in the running state. Best
+    effort — any docker error is treated as 'not running'."""
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER_NAME],
+            capture_output=True, text=True, timeout=15)
+        return r.returncode == 0 and r.stdout.strip() == "true"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def ensure_container(force=False):
+    """Make sure the sandbox container is up, restarting it against the last-known
+    workspace mount if it stopped. With force=True it RECREATES the container even
+    if `docker inspect` reports it running — used after an exec failed with an
+    I/O error, since a container can be 'Up' while its overlay filesystem is
+    corrupt (inspect lies, exec doesn't). Returns True on success; never raises."""
+    if not force and container_running():
+        return True
+    if _workspace_host_path is None:
+        return False  # nothing to mount yet (setup_sandbox never ran)
+    try:
+        subprocess.run(["docker", "rm", "-f", CONTAINER_NAME],
+                       capture_output=True, text=True, timeout=30)
+        r = subprocess.run(
+            ["docker", "run", "-d", "--name", CONTAINER_NAME,
+             "-v", f"{_workspace_host_path}:/workspace",
+             IMAGE_NAME, "tail", "-f", "/dev/null"],
+            capture_output=True, text=True, timeout=60)
+        return r.returncode == 0 and container_running()
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+_SANDBOX_DOWN_MSG = (
+    "The Docker sandbox is not usable right now (the container '{c}' is stopped, "
+    "was removed, or its filesystem is corrupt, or the Docker daemon is "
+    "unreachable) and it could not be auto-restarted. No command ran, so tools "
+    "like decode_apk create no output. Fix Docker, then retry:\n"
+    "  1. Make sure Docker Desktop is running and healthy.\n"
+    "  2. If you see repeated 'input/output error' from Docker, its disk image is "
+    "corrupt — restart Docker Desktop; if it persists, Settings -> Troubleshoot -> "
+    "Clean / Purge data (or enlarge the disk image).\n"
+    "  3. Reopen the project (or re-select the workspace) so the sandbox image "
+    "rebuilds and the container remounts.\n"
+    "Docker said: {detail}"
+).format
+
+
 def run_cmd(command, timeout=DEFAULT_TIMEOUT):
     """
     Executes a shell command inside the docker sandbox.
     Returns a dictionary with stdout, stderr, and the return code.
+
+    Sandbox health: if the container is down/corrupt (so the command couldn't run
+    at all), we try to bring it back ONCE and re-run; if it still can't run, we
+    return a CLEAR error dict rather than an empty result the caller would treat as
+    "the tool produced nothing". A normal non-zero exit from the command itself is
+    passed through untouched.
 
     On timeout the command is NOT killed outright: if a timeout decider is
     registered (see set_timeout_decider) it is asked whether to kill the
@@ -122,9 +208,21 @@ def run_cmd(command, timeout=DEFAULT_TIMEOUT):
     dict returned.
     """
     cmd = ["docker", "exec", CONTAINER_NAME, "sh", "-c", command]
-    return _run_polling(cmd, timeout, display=command,
-                        timeout_msg=f"Command timed out after {{elapsed}}s. "
-                        "Try a lighter command or break the task into smaller steps.")
+    timeout_msg = ("Command timed out after {elapsed}s. "
+                   "Try a lighter command or break the task into smaller steps.")
+    res = _run_polling(cmd, timeout, display=command, timeout_msg=timeout_msg)
+
+    # If the sandbox itself looks down (not just a command that failed), try to
+    # recover the container once, then re-run the command. force=True because an
+    # I/O-error exec can come from a container that still reports "running".
+    if _looks_like_sandbox_down(res):
+        if ensure_container(force=True):
+            res = _run_polling(cmd, timeout, display=command, timeout_msg=timeout_msg)
+        if _looks_like_sandbox_down(res):
+            detail = ((res.get("stderr") or res.get("error") or "").strip() or "(no detail)")[:300]
+            return {"stdout": "", "stderr": detail, "returncode": res.get("returncode", 1),
+                    "error": _SANDBOX_DOWN_MSG(c=CONTAINER_NAME, detail=detail)}
+    return res
 
 
 def _run_polling(cmd, timeout, display, timeout_msg):

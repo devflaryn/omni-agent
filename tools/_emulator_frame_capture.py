@@ -76,7 +76,7 @@ def _mean_brightness(img):
 
 def capture_keyframes(adb_path, output_dir, duration_seconds, interval_seconds,
                        change_threshold, black_threshold, sample_scale_w, serial=None,
-                       change_percent=8.0, pixel_threshold=24, max_keyframes=120,
+                       change_percent=2.0, pixel_threshold=24, max_keyframes=120,
                        start_monotonic_ns=None, start_epoch_ms=None):
     """Runs the sample/diff/keep loop for duration_seconds and writes keyframe
     PNGs + metadata.json into output_dir (a real host directory).

@@ -1,12 +1,78 @@
 import inspect
 import json
 
+# --- Progressive tool disclosure --------------------------------------------
+# The module a tool is defined in determines its "toolset". CORE toolsets are
+# always shown in the prompt in full; the rest are shown only as a compact
+# one-line catalog until they are ACTIVATED — either by the model calling one of
+# their tools (usage-driven auto-expand) or via the expand_tools() tool. An
+# activated toolset folds its full schemas into the prompt on subsequent turns.
+#
+# This is the single biggest context win: the base prompt drops from ~35k tokens
+# of tool schemas (all 105 tools) to a small core + a ~1k-token catalog, without
+# hiding any capability — every tool still executes if called, and a malformed
+# call to a catalog-only tool gets that tool's full schema back so the model can
+# self-correct immediately (see agent.py's error-injection path).
+CORE_GROUP = "core"
+_GROUP_BY_MODULE = {
+    # Always-on core: file/shell/search, code navigation, the plan +
+    # investigation workflow, skills, review, web, hashing.
+    "filesystem": CORE_GROUP,
+    "shell": CORE_GROUP,
+    "text_analysis": CORE_GROUP,
+    "code_graph": CORE_GROUP,
+    "codebase_qa": CORE_GROUP,
+    "plan_tools": CORE_GROUP,
+    "investigation_tools": CORE_GROUP,
+    "skill_tools": CORE_GROUP,
+    "reviewer": CORE_GROUP,
+    "web_tools": CORE_GROUP,
+    "hash_tools": CORE_GROUP,
+    "meta_tools": CORE_GROUP,
+    "delegation_tools": CORE_GROUP,
+    # On-demand domain toolsets:
+    "apk_tools": "apk",
+    "session_bootstrap": "apk",
+    "dex_editing": "smali",
+    "binary_analysis": "native",
+    "binary_editing": "native",
+    "hex_patching": "native",
+    "native_codegen": "native",
+    "android_emulator": "emulator",
+    "vision_tools": "emulator",
+    "roblox_session": "emulator",
+    "frida_tools": "frida",
+}
+# Per-tool overrides that beat the module mapping. Used to pull a few heavy or
+# rarely-first-used tools out of core (e.g. graph BUILDING — query_code_graph
+# auto-builds, so the verbose build/diff/list tools don't need to sit in the
+# base prompt — and web tools) into their own on-demand toolsets.
+_GROUP_BY_TOOL = {
+    "build_code_graph": "graph",
+    "diff_code_graphs": "graph",
+    "list_code_graphs": "graph",
+    "web_search": "web",
+    "read_webpage": "web",
+    "download_file": "web",
+}
+# Human-facing one-liners for the on-demand toolset headers in the catalog.
+GROUP_LABELS = {
+    "apk": "APK unpack / decode / rebuild / sign / inspect / manifest",
+    "smali": "standalone DEX & smali disassembly / method+field patching",
+    "native": "native .so analysis + byte / assembly / C patching",
+    "emulator": "Android emulator: install / launch / logcat / screenshots / vision",
+    "frida": "Frida runtime hooking + tracing + unpinning (dev base: root + frida-server)",
+    "graph": "build / diff / list code knowledge-graphs (query_code_graph auto-builds, so only needed to index a sub-dir or a named version)",
+    "web": "internet search / fetch a page / download a file",
+}
+
 
 class ToolRegistry:
     def __init__(self):
         self._tools = {}
 
-    def register(self, name, description, params_schema, output=None, when_to_use=None):
+    def register(self, name, description, params_schema, output=None,
+                 when_to_use=None, summary=None):
         """
         Decorator to register a tool with the framework.
 
@@ -18,6 +84,9 @@ class ToolRegistry:
                             returns — what the LLM will see in TOOL RESULT.
             when_to_use:    (optional) Short guidance on when to choose this
                             tool over alternatives.
+            summary:        (optional) A <=90-char one-liner used in the compact
+                            on-demand catalog. Falls back to the first sentence
+                            of `description` when omitted.
         """
         def decorator(func):
             self._tools[name] = {
@@ -25,35 +94,132 @@ class ToolRegistry:
                 "params": params_schema,
                 "output": output or "",
                 "when_to_use": when_to_use or "",
+                "summary": (summary or "").strip(),
                 "func": func
             }
             return func
         return decorator
 
-    def get_tool_prompt(self, allowed_tools=None):
+    def is_registered(self, name):
+        """True iff `name` is a real registered tool. Used to validate a skill's
+        allowed-tools so a typo / renamed / removed tool in a SKILL.md surfaces
+        as an authoring bug instead of silently mapping to nothing."""
+        return name in self._tools
+
+    # --- toolset helpers ------------------------------------------------------
+    def group_of(self, name):
+        """The toolset a tool belongs to (its defining module's group, or
+        CORE_GROUP if unmapped)."""
+        if name in _GROUP_BY_TOOL:
+            return _GROUP_BY_TOOL[name]
+        data = self._tools.get(name)
+        if not data:
+            return CORE_GROUP
+        mod = getattr(data["func"], "__module__", "") or ""
+        base = mod.rsplit(".", 1)[-1]
+        return _GROUP_BY_MODULE.get(base, CORE_GROUP)
+
+    def domain_groups(self):
+        """All non-core toolset names that actually have tools, in a stable
+        order (order of first appearance in the registry)."""
+        seen = []
+        for name in self._tools:
+            g = self.group_of(name)
+            if g != CORE_GROUP and g not in seen:
+                seen.append(g)
+        return seen
+
+    def tools_in_group(self, group):
+        return [n for n in self._tools if self.group_of(n) == group]
+
+    def _summary_line(self, name):
+        data = self._tools[name]
+        if data["summary"]:
+            return data["summary"]
+        d = (data["description"] or "").strip().replace("\n", " ")
+        cut = d.find(". ")
+        if 0 < cut <= 100:
+            return d[:cut]
+        return (d[:100].rstrip() + "…") if len(d) > 100 else d
+
+    def _full_block(self, name):
+        data = self._tools[name]
+        block = f"\n### {name}\n{data['description']}\n"
+        if data["when_to_use"]:
+            block += f"When: {data['when_to_use']}\n"
+        block += f"Params: {json.dumps(data['params'])}\n"
+        if data["output"]:
+            block += f"Output: {data['output']}\n"
+        return block
+
+    def full_tool_block(self, name):
+        """Public: the full schema block for ONE tool (used by expand_tools and
+        the malformed-call error-injection path). Empty string if unknown."""
+        return self._full_block(name) if name in self._tools else ""
+
+    def group_full_blocks(self, group):
+        """Full schema blocks for every tool in a group, concatenated."""
+        return "".join(self._full_block(n) for n in self.tools_in_group(group))
+
+    def get_tool_prompt(self, allowed_tools=None, active_groups=None):
         """
-        Generates the system prompt segment listing available tools. Each entry
-        is compact — name, what it does, when to use it, params and output — with
-        the call format stated ONCE up front instead of repeated per tool (that
-        repetition was pure token overhead and, on smaller models, noise that
-        encouraged malformed calls).
+        Generates the system prompt segment listing available tools. Each full
+        entry is compact — name, what it does, when to use it, params, output —
+        with the call format stated ONCE up front.
+
+        Progressive disclosure:
+          * active_groups is None  -> LEGACY behavior: every tool rendered in
+            full (used by isolated sub-agents/tests that want the whole surface).
+          * active_groups is a set -> CORE tools + tools of any active domain
+            group are rendered in full; every other domain tool is shown as a
+            single catalog line under its toolset header. The model can call a
+            catalog tool directly (it still executes) or expand_tools("<group>")
+            to pull the full schemas in first.
+
+        allowed_tools (if given) still hard-filters the visible surface.
         """
         prompt = (
             "AVAILABLE TOOLS\n"
             'Call ONE tool per turn as JSON: {"type":"tool_call","tool":"<name>","args":{...}}. '
-            "Use only the args listed for that tool. Each entry below is: name — what it does; "
+            "Use only the args listed for that tool. Each full entry below is: name — what it does; "
             "When: when to pick it; Params: its arguments; Output: what you get back.\n"
         )
-        for name, data in self._tools.items():
-            if allowed_tools is not None and name not in allowed_tools:
-                continue
 
-            prompt += f"\n### {name}\n{data['description']}\n"
-            if data["when_to_use"]:
-                prompt += f"When: {data['when_to_use']}\n"
-            prompt += f"Params: {json.dumps(data['params'])}\n"
-            if data["output"]:
-                prompt += f"Output: {data['output']}\n"
+        def visible(name):
+            return allowed_tools is None or name in allowed_tools
+
+        if active_groups is None:
+            for name in self._tools:
+                if visible(name):
+                    prompt += self._full_block(name)
+            prompt += "\nEND OF TOOL LIST.\n"
+            return prompt
+
+        active = set(active_groups or ())
+        catalog = {}  # group -> [names] for inactive domain groups
+        for name in self._tools:
+            if not visible(name):
+                continue
+            grp = self.group_of(name)
+            if grp == CORE_GROUP or grp in active:
+                prompt += self._full_block(name)
+            else:
+                catalog.setdefault(grp, []).append(name)
+
+        if catalog:
+            prompt += (
+                "\n---\nON-DEMAND TOOLSETS — these tools exist and work; only their full\n"
+                "parameters are hidden to save context. Call one directly and its toolset\n"
+                "auto-expands next turn, or call expand_tools(\"<group>\") to see full params first.\n"
+            )
+            for grp in self.domain_groups():
+                names = catalog.get(grp)
+                if not names:
+                    continue
+                label = GROUP_LABELS.get(grp, grp)
+                prompt += f"\n[{grp}] {label}:\n"
+                for name in names:
+                    prompt += f"  - {name} — {self._summary_line(name)}\n"
 
         prompt += "\nEND OF TOOL LIST.\n"
         return prompt

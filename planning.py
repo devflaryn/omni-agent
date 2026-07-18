@@ -90,12 +90,16 @@ class Plan:
     # --- steps (items) ---------------------------------------------------------
     def add_item(self, content, status="pending", after_id=None, notes=None,
                  action=None, purpose=None, expected=None, verification=None,
-                 fallback=None, phase_id=None, explanation=None):
+                 fallback=None, phase_id=None, explanation=None, delegate=None):
         item = {
             "id": _new_id(),
             "content": content,
             "status": status if status in VALID_STATUSES else "pending",
             "notes": notes or "",
+            # Optional delegation: the name of a subagent that should execute this
+            # step in its own isolated context (the harness auto-dispatches it when
+            # the step is marked in_progress; only its distilled report returns).
+            "delegate": delegate or "",
             # Evidence-driven step fields (all optional; important steps fill them).
             "action": action or "",
             "purpose": purpose or "",
@@ -126,7 +130,7 @@ class Plan:
 
     def update_item(self, item_id, status=None, content=None, notes=None,
                     action=None, purpose=None, expected=None, verification=None,
-                    fallback=None, explanation=None):
+                    fallback=None, explanation=None, delegate=None):
         item = self.find(item_id)
         if not item:
             return None
@@ -142,7 +146,7 @@ class Plan:
         # so refining status doesn't wipe an existing verification/fallback.
         for key, val in (("action", action), ("purpose", purpose), ("expected", expected),
                          ("verification", verification), ("fallback", fallback),
-                         ("explanation", explanation)):
+                         ("explanation", explanation), ("delegate", delegate)):
             if val is not None:
                 item[key] = val
         item["updated_at"] = time.time()
@@ -316,7 +320,11 @@ class Plan:
             "active_item_id": active["id"] if active else None,
         }
 
-    def to_markdown(self):
+    def to_markdown(self, full=False):
+        """Render the plan. By default only the CURRENT phase's steps are shown in
+        full (older phases collapse to a count) so the plan stays compact in the
+        live prompt across a long run; pass full=True (e.g. from plan_view) to list
+        every step."""
         icon = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]", "skipped": "[-]"}
         lines = [f"Task: {self.task}"]
         if self.outcome and self.outcome != "active":
@@ -345,7 +353,22 @@ class Plan:
         cur = self.current_phase()
         steps_header = "Steps" + (f" (current phase: {cur['title']})" if cur else "") + ":"
         lines.append(steps_header)
-        for it in self.items:
+        # On a long, multi-phase run the step list grows without bound. Since STEPS
+        # are the *current-phase* layer (older phases' steps are settled history),
+        # render only the current phase's steps — plus any still-in-progress step —
+        # in full, and summarize the rest as a one-line count. This keeps the plan
+        # section that rides in the prompt small even after hundreds of steps. When
+        # there are no phases at all, everything is "current".
+        if full or not cur:
+            shown = list(self.items)
+        else:
+            shown = [it for it in self.items
+                     if it.get("phase_id") == self.current_phase_id or it["status"] == "in_progress"]
+        hidden = [it for it in self.items if it not in shown]
+        if hidden:
+            hdone = sum(1 for it in hidden if it["status"] in DONE_STATUSES)
+            lines.append(f"  (+{len(hidden)} steps from earlier phases — {hdone} done; use plan_view for the full list)")
+        for it in shown:
             line = f"- {icon.get(it['status'], '[ ]')} ({it['id']}) {it['content']}"
             if it.get("notes"):
                 line += f" — {it['notes']}"
@@ -353,6 +376,9 @@ class Plan:
             # The step's user-facing narration (shown when it's started), if set.
             if it.get("explanation"):
                 lines.append(f"    » {it['explanation']}")
+            # A delegated step is executed by a subagent in its own context.
+            if it.get("delegate"):
+                lines.append(f"    → delegate to subagent: {it['delegate']}")
             # Fold the evidence fields onto a compact indented line when present, so
             # an important step reads as action/why/expect/verify/fallback.
             detail = []
@@ -381,7 +407,7 @@ class Plan:
         # on-disk plan that predates them, so rendering/serialization stay uniform.
         for it in plan.items:
             for key in ("action", "purpose", "expected", "verification", "fallback",
-                        "phase_id", "notes", "explanation"):
+                        "phase_id", "notes", "explanation", "delegate"):
                 it.setdefault(key, "")
         plan.phases = data.get("phases", []) or []
         plan.current_phase_id = data.get("current_phase_id")

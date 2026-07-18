@@ -223,32 +223,31 @@ def build_code_graph(root_dir, include_so=True, force=False, graph_id=None):
 @registry.register(
     name="query_code_graph",
     description=(
-        "Queries a code knowledge graph built by build_code_graph. Lets you navigate a big codebase (thousands of smali OR ordinary source files) cheaply instead of re-reading them. "
-        "AUTO-BUILD: if no graph exists yet and you don't pass a graph_id, this builds one over the whole workspace automatically and answers from it — so you can query straight away without a separate build_code_graph call. "
-        "Returns compact results with file:line so you can then read_file_chunk only the relevant slice. "
-        "If you built multiple graphs (e.g. several app versions or projects), pass graph_id to pick one; otherwise the most recently built graph is used. "
-        "query_type options: "
-        "'stats' (graph summary + biggest classes); "
-        "'search_classes' (name=substring -> matching class descriptors + files); "
-        "'class' (name=class descriptor or 'com.foo.Bar' -> super/interfaces/fields/methods with line + file); "
-        "'method' (name='Class;->proto' or substring -> file:line + callees + referenced strings); "
-        "'callers' (name=method or class-method -> who calls it, reverse call-edges); "
-        "'callees' (name=method or class -> what it calls); "
-        "'string_refs' (name=substring -> where that const-string literal is referenced: file:line + holder method — great for finding signature/anti-tamper checks); "
-        "'hierarchy' (name=class -> superclass chain + direct subclasses + interfaces); "
-        "'so_symbols' (name=.so path or symbol substring -> exported/imported native symbols); "
-        "'graphs' (list every graph you've built — ignores name)."
+        "Navigate a big codebase (thousands of smali OR source files) via its code knowledge graph instead of "
+        "re-reading files — every result comes back as file:line so you read_file_chunk only the exact slice. "
+        "AUTO-BUILDS a workspace graph on first use, so it just works.\n"
+        "SIMPLEST USE — pass only name= and it SEARCHES EVERYTHING (string literals + methods + classes + native "
+        "symbols) at once; you do NOT need to pick a query_type:\n"
+        '  {\"tool\":\"query_code_graph\",\"args\":{\"name\":\"isRooted\"}}          # find a check/method/anything\n'
+        '  {\"tool\":\"query_code_graph\",\"args\":{\"name\":\"/system/xbin/su\"}}   # find where a literal is used\n'
+        "Reach for a specific query_type only to drill in after a search hit:\n"
+        "  string_refs (where a const-string is referenced — best for root/license/signature/pinning checks), "
+        "callers (who calls a method), callees (what it calls), class (fields+methods of a class), "
+        "method (a method's file:line + callees + strings), hierarchy (super/subclasses), "
+        "so_symbols (native .so exports/imports), stats (graph overview), graphs (list built graphs). "
+        "Class names are matched loosely ('com.foo.Bar', 'Bar', or 'Lcom/foo/Bar;' all work)."
     ),
     params_schema={
-        "query_type": "string (stats | search_classes | class | method | callers | callees | string_refs | hierarchy | so_symbols | graphs)",
-        "name": "string (the class/method/string/so to look up; meaning depends on query_type; optional for stats/graphs)",
-        "limit": "integer (optional, max results to return, default 40)",
-        "graph_id": "string (optional) — which built graph to query. Defaults to the most recently built one. Use 'graphs' query_type to list available ids."
+        "name": "string — the identifier/literal to look up (method, class fragment, string, or symbol). This is the main argument.",
+        "query_type": "string (OPTIONAL, default 'search' = search everything). Only set it to drill in: string_refs | callers | callees | class | method | hierarchy | so_symbols | stats | search_classes | graphs.",
+        "limit": "integer (optional, max results, default 40)",
+        "graph_id": "string (optional) — which built graph to query; defaults to the most recent. Use query_type='graphs' to list ids."
     },
-    output="Compact text results WITH file:line references, so you can then use read_file_chunk on just the relevant slice. Format depends on query_type. When several graphs exist, the output notes which graph_id was used.",
-    when_to_use="Use this to navigate ONE code graph. 'string_refs' finds signature/anti-tamper checks; 'callers' finds who calls a method; 'hierarchy' walks the superclass chain; 'graphs' lists what you've built. To COMPARE two graphs, use diff_code_graphs instead."
+    output="Compact text WITH file:line references. The default 'search' groups hits into STRING LITERALS / METHODS / CLASSES / NATIVE SYMBOLS; then read_file_chunk the exact file:line or drill in with callers/callees/class on a hit.",
+    when_to_use="FIRST move on any big/obfuscated tree: pass name= to locate something (a check, a class, a string) without picking an axis. Then drill in with a specific query_type. To COMPARE two graphs use diff_code_graphs.",
+    summary="search a big codebase's graph by any identifier/string -> file:line hits (auto-builds; no query_type needed)",
 )
-def query_code_graph(query_type, name="", limit=40, graph_id=None):
+def query_code_graph(name="", query_type="search", limit=40, graph_id=None):
     try:
         limit = int(limit)
     except Exception:
