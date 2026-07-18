@@ -895,6 +895,13 @@ def _normalize_nonjson_action(text):
             for obj in _json_candidates(body):
                 if isinstance(obj, dict) and isinstance(obj.get("name"), str):
                     name = obj["name"]
+                    # Flat convention {"name": <tool>, ...args} with no
+                    # arguments/args wrapper: _coerce_args returned the object
+                    # verbatim, so drop the consumed "name" key from args (but
+                    # never strip a real `name` PARAM that came via a wrapper).
+                    if (isinstance(args, dict) and args.get("name") == name
+                            and "arguments" not in obj and "args" not in obj):
+                        args = {k: v for k, v in args.items() if k != "name"}
                     break
             if not name:
                 lead = _BARE_NAME_RE.match(body)
