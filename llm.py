@@ -374,6 +374,8 @@ def _norm_model_settings(value, model_ids=None):
         sty = _norm_reasoning_style(s.get("reasoning_style"))
         if sty:
             entry["reasoning_style"] = sty
+        if isinstance(s.get("supports_native_tools"), bool):
+            entry["supports_native_tools"] = s["supports_native_tools"]
         if entry:
             out[model] = entry
     return out
@@ -410,6 +412,17 @@ def _auto_reasoning_style(model):
 def _resolve_reasoning_style(cfg):
     """The explicit reasoning style if set, else the model-inferred one."""
     return _norm_reasoning_style(cfg.get("reasoning_style")) or _auto_reasoning_style(cfg.get("model"))
+
+
+def _supports_native_tools(cfg):
+    """Whether the active model should be sent an OpenAI `tools` array.
+    Per-model override (model_settings) wins; else the config-level default;
+    else False (the safe prose path)."""
+    model = cfg.get("model")
+    ms = (cfg.get("model_settings") or {}).get(model) or {}
+    if isinstance(ms.get("supports_native_tools"), bool):
+        return ms["supports_native_tools"]
+    return bool(cfg.get("supports_native_tools"))
 
 
 def _dsv4_effort(level):
