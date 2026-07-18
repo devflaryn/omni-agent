@@ -1,0 +1,6 @@
+{
+  "name": "gsd",
+  "version": "1.0.0",
+  "description": "GSD-style context-hygiene: keep an hours-to-days run sharp by delegating heavy sub-tasks to fresh subagent contexts, holding durable state in the plan + investigation memory, working in phases, and re-grounding at phase boundaries. Replicates the 'fresh context per task, task 50 == task 1' discipline that beats context rot.",
+  "enabled": true
+}

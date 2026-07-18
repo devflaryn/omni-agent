@@ -1,6 +1,6 @@
 # Agent Tools Reference
 
-The agent exposes **104 tools**, registered via `@registry.register` across the
+The agent exposes **112 tools**, registered via `@registry.register` across the
 modules in `tools/`. The tool list the LLM sees is generated dynamically from
 this registry (see `tool_registry.get_tool_prompt`), so this file is a
 human-readable index — the source of truth is the `@registry.register` blocks.
@@ -10,6 +10,22 @@ human-readable index — the source of truth is the `@registry.register` blocks.
 > import tools; from tool_registry import registry
 > for n in registry._tools: print(n)
 > ```
+
+## Progressive tool disclosure (context optimization)
+
+The full tool list is ~35k tokens. To keep the prompt small, tools are split into
+a small always-on **core** and on-demand **domain toolsets** (`apk`, `smali`,
+`native`, `emulator`, `frida`, `graph`, `web`; see `_GROUP_BY_MODULE` /
+`_GROUP_BY_TOOL` in `tool_registry.py`). The base prompt shows core tools in full
+plus a **one-line catalog** of every domain tool. A domain tool still executes
+if called; doing so **auto-activates** its toolset (full schemas fold into the
+prompt on later turns), and `expand_tools("<group>")` loads a toolset's full
+params proactively. A malformed first call to a domain tool gets that tool's full
+schema back inline for one-shot self-correction. This cut the first-message
+system prompt from ~39k to ~17k tokens.
+
+- **expand_tools** — reveal the full parameter schemas of an on-demand toolset
+  (apk|smali|native|emulator|frida|graph|web) or a single tool, before using it.
 
 ## Filesystem & file editing — `tools/filesystem.py`
 - **list_directory** — list files/folders in a workspace directory (`ls -la`).
@@ -94,7 +110,7 @@ human-readable index — the source of truth is the `@registry.register` blocks.
 - **ask_codebase** — ask a natural-language question about `/workspace`; an isolated read-only sub-agent investigates and returns one answer.
 
 ## Android emulator / device — `tools/android_emulator.py`
-- **ensure_emulator_running** — boot the project's Android VM (omnidroid backend). Pass `dev=true` (or set `OMNI_USE_DEV_BASE=1`) to boot the **dev base** (`base-dev.qcow2`: frida-server + root/frida-hiding tools) instead of the shipped x86 base.
+- **ensure_emulator_running** — boot the project's Android VM (omnidroid backend). Pass `dev=true` (or set `OMNI_USE_DEV_BASE=1`) to boot the **dev base** (`base_arm` + the extra **vdc devkit disk** `base_arm_devkit.qcow2`: android-arm64 frida-server + Magisk + `omni-*` tools) instead of a shipped production base.
 - **adb_shell** — run an arbitrary `adb shell` command against the emulator.
 - **install_apk_on_emulator** — install an APK (ABI-safe on the omnidroid/qemu path).
 - **launch_app_on_emulator** — launch an installed app.
@@ -105,13 +121,67 @@ human-readable index — the source of truth is the `@registry.register` blocks.
 - **read_auto_screenshots** — *(dev base only)* read the **ALWAYS-ON** auto-screenshot feed. There is nothing to start or stop: whenever a dev emulator is up (`ensure_emulator_running(dev=True)`), omnidroid auto-captures a full-res PNG on every big on-screen change (a spinner stays below threshold; a black↔loading flip is always caught) into `/workspace/screenshots/auto/`, flushing `metadata.json` live. This returns the running flag + per-keyframe elapsed/gap/black/reason/filename; filenames encode elapsed + gap-since-previous + wall-clock so an instant transition is distinguishable from one that took time. Call with no args for the default `auto` feed; `since_index` polls just the new frames. (The recorder is engine-owned — started on the dev boot, stopped on `stop_emulator`. For a package-scoped crash/exit VERDICT over a bounded window, use `record_and_capture_keyframes`.)
 - **analyze_keyframes** — describe each keyframe with a vision model.
 - **generate_test_report** — assemble a Markdown test report (keyframes + logcat).
-- **run_apk_test_session** — one-shot pipeline: boot → install → launch → capture → analyze → report. Always runs on a FRESH instance: reset is forced true and the harness verifies no third-party packages exist (uninstalling leftovers) before installing the APK under test. Pass `dev=true` to run the whole session on the frida/root-hiding dev base.
+- **run_apk_test_session** — one-shot pipeline: boot → install → launch → capture → analyze → report. Always runs on a FRESH instance: reset is forced true and the harness verifies no third-party packages exist (uninstalling leftovers) before installing the APK under test. Pass `dev=true` to run the whole session on the frida/root-hiding dev base. **Not for Roblox** — it has no concept of accounts/cookies/the session bootstrap and just does a plain install + launcher-intent open; given a Roblox cookie it silently lands on Roblox's own login screen while still reporting success. Use `launch_roblox_build` (or `login_roblox_account` + `play_roblox`) for any Roblox cookie/login/join scenario.
 - **stop_emulator** — stop the running emulator/account.
-- **ensure_frida_server** — *(dev base only)* start the baked frida-server hidden (custom port + randomized process name) and `adb forward` a host port onto it; returns the `frida -H 127.0.0.1:<port>` endpoint to attach with.
-- **hide_root_from_app** — *(dev base only)* best-effort hide root+frida from a target package via the baked `omni-hide` (Magisk `resetprop` prop-spoofs + KernelSU per-app denylist). Run after `ensure_frida_server`, before launching the target.
+- **ensure_frida_server** — *(dev base only)* start the devkit frida-server hidden (custom port + randomized process name) via Magisk `su` and `adb forward` a host port onto it; returns the `frida -H 127.0.0.1:<port>` endpoint to attach with. Needs a Magisk-rooted dev boot (`omni build-dev-base --patch-boot`).
+- **hide_root_from_app** — *(dev base only)* best-effort hide root+Magisk+frida from a target package via the devkit `omni-hide` (Magisk DenyList/Shamiko + `resetprop` prop-spoofs). Run after `ensure_frida_server`, before launching the target.
+
+## Roblox login/join (product session path) — `tools/roblox_session.py`
+Wraps the engine's `omni play` / `omni session` / `omni login` / `omni accounts`
+rather than reimplementing them (see `contracts/omni-session.md`), so these
+exercise the exact zero-click path a customer gets: login is a `.ROBLOSECURITY`
+cookie (the Roblox Android client has no deep-link auth parameter), planted into
+Roblox's own WebView cookie jar by the injected bootstrap after a cold-start +
+`roblox://experiences/start` deep link fired by the kiosk. Identical on dev and
+production bases.
+
+**Account model:** a saved account is just its cookie in ONE `accounts.json`,
+keyed by Roblox **username** (the login name, never the display name) — either
+added by a human via an interactive `omni login` browser sign-in, OR by the agent
+via `login_roblox_account` from a cookie it was already handed (headless, no
+browser). An instance is a THIN (~0.4 MB) overlay auto-created and named for the
+account, so two accounts run at once. The engine refuses to create ANY instance
+for a name with no saved cookie and no explicit override (`no_token` error) —
+"the only way to get a profile is to log in" is enforced, not just documented.
+- **login_roblox_account** — register/refresh an account from a cookie (file or
+  raw string) you already have. The cookie is verified against Roblox exactly
+  like an interactive sign-in, then saved under its real username. The SAME
+  cookie always resolves to the SAME username, so this is safe to call
+  repeatedly — it refreshes one account in place, never duplicates it. This is
+  the ONLY way the agent can add a new playable account.
+- **list_roblox_accounts** — the saved usernames available to play as (cookies
+  never returned; `verify=true` also checks each is still valid). Call this
+  first to pick an `account`.
+- **play_roblox** — boot (or reuse) a thin instance and land INSIDE a Roblox
+  place, logged in, no menu, no taps. MODERN path: `account="<username>"` and the
+  engine resolves the cookie automatically (no token to handle). `token=` is an
+  override for an unsaved cookie. Prefer this over `launch_app_on_emulator`.
+- **set_roblox_account** — switch which account a running instance is logged in
+  as (cold-starts Roblox first — a token swap on a live process would silently
+  keep playing as the old account), change the place, or just read back the
+  stored session (token always redacted).
+- **launch_roblox_build** — the single call for "here's a cookie (+ optionally a
+  new Roblox APK to test) and a place id, get me into that game": composes
+  login_roblox_account -> (if apk_path given) decode_apk -> inject_session_
+  bootstrap -> recompile_apk -> sign_apk -> install -> play_roblox. Exists
+  because a STOCK Roblox APK has no code path that reads a session cookie at
+  all — installing one as-is and expecting cookie login to work just silently
+  lands on Roblox's own login screen. Prefer this over composing the steps by
+  hand, and NEVER use run_apk_test_session for this — it has no concept of
+  accounts, cookies, or the bootstrap.
+
+## Roblox session bootstrap injection — `tools/session_bootstrap.py`
+- **inject_session_bootstrap** — inject the Omni session bootstrap
+  (`omnidroid/bootstrap/`) into a **decoded** Roblox APK: adds
+  `com/omni/bootstrap/OmniBootstrap.smali`, one `invoke-static` at the top of
+  `Application.onCreate()`, and a `<queries>` entry making the kiosk visible to
+  Roblox (Android 11+ package-visibility filtering — without it the provider
+  query silently returns null). Run between `decode_apk` and `recompile_apk` on
+  every Roblox build omnidroid will ship or test; without it, `play_roblox`
+  still joins the right place but lands on Roblox's own login screen.
 
 ## Frida runtime hooking / instrumentation (dev base) — `tools/frida_tools.py`
-Run natively on the host via the `frida` Python binding against the dev base's baked frida-server (hidden custom port, auto-forwarded). Dev base only (`ensure_emulator_running(dev=true)`). Java/Kotlin hooks work fully on the x86 base; native `Interceptor` hooks are reliable only for x86_64 code, not the app's ARM64 `.so` under libndk translation.
+Run natively on the host via the `frida` Python binding against the dev base's devkit frida-server (android-arm64, hidden custom port, auto-forwarded). Dev base only (`ensure_emulator_running(dev=true)`, Magisk-rooted). The base is **arm64 native** (no libndk translation), so BOTH Java/Kotlin hooks AND native `Interceptor`/`Stalker` hooks of the app's own arm64 `.so` code work.
 - **frida_list_processes** — enumerate processes/apps the frida-server sees (confirms connectivity; finds exact process names/pids).
 - **frida_run_script** — inject an arbitrary Frida JS agent (inline or from a `/workspace` `.js`) into an app (attach or spawn-gated), run it for a window, and return every `send()`/`console.log`/error plus whether the app stayed alive (a crash right after injection ⇒ likely detection).
 - **frida_trace** — auto-generate + run a tracer for named Java methods (`com.pkg.Class.method`, all overloads) and/or native functions (`lib.so!symbol`), logging args + return values.
@@ -146,5 +216,13 @@ Structured, deduplicated, evidence-backed record of what's been established; sur
 
 ## Skills — `tools/skill_tools.py`
 - **list_skills** — list available skills (name/description/when-to-use/resources).
-- **use_skill** — load a skill's full instructions.
+- **use_skill** — load a skill's full instructions; also activates the skill's toolsets.
 - **read_skill_resource** — load one bundled resource file of a skill.
+
+## Commands (plugin workflows) — `tools/command_tools.py`
+- **list_commands** — list plugin-contributed workflow commands (name/description/source plugin).
+- **use_command** — load one command's full step-by-step body to follow. A command is broader than a skill (it orchestrates skills, subagents, and the plan). NOTE: this only loads instructions — it is NOT `run_command` (the shell tool). Shipped commands: `/plan-feature`, `/verify-work`, `/re-triage`.
+
+## Delegation & meta — `tools/delegation_tools.py`, `tools/meta_tools.py`
+- **dispatch_agents** — run a wave of read-only subagents in parallel (each in its own isolated context) and get back only their distilled reports; keeps heavy exploration off the main context. Name agents from AVAILABLE SUBAGENTS. For a tracked/self-contained step (research OR a change) prefer a plan step tagged `delegate=<agent>` instead.
+- **expand_tools** — reveal the full parameter schemas of an on-demand toolset (`apk`/`smali`/`native`/`emulator`/`frida`) or a single tool, before a chunk of domain work.

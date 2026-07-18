@@ -29,7 +29,7 @@ def _add_step(plan, step, after_id=None):
             action=step.get("action"), purpose=step.get("purpose"),
             expected=step.get("expected"), verification=step.get("verification"),
             fallback=step.get("fallback"), notes=step.get("notes"),
-            explanation=step.get("explanation"),
+            explanation=step.get("explanation"), delegate=step.get("delegate"),
         )
     content = str(step or "").strip()
     if not content:
@@ -95,18 +95,20 @@ def plan_create(task, steps=None, success_criteria=None, constraints=None, phase
         "verification": "string (optional — how you'll verify it: command/build/test/file:line/log)",
         "fallback": "string (optional — what to do if it fails or the expected result doesn't appear)",
         "explanation": "string (optional — a short first-person narration shown to the user when this step is started, e.g. \"Now I'll patch the license check.\")",
+        "delegate": "string (optional — the name of a subagent to run this step in its own isolated context; when you mark the step in_progress the harness auto-dispatches it and folds back only the distilled report. See AVAILABLE SUBAGENTS. Use for a heavy, self-contained sub-task (deep research / analysis / a well-specified implementation) so this conversation stays lean.)",
         "after_id": "string (optional — an existing step's id to insert this one right after; omit to append)"
     },
     output="A rendered view of the updated plan including the new step's id.",
-    when_to_use="Call this the moment you realize the plan is missing a step — don't silently do extra work outside the plan; add it first so the plan stays an accurate record."
+    when_to_use="Call this the moment you realize the plan is missing a step — don't silently do extra work outside the plan; add it first so the plan stays an accurate record. Tag it with delegate=<subagent> to offload a heavy, self-contained step to an isolated context."
 )
 def plan_add_task(content, purpose=None, expected=None, verification=None, fallback=None,
-                  after_id=None, explanation=None):
+                  after_id=None, explanation=None, delegate=None):
     plan = planning.get_active_plan()
     if plan is None:
         return {"error": "No active plan. Call plan_create first."}
     plan.add_item(content, after_id=after_id, purpose=purpose, expected=expected,
-                  verification=verification, fallback=fallback, explanation=explanation)
+                  verification=verification, fallback=fallback, explanation=explanation,
+                  delegate=delegate)
     planning.notify_updated()
     return {"stdout": plan.to_markdown()}
 
@@ -131,21 +133,22 @@ def plan_add_task(content, purpose=None, expected=None, verification=None, fallb
         "expected": "string (optional — the concrete success result)",
         "verification": "string (optional — how it's verified)",
         "fallback": "string (optional — the fallback if it fails)",
-        "explanation": "string (optional — set/refine the first-person narration shown when this step starts)"
+        "explanation": "string (optional — set/refine the first-person narration shown when this step starts)",
+        "delegate": "string (optional — set/clear the subagent that runs this step in isolation; marking the step in_progress then auto-dispatches it. Pass an empty string to clear a previously-set delegate.)"
     },
     output="A rendered view of the updated plan, or an error if the task_id doesn't exist or the status is invalid.",
-    when_to_use="Call this to START a step (status='in_progress' — this narrates the subprocess to the user) and again to complete it once it's DONE AND VERIFIED. Don't batch updates until the end; the GUI, the chat narration, and progress tracking all depend on these happening as you go."
+    when_to_use="Call this to START a step (status='in_progress' — this narrates the subprocess to the user, and auto-dispatches it if the step has a delegate) and again to complete it once it's DONE AND VERIFIED. Don't batch updates until the end; the GUI, the chat narration, and progress tracking all depend on these happening as you go."
 )
 def plan_update_task(task_id, status=None, content=None, notes=None,
                      purpose=None, expected=None, verification=None, fallback=None,
-                     explanation=None):
+                     explanation=None, delegate=None):
     plan = planning.get_active_plan()
     if plan is None:
         return {"error": "No active plan. Call plan_create first."}
     item = plan.update_item(task_id, status=status, content=content, notes=notes,
                             purpose=purpose, expected=expected,
                             verification=verification, fallback=fallback,
-                            explanation=explanation)
+                            explanation=explanation, delegate=delegate)
     if item is None:
         return {"error": f"Step '{task_id}' not found (or invalid status). Call plan_view to see current step ids."}
     planning.notify_updated()
@@ -298,4 +301,6 @@ def plan_view():
     plan = planning.get_active_plan()
     if plan is None:
         return {"stdout": "No active plan. Call plan_create to start one."}
-    return {"stdout": plan.to_markdown()}
+    # plan_view is the explicit "show me everything" tool — render ALL steps across
+    # phases (the live prompt only carries the current phase to stay compact).
+    return {"stdout": plan.to_markdown(full=True)}

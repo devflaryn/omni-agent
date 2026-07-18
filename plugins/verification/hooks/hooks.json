@@ -1,0 +1,3 @@
+{
+  "on_final_answer": ["verify_guard.py:on_final_answer"]
+}

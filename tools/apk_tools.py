@@ -79,6 +79,88 @@ def _append_graph_note(res, target_dir, kind):
     return res
 
 
+MULTI_PACKAGE_ERR = "Can't find framework resources for package of id"
+
+# Marker file left in an output_dir that was decoded by APKEditor (not
+# apktool), so recompile_apk knows to dispatch to `APKEditor b` instead of
+# `apktool b`. Its directories are normalized to LOOK like an apktool tree
+# (smali/, smali_classes2/, ... instead of APKEditor's own smali/classes,
+# smali/classes2, ...) right after decode, so every other tool that walks a
+# decompiled dir (search_smali, patch_smali_method, the code graph indexer,
+# session_bootstrap's injector) keeps working completely unchanged.
+APKEDITOR_MARKER = ".apkeditor_decoded"
+
+
+def _apkeditor_normalize_smali(output_dir):
+    """APKEditor's smali/classes, smali/classes2, ... -> apktool's smali/,
+    smali_classes2/, ... (sibling dirs). Safe to call when smali/classes
+    doesn't exist (no-op)."""
+    cmd = (
+        f"cd /workspace/{output_dir} && "
+        "if [ -d smali/classes ]; then "
+        "mv smali smali_apkeditor_src && mkdir smali && "
+        "find smali_apkeditor_src/classes -mindepth 1 -maxdepth 1 -exec mv {} smali/ \\; && "
+        "for d in smali_apkeditor_src/classes*; do "
+        "[ -d \"$d\" ] || continue; "
+        "n=$(basename \"$d\" | sed 's/^classes//'); "
+        "[ -n \"$n\" ] && mv \"$d\" \"smali_classes${n}\"; "
+        "done; "
+        "rm -rf smali_apkeditor_src; "
+        f"touch {APKEDITOR_MARKER}; "
+        "fi"
+    )
+    return run_cmd(cmd, timeout=60)
+
+
+def _apkeditor_denormalize_smali(output_dir):
+    """Reverse of _apkeditor_normalize_smali — restores APKEditor's own
+    smali/classes, smali/classes2, ... layout so `APKEditor b` can read it."""
+    cmd = (
+        f"cd /workspace/{output_dir} && "
+        "mkdir -p smali_apkeditor_src/classes && "
+        "find smali -mindepth 1 -maxdepth 1 -exec mv {} smali_apkeditor_src/classes/ \\; && "
+        "rmdir smali && "
+        "for d in smali_classes*; do "
+        "[ -d \"$d\" ] || continue; "
+        "n=$(echo \"$d\" | sed 's/^smali_classes//'); "
+        "mv \"$d\" \"smali_apkeditor_src/classes${n}\"; "
+        "done; "
+        "mv smali_apkeditor_src smali"
+    )
+    return run_cmd(cmd, timeout=60)
+
+
+def _decode_with_apkeditor(apk_filename, output_dir):
+    """Fallback decoder for APKs with more than one app-defined resource
+    package (e.g. Roblox, which bundles a personasdk package alongside its
+    main one) — apktool has a long-standing upstream limitation there
+    (iBotPeaches/Apktool#2514): it assumes 0x7f is the only non-framework
+    package and aborts full resource decoding on anything else, leaving no
+    smali and no text manifest. APKEditor (built on ARSCLib) handles multiple
+    packages correctly, so this is what gets a REAL text AndroidManifest.xml
+    (needed by inject_session_bootstrap's <queries> edit) instead of only the
+    binary -r fallback."""
+    cmd = f"rm -rf /workspace/{output_dir} && java -jar /usr/local/bin/APKEditor.jar d -i /workspace/{apk_filename} -o /workspace/{output_dir} -t xml -f"
+    res = run_cmd(cmd, timeout=600)
+    if not isinstance(res, dict) or res.get("error"):
+        return res
+    norm = _apkeditor_normalize_smali(output_dir)
+    if isinstance(norm, dict) and norm.get("error"):
+        return norm
+    res["stdout"] = (res.get("stdout") or "") + (
+        "\n\n=== NOTE: decoded with APKEditor, not apktool ===\n"
+        "This APK bundles more than one app-defined resource package (apktool's "
+        "long-standing multi-package limitation — iBotPeaches/Apktool#2514), so "
+        "apktool's full resource decode aborted with "
+        f"\"{MULTI_PACKAGE_ERR}...\". APKEditor decoded it instead: you have the "
+        "COMPLETE smali tree AND a real TEXT AndroidManifest.xml (smali dirs "
+        "renamed to the usual smali/, smali_classes2/, ... layout). Rebuild with "
+        "recompile_apk as usual — it detects the APKEditor marker and dispatches "
+        "to `APKEditor b` instead of `apktool b` automatically.\n"
+    )
+    return res
+
+
 def _output_has_smali(output_dir):
     """True when apktool produced at least one ``smali*/`` directory in
     output_dir — the marker of a successful SOURCE decode (baksmali). A
@@ -90,7 +172,7 @@ def _output_has_smali(output_dir):
 
 @registry.register(
     name="decode_apk",
-    description="Decodes an APK with apktool (apktool's `d`/decode command) to get readable AndroidManifest.xml and smali source code. This is the PRIMARY tool for editing an app: use it whenever you need to read or edit smali, XML resources, or AndroidManifest.xml. For whole-file edits (lib folders, assets, .so files) use unzip_apk instead; to read the app's logic as Java use jadx_decompile. It ALWAYS produces the full smali code tree: if apktool can't decode the APK's resources (some apps use a shared-library resource package that makes apktool abort mid-resource-decode, leaving only res/), it automatically re-runs with resource decoding disabled so you still get complete smali. By default it AUTO-BUILDS a code knowledge graph over the output so you can immediately query_code_graph instead of reading smali one-by-one (set auto_graph=false to skip).",
+    description="Decodes an APK with apktool (apktool's `d`/decode command) to get readable AndroidManifest.xml and smali source code. This is the PRIMARY tool for editing an app: use it whenever you need to read or edit smali, XML resources, or AndroidManifest.xml. For whole-file edits (lib folders, assets, .so files) use unzip_apk instead; to read the app's logic as Java use jadx_decompile. It ALWAYS produces the full smali code tree: if apktool can't decode the APK's resources (some apps use a shared-library resource package that makes apktool abort mid-resource-decode, leaving only res/), it automatically re-runs with resource decoding disabled so you still get complete smali. For apps with MULTIPLE app-defined resource packages (e.g. Roblox — apktool's still-open #2514 limitation, error message contains 'Can't find framework resources for package of id'), it instead automatically falls back to APKEditor, which gets you BOTH full smali AND a real text AndroidManifest.xml (not just raw/binary) — recompile_apk auto-detects this and dispatches to APKEditor's builder too, so the rest of the workflow (inject_session_bootstrap, search_smali, recompile_apk, sign_apk) needs no changes. By default it AUTO-BUILDS a code knowledge graph over the output so you can immediately query_code_graph instead of reading smali one-by-one (set auto_graph=false to skip).",
     params_schema={"apk_filename": "string", "output_dir": "string", "no_resources": "boolean (optional, set to true to skip resource decoding up front — faster, and avoids resource-decode errors; you still get full smali + manifest/resources in raw form)", "auto_graph": "boolean (optional, default true — build a code knowledge graph over the decompiled output automatically so query_code_graph works right away and the UI Graph tab is populated)"},
     output="apktool's decompile log. On success the output_dir contains a smali/ tree (plus smali_classes2/ … for multidex), AndroidManifest.xml, res/, and apktool.yml. If resource decoding failed and it fell back to -r, a NOTE says so — you still get the full smali tree, but AndroidManifest.xml and res/ are left in raw form (read them with jadx_decompile). Can take several minutes on large APKs. Unless auto_graph=false, a code knowledge graph is then built automatically and its summary appended — navigate with query_code_graph, do NOT read smali files one by one.",
     when_to_use="Use this when you need to READ or EDIT Dalvik bytecode (smali), AndroidManifest.xml, or XML resources. If you only need to swap/delete whole files (like .so libs), unzip_apk is much faster. The graph is built for you automatically, so after this just call query_code_graph."
@@ -118,18 +200,38 @@ def decode_apk(apk_filename, output_dir, no_resources=False, auto_graph=True):
     else:
         res = _decode(want_no_res)
 
+        # If the command couldn't run at all (sandbox down / timeout — run_cmd sets
+        # 'error'), don't do the resource-fallback retry (it just fails again) and
+        # don't pretend nothing happened: surface the real reason so the user sees
+        # WHY no folder appeared instead of a bare "no output".
+        if isinstance(res, dict) and res.get("error"):
+            return res
+
         # A full decode MUST leave a smali*/ tree. Some APKs (notably ones using an
         # AAPT2 shared-library resource package — e.g. Roblox's
         # com.roblox.client.personasdk at pkgId 0x87) make apktool throw DURING
         # resource decoding; because it decodes resources BEFORE sources, it aborts
         # with only res/ and NO smali. That's the intermittent "res-only" folder.
-        # When we attempted resource decoding and got no smali, retry with resource
-        # decoding disabled (-r): baksmali then runs and produces the complete smali
-        # tree (with AndroidManifest.xml/resources kept in raw form).
         fell_back = False
+        used_apkeditor = False
         if not want_no_res and not _output_has_smali(output_dir):
-            fell_back = True
-            res = _decode(True)
+            combined = (res.get("stdout") or "") + (res.get("stderr") or "")
+            if MULTI_PACKAGE_ERR in combined:
+                # apktool's specific multi-app-package limitation (#2514, not the
+                # general shared-library-resource abort): a -r decode would only
+                # get smali, leaving AndroidManifest.xml binary. APKEditor handles
+                # multiple packages correctly, so it gets BOTH smali and a real
+                # text manifest — strictly better here, so prefer it over -r.
+                apke_res = _decode_with_apkeditor(apk_filename, output_dir)
+                if isinstance(apke_res, dict) and not apke_res.get("error") and _output_has_smali(output_dir):
+                    res = apke_res
+                    used_apkeditor = True
+            if not used_apkeditor:
+                # Retry with resource decoding disabled (-r): baksmali then runs
+                # and produces the complete smali tree (with AndroidManifest.xml/
+                # resources kept in raw form).
+                fell_back = True
+                res = _decode(True)
 
         if not isinstance(res, dict):
             return res
@@ -295,6 +397,23 @@ with open(p, "w", encoding="utf-8") as f:
 '''
 
 
+def _recompile_with_apkeditor(input_dir, output_apk):
+    """Build path for a decode_apk directory that _decode_with_apkeditor
+    produced (marked by APKEDITOR_MARKER). Restores APKEditor's own
+    smali/classes, smali/classes2, ... layout, runs `APKEditor b`, then
+    re-normalizes back to the smali/, smali_classes2/, ... layout so the
+    directory stays editable by every other tool afterward."""
+    denorm = _apkeditor_denormalize_smali(input_dir)
+    if isinstance(denorm, dict) and denorm.get("error"):
+        return denorm
+    cmd = f"java -jar /usr/local/bin/APKEditor.jar b -i /workspace/{input_dir} -o /workspace/{output_apk} -f"
+    res = run_cmd(cmd, timeout=600)
+    renorm = _apkeditor_normalize_smali(input_dir)
+    if isinstance(renorm, dict) and renorm.get("error") and isinstance(res, dict):
+        res["stdout"] = (res.get("stdout") or "") + f"\n\n(note: re-normalizing smali dirs afterward failed: {renorm.get('error')})\n"
+    return res
+
+
 @registry.register(
     name="recompile_apk",
     description=(
@@ -321,6 +440,14 @@ with open(p, "w", encoding="utf-8") as f:
 def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None):
     input_dir = normalize_path(input_dir)
     output_apk = normalize_path(output_apk)
+
+    # A decode_apk directory that _decode_with_apkeditor produced (apktool's
+    # multi-package limitation, #2514) must be rebuilt with `APKEditor b`, not
+    # `apktool b` — it has no apktool.yml and a different on-disk resource
+    # representation. Check this BEFORE the apktool.yml test below.
+    apke_check = run_cmd(f"test -f /workspace/{input_dir}/{APKEDITOR_MARKER}", timeout=10)
+    if apke_check["returncode"] == 0:
+        return _recompile_with_apkeditor(input_dir, output_apk)
 
     # Auto-detect the directory type. apktool-decoded dirs carry apktool.yml and
     # must be rebuilt with `apktool b`; a raw unzip_apk tree has none, so it is

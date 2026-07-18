@@ -1,0 +1,6 @@
+{
+  "name": "android-re",
+  "version": "1.0.0",
+  "description": "Android reverse-engineering workflow commands that chain the RE skills, subagents, and plan end-to-end: /re-triage runs the canonical decode -> detect-protections -> map -> locate-guard -> confirm-with-frida -> patch -> verify playbook, delegating heavy steps to fresh contexts. The 'ultimate action' layer for an APK-modding campaign.",
+  "enabled": true
+}

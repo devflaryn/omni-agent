@@ -155,6 +155,7 @@ def readelf_info(so_filename, args="-d"):
 
 @registry.register(
     name="radare2_cmd",
+    summary="run SPECIFIC radare2 commands (escape hatch; never full 'aaa' on big binaries)",
     description=(
         "Runs radare2 commands on a binary. "
         "IMPORTANT: Never use 'aaa' or 'aaaa' on large binaries (>5MB) — they hang. "
@@ -181,6 +182,7 @@ def radare2_cmd(binary_path, r2_args, timeout_seconds=30):
 
 @registry.register(
     name="disassemble_range",
+    summary="objdump disassembly of a file-offset range (safe on huge .so)",
     description=(
         "Disassembles a specific address range in a binary using objdump. "
         "Safe on large binaries because it only reads the requested range. "
@@ -281,15 +283,41 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
         core = out.split("GHIDRA_DECOMPILE_BEGIN", 1)[1].split("GHIDRA_DECOMPILE_END", 1)[0].strip()
         return {"stdout": core}
 
-    # No markers => Ghidra failed before the script ran (bad path, OOM, timeout).
-    if res.get("error"):
+    # No markers => Ghidra failed before the script ran. A failed run can leave a
+    # half-created / lock-held project behind that would make the NEXT call take
+    # the broken cached (-process) path — so wipe this project namespace and any
+    # stale lock so a retry re-imports cleanly.
+    run_cmd(
+        f"rm -rf {proj_dir}/{proj_name}.gpr {proj_dir}/{proj_name}.rep "
+        f"{proj_dir}/{proj_name}.lock {proj_dir}/{proj_name}.lock~ 2>/dev/null || true",
+        timeout=30,
+    )
+
+    detail = (out or res.get("stderr", "") or "").strip()
+    low = detail.lower()
+
+    # A JDK version / JVM launch failure is the classic cause of an empty
+    # .ghidra_proj (Ghidra 11.2+ needs JDK 21). Flag it explicitly so it's not
+    # mistaken for a bad path — the sandbox image must be rebuilt with JDK 21.
+    java_markers = ("unsupportedclassversionerror", "class file version",
+                    "requires java", "requires jdk", "supported by java runtime",
+                    "failed to find a suitable", "no java", "java_home")
+    if any(m in low for m in java_markers):
+        return {"error": (
+            "Ghidra could not start its Java runtime (JDK version mismatch — Ghidra 11.2+ requires "
+            "JDK 21). Rebuild the sandbox image so it has JDK 21 (the Dockerfile now installs "
+            "openjdk-21-jdk and pins JAVA_HOME); restart the app to trigger the rebuild.\n\n"
+            f"Ghidra output (tail):\n{detail[-1500:]}"
+        )}
+
+    if res.get("error") and not detail:
         return res
-    detail = (out or res.get("stderr", "")).strip()
     return {"error": (
-        "Ghidra did not produce decompiler output. This usually means the binary path is wrong, "
-        "the .so isn't a valid ELF, or analysis ran out of time/memory. "
-        "Raise timeout_seconds and confirm the path with inspect_apk/list_directory.\n\n"
-        f"Ghidra output (tail):\n{detail[-1500:]}"
+        "Ghidra did not produce decompiler output. Likely causes: the binary path is wrong, the file "
+        "isn't a valid ELF, analysis ran out of time/memory, or Ghidra's JVM failed to launch (needs "
+        "JDK 21). Confirm the path with inspect_apk/list_directory and raise timeout_seconds; if this "
+        "keeps happening the sandbox image likely needs rebuilding with JDK 21.\n\n"
+        f"Ghidra output (tail):\n{detail[-1500:] or '(no output captured)'}"
     )}
 
 
@@ -433,6 +461,7 @@ def diff_binary_files(file1, file2, max_diff=200):
 
 @registry.register(
     name="llvm_objdump_disasm",
+    summary="clean AArch64 disassembly, resolves <sym@plt> calls — preferred for reading arm64 over disassemble_range/radare2",
     description=(
         "Disassembles a binary with LLVM's llvm-objdump — the clean-output counterpart to disassemble_range "
         "(objdump) and radare2_cmd. On ARM64 (aarch64) .so files it produces tidy AArch64 assembly and resolves "

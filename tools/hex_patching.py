@@ -31,6 +31,7 @@ def _format_hex_bytes(new_hex_bytes):
 
 @registry.register(
     name="patch_bytes_at_offset",
+    summary="write hex bytes at a KNOWN file offset + verify (minimal offset-patch primitive)",
     description=(
         "Writes raw hex bytes at a specific FILE OFFSET in a binary (.so or any file) and verifies the write "
         "by reading the bytes back. This is the low-level offset-based patch primitive: you already know the "

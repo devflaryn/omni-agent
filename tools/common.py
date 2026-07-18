@@ -7,6 +7,7 @@ hex_patching.py and hash_tools.py.
 import base64
 import os
 import shlex
+import sys
 
 def normalize_path(path):
     """Normalize a path so it can be safely appended to ``/workspace``.
@@ -150,8 +151,8 @@ def resolve_workspace_path(path):
 
     Used by tools that need real Python file I/O on the host rather than
     going through docker exec — currently the Android emulator tools, since
-    the emulator itself runs natively on Windows (Android Studio / the SDK's
-    emulator.exe) rather than inside the Linux sandbox used for APK static
+    the emulator itself runs natively on the host machine (macOS / Linux /
+    Windows) rather than inside the Linux sandbox used for APK static
     analysis/patching. The file still ends up visible at the same
     /workspace/<path> location inside the sandbox too, since it's the same
     bind-mounted directory on both sides.
@@ -165,47 +166,68 @@ def resolve_workspace_path(path):
 
 
 def find_android_sdk_tools():
-    """Locate the Windows-native Android SDK's adb/emulator/avdmanager.
+    """Locate the host Android SDK's adb/emulator/avdmanager — cross-platform
+    (macOS / Linux / Windows).
 
-    Resolution order: $ANDROID_SDK_ROOT or $ANDROID_HOME env var, then Android
-    Studio's default Windows install location (%LOCALAPPDATA%\\Android\\Sdk).
-    Returns a dict {"sdk_root", "adb", "emulator", "avdmanager"} — avdmanager
-    may be None if no cmdline-tools package is installed (only needed for
-    first-time AVD creation; adb/emulator are required).
+    Resolution order: $ANDROID_SDK_ROOT or $ANDROID_HOME, then the OS default
+    Android Studio SDK location — ~/Library/Android/sdk (macOS),
+    ~/Android/Sdk (Linux), %LOCALAPPDATA%\\Android\\Sdk (Windows). Binary names
+    are OS-appropriate (adb/emulator on POSIX, adb.exe/emulator.exe on Windows;
+    avdmanager vs avdmanager.bat). Returns {"sdk_root","adb","emulator",
+    "avdmanager"} — avdmanager may be None if no cmdline-tools package is present
+    (only needed for first-time AVD creation; adb/emulator are required).
 
-    Raises RuntimeError with a clear, actionable message if no SDK with both
-    adb.exe and emulator.exe can be found.
+    Raises RuntimeError with a clear, actionable message if no SDK with both adb
+    and emulator can be found.
     """
+    is_nt = os.name == "nt"
+    adb_name = "adb.exe" if is_nt else "adb"
+    emu_name = "emulator.exe" if is_nt else "emulator"
+    avd_names = ("avdmanager.bat",) if is_nt else ("avdmanager",)
+
     candidates = []
     for var in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
         v = os.environ.get(var)
         if v:
             candidates.append(v)
-    localappdata = os.environ.get("LOCALAPPDATA")
-    if localappdata:
-        candidates.append(os.path.join(localappdata, "Android", "Sdk"))
+    home = os.path.expanduser("~")
+    if is_nt:
+        localappdata = os.environ.get("LOCALAPPDATA")
+        if localappdata:
+            candidates.append(os.path.join(localappdata, "Android", "Sdk"))
+    elif sys.platform == "darwin":
+        candidates.append(os.path.join(home, "Library", "Android", "sdk"))
+    else:  # linux and other POSIX
+        candidates.append(os.path.join(home, "Android", "Sdk"))
 
     for sdk_root in candidates:
-        adb = os.path.join(sdk_root, "platform-tools", "adb.exe")
-        emulator = os.path.join(sdk_root, "emulator", "emulator.exe")
+        adb = os.path.join(sdk_root, "platform-tools", adb_name)
+        emulator = os.path.join(sdk_root, "emulator", emu_name)
         if os.path.isfile(adb) and os.path.isfile(emulator):
             avdmanager = None
-            for sub in (
-                os.path.join("cmdline-tools", "latest", "bin", "avdmanager.bat"),
-                os.path.join("tools", "bin", "avdmanager.bat"),
-                os.path.join("cmdline-tools", "bin", "avdmanager.bat"),
-            ):
-                cand = os.path.join(sdk_root, sub)
-                if os.path.isfile(cand):
-                    avdmanager = cand
+            for avd_name in avd_names:
+                for sub in (
+                    os.path.join("cmdline-tools", "latest", "bin", avd_name),
+                    os.path.join("tools", "bin", avd_name),
+                    os.path.join("cmdline-tools", "bin", avd_name),
+                ):
+                    cand = os.path.join(sdk_root, sub)
+                    if os.path.isfile(cand):
+                        avdmanager = cand
+                        break
+                if avdmanager:
                     break
             return {"sdk_root": sdk_root, "adb": adb, "emulator": emulator, "avdmanager": avdmanager}
 
+    default_hint = (
+        "%LOCALAPPDATA%\\Android\\Sdk" if is_nt
+        else "~/Library/Android/sdk" if sys.platform == "darwin"
+        else "~/Android/Sdk")
     raise RuntimeError(
-        "Could not find an Android SDK with both adb.exe and emulator.exe. Checked: "
-        + (", ".join(candidates) if candidates else "(no ANDROID_SDK_ROOT/ANDROID_HOME set, and %LOCALAPPDATA% unavailable)")
-        + ". Install Android Studio (its default SDK location is %LOCALAPPDATA%\\Android\\Sdk), "
-        "or set the ANDROID_SDK_ROOT environment variable to your SDK's install location."
+        "Could not find an Android SDK with both %s and %s. Checked: " % (adb_name, emu_name)
+        + (", ".join(candidates) if candidates else "(no ANDROID_SDK_ROOT/ANDROID_HOME set)")
+        + ". Install Android Studio (its default SDK location is %s), " % default_hint
+        + "or set the ANDROID_SDK_ROOT environment variable to your SDK's install location."
     )
 
 

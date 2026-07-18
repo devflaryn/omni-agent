@@ -8,15 +8,17 @@ skills/ directory:
 """
 import os
 from tool_registry import registry
-from skills_loader import load_skills, get_skills_prompt
+from skills_loader import (
+    load_skills, get_skills_prompt, skill_toolsets, skill_tool_issues,
+)
 
 
 @registry.register(
     name="list_skills",
-    description="Lists all available skills with their names, descriptions, when-to-use guidance, and any bundled resource files. Skills are specialized, detailed workflows (APK modding, native patching, signature bypass, SSL pinning bypass, anti-debug bypass, string deobfuscation, manifest/resource editing, dex/multidex handling, project scaffolding, code graph analysis). Use this to discover what skills exist and what supporting reference material they carry before loading one with use_skill.",
+    description="Lists all available skills with their names, descriptions, when-to-use guidance, and any bundled resource files. Skills are specialized, battle-tested workflows for reverse-engineering and tool-usage tasks (APK modding, native/smali patching, the various bypasses, Frida dynamic instrumentation, code-graph navigation, planning, context hygiene, verification, and more — the full set is in the AVAILABLE SKILLS index and can grow). Use this to discover what skills exist and what supporting reference material they carry before loading one with use_skill.",
     params_schema={},
     output="One block per skill: name, description, when_to_use, and (if any) a list of bundled resource file paths that can be pulled in individually with read_skill_resource.",
-    when_to_use="Call this if you are unsure which skills exist or which skill applies to the current task."
+    when_to_use="Call this if you are unsure which skills exist or which skill applies to the current task — it always reflects the current skill set, including any added by plugins."
 )
 def list_skills():
     skills = load_skills()
@@ -28,6 +30,9 @@ def list_skills():
         lines.append(f"  Description: {s['description']}")
         if s["when_to_use"]:
             lines.append(f"  When to use: {s['when_to_use']}")
+        toolsets = skill_toolsets(s["allowed_tools"])
+        if toolsets:
+            lines.append(f"  Toolsets (auto-loaded on use_skill): {', '.join(toolsets)}")
         if s["resources"]:
             lines.append(f"  Bundled resources: {', '.join(s['resources'])}")
         lines.append("")
@@ -36,10 +41,10 @@ def list_skills():
 
 @registry.register(
     name="use_skill",
-    description="Loads the full instructions of a skill by name and returns them so you can follow the skill's workflow step by step. The skill instructions tell you exactly which tools to call, in what order, and which bundled resource files (if any) to pull in with read_skill_resource for deeper detail.",
-    params_schema={"skill_name": "string (the exact skill name from list_skills, e.g. 'apk-modding', 'native-patching', 'signature-bypass', 'ssl-pinning-bypass', 'anti-debug-bypass', 'string-deobfuscation', 'manifest-resource-editing', 'dex-multidex-handling', 'project-scaffolding', 'code-graph-analysis')"},
-    output="The full Markdown body of the skill's SKILL.md — step-by-step instructions and critical rules — plus, if the skill has bundled resource files, a list of their paths so you know what's available to pull in with read_skill_resource.",
-    when_to_use="Call this when the task matches a skill's description. After reading the instructions, follow them step by step, calling the appropriate tools in the order the skill specifies, and pulling in bundled resources only when the instructions say to."
+    description="Loads the full instructions of a skill by name and returns them so you can follow the skill's workflow step by step. The skill instructions tell you exactly which tools to call, in what order, and which bundled resource files (if any) to pull in with read_skill_resource for deeper detail. Loading a skill ALSO activates its toolsets — the full parameter schemas of every tool the skill uses fold into AVAILABLE TOOLS from the next turn on, so you can call them straight away without expand_tools or guessing arguments.",
+    params_schema={"skill_name": "string — the exact skill name as it appears in the AVAILABLE SKILLS index (or from list_skills). Use the name verbatim; if unsure which skills exist, call list_skills first."},
+    output="The full Markdown body of the skill's SKILL.md — step-by-step instructions and critical rules — plus, if the skill has bundled resource files, a list of their paths so you know what's available to pull in with read_skill_resource. It also states which toolsets were just loaded so you know those tools are now callable in full.",
+    when_to_use="Call this when the task matches a skill's description. After reading the instructions, follow them step by step, calling the appropriate tools in the order the skill specifies (their schemas are now loaded), and pulling in bundled resources only when the instructions say to."
 )
 def use_skill(skill_name):
     skills = load_skills()
@@ -56,7 +61,30 @@ def use_skill(skill_name):
             f"{{\"skill_name\": \"{skill_name}\", \"resource_path\": <one of the paths above>}}, "
             "when the instructions above tell you to.\n"
         )
-    return {"stdout": out}
+    # Bring the skill's toolsets online so every tool it names arrives with full
+    # parameter schemas next turn (progressive tool disclosure). The runtime
+    # reads _activate_groups and folds those toolsets into the system prompt;
+    # since stdout is populated, this private key never reaches the transcript.
+    groups = skill_toolsets(skill["allowed_tools"])
+    if groups:
+        out += (
+            f"\n\n=== Toolsets loaded for '{skill_name}': {', '.join(groups)} ===\n"
+            "The full parameter schemas for this skill's tools are now in AVAILABLE TOOLS — "
+            "call them directly, no expand_tools needed.\n"
+        )
+    # Surface any allowed-tools that don't map to a real tool — a skill bug worth
+    # flagging rather than silently ignoring.
+    issues = skill_tool_issues(skill["allowed_tools"])
+    if issues:
+        out += (
+            f"\n[skill maintenance] These allowed-tools in '{skill_name}' are not registered "
+            f"tools (typo or renamed/removed): {', '.join(issues)}. Use list_skills / the "
+            "AVAILABLE TOOLS list for the current names.\n"
+        )
+    result = {"stdout": out}
+    if groups:
+        result["_activate_groups"] = groups
+    return result
 
 
 @registry.register(

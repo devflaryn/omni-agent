@@ -1,24 +1,26 @@
 """Frida runtime hooking / dynamic-instrumentation tools for the DEV BASE.
 
-These run NATIVELY on the Windows host (like tools/android_emulator.py), using
-the host `frida` Python binding against the frida-server baked into
-base-dev.qcow2. They ONLY work on an omnidroid account booted from the dev base
-(ensure_emulator_running dev=true / OMNI_USE_DEV_BASE=1); on a production account
-the frida-server is absent and every tool here returns a clear "not a dev base"
-error.
+These run NATIVELY on the host (like tools/android_emulator.py), using the host
+`frida` Python binding against the android-arm64 frida-server carried on the dev
+base's devkit disk (base_arm_devkit.qcow2, attached to dev accounts as vdc). They
+ONLY work on an omnidroid account booted from the dev base
+(ensure_emulator_running dev=true / OMNI_USE_DEV_BASE=1) whose boot is Magisk-
+rooted; on a production account (or an un-rooted dev boot) every tool here returns
+a clear error.
 
-Connection model: the baked frida-server listens on a CUSTOM loopback port inside
-the guest (hidden — see omni-fridad), so frida's usb/adb transport (which probes
-the default 27042) can't auto-find it. Each tool starts the hidden server if
-needed, `adb forward`s a host port onto the guest's frida port, and attaches via
-frida's remote-device transport. The forward is torn down after each call.
+Connection model: the frida-server listens on a CUSTOM loopback port inside the
+guest (hidden — see omni-fridad), so frida's usb/adb transport (which probes the
+default 27042) can't auto-find it. Each tool activates the devkit + starts the
+hidden server if needed (via Magisk `su`), `adb forward`s a host port onto the
+guest's frida port, and attaches via frida's remote-device transport. The forward
+is torn down after each call.
 
-x86/ABI NOTE (important): the dev base is x86_64 Bliss; an arm64-only app runs in
-an x86_64 process (app_process64) with its arm64 .so code executed by libndk
-TRANSLATION. So JAVA/KOTLIN hooks (Java.use/Java.perform, via x86_64 libart) work
-fully, but Interceptor/Stalker hooks of the app's own ARM64 native functions are
-unreliable — x86_64 frida can't instrument translated arm64 instructions. Hook the
-Java layer here; do native arm64 RE statically (Ghidra/r2) + static .so patching.
+ARM NOTE (important): the dev base is arm64 LineageOS running NATIVELY (no libndk
+translation). The target app is a native arm64 process, so BOTH Java/Kotlin hooks
+(Java.use/Java.perform) AND native Interceptor/Stalker hooks of the app's own
+arm64 .so functions work — a real improvement over the retired x86 dev base, where
+translated arm64 native frames could not be instrumented. Match the host binding
+to the server: `pip install frida==17.15.4 frida-tools`.
 """
 import json
 import os
@@ -32,7 +34,8 @@ from tools.common import resolve_workspace_path
 # adb-root, dev-manifest detection, host adb runner).
 from tools.android_emulator import (
     _resolve_serial, _dev_manifest, _adb_root, _run, _default_device_name,
-    _DEFAULT_BACKEND,
+    _DEFAULT_BACKEND, _su_sh, _not_dev_base_error, _DEVKIT_WORK,
+    _DEFAULT_FRIDA_PORT,
 )
 
 
@@ -89,16 +92,13 @@ def _connect(device_name=None, backend=_DEFAULT_BACKEND, start_server=True):
     if adb is None:
         return None, None, serial_or_err
     serial = serial_or_err
-    _adb_root(adb, serial)
+    _adb_root(adb, serial)          # ensure Magisk root + devkit activation
     manifest = _dev_manifest(adb, serial)
     if manifest is None:
-        return None, None, {"error": (
-            "This account is not a DEV base (no omni-devkit manifest / frida-server). "
-            "Boot it with ensure_emulator_running(dev=true) or set OMNI_USE_DEV_BASE=1, "
-            "and make sure `omni build-dev-base` produced base-dev.qcow2.")}
-    guest_port = int(manifest.get("frida_port") or 27142)
+        return None, None, _not_dev_base_error(adb, serial, "frida-server")
+    guest_port = int(manifest.get("frida_port") or _DEFAULT_FRIDA_PORT)
     if start_server:
-        _run([adb, "-s", serial, "shell", "omni-fridad"], timeout=40)
+        _su_sh(adb, serial, f"{_DEVKIT_WORK}/omni-fridad", timeout=40)
     # Forward a host port onto the guest's hidden frida port.
     fwd = _run([adb, "-s", serial, "forward", "tcp:0", f"tcp:{guest_port}"], timeout=15)
     host_port = (fwd.get("stdout") or "").strip()
@@ -125,8 +125,21 @@ def _connect(device_name=None, backend=_DEFAULT_BACKEND, start_server=True):
 
 
 def _resolve_target_pid(dev, package_name):
-    """pid of a running process matching package_name (exact name first, then
-    substring), or None."""
+    """pid of the running app whose PACKAGE is package_name, or None.
+
+    On Android, frida reports the app's LABEL (e.g. "Roblox", "Omni Kiosk") as
+    process.name — NOT its package (com.roblox.client). Matching a package
+    against enumerate_processes() therefore never hits, and attach mode wrongly
+    reports a live app as "not running". enumerate_applications() carries the
+    real identifier (package) and its running pid (0 if not running), so resolve
+    there first; only then fall back to process-name matching (covers a bare
+    process name, or a host where enumerate_applications is unavailable)."""
+    try:
+        for app in dev.enumerate_applications():
+            if app.identifier == package_name and app.pid:
+                return app.pid
+    except Exception:
+        pass
     procs = dev.enumerate_processes()
     for p in procs:
         if p.name == package_name:
@@ -262,9 +275,9 @@ def frida_list_processes(filter=None, device_name=None, backend=_DEFAULT_BACKEND
         "in your script to return structured data; console.log is also captured. mode='spawn' gates the "
         "app at startup so you can hook BEFORE its early code runs (anti-tamper/init) — the app is resumed "
         "right after the script loads. mode='attach' (default) hooks an already-running app. "
-        "Java/Kotlin hooks (Java.perform/Java.use) work fully on the x86 base (libart is native x86_64); "
-        "native Interceptor hooks of the app's own ARM64 .so are unreliable under libndk translation — "
-        "prefer Java hooks, or hook x86_64 system libs."
+        "The dev base is arm64 NATIVE, so BOTH Java/Kotlin hooks (Java.perform/Java.use) AND native "
+        "Interceptor/Stalker hooks of the app's own arm64 .so functions work (no libndk translation "
+        "getting in the way)."
     ),
     params_schema={
         "package_name": "string (the app package / process name, e.g. 'com.roblox.client')",
@@ -343,7 +356,7 @@ specs.forEach(function (spec) {
   var sym = parts.length > 1 ? parts[1] : parts[0];
   var addr = null;
   try { addr = Module.findExportByName(mod, sym); } catch (e) {}
-  if (!addr) { send({hook_error: 'native symbol not found (x86_64 only): ' + spec}); return; }
+  if (!addr) { send({hook_error: 'native symbol not found: ' + spec}); return; }
   try {
     Interceptor.attach(addr, {
       onEnter: function (args) {
@@ -363,15 +376,14 @@ specs.forEach(function (spec) {
     description=(
         "Convenience wrapper over frida_run_script that auto-generates a tracing agent: it hooks the "
         "Java methods and/or native functions you name and logs every call's arguments and return value. "
-        "Java methods are given as fully-qualified 'com.pkg.Class.method' (all overloads are hooked) and "
-        "work fully on the x86 base. Native functions are 'libfoo.so!symbol' (or just 'symbol') and are "
-        "hooked via Interceptor — reliable only for x86_64 modules (system libs, the app's x86_64 code); "
-        "the app's own ARM64 .so under libndk translation generally won't resolve/attach cleanly."
+        "Java methods are given as fully-qualified 'com.pkg.Class.method' (all overloads are hooked). "
+        "Native functions are 'libfoo.so!symbol' (or just 'symbol') and are hooked via Interceptor — on "
+        "this arm64-native dev base they resolve/attach cleanly, including the app's own arm64 .so code."
     ),
     params_schema={
         "package_name": "string (the app package / process name)",
         "java_methods": "array of string (optional — fully-qualified 'com.pkg.Class.method' to trace; all overloads hooked)",
-        "native_functions": "array of string (optional — 'module.so!symbol' or 'symbol'; x86_64 targets only)",
+        "native_functions": "array of string (optional — 'module.so!symbol' or 'symbol'; arm64 modules)",
         "mode": "string (optional, default 'attach' — or 'spawn' to trace from process start)",
         "duration_seconds": "integer (optional, default 15, max 120)",
         "device_name": "string (optional — the omnidroid dev account name, default 'omniagent')",
@@ -403,7 +415,7 @@ def frida_trace(package_name, java_methods=None, native_functions=None, mode="at
 
 # A compact, widely-used Java-layer TLS-unpinning agent: neutralizes the default
 # TrustManager, HostnameVerifier, OkHttp CertificatePinner, and TrustManagerImpl
-# so an intercepting proxy's cert is accepted. Java layer => works on the x86 base.
+# so an intercepting proxy's cert is accepted. Java layer => works on the dev base.
 _SSL_UNPIN_JS = r"""
 Java.perform(function () {
   var count = 0;
@@ -457,7 +469,7 @@ Java.perform(function () {
     description=(
         "Injects a ready-made Frida agent that disables common Android TLS certificate pinning "
         "(custom X509TrustManager, OkHttp CertificatePinner, Conscrypt TrustManagerImpl, HostnameVerifier) "
-        "so traffic can be intercepted by a proxy for analysis. Java-layer, so it works on the x86 dev "
+        "so traffic can be intercepted by a proxy for analysis. Java-layer, so it works on the dev "
         "base. mode='spawn' installs it before the app makes any TLS call (recommended); the tool reports "
         "each pinning check it neutralized. This is for authorized security testing of the app under test."
     ),

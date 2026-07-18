@@ -11,6 +11,38 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
+## Context & memory architecture (2026-07 upgrade)
+
+Built to keep an hours-to-days run cheap and focused on a fixed model (GLM 5.2 +
+DeepSeek fallback). See `FRAMEWORK_UPGRADE.md` for the full diagnosis.
+
+**Progressive tool disclosure** (`tool_registry.py`, `tools/meta_tools.py`) — the
+106 tools are split into always-on **core** + on-demand **domain toolsets**
+(`apk`, `smali`, `native`, `emulator`, `frida`, `graph`, `web`). The prompt shows
+core tools in full plus a one-line catalog of the rest; a domain tool still runs
+if called and **auto-activates** its toolset, and `expand_tools()` loads one
+proactively. This cut the first-message system prompt from ~39k to ~17k tokens
+without hiding any capability. `get_tool_prompt(active_groups=None)` keeps the
+legacy full render for isolated sub-agents/tests. The active set is persisted per
+session and re-armed on use.
+
+**Long-run context editing** (`agent.evict_old_tool_results`) — old, large
+`TOOL RESULT` messages collapse to short stubs once past a recent-keep window, so
+history stays lean between summaries (the plan + investigation + knowledge graph
+retain what mattered). Toggle via the session `context_editing` flag.
+
+**Code knowledge graph usability** (`tools/code_graph.py`, `tools/_kg_query.py`)
+— the existing auto-derived code graph (`build_code_graph`/`query_code_graph`)
+was capable but under-used because `query_type` was a required pick-one-of-ten.
+`query_type` is now optional and defaults to a universal `search` across
+classes + methods + strings, so the model can throw any identifier at it and get
+file:line hits; empty/misdirected queries return guidance instead of nothing.
+
+**Tighter behavioral prompt** — the plan/evidence guidance was de-duplicated and
+an APK-modding playbook (decode → map → understand → patch smallest → rebuild →
+verify; expect layered Java+native protections; confirm with frida before a
+static patch) added, so a mid-tier model makes cleverer tool choices.
+
 ## Evidence-based workflow (planner → worker → reviewer)
 
 The agent loop (`agent.AgentApi._run_agent_loop`) runs one model that plays three
@@ -79,3 +111,60 @@ memory dir, so it **survives a context-window summarization/reset intact**.
   (Tests under `tests/` that need Docker, a live LLM provider, or APK fixtures —
   e.g. `test_code_graph`, `test_llm_live`, `test_abi_contract` — are environment
   dependent and unrelated to this workflow.)
+
+## Skills, plugins & delegation (Claude-Code-style capability layer)
+
+Capability is **discovered from disk and declared**, not hard-coded into the tool
+registry — so the base prompt stays small and the surface grows without edits to the
+106-tool core.
+
+**Skills** (`skills_loader.py`, `tools/skill_tools.py`, `skills/<name>/SKILL.md`) —
+detailed, battle-tested workflows under progressive disclosure. The prompt shows only a
+lightweight index (name + description + when-to-use + resource filenames); `use_skill`
+pulls one skill's full body and **auto-activates its toolsets** (the tools it names
+arrive with full schemas next turn), and `read_skill_resource` pulls a bundled
+`reference/` file on demand. A skill's `allowed-tools` frontmatter both drives that
+toolset activation and is checked against the live registry (`skill_tool_issues`) so a
+typo surfaces instead of silently doing nothing. First-party skills cover APK modding,
+smali/native patching, the bypasses (SSL, root, signature, anti-debug), Frida dynamic
+instrumentation, string deobfuscation, dynamic unpacking of packed apps, dex/multidex,
+manifest/resource editing, code-graph navigation, project scaffolding, and a
+`tool-usage` meta-skill on wielding this agent's own arsenal.
+
+**Plugins** (`plugins.py`, `plugins/<name>/`) — self-contained capability bundles
+declaring any mix of: `plugin.json` (manifest, `enabled` toggled via `llm_config.json`'s
+`plugins` map), `agents/*.md` (subagent personas), `skills/<name>/SKILL.md` (extra
+skills merged into the index), `commands/*.md` (named workflows), and
+`hooks/hooks.json` (lifecycle callbacks). A broken plugin is skipped with its error in
+`.issues`, never raised. Shipped plugins: `omni-agents` (researcher / native-analyst /
+implementer delegation personas), `planning-superpowers` (deep-planning skill + architect
+/ brainstormer agents + `/plan-feature`), `gsd` (context-hygiene skill), `verification`
+(verify-before-completion skill + verifier agent + `/verify-work` + a live on_final_answer
+hook), and `android-re` (`/re-triage` end-to-end RE playbook).
+
+**Subagents & delegation** (`subagents.py`, `tools/delegation_tools.py`) — the GSD
+"fresh context per task" primitive: a persona runs in its OWN isolated conversation over
+a mode-filtered tool surface (READ agents fan out in parallel; WRITE agents serialize
+behind a workspace lock) and returns only a distilled report, so the orchestrator's
+context never accumulates the sub-work. Two paths: a plan step tagged `delegate="<agent>"`
+(auto-dispatched when marked in_progress) and `dispatch_agents([...])` for an ad-hoc
+parallel read-only wave.
+
+**Commands** (`tools/command_tools.py`) — a plugin's `commands/*.md` are surfaced as an
+`AVAILABLE COMMANDS` index and loaded on demand with `use_command` (the workflow-loader;
+distinct from the core `run_command` shell tool). A command is broader than a skill — it
+orchestrates skills, subagents, and the plan end-to-end.
+
+**Plugin hooks** (`agent.AgentApi._fire_plugin_hooks`) — enabled plugins can register
+`pre_tool` / `post_tool` / `on_phase_change` / `on_final_answer` callbacks, fired live in
+the run loop with durable runtime signals. Hooks are **advisory and bounded**: a hook may
+return `{"inject": ...}` (a `[PLUGIN]` steering message the model sees next turn) or
+`{"note": ...}` (a user-only line); they never crash the loop and are a zero-cost no-op
+when no plugin hooks an event. The `on_final_answer` gate can send an answer back for more
+work (bounded by `agent.MAX_FINAL_HOOK_NUDGES`), which is how the `verification` plugin
+catches an unverified success claim before "done".
+
+Offline tests: `tests/test_plugins.py`, `tests/test_subagents.py`,
+`tests/test_delegation.py`, `tests/test_skill_toolsets.py`, `tests/test_new_skills.py`,
+`tests/test_command_surface.py`, `tests/test_plugin_hooks_wired.py`,
+`tests/test_context_hygiene.py`, `tests/test_planning_superpowers.py`.
