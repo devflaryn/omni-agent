@@ -848,6 +848,71 @@ _THINK_TAIL_RE = re.compile(r"^.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
+# Non-JSON tool-call shapes that reasoning/open models (esp. GLM, trained on
+# harmony/XML tool syntax) emit instead of the required JSON envelope. Handled as
+# a LAST RESORT in extract_json_action, after JSON salvage finds no action.
+_TAG_RE = re.compile(
+    r"<(?:tool_call|function_call|function)(?:\s+name\s*=\s*\"(?P<attr>[\w.]+)\")?"
+    r"(?:\s*=\s*(?P<eqname>[\w.]+))?\s*>(?P<body>.*?)</(?:tool_call|function_call|function)>",
+    re.DOTALL | re.IGNORECASE,
+)
+_LEADING_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)\s*(\{.*\})\s*$", re.DOTALL)
+_BARE_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)\s*$")
+
+
+def _coerce_args(raw):
+    """Pull an args dict out of a fragment: a JSON object if present, else {}."""
+    if not raw:
+        return {}
+    for obj in _json_candidates(raw):
+        if isinstance(obj, dict):
+            # A wrapper like {"name":..,"arguments":{..}} -> use its arguments.
+            if "arguments" in obj and isinstance(obj["arguments"], dict):
+                return obj["arguments"]
+            if "args" in obj and isinstance(obj["args"], dict):
+                return obj["args"]
+            return obj
+    return {}
+
+
+def _normalize_nonjson_action(text):
+    """Map a non-JSON tool-call shape onto the canonical action, or None.
+
+    Recognizes <tool_call>/<function_call>/<function=> tags (name via attribute,
+    `=name`, or a leading token inside the body), a bare `name\\n{json}` pair, and
+    a lone registered tool name. Only accepts a bare/leading name when it is a
+    REGISTERED tool, so ordinary prose starting with a word is not misread."""
+    if not text:
+        return None
+
+    m = _TAG_RE.search(text)
+    if m:
+        body = (m.group("body") or "").strip()
+        name = m.group("attr") or m.group("eqname")
+        args = _coerce_args(body)
+        if not name:
+            # Name may be a JSON "name" field, or the leading token of the body.
+            for obj in _json_candidates(body):
+                if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+                    name = obj["name"]
+                    break
+            if not name:
+                lead = _BARE_NAME_RE.match(body)
+                if lead and registry.is_registered(lead.group(1)):
+                    name = lead.group(1)
+        if name:
+            return {"type": "tool_call", "tool": name, "args": args if isinstance(args, dict) else {}}
+
+    lead = _LEADING_NAME_RE.match(text)
+    if lead and registry.is_registered(lead.group(1)):
+        return {"type": "tool_call", "tool": lead.group(1), "args": _coerce_args(lead.group(2))}
+
+    bare = _BARE_NAME_RE.match(text)
+    if bare and registry.is_registered(bare.group(1)):
+        return {"type": "tool_call", "tool": bare.group(1), "args": {}}
+
+    return None
+
 
 def strip_reasoning(text):
     """Remove <think>/<thinking> blocks from a reply. Also handles a reply that
@@ -893,6 +958,12 @@ def _normalize_action(obj):
         obj["args"] = obj.get("arguments")
     if "tool" not in obj and isinstance(obj.get("name"), str) and obj.get("type") != "final_answer":
         obj["tool"] = obj["name"]
+    # A dict that only signals "action" via a bare tool/args key (no explicit
+    # type/action field) -- e.g. a raw {"name":.., "arguments":{..}} function-call
+    # body -- is still a tool call; without this the caller sees a dict with no
+    # "type" at all and treats it as unrecognized.
+    if "type" not in obj and "tool" in obj:
+        obj["type"] = "tool_call"
     return obj
 
 
@@ -939,6 +1010,13 @@ def extract_json_action(text):
                     return _normalize_action(obj)
                 if fallback is None:
                     fallback = obj
+
+    # No action-shaped JSON found in any source. Try the non-JSON tool-call
+    # shapes (harmony/XML tags, name-then-json, bare tool name) before falling
+    # back to any stray JSON object the reply happened to contain.
+    nonjson = _normalize_nonjson_action(cleaned)
+    if nonjson is not None:
+        return nonjson
     return fallback
 
 
