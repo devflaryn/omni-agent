@@ -1127,6 +1127,17 @@ def _openai_request(cfg, messages, temperature):
     if not (reasoning_on and style == "openai"):
         cfg_temp = cfg.get("temperature")
         payload["temperature"] = cfg_temp if cfg_temp is not None else temperature
+    # Native function-calling: for models flagged supports_native_tools, offer the
+    # active-group tool schemas + final_answer and REQUIRE a structured call, so the
+    # model cannot emit free-text outside the protocol. Progressive disclosure is
+    # honored via active_groups. Providers not flagged keep the prose-JSON path.
+    if _supports_native_tools(cfg):
+        from tools import tool_schema
+        payload["tools"] = tool_schema.openai_tools_for(cfg.get("active_groups"))
+        payload["tool_choice"] = "required"
+    seed = cfg.get("seed")
+    if seed is not None:
+        payload["seed"] = seed
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
@@ -1193,7 +1204,13 @@ def _openai_request(cfg, messages, temperature):
                     args = json.loads(fn.get("arguments", "{}") or "{}")
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-                return {"ok": True, "content": json.dumps({"type": "tool_call", "tool": fn.get("name", ""), "args": args})}
+                fname = fn.get("name", "")
+                # final_answer is offered as a tool so tool_choice can be "required";
+                # convert it back to the final-answer envelope the loop expects.
+                if fname == "final_answer":
+                    return {"ok": True, "content": json.dumps(
+                        {"type": "final_answer", "content": args.get("content", "")})}
+                return {"ok": True, "content": json.dumps({"type": "tool_call", "tool": fname, "args": args})}
 
             # Reasoning models (OpenRouter routes DeepSeek-R1, Cohere north, etc.)
             # sometimes leave `content` null and put the whole reply in `reasoning`
