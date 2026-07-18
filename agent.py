@@ -2587,7 +2587,8 @@ class AgentApi:
                 # Thinking indicator
                 self._emit({"type": "thinking_start"})
                 start_time = time.time()
-                raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE)
+                raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
+                                       active_groups=s.get("active_toolsets"))
                 elapsed_ms = int((time.time() - start_time) * 1000)
                 self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
 
@@ -2606,7 +2607,8 @@ class AgentApi:
                     s["messages"].append({"role": "user", "content": JSON_CORRECTION_MSG})
                     self._emit({"type": "thinking_start"})
                     start_time = time.time()
-                    raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE)
+                    raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
+                                       active_groups=s.get("active_toolsets"))
                     elapsed_ms += int((time.time() - start_time) * 1000)
                     self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
                     response_type, payload = parse_response(raw_response)

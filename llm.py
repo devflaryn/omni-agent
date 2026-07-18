@@ -1204,6 +1204,8 @@ def _openai_request(cfg, messages, temperature):
                     args = json.loads(fn.get("arguments", "{}") or "{}")
                 except (json.JSONDecodeError, TypeError):
                     args = {}
+                if not isinstance(args, dict):
+                    args = {}
                 fname = fn.get("name", "")
                 # final_answer is offered as a tool so tool_choice can be "required";
                 # convert it back to the final-answer envelope the loop expects.
@@ -1810,7 +1812,7 @@ def _model_label(group, m):
     return f"{name} · {model}"
 
 
-def _run_group(group, messages, temperature, ladder=None, track_active=True):
+def _run_group(group, messages, temperature, ladder=None, track_active=True, active_groups=None):
     """Serve one request from a single provider GROUP, recovering on the correct
     axis per failure kind: rotate the API KEY on a rate limit (429/auth), switch
     the MODEL on an unavailable/queued/slow model. Models are tried primary-first
@@ -1839,6 +1841,7 @@ def _run_group(group, messages, temperature, ladder=None, track_active=True):
             key = live[0]
             cfg = dict(m["cfg"])
             cfg["api_key"] = key
+            cfg["active_groups"] = active_groups
             res = _one_request(cfg, messages, temperature)
             if res.get("ok"):
                 _ACTIVE_KEY = key                       # shared key pool (text + vision)
@@ -1869,7 +1872,7 @@ def _run_group(group, messages, temperature, ladder=None, track_active=True):
     return {"ok": False, "errors": errors}
 
 
-def ask_llm(messages, temperature=0.7):
+def ask_llm(messages, temperature=0.7, active_groups=None):
     """Send the conversation to the configured LLM(s) and return the first
     successful reply's raw text.
 
@@ -1915,7 +1918,7 @@ def ask_llm(messages, temperature=0.7):
         for gi, group in enumerate(groups):
             if _stop_requested():
                 return _stopped_response()
-            res = _run_group(group, messages, temperature)
+            res = _run_group(group, messages, temperature, active_groups=active_groups)
             if res.get("ok"):
                 if gi > 0 or cycle > 0:
                     _notify_fallback(f"{_model_label(group, res['model'])} responded — continuing.")
