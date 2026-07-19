@@ -792,6 +792,40 @@ def _input_failure(res):
 
 
 @registry.register(
+    name="set_emulator_ui",
+    description=(
+        "Switches a DEV instance's visible UI between the custom kiosk and the Magisk manager "
+        "(root) app, via omnidroid 'dev-ui'. Dev instances boot to the SAME kiosk as production; "
+        "use view='magisk' when you need to see/manage root in the Magisk app, then view='kiosk' "
+        "to return to the kiosk/game. Dev base only (a normal instance has no Magisk UI)."
+    ),
+    params_schema={
+        "view": "string — 'kiosk' (foreground the kiosk, stop the Magisk app) or 'magisk' (open the Magisk manager/root UI)",
+        "device_name": "string (optional — the omnidroid instance/username; must match the running dev instance)"
+    },
+    output="JSON confirming which UI is now showing, or an error (not a dev instance / not running / Magisk not installed).",
+    when_to_use="Use to peek at or manage root via the Magisk app during a dev test, then switch back to 'kiosk' so the game/kiosk is visible again for screenshots."
+)
+def set_emulator_ui(view="kiosk", device_name=None):
+    view = (view or "kiosk").strip().lower()
+    if view not in ("kiosk", "magisk"):
+        return {"error": "view must be 'kiosk' or 'magisk'."}
+    name = device_name or _default_device_name("qemu")
+    err = _validate_session_id(name)
+    if err:
+        return {"error": err}
+    try:
+        parsed, res, _pd = _run_qemu(["dev-ui", name, "--show", view, "--json"], timeout=60)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    if res.get("error"):
+        return {"error": res["error"]}
+    if isinstance(parsed, dict) and not parsed.get("ok"):
+        return {"error": parsed.get("message") or parsed.get("error") or "dev-ui failed"}
+    return parsed if isinstance(parsed, dict) else {"stdout": (res.get("stdout") or "").strip()}
+
+
+@registry.register(
     name="tap_screen",
     description=(
         "Taps the emulator screen at pixel (x, y) via 'adb shell input tap'. Coordinates are in "
