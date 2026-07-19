@@ -36,9 +36,11 @@ The Android SDK emulator (`emulator.exe` + AVDs) and LDPlayer paths were REMOVED
 AVDs, ever. The `backend` parameter still exists on the tools for
 call-compatibility but any value other than 'qemu' is coerced to omnidroid.
 
-`device_name` is the omnidroid ACCOUNT NAME (default 'omniagent',
-[A-Za-z0-9_-]+). The SAME account is reused on each call; with reset=True (the
-default) it is REMOVED and re-CREATED fresh from the base (new overlay + /data).
+`device_name` is the omnidroid instance/account name ([A-Za-z0-9_-]+) — name it
+the exact ROBLOX USERNAME under test (not display name); the engine keys instances
+by username and resolves that account's cookie. Only fall back to the generic
+'omniagent' when no Roblox account is in play. The SAME name is reused on each
+call; with reset=True (the default) it is REMOVED and re-CREATED fresh from the base.
 NOTE: a fresh account's first boot runs one-time provisioning + dexopt
 (~3–15 min); pass reset=False to reuse an already-provisioned account and just
 reinstall the APK — the fast path for iterating on a build. That opt-out exists
@@ -449,8 +451,35 @@ def _qemu_create(name, boot_timeout, log, dev=False):
 
 def _autocap_workspace_dir():
     """Where the always-on dev auto-screenshots land in the agent workspace:
-    /workspace/screenshots/auto/ (read them with read_auto_screenshots)."""
+    /workspace/screenshots/<current session>/ (read with read_auto_screenshots).
+    The session name is 'auto' until an APK is installed, then it becomes
+    '<apk_basename>_<DDMMHHMM>' so each install/test session gets its own folder."""
     return resolve_workspace_path(f"screenshots/{_AUTOCAP_SESSION}")
+
+
+def _install_session_name(apk_path):
+    """A per-install-session screenshot-folder name: the APK's base filename plus
+    a DDMMHHMM stamp of when it was installed this session, e.g.
+    'intermadiate_test_v4_19070641'. Sanitized to [A-Za-z0-9_-]."""
+    base = os.path.splitext(os.path.basename(str(apk_path)))[0]
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", base).strip("_") or "apk"
+    return f"{base}_{time.strftime('%d%m%H%M')}"
+
+
+def _begin_install_autocap_session(apk_path, name, log):
+    """Point the always-on recorder at a fresh per-install screenshot folder named
+    for this APK + timestamp, so the test session's frames don't mix with the
+    boot's. Dev-base only (the engine no-ops autocap off-dev); best-effort."""
+    global _AUTOCAP_SESSION
+    _AUTOCAP_SESSION = _install_session_name(apk_path)
+    try:
+        os.environ["OMNI_AUTOCAP_DIR"] = _autocap_workspace_dir()
+    except RuntimeError:
+        pass
+    # Re-ensure with the new --out; the engine repoints a running recorder when a
+    # different dir is requested (omnidroid ensure_autocap).
+    _agent_ensure_autocap(name, log)
+    return _AUTOCAP_SESSION
 
 
 def _agent_ensure_autocap(name, log):
@@ -679,7 +708,7 @@ def _resolve_serial(backend, device_name=None):
     ),
     params_schema={
         "backend": "string (optional, default 'qemu' — omnidroid is the ONLY backend; any other value is coerced to omnidroid, there is no SDK-emulator/AVD/LDPlayer path)",
-        "device_name": "string (optional — the omnidroid account name, must match [A-Za-z0-9_-]+; default 'omniagent'. The SAME account is always reused, never duplicated)",
+        "device_name": "string (the omnidroid instance/account name, must match [A-Za-z0-9_-]+). NAME IT THE ROBLOX USERNAME you are testing as — the exact username (NOT display name) from register_roblox_account / list_roblox_accounts. The engine keys instances by username and resolves that account's cookie automatically, so the same username always reuses the same instance. Only fall back to the generic 'omniagent' when there is no Roblox account in play. PREFER play_roblox, which sets this for you.)",
         "system_image": "string (IGNORED — was AVD-only; the base image is base_x86 on an x86 host / base_arm on an arm64 host)",
         "device_profile": "string (IGNORED — was AVD-only)",
         "reset": "boolean (optional, default true — remove+recreate the account (fresh instance, re-provisions on first boot). Set false to reuse the existing running/provisioned account as-is (much faster).",
@@ -741,6 +770,161 @@ def adb_shell(command, backend=_DEFAULT_BACKEND, device_name=None, timeout_secon
         timeout_seconds = 30
     args = shlex.split(command)
     return _run([adb, "-s", serial_or_err, "shell"] + args, timeout=timeout_seconds)
+
+
+def _int_arg(value, name):
+    """Coerce a coordinate/keycode arg to int, or return an {'error': ...} dict."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return {"error": f"{name} must be an integer (got {value!r})."}
+
+
+def _input_failure(res):
+    """Return an {'error': ...} dict if an adb `input` _run result failed (a _run
+    error, or a non-zero exit / stderr from adb itself), else None on success."""
+    if isinstance(res, dict) and res.get("error"):
+        return res
+    if isinstance(res, dict) and res.get("returncode", 0) != 0:
+        return {"error": f"adb input failed (exit {res.get('returncode')}): "
+                         f"{(res.get('stderr') or res.get('stdout') or '').strip()[:300]}"}
+    return None
+
+
+@registry.register(
+    name="tap_screen",
+    description=(
+        "Taps the emulator screen at pixel (x, y) via 'adb shell input tap'. Coordinates are in "
+        "SCREEN PIXELS from the top-left. WORKFLOW: first take_emulator_screenshot (or read the "
+        "always-on auto-screenshots), read the pixel position of the button/field you want from "
+        "that image, then tap it here. The screenshot and the device share the same pixel space."
+    ),
+    params_schema={
+        "x": "integer (pixels from left)",
+        "y": "integer (pixels from top)",
+        "backend": "string (optional, default 'qemu' — must match ensure_emulator_running's backend)",
+        "device_name": "string (optional — must match the device_name ensure_emulator_running used)"
+    },
+    output="Confirmation of the tap, or an adb error.",
+    when_to_use="Use to click a button/menu/field whose on-screen position you read from a screenshot. Pair with take_emulator_screenshot to get coordinates first."
+)
+def tap_screen(x, y, backend=_DEFAULT_BACKEND, device_name=None):
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    xi, yi = _int_arg(x, "x"), _int_arg(y, "y")
+    if isinstance(xi, dict):
+        return xi
+    if isinstance(yi, dict):
+        return yi
+    res = _run([adb, "-s", serial_or_err, "shell", "input", "tap", str(xi), str(yi)], timeout=30)
+    fail = _input_failure(res)
+    if fail:
+        return fail
+    return {"ok": True, "tapped": [xi, yi], "detail": res}
+
+
+@registry.register(
+    name="type_text",
+    description=(
+        "Types a string into the currently focused text field via 'adb shell input text'. Tap the "
+        "field first (tap_screen) so it has focus. Spaces are handled automatically; for Enter/Back "
+        "use press_key. Note: 'input text' handles plain text — very unusual characters may not send."
+    ),
+    params_schema={
+        "text": "string (the text to type into the focused field)",
+        "backend": "string (optional, default 'qemu')",
+        "device_name": "string (optional — must match ensure_emulator_running's device_name)"
+    },
+    output="Confirmation of the typed text, or an adb error.",
+    when_to_use="Use after tapping a text field to enter a value (search terms, a Luau script name, credentials). Pair with tap_screen for focus."
+)
+def type_text(text, backend=_DEFAULT_BACKEND, device_name=None):
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    if not isinstance(text, str) or text == "":
+        return {"error": "text must be a non-empty string."}
+    # `input text` treats spaces specially — encode them as %s. Pass as ONE arg so
+    # the host shell doesn't split it; Android's input decodes the %s back to space.
+    encoded = text.replace(" ", "%s")
+    res = _run([adb, "-s", serial_or_err, "shell", "input", "text", encoded], timeout=30)
+    fail = _input_failure(res)
+    if fail:
+        return fail
+    return {"ok": True, "typed": text, "detail": res}
+
+
+@registry.register(
+    name="swipe_screen",
+    description=(
+        "Swipes/drags from (x1, y1) to (x2, y2) via 'adb shell input swipe', over an optional "
+        "duration in ms (longer = slower drag; a long same-point swipe is a long-press). Coordinates "
+        "are screen pixels read from a screenshot, same as tap_screen."
+    ),
+    params_schema={
+        "x1": "integer (start x, pixels)",
+        "y1": "integer (start y, pixels)",
+        "x2": "integer (end x, pixels)",
+        "y2": "integer (end y, pixels)",
+        "duration_ms": "integer (optional, default 300 — swipe duration; larger = slower)",
+        "backend": "string (optional, default 'qemu')",
+        "device_name": "string (optional)"
+    },
+    output="Confirmation of the swipe, or an adb error.",
+    when_to_use="Use to scroll a list, drag a slider, or long-press (same start/end with a large duration). Read start/end pixels from a screenshot."
+)
+def swipe_screen(x1, y1, x2, y2, duration_ms=300, backend=_DEFAULT_BACKEND, device_name=None):
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    coords = []
+    for val, nm in ((x1, "x1"), (y1, "y1"), (x2, "x2"), (y2, "y2")):
+        iv = _int_arg(val, nm)
+        if isinstance(iv, dict):
+            return iv
+        coords.append(iv)
+    dur = _int_arg(duration_ms, "duration_ms")
+    if isinstance(dur, dict):
+        dur = 300
+    dur = max(50, min(dur, 10000))
+    res = _run([adb, "-s", serial_or_err, "shell", "input", "swipe",
+                *[str(c) for c in coords], str(dur)], timeout=30)
+    fail = _input_failure(res)
+    if fail:
+        return fail
+    return {"ok": True, "swiped": {"from": coords[:2], "to": coords[2:], "duration_ms": dur}, "detail": res}
+
+
+@registry.register(
+    name="press_key",
+    description=(
+        "Presses a hardware/navigation key via 'adb shell input keyevent'. Accepts an Android "
+        "keycode NUMBER (e.g. 4=BACK, 3=HOME, 66=ENTER, 187=APP_SWITCH, 26=POWER) or a keycode "
+        "NAME (e.g. 'BACK', 'HOME', 'ENTER', 'DEL', 'TAB'). Use for navigation the touch tools "
+        "can't express."
+    ),
+    params_schema={
+        "key": "string|integer (a keycode number like 4, or a name like 'BACK'/'ENTER'/'HOME')",
+        "backend": "string (optional, default 'qemu')",
+        "device_name": "string (optional)"
+    },
+    output="Confirmation of the keyevent, or an adb error.",
+    when_to_use="Use for Back/Home/Enter/App-switch and other hardware keys — e.g. Enter to submit after type_text, or Back to dismiss a dialog."
+)
+def press_key(key, backend=_DEFAULT_BACKEND, device_name=None):
+    adb, serial_or_err = _resolve_serial(backend, device_name)
+    if adb is None:
+        return serial_or_err
+    if key is None or (isinstance(key, str) and not key.strip()):
+        return {"error": "key must be a keycode number or name (e.g. 4 or 'BACK')."}
+    # adb accepts either a number or a KEYCODE name; pass through as a string.
+    keycode = str(key).strip()
+    res = _run([adb, "-s", serial_or_err, "shell", "input", "keyevent", keycode], timeout=30)
+    fail = _input_failure(res)
+    if fail:
+        return fail
+    return {"ok": True, "key": keycode, "detail": res}
 
 
 @registry.register(
@@ -825,10 +1009,17 @@ def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None
                 f"ABI CONTRACT VIOLATION on {arch} account '{name}': installed as abi={abi_installed} "
                 f"with native_bridge_used={nbu}, but this account's intended path is {want}. "
                 f"The APK was NOT tested on the intended path — failing the test.")}
+        # Start a fresh per-install screenshot session named for this APK + time
+        # (e.g. screenshots/<apk>_<DDMMHHMM>/), so this test's frames get their own
+        # folder instead of piling into a single shared 'auto/'. Dev-base only.
+        cap_log = []
+        session = _begin_install_autocap_session(apk_path, name, cap_log)
+        cap_note = f" Auto-screenshots -> /workspace/screenshots/{session}/ (read_auto_screenshots)."
         return {"stdout": (
             f"Installed {parsed.get('package')} on {arch} account '{name}': abi={abi_installed}, "
             f"native_bridge_used={nbu} — intended path exercised "
-            f"({'ARM translation' if expect_bridge else 'native'}). Kiosk launching the app.")}
+            f"({'ARM translation' if expect_bridge else 'native'}). Kiosk launching the app."
+            + cap_note)}
 
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
