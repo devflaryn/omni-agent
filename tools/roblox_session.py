@@ -100,6 +100,7 @@ def _summarize(parsed, res, action):
         "launch_data": "string (optional — <=200 bytes, readable in-game via Player:GetJoinData())",
         "user_id": "integer (optional — informational: which Roblox user the token belongs to)",
         "dev": "boolean (optional — create the instance on the DEV base (frida+Magisk) to test a new Roblox build. Only affects a NEW instance; ignored if it already exists. For the standard 'does this build work' check on production, leave false)",
+        "ephemeral": "boolean (optional, default TRUE — fully-shared, no-persistence instance: shared base booted snapshot=on, no per-account disk, concurrent instances, clean device every boot (cookie re-injected each run). Set false only to persist an instance's writes across reboots)",
         "timeout": "integer (optional — seconds to wait for boot; the engine picks a first-boot-aware default)",
     },
     output=("JSON: {ok, place_id, deeplink, booted, launched, session:{...token redacted...}, "
@@ -115,7 +116,7 @@ def _summarize(parsed, res, action):
 )
 def play_roblox(place_id, account=None, token=None, session_name=None,
                 job_id=None, launch_data=None, user_id=None, dev=False,
-                timeout=None):
+                ephemeral=True, timeout=None):
     # Modern model: the account username IS the instance name, so the engine
     # resolves its saved cookie automatically. `account` therefore takes
     # precedence over session_name for NAMING — otherwise a mismatched
@@ -131,6 +132,11 @@ def play_roblox(place_id, account=None, token=None, session_name=None,
         return {"error": err}
 
     argv = ["play", session_name, "--place", str(place_id), "--json"]
+    if _truthy(ephemeral):
+        # Fully-shared, no-persistence: shared base booted snapshot=on, no
+        # per-account disk, concurrent instances, clean device each boot (the
+        # cookie is re-injected on this run). Only affects a NEW instance.
+        argv += ["--ephemeral"]
     if _truthy(dev):
         # Create the instance on the DEV base (frida+Magisk) for testing a new
         # Roblox build. Only affects a NEW instance; the engine gates --dev by

@@ -426,17 +426,23 @@ def _dev_base_enabled(dev=None):
     return _truthy(os.environ.get("OMNI_USE_DEV_BASE", ""))
 
 
-def _qemu_create(name, boot_timeout, log, dev=False):
-    """Create disks for a fresh account (no boot — the first `start` provisions).
-    Returns None on success or an {"error": ...} dict on failure. When dev=True
-    the account is pinned to the 'dev' base (`create --base dev`) so it boots
-    base_arm with the frida/Magisk devkit disk attached instead of a production
-    base."""
+def _qemu_create(name, boot_timeout, log, dev=False, ephemeral=True):
+    """Create a fresh instance (no boot — the first `start` provisions). Returns
+    None on success or an {"error": ...} dict on failure. When dev=True the
+    account is pinned to the 'dev' base (`create --base dev`) so it boots base_arm
+    with the frida/Magisk devkit disk attached. When ephemeral=True (the default)
+    the instance is fully-shared / no-persistence: it boots the shared base
+    directly (snapshot=on) with NO per-account overlay disks, so many instances
+    run concurrently and nothing persists between boots — the right model for
+    reproducible test runs named by the Roblox username."""
     tag = " on the DEV base (frida+root-hiding)" if dev else ""
-    log.append(f"Creating account '{name}'{tag} (disks only; first boot provisions)...")
+    eph = " [ephemeral: shared disk, no persistence]" if ephemeral else ""
+    log.append(f"Creating account '{name}'{tag}{eph} (disks only; first boot provisions)...")
     argv = ["create", name, "--no-provision", "--json"]
     if dev:
         argv += ["--base", "dev"]
+    if ephemeral:
+        argv += ["--ephemeral"]
     try:
         parsed, res, _pd = _run_qemu(argv, timeout=600)
     except RuntimeError as e:
@@ -508,7 +514,7 @@ def _agent_ensure_autocap(name, log):
         log.append(f"[autocap] recorder not started ({why}).")
 
 
-def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
+def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False, ephemeral=True):
     err = _validate_session_id(name)
     if err:
         return {"error": err}
@@ -586,13 +592,13 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
             if res_rm.get("error"):
                 return {"error": res_rm["error"]}
             exists = running = False
-        err = _qemu_create(name, boot_timeout, log, dev=dev)
+        err = _qemu_create(name, boot_timeout, log, dev=dev, ephemeral=ephemeral)
         if err:
             return err
         exists, running = True, False
     elif not exists:
         # reset=False but nothing to reuse yet — create it once.
-        err = _qemu_create(name, boot_timeout, log, dev=dev)
+        err = _qemu_create(name, boot_timeout, log, dev=dev, ephemeral=ephemeral)
         if err:
             return err
         exists = True
@@ -717,18 +723,20 @@ def _resolve_serial(backend, device_name=None):
         "ram_mb": "integer (optional — override guest RAM in MB, passed as --mem; overrides the mode's RAM. Engine defaults to the mode's tier if omitted)",
         "cpus": "integer (optional — IGNORED (vCPU count is set by 'mode'))",
         "headless": "boolean (IGNORED — omnidroid instances are always headless; view over the instance's localhost VNC port)",
-        "dev": "boolean (optional, default false — boot the DEV base: base_arm plus the extra devkit disk (vdc = base_arm_devkit.qcow2) carrying an android-arm64 frida-server + Magisk + the omni-* tools, for reverse-engineering/runtime-hooking work. Requires `omni build-dev-base` to have produced the devkit disk (and `--patch-boot` to root it, so frida can attach). Also enablable globally via the OMNI_USE_DEV_BASE env var. Only affects a FRESH create (base is fixed per account); production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)"
+        "dev": "boolean (optional, default false — boot the DEV base: base_arm plus the extra devkit disk (vdc = base_arm_devkit.qcow2) carrying an android-arm64 frida-server + Magisk + the omni-* tools, for reverse-engineering/runtime-hooking work. Requires `omni build-dev-base` to have produced the devkit disk (and `--patch-boot` to root it, so frida can attach). Also enablable globally via the OMNI_USE_DEV_BASE env var. Only affects a FRESH create (base is fixed per account); production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)",
+        "ephemeral": "boolean (optional, default TRUE — fully-shared, no-persistence instance: boots the shared base directly (snapshot=on) with NO per-account disk files, so many instances run concurrently and every boot is a clean, reproducible device (nothing persists between boots). This is the normal model for username-named test runs. Set false ONLY if you need writes to persist across reboots of the SAME instance (then it gets its own overlay disks)."
     },
     output="A log of what happened (account creation/reset if needed, boot wait progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
     when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly — it always targets the same omnidroid account and (by default) resets it to a clean state each time. Fully self-contained (no Android Studio / SDK emulator / LDPlayer). Pass dev=true (or set OMNI_USE_DEV_BASE) to boot the frida/root-hiding dev base."
 )
 def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_image=_DEFAULT_SYSTEM_IMAGE,
                              device_profile="pixel_5", reset=True, boot_timeout=300, headless=False,
-                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, dev=None):
+                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, dev=None, ephemeral=True):
     backend = _coerce_backend(backend)   # omnidroid (qemu) only — never an AVD
     device_name = device_name or _default_device_name()
     reset = _truthy(reset)
     dev = _dev_base_enabled(dev)
+    ephemeral = _truthy(ephemeral)
     try:
         boot_timeout = int(boot_timeout)
     except (TypeError, ValueError):
@@ -739,7 +747,8 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     # ALWAYS omnidroid: create/start an account on the base (base_x86 on x86,
     # base_arm on an arm64 host) via the frozen contract. system_image/
     # device_profile/headless are ignored (they were AVD-only).
-    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb, dev=dev)
+    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb, dev=dev,
+                                ephemeral=ephemeral)
 
 
 @registry.register(
