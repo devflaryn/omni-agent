@@ -8,6 +8,7 @@ no stale schema is ever served after a code change.
 import hashlib
 import inspect
 import json
+import re
 
 from tool_registry import registry, CORE_GROUP
 
@@ -35,6 +36,43 @@ def _json_type(annotation):
     return _TYPE_MAP.get(annotation, "string")
 
 
+# The registry's params_schema descriptions follow a "<type> (...)" convention
+# (e.g. "array of strings (...)", "integer (...)", "boolean (...)"). Tool functions
+# rarely carry real annotations, so we derive the JSON type from that leading word
+# — otherwise every param defaults to "string" and a native-function-calling model
+# passes arrays/objects in the wrong shape (e.g. plan_create's `phases`).
+_DESC_TYPE_RE = re.compile(r"^\s*(array|object|integer|number|boolean|string|dict|list|bool|int|float)\b",
+                           re.IGNORECASE)
+
+
+def _prop_from_desc(annotation, desc):
+    """Build the JSON-schema property for one param: prefer a real annotation, else
+    infer the type from the leading word of the description. Arrays get an `items`
+    schema ('array of strings' -> string items; a bare 'array' -> permissive)."""
+    # A real annotation wins when present.
+    if annotation is not None and annotation in _TYPE_MAP:
+        jtype = _TYPE_MAP[annotation]
+    else:
+        m = _DESC_TYPE_RE.match(desc or "")
+        word = (m.group(1).lower() if m else "string")
+        jtype = {"array": "array", "list": "array", "object": "object", "dict": "object",
+                 "integer": "integer", "int": "integer", "number": "number",
+                 "float": "number", "boolean": "boolean", "bool": "boolean"}.get(word, "string")
+    prop = {"type": jtype}
+    if jtype == "array":
+        # "array of strings/objects/..." pins the item type; a bare "array" (items
+        # may be strings OR objects, as in plan_create's `steps`) stays permissive.
+        mi = re.search(r"array of (\w+)", desc or "", re.IGNORECASE)
+        if mi:
+            item_word = mi.group(1).rstrip("s").lower()  # "strings" -> "string"
+            prop["items"] = {"type": {"string": "string", "object": "object",
+                                      "integer": "integer", "number": "number",
+                                      "boolean": "boolean"}.get(item_word, "string")}
+        else:
+            prop["items"] = {}  # permissive: string or object element allowed
+    return prop
+
+
 def build_openai_schema(name):
     """The OpenAI `tools` entry for one registered tool, from its live signature."""
     data = registry._tools[name]
@@ -52,8 +90,9 @@ def build_openai_schema(name):
     for pname, p in sig_params.items():
         if p.kind in (p.VAR_KEYWORD, p.VAR_POSITIONAL):
             continue
-        prop = {"type": _json_type(p.annotation if p.annotation is not p.empty else None)}
         desc = params_text.get(pname)
+        annotation = p.annotation if p.annotation is not p.empty else None
+        prop = _prop_from_desc(annotation, str(desc) if desc else "")
         if desc:
             prop["description"] = str(desc)
         properties[pname] = prop

@@ -55,14 +55,31 @@ def _new_id():
     return uuid.uuid4().hex[:8]
 
 
+def _coerce_title(v):
+    """One list element -> a title string. A plain string passes through; a dict
+    (some models send phases/criteria as objects like {"name": ..., "steps": [...]}
+    despite the 'array of strings' schema) is reduced to its name/title/content
+    field instead of being str()'d into a raw '{...}' blob that renders in the UI."""
+    if isinstance(v, dict):
+        for key in ("name", "title", "content", "description", "step", "text"):
+            val = v.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return ""   # a dict with no usable label -> drop it, don't render raw JSON
+    return str(v).strip()
+
+
 def _clean_list(values):
     """A list of non-empty trimmed strings, or [] — used for success criteria,
-    constraints, and phase titles coming from tool args."""
+    constraints, and phase titles coming from tool args. Robust to dict elements
+    (coerced to their name/title) so a mis-shaped tool arg never renders as raw JSON."""
     if not values:
         return []
     if isinstance(values, str):
         values = [values]
-    return [str(v).strip() for v in values if str(v).strip()]
+    if isinstance(values, dict):   # a single object instead of a list
+        values = [values]
+    return [t for t in (_coerce_title(v) for v in values) if t]
 
 
 class Plan:
