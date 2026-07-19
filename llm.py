@@ -151,19 +151,38 @@ You run in a Linux Docker sandbox with the active project mounted at `/workspace
 tools run on the host machine instead (their descriptions say so)."""
 
 
-def get_static_system_prompt():
+def get_static_system_prompt(native_tools=False):
     """The STATIC half of the system prompt: intro + behavioral contract +
     skills. It deliberately EXCLUDES the tool list — tools are rendered
     separately by render_tools_section() so progressive tool disclosure can vary
-    which schemas are shown per turn without rebuilding any of this."""
+    which schemas are shown per turn without rebuilding any of this.
+
+    native_tools=True adapts the RESPONSE FORMAT block for models driven via the
+    OpenAI function-calling interface: they must NOT be told to emit the JSON
+    envelope (that contradicts tool_choice=required and confuses the model), so
+    the block points at the native interface and the final_answer tool instead."""
     base_prompt = DEFAULT_SYSTEM_PROMPT
 
-    base_prompt += """
+    if native_tools:
+        base_prompt += """
+
+RESPONSE FORMAT: call tools through your native function-calling interface — exactly ONE tool call per turn. \
+Pass a one-sentence `explanation` argument when you START a new sub-step (see EXPLAINING YOUR WORK). To FINISH the \
+task, call the final_answer tool with your answer as `content`. Do NOT wrap calls in JSON text, markdown, or \
+<tool_call>/<function> tags — use the function-calling interface directly.
+"""
+    else:
+        base_prompt += """
 
 RESPONSE FORMAT (always valid JSON, nothing else):
 - Tool call:    {"type": "tool_call", "tool": "<name>", "args": { ... }, "explanation": "<optional 1 sentence>"}
 - Final answer: {"type": "final_answer", "content": "<text>"}
 Exactly ONE JSON object per turn — one tool at a time. No markdown, no code fences, no text outside the JSON.
+"""
+
+    # Shared behavioral contract (protocol-agnostic) — appended for BOTH the native
+    # and prose RESPONSE FORMAT variants above.
+    base_prompt += """
 
 EXPLAINING YOUR WORK — the PLAN narrates the chat:
 - Break work into subprocess/subtask STEPS (e.g. "scan the workspace", "patch the license check", "rebuild & verify").
@@ -258,19 +277,26 @@ APK MODDING PLAYBOOK (the core mission — decode → map → understand → pat
     return prompt
 
 
-def render_tools_section(active_groups=None):
+def render_tools_section(active_groups=None, native=False):
     """The AVAILABLE TOOLS section of the prompt, honoring progressive
     disclosure. active_groups=None renders EVERY tool in full (legacy behavior,
     used by isolated sub-agents/tests); a set renders core + active domain
-    toolsets in full and the rest as a compact one-line catalog."""
-    return registry.get_tool_prompt(active_groups=active_groups)
+    toolsets in full and the rest as a compact one-line catalog.
+
+    native=True renders a COMPACT name+summary index only (no JSON call-format
+    header, no full param blocks) — the authoritative schemas ride in the
+    request's `tools=` array, so duplicating them as text just wastes context and
+    contradicts the function-calling protocol."""
+    return registry.get_tool_prompt(active_groups=active_groups, native=native)
 
 
-def get_full_system_prompt(active_groups=None):
+def get_full_system_prompt(active_groups=None, native=False):
     """Convenience: the whole prompt = static half + tool section. With
     active_groups=None every tool is shown (used where the full surface is
-    wanted); pass a set for progressive disclosure."""
-    return get_static_system_prompt() + "\n" + render_tools_section(active_groups)
+    wanted); pass a set for progressive disclosure. native=True adapts both
+    halves for the function-calling interface."""
+    return (get_static_system_prompt(native_tools=native) + "\n"
+            + render_tools_section(active_groups, native=native))
 
 
 # --- config load / save ------------------------------------------------------
@@ -1212,7 +1238,15 @@ def _openai_request(cfg, messages, temperature):
                 if fname == "final_answer":
                     return {"ok": True, "content": json.dumps(
                         {"type": "final_answer", "content": args.get("content", "")})}
-                return {"ok": True, "content": json.dumps({"type": "tool_call", "tool": fname, "args": args})}
+                # Narration: every native tool carries an optional `explanation` arg.
+                # Lift it to the action's top level (where the agent loop reads it to
+                # open a chat/action group) and strip it from args so the underlying
+                # tool — which has no such parameter — never receives it.
+                action = {"type": "tool_call", "tool": fname, "args": args}
+                expl = args.pop("explanation", None)
+                if isinstance(expl, str) and expl.strip():
+                    action["explanation"] = expl.strip()
+                return {"ok": True, "content": json.dumps(action)}
 
             # Reasoning models (OpenRouter routes DeepSeek-R1, Cohere north, etc.)
             # sometimes leave `content` null and put the whole reply in `reasoning`
@@ -1658,6 +1692,27 @@ def get_active_provider():
         model = chosen.get("model", "")   # active model belongs to a different group
     return {"id": chosen.get("id"), "name": chosen.get("name", ""),
             "label": chosen.get("label", ""), "model": model}
+
+
+def active_supports_native_tools():
+    """Whether the model that will actually serve requests is flagged for native
+    function-calling. Resolves the active provider + model (same logic the badge
+    uses) and checks its per-model supports_native_tools. Used by the agent to
+    build a native-aware system prompt (no JSON-envelope protocol, compact tool
+    index) that MATCHES how the request is sent. Best-effort → False on any error."""
+    try:
+        active = get_active_provider()
+        if not active:
+            return False
+        model = active.get("model")
+        for c in get_effective_configs():
+            if c.get("id") == active.get("id") or model in (c.get("models") or [c.get("model")]):
+                cfg = dict(c)
+                cfg["model"] = model
+                return _supports_native_tools(cfg)
+        return False
+    except Exception:
+        return False
 
 
 # --- user-selected preferred model --------------------------------------------

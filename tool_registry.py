@@ -161,7 +161,7 @@ class ToolRegistry:
         """Full schema blocks for every tool in a group, concatenated."""
         return "".join(self._full_block(n) for n in self.tools_in_group(group))
 
-    def get_tool_prompt(self, allowed_tools=None, active_groups=None):
+    def get_tool_prompt(self, allowed_tools=None, active_groups=None, native=False):
         """
         Generates the system prompt segment listing available tools. Each full
         entry is compact — name, what it does, when to use it, params, output —
@@ -176,17 +176,46 @@ class ToolRegistry:
             catalog tool directly (it still executes) or expand_tools("<group>")
             to pull the full schemas in first.
 
+        native=True -> a COMPACT name+summary index of EVERY tool (grouped), with
+        NO JSON call-format header and NO param blocks: the authoritative schemas
+        are delivered out-of-band in the request's `tools=` array, so repeating
+        them as text only wastes context and contradicts the function-calling
+        protocol. The index still lets the model choose tools and pick skills.
+
         allowed_tools (if given) still hard-filters the visible surface.
         """
+        def visible(name):
+            return allowed_tools is None or name in allowed_tools
+
+        if native:
+            prompt = (
+                "AVAILABLE TOOLS (index)\n"
+                "Call these through your function-calling interface — their full parameter schemas are provided "
+                "there. This list is your index for choosing a tool or a skill; one tool call per turn.\n"
+            )
+            # Core tools first, then each domain toolset, as one-line entries.
+            core = [n for n in self._tools if visible(n) and self.group_of(n) == CORE_GROUP]
+            if core:
+                prompt += "\n[core]:\n"
+                for name in core:
+                    prompt += f"  - {name} — {self._summary_line(name)}\n"
+            for grp in self.domain_groups():
+                names = [n for n in self.tools_in_group(grp) if visible(n)]
+                if not names:
+                    continue
+                label = GROUP_LABELS.get(grp, grp)
+                prompt += f"\n[{grp}] {label}:\n"
+                for name in names:
+                    prompt += f"  - {name} — {self._summary_line(name)}\n"
+            prompt += "\nEND OF TOOL LIST.\n"
+            return prompt
+
         prompt = (
             "AVAILABLE TOOLS\n"
             'Call ONE tool per turn as JSON: {"type":"tool_call","tool":"<name>","args":{...}}. '
             "Use only the args listed for that tool. Each full entry below is: name — what it does; "
             "When: when to pick it; Params: its arguments; Output: what you get back.\n"
         )
-
-        def visible(name):
-            return allowed_tools is None or name in allowed_tools
 
         if active_groups is None:
             for name in self._tools:

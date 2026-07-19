@@ -87,16 +87,45 @@ def _final_answer_schema():
     }
 
 
+# Optional narration arg offered on every real tool (NOT final_answer) so the
+# per-call "explanation" mechanism works over the native interface too. It's
+# lifted out of args and stripped before the tool runs (see _openai_request), so
+# the underlying function never receives it.
+_NARRATION_PROP = {
+    "type": "string",
+    "description": "Optional: a one-sentence, first-person note when you START a new sub-step (narrates the chat).",
+}
+
+
+def _with_narration(schema):
+    """A copy of `schema` with the optional `explanation` arg added, without
+    mutating the cached base schema."""
+    fn = schema["function"]
+    params = fn["parameters"]
+    props = dict(params.get("properties") or {})
+    props["explanation"] = _NARRATION_PROP
+    return {
+        "type": "function",
+        "function": {
+            "name": fn["name"],
+            "description": fn["description"],
+            "parameters": {"type": "object", "properties": props,
+                           "required": params.get("required", [])},
+        },
+    }
+
+
 def openai_tools_for(active_groups):
     """Build the per-turn `tools=` array: core + active-group tools (progressive
     disclosure preserved — NOT all tools), plus expand_tools and final_answer.
+    Every real tool also carries an optional `explanation` narration arg.
     active_groups=None means every registered tool (legacy/isolated callers)."""
     names = []
     for name in registry._tools:
         grp = registry.group_of(name)
         if active_groups is None or grp == CORE_GROUP or grp in active_groups:
             names.append(name)
-    tools = [build_openai_schema(n) for n in names]
+    tools = [_with_narration(build_openai_schema(n)) for n in names]
     if not any(t["function"]["name"] == FINAL_ANSWER_TOOL for t in tools):
         tools.append(_final_answer_schema())
     return tools

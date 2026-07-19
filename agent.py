@@ -36,6 +36,7 @@ from llm import (
     set_fallback_notifier,
     set_active_provider_notifier,
     get_active_provider,
+    active_supports_native_tools,
     get_preferred_model,
     set_preferred_model,
     list_model_options,
@@ -168,6 +169,12 @@ LOOP_REPEAT_THRESHOLD = 3
 # before the loop moves on WITHOUT terminating (it keeps re-prompting on the next
 # turn — a parse failure never ends the session).
 MAX_PARSE_RETRIES = 3
+# Incremental conversation persistence: the agent loop saves the chat at most
+# this often (seconds) DURING a run, not only when the loop ends. Without this a
+# hard interrupt / crash / kill mid-run loses every assistant+tool turn since the
+# last send_message (plan/investigation persist per-update and survive; the chat
+# must too). Throttled so rapid tool calls don't rewrite the ~100KB+ file every turn.
+PERSIST_MIN_INTERVAL_S = 15
 # Watchdog: if the SAME tool fails this many times in a row, force the agent to
 # switch strategy instead of blindly retrying the same failing command.
 WATCHDOG_FAIL_THRESHOLD = 5
@@ -1151,6 +1158,19 @@ class AgentApi:
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         })
         _write_json_atomic(os.path.join(mem, TRANSCRIPT_FILENAME), _cap_transcript(s.get("transcript", [])))
+        s["_last_persist_ts"] = time.monotonic()
+
+    def _persist_session_throttled(self):
+        """Persist the session at most once per PERSIST_MIN_INTERVAL_S — called on
+        every agent-loop iteration so an interrupted long run keeps its history
+        without rewriting the (growing) conversation file on every single turn.
+        The loop's end-of-run `finally` still does an unconditional final save."""
+        s = self.session
+        if not s:
+            return
+        last = s.get("_last_persist_ts", 0.0)
+        if time.monotonic() - last >= PERSIST_MIN_INTERVAL_S:
+            self._persist_session()
 
     def _load_persisted(self, memory_dir):
         """Returns (messages_or_None, transcript_list, original_task, stats) saved
@@ -1219,9 +1239,17 @@ class AgentApi:
         on every single status update)."""
         if not self.session:
             return
+        # Native-aware: when the active model is driven via the function-calling
+        # interface, the prompt must NOT command the JSON-envelope protocol or
+        # embed full text schemas (they ride in the request's tools= array) — that
+        # contradicts tool_choice=required and wastes context. The decision is made
+        # ONCE per session (start_session, stored as session["native_tools"]) and
+        # the matching base_system_prompt is built there; here we just read it, so
+        # composition doesn't depend on live global config mid-run.
+        native = bool(self.session.get("native_tools"))
         # Progressive tool disclosure: render only core + activated toolsets in
         # full; everything else stays a one-line catalog until used/expanded.
-        tools_section = render_tools_section(self.session.get("active_toolsets"))
+        tools_section = render_tools_section(self.session.get("active_toolsets"), native=native)
         plan = planning.get_active_plan()
         section = ""
         if plan is not None:
@@ -1875,7 +1903,11 @@ class AgentApi:
                 return {"ok": False, "error": f"Docker sandbox failed to start: {e}"}
         self._emit({"type": "log", "content": "[Sandbox] Container is ready."})
 
-        base_system_prompt = get_static_system_prompt()
+        # Build the static base to MATCH how requests are sent: native-aware when
+        # the active model uses the function-calling interface. _refresh_system_prompt
+        # recomputes this if the model changes mid-session.
+        session_native = active_supports_native_tools()
+        base_system_prompt = get_static_system_prompt(native_tools=session_native)
 
         # Prefer restoring the full prior conversation (so the agent can CONTINUE
         # from the old chat). Fall back to the latest memory summary only if there
@@ -1918,6 +1950,7 @@ class AgentApi:
             "root": root,
             "messages": messages,
             "base_system_prompt": base_system_prompt,
+            "native_tools": session_native,
             "memory_dir": memory_dir,
             "last_summary": last_summary_text or "",
             "transcript": saved_transcript,
@@ -2575,6 +2608,12 @@ class AgentApi:
                 if self._stop:
                     self._emit({"type": "system", "content": "Generation stopped by user."})
                     break
+
+                # Durably save the conversation as it grows (throttled), so a hard
+                # interrupt / crash mid-run keeps the history instead of losing every
+                # turn since the last send_message. Runs at the loop top so it fires
+                # on every iteration regardless of which `continue` a turn takes.
+                self._persist_session_throttled()
 
                 # No consecutive-tool nudge: this agent is built for multi-day runs
                 # where hundreds of tool calls in a row are normal. Injecting a
