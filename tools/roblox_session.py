@@ -331,7 +331,8 @@ def _rm_workspace_artifact(rel_path):
     ),
     params_schema={
         "place_id": "integer or string (REQUIRED — the numeric Roblox placeId to land in)",
-        "token": "string (optional — raw .ROBLOSECURITY cookie; give this OR token_file)",
+        "account": "string (optional — a saved Roblox USERNAME from `omni login` / list_roblox_accounts. Its cookie is resolved automatically and it names the instance. PREFER this over token/token_file when the account is already saved; give ONE of account / token / token_file)",
+        "token": "string (optional — raw .ROBLOSECURITY cookie; give this OR token_file OR account)",
         "token_file": "string (optional — path to a file with the cookie, e.g. 'cookie.txt')",
         "apk_path": "string (optional — a Roblox APK to test, relative to /workspace. Omit this to just "
                     "log in and play whatever Roblox build is ALREADY installed on the instance; pass it "
@@ -357,21 +358,31 @@ def _rm_workspace_artifact(rel_path):
         "and inspect one specific stage."
     ),
 )
-def launch_roblox_build(place_id, token=None, token_file=None, apk_path=None, dev=None, timeout=None):
+def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk_path=None,
+                        dev=None, timeout=None):
     err = _place_error(place_id)
     if err:
         return {"error": err, "stage": "validate"}
-    if not token and not token_file:
-        return {"error": "give either token or token_file (a .ROBLOSECURITY cookie)", "stage": "login"}
+    if not account and not token and not token_file:
+        return {"error": "give one of account (a saved username), token, or token_file "
+                         "(a .ROBLOSECURITY cookie)", "stage": "login"}
 
-    login_res = login_roblox_account(token=token, token_file=token_file)
-    if login_res.get("error"):
-        login_res = dict(login_res)
-        login_res["stage"] = "login"
-        return login_res
-    username = login_res.get("username")
-    if not username:
-        return {"error": "login succeeded but returned no username", "stage": "login"}
+    if account:
+        # Already-saved account: the engine resolves its cookie by username at play
+        # time, so there is nothing to log in here — just use the name.
+        err = _validate_session_id(account)
+        if err:
+            return {**err, "stage": "login"} if isinstance(err, dict) else {"error": err, "stage": "login"}
+        username = account
+    else:
+        login_res = login_roblox_account(token=token, token_file=token_file)
+        if login_res.get("error"):
+            login_res = dict(login_res)
+            login_res["stage"] = "login"
+            return login_res
+        username = login_res.get("username")
+        if not username:
+            return {"error": "login succeeded but returned no username", "stage": "login"}
 
     use_dev = bool(apk_path) if dev is None else _truthy(dev)
 
