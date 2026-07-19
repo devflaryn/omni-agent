@@ -93,9 +93,12 @@ _DEFAULT_BACKEND = "qemu"
 # v1). The qemu backend does a `version --json` handshake and warns on mismatch.
 _EXPECTED_CONTRACT = "1.0"
 _DEFAULT_QEMU_SESSION = "omniagent"
-# Workspace subfolder the always-on dev auto-screenshot recorder writes into
-# (/workspace/screenshots/auto). read_auto_screenshots reads this by default.
-_AUTOCAP_SESSION = "auto"
+# The CURRENT auto-screenshot session folder under /workspace/screenshots/, or
+# None until an APK install names one (`<apk_basename>_<DDMMHHMM>`). We do NOT use
+# a generic "auto" folder: auto-capture into the workspace begins at install with
+# the rule-named folder; before that the engine records to its own account dir
+# (outside the workspace), so no `screenshots/auto/` is ever created.
+_AUTOCAP_SESSION = None
 _DEFAULT_SYSTEM_IMAGE = None   # (removed) AVD-only; kept as a no-op for old callers
 _DEFAULT_QEMU_MODE = "playable"
 
@@ -456,10 +459,13 @@ def _qemu_create(name, boot_timeout, log, dev=False, ephemeral=True):
 
 
 def _autocap_workspace_dir():
-    """Where the always-on dev auto-screenshots land in the agent workspace:
-    /workspace/screenshots/<current session>/ (read with read_auto_screenshots).
-    The session name is 'auto' until an APK is installed, then it becomes
-    '<apk_basename>_<DDMMHHMM>' so each install/test session gets its own folder."""
+    """The workspace folder for the CURRENT auto-screenshot session
+    (/workspace/screenshots/<apk_basename>_<DDMMHHMM>/), or None when no session
+    has been named yet (before an APK install). None means 'do not capture into
+    the workspace' — the engine records to its own account dir instead, so no
+    generic screenshots/auto/ folder is created."""
+    if not _AUTOCAP_SESSION:
+        return None
     return resolve_workspace_path(f"screenshots/{_AUTOCAP_SESSION}")
 
 
@@ -489,14 +495,18 @@ def _begin_install_autocap_session(apk_path, name, log):
 
 
 def _agent_ensure_autocap(name, log):
-    """Idempotently make sure the engine's always-on recorder is running and
-    pointed at the workspace. Safe to call on every ensure-emulator (dev only);
-    it never starts a second recorder. Best-effort — never fails the boot."""
+    """Idempotently point the engine's recorder at the CURRENT workspace session
+    folder. No-op until a session has been named (by an APK install) — that's how
+    we avoid a generic screenshots/auto/ folder: before an install there is no
+    workspace session, so the engine keeps recording to its own account dir.
+    Best-effort — never fails the boot."""
     try:
         out_dir = _autocap_workspace_dir()
     except RuntimeError as e:
         log.append(f"[autocap] workspace path unresolved ({e}); skipping.")
         return
+    if not out_dir:
+        return  # no named session yet — don't create a workspace autocap folder
     os.makedirs(out_dir, exist_ok=True)
     try:
         parsed, res, _pd = _run_qemu(
@@ -524,13 +534,12 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False, epheme
                    "devkit disk (vdc: frida + Magisk + omni tools). Start frida "
                    "with ensure_frida_server; hide it with hide_root_from_app. "
                    "(Root needs a Magisk-patched boot: omni build-dev-base --patch-boot.)")
-        # Point the engine's own boot-time auto-start (and our later ensure) at
-        # the workspace so screenshots are captured automatically and readably,
-        # with no explicit start call needed. Set BEFORE `start` runs.
-        try:
-            os.environ["OMNI_AUTOCAP_DIR"] = _autocap_workspace_dir()
-        except RuntimeError:
-            pass
+        # Do NOT point the engine's boot-time recorder at the workspace yet: there
+        # is no APK session named at boot, and we don't want a generic
+        # screenshots/auto/ folder. Clear any stale value so the engine records to
+        # its own account dir; install_apk_on_emulator names the workspace session
+        # (screenshots/<apk>_<DDMMHHMM>/) and repoints the recorder there.
+        os.environ.pop("OMNI_AUTOCAP_DIR", None)
 
     # Which engine + config are we actually driving? Surface it so a path/config
     # mismatch is diagnosable at a glance (this is exactly the class of bug where
@@ -1647,13 +1656,20 @@ def _autocap_session_dir(session_name):
         "so an instant transition is distinguishable from one that took time."
     ),
     params_schema={
-        "session_name": "string (optional, default 'auto' — the always-on feed. Only change this if you pointed a capture at a different screenshots/<name> folder)",
+        "session_name": "string (optional — defaults to the CURRENT install session folder screenshots/<apk>_<DDMMHHMM>/. Only set this to read a different screenshots/<name> folder)",
         "since_index": "integer (optional, default 0 — only report keyframes with index >= this, to poll for just the new ones)"
     },
     output="A running/stopped status line, counts (kept keyframes / display updates seen / elapsed ms), and one line per keyframe from since_index onward. Empty-but-running means nothing has changed on screen yet.",
-    when_to_use="Call any time the dev emulator is up to see the screens captured so far (e.g. between adb interactions, or right after launching an app) — no setup needed. For a package-scoped crash/exit VERDICT over a bounded window, use record_and_capture_keyframes; for one frame right now, take_emulator_screenshot."
+    when_to_use="Call after install_apk_on_emulator (which starts the auto feed for that build) to see the screens captured so far. For a package-scoped crash/exit VERDICT over a bounded window, use record_and_capture_keyframes; for one frame right now, take_emulator_screenshot."
 )
-def read_auto_screenshots(session_name=_AUTOCAP_SESSION, since_index=0):
+def read_auto_screenshots(session_name=None, since_index=0):
+    # Default to the LIVE current session (resolved at call time, not import time).
+    session_name = session_name or _AUTOCAP_SESSION
+    if not session_name:
+        return {"error": ("No auto-screenshot session yet. The auto feed starts when you "
+                          "install a build (install_apk_on_emulator names it "
+                          "screenshots/<apk>_<DDMMHHMM>/). For a frame right now use "
+                          "take_emulator_screenshot.")}
     try:
         session_dir = _autocap_session_dir(session_name)
     except (ValueError, RuntimeError) as e:
