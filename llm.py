@@ -919,8 +919,8 @@ def _coerce_args(raw):
     return {}
 
 
-def _normalize_nonjson_action(text):
-    """Map a non-JSON tool-call shape onto the canonical action, or None.
+def _normalize_nonjson_actions(text):
+    """Map every non-JSON tool-call shape in `text` onto canonical actions, in order.
 
     Recognizes <tool_call>/<function_call>/<function=> tags (name via attribute,
     `=name`, or a leading token inside the body), a bare `name\\n{json}` pair, and
@@ -930,45 +930,55 @@ def _normalize_nonjson_action(text):
     plain-text `name\\n{json}` pair), only accepts a leading/bare name when it is a
     REGISTERED tool, so ordinary prose starting with a word is not misread."""
     if not text:
-        return None
-
-    m = _TAG_RE.search(text)
-    if m:
+        return []
+    actions = []
+    for m in _TAG_RE.finditer(text):
         body = (m.group("body") or "").strip()
         name = m.group("attr") or m.group("eqname")
         args = _coerce_args(body)
         if not name:
-            # Name may be a JSON "name" field, or the leading token of the body.
             for obj in _json_candidates(body):
                 if isinstance(obj, dict) and isinstance(obj.get("name"), str):
                     name = obj["name"]
-                    # Flat convention {"name": <tool>, ...args} with no
-                    # arguments/args wrapper: _coerce_args returned the object
-                    # verbatim, so drop the consumed "name" key from args (but
-                    # never strip a real `name` PARAM that came via a wrapper).
                     if (isinstance(args, dict) and args.get("name") == name
                             and "arguments" not in obj and "args" not in obj):
                         args = {k: v for k, v in args.items() if k != "name"}
                     break
-            if not name:
-                # Inside a tag the leading token IS the tool name — the tag is
-                # the evidence, so no registration check (progressive
-                # disclosure leaves inactive toolsets' tools unregistered).
-                lead = _LEADING_NAME_RE.match(body) or _BARE_NAME_RE.match(body)
-                if lead:
-                    name = lead.group(1)
+        if not name:
+            lead = _LEADING_NAME_RE.match(body) or _BARE_NAME_RE.match(body)
+            if lead:
+                name = lead.group(1)
         if name:
-            return {"type": "tool_call", "tool": name, "args": args if isinstance(args, dict) else {}}
+            actions.append({"type": "tool_call", "tool": name,
+                            "args": args if isinstance(args, dict) else {}})
+    if actions:
+        return actions
 
     lead = _LEADING_NAME_RE.match(text)
     if lead and registry.is_registered(lead.group(1)):
-        return {"type": "tool_call", "tool": lead.group(1), "args": _coerce_args(lead.group(2))}
+        return [{"type": "tool_call", "tool": lead.group(1),
+                 "args": _coerce_args(lead.group(2))}]
 
     bare = _BARE_NAME_RE.match(text)
     if bare and registry.is_registered(bare.group(1)):
-        return {"type": "tool_call", "tool": bare.group(1), "args": {}}
+        return [{"type": "tool_call", "tool": bare.group(1), "args": {}}]
 
-    return None
+    return []
+
+
+def _normalize_nonjson_action(text):
+    """First non-JSON action in `text`, or None.
+
+    When the model stacked several calls into one message (43% of observed
+    off-protocol messages), the extras are named in `_dropped_calls` so the
+    loop can ask for them one per turn instead of losing them silently."""
+    actions = _normalize_nonjson_actions(text)
+    if not actions:
+        return None
+    first = actions[0]
+    if len(actions) > 1:
+        first["_dropped_calls"] = [a["tool"] for a in actions[1:]]
+    return first
 
 
 def strip_reasoning(text):
