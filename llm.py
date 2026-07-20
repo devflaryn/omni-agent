@@ -1102,6 +1102,7 @@ def extract_json_action(text):
         sources.append(text)
 
     fallback = None
+    weak_fallback = None
     for source in sources:
         attempts = [source]
         defused = _TRAILING_COMMA_RE.sub(r"\1", source)
@@ -1113,6 +1114,8 @@ def extract_json_action(text):
                     continue
                 if _is_strong_action(obj):
                     return _normalize_action(obj)
+                if weak_fallback is None and _looks_like_action(obj):
+                    weak_fallback = obj
                 if fallback is None:
                     fallback = obj
 
@@ -1125,8 +1128,8 @@ def extract_json_action(text):
     nonjson = _normalize_nonjson_action(cleaned)
     if nonjson is not None:
         return nonjson
-    if fallback is not None and _looks_like_action(fallback):
-        return _normalize_action(fallback)
+    if weak_fallback is not None:
+        return _normalize_action(weak_fallback)
     return fallback
 
 
