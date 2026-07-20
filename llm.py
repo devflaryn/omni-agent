@@ -948,8 +948,11 @@ def _normalize_nonjson_action(text):
                         args = {k: v for k, v in args.items() if k != "name"}
                     break
             if not name:
-                lead = _BARE_NAME_RE.match(body)
-                if lead and registry.is_registered(lead.group(1)):
+                # Inside a tag the leading token IS the tool name — the tag is
+                # the evidence, so no registration check (progressive
+                # disclosure leaves inactive toolsets' tools unregistered).
+                lead = _LEADING_NAME_RE.match(body) or _BARE_NAME_RE.match(body)
+                if lead:
                     name = lead.group(1)
         if name:
             return {"type": "tool_call", "tool": name, "args": args if isinstance(args, dict) else {}}
