@@ -1,3 +1,4 @@
+import collections
 import json
 import os
 import re
@@ -37,6 +38,17 @@ DEFAULT_MAX_TOKENS = 8192      # only the Anthropic protocol needs an explicit o
 # "context_window" — this default assumes the large-window target model.
 DEFAULT_CONTEXT_WINDOW = 1_000_000
 DEFAULT_PROVIDER = "cline"
+
+# Off-protocol tool calls repaired this session. GLM emits tag-shaped calls
+# instead of the JSON envelope; this makes the rate visible instead of only
+# surfacing when a run dies.
+SALVAGE_STATS = collections.Counter()
+
+
+def reset_salvage_stats():
+    """Zero the salvage counters. Called once per session start."""
+    SALVAGE_STATS.clear()
+
 
 # Legacy hardcoded defaults. Kept for two reasons only:
 #   1. First-run migration seed (see _SEED_CONFIG) so the app keeps working out
@@ -976,8 +988,10 @@ def _normalize_nonjson_action(text):
     if not actions:
         return None
     first = actions[0]
+    SALVAGE_STATS["salvaged"] += 1
     if len(actions) > 1:
         first["_dropped_calls"] = [a["tool"] for a in actions[1:]]
+        SALVAGE_STATS["dropped_calls"] += len(actions) - 1
     return first
 
 
