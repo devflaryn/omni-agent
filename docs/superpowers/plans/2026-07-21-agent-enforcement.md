@@ -19,8 +19,10 @@
 - `run_command` returns `{"error": "..."}` on rejection. Match that shape; do not introduce a `success` key.
 - `fnmatch`'s `*` matches `/`. Use `*.so`, never `lib/**/*.so` — `**` is not fnmatch syntax.
 - Retry cap for constraint failures: **3** attempts, then stop and report.
-- `memory/` is gitignored (`.gitignore:28`). The corpus cannot be committed directly; Task 5 extracts a fixture into `tests/fixtures/`.
-- Every task ends with a commit.
+- **`/tests/` is gitignored (`.gitignore:38`) and no test file is tracked** — this is deliberate project policy ("Local test scripts live here and are NOT pushed to GitHub"). Write test files into `tests/`, run them locally, but **commit SOURCE ONLY**. Never `git add tests/...`; never `git add -f`. A task whose only deliverable is a test file has nothing to commit — say so and move on.
+- `memory/` is also gitignored (`.gitignore:28`). Task 5 extracts a fixture into `tests/fixtures/`, which stays untracked like the rest of `tests/`.
+- Work happens directly on `main` (user's explicit choice). No feature branch.
+- Every task ends with a commit **of its source changes**, where it has any.
 
 ## Baseline (measured 2026-07-21)
 
@@ -119,7 +121,7 @@ Expected: PASS — 14 passed. All 12 pre-existing tests must stay green; they co
 - [ ] **Step 5: Commit**
 
 ```bash
-git add llm.py tests/test_hardened_parser.py
+git add llm.py
 git commit -m "fix(parser): accept unclosed tool_call tags
 
 GLM emits <tool_call>... with no closing tag in 742 of 808 observed
@@ -198,7 +200,7 @@ Expected: PASS — 16 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add llm.py tests/test_hardened_parser.py
+git add llm.py
 git commit -m "fix(parser): resolve tool name from name{json} tag bodies"
 ```
 
@@ -308,7 +310,7 @@ Expected: PASS — 18 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add llm.py tests/test_hardened_parser.py
+git add llm.py
 git commit -m "feat(parser): extract all stacked tool calls, report the extras"
 ```
 
@@ -382,7 +384,7 @@ Expected: PASS — 20 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add llm.py tests/test_hardened_parser.py
+git add llm.py
 git commit -m "feat(parser): count salvaged off-protocol tool calls"
 ```
 
@@ -484,19 +486,23 @@ def test_parse_rate_at_least_95_percent():
 Run: `python3 -m pytest tests/test_tag_corpus.py -q`
 Expected: PASS — 2 passed. If the rate assertion fails it prints up to 5 unparsed samples; extend the parser to cover those shapes rather than lowering the threshold.
 
-- [ ] **Step 4: Confirm the fixture is not gitignored**
+- [ ] **Step 4: Record the achieved parse rate**
 
-Run: `git check-ignore -v tests/fixtures/tag_shapes.json; echo "exit=$?"`
-Expected: `exit=1` with no preceding output — the file is NOT ignored. `.gitignore:28` ignores `memory/*`, not `tests/`.
-
-- [ ] **Step 5: Commit**
+Run:
 
 ```bash
-git add tests/fixtures/tag_shapes.json tests/test_tag_corpus.py
-git commit -m "test(parser): corpus regression gate at 95% parse rate
-
-Baseline before repair: 75/808 parsed (9.3%)."
+python3 -c "
+import json, llm
+c = json.load(open('tests/fixtures/tag_shapes.json'))
+ok = sum(1 for t in c if (llm.extract_json_action(t) or {}).get('tool'))
+print(f'parse rate: {ok}/{len(c)} = {ok/len(c):.1%}')"
 ```
+
+Expected: a rate ≥95%. Report the exact figure — it is this component's headline result against the 9.3% baseline.
+
+- [ ] **Step 5: No commit for this task**
+
+This task produces only `tests/fixtures/tag_shapes.json` and `tests/test_tag_corpus.py`, both inside the gitignored `tests/` tree. There is no source change to commit. Do **not** `git add -f`. Confirm the tree is clean with `git status --porcelain` (expect no output) and report the parse rate instead.
 
 ---
 
@@ -690,7 +696,7 @@ Expected: PASS — 9 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools/constraints.py tests/test_constraints.py
+git add tools/constraints.py
 git commit -m "feat(constraints): app-agnostic build constraint evaluator"
 ```
 
@@ -750,12 +756,11 @@ def test_intermediate_build_keeps_classes4():
 Run: `python3 -m pytest tests/test_constraints.py -q`
 Expected: PASS — 11 passed (or 9 passed, 2 skipped where the artifacts are absent).
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: No commit for this task**
 
-```bash
-git add tests/test_constraints.py
-git commit -m "test(constraints): pin the real instance-create regression"
-```
+This task adds only test code, inside the gitignored `tests/` tree. There is no
+source change to commit. Do **not** `git add -f`. Confirm with
+`git status --porcelain` (expect no output) and report the pass/skip counts.
 
 ---
 
@@ -921,7 +926,7 @@ Expected: PASS — 5 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools/mission_constraints.py tests/test_mission_constraints.py
+git add tools/mission_constraints.py
 git commit -m "feat(constraints): declare_constraints tool with echo-back"
 ```
 
@@ -1033,7 +1038,7 @@ Expected: PASS — 11 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools/mission_constraints.py tests/test_mission_constraints.py
+git add tools/mission_constraints.py
 git commit -m "feat(constraints): capped retry accounting and failure feedback"
 ```
 
@@ -1130,7 +1135,7 @@ Expected: PASS. `test_build_fallback.py` must stay green — the new parameter d
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/apk_tools.py tests/test_constraints.py
+git add tools/apk_tools.py
 git commit -m "feat(constraints): static verification gate on recompile_apk"
 ```
 
@@ -1202,7 +1207,7 @@ Expected: PASS — 3 passed.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tools/apk_tools.py tests/test_decode_discipline.py
+git add tools/apk_tools.py
 git commit -m "feat(apk): deterministic canonical decode directory"
 ```
 
@@ -1319,7 +1324,7 @@ Expected: no new failures versus the pre-task baseline. Capture that baseline **
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tools/shell.py tests/test_decode_discipline.py
+git add tools/shell.py
 git commit -m "fix(shell): block APK decode bypass via run_command"
 ```
 
