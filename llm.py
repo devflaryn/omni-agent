@@ -924,7 +924,10 @@ def _normalize_nonjson_action(text):
 
     Recognizes <tool_call>/<function_call>/<function=> tags (name via attribute,
     `=name`, or a leading token inside the body), a bare `name\\n{json}` pair, and
-    a lone registered tool name. Only accepts a bare/leading name when it is a
+    a lone registered tool name. Inside a tag, the leading token IS the tool name
+    — the tag is the evidence, so no registration check (progressive disclosure
+    leaves inactive toolsets' tools unregistered). Outside any tag (bare word or
+    plain-text `name\\n{json}` pair), only accepts a leading/bare name when it is a
     REGISTERED tool, so ordinary prose starting with a word is not misread."""
     if not text:
         return None
