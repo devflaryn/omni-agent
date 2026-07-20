@@ -914,6 +914,15 @@ _TAG_RE = re.compile(
 )
 _LEADING_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)\s*(\{.*\})\s*$", re.DOTALL)
 _BARE_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)\s*$")
+# Two more in-tag call shapes GLM emits, name-resolution only (the JSON args
+# are already recovered by _coerce_args/_json_candidates regardless of what
+# wraps them, since raw_decode scans for the first '{' and tolerates
+# trailing text): `name({...})` (call-syntax body, dominant real-world shape)
+# and `name args={...}` (bare "args=" prefix instead of touching braces
+# directly). Only used inside a tag body, where the tag is already the
+# evidence a call is present (no registration check, same as the other
+# in-tag name patterns above).
+_LEADING_NAME_CALL_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)(?:\s*\(|\s+args\s*=)", re.DOTALL)
 
 
 def _coerce_args(raw):
@@ -957,7 +966,8 @@ def _normalize_nonjson_actions(text):
                         args = {k: v for k, v in args.items() if k != "name"}
                     break
         if not name:
-            lead = _LEADING_NAME_RE.match(body) or _BARE_NAME_RE.match(body)
+            lead = (_LEADING_NAME_RE.match(body) or _BARE_NAME_RE.match(body)
+                    or _LEADING_NAME_CALL_RE.match(body))
             if lead:
                 name = lead.group(1)
         if name:
