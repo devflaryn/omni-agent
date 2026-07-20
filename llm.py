@@ -887,12 +887,17 @@ _THINK_TAIL_RE = re.compile(r"^.*?</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
-# Non-JSON tool-call shapes that reasoning/open models (esp. GLM, trained on
-# harmony/XML tool syntax) emit instead of the required JSON envelope. Handled as
-# a LAST RESORT in extract_json_action, after JSON salvage finds no action.
+_TAG_NAMES = r"tool_call|function_call|function"
+_TAG_OPEN = r"<(?:" + _TAG_NAMES + r")"
+# The closing tag is OPTIONAL: GLM emits `<tool_call>name{json}` with no
+# `</tool_call>` in 742 of 808 observed messages. An unclosed body runs to the
+# next tag opener or to end of string.
 _TAG_RE = re.compile(
-    r"<(?:tool_call|function_call|function)(?:\s+name\s*=\s*\"(?P<attr>[\w.]+)\")?"
-    r"(?:\s*=\s*(?P<eqname>[\w.]+))?\s*>(?P<body>.*?)</(?:tool_call|function_call|function)>",
+    _TAG_OPEN
+    + r"(?:\s+name\s*=\s*\"(?P<attr>[\w.]+)\")?"
+    + r"(?:\s*=\s*(?P<eqname>[\w.]+))?\s*>"
+    + r"(?P<body>.*?)"
+    + r"(?:</(?:" + _TAG_NAMES + r")>|(?=" + _TAG_OPEN + r")|\Z)",
     re.DOTALL | re.IGNORECASE,
 )
 _LEADING_NAME_RE = re.compile(r"^\s*([A-Za-z_][\w.]*)\s*(\{.*\})\s*$", re.DOTALL)
