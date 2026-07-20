@@ -1057,6 +1057,20 @@ def _looks_like_action(obj):
     )
 
 
+def _is_strong_action(obj):
+    """Whether a parsed JSON object is UNAMBIGUOUSLY an agent action -- i.e.
+    action-like for a reason other than merely carrying a bare 'args'/
+    'arguments' key. A weak match (action-like ONLY via 'args'/'arguments')
+    can be an ARGUMENTS object of a tag-shaped call (e.g. a param literally
+    named "args") rather than the action envelope itself, so it must not
+    preempt the tag parser in extract_json_action."""
+    return (
+        obj.get("type") in ("tool_call", "final_answer")
+        or obj.get("action") in ("tool_call", "final_answer")
+        or "tool" in obj
+    )
+
+
 def extract_json_action(text):
     """Find the agent-action JSON object in a raw LLM reply, or None.
 
@@ -1087,17 +1101,22 @@ def extract_json_action(text):
             for obj in _json_candidates(attempt):
                 if not isinstance(obj, dict):
                     continue
-                if _looks_like_action(obj):
+                if _is_strong_action(obj):
                     return _normalize_action(obj)
                 if fallback is None:
                     fallback = obj
 
-    # No action-shaped JSON found in any source. Try the non-JSON tool-call
-    # shapes (harmony/XML tags, name-then-json, bare tool name) before falling
-    # back to any stray JSON object the reply happened to contain.
+    # No STRONG action-shaped JSON found in any source. Try the non-JSON
+    # tool-call shapes (harmony/XML tags, name-then-json, bare tool name)
+    # first -- a tag-resolved tool call is more reliable than a weak JSON
+    # match (one that only looks action-like via a bare 'args'/'arguments'
+    # key, which can just be the ARGUMENTS object of a tag-shaped call) --
+    # then fall back to that weak match, normalized, before giving up.
     nonjson = _normalize_nonjson_action(cleaned)
     if nonjson is not None:
         return nonjson
+    if fallback is not None and _looks_like_action(fallback):
+        return _normalize_action(fallback)
     return fallback
 
 
