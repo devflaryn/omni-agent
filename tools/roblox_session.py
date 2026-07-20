@@ -17,7 +17,7 @@ import tempfile
 from tool_registry import registry
 from tools.android_emulator import (
     _default_device_name, _parse_json_object, _run_qemu, _truthy,
-    _validate_session_id, install_apk_on_emulator,
+    _validate_session_id,
 )
 from tools.common import resolve_workspace_path
 
@@ -99,8 +99,7 @@ def _summarize(parsed, res, action):
         "job_id": "string (optional — gameInstanceId/JobId to join a SPECIFIC running server instead of matchmaking)",
         "launch_data": "string (optional — <=200 bytes, readable in-game via Player:GetJoinData())",
         "user_id": "integer (optional — informational: which Roblox user the token belongs to)",
-        "dev": "boolean (optional — create the instance on the DEV base (frida+Magisk) to test a new Roblox build. Only affects a NEW instance; ignored if it already exists. For the standard 'does this build work' check on production, leave false)",
-        "ephemeral": "boolean (optional, default TRUE — fully-shared, no-persistence instance: shared base booted snapshot=on, no per-account disk, concurrent instances, clean device every boot (cookie re-injected each run). Set false only to persist an instance's writes across reboots)",
+        "dev": "boolean (optional — boot the instance on the DEV base (frida+Magisk+root) to test a new Roblox build. For the standard 'does this build work' check on production, leave false)",
         "timeout": "integer (optional — seconds to wait for boot; the engine picks a first-boot-aware default)",
     },
     output=("JSON: {ok, place_id, deeplink, booted, launched, session:{...token redacted...}, "
@@ -116,7 +115,7 @@ def _summarize(parsed, res, action):
 )
 def play_roblox(place_id, account=None, token=None, session_name=None,
                 job_id=None, launch_data=None, user_id=None, dev=False,
-                ephemeral=True, timeout=None):
+                timeout=None, apk_path=None):
     # Modern model: the account username IS the instance name, so the engine
     # resolves its saved cookie automatically. `account` therefore takes
     # precedence over session_name for NAMING — otherwise a mismatched
@@ -131,12 +130,20 @@ def play_roblox(place_id, account=None, token=None, session_name=None,
     if err:
         return {"error": err}
 
-    argv = ["play", session_name, "--place", str(place_id), "--json"]
-    if _truthy(ephemeral):
-        # Fully-shared, no-persistence: shared base booted snapshot=on, no
-        # per-account disk, concurrent instances, clean device each boot (the
-        # cookie is re-injected on this run). Only affects a NEW instance.
-        argv += ["--ephemeral"]
+    # `start` absorbed `play` in omnidroid's diskless rework: there is no
+    # separate create/play step any more, and no --ephemeral knob — every
+    # instance boots the shared base snapshot=on with no per-account disk, so
+    # concurrency and a clean device each boot are the ONLY model. Re-delivery
+    # to an ALREADY-RUNNING instance is a different command (`session --play`,
+    # see set_roblox_account); `start` refuses if the instance is up.
+    argv = ["start", session_name, "--place", str(place_id), "--json"]
+    if apk_path:
+        # One-shot: omnidroid installs this APK on the dev base after boot and
+        # BEFORE delivering the session, then checks the guest actually logged
+        # in. `--apk` is dev-gated engine-side (apk_dev_only), so dev is forced
+        # rather than left to the caller to get right.
+        dev = True
+        argv += ["--apk", str(apk_path)]
     if _truthy(dev):
         # Create the instance on the DEV base (frida+Magisk) for testing a new
         # Roblox build. Only affects a NEW instance; the engine gates --dev by
@@ -202,7 +209,9 @@ def set_roblox_account(token=None, place_id=None, session_name=None, play=None,
                 return {"error": err}
             argv += ["--place", str(place_id)]
         if token is None and place_id is None:
-            argv += ["--show"]
+            # Read-only: a bare `session <name> --json` already reports the
+            # current session (place_id + redacted token). `--show` was deleted.
+            pass
         elif play is None or play:
             argv += ["--play"]
     argv, cleanup = _with_token_file(token, argv)
@@ -387,14 +396,11 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
     use_dev = bool(apk_path) if dev is None else _truthy(dev)
 
     if apk_path:
-        # Get a thin instance up and booted for this account BEFORE touching the
-        # APK pipeline — install needs a live, adb-reachable instance. This first
-        # play is deliberately best-effort and its result is discarded: on a
-        # brand-new dev instance Roblox isn't installed yet, so the join itself
-        # is EXPECTED to fail (no_deeplink_handler). The FINAL play below (after
-        # install) is the one whose result is actually returned.
-        play_roblox(place_id=place_id, account=username, dev=use_dev, timeout=timeout)
-
+        # NO throwaway boot here any more. omnidroid's `start --dev --apk` does
+        # boot -> install -> deliver session -> verify login in ONE call, so the
+        # old "boot, install, boot again" dance is not just wasteful — the second
+        # boot would now hard-fail, because `start` refuses an instance that is
+        # already running. Build the APK first, then hand it to a single start.
         from tools.apk_tools import decode_apk, recompile_apk, sign_apk
         from tools.session_bootstrap import inject_session_bootstrap
 
@@ -421,14 +427,24 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
         if _apk_step_failed(sign_res):
             return _apk_stage_error(sign_res, "sign")
 
-        install_res = install_apk_on_emulator(built_apk, device_name=username)
-        if install_res.get("error"):
-            return {"error": install_res["error"], "stage": "install"}
+        # `start` refuses a running instance, and this flow owns the whole
+        # lifecycle — clear any stale instance so the one-shot below can boot.
+        _run_qemu(["stop", username, "--json"], timeout=300)
 
-    play_res = play_roblox(place_id=place_id, account=username, dev=use_dev, timeout=timeout)
+    play_res = play_roblox(place_id=place_id, account=username, dev=use_dev,
+                           timeout=timeout,
+                           apk_path=(built_apk if apk_path else None))
     if play_res.get("error"):
         play_res = dict(play_res)
-        play_res["stage"] = "play"
+        # Map the engine's one-shot failures onto the stage the caller must fix,
+        # instead of burying them under a generic "play".
+        play_res["stage"] = {
+            "apk_install_failed": "install",
+            # The APK installed and the cookie was delivered, but the guest never
+            # reported a login — almost always a build with no OmniBootstrap in
+            # it (re-run inject_session_bootstrap), or a dead cookie.
+            "not_logged_in": "login_check",
+        }.get(play_res.get("error"), "play")
         return play_res
     if apk_path:
         # Success: the built APK is now installed on the instance, so drop the

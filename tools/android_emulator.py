@@ -429,35 +429,6 @@ def _dev_base_enabled(dev=None):
     return _truthy(os.environ.get("OMNI_USE_DEV_BASE", ""))
 
 
-def _qemu_create(name, boot_timeout, log, dev=False, ephemeral=True):
-    """Create a fresh instance (no boot — the first `start` provisions). Returns
-    None on success or an {"error": ...} dict on failure. When dev=True the
-    account is pinned to the 'dev' base (`create --base dev`) so it boots base_arm
-    with the frida/Magisk devkit disk attached. When ephemeral=True (the default)
-    the instance is fully-shared / no-persistence: it boots the shared base
-    directly (snapshot=on) with NO per-account overlay disks, so many instances
-    run concurrently and nothing persists between boots — the right model for
-    reproducible test runs named by the Roblox username."""
-    tag = " on the DEV base (frida+root-hiding)" if dev else ""
-    eph = " [ephemeral: shared disk, no persistence]" if ephemeral else ""
-    log.append(f"Creating account '{name}'{tag}{eph} (disks only; first boot provisions)...")
-    argv = ["create", name, "--no-provision", "--json"]
-    if dev:
-        argv += ["--base", "dev"]
-    if ephemeral:
-        argv += ["--ephemeral"]
-    try:
-        parsed, res, _pd = _run_qemu(argv, timeout=600)
-    except RuntimeError as e:
-        return {"error": str(e)}
-    if res.get("error"):
-        return {"error": res["error"]}
-    if not (isinstance(parsed, dict) and parsed.get("ok", False)):
-        detail = (res.get("stdout") or res.get("stderr") or "").strip()[:800]
-        return {"error": f"omnidroid create failed. Output:\n{detail}"}
-    return None
-
-
 def _autocap_workspace_dir():
     """The workspace folder for the CURRENT auto-screenshot session
     (/workspace/screenshots/<apk_basename>_<DDMMHHMM>/), or None when no session
@@ -524,7 +495,7 @@ def _agent_ensure_autocap(name, log):
         log.append(f"[autocap] recorder not started ({why}).")
 
 
-def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False, ephemeral=True):
+def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
     err = _validate_session_id(name)
     if err:
         return {"error": err}
@@ -590,27 +561,25 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False, epheme
     exists = acct is not None
     running = exists and _qemu_is_running(acct)
 
-    # reset=True -> a truly fresh instance: destroy any old account, recreate it.
-    if reset:
-        if exists:
-            log.append(f"Removing existing account '{name}' for a fresh instance (DESTRUCTIVE)...")
-            try:
-                _parsed_rm, res_rm, _pd = _run_qemu(["remove", name, "--json"], timeout=180)
-            except RuntimeError as e:
-                return {"error": str(e)}
-            if res_rm.get("error"):
-                return {"error": res_rm["error"]}
-            exists = running = False
-        err = _qemu_create(name, boot_timeout, log, dev=dev, ephemeral=ephemeral)
-        if err:
-            return err
-        exists, running = True, False
-    elif not exists:
-        # reset=False but nothing to reuse yet — create it once.
-        err = _qemu_create(name, boot_timeout, log, dev=dev, ephemeral=ephemeral)
-        if err:
-            return err
-        exists = True
+    # There is NO create step any more. omnidroid's diskless model builds the
+    # launch handle inside `start` from the central account store, and every
+    # instance boots the shared base snapshot=on — so a boot is ALREADY a clean
+    # device and nothing persists between boots.
+    #
+    # reset therefore no longer means "destroy and recreate"; it means "don't
+    # reuse the live instance, get me a fresh boot". Stop it and let the `start`
+    # below bring it back up clean. `remove` is not used: it would delete the
+    # account's stored cookie, which reset never intended.
+    if reset and running:
+        log.append(f"reset=true: stopping the running '{name}' for a fresh boot "
+                   f"(diskless — every boot is already a clean device)...")
+        try:
+            _parsed_st, res_st, _pd = _run_qemu(["stop", name, "--json"], timeout=180)
+        except RuntimeError as e:
+            return {"error": str(e)}
+        if res_st.get("error"):
+            return {"error": res_st["error"]}
+        running = False
 
     # Reuse an already-running, already-provisioned account as-is.
     if running and not reset:
@@ -624,11 +593,19 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False, epheme
         log.append(f"BOOT_OK (serial={serial or 'unknown'})")
         return {"stdout": "\n".join(log)}
 
-    # Cold-boot and block until Android reports boot_completed. A just-created
-    # account provisions + dexopts on this first boot, which the engine bounds at
-    # ~1500 s — give at least that so we don't time out mid-provision.
+    # Cold-boot. `start` is already synchronous — it boots, delivers and returns
+    # a JSON result — so the deleted `--wait` was only ever an outer hint; the
+    # engine's own --timeout plus _run_qemu's outer timeout govern.
     wait_timeout = max(boot_timeout, 1500) if reset else boot_timeout
-    args = ["start", name, "--wait", "--timeout", str(wait_timeout), "--json"]
+    args = ["start", name, "--timeout", str(wait_timeout), "--json"]
+    # This boot exists to run APKs, not to play Roblox: without --no-token
+    # `start` hard-fails `no_token` for any account with no saved cookie. With
+    # it, the instance comes up on Roblox's own login screen, which is fine for
+    # install/launch/frida work. play_roblox is the tool that wants a session.
+    args += ["--no-token"]
+    if dev:
+        # The base is chosen at START now (there is no create-time --base dev).
+        args += ["--dev"]
     if mode:
         args += ["--mode", mode]
     if mem:
@@ -732,20 +709,18 @@ def _resolve_serial(backend, device_name=None):
         "ram_mb": "integer (optional — override guest RAM in MB, passed as --mem; overrides the mode's RAM. Engine defaults to the mode's tier if omitted)",
         "cpus": "integer (optional — IGNORED (vCPU count is set by 'mode'))",
         "headless": "boolean (IGNORED — omnidroid instances are always headless; view over the instance's localhost VNC port)",
-        "dev": "boolean (optional, default false — boot the DEV base: base_arm plus the extra devkit disk (vdc = base_arm_devkit.qcow2) carrying an android-arm64 frida-server + Magisk + the omni-* tools, for reverse-engineering/runtime-hooking work. Requires `omni build-dev-base` to have produced the devkit disk (and `--patch-boot` to root it, so frida can attach). Also enablable globally via the OMNI_USE_DEV_BASE env var. Only affects a FRESH create (base is fixed per account); production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)",
-        "ephemeral": "boolean (optional, default TRUE — fully-shared, no-persistence instance: boots the shared base directly (snapshot=on) with NO per-account disk files, so many instances run concurrently and every boot is a clean, reproducible device (nothing persists between boots). This is the normal model for username-named test runs. Set false ONLY if you need writes to persist across reboots of the SAME instance (then it gets its own overlay disks)."
+        "dev": "boolean (optional, default false — boot the DEV base: base_arm plus the extra devkit disk (vdc = base_arm_devkit.qcow2) carrying an android-arm64 frida-server + Magisk + the omni-* tools, for reverse-engineering/runtime-hooking work. The base is chosen at BOOT, so the same instance name can boot dev or production on different runs. Also enablable globally via the OMNI_USE_DEV_BASE env var; production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)",
     },
-    output="A log of what happened (account creation/reset if needed, boot wait progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
-    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly — it always targets the same omnidroid account and (by default) resets it to a clean state each time. Fully self-contained (no Android Studio / SDK emulator / LDPlayer). Pass dev=true (or set OMNI_USE_DEV_BASE) to boot the frida/root-hiding dev base."
+    output="A log of what happened (stop-for-reset if needed, boot progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
+    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly. Instances are diskless (the shared base booted snapshot=on), so EVERY boot is already a clean device and nothing persists between boots; reset=true just means 'stop the live instance and boot it fresh' rather than reusing it. This boot passes --no-token, so it comes up on Roblox's own login screen — use play_roblox when you want a logged-in session. Fully self-contained (no Android Studio / SDK emulator / LDPlayer). Pass dev=true (or set OMNI_USE_DEV_BASE) to boot the frida/root dev base."
 )
 def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_image=_DEFAULT_SYSTEM_IMAGE,
                              device_profile="pixel_5", reset=True, boot_timeout=300, headless=False,
-                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, dev=None, ephemeral=True):
+                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, dev=None):
     backend = _coerce_backend(backend)   # omnidroid (qemu) only — never an AVD
     device_name = device_name or _default_device_name()
     reset = _truthy(reset)
     dev = _dev_base_enabled(dev)
-    ephemeral = _truthy(ephemeral)
     try:
         boot_timeout = int(boot_timeout)
     except (TypeError, ValueError):
@@ -756,8 +731,7 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     # ALWAYS omnidroid: create/start an account on the base (base_x86 on x86,
     # base_arm on an arm64 host) via the frozen contract. system_image/
     # device_profile/headless are ignored (they were AVD-only).
-    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb, dev=dev,
-                                ephemeral=ephemeral)
+    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb, dev=dev)
 
 
 @registry.register(
