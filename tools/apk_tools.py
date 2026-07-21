@@ -9,10 +9,14 @@ lives in one focused, readable module.
 """
 
 import base64
+import zipfile
 
 from tool_registry import registry
-from tools.common import normalize_path, build_paginated_command, append_page_hint
+from tools.common import (normalize_path, build_paginated_command, append_page_hint,
+                          resolve_workspace_path)
 from tools import cache
+from tools import constraints as _constraints
+from tools import mission_constraints as _mission
 from docker_sandbox import run_cmd
 
 
@@ -437,7 +441,8 @@ def _recompile_with_apkeditor(input_dir, output_apk):
     output="For a decode_apk directory: the doNotCompress normalization result, apktool's build log, a compression summary for resources.arsc and each .so (Stored vs Defl), and — if original_apk was given — a size comparison. For a raw unzip_apk directory: the zip repack log (old META-INF signatures stripped, mmap-sensitive types kept stored). Either way the output is UNSIGNED; call sign_apk next.",
     when_to_use="Use this to rebuild an APK AFTER editing — it handles BOTH decode_apk directories (smali/resources/manifest edits) and raw unzip_apk directories (whole-file swaps), auto-selecting apktool build vs zip repack from the directory. It is compression-safe by default (no mmap/load crashes or size bloat). Then sign_apk (and verify_apk)."
 )
-def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None):
+def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
+                  constraints_list=None):
     input_dir = normalize_path(input_dir)
     output_apk = normalize_path(output_apk)
 
@@ -480,7 +485,36 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None):
         f"awk '{{print $8\"  method=\"$2\"  length=\"$1\" bytes\"}}' | head -n 40"
         f"{size_cmp}"
     )
-    return run_cmd(cmd, timeout=360)
+    res = run_cmd(cmd, timeout=360)
+
+    # Static constraint gate: a zip-member diff against the base APK. No
+    # emulator is involved, so this is unaffected by omnidroid instance state.
+    checks = constraints_list
+    if checks is None:
+        checks = _mission.get_mission_constraints()
+    if checks and original_apk:
+        try:
+            results = _constraints.evaluate(
+                checks,
+                _constraints.apk_members(resolve_workspace_path(original_apk)),
+                _constraints.apk_members(resolve_workspace_path(output_apk)))
+        except (OSError, zipfile.BadZipFile) as e:
+            res["constraint_results"] = []
+            res["constraints_ok"] = False
+            res["message"] = (res.get("message", "")
+                              + f"\n\nConstraint check could not run: {e}").strip()
+        else:
+            res["constraint_results"] = results
+            res["constraints_ok"] = _constraints.all_passed(results)
+            if res["constraints_ok"]:
+                res["message"] = (res.get("message", "") + "\n\n"
+                                  + _constraints.format_results(results)).strip()
+            else:
+                _mission.record_failure()
+                res["message"] = (res.get("message", "") + "\n\n"
+                                  + _mission.failure_feedback(results)).strip()
+
+    return res
 
 
 @registry.register(
