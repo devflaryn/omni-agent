@@ -23,6 +23,32 @@ def reset_mission_constraints():
     _ATTEMPTS["failed"] = 0
 
 
+def record_failure():
+    """Count one failed constraint check; returns the running total."""
+    _ATTEMPTS["failed"] += 1
+    return _ATTEMPTS["failed"]
+
+
+def retries_exhausted():
+    """True once the retry budget for constraint failures is spent."""
+    return _ATTEMPTS["failed"] >= MAX_CONSTRAINT_RETRIES
+
+
+def failure_feedback(results):
+    """Actionable feedback for a failed constraint check."""
+    report = _c.format_results(results)
+    attempt = _ATTEMPTS["failed"]
+    if retries_exhausted():
+        tail = (f"\n\nThis was attempt {attempt} of {MAX_CONSTRAINT_RETRIES}; "
+                "the retry budget is spent. Stop modifying the APK and report "
+                "which constraints could not be satisfied and why.")
+    else:
+        tail = (f"\n\nThis was attempt {attempt} of {MAX_CONSTRAINT_RETRIES}. "
+                "Fix the specific violations listed above and rebuild. Do not "
+                "deliver this artifact.")
+    return report + tail
+
+
 @registry.register(
     name="declare_constraints",
     description=(
