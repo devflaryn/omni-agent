@@ -11,8 +11,28 @@ Prefer a purpose-built tool when one exists (they give cleaner, paginated,
 context-friendly output and steer you correctly) — reach for this only when
 nothing else fits.
 """
+import re as _re
 from tool_registry import registry
 from docker_sandbox import run_cmd
+
+
+# The agent bypassed the decode tools by shelling out — this is how the four
+# partial decode trees in `fourth overnight` were created. Tool-level
+# restriction alone is ineffective, so the shell is guarded too. The segment
+# match stops at |, ; and & so only the clause naming the .apk is considered.
+_APK_DECODE_RE = _re.compile(
+    r"\b(?:unzip|apktool|7z|jar)\b[^|;&]*\.apk\b", _re.IGNORECASE)
+
+
+def _decode_bypass(command):
+    """Rejection message if `command` extracts/decodes an APK, else None."""
+    if not _APK_DECODE_RE.search(command or ""):
+        return None
+    return ("Refused: this command extracts or decodes an APK through the "
+            "shell. Use the decode_apk tool, which writes to the one canonical "
+            "decode directory for that APK. Partial shell extractions produced "
+            "four conflicting trees for a single APK in a previous run and are "
+            "not a valid rebuild source.")
 
 
 @registry.register(
@@ -37,6 +57,9 @@ from docker_sandbox import run_cmd
 )
 def run_command(command, timeout_seconds=120):
     command = (command or "").strip()
+    blocked = _decode_bypass(command)
+    if blocked:
+        return {"error": blocked}
     if not command:
         return {"error": "run_command requires a non-empty 'command'."}
     try:
