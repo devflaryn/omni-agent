@@ -418,6 +418,59 @@ def _recompile_with_apkeditor(input_dir, output_apk):
     return res
 
 
+def _apply_constraint_gate(res, constraints_list, original_apk, output_apk):
+    """Static constraint gate: a zip-member diff against the base APK. No
+    emulator is involved, so this is unaffected by omnidroid instance state.
+
+    Applied as a single choke point AFTER any recompile_apk build path (apktool,
+    APKEditor, or raw zip repack) so a declared constraint (e.g. "no new .so
+    files") is enforced regardless of which path produced the build — including
+    the whole-file-swap _zip_repack path, which is exactly how an unauthorized
+    .so would be smuggled in.
+
+    Feedback is written to res["stdout"] (what the agent actually renders back
+    to the model — see agent.py's tool-result feedback, which reads "stdout"
+    and only falls back to a JSON dump when stdout is empty) rather than a
+    "message" key, which run_cmd never produces and the agent never reads.
+    On a constraint violation, res["error"] is also set so
+    agent._tool_result_failed flags it as a real failure the model must act on.
+
+    Returns `res` unchanged if `res` is not a dict, or if no constraints are
+    declared (no-op — preserves prior behavior when nothing is declared)."""
+    if not isinstance(res, dict):
+        return res
+
+    checks = constraints_list if constraints_list is not None else _mission.get_mission_constraints()
+    if not (checks and original_apk):
+        return res
+
+    try:
+        results = _constraints.evaluate(
+            checks,
+            _constraints.apk_members(resolve_workspace_path(original_apk)),
+            _constraints.apk_members(resolve_workspace_path(output_apk)))
+    except (OSError, zipfile.BadZipFile) as e:
+        res["constraint_results"] = []
+        res["constraints_ok"] = False
+        res["stdout"] = (res.get("stdout", "")
+                          + f"\n\nConstraint check could not run: {e}")
+        res["error"] = f"Constraint check could not run: {e}"
+        return res
+
+    res["constraint_results"] = results
+    all_passed = _constraints.all_passed(results)
+    res["constraints_ok"] = all_passed
+    if all_passed:
+        res["stdout"] = (res.get("stdout", "") + "\n\n"
+                          + _constraints.format_results(results))
+    else:
+        _mission.record_failure()
+        res["stdout"] = (res.get("stdout", "") + "\n\n"
+                          + _mission.failure_feedback(results))
+        res["error"] = "Build violates declared constraints; see feedback above."
+    return res
+
+
 @registry.register(
     name="recompile_apk",
     description=(
@@ -452,68 +505,42 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
     # representation. Check this BEFORE the apktool.yml test below.
     apke_check = run_cmd(f"test -f /workspace/{input_dir}/{APKEDITOR_MARKER}", timeout=10)
     if apke_check["returncode"] == 0:
-        return _recompile_with_apkeditor(input_dir, output_apk)
-
-    # Auto-detect the directory type. apktool-decoded dirs carry apktool.yml and
-    # must be rebuilt with `apktool b`; a raw unzip_apk tree has none, so it is
-    # repacked with zip (the former repack_apk path, folded into _zip_repack).
-    # This keeps unzip_apk's whole-file-swap workflow working now that the
-    # separate repack_apk tool is gone.
-    check = run_cmd(f"test -f /workspace/{input_dir}/apktool.yml", timeout=10)
-    if check["returncode"] != 0:
-        return _zip_repack(input_dir, output_apk)
-
-    # 1) Normalize doNotCompress so the mmap-sensitive/media types stay stored.
-    patch_script = _APKTOOL_YML_PATCH.replace("__YMLPATH__", f"{input_dir}/apktool.yml")
-    b64 = base64.b64encode(patch_script.encode("utf-8")).decode("ascii")
-    aapt2_flag = "--use-aapt2 " if use_aapt2 in (True, "true", "True", 1, "1") else ""
-    size_cmp = ""
-    if original_apk:
-        orig = normalize_path(original_apk)
-        size_cmp = (
-            f' && echo "--- SIZE COMPARISON ---" '
-            f'&& echo "original: $(stat -c%s /workspace/{orig} 2>/dev/null || echo ?) bytes" '
-            f'&& echo "rebuilt:  $(stat -c%s /workspace/{output_apk} 2>/dev/null || echo ?) bytes"'
-        )
-
-    cmd = (
-        f"echo '{b64}' | base64 -d | python3 - && "
-        f"echo '--- APKTOOL BUILD ---' && "
-        f"apktool b {aapt2_flag}/workspace/{input_dir} -o /workspace/{output_apk} && "
-        f"echo '--- COMPRESSION SUMMARY (Stored = uncompressed, good for arsc/.so) ---' && "
-        f"unzip -v /workspace/{output_apk} 2>/dev/null | grep -E 'resources\\.arsc|\\.so' | "
-        f"awk '{{print $8\"  method=\"$2\"  length=\"$1\" bytes\"}}' | head -n 40"
-        f"{size_cmp}"
-    )
-    res = run_cmd(cmd, timeout=360)
-
-    # Static constraint gate: a zip-member diff against the base APK. No
-    # emulator is involved, so this is unaffected by omnidroid instance state.
-    checks = constraints_list
-    if checks is None:
-        checks = _mission.get_mission_constraints()
-    if checks and original_apk:
-        try:
-            results = _constraints.evaluate(
-                checks,
-                _constraints.apk_members(resolve_workspace_path(original_apk)),
-                _constraints.apk_members(resolve_workspace_path(output_apk)))
-        except (OSError, zipfile.BadZipFile) as e:
-            res["constraint_results"] = []
-            res["constraints_ok"] = False
-            res["message"] = (res.get("message", "")
-                              + f"\n\nConstraint check could not run: {e}").strip()
+        res = _recompile_with_apkeditor(input_dir, output_apk)
+    else:
+        # Auto-detect the directory type. apktool-decoded dirs carry apktool.yml
+        # and must be rebuilt with `apktool b`; a raw unzip_apk tree has none, so
+        # it is repacked with zip (the former repack_apk path, folded into
+        # _zip_repack). This keeps unzip_apk's whole-file-swap workflow working
+        # now that the separate repack_apk tool is gone.
+        check = run_cmd(f"test -f /workspace/{input_dir}/apktool.yml", timeout=10)
+        if check["returncode"] != 0:
+            res = _zip_repack(input_dir, output_apk)
         else:
-            res["constraint_results"] = results
-            res["constraints_ok"] = _constraints.all_passed(results)
-            if res["constraints_ok"]:
-                res["message"] = (res.get("message", "") + "\n\n"
-                                  + _constraints.format_results(results)).strip()
-            else:
-                _mission.record_failure()
-                res["message"] = (res.get("message", "") + "\n\n"
-                                  + _mission.failure_feedback(results)).strip()
+            # 1) Normalize doNotCompress so the mmap-sensitive/media types stay stored.
+            patch_script = _APKTOOL_YML_PATCH.replace("__YMLPATH__", f"{input_dir}/apktool.yml")
+            b64 = base64.b64encode(patch_script.encode("utf-8")).decode("ascii")
+            aapt2_flag = "--use-aapt2 " if use_aapt2 in (True, "true", "True", 1, "1") else ""
+            size_cmp = ""
+            if original_apk:
+                orig = normalize_path(original_apk)
+                size_cmp = (
+                    f' && echo "--- SIZE COMPARISON ---" '
+                    f'&& echo "original: $(stat -c%s /workspace/{orig} 2>/dev/null || echo ?) bytes" '
+                    f'&& echo "rebuilt:  $(stat -c%s /workspace/{output_apk} 2>/dev/null || echo ?) bytes"'
+                )
 
+            cmd = (
+                f"echo '{b64}' | base64 -d | python3 - && "
+                f"echo '--- APKTOOL BUILD ---' && "
+                f"apktool b {aapt2_flag}/workspace/{input_dir} -o /workspace/{output_apk} && "
+                f"echo '--- COMPRESSION SUMMARY (Stored = uncompressed, good for arsc/.so) ---' && "
+                f"unzip -v /workspace/{output_apk} 2>/dev/null | grep -E 'resources\\.arsc|\\.so' | "
+                f"awk '{{print $8\"  method=\"$2\"  length=\"$1\" bytes\"}}' | head -n 40"
+                f"{size_cmp}"
+            )
+            res = run_cmd(cmd, timeout=360)
+
+    res = _apply_constraint_gate(res, constraints_list, original_apk, output_apk)
     return res
 
 
