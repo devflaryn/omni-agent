@@ -12,6 +12,7 @@ skill, keeping this tool offline-testable."""
 import copy
 
 from tool_registry import registry
+from tools import mission_constraints as _mission
 
 # Live handle for the current mission's learned technique (or None). A learn
 # task REPLACES it wholesale; a non-learn task never reads it, so a stale value
@@ -49,6 +50,28 @@ def _validate(technique, mechanism, hook_points):
         if not isinstance(hp, dict) or not hp.get("class") or not hp.get("method"):
             return f"hook_point {i} needs at least 'class' and 'method'."
     return None
+
+
+def _derive_constraints(artifact):
+    """Map a learned technique to Component 2 constraints (deduped, ordered)."""
+    derived = []
+    native = artifact.get("native_additions") or []
+    if native:
+        for so in native:
+            derived.append({"kind": "file_present", "pattern": so})
+    else:
+        derived.append({"kind": "no_new_files_matching", "pattern": "*.so"})
+    for hp in artifact.get("hook_points", []):
+        dex = hp.get("dex")
+        if dex:
+            derived.append({"kind": "file_present", "pattern": dex})
+    seen, out = set(), []
+    for c in derived:
+        key = (c["kind"], c["pattern"])
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
 
 
 @registry.register(
@@ -101,10 +124,24 @@ def record_learned_technique(technique=None, mechanism=None, hook_points=None,
     }
     _LEARNED["artifact"] = artifact
 
+    # Auto-arm the Component 2 gate. UNION with any constraints already declared
+    # so a user-stated constraint is never clobbered (declare_constraints
+    # REPLACES its set). De-dup on (kind, pattern), existing first.
+    derived = _derive_constraints(artifact)
+    union, seen = [], set()
+    for c in _mission.get_mission_constraints() + derived:
+        key = (c["kind"], c["pattern"])
+        if key not in seen:
+            seen.add(key)
+            union.append(c)
+    _mission.declare_constraints(union)
+
     lines = [f"  - {hp['class']}->{hp['method']}: {hp.get('edit', '')}"
              for hp in hook_points]
+    armed = ", ".join(f"{c['kind']}({c['pattern']})" for c in union) or "none"
     echo = ("Learned technique recorded:\n"
             f"  technique: {artifact['technique']}\n"
             f"  mechanism: {artifact['mechanism']}\n"
-            "  hook points:\n" + "\n".join(lines))
+            "  hook points:\n" + "\n".join(lines)
+            + f"\n  constraints armed: {armed}")
     return {"message": echo}
