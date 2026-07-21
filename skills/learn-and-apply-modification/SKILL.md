@@ -2,7 +2,7 @@
 name: learn-and-apply-modification
 description: Learn a modification technique from a WORKING modified APK plus its plain base, then reconstruct it on a target APK — understanding the technique, not copying files. Records what it learned as a checkpoint that also arms the build-constraint gate.
 when_to_use: Use when the user gives a working modified APK and its base and asks to learn the change/bypass and apply it to the base or a new target (e.g. "learn the bypass on this APK and add it to the base"). NOT for a from-scratch mod (use apk-modding) or a whole-file swap (use apk-toolchain's unzip path).
-allowed-tools: decode_apk, compare_directories, diff_code_graphs, query_code_graph, jadx_decompile, search_smali, record_learned_technique, patch_smali_method, insert_smali_code, recompile_apk, sign_apk, verify_apk, write_file
+allowed-tools: decode_apk, compare_directories, diff_code_graphs, build_code_graph, query_code_graph, jadx_decompile, search_smali, record_learned_technique, clear_technique_constraints, patch_smali_method, insert_smali_code, recompile_apk, sign_apk, verify_apk, write_file
 ---
 
 # Learn-and-apply modification
@@ -49,11 +49,20 @@ structure so a durable per-project copy exists for review.
 
 ## Phase 4 — Apply to the target
 
-`decode_apk` the target. For EACH hook point, resolve the site in the target by
-**`query_code_graph` on class+method NAME — never by the reference's file
-path** (apktool/APKEditor can renumber smali paths between builds; the graph
-finds the method wherever it landed). Apply the edit with `patch_smali_method`
-or `insert_smali_code`. Reproduce the entry-point wiring the same way.
+`decode_apk` the target into its own dir, then **`build_code_graph` over that
+target dir with a DISTINCT `graph_id`** (e.g. `graph_id="target"`). This is
+mandatory: Phase 1 already built graphs for the reference pair, and
+`query_code_graph` defaults to the most-recently-built graph — so without an
+explicit target graph you would resolve hook points against the REFERENCE tree
+and reintroduce the exact reference-path bug the name-based approach exists to
+avoid.
+
+For EACH hook point, resolve the site in the target by **`query_code_graph`
+with your target `graph_id`, on class+method NAME — never by the reference's
+file path** (apktool/APKEditor can renumber smali paths between builds; the
+graph finds the method wherever it landed). Apply the edit with
+`patch_smali_method` or `insert_smali_code`. Reproduce the entry-point wiring
+the same way.
 
 ## Phase 5 — Verify and hand off
 
@@ -63,8 +72,13 @@ tool refuses). The gate checks your reconstruction against what you recorded:
 if you said "no new .so" and a `.so` slipped in, the build fails with the
 delta — fix and rebuild (bounded retries). Once it passes, `sign_apk` +
 `verify_apk`, then hand the signed APK to the normal on-device test flow to
-confirm the technique works at runtime. This skill's job ends at a
-structurally-verified, signed APK.
+confirm the technique works at runtime.
+
+Finally, call **`clear_technique_constraints`** so the constraints this
+technique auto-armed do not leak into a later, unrelated task in the same
+session (it removes only the technique's own constraints, keeping any the user
+stated). This skill's job ends at a structurally-verified, signed APK with the
+technique constraints cleared.
 
 ## Related skills
 - **android-package-anatomy** — what the APK members are; why signing breaks.

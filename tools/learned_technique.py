@@ -14,10 +14,11 @@ import copy
 from tool_registry import registry
 from tools import mission_constraints as _mission
 
-# Live handle for the current mission's learned technique (or None). A learn
-# task REPLACES it wholesale; a non-learn task never reads it, so a stale value
-# is harmless and needs no session reset.
-_LEARNED = {"artifact": None}
+# Live handle for the current mission's learned technique. `artifact` is the
+# structured record (or None); `derived` is the constraint set THIS module last
+# declared, tracked separately so re-recording replaces (not accumulates) its
+# own constraints and a hand-off can clear only them, leaving user constraints.
+_LEARNED = {"artifact": None, "derived": []}
 
 _ARTIFACT_KEYS = ("technique", "mechanism", "hook_points", "entry_point",
                   "native_additions", "asset_additions", "notes")
@@ -33,8 +34,10 @@ def get_learned_technique():
 
 
 def reset_learned_technique():
-    """Clear the stored artifact (test isolation; not wired to agent.py)."""
+    """Clear the stored artifact + derived tracking (test isolation; not wired
+    to agent.py)."""
     _LEARNED["artifact"] = None
+    _LEARNED["derived"] = []
 
 
 def _validate(technique, mechanism, hook_points):
@@ -124,17 +127,28 @@ def record_learned_technique(technique=None, mechanism=None, hook_points=None,
     }
     _LEARNED["artifact"] = artifact
 
-    # Auto-arm the Component 2 gate. UNION with any constraints already declared
-    # so a user-stated constraint is never clobbered (declare_constraints
-    # REPLACES its set). De-dup on (kind, pattern), existing first.
+    # Auto-arm the Component 2 gate. The declared set is (USER constraints) +
+    # (this technique's derived constraints). Two rules:
+    #  - never clobber a user-stated constraint (declare_constraints REPLACES
+    #    its whole set, so we must union rather than overwrite);
+    #  - RE-recording a technique must REPLACE the previous technique's derived
+    #    constraints, not accumulate them — otherwise correcting a misread
+    #    (e.g. native [] -> [libX.so]) would leave the old `no_new *.so` AND the
+    #    new `file_present libX.so` both armed, a contradiction no build can pass.
+    # So: strip the PRIOR derived set out of the current mission constraints to
+    # recover the user's own constraints, then union with the NEW derived set.
+    prior_derived = {(c["kind"], c["pattern"]) for c in _LEARNED["derived"]}
+    user_constraints = [c for c in _mission.get_mission_constraints()
+                        if (c["kind"], c["pattern"]) not in prior_derived]
     derived = _derive_constraints(artifact)
     union, seen = [], set()
-    for c in _mission.get_mission_constraints() + derived:
+    for c in user_constraints + derived:
         key = (c["kind"], c["pattern"])
         if key not in seen:
             seen.add(key)
             union.append(c)
     _mission.declare_constraints(union)
+    _LEARNED["derived"] = derived
 
     lines = [f"  - {hp['class']}->{hp['method']}: {hp.get('edit', '')}"
              for hp in hook_points]
@@ -145,3 +159,29 @@ def record_learned_technique(technique=None, mechanism=None, hook_points=None,
             "  hook points:\n" + "\n".join(lines)
             + f"\n  constraints armed: {armed}")
     return {"message": echo}
+
+
+@registry.register(
+    name="clear_technique_constraints",
+    description=(
+        "Remove ONLY the build constraints that record_learned_technique armed, "
+        "leaving any constraints the user stated themselves in place. Call this "
+        "at the end of a learn-and-apply task, after the target is verified and "
+        "handed off, so a later UNRELATED task in the same session is not gated "
+        "by this technique's rules."),
+    params_schema={},
+    output="A confirmation of which technique constraints were cleared.",
+    when_to_use=(
+        "At the very end of the learn-and-apply workflow, after hand-off, so the "
+        "technique's auto-armed constraints do not leak into a later task."),
+)
+def clear_technique_constraints():
+    """Re-declare the mission constraints minus this technique's derived set."""
+    derived_pairs = {(c["kind"], c["pattern"]) for c in _LEARNED["derived"]}
+    kept = [c for c in _mission.get_mission_constraints()
+            if (c["kind"], c["pattern"]) not in derived_pairs]
+    _mission.declare_constraints(kept)
+    _LEARNED["derived"] = []
+    n = len(derived_pairs)
+    return {"message": (f"Cleared {n} technique-derived constraint(s); "
+                        f"{len(kept)} user constraint(s) remain.")}
