@@ -20,8 +20,10 @@ from docker_sandbox import run_cmd
 # partial decode trees in `fourth overnight` were created. Tool-level
 # restriction alone is ineffective, so the shell is guarded too. The segment
 # match stops at |, ; and & so only the clause naming the .apk is considered.
+# 7z[ar]? catches the 7-Zip CLI variants 7z, 7za and 7zr — `\b7z\b` alone
+# misses 7za/7zr because the trailing letter suppresses the word boundary.
 _APK_DECODE_RE = _re.compile(
-    r"\b(?:unzip|apktool|7z|jar)\b[^|;&]*\.apk\b", _re.IGNORECASE)
+    r"\b(?:unzip|apktool|7z[ar]?|jar)\b[^|;&]*\.apk\b", _re.IGNORECASE)
 
 
 def _decode_bypass(command):
