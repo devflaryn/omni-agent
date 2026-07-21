@@ -46,6 +46,7 @@ from llm import (
     strip_reasoning,
     get_context_window,
     reset_salvage_stats,
+    SALVAGE_STATS,
 )
 from docker_sandbox import setup_sandbox, set_timeout_decider
 from tool_registry import registry, CORE_GROUP
@@ -3036,6 +3037,18 @@ class AgentApi:
                                 "time": time_str})
                     self._refresh_tree()
 
+                    # The model stacked several tool calls into one message (a
+                    # common GLM off-protocol shape). The parser executed the
+                    # first and named the rest in _dropped_calls; tell the model
+                    # so it resends them one per turn instead of assuming they ran.
+                    dropped = payload.get("_dropped_calls") if isinstance(payload, dict) else None
+                    if dropped:
+                        tool_feedback += (
+                            f"\n\n[SYSTEM] You emitted {len(dropped) + 1} tool calls in "
+                            f"one message; only the first ran. This loop takes ONE tool "
+                            f"call per turn. Resend these individually if still needed: "
+                            f"{', '.join(dropped)}.")
+
                     s["messages"].append({"role": "user", "content": f"TOOL RESULT:\n{tool_feedback}"})
 
                     # Context editing: collapse OLD, large tool results to stubs so a
@@ -3223,6 +3236,18 @@ class AgentApi:
                             f"Reviewer approved the conclusion: {verdict.get('summary', '')}")})
 
                     s["review_rounds"] = 0
+                    # Surface the tool-call salvage rate for the run. This is the
+                    # reader the counter's rationale promised: if the model went
+                    # off-protocol a lot, the operator sees it here instead of
+                    # only when a run dies. Silent when nothing was salvaged.
+                    _salvaged = SALVAGE_STATS.get("salvaged", 0)
+                    if _salvaged:
+                        self._emit({"type": "system", "content": (
+                            f"Tool-call salvage this run: {_salvaged} off-protocol "
+                            f"message(s) recovered by the parser"
+                            + (f", {SALVAGE_STATS['dropped_calls']} stacked extra call(s) "
+                               f"fed back" if SALVAGE_STATS.get("dropped_calls") else "")
+                            + ".")})
                     self._emit({"type": "final_answer",
                                 "content": payload,
                                 "steps": s["step_count"],
