@@ -9,6 +9,8 @@ added in the neighbouring function `_derive_constraints` / the record path.
 Pure module: no agent.py coupling, no sandbox I/O. Durable per-project
 persistence of the artifact (write_file learned_technique.json) is done by the
 skill, keeping this tool offline-testable."""
+import copy
+
 from tool_registry import registry
 
 # Live handle for the current mission's learned technique (or None). A learn
@@ -21,9 +23,12 @@ _ARTIFACT_KEYS = ("technique", "mechanism", "hook_points", "entry_point",
 
 
 def get_learned_technique():
-    """A copy of the current mission's learned-technique artifact, or None."""
+    """A DEEP copy of the current mission's learned-technique artifact, or None.
+
+    Deep so a caller mutating a nested hook_point can't corrupt the store — the
+    apply phase reads this as its plan, so it must be tamper-proof."""
     a = _LEARNED["artifact"]
-    return dict(a) if a else None
+    return copy.deepcopy(a) if a else None
 
 
 def reset_learned_technique():
