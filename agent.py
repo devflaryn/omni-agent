@@ -45,6 +45,7 @@ from llm import (
     extract_json_action,
     strip_reasoning,
     get_context_window,
+    reset_salvage_stats,
 )
 from docker_sandbox import setup_sandbox, set_timeout_decider
 from tool_registry import registry, CORE_GROUP
@@ -52,6 +53,7 @@ import planning
 import investigation
 import tools  # Triggers the __init__.py which loads all tool categories
 from tools.reviewer import run_review
+from tools import mission_constraints
 import subagents  # generalized isolated-context subagent engine
 import plugins     # Claude-Code-style plugin system (agents/skills/commands/hooks)
 
@@ -2030,6 +2032,15 @@ class AgentApi:
             investigation.set_active(resumed_inv, notify=False)
         else:
             investigation.clear_active(notify=False)
+
+        # Per-session ephemeral state (no resume, unlike plan/investigation):
+        # mission build-constraints + retry budget, and the tool-call salvage
+        # counters. These live in process-wide module globals, so switching
+        # projects in the same running process (omni-executor drives many) MUST
+        # clear them, or project A's declared constraints (and spent retry
+        # budget) leak into project B's builds.
+        mission_constraints.reset_mission_constraints()
+        reset_salvage_stats()
 
         # Compose messages[0] = static prompt + progressive tool section + live
         # plan + investigation. The plan/investigation were wired with
