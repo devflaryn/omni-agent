@@ -454,7 +454,21 @@ def _apply_constraint_gate(res, constraints_list, original_apk, output_apk):
         return res
 
     checks = constraints_list if constraints_list is not None else _mission.get_mission_constraints()
-    if not (checks and original_apk):
+    if not checks:
+        return res  # nothing declared — genuine no-op, prior behavior preserved
+    if not original_apk:
+        # Constraints ARE declared but there's no base APK to verify against.
+        # Do NOT silently pass — that would let a violating build ship exactly
+        # on the whole-file-swap path the gate exists to guard. Make it an error
+        # the model must act on by re-running with original_apk set.
+        msg = ("Build NOT verified: constraints are declared for this mission "
+               "but recompile_apk was called without original_apk. Re-run "
+               "recompile_apk with original_apk set to the base APK so the "
+               "declared constraints can be checked against the rebuild.")
+        res["constraint_results"] = []
+        res["constraints_ok"] = False
+        res["stdout"] = (res.get("stdout", "") + "\n\n" + msg)
+        res["error"] = msg
         return res
 
     try:
@@ -502,13 +516,27 @@ def _apply_constraint_gate(res, constraints_list, original_apk, output_apk):
         "input_dir": "string (a decode_apk directory with apktool.yml, OR a raw unzip_apk directory)",
         "output_apk": "string (output apk filename)",
         "use_aapt2": "boolean (optional, default true — apktool path only: build with aapt2, which handles arsc/resources more reliably)",
-        "original_apk": "string (optional — apktool path only: path to the original APK; if given, the size of the rebuilt APK is compared against it to flag unexpected bloat)"
+        "original_apk": "string (path to the original/base APK). Two uses: (1) on the apktool path the rebuilt APK's size is compared against it to flag bloat; (2) REQUIRED whenever you have declared build constraints (declare_constraints) — the rebuild's ZIP members are diffed against this base to verify them. If constraints are declared and this is omitted, the build is refused as unverifiable."
     },
     output="For a decode_apk directory: the doNotCompress normalization result, apktool's build log, a compression summary for resources.arsc and each .so (Stored vs Defl), and — if original_apk was given — a size comparison. For a raw unzip_apk directory: the zip repack log (old META-INF signatures stripped, mmap-sensitive types kept stored). Either way the output is UNSIGNED; call sign_apk next.",
     when_to_use="Use this to rebuild an APK AFTER editing — it handles BOTH decode_apk directories (smali/resources/manifest edits) and raw unzip_apk directories (whole-file swaps), auto-selecting apktool build vs zip repack from the directory. It is compression-safe by default (no mmap/load crashes or size bloat). Then sign_apk (and verify_apk)."
 )
 def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
                   constraints_list=None):
+    # Enforce the capped retry budget: once the mission has failed its declared
+    # constraints MAX_CONSTRAINT_RETRIES times, refuse to keep rebuilding. The
+    # feedback already told the model to stop; this makes "stop" mechanical
+    # rather than advisory (the exact ask-nicely pattern this gate replaces).
+    active_checks = (constraints_list if constraints_list is not None
+                     else _mission.get_mission_constraints())
+    if active_checks and _mission.retries_exhausted():
+        stop = (f"recompile_apk refused: the constraint retry budget "
+                f"({_mission.MAX_CONSTRAINT_RETRIES} attempts) is spent for this "
+                f"mission. Stop rebuilding and report which declared constraints "
+                f"could not be satisfied and why.")
+        return {"stdout": stop, "stderr": "", "returncode": 1,
+                "error": stop, "constraints_ok": False}
+
     input_dir = normalize_path(input_dir)
     output_apk = normalize_path(output_apk)
 
