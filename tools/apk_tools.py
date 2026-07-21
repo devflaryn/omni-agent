@@ -9,6 +9,7 @@ lives in one focused, readable module.
 """
 
 import base64
+import os
 import zipfile
 
 from tool_registry import registry
@@ -172,6 +173,18 @@ def _output_has_smali(output_dir):
     has none, so this is how we tell a full decode from a partial one."""
     res = run_cmd(f"ls -d /workspace/{output_dir}/smali* 2>/dev/null | head -1", timeout=20)
     return bool((res.get("stdout") or "").strip())
+
+
+def canonical_decode_dir(apk_filename):
+    """The one decode directory for this APK.
+
+    A single APK produced four decode trees in the `fourth overnight` run —
+    `roblox_extract` (lib only), `roblox_apk_decoded` (res only),
+    `roblox_decoded`, `roblox_decoded_full`. Rebuilding from a partial tree is
+    a plausible cause of the dropped classes4.dex, so the path is derived
+    rather than chosen."""
+    stem = os.path.splitext(os.path.basename(apk_filename))[0]
+    return f"{stem}_decoded"
 
 
 @registry.register(
