@@ -854,7 +854,6 @@ def active_key_pool():
     if isinstance(keys, list):
         return [k for k in keys if k]
     if isinstance(keys, str):
-        import re
         return [p for p in re.split(r"[,\s]+", keys) if p]
     k = chosen.get("api_key")
     return [k] if k else []
@@ -2090,7 +2089,7 @@ def _run_group(group, messages, temperature, ladder=None, track_active=True, act
                 # Per-key problem: retire this key and try the SAME model on another.
                 dead.add(key)
                 _KEY_COOLDOWN[key] = time.monotonic() + KEY_COOLDOWN_SECONDS
-                if _live_keys(keys, dead):
+                if _live_keys(keys, dead) and not _is_subagent_thread():
                     _notify_fallback(
                         f"API key {_mask_key(key)} rate-limited ({kind}) on {_model_label(group, m)} "
                         f"— rotating to another key.")

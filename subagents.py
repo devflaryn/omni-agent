@@ -42,9 +42,11 @@ REPEAT_LIMIT = 3             # identical call this many times in a row -> steer
 
 
 def _pool_size(n_specs):
-    """Concurrency for a read wave: at most keys-1 (reserve headroom for the main
-    orchestrator), never more than the number of specs, floored at 1. Derived live
-    from the key pool — no hardcoded constant."""
+    """Concurrency for a read wave: at most keys-1 (reserve headroom), never more
+    than the number of specs, floored at 1. Derived live from the key pool — no
+    hardcoded constant.
+    Note: this reserves HEADROOM (bounds concurrent subagents to keys-1) — it does
+    NOT pin a specific key away from the main thread."""
     n_keys = len(llm.active_key_pool())
     reserve = max(1, n_keys - 1)
     return max(1, min(reserve, n_specs))
@@ -61,14 +63,16 @@ class KeyAllocator:
     running set stays balanced across the pool at every instant — and, over a run,
     each key serves ~equal subagents. A subagent holds its key for its whole run
     (many ask_llm calls) so it keeps a warm prompt cache; per-request switching
-    would forfeit that discount. Thread-safe."""
+    would forfeit that discount. Thread-safe.
+    Note: the balancing guarantee assumes the SAME key pool is passed in on every
+    acquire() call for this instance."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self._counts = {}
         self._rr = 0
 
-    def acquire(self, keys):
+    def acquire(self, keys: list[str]) -> "str | None":
         with self._lock:
             if not keys:
                 return None
@@ -85,7 +89,7 @@ class KeyAllocator:
             self._counts[best] += 1
             return best
 
-    def release(self, key):
+    def release(self, key: "str | None") -> None:
         if key is None:
             return
         with self._lock:
@@ -93,6 +97,9 @@ class KeyAllocator:
                 self._counts[key] -= 1
 
 
+# The distinct-key-per-concurrent-subagent guarantee assumes ONE wave holds keys at
+# a time (true today: the read wave blocks on its queue drain; write path and
+# dispatch_agents are serial).
 _KEY_ALLOCATOR = KeyAllocator()
 
 
@@ -305,6 +312,8 @@ def _force_final(agent_def, messages, temperature, steps, tools_used, result, no
         result.update(ok=False, report=f"(subagent could not finalize: {e})", steps=steps,
                       tools_used=tools_used, note=note, tokens=tokens)
         return result
+    tokens_here = (llm.take_last_usage() or {}).get("total") or _estimate_tokens(messages, raw)
+    tokens += tokens_here
     rtype, payload = _parse_response(raw)
     content = payload if rtype == "final_answer" else strip_reasoning(raw)
     result.update(ok=True, report=_content_to_text(content), raw_report=content,
@@ -342,16 +351,17 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
         result["report"] = f"(subagent setup failed: {e})"
         return result
 
-    key = _KEY_ALLOCATOR.acquire(llm.active_key_pool())
-    llm.set_subagent_context(pinned_key=key)
+    key = None
+    acquired_lock = None
     started = time.monotonic()
-    _emit_event(on_event, {"type": "subagent_started", "agent": agent_def.name,
-                           "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode})
-
-    write_lock = _WORKSPACE_LOCK if agent_def.is_write else None
-    if write_lock:
-        write_lock.acquire()
     try:
+        key = _KEY_ALLOCATOR.acquire(llm.active_key_pool())
+        llm.set_subagent_context(pinned_key=key)
+        _emit_event(on_event, {"type": "subagent_started", "agent": agent_def.name,
+                               "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode})
+        if agent_def.is_write:
+            _WORKSPACE_LOCK.acquire()
+            acquired_lock = _WORKSPACE_LOCK
         out = _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                         on_event=on_event, agent_name=agent_def.name, max_steps_total=max_steps,
                         started=started, key_label=_mask(key))
@@ -359,10 +369,10 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
         result.update(ok=False, report=f"(subagent crashed: {e})")
         out = result
     finally:
-        if write_lock:
-            write_lock.release()
+        if acquired_lock is not None:
+            acquired_lock.release()
         llm.clear_subagent_context()
-        _KEY_ALLOCATOR.release(key)
+        _KEY_ALLOCATOR.release(key)  # release(None) is already a safe no-op
 
     _emit_event(on_event, {"type": "subagent_done", "agent": agent_def.name,
                            "ok": bool(out.get("ok")), "tokens": out.get("tokens", 0),
