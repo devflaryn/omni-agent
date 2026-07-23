@@ -56,6 +56,7 @@ import investigation
 import tools  # Triggers the __init__.py which loads all tool categories
 from tools.reviewer import run_review
 from tools import mission_constraints
+from tools.output_distillers import NOISY_TOOLS, distill as distill_output
 import subagents  # generalized isolated-context subagent engine
 import plugins     # Claude-Code-style plugin system (agents/skills/commands/hooks)
 
@@ -746,7 +747,7 @@ def parse_timeout_decision(raw):
 
 
 def execute_tool(tool_data, last_tool_call=None, repeat_threshold=LOOP_REPEAT_THRESHOLD,
-                 return_result=False):
+                 return_result=False, run_dir=None, task_context=""):
     """Executes a tool from a parsed tool_call dict and returns a feedback string.
 
     When return_result=True, returns (feedback, result_dict) so the caller can
@@ -787,12 +788,42 @@ def execute_tool(tool_data, last_tool_call=None, repeat_threshold=LOOP_REPEAT_TH
         # and fall back to a legacy tool that happens to always populate stdout.
         output = json.dumps(result, indent=2, default=str)
 
+    # --- Context hygiene -------------------------------------------------
+    # A curated NOISY tool's output is distilled (summary in chat, full raw to a
+    # file) instead of dumped. Any OTHER oversized output is saved to a file so
+    # the tail is never silently lost to blind truncation.
+    if tool_name in NOISY_TOOLS and (output or err_dict):
+        try:
+            distilled = distill_output(tool_name, result, run_dir, task_context)
+            output = distilled.get("stdout", output)
+            feedback = f"Tool '{tool_name}' executed.\n"
+            if output:
+                feedback += f"Output:\n{output}\n"
+            if err:
+                feedback += f"Stderr:\n{err[:2000]}\n"
+            return (feedback, result) if return_result else feedback
+        except Exception:
+            pass  # fall through to the generic path — never break the call
+
     feedback = f"Tool '{tool_name}' executed.\n"
     if output:
-        trimmed = output[:8000]
-        feedback += f"Output:\n{trimmed}\n"
         if len(output) > 8000:
-            feedback += f"[WARNING: Output truncated at 8000 chars. Total output was {len(output)} chars. If this is a symbol/string listing, call the tool again with a higher 'skip' or 'page' offset to see more results.]\n"
+            path = None
+            if run_dir:
+                try:
+                    from tools.output_distillers import _save_raw
+                    path = _save_raw(run_dir, tool_name, output)
+                except Exception:
+                    path = None
+            feedback += f"Output:\n{output[:8000]}\n"
+            if path:
+                feedback += f"[Output truncated at 8000 of {len(output)} chars — full raw saved to {path}]\n"
+            else:
+                feedback += (f"[WARNING: Output truncated at 8000 chars. Total output was {len(output)} chars. "
+                             "If this is a symbol/string listing, call the tool again with a higher 'skip' or "
+                             "'page' offset to see more results.]\n")
+        else:
+            feedback += f"Output:\n{output}\n"
     if err:
         feedback += f"Stderr:\n{err[:2000]}\n"
     if err_dict:
@@ -2916,7 +2947,8 @@ class AgentApi:
                                 "step": s["step_count"] + 1})
 
                     tool_feedback, tool_result = execute_tool(
-                        payload, s["last_tool_call"], s["loop_repeat_threshold"], return_result=True)
+                        payload, s["last_tool_call"], s["loop_repeat_threshold"], return_result=True,
+                        run_dir=s.get("memory_dir"), task_context=(s.get("original_task") or ""))
                     run_ms = int((time.time() - run_started) * 1000)
                     is_loop_warning = tool_feedback.startswith("[SYSTEM WARNING]")
                     tool_failed = _tool_result_failed(tool_result)
