@@ -653,6 +653,32 @@ function _renderWave() {
   if (!_wave.manualCollapsed) el.classList.remove('cdock-collapsed');
 }
 
+// Dev-only: fire a synthetic parallel wave so the dock can be verified without a
+// real delegating task. Call __demoWave(3) from the browser console.
+window.__demoWave = function (n = 3) {
+  const send = ev => window.__agent.onEvent(ev);
+  const wave_id = 'demo' + Math.floor(Math.random() * 1e4);
+  send({ type: 'wave_started', wave_id, size: n, workers: n });
+  for (let i = 0; i < n; i++) {
+    const agent = `probe-${i + 1}`, key_label = `k${i + 1}`;
+    const dur = 1500 + Math.round(Math.random() * 3500);
+    const base = { wave_id, agent, key_label };
+    send({ type: 'subagent_started', ...base, task: `investigating thing #${i + 1}`, mode: 'read' });
+    let step = 0;
+    const iv = setInterval(() => {
+      step++;
+      send({ type: 'subagent_progress', ...base, elapsed_s: step, tokens: step * 900, step, max_steps: 6 });
+    }, dur / 5);
+    setTimeout(() => {
+      clearInterval(iv);
+      send({ type: 'subagent_done', ...base, ok: Math.random() > 0.15,
+             elapsed_s: Math.round(dur / 1000), tokens: 5400, steps: 5 });
+    }, dur);
+  }
+  const total = 5200;
+  setTimeout(() => send({ type: 'wave_done', wave_id }), total);
+};
+
 // ---------- plan-and-execute panel ----------
 let currentPlan = null;
 
