@@ -1351,15 +1351,13 @@ class AgentApi:
 
     # --- plan-driven delegation ------------------------------------------------
     def _maybe_dispatch_delegated_steps(self):
-        """After a plan mutation, auto-run every step just marked in_progress that
-        carries a `delegate` — in an ISOLATED subagent — and fold back only its
-        distilled report. Delegation is therefore a property of the PLAN, not a tool
-        the model must pick from the registry (the user's "not just another tool").
-        Independent READ-delegated steps marked in_progress together are batched into
-        ONE streamed parallel wave (see `_run_delegated_read_wave`); WRITE-delegated
-        steps still run one at a time, sequentially, to protect the shared workspace.
-        The main loop waits either way, but its context only gains each short report,
-        never a subagent's transcript."""
+        """Dispatch delegated plan steps of the ACTIVE phase. Parallel-by-default:
+        every ready independent READ step (deps satisfied) fans out in ONE wide wave
+        via run_subagents_parallel; WRITE steps run serially behind the workspace
+        lock. Loops until no step is ready (a completed dependency can unblock more).
+        With session['parallel_execution_enabled'] False, falls back to dispatching
+        only steps already marked in_progress, one at a time (legacy behavior).
+        Only distilled reports fold back into the main context, never transcripts."""
         s = self.session
         if not s.get("delegation_enabled", True):
             return
@@ -1368,12 +1366,11 @@ class AgentApi:
             return
         dispatched = s.setdefault("dispatched_steps", set())
         reg = plugins.get_registry()
+        parallel = s.get("parallel_execution_enabled", True)
 
-        reads, writes = [], []
-        for step in list(plan.items):
-            if not (step.get("status") == "in_progress" and step.get("delegate")
-                    and step["id"] not in dispatched):
-                continue
+        def _resolve(step):
+            """Return the AgentDef for a step's delegate, or None (and surface the
+            unknown-agent nudge, marking it dispatched so we don't retry it)."""
             name = (step.get("delegate") or "").strip()
             ad = reg.get_agent(name)
             if ad is None:
@@ -1384,32 +1381,62 @@ class AgentApi:
                 s["messages"].append({"role": "user", "content": (
                     f"[SYSTEM] Plan step ({step['id']}) is tagged delegate='{name}', but no such subagent "
                     f"exists (available: {names}). Do this step yourself, or fix/clear the delegate name.")})
-                continue
-            dispatched.add(step["id"])
-            (writes if ad.is_write else reads).append((step, name, ad))
+                return None
+            return ad
 
-        if reads:
-            try:
-                self._run_delegated_read_wave(plan, reads)
-            except Exception as e:
-                for step, _name, _ad in reads:
+        # Bounded loop: each pass dispatches the currently-ready batch; a completed
+        # dependency can make more steps ready on the next pass. Capped so a
+        # pathological dependency cycle degrades to "nothing ready" instead of hanging.
+        for _ in range(len(plan.items) + 1):
+            if parallel:
+                candidates = plan.ready_delegatable_steps(dispatched)
+            else:
+                # Legacy: only steps the model has explicitly started, untouched.
+                candidates = [it for it in plan.items
+                              if it.get("status") == "in_progress" and (it.get("delegate") or "").strip()
+                              and it["id"] not in dispatched]
+            if not candidates:
+                return
+
+            reads, writes = [], []
+            for step in candidates:
+                ad = _resolve(step)
+                if ad is None:
+                    continue
+                dispatched.add(step["id"])
+                if parallel and step.get("status") != "in_progress":
+                    # Harness-initiated start of a pulled-forward step: mark it live so
+                    # the plan/UI reflect it, exactly like a model-started step.
+                    plan.update_item(step["id"], status="in_progress")
+                (writes if ad.is_write else reads).append((step, ad.name, ad))
+            planning.notify_updated()
+
+            if reads:
+                try:
+                    self._run_delegated_read_wave(plan, reads)
+                except Exception as e:
+                    for step, _name, _ad in reads:
+                        s["messages"].append({"role": "user", "content": (
+                            f"[SYSTEM] Delegation of step ({step['id']}) failed to start ({e}). "
+                            "Handle this step yourself.")})
+
+            for step, name, ad in writes:
+                try:
+                    task = self._compose_delegate_task(step)
+                    context = self._compose_delegate_context(plan)
+                    self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
+                                "content": f"Delegating step ({step['id']}) to subagent '{name}' ({ad.mode})…"})
+                    result = subagents.run_subagent(ad, task, context=context,
+                                                    run_dir=getattr(self, "_delegate_run_dir", None))
+                    self._fold_delegate_result(plan, step, name, ad, result)
+                except Exception as e:
                     s["messages"].append({"role": "user", "content": (
                         f"[SYSTEM] Delegation of step ({step['id']}) failed to start ({e}). "
                         "Handle this step yourself.")})
 
-        for step, name, ad in writes:
-            try:
-                task = self._compose_delegate_task(step)
-                context = self._compose_delegate_context(plan)
-                self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
-                            "content": f"Delegating step ({step['id']}) to subagent '{name}' ({ad.mode})…"})
-                result = subagents.run_subagent(ad, task, context=context,
-                                                run_dir=getattr(self, "_delegate_run_dir", None))
-                self._fold_delegate_result(plan, step, name, ad, result)
-            except Exception as e:
-                s["messages"].append({"role": "user", "content": (
-                    f"[SYSTEM] Delegation of step ({step['id']}) failed to start ({e}). "
-                    "Handle this step yourself.")})
+            if not parallel:
+                # Legacy path handled the started step(s) once; don't loop-pull more.
+                return
 
     def _run_delegated_read_wave(self, plan, reads):
         """Run a batch of independent READ-delegated steps as ONE parallel wave
@@ -2137,6 +2164,10 @@ class AgentApi:
             # returns to this conversation. dispatched_steps tracks ids already handed off.
             "delegation_enabled": ADAPTIVE_PLANNING_DEFAULT,
             "dispatched_steps": set(),
+            # Parallel-by-default execution: dispatch ALL ready independent delegated
+            # steps of the active phase as one wide wave (vs one at a time). Kill
+            # switch — False restores strict one-step dispatch.
+            "parallel_execution_enabled": ADAPTIVE_PLANNING_DEFAULT,
             # GSD context-hygiene: periodic re-grounding against context rot.
             "context_hygiene": ADAPTIVE_PLANNING_DEFAULT,
             "steps_since_reground": 0,

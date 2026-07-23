@@ -82,6 +82,15 @@ def _clean_list(values):
     return [t for t in (_coerce_title(v) for v in values) if t]
 
 
+def _clean_id_list(v):
+    """Normalize a depends_on value to a list of non-empty string ids."""
+    if not v:
+        return []
+    if isinstance(v, str):
+        v = [v]
+    return [str(x).strip() for x in v if x and str(x).strip()]
+
+
 class Plan:
     def __init__(self, task):
         self.task = task
@@ -107,7 +116,7 @@ class Plan:
     # --- steps (items) ---------------------------------------------------------
     def add_item(self, content, status="pending", after_id=None, notes=None,
                  action=None, purpose=None, expected=None, verification=None,
-                 fallback=None, phase_id=None, explanation=None, delegate=None):
+                 fallback=None, phase_id=None, explanation=None, delegate=None, depends_on=None):
         item = {
             "id": _new_id(),
             "content": content,
@@ -117,6 +126,9 @@ class Plan:
             # step in its own isolated context (the harness auto-dispatches it when
             # the step is marked in_progress; only its distilled report returns).
             "delegate": delegate or "",
+            # Steps this one waits for (same-phase ids). Empty => independent =>
+            # eligible immediately, so the harness can dispatch it in parallel.
+            "depends_on": _clean_id_list(depends_on),
             # Evidence-driven step fields (all optional; important steps fill them).
             "action": action or "",
             "purpose": purpose or "",
@@ -147,7 +159,7 @@ class Plan:
 
     def update_item(self, item_id, status=None, content=None, notes=None,
                     action=None, purpose=None, expected=None, verification=None,
-                    fallback=None, explanation=None, delegate=None):
+                    fallback=None, explanation=None, delegate=None, depends_on=None):
         item = self.find(item_id)
         if not item:
             return None
@@ -163,7 +175,8 @@ class Plan:
         # so refining status doesn't wipe an existing verification/fallback.
         for key, val in (("action", action), ("purpose", purpose), ("expected", expected),
                          ("verification", verification), ("fallback", fallback),
-                         ("explanation", explanation), ("delegate", delegate)):
+                         ("explanation", explanation), ("delegate", delegate),
+                         ("depends_on", _clean_id_list(depends_on) if depends_on is not None else None)):
             if val is not None:
                 item[key] = val
         item["updated_at"] = time.time()
@@ -180,6 +193,28 @@ class Plan:
 
     def active_item(self):
         return next((it for it in self.items if it["status"] == "in_progress"), None)
+
+    def ready_delegatable_steps(self, dispatched_ids):
+        """Steps in the current phase that are ready to hand to a subagent right
+        now: they carry a `delegate`, aren't done or already dispatched, and every
+        same-phase id in their `depends_on` is completed/skipped. Foreign/self dep
+        ids are ignored (they never block). Returns them in plan order."""
+        dispatched_ids = dispatched_ids or set()
+        phase_ids = {it["id"] for it in self.items
+                     if it.get("phase_id") == self.current_phase_id}
+        done = {it["id"] for it in self.items if it["status"] in DONE_STATUSES}
+        ready = []
+        for it in self.items:
+            if it.get("phase_id") != self.current_phase_id:
+                continue
+            if not (it.get("delegate") or "").strip():
+                continue
+            if it["status"] in DONE_STATUSES or it["id"] in dispatched_ids:
+                continue
+            deps = [d for d in it.get("depends_on", []) if d in phase_ids and d != it["id"]]
+            if all(d in done for d in deps):
+                ready.append(it)
+        return ready
 
     def progress(self):
         total = len(self.items)
@@ -396,6 +431,8 @@ class Plan:
             # A delegated step is executed by a subagent in its own context.
             if it.get("delegate"):
                 lines.append(f"    → delegate to subagent: {it['delegate']}")
+            if it.get("depends_on"):
+                lines.append(f"    ↳ waits for: {', '.join(it['depends_on'])}")
             # Fold the evidence fields onto a compact indented line when present, so
             # an important step reads as action/why/expect/verify/fallback.
             detail = []
@@ -426,6 +463,7 @@ class Plan:
             for key in ("action", "purpose", "expected", "verification", "fallback",
                         "phase_id", "notes", "explanation", "delegate"):
                 it.setdefault(key, "")
+            it.setdefault("depends_on", [])
         plan.phases = data.get("phases", []) or []
         plan.current_phase_id = data.get("current_phase_id")
         plan.success_criteria = data.get("success_criteria", []) or []

@@ -24,8 +24,10 @@ subagent returns {ok: False, report: "<why>"} so the caller decides.
 """
 import concurrent.futures
 import json
+import os
 import threading
 import time
+import uuid
 
 import llm
 from llm import ask_llm, extract_json_action, strip_reasoning
@@ -40,16 +42,22 @@ PER_RESULT_CHAR_CAP = 6000   # truncate each tool result fed back into the sub-s
 CONTEXT_CHAR_LIMIT = 180_000 # force an answer if the sub-conversation grows past this
 REPEAT_LIMIT = 3             # identical call this many times in a row -> steer
 
+# Max subagents run at once in a single wave. Cost is not a constraint, so this is
+# deliberately generous and DECOUPLED from the key count (keys are shared across
+# concurrent subagents by KeyAllocator). Env-overridable for tuning against provider
+# rate limits.
+try:
+    SUBAGENT_MAX_CONCURRENCY = max(1, int(os.environ.get("OMNI_SUBAGENT_MAX_CONCURRENCY", "16")))
+except ValueError:
+    SUBAGENT_MAX_CONCURRENCY = 16
+
 
 def _pool_size(n_specs):
-    """Concurrency for a read wave: at most keys-1 (reserve headroom), never more
-    than the number of specs, floored at 1. Derived live from the key pool — no
-    hardcoded constant.
-    Note: this reserves HEADROOM (bounds concurrent subagents to keys-1) — it does
-    NOT pin a specific key away from the main thread."""
-    n_keys = len(llm.active_key_pool())
-    reserve = max(1, n_keys - 1)
-    return max(1, min(reserve, n_specs))
+    """Concurrency for a read wave: up to SUBAGENT_MAX_CONCURRENCY, never more than
+    the number of specs, floored at 1. Decoupled from the key count — keys are
+    shared across concurrent subagents (cost is irrelevant), so parallelism is
+    bounded by the work and the safety cap, not by how many keys exist."""
+    return max(1, min(SUBAGENT_MAX_CONCURRENCY, n_specs))
 
 # Only ONE write-capable subagent may touch the shared /workspace at a time. Read
 # subagents never acquire it (they can't mutate), so parallel research is unaffected.
@@ -97,9 +105,11 @@ class KeyAllocator:
                 self._counts[key] -= 1
 
 
-# The distinct-key-per-concurrent-subagent guarantee assumes ONE wave holds keys at
-# a time (true today: the read wave blocks on its queue drain; write path and
-# dispatch_agents are serial).
+# NOTE: concurrent subagents may now SHARE a key — _pool_size is deliberately
+# decoupled from the key count, so a wide wave can outnumber the key pool and
+# KeyAllocator hands the same least-loaded key to more than one subagent at once.
+# The frontend dock does NOT rely on key_label to tell concurrent bars apart; each
+# subagent invocation carries its own unique `sub_id` (see run_subagent) for that.
 _KEY_ALLOCATOR = KeyAllocator()
 
 
@@ -354,17 +364,19 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
     key = None
     acquired_lock = None
     started = time.monotonic()
+    sub_id = uuid.uuid4().hex[:8]
     try:
         key = _KEY_ALLOCATOR.acquire(llm.active_key_pool())
         llm.set_subagent_context(pinned_key=key)
         _emit_event(on_event, {"type": "subagent_started", "agent": agent_def.name,
-                               "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode})
+                               "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode,
+                               "sub_id": sub_id})
         if agent_def.is_write:
             _WORKSPACE_LOCK.acquire()
             acquired_lock = _WORKSPACE_LOCK
         out = _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                         on_event=on_event, agent_name=agent_def.name, max_steps_total=max_steps,
-                        started=started, key_label=_mask(key))
+                        started=started, key_label=_mask(key), sub_id=sub_id)
     except Exception as e:
         result.update(ok=False, report=f"(subagent crashed: {e})")
         out = result
@@ -378,12 +390,13 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
                            "ok": bool(out.get("ok")), "tokens": out.get("tokens", 0),
                            "steps": out.get("steps", 0),
                            "elapsed_s": round(time.monotonic() - started, 1),
-                           "key_label": _mask(key)})
+                           "key_label": _mask(key), "sub_id": sub_id})
     return out
 
 
 def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
-              on_event=None, agent_name="", max_steps_total=None, started=None, key_label=""):
+              on_event=None, agent_name="", max_steps_total=None, started=None, key_label="",
+              sub_id=""):
     steps = 0
     last_sig = None
     repeats = 0
@@ -440,7 +453,8 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                                "elapsed_s": round(time.monotonic() - started, 1),
                                "tokens": tokens, "step": steps,
                                "max_steps": max_steps_total or max_steps,
-                               "last_tool": tool_name, "key_label": key_label})
+                               "last_tool": tool_name, "key_label": key_label,
+                               "sub_id": sub_id})
 
         if _estimate_chars(messages) > CONTEXT_CHAR_LIMIT:
             return _force_final(agent_def, messages, temperature, steps, tools_used, result,
@@ -476,22 +490,28 @@ def run_subagents_parallel(specs, pool_size=None, run_dir=None, on_event=None):
     read_idx = [i for i, (a, _t, _c) in enumerate(norm) if not a.is_write]
     write_idx = [i for i, (a, _t, _c) in enumerate(norm) if a.is_write]
 
-    if read_idx:
-        workers = pool_size if pool_size is not None else _pool_size(len(read_idx))
-        workers = max(1, min(workers, len(read_idx)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(run_subagent, norm[i][0], norm[i][1], norm[i][2], run_dir, on_event): i
-                    for i in read_idx}
-            for fut in concurrent.futures.as_completed(futs):
-                i = futs[fut]
-                try:
-                    results[i] = fut.result()
-                except Exception as e:
-                    r = _new_result(norm[i][0])
-                    r["report"] = f"(subagent crashed: {e})"
-                    results[i] = r
+    wave_id = uuid.uuid4().hex[:8]
+    workers = pool_size if pool_size is not None else _pool_size(max(1, len(read_idx)))
+    _emit_event(on_event, {"type": "wave_started", "wave_id": wave_id,
+                           "size": len(norm), "workers": max(1, min(workers, len(read_idx) or 1))})
+    try:
+        if read_idx:
+            workers = pool_size if pool_size is not None else _pool_size(len(read_idx))
+            workers = max(1, min(workers, len(read_idx)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(run_subagent, norm[i][0], norm[i][1], norm[i][2], run_dir, on_event): i
+                        for i in read_idx}
+                for fut in concurrent.futures.as_completed(futs):
+                    i = futs[fut]
+                    try:
+                        results[i] = fut.result()
+                    except Exception as e:
+                        r = _new_result(norm[i][0])
+                        r["report"] = f"(subagent crashed: {e})"
+                        results[i] = r
 
-    for i in write_idx:  # sequential; each write subagent takes the workspace lock
-        results[i] = run_subagent(norm[i][0], norm[i][1], norm[i][2], run_dir, on_event)
-
+        for i in write_idx:  # sequential; each write subagent takes the workspace lock
+            results[i] = run_subagent(norm[i][0], norm[i][1], norm[i][2], run_dir, on_event)
+    finally:
+        _emit_event(on_event, {"type": "wave_done", "wave_id": wave_id})
     return results
