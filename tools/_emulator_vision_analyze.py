@@ -24,6 +24,8 @@ import os
 
 import requests
 
+from tools.vision_cache import cached_vision
+
 _REFUSAL_MARKERS = (
     "cannot see images", "can't see images", "unable to view images",
     "i cannot view", "no image was provided", "i don't have the ability to view",
@@ -96,6 +98,53 @@ def _analyze_with_ollama(image_b64, prompt, cfg):
     return text, None
 
 
+def _analyze_one_frame(frame_path, prompt, cfg):
+    """Analyze one keyframe image, trying the auto/api/ollama backend(s)
+    selected by cfg.get("backend", "auto") — same selection logic
+    analyze_session used to run inline. Byte-identical (image bytes, prompt)
+    pairs are served from tools/vision_cache.py's content-addressed cache
+    instead of hitting the vision backend again, so a long run with many
+    repeated black-screen keyframes analyzes that frame only once.
+
+    Returns (description, error, backend_used): description is None and
+    error is set if every attempted backend failed. backend_used is "cache"
+    on a cache hit (the backend that originally produced the cached text
+    isn't recorded — same convention as tools/vision_tools.py's cached
+    analyze_image, which reports "cached" in that case)."""
+    backend = cfg.get("backend", "auto")
+    state = {"error": None, "backend_used": None}
+
+    def _compute():
+        try:
+            with open(frame_path, "rb") as fh:
+                image_b64 = base64.b64encode(fh.read()).decode("ascii")
+        except OSError as e:
+            state["error"] = f"Could not read frame file: {e}"
+            return None
+
+        description, error, backend_used = None, None, None
+        if backend in ("auto", "api"):
+            description, error = _analyze_with_api(image_b64, prompt, cfg)
+            if description:
+                backend_used = "api"
+
+        if description is None and backend in ("auto", "ollama"):
+            description, err2 = _analyze_with_ollama(image_b64, prompt, cfg)
+            if description:
+                backend_used = "ollama"
+            else:
+                error = (error + " | " if error else "") + (err2 or "")
+
+        state["error"] = error
+        state["backend_used"] = backend_used
+        return description
+
+    text, was_cached = cached_vision(frame_path, prompt, _compute)
+    if text is not None:
+        return text, None, ("cache" if was_cached else state["backend_used"])
+    return None, state["error"], None
+
+
 _DEFAULT_PROMPT = (
     "You are looking at a screenshot from an Android app under test. Describe, in 2-3 "
     "sentences, exactly what is on screen: what screen/page this looks like, whether it's a "
@@ -139,7 +188,6 @@ def _select_frames_for_vision(keyframes, max_frames):
 def analyze_session(session_dir, cfg):
     """Analyzes every keyframe in session_dir/metadata.json per cfg, writing
     descriptions back into that file. Returns a plain-text summary string."""
-    backend = cfg.get("backend", "auto")
     prompt = cfg.get("prompt") or _DEFAULT_PROMPT
     try:
         max_frames = int(cfg.get("max_frames", _DEFAULT_MAX_FRAMES))
@@ -163,28 +211,7 @@ def analyze_session(session_dir, cfg):
             kf["vision_error"] = "skipped (frame-budget cap; not a state/failure frame)"
             continue
         fpath = os.path.join(session_dir, kf["file"])
-        try:
-            with open(fpath, "rb") as f:
-                image_b64 = base64.b64encode(f.read()).decode("ascii")
-        except OSError as e:
-            kf["vision_description"] = None
-            kf["vision_error"] = f"Could not read frame file: {e}"
-            summary_lines.append(f"  frame {kf['index']}: FAILED — {kf['vision_error']}")
-            continue
-
-        description, error, backend_used = None, None, None
-
-        if backend in ("auto", "api"):
-            description, error = _analyze_with_api(image_b64, prompt, cfg)
-            if description:
-                backend_used = "api"
-
-        if description is None and backend in ("auto", "ollama"):
-            description, err2 = _analyze_with_ollama(image_b64, prompt, cfg)
-            if description:
-                backend_used = "ollama"
-            else:
-                error = (error + " | " if error else "") + (err2 or "")
+        description, error, backend_used = _analyze_one_frame(fpath, prompt, cfg)
 
         kf["vision_description"] = description
         kf["vision_error"] = None if description else error
