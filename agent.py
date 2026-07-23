@@ -37,6 +37,7 @@ from llm import (
     set_active_provider_notifier,
     get_active_provider,
     active_supports_native_tools,
+    native_tools_payload_chars,
     get_preferred_model,
     set_preferred_model,
     list_model_options,
@@ -443,6 +444,25 @@ def estimate_tokens(messages):
     return estimate_context_chars(messages) // CHARS_PER_TOKEN
 
 
+def session_context_chars(session):
+    """Total request size (chars) for THIS session: the message list PLUS the
+    native function-calling `tools=` array, which ask_llm sends out of band and
+    the message list never carries. Without this, the header and summarize-guard
+    undercount native-mode context by the whole tool-schema payload (tens of
+    thousands of tokens). Reduces to estimate_context_chars when not native."""
+    chars = estimate_context_chars(session.get("messages", []))
+    try:
+        chars += native_tools_payload_chars(session.get("active_toolsets"))
+    except Exception:
+        pass
+    return chars
+
+
+def session_context_tokens(session):
+    """Rough token estimate for the whole session request (chars / CHARS_PER_TOKEN)."""
+    return session_context_chars(session) // CHARS_PER_TOKEN
+
+
 def context_token_budget():
     """The token count at which the loop must summarize: CONTEXT_WINDOW_FRACTION of
     the ACTIVE model's context window (read live so a UI/model change takes effect)."""
@@ -453,11 +473,14 @@ def context_token_budget():
     return int(window * CONTEXT_WINDOW_FRACTION)
 
 
-def context_pressure(messages):
+def context_pressure(messages, extra_chars=0):
     """True when estimated usage has reached the summarize threshold — either the
-    80%-of-window token budget or the absolute char safety bound."""
-    return (estimate_tokens(messages) >= context_token_budget()
-            or estimate_context_chars(messages) > CONTEXT_CHAR_LIMIT)
+    80%-of-window token budget or the absolute char safety bound. `extra_chars`
+    folds in out-of-band request bytes (the native `tools=` array) so the guard
+    fires on the REAL request size, not just the message list."""
+    total_chars = estimate_context_chars(messages) + extra_chars
+    return (total_chars // CHARS_PER_TOKEN >= context_token_budget()
+            or total_chars > CONTEXT_CHAR_LIMIT)
 
 
 def _is_tool_result_msg(m):
@@ -659,6 +682,12 @@ def parse_response(response_text):
         return ("error", f"LLM returned non-JSON content: {(response_text or '')[:300]}")
 
     response_type = data.get("type")
+
+    # The provider cut the response off at the output-token cap (llm marks it with
+    # this sentinel). Non-terminal and recoverable — the loop re-prompts for a
+    # smaller output instead of trying to parse a truncated fragment.
+    if response_type == "truncated":
+        return ("truncated", None)
 
     if response_type != "tool_call" and response_type != "final_answer":
         if "args" in data or "tool" in data:
@@ -3253,6 +3282,27 @@ class AgentApi:
                                 "steps": s["step_count"],
                                 "time": time_str})
                     break
+                elif response_type == "truncated":
+                    # The provider cut the reply off at the output-token cap — the
+                    # tool call never completed. Do NOT dump the raw partial (that
+                    # was the "huge text chunk" bug); tell the model WHY it failed
+                    # and how to recover (smaller outputs / chunked writes), then
+                    # continue so it retries a bounded call instead of the same one.
+                    s["step_count"] += 1
+                    s["last_tool_call"] = None
+                    self._emit({"type": "system", "content": (
+                        "The model's last response hit the output-token limit and was cut off before "
+                        "the tool call finished — re-prompting for a smaller output (large files must be "
+                        "written in parts). Raw partial output suppressed.")})
+                    s["messages"].append({"role": "user", "content": (
+                        "[SYSTEM] Your previous response was TRUNCATED at the output-token limit "
+                        "(max_tokens) — the JSON was cut off mid-way, so the tool call did not run. Do "
+                        "NOT repeat the same oversized call. Produce a SMALLER output this turn: for a "
+                        "large file, write_file the first portion, then append the remaining lines with "
+                        "further calls (e.g. run_cmd appending via base64/tee, or replace_in_file to add "
+                        "sections). Keep every response well under the limit."
+                    )})
+                    # fall through to the context/status housekeeping and loop again
                 else:
                     # Still malformed after the in-turn retries. Do NOT terminate the
                     # session — a parse failure is recoverable. Surface the model's
@@ -3284,8 +3334,12 @@ class AgentApi:
                 # of the active model's context window (token estimate) or after a
                 # large number of steps, then CONTINUES — the run never crashes on
                 # overflow and never terminates here.
-                if s["step_count"] >= MAX_STEPS_BEFORE_SUMMARY or context_pressure(s["messages"]):
-                    used = estimate_tokens(s["messages"])
+                # Out-of-band request bytes (native `tools=` schema array) counted
+                # alongside the messages so the guard and header reflect the true
+                # request size — the tool schemas never appear in s["messages"].
+                ctx_overhead = native_tools_payload_chars(s.get("active_toolsets"))
+                if s["step_count"] >= MAX_STEPS_BEFORE_SUMMARY or context_pressure(s["messages"], ctx_overhead):
+                    used = estimate_tokens(s["messages"]) + ctx_overhead // CHARS_PER_TOKEN
                     self._emit({"type": "system", "content": (
                         f"Context at ~{used} tokens (>= {int(CONTEXT_WINDOW_FRACTION*100)}% of the "
                         f"{get_context_window()}-token window) — summarizing and continuing. "
@@ -3301,8 +3355,8 @@ class AgentApi:
                              "step_count": s["step_count"],
                              "consecutive_tools": s["consecutive_tools"],
                              "tools_used": s.get("tools_used", 0),
-                             "ctx_chars": estimate_context_chars(s["messages"]),
-                             "ctx_tokens": estimate_tokens(s["messages"]),
+                             "ctx_chars": session_context_chars(s),
+                             "ctx_tokens": session_context_tokens(s),
                              "ctx_budget": context_token_budget(),
                              "summary_resets": s["summary_resets"]}
                 # Remember the latest stats so they can be persisted and restored

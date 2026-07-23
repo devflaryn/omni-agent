@@ -32,6 +32,12 @@ RETRY_BACKOFF = 2             # seconds to wait before retrying a provider-side 
 QUEUE_POLL_SECONDS = 25
 QUEUE_POLL_INTERVAL = 2
 DEFAULT_MAX_TOKENS = 8192      # only the Anthropic protocol needs an explicit output cap
+# Emitted in place of a response the provider cut off at the output-token cap
+# (OpenAI finish_reason "length" / Anthropic stop_reason "max_tokens"). The
+# partial text is unusable — often invalid mid-JSON — so returning it would make
+# the agent fail to parse and dump the raw fragment to the UI. This small sentinel
+# lets the agent recognize truncation and re-prompt for a smaller output instead.
+TRUNCATED_ENVELOPE = json.dumps({"type": "truncated"})
 # The active model's MAXIMUM context window, in tokens. The agent loop summarizes
 # once estimated usage reaches a fraction of this (see agent.CONTEXT_WINDOW_FRACTION)
 # so a long overnight run never overflows. Override per model via llm_config.json's
@@ -1291,6 +1297,11 @@ def _openai_request(cfg, messages, temperature):
 
             # Native function-calling: content is null, tool call is in tool_calls.
             if not content and message.get("tool_calls"):
+                # Cut off at the output cap → the tool arguments JSON is truncated
+                # and unreliable. Signal truncation instead of running a half-parsed
+                # (often empty-args) call.
+                if finish == "length":
+                    return {"ok": True, "content": TRUNCATED_ENVELOPE}
                 tc = message["tool_calls"][0]
                 fn = tc.get("function", {})
                 try:
@@ -1347,6 +1358,12 @@ def _openai_request(cfg, messages, temperature):
                 if finish == "stop":
                     return {"ok": True, "content": json.dumps({"type": "final_answer", "content": "Done."})}
                 return {"ok": False, "error": f"Missing message content from {cfg['label']} (finish_reason: {finish}):\n{json.dumps(data)[:800]}"}
+
+            # Cut off at the output cap → the content is a truncated fragment (often
+            # invalid mid-JSON). Signal truncation so the agent re-prompts for a
+            # smaller output rather than failing to parse and dumping the raw text.
+            if finish == "length":
+                return {"ok": True, "content": TRUNCATED_ENVELOPE}
 
             return {"ok": True, "content": content}
 
@@ -1482,6 +1499,11 @@ def _anthropic_request(cfg, messages, temperature):
             )
             if not text:
                 return {"ok": False, "error": f"No text content from Anthropic:\n{json.dumps(data)[:800]}"}
+            # Cut off at the output cap → truncated fragment. Signal truncation so
+            # the agent re-prompts for a smaller output instead of dumping the raw
+            # partial (see TRUNCATED_ENVELOPE).
+            if data.get("stop_reason") == "max_tokens":
+                return {"ok": True, "content": TRUNCATED_ENVELOPE}
             return {"ok": True, "content": text}
 
         except requests.exceptions.Timeout:
@@ -1780,6 +1802,24 @@ def active_supports_native_tools():
         return False
     except Exception:
         return False
+
+
+def native_tools_payload_chars(active_groups=None):
+    """Serialized size (chars) of the native function-calling `tools=` array that
+    ask_llm sends OUT OF BAND for the active model — matching the exact schemas
+    built in _openai_request (openai_tools_for(active_groups)). Returns 0 when the
+    model isn't driven natively: there the full schemas ride INLINE in the system
+    prompt and are already counted in the message list. The agent adds this to its
+    context estimate so the header/summarize-guard reflect the true request size
+    (in native mode the tools array is tens of thousands of tokens the messages
+    never carry). Best-effort → 0 on any error."""
+    try:
+        if not active_supports_native_tools():
+            return 0
+        from tools import tool_schema
+        return len(json.dumps(tool_schema.openai_tools_for(active_groups)))
+    except Exception:
+        return 0
 
 
 # --- user-selected preferred model --------------------------------------------
