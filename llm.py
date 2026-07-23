@@ -227,8 +227,12 @@ PLAN & EXECUTE (adaptive, layered — the runtime expects it):
   PHASES are STABLE (re-cut only on a real replan); STEPS are the small current-phase actions that churn; NEXT ACTION
   is the one precise next move (`plan_set_next_action`).
 - STEPS ARE SMALL AND VERIFIABLE: give an important step a clear "done when…" check plus action / purpose / expected /
-  verification / fallback (fields on plan_add_task/plan_update_task). Work top-to-bottom, ONE step at a time: mark it
-  in_progress when you start, completed ONLY once done AND its verification passed, skipped (with a note) if moot.
+  verification / fallback (fields on plan_add_task/plan_update_task). Mark a step in_progress when you start it,
+  completed ONLY once done AND its verification passed, skipped (with a note) if moot.
+- PARALLELISM: steps in the SAME phase run CONCURRENTLY by default — starting one delegated step fans out every
+  independent delegated step in that phase at once. So GROUP independent research/probes into one phase to run them in
+  parallel, and when a step truly needs another's result, either set its `depends_on` to that step's id (same phase) or
+  put it in a LATER phase. Writes to the shared workspace are always serialized for you.
   Prefer the smallest action that reduces uncertainty; avoid over-planning and inventing unconfirmed details.
 - ADVANCE with `plan_advance_phase` at a real milestone. REPLAN, don't drift: a SCOPED edit (add/update/reorder) for a
   course-correction; `plan_replan` (with reason) after a major failure / invalidated assumption / repeated dead ends —
