@@ -311,6 +311,32 @@
     .toast .toast-close:hover { opacity: 1; }
     @keyframes toast-in { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
     @keyframes toast-out { to { opacity: 0; transform: translateX(16px); } }
+
+    /* --- subagent telemetry panel (live rows for a delegated wave) --- */
+    .subagent-panel { display: flex; flex-direction: column; gap: 4px; }
+    .subagent-row {
+      display: flex; align-items: baseline; gap: 8px;
+      font-size: 11.5px; line-height: 1.4;
+      padding: 4px 8px; border-radius: 6px;
+      background: rgb(var(--term-panel));
+      border: 1px solid rgb(var(--term-line));
+      border-left: 3px solid rgb(var(--term-line));
+    }
+    .subagent-row.running { border-left-color: rgb(var(--term-cyan)); }
+    .subagent-row.ok { border-left-color: rgb(var(--term-green)); }
+    .subagent-row.failed { border-left-color: rgb(var(--term-red)); }
+    .subagent-row .sa-name { font-weight: 600; color: rgb(var(--term-text)); flex-shrink: 0; }
+    .subagent-row .sa-task {
+      color: rgb(var(--term-muted)); overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; min-width: 0; flex: 1;
+    }
+    .subagent-row .sa-key { color: rgb(var(--term-muted)); flex-shrink: 0; }
+    .subagent-row .sa-stats {
+      margin-left: auto; flex-shrink: 0; color: rgb(var(--term-muted));
+      font-variant-numeric: tabular-nums;
+    }
+    .subagent-row.ok .sa-stats { color: rgb(var(--term-green)); }
+    .subagent-row.failed .sa-stats { color: rgb(var(--term-red)); }
   </style>
 </head>
 <body class="h-full font-sans text-[13px] text-term-text antialiased">

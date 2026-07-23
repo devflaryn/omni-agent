@@ -221,6 +221,7 @@ let currentGroup = null;   // the action group following the most recent thought
 function resetActivityState() {
   thinkingEl = null;
   currentGroup = null;
+  for (const k in _subagentRows) delete _subagentRows[k]; // drop refs to a wiped-out chat's rows
 }
 
 function startThinking() {
@@ -508,6 +509,73 @@ function renderStatus(ev) {
   const ctx = (ev.ctx_chars !== undefined && ev.ctx_chars !== null) ? ev.ctx_chars : 0;
   setStatus('statCtx', Number(ctx).toLocaleString());
   setStatus('statResets', ev.summary_resets);
+}
+
+// ---------- subagent telemetry panel ----------
+// Live panel for a delegated wave (subagents.run_subagent /
+// run_subagents_parallel), one row per running subagent: name, task, which
+// API key it holds, and a live elapsed/tokens/step readout that resolves to
+// a ✓/✗ summary on subagent_done.
+//
+// Rows are keyed by `agent name + key label`, NOT agent name alone: a wave
+// can dispatch the SAME agent type more than once in parallel (e.g. two
+// `delegate=<read-agent>` steps together), and each acquires a distinct API
+// key from the pool (KeyAllocator), so the masked key label is what actually
+// disambiguates two concurrent rows for the same agent name. Keying on
+// `ev.agent` alone (as a naive single-subagent design would) would collide
+// the two rows and make it impossible to see them advance independently.
+const _subagentRows = {};
+
+function _subagentRowKey(ev) {
+  return `${ev.agent || ''}::${ev.key_label || ''}`;
+}
+
+function _subagentPanel() {
+  let el = document.getElementById('subagent-panel');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'subagent-panel';
+    el.className = 'subagent-panel';
+    appendRow(el); // same append/trim/scroll pipeline as every other chat row
+  }
+  return el;
+}
+
+function subagentStarted(ev) {
+  const row = document.createElement('div');
+  row.className = 'subagent-row running';
+  row.innerHTML =
+    `<span class="sa-name">${escapeHtml(ev.agent)}</span>` +
+    `<span class="sa-task">${escapeHtml(ev.task || '')}</span>` +
+    `<span class="sa-key">${escapeHtml(ev.key_label || '')}</span>` +
+    `<span class="sa-stats">0s · 0 tok</span>`;
+  _subagentPanel().appendChild(row);
+  _subagentRows[_subagentRowKey(ev)] = row;
+  scrollDown();
+}
+
+function subagentProgress(ev) {
+  const row = _subagentRows[_subagentRowKey(ev)];
+  if (!row) return; // stale/unknown row (e.g. event arrived before started, or a replay edge case)
+  const stats = row.querySelector('.sa-stats');
+  if (stats) stats.textContent =
+    `${ev.elapsed_s}s · ${ev.tokens} tok · step ${ev.step}/${ev.max_steps}`;
+}
+
+function subagentDone(ev) {
+  const key = _subagentRowKey(ev);
+  const row = _subagentRows[key];
+  if (!row) return;
+  row.classList.remove('running');
+  row.classList.add(ev.ok ? 'ok' : 'failed');
+  const stats = row.querySelector('.sa-stats');
+  if (stats) stats.textContent =
+    `${ev.ok ? '✓' : '✗'} ${ev.elapsed_s}s · ${ev.tokens} tok · ${ev.steps} steps`;
+  // Drop the tracking entry (the row itself stays in the DOM as a finished
+  // record) so a later run that reuses the same agent+key identity starts a
+  // fresh row instead of resuming this finished one.
+  delete _subagentRows[key];
+  scrollDown();
 }
 
 // ---------- plan-and-execute panel ----------
@@ -1069,6 +1137,9 @@ window.__agent = {
       case 'status': renderStatus(ev); break;
       case 'file_tree': renderFileTree(ev.tree); break;
       case 'plan_update': renderPlan(ev.plan); break;
+      case 'subagent_started': subagentStarted(ev); break;
+      case 'subagent_progress': subagentProgress(ev); break;
+      case 'subagent_done': subagentDone(ev); break;
       case 'done': onDone(); break;
     }
     // No scrollDown() here: every renderer that appends to the chat already
