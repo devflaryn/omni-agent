@@ -539,7 +539,14 @@ function _dock() {
   return el;
 }
 
-function _waveRowKey(ev) { return `${ev.wave_id || ''}::${ev.agent || ''}::${ev.key_label || ''}`; }
+function _waveRowKey(ev) {
+  // sub_id uniquely identifies one subagent invocation — prefer it. Concurrent
+  // subagents can now share an API key (no keys-1 cap), so key_label alone can
+  // collide between two bars of the same delegate agent; fall back to the old
+  // agent+key_label key only for events that predate sub_id.
+  if (ev.sub_id) return `${ev.wave_id || ''}::${ev.sub_id}`;
+  return `${ev.wave_id || ''}::${ev.agent || ''}::${ev.key_label || ''}`;
+}
 
 function resetConcurrencyDock() {
   if (_waveTicker) { clearInterval(_waveTicker); _waveTicker = null; }
@@ -660,9 +667,9 @@ window.__demoWave = function (n = 3) {
   const wave_id = 'demo' + Math.floor(Math.random() * 1e4);
   send({ type: 'wave_started', wave_id, size: n, workers: n });
   for (let i = 0; i < n; i++) {
-    const agent = `probe-${i + 1}`, key_label = `k${i + 1}`;
+    const agent = `probe-${i + 1}`, key_label = `k${i + 1}`, sub_id = `demo-${i}`;
     const dur = 1500 + Math.round(Math.random() * 3500);
-    const base = { wave_id, agent, key_label };
+    const base = { wave_id, agent, key_label, sub_id };
     send({ type: 'subagent_started', ...base, task: `investigating thing #${i + 1}`, mode: 'read' });
     let step = 0;
     const iv = setInterval(() => {

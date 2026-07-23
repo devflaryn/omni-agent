@@ -27,6 +27,7 @@ import json
 import os
 import threading
 import time
+import uuid
 
 import llm
 from llm import ask_llm, extract_json_action, strip_reasoning
@@ -104,9 +105,11 @@ class KeyAllocator:
                 self._counts[key] -= 1
 
 
-# The distinct-key-per-concurrent-subagent guarantee assumes ONE wave holds keys at
-# a time (true today: the read wave blocks on its queue drain; write path and
-# dispatch_agents are serial).
+# NOTE: concurrent subagents may now SHARE a key — _pool_size is deliberately
+# decoupled from the key count, so a wide wave can outnumber the key pool and
+# KeyAllocator hands the same least-loaded key to more than one subagent at once.
+# The frontend dock does NOT rely on key_label to tell concurrent bars apart; each
+# subagent invocation carries its own unique `sub_id` (see run_subagent) for that.
 _KEY_ALLOCATOR = KeyAllocator()
 
 
@@ -361,17 +364,19 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
     key = None
     acquired_lock = None
     started = time.monotonic()
+    sub_id = uuid.uuid4().hex[:8]
     try:
         key = _KEY_ALLOCATOR.acquire(llm.active_key_pool())
         llm.set_subagent_context(pinned_key=key)
         _emit_event(on_event, {"type": "subagent_started", "agent": agent_def.name,
-                               "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode})
+                               "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode,
+                               "sub_id": sub_id})
         if agent_def.is_write:
             _WORKSPACE_LOCK.acquire()
             acquired_lock = _WORKSPACE_LOCK
         out = _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                         on_event=on_event, agent_name=agent_def.name, max_steps_total=max_steps,
-                        started=started, key_label=_mask(key))
+                        started=started, key_label=_mask(key), sub_id=sub_id)
     except Exception as e:
         result.update(ok=False, report=f"(subagent crashed: {e})")
         out = result
@@ -385,12 +390,13 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
                            "ok": bool(out.get("ok")), "tokens": out.get("tokens", 0),
                            "steps": out.get("steps", 0),
                            "elapsed_s": round(time.monotonic() - started, 1),
-                           "key_label": _mask(key)})
+                           "key_label": _mask(key), "sub_id": sub_id})
     return out
 
 
 def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
-              on_event=None, agent_name="", max_steps_total=None, started=None, key_label=""):
+              on_event=None, agent_name="", max_steps_total=None, started=None, key_label="",
+              sub_id=""):
     steps = 0
     last_sig = None
     repeats = 0
@@ -447,7 +453,8 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                                "elapsed_s": round(time.monotonic() - started, 1),
                                "tokens": tokens, "step": steps,
                                "max_steps": max_steps_total or max_steps,
-                               "last_tool": tool_name, "key_label": key_label})
+                               "last_tool": tool_name, "key_label": key_label,
+                               "sub_id": sub_id})
 
         if _estimate_chars(messages) > CONTEXT_CHAR_LIMIT:
             return _force_final(agent_def, messages, temperature, steps, tools_used, result,
@@ -483,7 +490,6 @@ def run_subagents_parallel(specs, pool_size=None, run_dir=None, on_event=None):
     read_idx = [i for i, (a, _t, _c) in enumerate(norm) if not a.is_write]
     write_idx = [i for i, (a, _t, _c) in enumerate(norm) if a.is_write]
 
-    import uuid
     wave_id = uuid.uuid4().hex[:8]
     workers = pool_size if pool_size is not None else _pool_size(max(1, len(read_idx)))
     _emit_event(on_event, {"type": "wave_started", "wave_id": wave_id,
