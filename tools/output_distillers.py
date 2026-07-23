@@ -135,6 +135,8 @@ def _path_note(path):
 def _cap_summary(summary):
     """Hard-cap a distilled summary so a misbehaving distiller (deterministic or
     LLM) can never flood the conversation the way the raw output would have."""
+    if summary is not None and not isinstance(summary, str):
+        summary = str(summary)
     if len(summary) <= _MAX_SUMMARY_CHARS:
         return summary
     truncated = len(summary) - _MAX_SUMMARY_CHARS
@@ -147,7 +149,16 @@ def _cap_summary(summary):
 def distill(tool_name, result, run_dir, task_context):
     """Distill a noisy tool's output: summary into chat, full raw to a file.
     Fail-open — never raises; on any problem returns a usable (head + path) body."""
-    raw = _extract_raw(result)
+    try:
+        raw = _extract_raw(result)
+    except Exception:
+        # e.g. a circular-referencing dict makes json.dumps(default=str) raise
+        # ValueError. Fall back to a plain str() so distill() still returns
+        # something usable instead of propagating the exception.
+        try:
+            raw = str(result or "")
+        except Exception:
+            raw = ""
     # Small / empty output: not worth distilling.
     if len(raw) <= _SMALL_OUTPUT_CHARS or not raw.strip():
         return {"stdout": raw}
