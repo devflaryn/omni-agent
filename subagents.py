@@ -44,6 +44,47 @@ POOL_SIZE = 4                # max read-only subagents to run concurrently in a 
 # Subagents are never nested (they get no delegation tools), so a plain Lock is safe.
 _WORKSPACE_LOCK = threading.Lock()
 
+
+class KeyAllocator:
+    """Hands each subagent the LEAST-LOADED API key (fewest active subagents
+    right now; ties broken round-robin) and tracks a per-key active count so the
+    running set stays balanced across the pool at every instant — and, over a run,
+    each key serves ~equal subagents. A subagent holds its key for its whole run
+    (many ask_llm calls) so it keeps a warm prompt cache; per-request switching
+    would forfeit that discount. Thread-safe."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counts = {}
+        self._rr = 0
+
+    def acquire(self, keys):
+        with self._lock:
+            if not keys:
+                return None
+            for k in keys:
+                self._counts.setdefault(k, 0)
+            n = len(keys)
+            best, best_load = None, None
+            for i in range(n):
+                k = keys[(self._rr + i) % n]
+                load = self._counts[k]
+                if best_load is None or load < best_load:
+                    best, best_load = k, load
+            self._rr = (self._rr + 1) % n
+            self._counts[best] += 1
+            return best
+
+    def release(self, key):
+        if key is None:
+            return
+        with self._lock:
+            if self._counts.get(key, 0) > 0:
+                self._counts[key] -= 1
+
+
+_KEY_ALLOCATOR = KeyAllocator()
+
 _SUBAGENT_CONTRACT = """You are an isolated SUBAGENT. You handle ONE delegated task in your own private \
 context and return a SINGLE distilled result to the orchestrator. Your intermediate tool output stays in \
 this session and is discarded — so put everything the orchestrator needs (findings, file:line evidence, \
