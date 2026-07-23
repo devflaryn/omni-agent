@@ -287,14 +287,22 @@ APK MODDING PLAYBOOK (the core mission — decode → map → understand → pat
     # unaffected.
     try:
         from plugins import get_registry
-        reg = get_registry()
-        prompt += "\n" + reg.get_agents_prompt()
-        # Fold in the plugin-contributed workflow COMMANDS index (name + description).
-        # Only the index is shown; full bodies load on demand via use_command, so this
-        # stays tiny no matter how many commands plugins ship.
-        prompt += "\n" + reg.get_commands_prompt()
-    except Exception:
-        pass
+    except ImportError:
+        get_registry = None  # plugins package absent (lightweight setup) — expected
+    if get_registry is not None:
+        try:
+            reg = get_registry()
+            prompt += "\n" + reg.get_agents_prompt()
+            # Fold in the plugin-contributed workflow COMMANDS index (name +
+            # description). Only the index is shown; full bodies load on demand via
+            # use_command, so this stays tiny no matter how many commands plugins ship.
+            prompt += "\n" + reg.get_commands_prompt()
+        except Exception as e:
+            # Plugins ARE installed but building their agents/commands index raised —
+            # a real bug, not the expected "no plugins" case. Stay fail-open (never
+            # break system-prompt construction) but SURFACE it instead of silently
+            # dropping the whole index, which would degrade the agent with no trace.
+            print(f"[llm] plugin agents/commands index skipped after error: {e!r}")
     return prompt
 
 
