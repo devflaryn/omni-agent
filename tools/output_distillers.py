@@ -8,9 +8,22 @@ A tool listed in DETERMINISTIC_DISTILLERS is distilled without any LLM call
 (logcat reuses the battle-tested crash-extraction helpers). Anything else in
 NOISY_TOOLS falls back to a read-only summarizer subagent (see distill()).
 """
+import os
+import time
+
+from subagents import run_subagent, AgentDef
 from tools._emulator_diagnostics import extract_crash_traces, analyze_logcat
 
 NOISY_TOOLS = {"get_logcat"}
+
+# Below this size, distillation isn't worth a file or a subagent — pass through.
+_SMALL_OUTPUT_CHARS = 8000
+_HEAD_CHARS = 4000  # how much raw head to show when we can only degrade
+# Hard cap on the FINAL summary (deterministic or LLM). A distilled summary
+# should be a fraction of the small-output threshold above — otherwise a
+# misbehaving distiller (or an unbounded LLM report) defeats the whole point
+# of keeping noisy output out of context.
+_MAX_SUMMARY_CHARS = 6000
 
 
 def _logcat_distiller(raw_text, tool_args):
@@ -76,3 +89,93 @@ def _logcat_distiller(raw_text, tool_args):
 DETERMINISTIC_DISTILLERS = {
     "get_logcat": _logcat_distiller,
 }
+
+
+def _summarizer_agent():
+    return AgentDef(
+        name="output_summarizer",
+        system_prompt=(
+            "You are an OUTPUT SUMMARIZER. You are given the raw output of a tool plus the "
+            "orchestrator's current goal. Distill the output down to what matters FOR THAT GOAL: "
+            "errors, failures, key state, and anything the orchestrator must act on. Drop routine "
+            "noise. Be concrete (quote the exact lines that matter). Return just the summary."),
+        mode="read", allowed_tools=set(), max_steps=1,
+    )
+
+
+def _extract_raw(result):
+    if isinstance(result, dict):
+        out = result.get("stdout")
+        if out:
+            return out if isinstance(out, str) else str(out)
+        # stdout-less dict: mirror the main loop's JSON rendering.
+        import json
+        return json.dumps(result, indent=2, default=str)
+    return str(result or "")
+
+
+def _save_raw(run_dir, tool_name, raw_text):
+    """Write raw output to <run_dir>/raw/<tool>-<ts>.txt. Returns the path, or None."""
+    try:
+        raw_dir = os.path.join(run_dir, "raw")
+        os.makedirs(raw_dir, exist_ok=True)
+        fname = f"{tool_name}-{int(time.time() * 1000)}.txt"
+        path = os.path.join(raw_dir, fname)
+        with open(path, "w") as f:
+            f.write(raw_text)
+        return path
+    except Exception:
+        return None
+
+
+def _path_note(path):
+    return f"\n\n[full raw output saved to {path} — read it if you need a detail this summary dropped]"
+
+
+def _cap_summary(summary):
+    """Hard-cap a distilled summary so a misbehaving distiller (deterministic or
+    LLM) can never flood the conversation the way the raw output would have."""
+    if len(summary) <= _MAX_SUMMARY_CHARS:
+        return summary
+    truncated = len(summary) - _MAX_SUMMARY_CHARS
+    return (
+        summary[:_MAX_SUMMARY_CHARS]
+        + f"\n… [+{truncated} chars of summary truncated — full raw at the path below]"
+    )
+
+
+def distill(tool_name, result, run_dir, task_context):
+    """Distill a noisy tool's output: summary into chat, full raw to a file.
+    Fail-open — never raises; on any problem returns a usable (head + path) body."""
+    raw = _extract_raw(result)
+    # Small / empty output: not worth distilling.
+    if len(raw) <= _SMALL_OUTPUT_CHARS or not raw.strip():
+        return {"stdout": raw}
+
+    path = _save_raw(run_dir, tool_name, raw) if run_dir else None
+
+    summary = None
+    distiller = DETERMINISTIC_DISTILLERS.get(tool_name)
+    if distiller is not None:
+        try:
+            summary = distiller(raw, (result.get("args") if isinstance(result, dict) else {}) or {})
+        except Exception:
+            summary = None
+    if summary is None:
+        try:
+            res = run_subagent(_summarizer_agent(),
+                               task="Summarize the tool output below for the current goal.",
+                               context=f"GOAL: {task_context}\n\nRAW OUTPUT:\n{raw}",
+                               run_dir=run_dir)
+            if res.get("ok"):
+                summary = (res.get("report") or "").strip() or None
+        except Exception:
+            summary = None
+
+    if summary is None:
+        # Degrade: show the head so nothing critical is silently lost.
+        head = raw[:_HEAD_CHARS]
+        body = f"(could not distill; showing first {len(head)} of {len(raw)} chars)\n{head}"
+        return {"stdout": body + (_path_note(path) if path else "")}
+
+    return {"stdout": _cap_summary(summary) + (_path_note(path) if path else "")}
