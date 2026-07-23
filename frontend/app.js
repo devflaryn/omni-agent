@@ -221,7 +221,7 @@ let currentGroup = null;   // the action group following the most recent thought
 function resetActivityState() {
   thinkingEl = null;
   currentGroup = null;
-  for (const k in _subagentRows) delete _subagentRows[k]; // drop refs to a wiped-out chat's rows
+  resetConcurrencyDock();
 }
 
 function startThinking() {
@@ -511,71 +511,139 @@ function renderStatus(ev) {
   setStatus('statResets', ev.summary_resets);
 }
 
-// ---------- subagent telemetry panel ----------
-// Live panel for a delegated wave (subagents.run_subagent /
-// run_subagents_parallel), one row per running subagent: name, task, which
-// API key it holds, and a live elapsed/tokens/step readout that resolves to
-// a ✓/✗ summary on subagent_done.
-//
-// Rows are keyed by `agent name + key label`, NOT agent name alone: a wave
-// can dispatch the SAME agent type more than once in parallel (e.g. two
-// `delegate=<read-agent>` steps together), and each acquires a distinct API
-// key from the pool (KeyAllocator), so the masked key label is what actually
-// disambiguates two concurrent rows for the same agent name. Keying on
-// `ev.agent` alone (as a naive single-subagent design would) would collide
-// the two rows and make it impossible to see them advance independently.
-const _subagentRows = {};
+// ---------- concurrency dock: live parallel-wave timeline ----------
+// A pinned bottom-right dock proving parallelism: one time-driven bar per
+// subagent on a shared wall-clock axis (overlap = provably concurrent), plus a
+// wall-vs-summed speedup line when the wave finishes. Driven by wave_started /
+// subagent_started|progress|done / wave_done. Bars grow via a local ticker, not
+// per-step events, so they glide smoothly regardless of event cadence.
+// computeWaveStats comes from wave_stats.js (loaded before this script).
+let _wave = null;          // { originTs, bars: Map<rowKey,bar>, done, manualCollapsed }
+let _waveTicker = null;
 
-function _subagentRowKey(ev) {
-  return `${ev.agent || ''}::${ev.key_label || ''}`;
-}
-
-function _subagentPanel() {
-  let el = document.getElementById('subagent-panel');
+function _dock() {
+  let el = document.getElementById('concurrency-dock');
   if (!el) {
     el = document.createElement('div');
-    el.id = 'subagent-panel';
-    el.className = 'subagent-panel';
-    appendRow(el); // same append/trim/scroll pipeline as every other chat row
+    el.id = 'concurrency-dock';
+    el.innerHTML =
+      '<div class="cdock-header"><span>⚡</span><span class="cdock-title">Subagents</span>' +
+      '<span class="cdock-count"></span></div>' +
+      '<div class="cdock-body"></div><div class="cdock-summary" style="display:none"></div>';
+    el.querySelector('.cdock-header').addEventListener('click', () => {
+      if (_wave) _wave.manualCollapsed = !el.classList.contains('cdock-collapsed');
+      el.classList.toggle('cdock-collapsed');
+    });
+    document.body.appendChild(el);
   }
   return el;
 }
 
+function _waveRowKey(ev) { return `${ev.wave_id || ''}::${ev.agent || ''}::${ev.key_label || ''}`; }
+
+function resetConcurrencyDock() {
+  if (_waveTicker) { clearInterval(_waveTicker); _waveTicker = null; }
+  _wave = null;
+  const el = document.getElementById('concurrency-dock');
+  if (el) el.remove();
+}
+
+function _startWave() {
+  if (_waveTicker) clearInterval(_waveTicker);
+  _wave = { originTs: performance.now(), bars: new Map(), done: false, manualCollapsed: false };
+  const el = _dock();
+  el.classList.remove('cdock-collapsed');
+  el.querySelector('.cdock-body').innerHTML = '';
+  el.querySelector('.cdock-summary').style.display = 'none';
+  _waveTicker = setInterval(_renderWave, 200);
+  _renderWave();
+}
+
+function _ensureWave() { if (!_wave || _wave.done) _startWave(); }
+
+function waveStarted(ev) { _startWave(); }
+
 function subagentStarted(ev) {
+  _ensureWave();
+  const key = _waveRowKey(ev);
+  const now = performance.now();
   const row = document.createElement('div');
-  row.className = 'subagent-row running';
+  row.className = 'cbar';
   row.innerHTML =
-    `<span class="sa-name">${escapeHtml(ev.agent)}</span>` +
-    `<span class="sa-task">${escapeHtml(ev.task || '')}</span>` +
-    `<span class="sa-key">${escapeHtml(ev.key_label || '')}</span>` +
-    `<span class="sa-stats">0s · 0 tok</span>`;
-  _subagentPanel().appendChild(row);
-  _subagentRows[_subagentRowKey(ev)] = row;
-  scrollDown();
+    '<div class="cbar-label"><span class="cbar-name"></span><span class="cbar-task"></span>' +
+    '<span class="cbar-key"></span><span class="cbar-stat"></span></div>' +
+    '<div class="cbar-track"><div class="cbar-fill"></div></div>';
+  row.querySelector('.cbar-name').textContent = ev.agent || '';
+  row.querySelector('.cbar-task').textContent = ev.task || '';
+  row.querySelector('.cbar-key').textContent = ev.key_label || '';
+  _dock().querySelector('.cdock-body').appendChild(row);
+  _wave.bars.set(key, { row, startOffsetMs: now - _wave.originTs, endOffsetMs: null,
+                        ok: null, steps: 0, tokens: 0, name: ev.agent, running: true });
+  _renderWave();
 }
 
 function subagentProgress(ev) {
-  const row = _subagentRows[_subagentRowKey(ev)];
-  if (!row) return; // stale/unknown row (e.g. event arrived before started, or a replay edge case)
-  const stats = row.querySelector('.sa-stats');
-  if (stats) stats.textContent =
-    `${ev.elapsed_s}s · ${ev.tokens} tok · step ${ev.step}/${ev.max_steps}`;
+  if (!_wave) return;
+  const bar = _wave.bars.get(_waveRowKey(ev));
+  if (!bar) return;
+  bar.steps = ev.step; bar.tokens = ev.tokens;
+  bar.row.querySelector('.cbar-stat').textContent = `${ev.tokens} tok · step ${ev.step}/${ev.max_steps}`;
 }
 
 function subagentDone(ev) {
-  const key = _subagentRowKey(ev);
-  const row = _subagentRows[key];
-  if (!row) return;
-  row.classList.remove('running');
-  row.classList.add(ev.ok ? 'ok' : 'failed');
-  const stats = row.querySelector('.sa-stats');
-  if (stats) stats.textContent =
+  if (!_wave) return;
+  const bar = _wave.bars.get(_waveRowKey(ev));
+  if (!bar) return;
+  bar.endOffsetMs = performance.now() - _wave.originTs;
+  bar.ok = !!ev.ok; bar.running = false; bar.steps = ev.steps; bar.tokens = ev.tokens;
+  bar.row.querySelector('.cbar-fill').classList.add(ev.ok ? 'ok' : 'failed');
+  bar.row.querySelector('.cbar-stat').textContent =
     `${ev.ok ? '✓' : '✗'} ${ev.elapsed_s}s · ${ev.tokens} tok · ${ev.steps} steps`;
-  // Drop the tracking entry (the row itself stays in the DOM as a finished
-  // record) so a later run that reuses the same agent+key identity starts a
-  // fresh row instead of resuming this finished one.
-  delete _subagentRows[key];
-  scrollDown();
+  _renderWave();
+  // Singleton (write) waves have no wave_done: freeze when nothing is running.
+  if (![..._wave.bars.values()].some(b => b.running)) _freezeWaveSoon();
+}
+
+let _freezeTimer = null;
+function _freezeWaveSoon() {
+  if (_freezeTimer) clearTimeout(_freezeTimer);
+  // brief grace so a rapid next-start in the same wave doesn't prematurely freeze
+  _freezeTimer = setTimeout(() => {
+    if (_wave && ![..._wave.bars.values()].some(b => b.running)) waveDone({});
+  }, 400);
+}
+
+function waveDone(ev) {
+  if (!_wave || _wave.done) return;
+  _wave.done = true;
+  if (_waveTicker) { clearInterval(_waveTicker); _waveTicker = null; }
+  _renderWave();
+  const stats = window.computeWaveStats([..._wave.bars.values()]);
+  const el = _dock();
+  const sum = el.querySelector('.cdock-summary');
+  sum.style.display = '';
+  sum.innerHTML = `⚡ wave done · ${stats.n} agents · peak ${stats.peak} concurrent · ` +
+    `${stats.wallS}s wall vs ${stats.summedS}s summed → ` +
+    `<span class="cdock-speedup">${stats.speedup}× faster</span>`;
+  el.querySelector('.cdock-count').textContent = '';
+}
+
+function _renderWave() {
+  if (!_wave) return;
+  const el = _dock();
+  const bars = [..._wave.bars.values()];
+  const now = performance.now();
+  let span = 1;
+  bars.forEach(b => { const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs; if (end > span) span = end; });
+  const runningCount = bars.filter(b => b.running).length;
+  el.querySelector('.cdock-count').textContent = _wave.done ? '' : `${runningCount} running`;
+  bars.forEach(b => {
+    const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs;
+    const fill = b.row.querySelector('.cbar-fill');
+    fill.style.left = `${(b.startOffsetMs / span) * 100}%`;
+    fill.style.width = `${Math.max(1, ((end - b.startOffsetMs) / span) * 100)}%`;
+  });
+  if (!_wave.manualCollapsed) el.classList.remove('cdock-collapsed');
 }
 
 // ---------- plan-and-execute panel ----------
@@ -1137,9 +1205,11 @@ window.__agent = {
       case 'status': renderStatus(ev); break;
       case 'file_tree': renderFileTree(ev.tree); break;
       case 'plan_update': renderPlan(ev.plan); break;
+      case 'wave_started': waveStarted(ev); break;
       case 'subagent_started': subagentStarted(ev); break;
       case 'subagent_progress': subagentProgress(ev); break;
       case 'subagent_done': subagentDone(ev); break;
+      case 'wave_done': waveDone(ev); break;
       case 'done': onDone(); break;
     }
     // No scrollDown() here: every renderer that appends to the chat already
