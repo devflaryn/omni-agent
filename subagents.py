@@ -25,6 +25,7 @@ subagent returns {ok: False, report: "<why>"} so the caller decides.
 import concurrent.futures
 import json
 import threading
+import time
 
 import llm
 from llm import ask_llm, extract_json_action, strip_reasoning
@@ -93,6 +94,25 @@ class KeyAllocator:
 
 
 _KEY_ALLOCATOR = KeyAllocator()
+
+
+def _emit_event(on_event, ev):
+    if on_event is None:
+        return
+    try:
+        on_event(ev)
+    except Exception:
+        pass  # telemetry must never break a run
+
+def _mask(key):
+    if not key:
+        return "—"
+    return (key[:4] + "…" + key[-2:]) if len(key) > 8 else "key"
+
+def _estimate_tokens(messages, raw):
+    chars = sum(len(m.get("content", "")) for m in messages) + len(raw or "")
+    return chars // 4
+
 
 _SUBAGENT_CONTRACT = """You are an isolated SUBAGENT. You handle ONE delegated task in your own private \
 context and return a SINGLE distilled result to the orchestrator. Your intermediate tool output stays in \
@@ -249,7 +269,8 @@ def _execute(agent_def, allowed, tool_name, tool_args):
 
 def _new_result(agent_def):
     return {"agent": agent_def.name, "ok": False, "report": "", "raw_report": None,
-            "artifacts": [], "verified": None, "steps": 0, "tools_used": [], "note": ""}
+            "artifacts": [], "verified": None, "steps": 0, "tools_used": [], "note": "",
+            "tokens": 0}
 
 
 def _build_messages(agent_def, allowed, task, context, run_dir):
@@ -273,7 +294,7 @@ def _build_messages(agent_def, allowed, task, context, run_dir):
             {"role": "user", "content": user}]
 
 
-def _force_final(agent_def, messages, temperature, steps, tools_used, result, note):
+def _force_final(agent_def, messages, temperature, steps, tools_used, result, note, tokens=0):
     messages.append({"role": "user", "content": (
         "[SYSTEM] Investigation budget reached. Do NOT call more tools. Return your best "
         '{"type":"final_answer","content":"..."} now, based on what you have — say what you found and what '
@@ -282,22 +303,27 @@ def _force_final(agent_def, messages, temperature, steps, tools_used, result, no
         raw = ask_llm(messages, temperature=temperature)
     except Exception as e:
         result.update(ok=False, report=f"(subagent could not finalize: {e})", steps=steps,
-                      tools_used=tools_used, note=note)
+                      tools_used=tools_used, note=note, tokens=tokens)
         return result
     rtype, payload = _parse_response(raw)
     content = payload if rtype == "final_answer" else strip_reasoning(raw)
     result.update(ok=True, report=_content_to_text(content), raw_report=content,
-                  steps=steps, tools_used=tools_used, note=note)
+                  steps=steps, tools_used=tools_used, note=note, tokens=tokens)
     return result
 
 
-def run_subagent(agent_def, task, context="", run_dir=None):
+def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
     """Run one subagent to completion and return a distilled result dict:
-    {agent, ok, report, raw_report, artifacts, verified, steps, tools_used, note}.
+    {agent, ok, report, raw_report, artifacts, verified, steps, tools_used, note, tokens}.
 
     `report` is the final answer as text; `raw_report` preserves its original
     structure (a dict, for personas like the reviewer that answer with JSON).
-    Never raises — any internal failure yields ok=False with the reason in report."""
+    Never raises — any internal failure yields ok=False with the reason in report.
+
+    Acquires a least-loaded API key for the run's whole duration (warm prompt
+    cache), pins the subagent's llm thread-local context so usage accounting and
+    key selection are isolated from the main thread, and — if `on_event` is
+    given — emits subagent_started/subagent_progress/subagent_done telemetry."""
     result = _new_result(agent_def)
     task = (task or "").strip()
     if not task:
@@ -316,34 +342,56 @@ def run_subagent(agent_def, task, context="", run_dir=None):
         result["report"] = f"(subagent setup failed: {e})"
         return result
 
-    lock = _WORKSPACE_LOCK if agent_def.is_write else None
-    if lock:
-        lock.acquire()
+    key = _KEY_ALLOCATOR.acquire(llm.active_key_pool())
+    llm.set_subagent_context(pinned_key=key)
+    started = time.monotonic()
+    _emit_event(on_event, {"type": "subagent_started", "agent": agent_def.name,
+                           "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode})
+
+    write_lock = _WORKSPACE_LOCK if agent_def.is_write else None
+    if write_lock:
+        write_lock.acquire()
     try:
-        return _run_loop(agent_def, messages, allowed, temperature, max_steps, result)
+        out = _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
+                        on_event=on_event, agent_name=agent_def.name, max_steps_total=max_steps,
+                        started=started)
     except Exception as e:
         result.update(ok=False, report=f"(subagent crashed: {e})")
-        return result
+        out = result
     finally:
-        if lock:
-            lock.release()
+        if write_lock:
+            write_lock.release()
+        llm.clear_subagent_context()
+        _KEY_ALLOCATOR.release(key)
+
+    _emit_event(on_event, {"type": "subagent_done", "agent": agent_def.name,
+                           "ok": bool(out.get("ok")), "tokens": out.get("tokens", 0),
+                           "steps": out.get("steps", 0),
+                           "elapsed_s": round(time.monotonic() - started, 1)})
+    return out
 
 
-def _run_loop(agent_def, messages, allowed, temperature, max_steps, result):
+def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
+              on_event=None, agent_name="", max_steps_total=None, started=None):
     steps = 0
     last_sig = None
     repeats = 0
     parse_errors = 0
     tools_used = []
+    tokens = 0
+    started = started if started is not None else time.monotonic()
 
     while steps < max_steps:
         raw = ask_llm(messages, temperature=temperature)
+        u = llm.take_last_usage()
+        tokens += (u["total"] if u else _estimate_tokens(messages, raw))
+        result["tokens"] = tokens
         rtype, payload = _parse_response(raw)
         messages.append({"role": "assistant", "content": raw})
 
         if rtype == "final_answer":
             result.update(ok=True, report=_content_to_text(payload), raw_report=payload,
-                          steps=steps, tools_used=tools_used)
+                          steps=steps, tools_used=tools_used, tokens=tokens)
             return result
 
         if rtype == "error":
@@ -351,7 +399,8 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result):
             if parse_errors >= 3:
                 salvage = strip_reasoning(raw)
                 result.update(ok=True, report=salvage, raw_report=salvage, steps=steps,
-                              tools_used=tools_used, note="salvaged from non-JSON output")
+                              tools_used=tools_used, note="salvaged from non-JSON output",
+                              tokens=tokens)
                 return result
             messages.append({"role": "user", "content": _JSON_NUDGE})
             continue
@@ -376,12 +425,18 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result):
         feedback = _execute(agent_def, allowed, tool_name, tool_args)
         messages.append({"role": "user", "content": f"TOOL RESULT:\n{feedback}"})
 
+        _emit_event(on_event, {"type": "subagent_progress", "agent": agent_name,
+                               "elapsed_s": round(time.monotonic() - started, 1),
+                               "tokens": tokens, "step": steps,
+                               "max_steps": max_steps_total or max_steps,
+                               "last_tool": tool_name})
+
         if _estimate_chars(messages) > CONTEXT_CHAR_LIMIT:
             return _force_final(agent_def, messages, temperature, steps, tools_used, result,
-                                note="stopped early — sub-context grew large.")
+                                note="stopped early — sub-context grew large.", tokens=tokens)
 
     return _force_final(agent_def, messages, temperature, steps, tools_used, result,
-                        note=f"reached the {max_steps}-step budget.")
+                        note=f"reached the {max_steps}-step budget.", tokens=tokens)
 
 
 # --- parallel waves ----------------------------------------------------------
@@ -395,22 +450,26 @@ def _normalize_spec(spec):
     return spec[0], spec[1], spec[2]
 
 
-def run_subagents_parallel(specs, pool_size=None, run_dir=None):
+def run_subagents_parallel(specs, pool_size=None, run_dir=None, on_event=None):
     """Run a wave of subagents and return their result dicts IN INPUT ORDER.
 
     Read-only subagents fan out across a bounded thread pool; write-capable
     subagents always run sequentially (one writer on the shared workspace at a
     time) after the reads, so a mixed wave is safe. This is the GSD "waves of
-    parallel researchers" pattern: each returns only its distilled report."""
+    parallel researchers" pattern: each returns only its distilled report.
+
+    `pool_size` overrides the derived concurrency (see `_pool_size`) when given;
+    `on_event`, if given, is threaded down to every subagent for live telemetry."""
     norm = [_normalize_spec(s) for s in specs]
     results = [None] * len(norm)
     read_idx = [i for i, (a, _t, _c) in enumerate(norm) if not a.is_write]
     write_idx = [i for i, (a, _t, _c) in enumerate(norm) if a.is_write]
 
     if read_idx:
-        workers = _pool_size(len(read_idx)) if pool_size is None else max(1, min(pool_size, len(read_idx)))
+        workers = pool_size if pool_size is not None else _pool_size(len(read_idx))
+        workers = max(1, min(workers, len(read_idx)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(run_subagent, norm[i][0], norm[i][1], norm[i][2], run_dir): i
+            futs = {ex.submit(run_subagent, norm[i][0], norm[i][1], norm[i][2], run_dir, on_event): i
                     for i in read_idx}
             for fut in concurrent.futures.as_completed(futs):
                 i = futs[fut]
@@ -422,6 +481,6 @@ def run_subagents_parallel(specs, pool_size=None, run_dir=None):
                     results[i] = r
 
     for i in write_idx:  # sequential; each write subagent takes the workspace lock
-        results[i] = run_subagent(norm[i][0], norm[i][1], norm[i][2], run_dir)
+        results[i] = run_subagent(norm[i][0], norm[i][1], norm[i][2], run_dir, on_event)
 
     return results
