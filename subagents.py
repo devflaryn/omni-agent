@@ -26,6 +26,7 @@ import concurrent.futures
 import json
 import threading
 
+import llm
 from llm import ask_llm, extract_json_action, strip_reasoning
 from tool_registry import registry, CORE_GROUP
 from tool_policy import is_readonly_tool, is_mutating_tool, READONLY_TOOLS, SUBAGENT_EXCLUDED
@@ -37,7 +38,15 @@ SUBAGENT_TEMPERATURE = 0.3   # steady tool use, like the other isolated sub-agen
 PER_RESULT_CHAR_CAP = 6000   # truncate each tool result fed back into the sub-session
 CONTEXT_CHAR_LIMIT = 180_000 # force an answer if the sub-conversation grows past this
 REPEAT_LIMIT = 3             # identical call this many times in a row -> steer
-POOL_SIZE = 4                # max read-only subagents to run concurrently in a wave
+
+
+def _pool_size(n_specs):
+    """Concurrency for a read wave: at most keys-1 (reserve headroom for the main
+    orchestrator), never more than the number of specs, floored at 1. Derived live
+    from the key pool — no hardcoded constant."""
+    n_keys = len(llm.active_key_pool())
+    reserve = max(1, n_keys - 1)
+    return max(1, min(reserve, n_specs))
 
 # Only ONE write-capable subagent may touch the shared /workspace at a time. Read
 # subagents never acquire it (they can't mutate), so parallel research is unaffected.
@@ -386,7 +395,7 @@ def _normalize_spec(spec):
     return spec[0], spec[1], spec[2]
 
 
-def run_subagents_parallel(specs, pool_size=POOL_SIZE, run_dir=None):
+def run_subagents_parallel(specs, pool_size=None, run_dir=None):
     """Run a wave of subagents and return their result dicts IN INPUT ORDER.
 
     Read-only subagents fan out across a bounded thread pool; write-capable
@@ -399,7 +408,7 @@ def run_subagents_parallel(specs, pool_size=POOL_SIZE, run_dir=None):
     write_idx = [i for i, (a, _t, _c) in enumerate(norm) if a.is_write]
 
     if read_idx:
-        workers = max(1, min(pool_size, len(read_idx)))
+        workers = _pool_size(len(read_idx)) if pool_size is None else max(1, min(pool_size, len(read_idx)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futs = {ex.submit(run_subagent, norm[i][0], norm[i][1], norm[i][2], run_dir): i
                     for i in read_idx}
