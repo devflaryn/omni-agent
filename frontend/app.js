@@ -543,6 +543,7 @@ function _waveRowKey(ev) { return `${ev.wave_id || ''}::${ev.agent || ''}::${ev.
 
 function resetConcurrencyDock() {
   if (_waveTicker) { clearInterval(_waveTicker); _waveTicker = null; }
+  if (_freezeTimer) { clearTimeout(_freezeTimer); _freezeTimer = null; }
   _wave = null;
   const el = document.getElementById('concurrency-dock');
   if (el) el.remove();
@@ -550,6 +551,7 @@ function resetConcurrencyDock() {
 
 function _startWave() {
   if (_waveTicker) clearInterval(_waveTicker);
+  if (_freezeTimer) { clearTimeout(_freezeTimer); _freezeTimer = null; }
   _wave = { originTs: performance.now(), bars: new Map(), done: false, manualCollapsed: false };
   const el = _dock();
   el.classList.remove('cdock-collapsed');
@@ -607,9 +609,14 @@ function subagentDone(ev) {
 let _freezeTimer = null;
 function _freezeWaveSoon() {
   if (_freezeTimer) clearTimeout(_freezeTimer);
+  // Capture the specific wave this freeze was scheduled for. A new wave_started
+  // can arrive within the grace window and replace the global _wave with a fresh,
+  // empty wave — without this the stale timer would see zero running bars on
+  // THAT new wave and prematurely freeze it (bogus "0 agents" summary).
+  const w = _wave;
   // brief grace so a rapid next-start in the same wave doesn't prematurely freeze
   _freezeTimer = setTimeout(() => {
-    if (_wave && ![..._wave.bars.values()].some(b => b.running)) waveDone({});
+    if (_wave === w && ![..._wave.bars.values()].some(b => b.running)) waveDone({});
   }, 400);
 }
 
