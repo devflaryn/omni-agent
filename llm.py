@@ -2,6 +2,7 @@ import collections
 import json
 import os
 import re
+import threading
 import time
 import uuid
 import requests
@@ -838,6 +839,25 @@ def get_effective_configs():
     return [_effective(c) for c in load_configs()]
 
 
+def active_key_pool():
+    """Flat list of API keys for the currently preferred (else primary) provider
+    group, in config order. Sizes subagent waves and feeds the KeyAllocator."""
+    configs = get_effective_configs()
+    if not configs:
+        return []
+    pref = get_preferred_model() or {}
+    cid = pref.get("config_id")
+    chosen = next((c for c in configs if c.get("id") == cid), None) or configs[0]
+    keys = chosen.get("api_keys")
+    if isinstance(keys, list):
+        return [k for k in keys if k]
+    if isinstance(keys, str):
+        import re
+        return [p for p in re.split(r"[,\s]+", keys) if p]
+    k = chosen.get("api_key")
+    return [k] if k else []
+
+
 def get_effective_config(overrides=None):
     """The PRIMARY effective config (first in the fallback chain), merged with
     optional unsaved overrides. When overrides name a provider (a connection test),
@@ -1365,6 +1385,15 @@ def _openai_request(cfg, messages, temperature):
             if finish == "length":
                 return {"ok": True, "content": TRUNCATED_ENVELOPE}
 
+            usage = data.get("usage") or {}
+            if usage:
+                _record_usage({
+                    "prompt": int(usage.get("prompt_tokens") or 0),
+                    "completion": int(usage.get("completion_tokens") or 0),
+                    "total": int(usage.get("total_tokens")
+                                 or (usage.get("prompt_tokens") or 0) + (usage.get("completion_tokens") or 0)),
+                })
+
             return {"ok": True, "content": content}
 
         except requests.exceptions.Timeout:
@@ -1504,6 +1533,11 @@ def _anthropic_request(cfg, messages, temperature):
             # partial (see TRUNCATED_ENVELOPE).
             if data.get("stop_reason") == "max_tokens":
                 return {"ok": True, "content": TRUNCATED_ENVELOPE}
+            usage = data.get("usage") or {}
+            if usage:
+                pt = int(usage.get("input_tokens") or 0)
+                ct = int(usage.get("output_tokens") or 0)
+                _record_usage({"prompt": pt, "completion": ct, "total": pt + ct})
             return {"ok": True, "content": text}
 
         except requests.exceptions.Timeout:
@@ -1535,6 +1569,37 @@ def _anthropic_request(cfg, messages, temperature):
 # retried first again. This yields the user's intended pattern over time (keep
 # coming back to the primary, widen to weaker models only while it's down) without
 # wasting a slow probe on a model that failed milliseconds ago.
+_TL = threading.local()
+
+def set_subagent_context(pinned_key=None):
+    """Mark THIS thread as a subagent: pin its API key, suppress the main-thread
+    provider badge, and start fresh usage accounting."""
+    _TL.pinned_key = pinned_key
+    _TL.is_subagent = True
+    _TL.last_usage = None
+
+def clear_subagent_context():
+    _TL.pinned_key = None
+    _TL.is_subagent = False
+    _TL.last_usage = None
+
+def _pinned_key():
+    return getattr(_TL, "pinned_key", None)
+
+def _is_subagent_thread():
+    return getattr(_TL, "is_subagent", False)
+
+def _record_usage(usage):
+    _TL.last_usage = usage
+
+def take_last_usage():
+    """Return and clear the usage dict captured for the last ask_llm on this
+    thread: {"prompt","completion","total"} or None if the provider omitted it."""
+    u = getattr(_TL, "last_usage", None)
+    _TL.last_usage = None
+    return u
+
+
 _ACTIVE_CONFIG_ID = None   # representative entry id of the group now serving (badge)
 _ACTIVE_MODEL = None       # the specific model in that group now serving (badge)
 _ACTIVE_KEY = None         # the API key that last answered (sticky, so we don't rotate needlessly)
@@ -1694,8 +1759,10 @@ def _live_keys(keys, dead):
     fresh = [k for k in live if _KEY_COOLDOWN.get(k, 0) <= now]
     cooled = [k for k in live if _KEY_COOLDOWN.get(k, 0) > now]
     ordered = fresh + cooled
-    if _ACTIVE_KEY in ordered:
-        i = ordered.index(_ACTIVE_KEY)
+    pin = _pinned_key()
+    anchor = pin if (pin in ordered) else _ACTIVE_KEY
+    if anchor in ordered:
+        i = ordered.index(anchor)
         ordered = ordered[i:] + ordered[:i]
     return ordered
 
@@ -2006,12 +2073,13 @@ def _run_group(group, messages, temperature, ladder=None, track_active=True, act
             cfg["active_groups"] = active_groups
             res = _one_request(cfg, messages, temperature)
             if res.get("ok"):
-                _ACTIVE_KEY = key                       # shared key pool (text + vision)
                 _MODEL_COOLDOWN.pop(m["model"], None)   # it works again
-                if track_active:
-                    _ACTIVE_CONFIG_ID = m.get("id") or None
-                    _ACTIVE_MODEL = m["model"]
-                    _notify_active(dict(cfg))
+                if not _is_subagent_thread():
+                    _ACTIVE_KEY = key                   # shared key pool (text + vision)
+                    if track_active:
+                        _ACTIVE_CONFIG_ID = m.get("id") or None
+                        _ACTIVE_MODEL = m["model"]
+                        _notify_active(dict(cfg))
                 return {"ok": True, "content": res["content"], "model": m, "key": key, "cfg": cfg}
 
             kind = res.get("error_kind", "other")
