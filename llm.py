@@ -213,6 +213,8 @@ EXPLAINING YOUR WORK — the PLAN narrates the chat:
 - The per-call "explanation" field is the SECONDARY path: an aside, a mid-step pivot, or narration before a plan
   exists (your first action — usually plan_create — should carry one so the run opens with a line). Don't double-
   narrate. final_answer takes no explanation, and NEVER write prose outside the JSON.
+- Independent RESEARCH steps tagged delegate=<read-agent> may be marked in_progress TOGETHER — they run as one
+  parallel wave. Dependent steps and delegate=<write-agent> steps must be started one at a time.
 
 PLAN & EXECUTE (adaptive, layered — the runtime expects it):
 - INSPECT FREELY, THEN PLAN. Analyze the workspace as much as you need FIRST — read, search, decompile, query the
