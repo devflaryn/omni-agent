@@ -354,7 +354,7 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
     try:
         out = _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                         on_event=on_event, agent_name=agent_def.name, max_steps_total=max_steps,
-                        started=started)
+                        started=started, key_label=_mask(key))
     except Exception as e:
         result.update(ok=False, report=f"(subagent crashed: {e})")
         out = result
@@ -367,12 +367,13 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
     _emit_event(on_event, {"type": "subagent_done", "agent": agent_def.name,
                            "ok": bool(out.get("ok")), "tokens": out.get("tokens", 0),
                            "steps": out.get("steps", 0),
-                           "elapsed_s": round(time.monotonic() - started, 1)})
+                           "elapsed_s": round(time.monotonic() - started, 1),
+                           "key_label": _mask(key)})
     return out
 
 
 def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
-              on_event=None, agent_name="", max_steps_total=None, started=None):
+              on_event=None, agent_name="", max_steps_total=None, started=None, key_label=""):
     steps = 0
     last_sig = None
     repeats = 0
@@ -429,7 +430,7 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                                "elapsed_s": round(time.monotonic() - started, 1),
                                "tokens": tokens, "step": steps,
                                "max_steps": max_steps_total or max_steps,
-                               "last_tool": tool_name})
+                               "last_tool": tool_name, "key_label": key_label})
 
         if _estimate_chars(messages) > CONTEXT_CHAR_LIMIT:
             return _force_final(agent_def, messages, temperature, steps, tools_used, result,
