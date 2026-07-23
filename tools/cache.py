@@ -52,7 +52,10 @@ import tarfile
 import tempfile
 
 # Bump to invalidate every existing entry if the format or semantics below change.
-_CACHE_VERSION = "v1"
+# v2: store() now caches the FULL result dict (was: only stdout/stderr/returncode).
+# Bumping discards any v1 entries whose custom keys were dropped (e.g. broken vision
+# cache entries) so they repopulate correctly on the next run.
+_CACHE_VERSION = "v2"
 
 _READ_CHUNK = 1024 * 1024  # 1 MiB — streaming hash/copy chunk
 
@@ -292,15 +295,23 @@ def store(tool_name, target_rel, result, extra=None, capture_dir=None):
         if capture_dir is not None and not _archive_tree(capture_dir, edir):
             _safe_rmtree(edir)
             return
+        # Cache the FULL result dict, not just the canonical three keys. Whitelisting
+        # stdout/stderr/returncode silently dropped every other key, which broke the
+        # vision cache — a hit replayed a result missing its analysis payload, so the
+        # caller saw a "cached" but empty answer. The canonical keys keep sensible
+        # defaults so lookup() can always rely on them. The result must be
+        # JSON-serializable; if a value isn't, json.dumps raises and the except-block
+        # below fails open (no entry written) — consistent with the module's contract
+        # that caching can only make things faster, never change or break a result.
+        cached_result = dict(result)
+        cached_result.setdefault("stdout", "")
+        cached_result.setdefault("stderr", "")
+        cached_result.setdefault("returncode", 0)
         meta = {
             "tool": tool_name,
             "file_sha256": file_hash,
             "extra": extra or {},
-            "result": {
-                "stdout": result.get("stdout", ""),
-                "stderr": result.get("stderr", ""),
-                "returncode": result.get("returncode", 0),
-            },
+            "result": cached_result,
         }
         _write_atomic(os.path.join(edir, "meta.json"),
                       json.dumps(meta).encode("utf-8"))
