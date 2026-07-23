@@ -2745,9 +2745,757 @@ class AgentApi:
         return {"ok": True}
 
     # --- the agent loop (runs in a background thread, emits events) ----------
+    def _maybe_summarize_context(self, s):
+        """Context-window guard: summarize BEFORE we overflow. Fires at 80% of the
+        active model's context window (token estimate) or after a large number of
+        steps, then returns — the run never crashes on overflow and never terminates
+        here. Out-of-band request bytes (native `tools=` schema array) are counted
+        alongside the messages so the guard reflects the true request size (the tool
+        schemas never appear in s["messages"])."""
+        ctx_overhead = native_tools_payload_chars(s.get("active_toolsets"))
+        if s["step_count"] >= MAX_STEPS_BEFORE_SUMMARY or context_pressure(s["messages"], ctx_overhead):
+            used = estimate_tokens(s["messages"]) + ctx_overhead // CHARS_PER_TOKEN
+            self._emit({"type": "system", "content": (
+                f"Context at ~{used} tokens (>= {int(CONTEXT_WINDOW_FRACTION*100)}% of the "
+                f"{get_context_window()}-token window) — summarizing and continuing. "
+                "Task and progress preserved.")})
+            s["messages"] = summarize_memory(s["messages"], s["memory_dir"], s["original_task"], s.get("root"))
+            s["base_system_prompt"] = s["messages"][0]["content"]
+            self._refresh_system_prompt()
+            s["step_count"] = 0
+            s["consecutive_tools"] = 0
+            s["summary_resets"] += 1
+
+    def _emit_status(self, s):
+        """Emit the per-iteration telemetry status event and remember it so the
+        stats can be persisted and restored into the header when the project is
+        reopened."""
+        status_ev = {"type": "status",
+                     "step_count": s["step_count"],
+                     "consecutive_tools": s["consecutive_tools"],
+                     "tools_used": s.get("tools_used", 0),
+                     "ctx_chars": session_context_chars(s),
+                     "ctx_tokens": session_context_tokens(s),
+                     "ctx_budget": context_token_budget(),
+                     "summary_resets": s["summary_resets"]}
+        s["last_status"] = status_ev
+        self._emit(status_ev)
+
+    def _skill_guard(self, s, tool_name):
+        """Consult a matching skill instead of improvising a whole APK/RE workflow.
+        Loading any skill (use_skill/list_skills) disarms this for the run; otherwise a
+        run of hands-on domain work with no skill consulted triggers a bounded nudge
+        toward use_skill. Only ever nudges — the work is never blocked."""
+        if tool_name in SKILL_TOOLS:
+            s["skill_loaded"] = True
+            s["domain_tools_since_skill"] = 0
+        elif tool_name in SKILL_DOMAIN_TOOLS and not s.get("skill_loaded"):
+            s["domain_tools_since_skill"] = s.get("domain_tools_since_skill", 0) + 1
+            if (s["domain_tools_since_skill"] >= SKILL_NUDGE_THRESHOLD
+                    and s.get("skill_nudges_sent", 0) < MAX_SKILL_NUDGES):
+                s["domain_tools_since_skill"] = 0
+                s["skill_nudges_sent"] = s.get("skill_nudges_sent", 0) + 1
+                self._emit({"type": "system", "content": (
+                    "SYSTEM GUARD: substantial APK/RE work without consulting a "
+                    "skill — steering to use_skill.")})
+                s["messages"].append({"role": "user", "content": (
+                    "[SYSTEM] You've done a lot of hands-on APK / emulator work "
+                    "without loading a skill. Skills are battle-tested workflows with "
+                    "the exact tool order and pitfalls to avoid — for APK/RE: "
+                    "apk-modding, ssl-pinning-bypass, signature-bypass, "
+                    "anti-debug-bypass, string-deobfuscation, manifest-resource-editing, "
+                    "dex-multidex-handling, smali-code-injection, code-graph-analysis; "
+                    "for on-device work: emulator-management (cookie login / saved "
+                    "account / enter a place id / dev instance / lifecycle) and "
+                    "emulator-testing (run + observe + report). Loading a skill also "
+                    "brings its tools online in full. Call list_skills, then use_skill "
+                    "for the ONE that matches this task and follow it. If you've already "
+                    "checked and none apply, just continue."
+                )})
+
+    def _watchdog_after_tool(self, s, tool_name, tool_failed):
+        """The SAME tool failing WATCHDOG_FAIL_THRESHOLD times in a row means retrying
+        it as-is isn't working — force a strategy switch instead of letting the model
+        grind the same failing path all night. A success (or a different tool) clears
+        the streak. Repeated failure of a core approach is a REPLAN trigger: in
+        adaptive mode, pause work until plan_replan deliberately revises the plan."""
+        if tool_failed:
+            if s.get("watchdog_tool") == tool_name:
+                s["tool_fail_streak"] = s.get("tool_fail_streak", 0) + 1
+            else:
+                s["watchdog_tool"] = tool_name
+                s["tool_fail_streak"] = 1
+            if s["tool_fail_streak"] >= WATCHDOG_FAIL_THRESHOLD:
+                s["tool_fail_streak"] = 0  # re-arm so it can fire again later
+                if s.get("adaptive_planning"):
+                    s["replan_required"] = True
+                self._emit({"type": "system", "content": (
+                    f"WATCHDOG: '{tool_name}' failed {WATCHDOG_FAIL_THRESHOLD} times in a "
+                    "row — forcing a replan / strategy switch.")})
+                s["messages"].append({"role": "user", "content": (
+                    f"[SYSTEM — STRATEGY SWITCH] The tool '{tool_name}' has failed "
+                    f"{WATCHDOG_FAIL_THRESHOLD} times in a row. STOP retrying it the same way — "
+                    "that approach is not working. This is a repeated failure, so REPLAN before "
+                    "doing more work: call plan_replan with the reason (these recorded failures) "
+                    "and new steps for a DIFFERENT approach — it preserves completed work. Ideas: "
+                    "search for a different class/method/symbol; target a different .so or "
+                    "architecture; use a fallback injection point; or switch tools (e.g. "
+                    "patch_function_return -> nop_function or binary_patch, smali edits -> a native "
+                    "patch). If it's a genuine dead end, call plan_set_outcome "
+                    "'blocked'/'needs_different_approach' with the evidence."
+                )})
+        else:
+            s["watchdog_tool"] = None
+            s["tool_fail_streak"] = 0
+
+    def _evidence_bookkeeping(self, s, tool_name, tool_args, tool_failed):
+        """Evidence-based bookkeeping (opt-in per session via evidence_guards):
+        remember failed (tool,args) signatures for the repeat-failure guard; treat a
+        workspace mutation as UNVERIFIED until an objective check confirms it, nudging
+        once toward validation + record_test_result; and auto-record modified files
+        into the durable investigation memory."""
+        if s.get("evidence_guards"):
+            sig = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
+            if tool_failed:
+                s.setdefault("failed_sigs", {})[sig] = True
+            elif tool_name in MUTATING_TOOLS:
+                s["unverified_change"] = tool_name
+                inv = investigation.ensure_active(s.get("original_task") or "")
+                inv.add_modified_file(_best_path_arg(tool_args) or f"(via {tool_name})", tool_name)
+                investigation.notify_updated()
+                if s.get("_validation_nudged_for") != tool_name:
+                    s["_validation_nudged_for"] = tool_name
+                    s["messages"].append({"role": "user", "content": (
+                        f"[SYSTEM] You just modified the workspace with '{tool_name}'. Treat this "
+                        "change as UNVERIFIED until an objective check passes: run the appropriate "
+                        "validation (rebuild/repack, sign, install, launch, run a test, or inspect "
+                        "logs) and record the outcome with record_test_result. Do not claim success "
+                        "until a check confirms it.")})
+            if tool_name in VALIDATION_TOOLS and not tool_failed:
+                s["unverified_change"] = None
+                s["_validation_nudged_for"] = None
+
+    def _maybe_compact_long_run(self, s):
+        """Long-run compaction: once we've done a lot of tool steps, fold the history
+        into a summary and continue (never abort — an overnight run must keep going;
+        only a final_answer or an explicit user stop ends the loop)."""
+        if s["consecutive_tools"] >= s["max_consecutive_tools"]:
+            self._emit({"type": "system", "content": f"Long task in progress: compacting memory after {s['consecutive_tools']} tool steps (progress preserved)."})
+            s["messages"] = summarize_memory(s["messages"], s["memory_dir"], s["original_task"], s.get("root"))
+            s["base_system_prompt"] = s["messages"][0]["content"]
+            self._refresh_system_prompt()
+            s["step_count"] = 0
+            s["consecutive_tools"] = 0
+            s["summary_resets"] += 1
+
+    def _plan_bookkeeping_after_tool(self, s, tool_name, tool_failed):
+        """Post-execution plan bookkeeping. Only a SUCCESSFUL plan_create that produced
+        a real plan opens the plan gate; a successful plan_replan lifts the
+        replan-required pause and re-arms the watchdog. Any plan tool resets the
+        plan-touch counter (and auto-dispatches a newly in_progress delegated step /
+        re-grounds + fires on_phase_change on a phase advance); otherwise a long run
+        with no plan touch gets a bounded nudge."""
+        if (tool_name == "plan_create" and not tool_failed
+                and planning.get_active_plan() is not None):
+            s["needs_plan"] = False
+            s["plan_gate_retries"] = 0
+        if tool_name == "plan_replan" and not tool_failed:
+            s["replan_required"] = False
+            s["watchdog_tool"] = None
+            s["tool_fail_streak"] = 0
+        if tool_name in PLAN_TOOL_NAMES or (tool_name or "").startswith("plan_"):
+            s["tools_since_plan_touch"] = 0
+            s["_plan_touch_nudge_sent"] = False
+            # If this plan tool just marked a delegated step in_progress, auto-run it
+            # in an isolated subagent and fold back its report.
+            if not tool_failed:
+                self._maybe_dispatch_delegated_steps()
+            # A phase advance is a natural re-grounding point (GSD phases).
+            if tool_name == "plan_advance_phase" and not tool_failed:
+                self._maybe_reground(force=True)
+                # Let plugins react to the milestone (e.g. a checkpoint/verify hook).
+                _plan = planning.get_active_plan()
+                _phase = (_plan.current_phase() or {}).get("title", "") if _plan else ""
+                self._fire_plugin_hooks("on_phase_change", phase=_phase)
+        else:
+            s["tools_since_plan_touch"] = s.get("tools_since_plan_touch", 0) + 1
+            if (planning.get_active_plan() is not None
+                    and s["tools_since_plan_touch"] >= PLAN_TOUCH_NUDGE
+                    and not s.get("_plan_touch_nudge_sent")):
+                s["_plan_touch_nudge_sent"] = True
+                s["messages"].append({"role": "user", "content": (
+                    f"[SYSTEM] {s['tools_since_plan_touch']} tool calls have passed without "
+                    "updating the plan. If you've made progress, call plan_update_task to "
+                    "reflect it (or plan_add_task if you've discovered new work) before continuing."
+                )})
+
+    def _code_graph_guard(self, s, tool_name):
+        """Catch the "sweeping files one by one" anti-pattern. Any navigation tool
+        (graph query or content search) resets the counter; a long run of pure
+        read_file_chunk with no navigation triggers a bounded nudge toward
+        build_code_graph / query_code_graph / grep_directory."""
+        if tool_name in NAVIGATION_TOOLS:
+            s["reads_since_nav"] = 0
+        elif tool_name == "read_file_chunk":
+            s["reads_since_nav"] = s.get("reads_since_nav", 0) + 1
+            if (s["reads_since_nav"] >= GRAPH_NUDGE_THRESHOLD
+                    and s.get("graph_nudges_sent", 0) < MAX_GRAPH_NUDGES):
+                s["reads_since_nav"] = 0
+                s["graph_nudges_sent"] = s.get("graph_nudges_sent", 0) + 1
+                self._emit({"type": "system", "content": (
+                    "SYSTEM GUARD: many files read one-by-one without using the code "
+                    "graph — steering to build_code_graph / query_code_graph.")})
+                s["messages"].append({"role": "user", "content": (
+                    "[SYSTEM] You've read many files individually without querying the code "
+                    "graph or running a search. On a decompiled app this exhausts context fast "
+                    "and is the wrong approach. STOP reading files one by one and NAVIGATE "
+                    "instead: call query_code_graph with just a name — no query_type needed — "
+                    "e.g. query_code_graph(name=\"isRooted\") or query_code_graph(name=\"/system/"
+                    "xbin/su\"); it AUTO-BUILDS the graph and searches strings+methods+classes+"
+                    "native symbols at once, landing you on the exact file:line. To search any "
+                    "tree (smali, Java, XML, assets) use grep_directory / search_smali / "
+                    "find_files. Then read_file_chunk ONLY the specific slice those point you to. "
+                    "If you genuinely have a reason to keep reading these files, continue."
+                )})
+
+    def _activate_used_toolsets(self, s, tool_name, tool_result, tool_failed, tool_feedback, is_loop_warning):
+        """Progressive tool disclosure: usage-driven expansion. Calling any on-demand
+        domain tool activates its whole toolset so its full schemas ride along on
+        subsequent turns; an explicit expand_tools activates the group it names, and
+        use_skill brings its toolsets online via _activate_groups. On a FAILED first
+        call into a catalog-only group, the tool's full schema is appended inline so
+        the model self-corrects in one shot. Loop-warning short-circuits (tool_result
+        is None) don't count as a real call. Returns the (possibly appended)
+        tool_feedback."""
+        if not is_loop_warning:
+            grp = registry.group_of(tool_name)
+            was_catalog_only = (grp != CORE_GROUP
+                                and grp not in s["active_toolsets"])
+            newly_active = False
+            if was_catalog_only:
+                s["active_toolsets"].add(grp)
+                newly_active = True
+            if tool_name == "expand_tools" and isinstance(tool_result, dict):
+                eg = tool_result.get("_expanded_group")
+                if eg and eg not in s["active_toolsets"]:
+                    s["active_toolsets"].add(eg)
+                    newly_active = True
+            # Loading a skill (use_skill) brings its toolsets online, so every tool the
+            # skill instructs you to call arrives with full schemas next turn instead of
+            # a one-line catalog entry. Same activation path as expand_tools.
+            if isinstance(tool_result, dict):
+                for ag in (tool_result.get("_activate_groups") or []):
+                    if ag and ag not in s["active_toolsets"]:
+                        s["active_toolsets"].add(ag)
+                        newly_active = True
+            # First call into a domain toolset that FAILED (usually a malformed/guessed
+            # arg) — hand back that tool's full schema inline so the model self-corrects
+            # in one shot instead of guessing again from the one-line catalog.
+            if tool_failed and was_catalog_only:
+                block = registry.full_tool_block(tool_name)
+                if block:
+                    tool_feedback += (
+                        "\n\n[TOOLSET EXPANDED] Full schema for '%s' (its '%s' toolset is now "
+                        "loaded for the rest of this session):\n%s" % (tool_name, grp, block))
+            if newly_active:
+                # Re-render messages[0] so the newly-active toolset's full schemas are
+                # present on the next LLM call.
+                self._refresh_system_prompt()
+        return tool_feedback
+
+    def _pre_tool_gates(self, s, tool_name, tool_args, adaptive, is_plan_tool):
+        """Gates that run BEFORE a tool executes and may skip execution this turn by
+        nudging the model (returning "continue"); otherwise returns None and the call
+        proceeds. Covers: the replan gate (mutations paused after a watchdog trip until
+        a deliberate plan_replan), the plan-and-execute gate (inspect freely, single
+        soft nudge on the first un-planned mutation; legacy non-adaptive keeps the old
+        "plan before any tool" behavior), and the repeat-failure guard (an EXACT call
+        that already failed earlier is nudged once before it's allowed through)."""
+        # Replan gate: once the watchdog trips (a core approach failed repeatedly),
+        # MUTATIONS stay paused until a DELIBERATE plan_replan, so the agent revises
+        # the plan instead of grinding a dead end. Read-only inspection stays FREE
+        # (inspect-freely policy). Plan tools are non-mutating so they pass; only
+        # plan_replan actually clears the gate (in the post-tool bookkeeping).
+        if adaptive and s.get("replan_required") and tool_name in MUTATING_TOOLS:
+            self._emit({"type": "system", "content": "Waiting for a deliberate replan before changing anything more…"})
+            s["messages"].append({"role": "user", "content": (
+                "[SYSTEM] A core approach failed repeatedly, so further CHANGES are paused until you "
+                "replan (you can still inspect freely). Call plan_replan with the reason (the recorded "
+                "failures) and new steps for a different approach — it preserves completed work — or, if "
+                "this is a genuine dead end, call plan_set_outcome 'blocked'/'needs_different_approach' "
+                "with the evidence. Do not retry the failed path as-is."
+            )})
+            return "continue"
+
+        # Plan-and-execute gate — INSPECT FREELY, PLAN WHEN READY. A new task does NOT
+        # have to be planned before inspecting: in adaptive mode every non-mutating
+        # tool runs with no plan and no cap. The ONLY plan gate is a SINGLE soft nudge
+        # the first time it goes to MUTATE the workspace with no plan; after that one
+        # nudge the mutation is allowed. The plan is never force-created and never
+        # silently disabled. (Legacy non-adaptive sessions keep the old simple "plan
+        # before any tool" behavior.)
+        if s.get("needs_plan") and not is_plan_tool:
+            if adaptive:
+                if tool_name not in MUTATING_TOOLS:
+                    pass  # inspect freely — fall through and run it
+                elif not s.get("mutating_gate_nudged"):
+                    s["mutating_gate_nudged"] = True
+                    self._emit({"type": "system", "content": "About to change the workspace with no plan yet — suggesting a plan first."})
+                    s["messages"].append({"role": "user", "content": (
+                        "[SYSTEM] You're about to MODIFY the workspace but haven't made a plan yet. "
+                        "You were free to inspect; now that you're about to CHANGE something, prefer "
+                        "plan_create first (task summary, success_criteria, constraints, phases, and the "
+                        "first phase's concrete steps) so the work stays tracked and verifiable. If this "
+                        "genuinely is a trivial one-off change, go ahead and repeat the call."
+                    )})
+                    return "continue"
+                # else: already nudged once — allow the mutation through
+                # (never deadlock, never disable the plan).
+            else:
+                s["plan_gate_retries"] = s.get("plan_gate_retries", 0) + 1
+                if s["plan_gate_retries"] <= 3:
+                    self._emit({"type": "system", "content": "Waiting for the agent to create a plan before proceeding..."})
+                    s["messages"].append({"role": "user", "content": (
+                        "[SYSTEM] This is a new task and no plan exists yet. Call plan_create with the "
+                        "task summary, success_criteria, constraints, the high-level phases, and the "
+                        "first phase's concrete steps before proceeding."
+                    )})
+                    return "continue"
+                else:
+                    self._emit({"type": "system", "content": "Proceeding without an explicit plan after repeated attempts to prompt for one."})
+                    s["needs_plan"] = False
+
+        # Repeat-failure guard: this EXACT call already failed earlier in the run (not
+        # just the immediately-previous call, which the loop-repeat guard covers).
+        # Nudge once — skipping execution this turn — so the worker reconsiders instead
+        # of blindly re-running a known-bad call. Bounded: after one nudge, the same
+        # call is allowed through.
+        if s.get("evidence_guards"):
+            fsig = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
+            if (fsig in s.get("failed_sigs", {})
+                    and fsig not in s.get("failed_sig_warned", set())):
+                s.setdefault("failed_sig_warned", set()).add(fsig)
+                self._emit({"type": "system", "content": (
+                    f"'{tool_name}' with these exact args already failed earlier — "
+                    "asking the agent to reconsider before retrying.")})
+                s["messages"].append({"role": "user", "content": (
+                    f"[SYSTEM] You already ran '{tool_name}' with these EXACT arguments earlier "
+                    "in this run and it FAILED. Don't blindly repeat it. Either change the "
+                    "approach, or — if you now have NEW evidence it should work — record that "
+                    "evidence (record_finding) and note why this attempt differs, then proceed. "
+                    "If it's a genuine dead end, log it with record_failed_attempt and switch "
+                    "strategy.")})
+                return "continue"
+        return None
+
+    def _handle_tool_call(self, s, payload, explanation_text, time_str):
+        """Execute one tool call end to end: pre-execution gates (may return
+        "continue" to skip this turn), plugin pre/post hooks, the execution itself,
+        progressive tool disclosure, per-call counters + narration cadence, plan
+        bookkeeping/delegation, the code-graph and skill guards, the tool_result
+        emit + TOOL RESULT message, context editing, the watchdog, evidence
+        bookkeeping, and long-run compaction. Returns "continue" or None."""
+        tool_name = payload.get("tool")
+        tool_args = payload.get("args", {})
+
+        adaptive = s.get("adaptive_planning")
+        is_plan_tool = tool_name in PLAN_TOOL_NAMES or (tool_name or "").startswith("plan_")
+
+        # Pre-execution gates (replan / plan / repeat-failure) may skip this
+        # turn by nudging the model instead of running the call.
+        if self._pre_tool_gates(s, tool_name, tool_args, adaptive, is_plan_tool) == "continue":
+            return "continue"
+
+        # Plugin pre_tool hook (advisory): a policy/verification plugin can
+        # inspect the intended call and steer via an [PLUGIN] message. No-op
+        # unless a plugin registered a pre_tool hook; never blocks execution.
+        self._fire_plugin_hooks("pre_tool", tool=tool_name, args=tool_args)
+
+        tool_id = uuid.uuid4().hex[:12]
+        run_started = time.time()
+
+        # Emit "running" immediately so the UI can show what tool
+        # is executing BEFORE we wait for its output.
+        self._emit({"type": "tool_running",
+                    "id": tool_id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "step": s["step_count"] + 1})
+
+        tool_feedback, tool_result = execute_tool(
+            payload, s["last_tool_call"], s["loop_repeat_threshold"], return_result=True,
+            run_dir=s.get("memory_dir"), task_context=(s.get("original_task") or ""))
+        run_ms = int((time.time() - run_started) * 1000)
+        is_loop_warning = tool_feedback.startswith("[SYSTEM WARNING]")
+        tool_failed = _tool_result_failed(tool_result)
+
+        # Progressive tool disclosure: a used tool's whole toolset comes
+        # online (may append an inline schema to tool_feedback on a failed
+        # first call into a catalog-only group).
+        tool_feedback = self._activate_used_toolsets(
+            s, tool_name, tool_result, tool_failed, tool_feedback, is_loop_warning)
+        prev_call = s["last_tool_call"]
+        same_as_prev = (
+            isinstance(prev_call, dict)
+            and prev_call.get("tool") == tool_name
+            and prev_call.get("args", {}) == tool_args
+        )
+        if is_loop_warning:
+            if isinstance(prev_call, dict):
+                s["last_tool_call"] = dict(prev_call)
+                s["last_tool_call"]["repeats"] = prev_call.get("repeats", 1) + 1
+            else:
+                s["last_tool_call"] = {"tool": tool_name, "args": tool_args, "repeats": 2}
+        elif same_as_prev:
+            s["last_tool_call"] = {"tool": tool_name, "args": tool_args, "repeats": prev_call.get("repeats", 1) + 1}
+        else:
+            s["last_tool_call"] = {"tool": tool_name, "args": tool_args, "repeats": 1}
+
+        s["step_count"] += 1
+        s["consecutive_tools"] += 1
+        # Tool calls since the last narration line — drives the min-gap
+        # throttle so narration can't fire again until several calls pass.
+        s["tools_since_narration"] = s.get("tools_since_narration", 0) + 1
+        # Cumulative tools-used count for this project's chat (persisted
+        # and restored across reopen; reset only when the chat is cleared).
+        s["tools_used"] = s.get("tools_used", 0) + 1
+
+        # Explanation-cadence guardrail: enforce a MIDDLE ground so the
+        # model neither narrates every single call nor runs a long silent
+        # stretch. If this call carried an explanation, the counter was
+        # reset above; otherwise count it, and once too many bare calls
+        # pass, nudge the model to introduce its current sub-process on
+        # the next call. Re-arms every N silent calls (steady cadence).
+        if explanation_text:
+            s["tools_since_explanation"] = 0
+        else:
+            s["tools_since_explanation"] = s.get("tools_since_explanation", 0) + 1
+            if s["tools_since_explanation"] >= EXPLANATION_CADENCE_NUDGE:
+                s["tools_since_explanation"] = 0
+                s["messages"].append({"role": "user", "content": (
+                    "[SYSTEM] You've run several tool calls without explaining what you're "
+                    "doing. On your NEXT tool call, add a short, friendly \"explanation\" "
+                    "introducing the sub-process you're working on now, so the user can follow "
+                    "along. Keep narrating each new sub-process this way (about one explanation "
+                    "per few related calls) — but don't explain every single call."
+                )})
+
+        # Plan bookkeeping: gate-clear on a real plan, delegation dispatch,
+        # phase-change re-grounding, and the plan-touch nudge.
+        self._plan_bookkeeping_after_tool(s, tool_name, tool_failed)
+
+        # GSD context-hygiene: periodic re-grounding tick (once per tool
+        # call). Injects a compact SITUATION block every REGROUND_EVERY
+        # calls so the goal/plan stay anchored across a very long run.
+        self._maybe_reground()
+
+        # Plugin post_tool hook (advisory): fires after a REAL execution
+        # (loop-warning short-circuits carry no result, so skip those). A
+        # plugin can watch outcomes and steer via an [PLUGIN] message.
+        if not is_loop_warning:
+            self._fire_plugin_hooks("post_tool", tool=tool_name, args=tool_args,
+                                    failed=bool(tool_failed), ok=not tool_failed)
+
+        # Code-graph guard: catch the "sweeping files one by one" anti-pattern.
+        self._code_graph_guard(s, tool_name)
+
+        # Skill guard: consult a matching skill instead of improvising a
+        # whole APK/RE workflow.
+        self._skill_guard(s, tool_name)
+
+        # NOTE: the raw tool output is deliberately NOT sent to the UI
+        # — the chat shows only the action, never its output (the full
+        # output stays in the agent's own message context below). This
+        # is also what keeps the webview from OOMing on long runs.
+        self._emit({"type": "tool_result",
+                    "id": tool_id,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "step": s["step_count"],
+                    "consecutive_tools": s["consecutive_tools"],
+                    "is_loop_warning": is_loop_warning,
+                    "run_ms": run_ms,
+                    "time": time_str})
+        self._refresh_tree()
+
+        # The model stacked several tool calls into one message (a
+        # common GLM off-protocol shape). The parser executed the
+        # first and named the rest in _dropped_calls; tell the model
+        # so it resends them one per turn instead of assuming they ran.
+        dropped = payload.get("_dropped_calls") if isinstance(payload, dict) else None
+        if dropped:
+            tool_feedback += (
+                f"\n\n[SYSTEM] You emitted {len(dropped) + 1} tool calls in "
+                f"one message; only the first ran. This loop takes ONE tool "
+                f"call per turn. Resend these individually if still needed: "
+                f"{', '.join(dropped)}.")
+
+        s["messages"].append({"role": "user", "content": f"TOOL RESULT:\n{tool_feedback}"})
+
+        # Context editing: collapse OLD, large tool results to stubs so a
+        # long run's history stays lean (the plan + investigation memory
+        # keep what mattered). Keeps the most-recent results verbatim.
+        if s.get("context_editing", True):
+            evict_old_tool_results(s["messages"])
+
+        # Watchdog: the SAME tool failing repeatedly forces a strategy
+        # switch (in adaptive mode, a replan pause).
+        self._watchdog_after_tool(s, tool_name, tool_failed)
+
+        # Evidence-based bookkeeping (opt-in per session via evidence_guards):
+        # failed-signature memory, unverified-change tracking + validation
+        # nudge, and auto-recording modified files into investigation memory.
+        self._evidence_bookkeeping(s, tool_name, tool_args, tool_failed)
+
+        # Long-run compaction: fold history into a summary after a lot of
+        # tool steps and CONTINUE (never abort — an overnight run keeps going).
+        self._maybe_compact_long_run(s)
+        return None
+
+    def _handle_truncated(self, s):
+        """The provider cut the reply off at the output-token cap — the tool call
+        never completed. Do NOT dump the raw partial (that was the "huge text chunk"
+        bug); tell the model WHY it failed and how to recover (smaller outputs /
+        chunked writes) so it retries a bounded call instead of the same one."""
+        s["step_count"] += 1
+        s["last_tool_call"] = None
+        self._emit({"type": "system", "content": (
+            "The model's last response hit the output-token limit and was cut off before "
+            "the tool call finished — re-prompting for a smaller output (large files must be "
+            "written in parts). Raw partial output suppressed.")})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] Your previous response was TRUNCATED at the output-token limit "
+            "(max_tokens) — the JSON was cut off mid-way, so the tool call did not run. Do "
+            "NOT repeat the same oversized call. Produce a SMALLER output this turn: for a "
+            "large file, write_file the first portion, then append the remaining lines with "
+            "further calls (e.g. run_cmd appending via base64/tee, or replace_in_file to add "
+            "sections). Keep every response well under the limit."
+        )})
+
+    def _handle_malformed(self, s, raw_response, time_str):
+        """Still malformed after the in-turn retries. Do NOT terminate the session — a
+        parse failure is recoverable. Surface the model's prose to the UI so the
+        operator can see it, append a firm correction, and let the loop re-prompt next
+        turn. Only a real final_answer (or a user stop) ends the run."""
+        s["step_count"] += 1
+        s["last_tool_call"] = None
+        salvage = strip_reasoning(raw_response)
+        self._emit({"type": "system", "content": (
+            "Model replied outside the JSON protocol again — re-prompting for valid JSON "
+            "(the session keeps running)." )})
+        if salvage:
+            self._emit({"type": "thought",
+                        "text": _ui_trunc(salvage, UI_THOUGHT_CAP),
+                        "thought_chars": len(salvage),
+                        "time": time_str})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] " + JSON_CORRECTION_MSG + " If you are finished, send a final_answer; "
+            "otherwise issue the next tool_call. Do not reply with prose again."
+        )})
+
+    def _get_model_response(self, s):
+        """Emit the thinking indicator, call the model, and parse its reply. A
+        malformed reply gets bounded correction retries — the failed attempt stays
+        in the message history so the model can see what it did wrong (the old
+        copy-list approach threw that away, so every retry started from the same
+        state that just failed). Appends the accepted assistant message and returns
+        (response_type, payload, raw_response, elapsed_ms)."""
+        self._emit({"type": "thinking_start"})
+        start_time = time.time()
+        raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
+                               active_groups=s.get("active_toolsets"))
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
+
+        response_type, payload = parse_response(raw_response)
+
+        parse_retries = 0
+        while response_type == "error" and parse_retries < MAX_PARSE_RETRIES and not self._stop:
+            parse_retries += 1
+            self._emit({"type": "system",
+                        "content": f"Response was not valid JSON — retrying ({parse_retries}/{MAX_PARSE_RETRIES})..."})
+            s["messages"].append({"role": "assistant", "content": raw_response})
+            s["messages"].append({"role": "user", "content": JSON_CORRECTION_MSG})
+            self._emit({"type": "thinking_start"})
+            start_time = time.time()
+            raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
+                               active_groups=s.get("active_toolsets"))
+            elapsed_ms += int((time.time() - start_time) * 1000)
+            self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
+            response_type, payload = parse_response(raw_response)
+
+        s["messages"].append({"role": "assistant", "content": raw_response})
+        return response_type, payload, raw_response, elapsed_ms
+
+    def _emit_narration(self, s, response_type, payload, elapsed_ms, time_str):
+        """Narration is opt-in per tool call: the model puts a short "explanation"
+        INSIDE the tool_call JSON when it starts a new subtask. We emit a 'thought'
+        event only when it's present, and the frontend uses it to open a new action
+        group — subsequent explanation-less calls fold into that group. ("thought" is
+        still accepted as a legacy alias.) Returns the (possibly throttled) explanation
+        text so the tool-call phase can drive its explanation-cadence guardrail."""
+        explanation_text = ""
+        if response_type == "tool_call" and isinstance(payload, dict):
+            # PLAN-DRIVEN NARRATION (primary): starting a plan step narrates the
+            # subprocess — the step's explanation/description becomes the chat line and
+            # opens a new action group for the calls that follow. Falls back to a
+            # per-call "explanation" (secondary) and the first-call opener.
+            explanation_text = _subprocess_narration(payload)
+            if not explanation_text:
+                explanation_text = str(
+                    payload.get("explanation") or payload.get("thought") or ""
+                ).strip()
+            # Guarantee the FIRST action of a task opens with an explanation even if
+            # the model omitted one, so a run never starts with a bare tool call.
+            if not explanation_text and not s.get("narrated_this_task"):
+                explanation_text = _default_opening_explanation(payload.get("tool"))
+        # THROTTLE: after the first narration of the task, a new line is only surfaced
+        # once several tool calls have run since the last one — so rapid, fine-grained
+        # step transitions coalesce into the current group instead of spamming the
+        # chat. The suppressed step still runs; only its chat line is dropped.
+        if (explanation_text and s.get("narrated_this_task")
+                and s.get("tools_since_narration", NARRATION_MIN_GAP) < NARRATION_MIN_GAP):
+            explanation_text = ""
+        if explanation_text:
+            self._emit({"type": "thought", "time": time_str, "elapsed_ms": elapsed_ms,
+                        "text": _ui_trunc(explanation_text, UI_THOUGHT_CAP),
+                        "thought_chars": len(explanation_text)})
+            s["narrated_this_task"] = True
+            # A narration line was just shown — reset both cadence counters (the
+            # too-silent nudge and the too-chatty min-gap throttle).
+            s["tools_since_explanation"] = 0
+            s["tools_since_narration"] = 0
+        return explanation_text
+
+    def _run_review_gate(self, s, payload):
+        """Independent-reviewer gate on a final answer. A separate isolated context
+        (same model/key) checks the conclusion for unsupported claims, contradictions,
+        and incomplete/unverified work. On "revise" it injects the reviewer's feedback
+        and returns "continue" so the worker fixes the gaps and answers again; otherwise
+        returns None (accept). Bounded by MAX_REVIEW_ROUNDS so it can never deadlock. A
+        bare conversational reply (no tools, no plan, no investigation) has nothing to
+        independently verify, so the review call is skipped entirely."""
+        answer_text = (payload or "").strip() if isinstance(payload, str) else str(payload or "").strip()
+        _inv = investigation.get_active()
+        did_work = (s.get("consecutive_tools", 0) > 0
+                    or planning.get_active_plan() is not None
+                    or (_inv is not None and not _inv.is_empty()))
+        if (s.get("review_enabled") and answer_text and did_work
+                and s.get("review_rounds", 0) < MAX_REVIEW_ROUNDS and not self._stop):
+            self._emit({"type": "system", "content": (
+                "Independent reviewer verifying the conclusion (evidence, contradictions, "
+                "completeness)…")})
+            inv = investigation.get_active()
+            # Give the reviewer the LIVE plan (mission, success criteria, phases,
+            # outcome) alongside the investigation evidence, so it judges the
+            # conclusion against what the task set out to do and the state it
+            # actually reached — not just the notes.
+            ctx_parts = []
+            _rev_plan = planning.get_active_plan()
+            if _rev_plan is not None:
+                ctx_parts.append("CURRENT PLAN:\n" + _rev_plan.to_markdown())
+            if inv is not None and not inv.is_empty():
+                ctx_parts.append("INVESTIGATION MEMORY:\n" + inv.to_markdown())
+            ctx = "\n\n".join(ctx_parts)
+            if s.get("unverified_change"):
+                ctx += (f"\n\nNOTE: a change made by '{s['unverified_change']}' has not yet been "
+                        "validated by an objective check (build/install/launch/test/log).")
+            try:
+                verdict = run_review(answer_text, task=s.get("original_task") or "",
+                                     extra_context=ctx, max_steps=REVIEW_MAX_STEPS)
+            except Exception as e:
+                verdict = {"approved": True, "summary": f"review skipped ({e})", "feedback": ""}
+            self._emit({"type": "review",
+                        "verdict": "approve" if verdict.get("approved") else "revise",
+                        "summary": verdict.get("summary", ""),
+                        "unsupported_claims": verdict.get("unsupported_claims", []),
+                        "contradictions": verdict.get("contradictions", []),
+                        "incomplete_work": verdict.get("incomplete_work", []),
+                        "required_actions": verdict.get("required_actions", [])})
+            if not verdict.get("approved"):
+                s["review_rounds"] = s.get("review_rounds", 0) + 1
+                self._emit({"type": "system", "content": (
+                    f"Reviewer requested changes (round {s['review_rounds']}/{MAX_REVIEW_ROUNDS}): "
+                    f"{verdict.get('summary', '')}")})
+                s["messages"].append({"role": "user", "content": (
+                    verdict.get("feedback")
+                    or "[REVIEWER] Revise and re-verify the conclusion before finalizing.")})
+                return "continue"  # worker addresses the feedback, then answers again
+            self._emit({"type": "system", "content": (
+                f"Reviewer approved the conclusion: {verdict.get('summary', '')}")})
+        return None
+
+    def _handle_final_answer(self, s, payload, time_str):
+        """Accept-or-send-back gate for a final answer. The plugin on_final_answer
+        hook, the plan-outcome gate, and the independent review gate each get a chance
+        to send the answer back for more work (returning "continue"). If all pass, the
+        salvage stats + final_answer event are emitted and the run ends (returns
+        "break")."""
+        s["step_count"] += 1
+        s["last_tool_call"] = None
+
+        # --- Plugin on_final_answer gate ---
+        # Give hook-bearing plugins (e.g. a verification plugin) the last word before
+        # the answer is accepted. If any injects an advisory, the answer is sent back
+        # for more work. Bounded by MAX_FINAL_HOOK_NUDGES so it can never deadlock; a
+        # zero-cost no-op when no plugin hooks on_final_answer.
+        if (s.get("final_hook_nudges", 0) < MAX_FINAL_HOOK_NUDGES
+                and not self._stop):
+            _ans = payload if isinstance(payload, str) else str(payload or "")
+            if self._fire_plugin_hooks("on_final_answer", answer=_ans,
+                                       unverified_change=s.get("unverified_change")):
+                s["final_hook_nudges"] = s.get("final_hook_nudges", 0) + 1
+                self._emit({"type": "system", "content": (
+                    "A plugin asked for more before finishing (verification/policy).")})
+                return "continue"
+
+        # --- Plan-outcome gate ---
+        # Don't let an in-progress plan be silently abandoned by a final answer. If a
+        # plan is active with no terminal outcome yet, ask for an explicit
+        # plan_set_outcome first — so the task's end state is deliberate. Bounded by
+        # MAX_FINAL_PLAN_NUDGES so it can't deadlock.
+        _active_plan = planning.get_active_plan()
+        if (s.get("adaptive_planning") and _active_plan is not None
+                and _active_plan.outcome == "active"
+                and s.get("final_plan_nudges", 0) < MAX_FINAL_PLAN_NUDGES
+                and not self._stop):
+            s["final_plan_nudges"] = s.get("final_plan_nudges", 0) + 1
+            self._emit({"type": "system", "content": (
+                "An active plan hasn't been concluded — asking for an explicit outcome "
+                "before finishing.")})
+            s["messages"].append({"role": "user", "content": (
+                "[SYSTEM] You're about to give a final answer, but the active plan has no "
+                "terminal outcome yet. First call plan_set_outcome to declare where the task "
+                "landed: 'completed' (success criteria met AND verified), 'partial' (say what's "
+                "left), 'blocked' (say what's blocking), or 'needs_different_approach' (say why). "
+                "Then send your final answer."
+            )})
+            return "continue"
+
+        # --- Review gate ---
+        if self._run_review_gate(s, payload) == "continue":
+            return "continue"
+
+        s["review_rounds"] = 0
+        # Surface the tool-call salvage rate for the run. If the model went
+        # off-protocol a lot, the operator sees it here instead of only when a run
+        # dies. Silent when nothing was salvaged.
+        _salvaged = SALVAGE_STATS.get("salvaged", 0)
+        if _salvaged:
+            self._emit({"type": "system", "content": (
+                f"Tool-call salvage this run: {_salvaged} off-protocol "
+                f"message(s) recovered by the parser"
+                + (f", {SALVAGE_STATS['dropped_calls']} stacked extra call(s) "
+                   f"fed back" if SALVAGE_STATS.get("dropped_calls") else "")
+                + ".")})
+        self._emit({"type": "final_answer",
+                    "content": payload,
+                    "steps": s["step_count"],
+                    "time": time_str})
+        return "break"
+
     def _run_agent_loop(self):
         s = self.session
-        container_msg = None
         try:
             while True:
                 if self._stop:
@@ -2768,706 +3516,36 @@ class AgentApi:
                 # long-run context is kept in check by the compaction at
                 # MAX_CONSECUTIVE_TOOLS and the context-window guard below.
 
-                # Thinking indicator
-                self._emit({"type": "thinking_start"})
-                start_time = time.time()
-                raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
-                                       active_groups=s.get("active_toolsets"))
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
+                # Thinking indicator, LLM call, and bounded JSON-correction retries.
+                response_type, payload, raw_response, elapsed_ms = self._get_model_response(s)
 
-                response_type, payload = parse_response(raw_response)
-
-                # A malformed reply gets bounded correction retries. The failed
-                # attempt stays in the message history so the model can see what
-                # it did wrong (the old copy-list approach threw that away, so
-                # every retry started from the same state that just failed).
-                parse_retries = 0
-                while response_type == "error" and parse_retries < MAX_PARSE_RETRIES and not self._stop:
-                    parse_retries += 1
-                    self._emit({"type": "system",
-                                "content": f"Response was not valid JSON — retrying ({parse_retries}/{MAX_PARSE_RETRIES})..."})
-                    s["messages"].append({"role": "assistant", "content": raw_response})
-                    s["messages"].append({"role": "user", "content": JSON_CORRECTION_MSG})
-                    self._emit({"type": "thinking_start"})
-                    start_time = time.time()
-                    raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
-                                       active_groups=s.get("active_toolsets"))
-                    elapsed_ms += int((time.time() - start_time) * 1000)
-                    self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
-                    response_type, payload = parse_response(raw_response)
-
-                s["messages"].append({"role": "assistant", "content": raw_response})
-
-                # Narration is opt-in per tool call: the model puts a short
-                # "explanation" INSIDE the tool_call JSON when it starts a new
-                # subtask (see EXPLAINING YOUR WORK in the system prompt). We emit
-                # a 'thought' event only when it's present, and the frontend uses
-                # it to open a new action group — subsequent explanation-less calls
-                # fold into that group. ("thought" is still accepted as a legacy
-                # alias so a mid-run model that used the old key doesn't go silent.)
+                # Narration: surface the model's per-subtask "explanation" as a
+                # throttled 'thought' so the UI opens a new action group on a shift.
                 time_str = _fmt_elapsed(elapsed_ms)
-                explanation_text = ""
-                if response_type == "tool_call" and isinstance(payload, dict):
-                    # PLAN-DRIVEN NARRATION (primary): starting a plan step narrates
-                    # the subprocess — the step's explanation/description becomes the
-                    # chat line and opens a new action group for the calls that follow.
-                    # This is how the PLAN (not ad-hoc per-call text) decides when to
-                    # split and what to write. Falls back to a per-call "explanation"
-                    # (secondary — for pre-plan/asides) and the first-call opener.
-                    explanation_text = _subprocess_narration(payload)
-                    if not explanation_text:
-                        explanation_text = str(
-                            payload.get("explanation") or payload.get("thought") or ""
-                        ).strip()
-                    # Guarantee the FIRST action of a task opens with an explanation
-                    # even if the model omitted one, so a run never starts with a
-                    # bare tool call. Later subtasks rely on the model's own text.
-                    if not explanation_text and not s.get("narrated_this_task"):
-                        explanation_text = _default_opening_explanation(payload.get("tool"))
-                # THROTTLE: don't print a line for every step/call. After the first
-                # narration of the task, a new line is only surfaced once several tool
-                # calls have run since the last one — so rapid, fine-grained step
-                # transitions coalesce into the current group instead of spamming the
-                # chat. The suppressed step still runs; only its chat line is dropped.
-                if (explanation_text and s.get("narrated_this_task")
-                        and s.get("tools_since_narration", NARRATION_MIN_GAP) < NARRATION_MIN_GAP):
-                    explanation_text = ""
-                if explanation_text:
-                    self._emit({"type": "thought", "time": time_str, "elapsed_ms": elapsed_ms,
-                                "text": _ui_trunc(explanation_text, UI_THOUGHT_CAP),
-                                "thought_chars": len(explanation_text)})
-                    s["narrated_this_task"] = True
-                    # A narration line was just shown — reset both cadence counters
-                    # (the too-silent nudge and the too-chatty min-gap throttle).
-                    s["tools_since_explanation"] = 0
-                    s["tools_since_narration"] = 0
+                explanation_text = self._emit_narration(s, response_type, payload, elapsed_ms, time_str)
 
                 if response_type == "tool_call":
-                    tool_name = payload.get("tool")
-                    tool_args = payload.get("args", {})
-
-                    adaptive = s.get("adaptive_planning")
-                    is_plan_tool = tool_name in PLAN_TOOL_NAMES or (tool_name or "").startswith("plan_")
-
-                    # Replan gate: once the watchdog trips (a core approach failed
-                    # repeatedly), MUTATIONS stay paused until a DELIBERATE plan_replan,
-                    # so the agent revises the plan instead of grinding a dead end. But
-                    # read-only inspection stays FREE (inspect-freely policy) — the agent
-                    # should be able to investigate WHY it failed. Plan tools (replan /
-                    # set_outcome / view) are non-mutating so they pass; only plan_replan
-                    # actually clears the gate (below).
-                    if adaptive and s.get("replan_required") and tool_name in MUTATING_TOOLS:
-                        self._emit({"type": "system", "content": "Waiting for a deliberate replan before changing anything more…"})
-                        s["messages"].append({"role": "user", "content": (
-                            "[SYSTEM] A core approach failed repeatedly, so further CHANGES are paused until you "
-                            "replan (you can still inspect freely). Call plan_replan with the reason (the recorded "
-                            "failures) and new steps for a different approach — it preserves completed work — or, if "
-                            "this is a genuine dead end, call plan_set_outcome 'blocked'/'needs_different_approach' "
-                            "with the evidence. Do not retry the failed path as-is."
-                        )})
+                    if self._handle_tool_call(s, payload, explanation_text, time_str) == "continue":
                         continue
-
-                    # Plan-and-execute gate — INSPECT FREELY, PLAN WHEN READY. A new task
-                    # does NOT have to be planned before inspecting: in adaptive mode every
-                    # non-mutating tool runs with no plan and no cap, so the agent analyzes
-                    # the workspace as much as it needs. The ONLY plan gate is a SINGLE soft
-                    # nudge the first time it goes to MUTATE the workspace with no plan; after
-                    # that one nudge the mutation is allowed. The plan is never force-created
-                    # and never silently disabled. (Legacy non-adaptive sessions keep the old
-                    # simple "plan before any tool" behavior.)
-                    if s.get("needs_plan") and not is_plan_tool:
-                        if adaptive:
-                            if tool_name not in MUTATING_TOOLS:
-                                pass  # inspect freely — fall through and run it
-                            elif not s.get("mutating_gate_nudged"):
-                                s["mutating_gate_nudged"] = True
-                                self._emit({"type": "system", "content": "About to change the workspace with no plan yet — suggesting a plan first."})
-                                s["messages"].append({"role": "user", "content": (
-                                    "[SYSTEM] You're about to MODIFY the workspace but haven't made a plan yet. "
-                                    "You were free to inspect; now that you're about to CHANGE something, prefer "
-                                    "plan_create first (task summary, success_criteria, constraints, phases, and the "
-                                    "first phase's concrete steps) so the work stays tracked and verifiable. If this "
-                                    "genuinely is a trivial one-off change, go ahead and repeat the call."
-                                )})
-                                continue
-                            # else: already nudged once — allow the mutation through
-                            # (never deadlock, never disable the plan).
-                        else:
-                            s["plan_gate_retries"] = s.get("plan_gate_retries", 0) + 1
-                            if s["plan_gate_retries"] <= 3:
-                                self._emit({"type": "system", "content": "Waiting for the agent to create a plan before proceeding..."})
-                                s["messages"].append({"role": "user", "content": (
-                                    "[SYSTEM] This is a new task and no plan exists yet. Call plan_create with the "
-                                    "task summary, success_criteria, constraints, the high-level phases, and the "
-                                    "first phase's concrete steps before proceeding."
-                                )})
-                                continue
-                            else:
-                                self._emit({"type": "system", "content": "Proceeding without an explicit plan after repeated attempts to prompt for one."})
-                                s["needs_plan"] = False
-
-                    # Repeat-failure guard: this EXACT call already failed earlier
-                    # in the run (not just the immediately-previous call, which the
-                    # loop-repeat guard covers). Nudge once — skipping execution this
-                    # turn — so the worker reconsiders instead of blindly re-running a
-                    # known-bad call after the immediate-repeat window has passed.
-                    # Bounded: after one nudge, the same call is allowed through.
-                    if s.get("evidence_guards"):
-                        fsig = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
-                        if (fsig in s.get("failed_sigs", {})
-                                and fsig not in s.get("failed_sig_warned", set())):
-                            s.setdefault("failed_sig_warned", set()).add(fsig)
-                            self._emit({"type": "system", "content": (
-                                f"'{tool_name}' with these exact args already failed earlier — "
-                                "asking the agent to reconsider before retrying.")})
-                            s["messages"].append({"role": "user", "content": (
-                                f"[SYSTEM] You already ran '{tool_name}' with these EXACT arguments earlier "
-                                "in this run and it FAILED. Don't blindly repeat it. Either change the "
-                                "approach, or — if you now have NEW evidence it should work — record that "
-                                "evidence (record_finding) and note why this attempt differs, then proceed. "
-                                "If it's a genuine dead end, log it with record_failed_attempt and switch "
-                                "strategy.")})
-                            continue
-
-                    # Plugin pre_tool hook (advisory): a policy/verification plugin can
-                    # inspect the intended call and steer via an [PLUGIN] message. No-op
-                    # unless a plugin registered a pre_tool hook; never blocks execution.
-                    self._fire_plugin_hooks("pre_tool", tool=tool_name, args=tool_args)
-
-                    tool_id = uuid.uuid4().hex[:12]
-                    run_started = time.time()
-
-                    # Emit "running" immediately so the UI can show what tool
-                    # is executing BEFORE we wait for its output.
-                    self._emit({"type": "tool_running",
-                                "id": tool_id,
-                                "tool": tool_name,
-                                "args": tool_args,
-                                "step": s["step_count"] + 1})
-
-                    tool_feedback, tool_result = execute_tool(
-                        payload, s["last_tool_call"], s["loop_repeat_threshold"], return_result=True,
-                        run_dir=s.get("memory_dir"), task_context=(s.get("original_task") or ""))
-                    run_ms = int((time.time() - run_started) * 1000)
-                    is_loop_warning = tool_feedback.startswith("[SYSTEM WARNING]")
-                    tool_failed = _tool_result_failed(tool_result)
-
-                    # --- Progressive tool disclosure: usage-driven expansion ----
-                    # Calling any on-demand domain tool activates its whole toolset
-                    # so its full schemas ride along on subsequent turns. An explicit
-                    # expand_tools call activates the group it names. Loop-warning
-                    # short-circuits (tool_result is None) don't count as a real call.
-                    if not is_loop_warning:
-                        grp = registry.group_of(tool_name)
-                        was_catalog_only = (grp != CORE_GROUP
-                                            and grp not in s["active_toolsets"])
-                        newly_active = False
-                        if was_catalog_only:
-                            s["active_toolsets"].add(grp)
-                            newly_active = True
-                        if tool_name == "expand_tools" and isinstance(tool_result, dict):
-                            eg = tool_result.get("_expanded_group")
-                            if eg and eg not in s["active_toolsets"]:
-                                s["active_toolsets"].add(eg)
-                                newly_active = True
-                        # Loading a skill (use_skill) brings its toolsets online, so
-                        # every tool the skill instructs you to call arrives with full
-                        # schemas next turn instead of a one-line catalog entry. Same
-                        # activation path as expand_tools, driven by _activate_groups.
-                        if isinstance(tool_result, dict):
-                            for ag in (tool_result.get("_activate_groups") or []):
-                                if ag and ag not in s["active_toolsets"]:
-                                    s["active_toolsets"].add(ag)
-                                    newly_active = True
-                        # First call into a domain toolset that FAILED (usually a
-                        # malformed/guessed arg) — hand back that tool's full schema
-                        # inline so the model self-corrects in one shot instead of
-                        # guessing again from the one-line catalog.
-                        if tool_failed and was_catalog_only:
-                            block = registry.full_tool_block(tool_name)
-                            if block:
-                                tool_feedback += (
-                                    "\n\n[TOOLSET EXPANDED] Full schema for '%s' (its '%s' toolset is now "
-                                    "loaded for the rest of this session):\n%s" % (tool_name, grp, block))
-                        if newly_active:
-                            # Re-render messages[0] so the newly-active toolset's full
-                            # schemas are present on the next LLM call.
-                            self._refresh_system_prompt()
-                    prev_call = s["last_tool_call"]
-                    same_as_prev = (
-                        isinstance(prev_call, dict)
-                        and prev_call.get("tool") == tool_name
-                        and prev_call.get("args", {}) == tool_args
-                    )
-                    if is_loop_warning:
-                        if isinstance(prev_call, dict):
-                            s["last_tool_call"] = dict(prev_call)
-                            s["last_tool_call"]["repeats"] = prev_call.get("repeats", 1) + 1
-                        else:
-                            s["last_tool_call"] = {"tool": tool_name, "args": tool_args, "repeats": 2}
-                    elif same_as_prev:
-                        s["last_tool_call"] = {"tool": tool_name, "args": tool_args, "repeats": prev_call.get("repeats", 1) + 1}
-                    else:
-                        s["last_tool_call"] = {"tool": tool_name, "args": tool_args, "repeats": 1}
-
-                    s["step_count"] += 1
-                    s["consecutive_tools"] += 1
-                    # Tool calls since the last narration line — drives the min-gap
-                    # throttle so narration can't fire again until several calls pass.
-                    s["tools_since_narration"] = s.get("tools_since_narration", 0) + 1
-                    # Cumulative tools-used count for this project's chat (persisted
-                    # and restored across reopen; reset only when the chat is cleared).
-                    s["tools_used"] = s.get("tools_used", 0) + 1
-
-                    # Explanation-cadence guardrail: enforce a MIDDLE ground so the
-                    # model neither narrates every single call nor runs a long silent
-                    # stretch. If this call carried an explanation, the counter was
-                    # reset above; otherwise count it, and once too many bare calls
-                    # pass, nudge the model to introduce its current sub-process on
-                    # the next call. Re-arms every N silent calls (steady cadence).
-                    if explanation_text:
-                        s["tools_since_explanation"] = 0
-                    else:
-                        s["tools_since_explanation"] = s.get("tools_since_explanation", 0) + 1
-                        if s["tools_since_explanation"] >= EXPLANATION_CADENCE_NUDGE:
-                            s["tools_since_explanation"] = 0
-                            s["messages"].append({"role": "user", "content": (
-                                "[SYSTEM] You've run several tool calls without explaining what you're "
-                                "doing. On your NEXT tool call, add a short, friendly \"explanation\" "
-                                "introducing the sub-process you're working on now, so the user can follow "
-                                "along. Keep narrating each new sub-process this way (about one explanation "
-                                "per few related calls) — but don't explain every single call."
-                            )})
-
-                    # Plan-and-execute bookkeeping: clear the gate once a plan
-                    # actually exists, and gently nudge if many tool calls pass
-                    # without the model touching the plan at all (it may be
-                    # silently working ahead of it instead of keeping status
-                    # updated as instructed in the system prompt).
-                    # Only a SUCCESSFUL plan_create that produced a real plan opens
-                    # the gate — a rejected/invalid plan_create must not (the loop
-                    # keeps requiring one). A successful plan_replan lifts the
-                    # replan-required pause and re-arms the watchdog.
-                    if (tool_name == "plan_create" and not tool_failed
-                            and planning.get_active_plan() is not None):
-                        s["needs_plan"] = False
-                        s["plan_gate_retries"] = 0
-                    if tool_name == "plan_replan" and not tool_failed:
-                        s["replan_required"] = False
-                        s["watchdog_tool"] = None
-                        s["tool_fail_streak"] = 0
-                    if tool_name in PLAN_TOOL_NAMES or (tool_name or "").startswith("plan_"):
-                        s["tools_since_plan_touch"] = 0
-                        s["_plan_touch_nudge_sent"] = False
-                        # If this plan tool just marked a delegated step in_progress,
-                        # auto-run it in an isolated subagent and fold back its report.
-                        if not tool_failed:
-                            self._maybe_dispatch_delegated_steps()
-                        # A phase advance is a natural re-grounding point (GSD phases).
-                        if tool_name == "plan_advance_phase" and not tool_failed:
-                            self._maybe_reground(force=True)
-                            # Let plugins react to the milestone (e.g. a checkpoint/verify hook).
-                            _plan = planning.get_active_plan()
-                            _phase = (_plan.current_phase() or {}).get("title", "") if _plan else ""
-                            self._fire_plugin_hooks("on_phase_change", phase=_phase)
-                    else:
-                        s["tools_since_plan_touch"] = s.get("tools_since_plan_touch", 0) + 1
-                        if (planning.get_active_plan() is not None
-                                and s["tools_since_plan_touch"] >= PLAN_TOUCH_NUDGE
-                                and not s.get("_plan_touch_nudge_sent")):
-                            s["_plan_touch_nudge_sent"] = True
-                            s["messages"].append({"role": "user", "content": (
-                                f"[SYSTEM] {s['tools_since_plan_touch']} tool calls have passed without "
-                                "updating the plan. If you've made progress, call plan_update_task to "
-                                "reflect it (or plan_add_task if you've discovered new work) before continuing."
-                            )})
-
-                    # GSD context-hygiene: periodic re-grounding tick (once per tool
-                    # call). Injects a compact SITUATION block every REGROUND_EVERY
-                    # calls so the goal/plan stay anchored across a very long run.
-                    self._maybe_reground()
-
-                    # Plugin post_tool hook (advisory): fires after a REAL execution
-                    # (loop-warning short-circuits carry no result, so skip those). A
-                    # plugin can watch outcomes and steer via an [PLUGIN] message.
-                    if not is_loop_warning:
-                        self._fire_plugin_hooks("post_tool", tool=tool_name, args=tool_args,
-                                                failed=bool(tool_failed), ok=not tool_failed)
-
-                    # Code-graph guard: catch the "sweeping files one by one"
-                    # anti-pattern. Any navigation tool (graph query or content
-                    # search) resets the counter; a long run of pure
-                    # read_file_chunk with no navigation triggers a bounded nudge
-                    # toward build_code_graph / query_code_graph / grep_directory.
-                    if tool_name in NAVIGATION_TOOLS:
-                        s["reads_since_nav"] = 0
-                    elif tool_name == "read_file_chunk":
-                        s["reads_since_nav"] = s.get("reads_since_nav", 0) + 1
-                        if (s["reads_since_nav"] >= GRAPH_NUDGE_THRESHOLD
-                                and s.get("graph_nudges_sent", 0) < MAX_GRAPH_NUDGES):
-                            s["reads_since_nav"] = 0
-                            s["graph_nudges_sent"] = s.get("graph_nudges_sent", 0) + 1
-                            self._emit({"type": "system", "content": (
-                                "SYSTEM GUARD: many files read one-by-one without using the code "
-                                "graph — steering to build_code_graph / query_code_graph.")})
-                            s["messages"].append({"role": "user", "content": (
-                                "[SYSTEM] You've read many files individually without querying the code "
-                                "graph or running a search. On a decompiled app this exhausts context fast "
-                                "and is the wrong approach. STOP reading files one by one and NAVIGATE "
-                                "instead: call query_code_graph with just a name — no query_type needed — "
-                                "e.g. query_code_graph(name=\"isRooted\") or query_code_graph(name=\"/system/"
-                                "xbin/su\"); it AUTO-BUILDS the graph and searches strings+methods+classes+"
-                                "native symbols at once, landing you on the exact file:line. To search any "
-                                "tree (smali, Java, XML, assets) use grep_directory / search_smali / "
-                                "find_files. Then read_file_chunk ONLY the specific slice those point you to. "
-                                "If you genuinely have a reason to keep reading these files, continue."
-                            )})
-
-                    # Skill guard: consult a matching skill instead of improvising a
-                    # whole APK/RE workflow. Loading any skill (use_skill/list_skills)
-                    # disarms this for the run; otherwise a run of hands-on domain
-                    # work with no skill consulted triggers a bounded nudge toward
-                    # use_skill. Only ever nudges — the work is never blocked.
-                    if tool_name in SKILL_TOOLS:
-                        s["skill_loaded"] = True
-                        s["domain_tools_since_skill"] = 0
-                    elif tool_name in SKILL_DOMAIN_TOOLS and not s.get("skill_loaded"):
-                        s["domain_tools_since_skill"] = s.get("domain_tools_since_skill", 0) + 1
-                        if (s["domain_tools_since_skill"] >= SKILL_NUDGE_THRESHOLD
-                                and s.get("skill_nudges_sent", 0) < MAX_SKILL_NUDGES):
-                            s["domain_tools_since_skill"] = 0
-                            s["skill_nudges_sent"] = s.get("skill_nudges_sent", 0) + 1
-                            self._emit({"type": "system", "content": (
-                                "SYSTEM GUARD: substantial APK/RE work without consulting a "
-                                "skill — steering to use_skill.")})
-                            s["messages"].append({"role": "user", "content": (
-                                "[SYSTEM] You've done a lot of hands-on APK / emulator work "
-                                "without loading a skill. Skills are battle-tested workflows with "
-                                "the exact tool order and pitfalls to avoid — for APK/RE: "
-                                "apk-modding, ssl-pinning-bypass, signature-bypass, "
-                                "anti-debug-bypass, string-deobfuscation, manifest-resource-editing, "
-                                "dex-multidex-handling, smali-code-injection, code-graph-analysis; "
-                                "for on-device work: emulator-management (cookie login / saved "
-                                "account / enter a place id / dev instance / lifecycle) and "
-                                "emulator-testing (run + observe + report). Loading a skill also "
-                                "brings its tools online in full. Call list_skills, then use_skill "
-                                "for the ONE that matches this task and follow it. If you've already "
-                                "checked and none apply, just continue."
-                            )})
-
-                    # NOTE: the raw tool output is deliberately NOT sent to the UI
-                    # — the chat shows only the action, never its output (the full
-                    # output stays in the agent's own message context below). This
-                    # is also what keeps the webview from OOMing on long runs.
-                    self._emit({"type": "tool_result",
-                                "id": tool_id,
-                                "tool": tool_name,
-                                "args": tool_args,
-                                "step": s["step_count"],
-                                "consecutive_tools": s["consecutive_tools"],
-                                "is_loop_warning": is_loop_warning,
-                                "run_ms": run_ms,
-                                "time": time_str})
-                    self._refresh_tree()
-
-                    # The model stacked several tool calls into one message (a
-                    # common GLM off-protocol shape). The parser executed the
-                    # first and named the rest in _dropped_calls; tell the model
-                    # so it resends them one per turn instead of assuming they ran.
-                    dropped = payload.get("_dropped_calls") if isinstance(payload, dict) else None
-                    if dropped:
-                        tool_feedback += (
-                            f"\n\n[SYSTEM] You emitted {len(dropped) + 1} tool calls in "
-                            f"one message; only the first ran. This loop takes ONE tool "
-                            f"call per turn. Resend these individually if still needed: "
-                            f"{', '.join(dropped)}.")
-
-                    s["messages"].append({"role": "user", "content": f"TOOL RESULT:\n{tool_feedback}"})
-
-                    # Context editing: collapse OLD, large tool results to stubs so a
-                    # long run's history stays lean (the plan + investigation memory
-                    # keep what mattered). Keeps the most-recent results verbatim.
-                    if s.get("context_editing", True):
-                        evict_old_tool_results(s["messages"])
-
-                    # Watchdog: the SAME tool failing WATCHDOG_FAIL_THRESHOLD times in
-                    # a row means retrying it as-is isn't working — force a strategy
-                    # switch instead of letting the model grind the same failing path
-                    # all night. A success (or a different tool) clears the streak.
-                    if tool_failed:
-                        if s.get("watchdog_tool") == tool_name:
-                            s["tool_fail_streak"] = s.get("tool_fail_streak", 0) + 1
-                        else:
-                            s["watchdog_tool"] = tool_name
-                            s["tool_fail_streak"] = 1
-                        if s["tool_fail_streak"] >= WATCHDOG_FAIL_THRESHOLD:
-                            s["tool_fail_streak"] = 0  # re-arm so it can fire again later
-                            # Repeated failure of a core approach is a REPLAN trigger:
-                            # in adaptive mode, pause work until plan_replan deliberately
-                            # revises the plan (preserving completed work).
-                            if s.get("adaptive_planning"):
-                                s["replan_required"] = True
-                            self._emit({"type": "system", "content": (
-                                f"WATCHDOG: '{tool_name}' failed {WATCHDOG_FAIL_THRESHOLD} times in a "
-                                "row — forcing a replan / strategy switch.")})
-                            s["messages"].append({"role": "user", "content": (
-                                f"[SYSTEM — STRATEGY SWITCH] The tool '{tool_name}' has failed "
-                                f"{WATCHDOG_FAIL_THRESHOLD} times in a row. STOP retrying it the same way — "
-                                "that approach is not working. This is a repeated failure, so REPLAN before "
-                                "doing more work: call plan_replan with the reason (these recorded failures) "
-                                "and new steps for a DIFFERENT approach — it preserves completed work. Ideas: "
-                                "search for a different class/method/symbol; target a different .so or "
-                                "architecture; use a fallback injection point; or switch tools (e.g. "
-                                "patch_function_return -> nop_function or binary_patch, smali edits -> a native "
-                                "patch). If it's a genuine dead end, call plan_set_outcome "
-                                "'blocked'/'needs_different_approach' with the evidence."
-                            )})
-                    else:
-                        s["watchdog_tool"] = None
-                        s["tool_fail_streak"] = 0
-
-                    # Evidence-based bookkeeping (opt-in per session via evidence_guards):
-                    #   * remember failed (tool,args) signatures for the repeat-failure guard;
-                    #   * treat a workspace mutation as UNVERIFIED until an objective check
-                    #     confirms it, nudging once toward validation + record_test_result;
-                    #   * auto-record modified files into the durable investigation memory.
-                    if s.get("evidence_guards"):
-                        sig = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
-                        if tool_failed:
-                            s.setdefault("failed_sigs", {})[sig] = True
-                        elif tool_name in MUTATING_TOOLS:
-                            s["unverified_change"] = tool_name
-                            inv = investigation.ensure_active(s.get("original_task") or "")
-                            inv.add_modified_file(_best_path_arg(tool_args) or f"(via {tool_name})", tool_name)
-                            investigation.notify_updated()
-                            if s.get("_validation_nudged_for") != tool_name:
-                                s["_validation_nudged_for"] = tool_name
-                                s["messages"].append({"role": "user", "content": (
-                                    f"[SYSTEM] You just modified the workspace with '{tool_name}'. Treat this "
-                                    "change as UNVERIFIED until an objective check passes: run the appropriate "
-                                    "validation (rebuild/repack, sign, install, launch, run a test, or inspect "
-                                    "logs) and record the outcome with record_test_result. Do not claim success "
-                                    "until a check confirms it.")})
-                        if tool_name in VALIDATION_TOOLS and not tool_failed:
-                            s["unverified_change"] = None
-                            s["_validation_nudged_for"] = None
-
-                    # Long-run compaction: once we've done a lot of tool steps, fold
-                    # the history into a summary and CONTINUE (never abort — an
-                    # overnight run must keep going; only a final_answer or an
-                    # explicit user stop ends the loop).
-                    if s["consecutive_tools"] >= s["max_consecutive_tools"]:
-                        self._emit({"type": "system", "content": f"Long task in progress: compacting memory after {s['consecutive_tools']} tool steps (progress preserved)."})
-                        s["messages"] = summarize_memory(s["messages"], s["memory_dir"], s["original_task"], s.get("root"))
-                        s["base_system_prompt"] = s["messages"][0]["content"]
-                        self._refresh_system_prompt()
-                        s["step_count"] = 0
-                        s["consecutive_tools"] = 0
-                        s["summary_resets"] += 1
                 elif response_type == "final_answer":
-                    s["step_count"] += 1
-                    s["last_tool_call"] = None
-
-                    # --- Plugin on_final_answer gate -----------------------------
-                    # Give hook-bearing plugins (e.g. a verification plugin) the last
-                    # word before the answer is accepted. If any injects an advisory,
-                    # the answer is sent back for more work and the loop continues.
-                    # Bounded by MAX_FINAL_HOOK_NUDGES so it can never deadlock; a
-                    # zero-cost no-op when no plugin hooks on_final_answer.
-                    if (s.get("final_hook_nudges", 0) < MAX_FINAL_HOOK_NUDGES
-                            and not self._stop):
-                        _ans = payload if isinstance(payload, str) else str(payload or "")
-                        if self._fire_plugin_hooks("on_final_answer", answer=_ans,
-                                                   unverified_change=s.get("unverified_change")):
-                            s["final_hook_nudges"] = s.get("final_hook_nudges", 0) + 1
-                            self._emit({"type": "system", "content": (
-                                "A plugin asked for more before finishing (verification/policy).")})
-                            continue
-
-                    # --- Plan-outcome gate ---------------------------------------
-                    # Don't let an in-progress plan be silently abandoned by a final
-                    # answer. If a plan is active with no terminal outcome yet, ask
-                    # for an explicit plan_set_outcome (completed / partial / blocked
-                    # / needs_different_approach) first — so the task's end state is
-                    # deliberate. Bounded by MAX_FINAL_PLAN_NUDGES so it can't deadlock.
-                    _active_plan = planning.get_active_plan()
-                    if (s.get("adaptive_planning") and _active_plan is not None
-                            and _active_plan.outcome == "active"
-                            and s.get("final_plan_nudges", 0) < MAX_FINAL_PLAN_NUDGES
-                            and not self._stop):
-                        s["final_plan_nudges"] = s.get("final_plan_nudges", 0) + 1
-                        self._emit({"type": "system", "content": (
-                            "An active plan hasn't been concluded — asking for an explicit outcome "
-                            "before finishing.")})
-                        s["messages"].append({"role": "user", "content": (
-                            "[SYSTEM] You're about to give a final answer, but the active plan has no "
-                            "terminal outcome yet. First call plan_set_outcome to declare where the task "
-                            "landed: 'completed' (success criteria met AND verified), 'partial' (say what's "
-                            "left), 'blocked' (say what's blocking), or 'needs_different_approach' (say why). "
-                            "Then send your final answer."
-                        )})
+                    sig = self._handle_final_answer(s, payload, time_str)
+                    if sig == "break":
+                        break
+                    if sig == "continue":
                         continue
-
-                    # --- Review gate ---------------------------------------------
-                    # Before accepting the conclusion, an INDEPENDENT reviewer (a
-                    # separate isolated context on the same model/key) checks it for
-                    # unsupported claims, contradictions, and incomplete/unverified
-                    # work. On "revise" we inject its feedback and CONTINUE the loop
-                    # (the worker fixes the gaps, then answers again) instead of
-                    # finishing. Bounded by MAX_REVIEW_ROUNDS so it can never
-                    # deadlock — after that the answer is accepted as-is.
-                    answer_text = (payload or "").strip() if isinstance(payload, str) else str(payload or "").strip()
-                    # Only review answers that came from actual work — a bare
-                    # conversational reply (no tools, no plan, no investigation) has
-                    # nothing to independently verify, so skip the review call.
-                    _inv = investigation.get_active()
-                    did_work = (s.get("consecutive_tools", 0) > 0
-                                or planning.get_active_plan() is not None
-                                or (_inv is not None and not _inv.is_empty()))
-                    if (s.get("review_enabled") and answer_text and did_work
-                            and s.get("review_rounds", 0) < MAX_REVIEW_ROUNDS and not self._stop):
-                        self._emit({"type": "system", "content": (
-                            "Independent reviewer verifying the conclusion (evidence, contradictions, "
-                            "completeness)…")})
-                        inv = investigation.get_active()
-                        # Give the reviewer the LIVE plan (mission, success criteria,
-                        # phases, outcome) alongside the investigation evidence, so it
-                        # judges the conclusion against what the task set out to do and
-                        # the state it actually reached — not just the notes.
-                        ctx_parts = []
-                        _rev_plan = planning.get_active_plan()
-                        if _rev_plan is not None:
-                            ctx_parts.append("CURRENT PLAN:\n" + _rev_plan.to_markdown())
-                        if inv is not None and not inv.is_empty():
-                            ctx_parts.append("INVESTIGATION MEMORY:\n" + inv.to_markdown())
-                        ctx = "\n\n".join(ctx_parts)
-                        if s.get("unverified_change"):
-                            ctx += (f"\n\nNOTE: a change made by '{s['unverified_change']}' has not yet been "
-                                    "validated by an objective check (build/install/launch/test/log).")
-                        try:
-                            verdict = run_review(answer_text, task=s.get("original_task") or "",
-                                                 extra_context=ctx, max_steps=REVIEW_MAX_STEPS)
-                        except Exception as e:
-                            verdict = {"approved": True, "summary": f"review skipped ({e})", "feedback": ""}
-                        self._emit({"type": "review",
-                                    "verdict": "approve" if verdict.get("approved") else "revise",
-                                    "summary": verdict.get("summary", ""),
-                                    "unsupported_claims": verdict.get("unsupported_claims", []),
-                                    "contradictions": verdict.get("contradictions", []),
-                                    "incomplete_work": verdict.get("incomplete_work", []),
-                                    "required_actions": verdict.get("required_actions", [])})
-                        if not verdict.get("approved"):
-                            s["review_rounds"] = s.get("review_rounds", 0) + 1
-                            self._emit({"type": "system", "content": (
-                                f"Reviewer requested changes (round {s['review_rounds']}/{MAX_REVIEW_ROUNDS}): "
-                                f"{verdict.get('summary', '')}")})
-                            s["messages"].append({"role": "user", "content": (
-                                verdict.get("feedback")
-                                or "[REVIEWER] Revise and re-verify the conclusion before finalizing.")})
-                            continue  # worker addresses the feedback, then answers again
-                        self._emit({"type": "system", "content": (
-                            f"Reviewer approved the conclusion: {verdict.get('summary', '')}")})
-
-                    s["review_rounds"] = 0
-                    # Surface the tool-call salvage rate for the run. This is the
-                    # reader the counter's rationale promised: if the model went
-                    # off-protocol a lot, the operator sees it here instead of
-                    # only when a run dies. Silent when nothing was salvaged.
-                    _salvaged = SALVAGE_STATS.get("salvaged", 0)
-                    if _salvaged:
-                        self._emit({"type": "system", "content": (
-                            f"Tool-call salvage this run: {_salvaged} off-protocol "
-                            f"message(s) recovered by the parser"
-                            + (f", {SALVAGE_STATS['dropped_calls']} stacked extra call(s) "
-                               f"fed back" if SALVAGE_STATS.get("dropped_calls") else "")
-                            + ".")})
-                    self._emit({"type": "final_answer",
-                                "content": payload,
-                                "steps": s["step_count"],
-                                "time": time_str})
-                    break
                 elif response_type == "truncated":
-                    # The provider cut the reply off at the output-token cap — the
-                    # tool call never completed. Do NOT dump the raw partial (that
-                    # was the "huge text chunk" bug); tell the model WHY it failed
-                    # and how to recover (smaller outputs / chunked writes), then
-                    # continue so it retries a bounded call instead of the same one.
-                    s["step_count"] += 1
-                    s["last_tool_call"] = None
-                    self._emit({"type": "system", "content": (
-                        "The model's last response hit the output-token limit and was cut off before "
-                        "the tool call finished — re-prompting for a smaller output (large files must be "
-                        "written in parts). Raw partial output suppressed.")})
-                    s["messages"].append({"role": "user", "content": (
-                        "[SYSTEM] Your previous response was TRUNCATED at the output-token limit "
-                        "(max_tokens) — the JSON was cut off mid-way, so the tool call did not run. Do "
-                        "NOT repeat the same oversized call. Produce a SMALLER output this turn: for a "
-                        "large file, write_file the first portion, then append the remaining lines with "
-                        "further calls (e.g. run_cmd appending via base64/tee, or replace_in_file to add "
-                        "sections). Keep every response well under the limit."
-                    )})
+                    self._handle_truncated(s)
                     # fall through to the context/status housekeeping and loop again
                 else:
-                    # Still malformed after the in-turn retries. Do NOT terminate the
-                    # session — a parse failure is recoverable. Surface the model's
-                    # prose to the UI so the operator can see it, append a firm
-                    # correction, and CONTINUE the loop so it gets re-prompted next
-                    # turn. Only a real final_answer (or a user stop) ends the run.
-                    s["step_count"] += 1
-                    s["last_tool_call"] = None
-                    salvage = strip_reasoning(raw_response)
-                    self._emit({"type": "system", "content": (
-                        "Model replied outside the JSON protocol again — re-prompting for valid JSON "
-                        "(the session keeps running)." )})
-                    if salvage:
-                        self._emit({"type": "thought",
-                                    "text": _ui_trunc(salvage, UI_THOUGHT_CAP),
-                                    "thought_chars": len(salvage),
-                                    "time": time_str})
-                    s["messages"].append({"role": "user", "content": (
-                        "[SYSTEM] " + JSON_CORRECTION_MSG + " If you are finished, send a final_answer; "
-                        "otherwise issue the next tool_call. Do not reply with prose again."
-                    )})
+                    self._handle_malformed(s, raw_response, time_str)
                     # fall through to the context/status housekeeping and loop again
 
                 if self._stop:
                     self._emit({"type": "system", "content": "Generation stopped by user."})
                     break
 
-                # Context-window guard: summarize BEFORE we overflow. Fires at 80%
-                # of the active model's context window (token estimate) or after a
-                # large number of steps, then CONTINUES — the run never crashes on
-                # overflow and never terminates here.
-                # Out-of-band request bytes (native `tools=` schema array) counted
-                # alongside the messages so the guard and header reflect the true
-                # request size — the tool schemas never appear in s["messages"].
-                ctx_overhead = native_tools_payload_chars(s.get("active_toolsets"))
-                if s["step_count"] >= MAX_STEPS_BEFORE_SUMMARY or context_pressure(s["messages"], ctx_overhead):
-                    used = estimate_tokens(s["messages"]) + ctx_overhead // CHARS_PER_TOKEN
-                    self._emit({"type": "system", "content": (
-                        f"Context at ~{used} tokens (>= {int(CONTEXT_WINDOW_FRACTION*100)}% of the "
-                        f"{get_context_window()}-token window) — summarizing and continuing. "
-                        "Task and progress preserved.")})
-                    s["messages"] = summarize_memory(s["messages"], s["memory_dir"], s["original_task"], s.get("root"))
-                    s["base_system_prompt"] = s["messages"][0]["content"]
-                    self._refresh_system_prompt()
-                    s["step_count"] = 0
-                    s["consecutive_tools"] = 0
-                    s["summary_resets"] += 1
-
-                status_ev = {"type": "status",
-                             "step_count": s["step_count"],
-                             "consecutive_tools": s["consecutive_tools"],
-                             "tools_used": s.get("tools_used", 0),
-                             "ctx_chars": session_context_chars(s),
-                             "ctx_tokens": session_context_tokens(s),
-                             "ctx_budget": context_token_budget(),
-                             "summary_resets": s["summary_resets"]}
-                # Remember the latest stats so they can be persisted and restored
-                # into the header when the project is reopened.
-                s["last_status"] = status_ev
-                self._emit(status_ev)
+                self._maybe_summarize_context(s)
+                self._emit_status(s)
         except Exception as e:
             self._emit({"type": "error", "content": f"Agent loop crashed: {e}"})
         finally:
