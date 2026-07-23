@@ -1404,6 +1404,8 @@ class AgentApi:
         def work():
             try:
                 holder["results"] = subagents.run_subagents_parallel(specs, on_event=evq.put)
+            except Exception as e:
+                holder["error"] = e
             finally:
                 evq.put(_SENTINEL)
 
@@ -1417,6 +1419,20 @@ class AgentApi:
         t.join()
 
         results = holder.get("results") or []
+        if holder.get("error") is not None or len(results) != len(reads):
+            # Wave-level (infrastructure) failure, or a partial/empty result list —
+            # either way every dispatched read step already has its id in
+            # dispatched_steps, so it must be folded here or it stalls in_progress
+            # forever with no failure ever surfaced.
+            err = holder.get("error")
+            for step, name, ad in reads:
+                result = {"agent": name, "ok": False,
+                          "report": f"(delegation wave failed to start: {err})" if err is not None
+                                    else "(delegation wave returned no result for this step)",
+                          "steps": 0, "tokens": 0}
+                self._fold_delegate_result(plan, step, name, ad, result)
+            return
+
         for (step, name, ad), result in zip(reads, results):
             self._fold_delegate_result(plan, step, name, ad, result)
 
@@ -1439,33 +1455,6 @@ class AgentApi:
         if cur:
             bits.append(f"Current phase: {cur['title']}")
         return "\n".join(bits)
-
-    def _dispatch_delegated_step(self, plan, step):
-        s = self.session
-        agent_name = (step.get("delegate") or "").strip()
-        agent_def = plugins.get_agent(agent_name)
-        if agent_def is None:
-            names = ", ".join(a.name for a in plugins.list_agents()) or "(none configured)"
-            self._emit({"type": "system", "content": f"Unknown delegate agent '{agent_name}' — the agent will handle the step itself."})
-            s["messages"].append({"role": "user", "content": (
-                f"[SYSTEM] Plan step ({step['id']}) is tagged delegate='{agent_name}', but no such subagent "
-                f"exists (available: {names}). Do this step yourself, or fix/clear the delegate name.")})
-            return
-
-        task = self._compose_delegate_task(step)
-        context = self._compose_delegate_context(plan)
-        run_dir = getattr(self, "_delegate_run_dir", None)
-        self._emit({"type": "system", "content":
-                    f"Delegating step ({step['id']}) to subagent '{agent_name}' ({agent_def.mode}) in an isolated context…"})
-        self._emit({"type": "delegate_running", "agent": agent_name, "mode": agent_def.mode,
-                    "step_id": step["id"], "task": step.get("content", "")})
-        try:
-            result = subagents.run_subagent(agent_def, task, context=context, run_dir=run_dir)
-        except Exception as e:
-            result = {"ok": False, "report": f"(delegation crashed: {e})", "agent": agent_name,
-                      "artifacts": [], "steps": 0}
-
-        self._fold_delegate_result(plan, step, agent_name, agent_def, result)
 
     def _fold_delegate_result(self, plan, step, agent_name, agent_def, result):
         """Post-`run_subagent` fold-back: distill the subagent's report into the
