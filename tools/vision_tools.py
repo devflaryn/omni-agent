@@ -125,10 +125,35 @@ def analyze_image(image_path=None, image_paths=None, question=None):
         if note:
             notes.append(f"{os.path.basename(p)} {note}")
 
-    res = llm.ask_vision([{"role": "user", "content": content}])
-    if not res.get("ok"):
-        return {"error": res.get("error", "vision request failed")}
-    out = res["content"].strip()
-    prefix = f"[vision: {res.get('model', '?')}"
+    if len(paths) == 1:
+        # Single image: byte-identical image + same question is analyzed by the
+        # vision model only once (see tools/vision_cache.py).
+        model_label = {}
+
+        def _compute():
+            res = llm.ask_vision([{"role": "user", "content": content}])
+            if not res.get("ok"):
+                return None
+            model_label["model"] = res.get("model", "?")
+            return res["content"].strip()
+
+        from tools.vision_cache import cached_vision
+        out, was_cached = cached_vision(paths[0], (question or "").strip() or _DEFAULT_QUESTION, _compute)
+        if out is None:
+            return {"error": "vision request failed"}
+        # On a cache hit there is no live `res` to read a model name off of —
+        # preserve the existing "[vision: ...]" prefix shape but degrade the
+        # label gracefully instead of crashing or dropping the analysis.
+        model_bit = "cached" if was_cached else model_label.get("model", "?")
+        prefix = f"[vision: {model_bit}"
+    else:
+        # Multiple images: not cached (a cache key would need to cover every
+        # image in the batch, which the plan scopes out of this task).
+        res = llm.ask_vision([{"role": "user", "content": content}])
+        if not res.get("ok"):
+            return {"error": res.get("error", "vision request failed")}
+        out = res["content"].strip()
+        prefix = f"[vision: {res.get('model', '?')}"
+
     prefix += (" · " + "; ".join(notes) + "]") if notes else "]"
     return {"stdout": f"{prefix}\n{out}"}
