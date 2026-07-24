@@ -53,6 +53,7 @@ from docker_sandbox import setup_sandbox, set_timeout_decider
 from tool_registry import registry, CORE_GROUP
 import planning
 import investigation
+import strategy
 import tools  # Triggers the __init__.py which loads all tool categories
 from tools.reviewer import run_review
 from tools import mission_constraints
@@ -394,6 +395,12 @@ MAIN_LOOP_TEMPERATURE = 0.15
 REVIEW_ENABLED_DEFAULT = True
 MAX_REVIEW_ROUNDS = 2          # after this many revise rounds, accept and finish
 REVIEW_MAX_STEPS = 8           # verification tool calls the reviewer may make
+
+# Strategic Brief: a synthesized, pinned, adversarially-reviewed thesis that shapes
+# decisions. Behind strategy_brief_enabled; OFF is byte-identical to today.
+STRATEGY_BRIEF_DEFAULT = True
+MAX_STRATEGY_REVIEW_ROUNDS = 2   # revise rounds before the gate forces a mutation through
+STRATEGY_RESYNC_FINDINGS = 5     # new findings before nudging a brief reconcile
 
 # The workspace-mutation classification (MUTATING_TOOLS / VALIDATION_TOOLS) now
 # lives in tool_policy.py — the single source of truth shared with subagents.py
@@ -1310,13 +1317,30 @@ class AgentApi:
         # the matching base_system_prompt is built there; here we just read it, so
         # composition doesn't depend on live global config mid-run.
         native = bool(self.session.get("native_tools"))
+        strat_on = bool(self.session.get("strategy_brief_enabled"))
+        # When the Strategic Brief is OFF, suppress its toolset entirely so the
+        # prompt is byte-identical to a pre-feature build; when ON, render it in full.
+        hidden = None if strat_on else {"strategy"}
+        active = set(self.session.get("active_toolsets") or set())
+        if strat_on:
+            active = active | {"strategy"}
         # Progressive tool disclosure: render only core + activated toolsets in
         # full; everything else stays a one-line catalog until used/expanded.
-        tools_section = render_tools_section(self.session.get("active_toolsets"), native=native)
+        tools_section = render_tools_section(active, native=native, hidden_groups=hidden)
         plan = planning.get_active_plan()
         section = ""
+        # Strategic Brief pins FIRST (above plan + investigation) so it's the stable
+        # north-star the model reasons against every turn.
+        if strat_on:
+            brief = strategy.get_active()
+            if brief is not None and not brief.is_empty():
+                section += (
+                    "\n\nSTRATEGIC BRIEF (your synthesized thesis — keep it current with strategy_set / "
+                    "strategy_update; a complete brief must pass an independent strategy review before you "
+                    "may change the workspace):\n" + brief.to_markdown()
+                )
         if plan is not None:
-            section = (
+            section += (
                 "\n\nCURRENT PLAN (auto-synchronized — this reflects your own plan_* tool calls in "
                 "real time; keep it accurate as you work):\n" + plan.to_markdown()
             )
@@ -1348,6 +1372,12 @@ class AgentApi:
         structured investigation memory visible in the prompt in real time."""
         self._refresh_system_prompt()
         self._emit({"type": "investigation_update", "investigation": inv_dict})
+
+    def _on_strategy_update(self, brief_dict):
+        """Bridge from strategy.py's notify callback to the live prompt + event
+        stream (mirrors _on_plan_update / _on_investigation_update)."""
+        self._refresh_system_prompt()
+        self._emit({"type": "strategy_update", "strategy": brief_dict})
 
     # --- plan-driven delegation ------------------------------------------------
     def _maybe_dispatch_delegated_steps(self):
@@ -2151,6 +2181,10 @@ class AgentApi:
             # --- evidence-based / review workflow state ---
             "review_enabled": REVIEW_ENABLED_DEFAULT,   # gate final answers on an independent review
             "review_rounds": 0,                         # revise rounds used this task
+            # --- Strategic Brief workflow state ---
+            "strategy_brief_enabled": STRATEGY_BRIEF_DEFAULT,
+            "strategy_review_rounds": 0,        # strategy-review revise rounds this task
+            "findings_since_brief_sync": 0,     # new findings since the last brief reconcile
             "evidence_guards": True,                    # repeat-failure guard + validation nudge + file tracking
             "unverified_change": None,                  # a mutating tool ran but wasn't validated yet
             "failed_sigs": {},                          # (tool,args) signatures that failed this run
@@ -2177,6 +2211,14 @@ class AgentApi:
             "tool_fail_streak": 0,                      # consecutive failures of watchdog_tool
         }
 
+        # Strategic Brief tools live in the non-core "strategy" group; when the
+        # feature is on they must be ACTIVE so the native function-calling tools=
+        # payload (openai_tools_for(active_toolsets)) offers strategy_set/update —
+        # otherwise a native-tools model can't call them. Off: never seeded, so the
+        # active set (and the OFF prompt) is unchanged.
+        if self.session.get("strategy_brief_enabled"):
+            self.session["active_toolsets"].add("strategy")
+
         # Plan-and-execute: resume a previous in-progress plan for this
         # project (if any), otherwise start clean. notify=False here since
         # self.session isn't fully wired to _on_plan_update semantics
@@ -2197,6 +2239,11 @@ class AgentApi:
             investigation.set_active(resumed_inv, notify=False)
         else:
             investigation.clear_active(notify=False)
+
+        strategy.set_context(memory_dir, notify_callback=self._on_strategy_update)
+        _restored_brief = strategy.load_brief(memory_dir)
+        if _restored_brief is not None:
+            strategy.set_active_brief(_restored_brief, notify=False)
 
         # Per-session ephemeral state (no resume, unlike plan/investigation):
         # mission build-constraints + retry budget, and the tool-call salvage
@@ -2762,6 +2809,7 @@ class AgentApi:
         self._persist_session()
         planning.clear_active_plan(notify=False)
         planning.set_context(None, notify_callback=None)
+        strategy.set_context(None, notify_callback=None)
         self.session = None
         self._emit({"type": "session_ended"})
         return {"ok": True}
