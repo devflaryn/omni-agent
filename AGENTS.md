@@ -43,6 +43,21 @@ an APK-modding playbook (decode → map → understand → patch smallest → re
 verify; expect layered Java+native protections; confirm with frida before a
 static patch) added, so a mid-tier model makes cleverer tool choices.
 
+**Strategic Brief** (`strategy.py`, `tools/strategy_tools.py`) — a synthesized,
+always-pinned thesis (goal / protection diagnosis with evidence / chosen strategy
++ rationale / rejected alternatives / top hypothesis / kill-criteria) that shapes
+decisions where the passive plan + investigation memory did not. The model authors
+it with `strategy_set` / `strategy_update`; it pins at the TOP of the system prompt
+(above the plan and investigation memory). A diagnosis-phase gate blocks *mutating*
+tools until a complete brief passes one independent **strategy review**
+(`tools/reviewer.run_strategy_review`, reusing the reviewer engine); reads are never
+gated. Phase advances and every Nth finding nudge a reconcile; a stall reminds of the
+brief's kill-criteria. It is single-writer orchestrator state — subagents get only a
+two-line read-only slice (chosen strategy + top hypothesis) and never the `strategy_*`
+tools (they're in `tool_policy.SUBAGENT_EXCLUDED`), so parallel waves are unaffected.
+Behind `strategy_brief_enabled` (default on); off is byte-identical to a pre-feature
+build. Offline tests: `tests/test_strategy_*.py`.
+
 ## Evidence-based workflow (planner → worker → reviewer)
 
 The agent loop (`agent.AgentApi._run_agent_loop`) runs one model that plays three
