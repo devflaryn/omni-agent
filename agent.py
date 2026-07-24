@@ -1542,6 +1542,17 @@ class AgentApi:
         cur = plan.current_phase()
         if cur:
             bits.append(f"Current phase: {cur['title']}")
+        # A minimal read-only slice of the Strategic Brief so a delegated subagent
+        # pulls in the orchestrator's direction — NEVER the full brief (no diagnosis
+        # internals, rejected alternatives, or kill-criteria) and never any strategy_*
+        # tool. Subagents execute a scoped task; they do not re-strategize.
+        if self.session and self.session.get("strategy_brief_enabled"):
+            brief = strategy.get_active()
+            if brief is not None and not brief.is_empty():
+                if brief.strategy:
+                    bits.append("Chosen strategy: " + brief.strategy)
+                if brief.hypothesis:
+                    bits.append("Current top hypothesis: " + brief.hypothesis)
         return "\n".join(bits)
 
     def _fold_delegate_result(self, plan, step, agent_name, agent_def, result):
