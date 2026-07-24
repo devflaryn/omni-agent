@@ -3007,7 +3007,10 @@ class AgentApi:
                 _plan = planning.get_active_plan()
                 _phase = (_plan.current_phase() or {}).get("title", "") if _plan else ""
                 self._fire_plugin_hooks("on_phase_change", phase=_phase)
+                self._reconcile_brief_on_phase_change()
         else:
+            if tool_name == "record_finding" and not tool_failed:
+                self._note_finding_for_brief()
             s["tools_since_plan_touch"] = s.get("tools_since_plan_touch", 0) + 1
             if (planning.get_active_plan() is not None
                     and s["tools_since_plan_touch"] >= PLAN_TOUCH_NUDGE
@@ -3187,13 +3190,20 @@ class AgentApi:
                 self._emit({"type": "system", "content": (
                     f"'{tool_name}' with these exact args already failed earlier — "
                     "asking the agent to reconsider before retrying.")})
+                _kc_line = ""
+                if s.get("strategy_brief_enabled"):
+                    _b = strategy.get_active()
+                    if _b is not None and _b.kill_criteria:
+                        _kc_line = ("\nCheck your brief's kill-criteria — if one is now met, abandon this "
+                                    "strategy (strategy_update) instead of retrying: "
+                                    + "; ".join(_b.kill_criteria))
                 s["messages"].append({"role": "user", "content": (
                     f"[SYSTEM] You already ran '{tool_name}' with these EXACT arguments earlier "
                     "in this run and it FAILED. Don't blindly repeat it. Either change the "
                     "approach, or — if you now have NEW evidence it should work — record that "
                     "evidence (record_finding) and note why this attempt differs, then proceed. "
                     "If it's a genuine dead end, log it with record_failed_attempt and switch "
-                    "strategy.")})
+                    "strategy." + _kc_line)})
                 return "continue"
         return None
 
@@ -3533,6 +3543,40 @@ class AgentApi:
             self._emit({"type": "system", "content": (
                 f"Reviewer approved the conclusion: {verdict.get('summary', '')}")})
         return None
+
+    def _reconcile_brief_on_phase_change(self):
+        """A phase advance is a natural re-synthesis point: re-open the Strategic
+        Brief for an independent review (it will re-fire before the next mutation)
+        and nudge the worker to reconcile it against the new evidence."""
+        s = self.session
+        if not s.get("strategy_brief_enabled"):
+            return
+        brief = strategy.get_active()
+        if brief is None or brief.is_empty():
+            return
+        brief.reviewed = False
+        strategy.notify_updated()
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] Phase advanced — reconcile your STRATEGIC BRIEF with what you've now established "
+            "(strategy_update): is the diagnosis still right, and is this still the best strategy? It will "
+            "be independently re-reviewed before your next change.")})
+
+    def _note_finding_for_brief(self):
+        """Count a new confirmed finding; every STRATEGY_RESYNC_FINDINGS, nudge a
+        brief reconcile so the thesis keeps up with accumulating evidence."""
+        s = self.session
+        if not s.get("strategy_brief_enabled"):
+            return
+        brief = strategy.get_active()
+        if brief is None or brief.is_empty():
+            return
+        s["findings_since_brief_sync"] = s.get("findings_since_brief_sync", 0) + 1
+        if s["findings_since_brief_sync"] >= STRATEGY_RESYNC_FINDINGS:
+            s["findings_since_brief_sync"] = 0
+            s["messages"].append({"role": "user", "content": (
+                "[SYSTEM] Several new findings since your last strategy sync — reconcile the STRATEGIC "
+                "BRIEF (strategy_update): confirm the diagnosis and top hypothesis still hold, and adjust "
+                "the strategy if the evidence has moved.")})
 
     def _run_strategy_review_gate(self, s, brief):
         """Independently review the Strategic Brief before the first mutation. On
