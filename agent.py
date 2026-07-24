@@ -55,7 +55,7 @@ import planning
 import investigation
 import strategy
 import tools  # Triggers the __init__.py which loads all tool categories
-from tools.reviewer import run_review
+from tools.reviewer import run_review, run_strategy_review
 from tools import mission_constraints
 from tools.output_distillers import NOISY_TOOLS, distill as distill_output
 import subagents  # generalized isolated-context subagent engine
@@ -3106,6 +3106,25 @@ class AgentApi:
             )})
             return "continue"
 
+        # Diagnosis-phase gate: before CHANGING the workspace, require a complete
+        # Strategic Brief that has passed one independent strategy review. Reads are
+        # never gated (recon stays free), so a read-only run can never deadlock here.
+        if s.get("strategy_brief_enabled") and tool_name in MUTATING_TOOLS:
+            brief = strategy.get_active()
+            if brief is None or not brief.required_present():
+                self._emit({"type": "system", "content": (
+                    "About to change the workspace with no diagnosed strategy yet — asking for a "
+                    "Strategic Brief first.")})
+                s["messages"].append({"role": "user", "content": (
+                    "[SYSTEM] STRATEGIC BRIEF REQUIRED before changing the workspace. You've done recon; "
+                    "now synthesize it: call strategy_set with the goal, the diagnosis (each protection "
+                    "with a file:line/symbol evidence pointer), and the chosen strategy (plus rationale, "
+                    "rejected alternatives, and kill-criteria if you can). It will be independently reviewed "
+                    "before your first change. Read/inspection tools remain free.")})
+                return "continue"
+            if not brief.reviewed:
+                return self._run_strategy_review_gate(s, brief)
+
         # Plan-and-execute gate — INSPECT FREELY, PLAN WHEN READY. A new task does NOT
         # have to be planned before inspecting: in adaptive mode every non-mutating
         # tool runs with no plan and no cap. The ONLY plan gate is a SINGLE soft nudge
@@ -3503,6 +3522,49 @@ class AgentApi:
             self._emit({"type": "system", "content": (
                 f"Reviewer approved the conclusion: {verdict.get('summary', '')}")})
         return None
+
+    def _run_strategy_review_gate(self, s, brief):
+        """Independently review the Strategic Brief before the first mutation. On
+        approve, mark it reviewed and return None (let the mutation proceed). On
+        revise, inject the reviewer's feedback and return "continue" so the worker
+        fixes the brief. Bounded by MAX_STRATEGY_REVIEW_ROUNDS — after the cap it
+        forces the brief through (reviewed=True) so the gate can never deadlock."""
+        if s.get("strategy_review_rounds", 0) >= MAX_STRATEGY_REVIEW_ROUNDS:
+            brief.reviewed = True
+            strategy.notify_updated()
+            return None
+        self._emit({"type": "system", "content": (
+            "Independent strategy reviewer pressure-testing the brief (diagnosis, better-strategy, order)…")})
+        ctx_parts = []
+        _plan = planning.get_active_plan()
+        if _plan is not None:
+            ctx_parts.append("CURRENT PLAN:\n" + _plan.to_markdown())
+        _inv = investigation.get_active()
+        if _inv is not None and not _inv.is_empty():
+            ctx_parts.append("INVESTIGATION MEMORY:\n" + _inv.to_markdown())
+        ctx = "\n\n".join(ctx_parts)
+        try:
+            verdict = run_strategy_review(brief.to_markdown(), task=s.get("original_task") or "",
+                                          extra_context=ctx, max_steps=REVIEW_MAX_STEPS)
+        except Exception as e:
+            verdict = {"approved": True, "summary": f"strategy review skipped ({e})", "feedback": ""}
+        self._emit({"type": "strategy_review",
+                    "verdict": "approve" if verdict.get("approved") else "revise",
+                    "summary": verdict.get("summary", ""),
+                    "unsupported_claims": verdict.get("unsupported_claims", []),
+                    "contradictions": verdict.get("contradictions", []),
+                    "incomplete_work": verdict.get("incomplete_work", []),
+                    "required_actions": verdict.get("required_actions", [])})
+        if verdict.get("approved"):
+            brief.reviewed = True
+            strategy.notify_updated()
+            self._emit({"type": "system", "content": (
+                f"Strategy approved: {verdict.get('summary', '')}")})
+            return None
+        s["strategy_review_rounds"] = s.get("strategy_review_rounds", 0) + 1
+        s["messages"].append({"role": "user", "content": (
+            verdict.get("feedback") or "[STRATEGY REVIEWER] Revise the brief before changing anything.")})
+        return "continue"
 
     def _handle_final_answer(self, s, payload, time_str):
         """Accept-or-send-back gate for a final answer. The plugin on_final_answer
