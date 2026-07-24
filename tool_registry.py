@@ -24,6 +24,7 @@ _GROUP_BY_MODULE = {
     "codebase_qa": CORE_GROUP,
     "plan_tools": CORE_GROUP,
     "investigation_tools": CORE_GROUP,
+    "strategy_tools": "strategy",
     "skill_tools": CORE_GROUP,
     "reviewer": CORE_GROUP,
     "web_tools": CORE_GROUP,
@@ -57,6 +58,7 @@ _GROUP_BY_TOOL = {
 }
 # Human-facing one-liners for the on-demand toolset headers in the catalog.
 GROUP_LABELS = {
+    "strategy": "author / revise the pinned Strategic Brief (goal + diagnosis + chosen strategy)",
     "apk": "APK unpack / decode / rebuild / sign / inspect / manifest",
     "smali": "standalone DEX & smali disassembly / method+field patching",
     "native": "native .so analysis + byte / assembly / C patching",
@@ -161,7 +163,7 @@ class ToolRegistry:
         """Full schema blocks for every tool in a group, concatenated."""
         return "".join(self._full_block(n) for n in self.tools_in_group(group))
 
-    def get_tool_prompt(self, allowed_tools=None, active_groups=None, native=False):
+    def get_tool_prompt(self, allowed_tools=None, active_groups=None, native=False, hidden_groups=None):
         """
         Generates the system prompt segment listing available tools. Each full
         entry is compact — name, what it does, when to use it, params, output —
@@ -183,9 +185,20 @@ class ToolRegistry:
         protocol. The index still lets the model choose tools and pick skills.
 
         allowed_tools (if given) still hard-filters the visible surface.
+
+        hidden_groups (if given) omits those toolset groups ENTIRELY, in every
+        render path (native index, legacy full, and progressive catalog) — no
+        full block, no catalog line, no header. Used to drop a whole feature's
+        tools (e.g. "strategy") from the prompt when the feature is flagged off.
         """
+        hidden = set(hidden_groups or ())
+
         def visible(name):
-            return allowed_tools is None or name in allowed_tools
+            if allowed_tools is not None and name not in allowed_tools:
+                return False
+            if hidden and self.group_of(name) in hidden:
+                return False
+            return True
 
         if native:
             prompt = (
