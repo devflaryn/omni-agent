@@ -10,13 +10,7 @@ import strategy
 def _render(action):
     b = strategy.get_active()
     body = b.to_markdown() if b is not None else "(no brief)"
-    missing = []
-    if b is None or not b.goal:
-        missing.append("goal")
-    if b is None or not b.diagnosis:
-        missing.append("diagnosis")
-    if b is None or not b.strategy:
-        missing.append("strategy")
+    missing = [f for f in strategy.REQUIRED if b is None or not getattr(b, f)]
     tail = ""
     if missing:
         tail = ("\n\nStill required before you can start CHANGING the workspace: "

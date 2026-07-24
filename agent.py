@@ -2341,6 +2341,8 @@ class AgentApi:
         s["tools_used"] = 0
         s["last_status"] = None
         s["review_rounds"] = 0
+        s["strategy_review_rounds"] = 0
+        s["findings_since_brief_sync"] = 0
         s["unverified_change"] = None
         s["failed_sigs"] = {}
         s["failed_sig_warned"] = set()
@@ -2386,6 +2388,8 @@ class AgentApi:
         self.session["skill_loaded"] = False
         # Fresh task -> reset the review/evidence guards for this task.
         self.session["review_rounds"] = 0
+        self.session["strategy_review_rounds"] = 0
+        self.session["findings_since_brief_sync"] = 0
         self.session["unverified_change"] = None
         self.session["failed_sigs"] = {}
         self.session["failed_sig_warned"] = set()
@@ -3587,6 +3591,9 @@ class AgentApi:
         if s.get("strategy_review_rounds", 0) >= MAX_STRATEGY_REVIEW_ROUNDS:
             brief.reviewed = True
             strategy.notify_updated()
+            s["strategy_review_rounds"] = 0
+            self._emit({"type": "system", "content": (
+                "Strategy review round cap reached — proceeding with the current brief (still contested).")})
             return None
         self._emit({"type": "system", "content": (
             "Independent strategy reviewer pressure-testing the brief (diagnosis, better-strategy, order)…")})
@@ -3613,6 +3620,7 @@ class AgentApi:
         if verdict.get("approved"):
             brief.reviewed = True
             strategy.notify_updated()
+            s["strategy_review_rounds"] = 0
             self._emit({"type": "system", "content": (
                 f"Strategy approved: {verdict.get('summary', '')}")})
             return None

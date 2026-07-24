@@ -106,7 +106,7 @@ class StrategicBrief:
         return not (self.goal or self.diagnosis or self.strategy)
 
     def required_present(self):
-        return bool(self.goal and self.diagnosis and self.strategy)
+        return all(getattr(self, f) for f in REQUIRED)
 
     def to_markdown(self):
         lines = []
