@@ -83,6 +83,41 @@ negligible). Otherwise use "revise" and fill required_actions with concrete, act
 tool at a time; investigate before you rule."""
 
 
+_STRATEGY_REVIEWER_SYSTEM_PROMPT = """You are an independent, skeptical STRATEGY REVIEWER in an isolated \
+session. A worker agent is about to start CHANGING an app based on a STRATEGIC BRIEF: a diagnosis of the \
+target's protections and a chosen attack. Your job is NOT to be agreeable — it is to find, BEFORE any change \
+is made, whether the strategy is aimed wrong: a mis-diagnosed protection, a better/simpler attack it skipped, \
+an attack order that will fail, or a diagnosis claim with no real evidence.
+
+You share the worker's read-only view (code graph, grep/find, file read, disassembly, decompilation, and the \
+worker's investigation memory). You cannot modify or run anything — you only verify the PLAN OF ATTACK.
+
+HOW TO REVIEW THE STRATEGY:
+1. EVIDENCE. For each diagnosis claim, check the cited evidence actually supports it (open the file:line, \
+confirm the class/method/string/symbol). A protection claim with no checkable evidence is UNSUPPORTED.
+2. BETTER-STRATEGY PASS. Actively look for a stronger or simpler attack the brief missed, or a second code \
+path/protection layer the strategy does not cover (e.g. a native probe in a .so when the plan only patches \
+smali). Spend at least one step trying to prove the strategy is not the best one.
+3. ORDER & KILL-CRITERIA. Check the attack order is sound (e.g. confirm-with-frida before a static patch on \
+layered protections) and that the kill-criteria are concrete enough to know when to abandon it.
+4. Be fair: only demand a revision for a REAL problem (unsupported diagnosis, a materially better/necessary \
+strategy, an order that will fail). If the strategy is well-diagnosed and sound, APPROVE it.
+
+RESPONSE FORMAT — always a single raw JSON object, no markdown, no prose outside it.
+To use a tool: {"type": "tool_call", "tool": "<name>", "args": { ... }}
+Verdict: {"type": "final_answer", "content": {
+  "verdict": "approve" | "revise",
+  "summary": "<one or two sentences>",
+  "unsupported_claims": ["<diagnosis claim lacking evidence>", ...],
+  "contradictions": ["<a better strategy, missed layer, or wrong-order risk>", ...],
+  "incomplete_work": ["<a gap the brief must fill before execution>", ...],
+  "required_actions": ["<concrete change to the brief/strategy>", ...]
+}}
+Use "approve" ONLY when unsupported_claims, contradictions and incomplete_work are all empty (or truly \
+negligible). Otherwise "revise" with concrete required_actions. Call one tool at a time; investigate before \
+you rule."""
+
+
 def _parse_response(raw):
     data = extract_json_action(raw or "")
     if data is None:
@@ -212,6 +247,24 @@ def _format_feedback(v):
     return "\n".join(lines)
 
 
+def _format_strategy_feedback(v):
+    """Render a strategy-review verdict into the corrective message the worker gets."""
+    lines = ["[STRATEGY REVIEWER — REVISION REQUIRED] An independent review of your STRATEGIC BRIEF found "
+             "problems. Fix the brief with strategy_update before you start changing the workspace."]
+    if v.get("summary"):
+        lines.append(f"Summary: {v['summary']}")
+    for label, key in (("Unsupported diagnosis (no checkable evidence)", "unsupported_claims"),
+                       ("Better strategy / missed layer / wrong order", "contradictions"),
+                       ("Gaps to fill before execution", "incomplete_work"),
+                       ("Required changes to the brief", "required_actions")):
+        items = v.get(key) or []
+        if items:
+            lines.append(label + ":")
+            lines.extend(f"  - {it}" for it in items)
+    lines.append("Revise the brief (strategy_update) to address these, then continue.")
+    return "\n".join(lines)
+
+
 def run_review(conclusion, task="", extra_context="", max_steps=DEFAULT_REVIEW_STEPS):
     """Independently review a worker conclusion. Returns a normalized verdict dict:
     {approved, verdict, summary, unsupported_claims, contradictions,
@@ -306,6 +359,98 @@ def run_review(conclusion, task="", extra_context="", max_steps=DEFAULT_REVIEW_S
         # Never let a reviewer/infrastructure failure block the worker.
         return {"approved": True, "verdict": "approve",
                 "summary": f"Review skipped (reviewer error: {e}).",
+                "unsupported_claims": [], "contradictions": [], "incomplete_work": [],
+                "required_actions": [], "feedback": "", "steps": 0}
+
+
+def run_strategy_review(brief_markdown, task="", extra_context="", max_steps=DEFAULT_REVIEW_STEPS):
+    """Independently review a STRATEGIC BRIEF before execution. Same verdict shape as
+    run_review; never raises for review reasons (a failure yields a conservative,
+    non-blocking approve so the diagnosis gate can never deadlock on infrastructure)."""
+    brief_markdown = (brief_markdown or "").strip()
+    if not brief_markdown:
+        return {"approved": True, "verdict": "approve", "summary": "No brief to review.",
+                "unsupported_claims": [], "contradictions": [], "incomplete_work": [],
+                "required_actions": [], "feedback": "", "steps": 0}
+    try:
+        max_steps = max(1, min(int(max_steps), MAX_STEPS_CAP))
+    except (TypeError, ValueError):
+        max_steps = DEFAULT_REVIEW_STEPS
+
+    tool_prompt = registry.get_tool_prompt(allowed_tools=REVIEWER_TOOLS)
+    system_prompt = _STRATEGY_REVIEWER_SYSTEM_PROMPT + "\n\n" + tool_prompt
+    user = "THE TASK:\n" + (task or "(not provided)") + "\n\n"
+    user += "THE STRATEGIC BRIEF TO REVIEW (the plan of attack, before any change):\n" + brief_markdown + "\n"
+    if (extra_context or "").strip():
+        user += "\nADDITIONAL CONTEXT / INVESTIGATION MEMORY:\n" + extra_context.strip() + "\n"
+    user += ("\nReview this strategy now. Verify the diagnosis evidence, run a better-strategy pass, check the "
+             "order and kill-criteria, then return your verdict JSON.")
+
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": user}]
+
+    steps = 0
+    last_sig = None
+    repeats = 0
+    parse_errors = 0
+    try:
+        while steps < max_steps:
+            raw = ask_llm(messages, temperature=SUBAGENT_TEMPERATURE)
+            rtype, payload = _parse_response(raw)
+            messages.append({"role": "assistant", "content": raw})
+
+            if rtype == "final_answer":
+                v = _coerce_verdict(payload)
+                v["steps"] = steps
+                v["feedback"] = "" if v["approved"] else _format_strategy_feedback(v)
+                return v
+
+            if rtype == "error":
+                parse_errors += 1
+                if parse_errors >= 3:
+                    v = _coerce_verdict(strip_reasoning(raw))
+                    v["steps"] = steps
+                    v["feedback"] = "" if v["approved"] else _format_strategy_feedback(v)
+                    return v
+                messages.append({"role": "user", "content": (
+                    "Your last reply was not valid JSON. Reply with a single raw JSON object: either a "
+                    'tool_call or your verdict {"type":"final_answer","content":{"verdict":...}}.')})
+                continue
+            parse_errors = 0
+
+            tool_name = payload.get("tool")
+            tool_args = payload.get("args", {}) or {}
+            sig = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
+            if sig == last_sig:
+                repeats += 1
+            else:
+                repeats, last_sig = 1, sig
+            if repeats >= REPEAT_LIMIT:
+                messages.append({"role": "user", "content": (
+                    f"[SYSTEM] You've called '{tool_name}' identically {repeats} times. Stop looping — "
+                    "try a different check or give your verdict.")})
+                repeats = 0
+                continue
+
+            steps += 1
+            feedback = _execute_readonly(tool_name, tool_args)
+            messages.append({"role": "user", "content": f"TOOL RESULT:\n{feedback}"})
+
+            if _estimate_chars(messages) > REVIEW_CONTEXT_CHAR_LIMIT:
+                break
+
+        messages.append({"role": "user", "content": (
+            "[SYSTEM] Review budget reached. Give your verdict now as "
+            '{"type":"final_answer","content":{"verdict":...}} based on what you have checked.')})
+        raw = ask_llm(messages, temperature=SUBAGENT_TEMPERATURE)
+        _, payload = _parse_response(raw)
+        v = _coerce_verdict(payload if payload else raw)
+        v["steps"] = steps
+        v["feedback"] = "" if v["approved"] else _format_strategy_feedback(v)
+        return v
+    except Exception as e:
+        return {"approved": True, "verdict": "approve",
+                "summary": f"Strategy review skipped (reviewer error: {e}).",
                 "unsupported_claims": [], "contradictions": [], "incomplete_work": [],
                 "required_actions": [], "feedback": "", "steps": 0}
 

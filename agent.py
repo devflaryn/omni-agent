@@ -53,8 +53,9 @@ from docker_sandbox import setup_sandbox, set_timeout_decider
 from tool_registry import registry, CORE_GROUP
 import planning
 import investigation
+import strategy
 import tools  # Triggers the __init__.py which loads all tool categories
-from tools.reviewer import run_review
+from tools.reviewer import run_review, run_strategy_review
 from tools import mission_constraints
 from tools.output_distillers import NOISY_TOOLS, distill as distill_output
 import subagents  # generalized isolated-context subagent engine
@@ -394,6 +395,12 @@ MAIN_LOOP_TEMPERATURE = 0.15
 REVIEW_ENABLED_DEFAULT = True
 MAX_REVIEW_ROUNDS = 2          # after this many revise rounds, accept and finish
 REVIEW_MAX_STEPS = 8           # verification tool calls the reviewer may make
+
+# Strategic Brief: a synthesized, pinned, adversarially-reviewed thesis that shapes
+# decisions. Behind strategy_brief_enabled; OFF is byte-identical to today.
+STRATEGY_BRIEF_DEFAULT = True
+MAX_STRATEGY_REVIEW_ROUNDS = 2   # revise rounds before the gate forces a mutation through
+STRATEGY_RESYNC_FINDINGS = 5     # new findings before nudging a brief reconcile
 
 # The workspace-mutation classification (MUTATING_TOOLS / VALIDATION_TOOLS) now
 # lives in tool_policy.py — the single source of truth shared with subagents.py
@@ -1310,13 +1317,30 @@ class AgentApi:
         # the matching base_system_prompt is built there; here we just read it, so
         # composition doesn't depend on live global config mid-run.
         native = bool(self.session.get("native_tools"))
+        strat_on = bool(self.session.get("strategy_brief_enabled"))
+        # When the Strategic Brief is OFF, suppress its toolset entirely so the
+        # prompt is byte-identical to a pre-feature build; when ON, render it in full.
+        hidden = None if strat_on else {"strategy"}
+        active = set(self.session.get("active_toolsets") or set())
+        if strat_on:
+            active = active | {"strategy"}
         # Progressive tool disclosure: render only core + activated toolsets in
         # full; everything else stays a one-line catalog until used/expanded.
-        tools_section = render_tools_section(self.session.get("active_toolsets"), native=native)
+        tools_section = render_tools_section(active, native=native, hidden_groups=hidden)
         plan = planning.get_active_plan()
         section = ""
+        # Strategic Brief pins FIRST (above plan + investigation) so it's the stable
+        # north-star the model reasons against every turn.
+        if strat_on:
+            brief = strategy.get_active()
+            if brief is not None and not brief.is_empty():
+                section += (
+                    "\n\nSTRATEGIC BRIEF (your synthesized thesis — keep it current with strategy_set / "
+                    "strategy_update; a complete brief must pass an independent strategy review before you "
+                    "may change the workspace):\n" + brief.to_markdown()
+                )
         if plan is not None:
-            section = (
+            section += (
                 "\n\nCURRENT PLAN (auto-synchronized — this reflects your own plan_* tool calls in "
                 "real time; keep it accurate as you work):\n" + plan.to_markdown()
             )
@@ -1348,6 +1372,12 @@ class AgentApi:
         structured investigation memory visible in the prompt in real time."""
         self._refresh_system_prompt()
         self._emit({"type": "investigation_update", "investigation": inv_dict})
+
+    def _on_strategy_update(self, brief_dict):
+        """Bridge from strategy.py's notify callback to the live prompt + event
+        stream (mirrors _on_plan_update / _on_investigation_update)."""
+        self._refresh_system_prompt()
+        self._emit({"type": "strategy_update", "strategy": brief_dict})
 
     # --- plan-driven delegation ------------------------------------------------
     def _maybe_dispatch_delegated_steps(self):
@@ -1512,6 +1542,17 @@ class AgentApi:
         cur = plan.current_phase()
         if cur:
             bits.append(f"Current phase: {cur['title']}")
+        # A minimal read-only slice of the Strategic Brief so a delegated subagent
+        # pulls in the orchestrator's direction — NEVER the full brief (no diagnosis
+        # internals, rejected alternatives, or kill-criteria) and never any strategy_*
+        # tool. Subagents execute a scoped task; they do not re-strategize.
+        if self.session and self.session.get("strategy_brief_enabled"):
+            brief = strategy.get_active()
+            if brief is not None and not brief.is_empty():
+                if brief.strategy:
+                    bits.append("Chosen strategy: " + brief.strategy)
+                if brief.hypothesis:
+                    bits.append("Current top hypothesis: " + brief.hypothesis)
         return "\n".join(bits)
 
     def _fold_delegate_result(self, plan, step, agent_name, agent_def, result):
@@ -2151,6 +2192,10 @@ class AgentApi:
             # --- evidence-based / review workflow state ---
             "review_enabled": REVIEW_ENABLED_DEFAULT,   # gate final answers on an independent review
             "review_rounds": 0,                         # revise rounds used this task
+            # --- Strategic Brief workflow state ---
+            "strategy_brief_enabled": STRATEGY_BRIEF_DEFAULT,
+            "strategy_review_rounds": 0,        # strategy-review revise rounds this task
+            "findings_since_brief_sync": 0,     # new findings since the last brief reconcile
             "evidence_guards": True,                    # repeat-failure guard + validation nudge + file tracking
             "unverified_change": None,                  # a mutating tool ran but wasn't validated yet
             "failed_sigs": {},                          # (tool,args) signatures that failed this run
@@ -2177,6 +2222,14 @@ class AgentApi:
             "tool_fail_streak": 0,                      # consecutive failures of watchdog_tool
         }
 
+        # Strategic Brief tools live in the non-core "strategy" group; when the
+        # feature is on they must be ACTIVE so the native function-calling tools=
+        # payload (openai_tools_for(active_toolsets)) offers strategy_set/update —
+        # otherwise a native-tools model can't call them. Off: never seeded, so the
+        # active set (and the OFF prompt) is unchanged.
+        if self.session.get("strategy_brief_enabled"):
+            self.session["active_toolsets"].add("strategy")
+
         # Plan-and-execute: resume a previous in-progress plan for this
         # project (if any), otherwise start clean. notify=False here since
         # self.session isn't fully wired to _on_plan_update semantics
@@ -2197,6 +2250,11 @@ class AgentApi:
             investigation.set_active(resumed_inv, notify=False)
         else:
             investigation.clear_active(notify=False)
+
+        strategy.set_context(memory_dir, notify_callback=self._on_strategy_update)
+        _restored_brief = strategy.load_brief(memory_dir)
+        if _restored_brief is not None:
+            strategy.set_active_brief(_restored_brief, notify=False)
 
         # Per-session ephemeral state (no resume, unlike plan/investigation):
         # mission build-constraints + retry budget, and the tool-call salvage
@@ -2283,6 +2341,8 @@ class AgentApi:
         s["tools_used"] = 0
         s["last_status"] = None
         s["review_rounds"] = 0
+        s["strategy_review_rounds"] = 0
+        s["findings_since_brief_sync"] = 0
         s["unverified_change"] = None
         s["failed_sigs"] = {}
         s["failed_sig_warned"] = set()
@@ -2328,6 +2388,8 @@ class AgentApi:
         self.session["skill_loaded"] = False
         # Fresh task -> reset the review/evidence guards for this task.
         self.session["review_rounds"] = 0
+        self.session["strategy_review_rounds"] = 0
+        self.session["findings_since_brief_sync"] = 0
         self.session["unverified_change"] = None
         self.session["failed_sigs"] = {}
         self.session["failed_sig_warned"] = set()
@@ -2762,6 +2824,7 @@ class AgentApi:
         self._persist_session()
         planning.clear_active_plan(notify=False)
         planning.set_context(None, notify_callback=None)
+        strategy.set_context(None, notify_callback=None)
         self.session = None
         self._emit({"type": "session_ended"})
         return {"ok": True}
@@ -2948,7 +3011,10 @@ class AgentApi:
                 _plan = planning.get_active_plan()
                 _phase = (_plan.current_phase() or {}).get("title", "") if _plan else ""
                 self._fire_plugin_hooks("on_phase_change", phase=_phase)
+                self._reconcile_brief_on_phase_change()
         else:
+            if tool_name == "record_finding" and not tool_failed:
+                self._note_finding_for_brief()
             s["tools_since_plan_touch"] = s.get("tools_since_plan_touch", 0) + 1
             if (planning.get_active_plan() is not None
                     and s["tools_since_plan_touch"] >= PLAN_TOUCH_NUDGE
@@ -3058,6 +3124,25 @@ class AgentApi:
             )})
             return "continue"
 
+        # Diagnosis-phase gate: before CHANGING the workspace, require a complete
+        # Strategic Brief that has passed one independent strategy review. Reads are
+        # never gated (recon stays free), so a read-only run can never deadlock here.
+        if s.get("strategy_brief_enabled") and tool_name in MUTATING_TOOLS:
+            brief = strategy.get_active()
+            if brief is None or not brief.required_present():
+                self._emit({"type": "system", "content": (
+                    "About to change the workspace with no diagnosed strategy yet — asking for a "
+                    "Strategic Brief first.")})
+                s["messages"].append({"role": "user", "content": (
+                    "[SYSTEM] STRATEGIC BRIEF REQUIRED before changing the workspace. You've done recon; "
+                    "now synthesize it: call strategy_set with the goal, the diagnosis (each protection "
+                    "with a file:line/symbol evidence pointer), and the chosen strategy (plus rationale, "
+                    "rejected alternatives, and kill-criteria if you can). It will be independently reviewed "
+                    "before your first change. Read/inspection tools remain free.")})
+                return "continue"
+            if not brief.reviewed:
+                return self._run_strategy_review_gate(s, brief)
+
         # Plan-and-execute gate — INSPECT FREELY, PLAN WHEN READY. A new task does NOT
         # have to be planned before inspecting: in adaptive mode every non-mutating
         # tool runs with no plan and no cap. The ONLY plan gate is a SINGLE soft nudge
@@ -3109,13 +3194,20 @@ class AgentApi:
                 self._emit({"type": "system", "content": (
                     f"'{tool_name}' with these exact args already failed earlier — "
                     "asking the agent to reconsider before retrying.")})
+                _kc_line = ""
+                if s.get("strategy_brief_enabled"):
+                    _b = strategy.get_active()
+                    if _b is not None and _b.kill_criteria:
+                        _kc_line = ("\nCheck your brief's kill-criteria — if one is now met, abandon this "
+                                    "strategy (strategy_update) instead of retrying: "
+                                    + "; ".join(_b.kill_criteria))
                 s["messages"].append({"role": "user", "content": (
                     f"[SYSTEM] You already ran '{tool_name}' with these EXACT arguments earlier "
                     "in this run and it FAILED. Don't blindly repeat it. Either change the "
                     "approach, or — if you now have NEW evidence it should work — record that "
                     "evidence (record_finding) and note why this attempt differs, then proceed. "
                     "If it's a genuine dead end, log it with record_failed_attempt and switch "
-                    "strategy.")})
+                    "strategy." + _kc_line)})
                 return "continue"
         return None
 
@@ -3455,6 +3547,87 @@ class AgentApi:
             self._emit({"type": "system", "content": (
                 f"Reviewer approved the conclusion: {verdict.get('summary', '')}")})
         return None
+
+    def _reconcile_brief_on_phase_change(self):
+        """A phase advance is a natural re-synthesis point: re-open the Strategic
+        Brief for an independent review (it will re-fire before the next mutation)
+        and nudge the worker to reconcile it against the new evidence."""
+        s = self.session
+        if not s.get("strategy_brief_enabled"):
+            return
+        brief = strategy.get_active()
+        if brief is None or brief.is_empty():
+            return
+        brief.reviewed = False
+        strategy.notify_updated()
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] Phase advanced — reconcile your STRATEGIC BRIEF with what you've now established "
+            "(strategy_update): is the diagnosis still right, and is this still the best strategy? It will "
+            "be independently re-reviewed before your next change.")})
+
+    def _note_finding_for_brief(self):
+        """Count a new confirmed finding; every STRATEGY_RESYNC_FINDINGS, nudge a
+        brief reconcile so the thesis keeps up with accumulating evidence."""
+        s = self.session
+        if not s.get("strategy_brief_enabled"):
+            return
+        brief = strategy.get_active()
+        if brief is None or brief.is_empty():
+            return
+        s["findings_since_brief_sync"] = s.get("findings_since_brief_sync", 0) + 1
+        if s["findings_since_brief_sync"] >= STRATEGY_RESYNC_FINDINGS:
+            s["findings_since_brief_sync"] = 0
+            s["messages"].append({"role": "user", "content": (
+                "[SYSTEM] Several new findings since your last strategy sync — reconcile the STRATEGIC "
+                "BRIEF (strategy_update): confirm the diagnosis and top hypothesis still hold, and adjust "
+                "the strategy if the evidence has moved.")})
+
+    def _run_strategy_review_gate(self, s, brief):
+        """Independently review the Strategic Brief before the first mutation. On
+        approve, mark it reviewed and return None (let the mutation proceed). On
+        revise, inject the reviewer's feedback and return "continue" so the worker
+        fixes the brief. Bounded by MAX_STRATEGY_REVIEW_ROUNDS — after the cap it
+        forces the brief through (reviewed=True) so the gate can never deadlock."""
+        if s.get("strategy_review_rounds", 0) >= MAX_STRATEGY_REVIEW_ROUNDS:
+            brief.reviewed = True
+            strategy.notify_updated()
+            s["strategy_review_rounds"] = 0
+            self._emit({"type": "system", "content": (
+                "Strategy review round cap reached — proceeding with the current brief (still contested).")})
+            return None
+        self._emit({"type": "system", "content": (
+            "Independent strategy reviewer pressure-testing the brief (diagnosis, better-strategy, order)…")})
+        ctx_parts = []
+        _plan = planning.get_active_plan()
+        if _plan is not None:
+            ctx_parts.append("CURRENT PLAN:\n" + _plan.to_markdown())
+        _inv = investigation.get_active()
+        if _inv is not None and not _inv.is_empty():
+            ctx_parts.append("INVESTIGATION MEMORY:\n" + _inv.to_markdown())
+        ctx = "\n\n".join(ctx_parts)
+        try:
+            verdict = run_strategy_review(brief.to_markdown(), task=s.get("original_task") or "",
+                                          extra_context=ctx, max_steps=REVIEW_MAX_STEPS)
+        except Exception as e:
+            verdict = {"approved": True, "summary": f"strategy review skipped ({e})", "feedback": ""}
+        self._emit({"type": "strategy_review",
+                    "verdict": "approve" if verdict.get("approved") else "revise",
+                    "summary": verdict.get("summary", ""),
+                    "unsupported_claims": verdict.get("unsupported_claims", []),
+                    "contradictions": verdict.get("contradictions", []),
+                    "incomplete_work": verdict.get("incomplete_work", []),
+                    "required_actions": verdict.get("required_actions", [])})
+        if verdict.get("approved"):
+            brief.reviewed = True
+            strategy.notify_updated()
+            s["strategy_review_rounds"] = 0
+            self._emit({"type": "system", "content": (
+                f"Strategy approved: {verdict.get('summary', '')}")})
+            return None
+        s["strategy_review_rounds"] = s.get("strategy_review_rounds", 0) + 1
+        s["messages"].append({"role": "user", "content": (
+            verdict.get("feedback") or "[STRATEGY REVIEWER] Revise the brief before changing anything.")})
+        return "continue"
 
     def _handle_final_answer(self, s, payload, time_str):
         """Accept-or-send-back gate for a final answer. The plugin on_final_answer

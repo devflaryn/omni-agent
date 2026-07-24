@@ -310,7 +310,7 @@ APK MODDING PLAYBOOK (the core mission — decode → map → understand → pat
     return prompt
 
 
-def render_tools_section(active_groups=None, native=False):
+def render_tools_section(active_groups=None, native=False, hidden_groups=None):
     """The AVAILABLE TOOLS section of the prompt, honoring progressive
     disclosure. active_groups=None renders EVERY tool in full (legacy behavior,
     used by isolated sub-agents/tests); a set renders core + active domain
@@ -319,8 +319,13 @@ def render_tools_section(active_groups=None, native=False):
     native=True renders a COMPACT name+summary index only (no JSON call-format
     header, no full param blocks) — the authoritative schemas ride in the
     request's `tools=` array, so duplicating them as text just wastes context and
-    contradicts the function-calling protocol."""
-    return registry.get_tool_prompt(active_groups=active_groups, native=native)
+    contradicts the function-calling protocol.
+
+    hidden_groups (if given) omits those toolset groups entirely from every
+    render path — used to suppress a whole feature's tools (e.g. "strategy")
+    when the feature's flag is off."""
+    return registry.get_tool_prompt(active_groups=active_groups, native=native,
+                                    hidden_groups=hidden_groups)
 
 
 def get_full_system_prompt(active_groups=None, native=False):

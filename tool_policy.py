@@ -92,7 +92,8 @@ READONLY_OPTIN_TOOLS = {
 # from EVERY subagent's tool surface so delegation can't recurse (a subagent may
 # not dispatch more subagents, ask_codebase, or run a review — that stays the
 # orchestrator's job and keeps depth and cost bounded).
-SUBAGENT_EXCLUDED = {"dispatch_agents", "ask_codebase", "review_conclusion"}
+SUBAGENT_EXCLUDED = {"dispatch_agents", "ask_codebase", "review_conclusion",
+                     "strategy_set", "strategy_update"}
 
 
 def is_mutating_tool(name):

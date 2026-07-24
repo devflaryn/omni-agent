@@ -18,6 +18,7 @@ import tools.session_bootstrap
 import tools.frida_tools
 import tools.plan_tools
 import tools.investigation_tools
+import tools.strategy_tools
 import tools.learned_technique
 import tools.skill_tools
 import tools.codebase_qa
