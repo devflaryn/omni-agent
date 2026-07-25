@@ -1949,8 +1949,10 @@ function _addListItem(containerId, opts) {
 // Nemotron 3 → off/reduced/full, o-series/GPT → an effort level, Claude → its
 // thinking effort, DeepSeek R1 → nothing to configure) — plus a per-model "test"
 // button that probes exactly this key pool + model + reasoning. Only the effort
-// VALUE is stored (model_settings[model] = {reasoning_effort}); how it's encoded
-// on the wire is derived from the model name by the backend.
+// VALUE is stored (model_settings[model] = {reasoning_effort, tier}); how the
+// effort is encoded on the wire is derived from the model name by the backend.
+// `tier` is a free-form cost band (premium/standard/cheap, or a custom string a
+// user hand-edited into llm_config.json) — '' means "derive from ladder position".
 
 const _REASONING_FAMILIES = {
   openai: {
@@ -1986,6 +1988,27 @@ const _REASONING_FAMILIES = {
     options: null,
   },
 };
+
+// COST TIER for a model — the band a subagent asks for by name (see
+// llm.model_ladder / llm._norm_tier). '' means "derive from ladder position",
+// which is the default for every model until the user tags one explicitly.
+const _MODEL_TIERS = [
+  ['', 'auto (by position)'],
+  ['premium', 'premium'],
+  ['standard', 'standard'],
+  ['cheap', 'cheap'],
+];
+
+// A tier already in the config that isn't one of the builtins (the user hand-
+// edited llm_config.json with e.g. 'fast') must survive a round-trip through
+// this select rather than silently resetting to blank.
+function _tierOptions(current) {
+  const opts = _MODEL_TIERS.slice();
+  if (current && !opts.some(([v]) => v === current)) {
+    opts.push([current, current + ' (custom)']);
+  }
+  return opts;
+}
 
 // JS mirror of llm.py's _auto_reasoning_style (+ the Anthropic protocol case).
 function detectReasoningFamily(model) {
@@ -2031,8 +2054,8 @@ function _miniSelect(extraCls, options, value) {
 }
 
 // Read the model ladder back as {models, settings, open}: the ordered ids, the
-// per-model {reasoning_effort} overrides, and which rows have their ⚙ panel open
-// (so a re-render doesn't slam panels shut). Blank rows are dropped.
+// per-model {reasoning_effort, tier} overrides, and which rows have their ⚙
+// panel open (so a re-render doesn't slam panels shut). Blank rows are dropped.
 function _readModelLadder(containerId) {
   const models = [];
   const settings = {};
@@ -2043,7 +2066,13 @@ function _readModelLadder(containerId) {
     models.push(id);
     const effSel = row.querySelector('select.llm-model-effort');
     const eff = effSel ? effSel.value : '';
-    if (eff) settings[id] = { reasoning_effort: eff };
+    const tierSel = row.querySelector('select.llm-model-tier');
+    const tier = tierSel ? tierSel.value : '';
+    if (eff || tier) {
+      settings[id] = {};
+      if (eff) settings[id].reasoning_effort = eff;
+      if (tier) settings[id].tier = tier;
+    }
     if (row.classList.contains('open')) open.add(id);
   });
   return { models, settings, open };
@@ -2126,6 +2155,13 @@ function _modelRow(containerId, val, i, s, openPanel) {
     rowEl.append(lab, _miniSelect('llm-model-effort', famDef.options, _coerceEffort(fam, s.reasoning_effort)));
     panel.appendChild(rowEl);
   }
+  const tierRow = document.createElement('div');
+  tierRow.className = 'flex items-center gap-1.5';
+  const tierLab = document.createElement('span');
+  tierLab.className = 'shrink-0 text-[10px] uppercase tracking-wider text-term-muted';
+  tierLab.textContent = 'cost tier';
+  tierRow.append(tierLab, _miniSelect('llm-model-tier', _tierOptions(s.tier), s.tier || ''));
+  panel.appendChild(tierRow);
   const testRow = document.createElement('div');
   testRow.className = 'flex min-w-0 items-center gap-2';
   testRow.appendChild(_miniBtn('test this model', 'send a tiny probe using this key pool + model + reasoning', () => _testModelRow(card)));
