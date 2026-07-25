@@ -418,8 +418,18 @@ def _norm_model_effort(value):
     return v if v in REASONING_LEVELS else ""
 
 
+def _norm_tier(value):
+    """Normalize a per-model TIER tag to a lowercase slug, or '' when absent.
+
+    Tier names are deliberately OPEN — 'premium'/'standard'/'cheap' are only the
+    names the system prompt advertises, so tagging a model 'fast' works with no
+    code change. Kept to a slug so it round-trips through JSON and the UI select."""
+    v = re.sub(r"[^a-z0-9_-]+", "-", (value or "").strip().lower()).strip("-")
+    return v[:32]
+
+
 def _norm_model_settings(value, model_ids=None):
-    """Normalize a model_settings map to {model_id: {reasoning_effort?, reasoning_style?}}.
+    """Normalize a model_settings map to {model_id: {reasoning_effort?, reasoning_style?, tier?}}.
     Only keeps keys the user actually set, drops empty overrides, and — when
     `model_ids` is given — any model no longer in the ladder (so stale entries don't
     linger after a model is removed/renamed)."""
@@ -440,6 +450,9 @@ def _norm_model_settings(value, model_ids=None):
             entry["reasoning_style"] = sty
         if isinstance(s.get("supports_native_tools"), bool):
             entry["supports_native_tools"] = s["supports_native_tools"]
+        tier = _norm_tier(s.get("tier"))
+        if tier:
+            entry["tier"] = tier
         if entry:
             out[model] = entry
     return out
