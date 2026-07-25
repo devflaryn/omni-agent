@@ -165,6 +165,26 @@ context never accumulates the sub-work. Two paths: a plan step tagged `delegate=
 (auto-dispatched when marked in_progress) and `dispatch_agents([...])` for an ad-hoc
 parallel read-only wave.
 
+**Subagent model routing** (`llm.model_ladder`, `subagents.resolve_model_ladder`) — cost-aware
+model selection layered on top of delegation. Ladder position IS cost: the provider order
+(drag to reorder in LLM Settings) and the model order within a provider, flattened
+most-expensive-first by `llm.model_ladder()`. Each model's tier is either an explicit tag
+(`model_settings[<model>].tier`, set in the per-model ⚙ panel) or derived from position (top
+rung `premium`, bottom rung `cheap`, everything between `standard`) — **a tagged model never
+changes tier when providers/models are added or reordered**, only untagged models drift.
+Tier names are open strings; the three builtins are advertised but a custom tier works with no
+code change. Selection precedence, highest first: call `models` > call `tier` > agent `.md`
+frontmatter `models` > frontmatter `tier` > `llm.DEFAULT_SUBAGENT_TIER` (`standard`). Routing
+paths: a plan step (`delegate="researcher@cheap"`), a `dispatch_agents` spec (`"tier": "cheap"`
+or `"models": [...]`), or a persona default (`tier:` in the agent's `.md` frontmatter). A
+subagent's ladder always ends with the higher rungs appended as a last-resort tail, so it can
+escalate rather than fail when everything at/below its tier is down; `subagents.escalate_ladder`
+also steps a subagent ONE rung up after 2 consecutive JSON-protocol parse errors (at most once
+per run — the existing 3-error salvage backstop still applies). Two bounded nudges push more
+delegation: a solo-read streak in the orchestrator's own context (`OMNI_SOLO_READ_NUDGE`,
+default 8, `0` disables) and a plan-shape check that flags 2+ untagged independent research
+steps in the same phase. Both fire at most once per streak/phase.
+
 **Commands** (`tools/command_tools.py`) — a plugin's `commands/*.md` are surfaced as an
 `AVAILABLE COMMANDS` index and loaded on demand with `use_command` (the workflow-loader;
 distinct from the core `run_command` shell tool). A command is broader than a skill — it
@@ -182,4 +202,6 @@ catches an unverified success claim before "done".
 Offline tests: `tests/test_plugins.py`, `tests/test_subagents.py`,
 `tests/test_delegation.py`, `tests/test_skill_toolsets.py`, `tests/test_new_skills.py`,
 `tests/test_command_surface.py`, `tests/test_plugin_hooks_wired.py`,
-`tests/test_context_hygiene.py`, `tests/test_planning_superpowers.py`.
+`tests/test_context_hygiene.py`, `tests/test_planning_superpowers.py`,
+`tests/test_model_ladder.py`, `tests/test_subagent_routing.py`,
+`tests/test_delegation_nudges.py`, `tests/test_agent_delegation_wave.py`.
