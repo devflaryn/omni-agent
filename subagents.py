@@ -191,12 +191,13 @@ class AgentDef:
     Fields: name, system_prompt (persona body), mode ("read"|"write"), description,
     toolsets (domain groups the agent works in), allowed_tools (explicit override),
     temperature, max_steps, allow_optin_read (grant web/emulator/frida *observation*
-    tools to a read agent), include_contract (prepend the shared protocol contract)."""
+    tools to a read agent), include_contract (prepend the shared protocol contract),
+    tier (default cost-spine tier), models (default explicit model ladder)."""
 
     def __init__(self, name, system_prompt, mode="read", description="",
                  toolsets=None, allowed_tools=None, temperature=None,
                  max_steps=DEFAULT_MAX_STEPS, allow_optin_read=False,
-                 include_contract=True):
+                 include_contract=True, tier=None, models=None):
         self.name = name
         self.system_prompt = system_prompt or ""
         self.mode = "write" if str(mode).lower().startswith("w") else "read"
@@ -207,6 +208,11 @@ class AgentDef:
         self.max_steps = max_steps
         self.allow_optin_read = allow_optin_read
         self.include_contract = include_contract
+        # Cost routing defaults for THIS persona. `tier` names a rung band on the
+        # global cost spine (llm.model_ladder); `models` pins an explicit ladder.
+        # Both are overridable per dispatch — see resolve_model_ladder.
+        self.tier = (tier or "").strip().lower() or None
+        self.models = list(models) if models else None
 
     @property
     def is_write(self):
@@ -248,6 +254,61 @@ def resolve_allowed_tools(agent_def):
     tools -= SUBAGENT_EXCLUDED
     # Only real, registered tools survive (drops typos in an override / stale name).
     return {n for n in tools if registry.is_registered(n)}
+
+
+# --- cost routing ------------------------------------------------------------
+
+def resolve_model_ladder(agent_def, tier=None, models=None):
+    """The concrete, ordered model ids ONE subagent run should try.
+
+    Precedence, highest first:
+      1. `models`            explicit ladder from the dispatch call
+      2. `tier`              explicit tier from the dispatch call
+      3. agent_def.models    persona default ladder (.md frontmatter)
+      4. agent_def.tier      persona default tier (.md frontmatter)
+      5. llm.DEFAULT_SUBAGENT_TIER
+
+    An explicit list keeps the rest of the spine appended behind it, so a short
+    list still has somewhere to fail over. Unknown ids are DROPPED (never fatal —
+    a typo must not kill a wave) and named in the returned note.
+
+    Returns (ladder, note). `ladder` is None when nothing is configured at all,
+    which reproduces today's behavior (the global ladder, unchanged)."""
+    spine = llm.model_ladder()
+    if not spine:
+        return None, ""
+    known = {e["model"] for e in spine}
+    note = ""
+    for candidate in (models, agent_def.models):
+        if not candidate:
+            continue
+        picked = [m for m in candidate if m in known]
+        dropped = [m for m in candidate if m not in known]
+        if dropped:
+            note = "unknown model(s) ignored: " + ", ".join(dropped)
+        if picked:
+            rest = [e["model"] for e in spine if e["model"] not in picked]
+            return picked + rest, note
+        break   # every id was bogus -> fall through to the tier paths
+    for t in (tier, agent_def.tier, llm.DEFAULT_SUBAGENT_TIER):
+        if t:
+            return llm.models_for_tier(t, spine), note
+    return None, note
+
+
+def escalate_ladder(ladder):
+    """One rung UP from `ladder`'s head — that model prepended, everything else
+    kept behind it. Returns None when the head is already the top rung (or is
+    unknown / the ladder is empty). Used by the parse-error safety valve so a
+    cheap default degrades into a retry on a stronger model, not into garbage."""
+    spine = llm.model_ladder()
+    if not ladder or not spine:
+        return None
+    rung = next((e["rung"] for e in spine if e["model"] == ladder[0]), None)
+    if not rung:            # None (unknown) or 0 (already the top)
+        return None
+    up = spine[rung - 1]["model"]
+    return [up] + [m for m in ladder if m != up]
 
 
 # --- response parsing / formatting (shared with the two legacy sub-agents) ----
@@ -319,7 +380,7 @@ def _execute(agent_def, allowed, tool_name, tool_args):
 def _new_result(agent_def):
     return {"agent": agent_def.name, "ok": False, "report": "", "raw_report": None,
             "artifacts": [], "verified": None, "steps": 0, "tools_used": [], "note": "",
-            "tokens": 0}
+            "tokens": 0, "model": None, "escalated": False}
 
 
 def _build_messages(agent_def, allowed, task, context, run_dir):
@@ -363,9 +424,11 @@ def _force_final(agent_def, messages, temperature, steps, tools_used, result, no
     return result
 
 
-def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
+def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
+                 tier=None, models=None):
     """Run one subagent to completion and return a distilled result dict:
-    {agent, ok, report, raw_report, artifacts, verified, steps, tools_used, note, tokens}.
+    {agent, ok, report, raw_report, artifacts, verified, steps, tools_used, note, tokens,
+    model, escalated}.
 
     `report` is the final answer as text; `raw_report` preserves its original
     structure (a dict, for personas like the reviewer that answer with JSON).
@@ -389,6 +452,10 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
         except (TypeError, ValueError):
             max_steps = DEFAULT_MAX_STEPS
         messages = _build_messages(agent_def, allowed, task, context, run_dir)
+        ladder, ladder_note = resolve_model_ladder(agent_def, tier, models)
+        if ladder_note:
+            result["note"] = ladder_note
+        eff_tier = (tier or agent_def.tier or llm.DEFAULT_SUBAGENT_TIER)
     except Exception as e:
         result["report"] = f"(subagent setup failed: {e})"
         return result
@@ -399,16 +466,18 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
     sub_id = uuid.uuid4().hex[:8]
     try:
         key = _KEY_ALLOCATOR.acquire(llm.active_key_pool())
-        llm.set_subagent_context(pinned_key=key)
+        llm.set_subagent_context(pinned_key=key, models=ladder)
         _emit_event(on_event, {"type": "subagent_started", "agent": agent_def.name,
                                "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode,
-                               "sub_id": sub_id})
+                               "sub_id": sub_id, "tier": eff_tier,
+                               "model": (ladder[0] if ladder else None)})
         if agent_def.is_write:
             _WORKSPACE_LOCK.acquire()
             acquired_lock = _WORKSPACE_LOCK
         out = _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                         on_event=on_event, agent_name=agent_def.name, max_steps_total=max_steps,
-                        started=started, key_label=_mask(key), sub_id=sub_id)
+                        started=started, key_label=_mask(key), sub_id=sub_id,
+                        ladder=ladder, key=key)
     except Exception as e:
         result.update(ok=False, report=f"(subagent crashed: {e})")
         out = result
@@ -422,19 +491,21 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None):
                            "ok": bool(out.get("ok")), "tokens": out.get("tokens", 0),
                            "steps": out.get("steps", 0),
                            "elapsed_s": round(time.monotonic() - started, 1),
-                           "key_label": _mask(key), "sub_id": sub_id})
+                           "key_label": _mask(key), "sub_id": sub_id,
+                           "model": out.get("model"), "escalated": out.get("escalated", False)})
     return out
 
 
 def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
               on_event=None, agent_name="", max_steps_total=None, started=None, key_label="",
-              sub_id=""):
+              sub_id="", ladder=None, key=None):
     steps = 0
     last_sig = None
     repeats = 0
     parse_errors = 0
     tools_used = []
     tokens = 0
+    escalated = False
     started = started if started is not None else time.monotonic()
 
     while steps < max_steps:
@@ -442,6 +513,9 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
         u = llm.take_last_usage()
         tokens += (u["total"] if u else _estimate_tokens(messages, raw))
         result["tokens"] = tokens
+        served = llm.take_last_model()
+        if served:
+            result["model"] = served
         rtype, payload = _parse_response(raw)
         messages.append({"role": "assistant", "content": raw})
 
@@ -499,12 +573,29 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
 # --- parallel waves ----------------------------------------------------------
 
 def _normalize_spec(spec):
-    """Accept (agent_def, task), (agent_def, task, context), or a dict."""
+    """Accept (agent_def, task), (agent_def, task, context), or a dict with
+    {agent_def, task, context?, tier?, models?}. Returns a 5-tuple
+    (agent_def, task, context, tier, models)."""
     if isinstance(spec, dict):
-        return spec["agent_def"], spec.get("task", ""), spec.get("context", "")
+        return (spec["agent_def"], spec.get("task", ""), spec.get("context", ""),
+                spec.get("tier"), spec.get("models"))
     if len(spec) == 2:
-        return spec[0], spec[1], ""
-    return spec[0], spec[1], spec[2]
+        return spec[0], spec[1], "", None, None
+    return spec[0], spec[1], spec[2], None, None
+
+
+def _route_kwargs(tier, models):
+    """Only forward tier/models as kwargs when actually set. Keeps the
+    zero-routing call shape IDENTICAL to before this feature existed — a bare
+    (agent_def, task, context, run_dir, on_event) call — so a caller/test double
+    still holding the old run_subagent signature keeps working when no per-spec
+    routing was requested."""
+    kw = {}
+    if tier is not None:
+        kw["tier"] = tier
+    if models is not None:
+        kw["models"] = models
+    return kw
 
 
 def run_subagents_parallel(specs, pool_size=None, run_dir=None, on_event=None):
@@ -519,8 +610,8 @@ def run_subagents_parallel(specs, pool_size=None, run_dir=None, on_event=None):
     `on_event`, if given, is threaded down to every subagent for live telemetry."""
     norm = [_normalize_spec(s) for s in specs]
     results = [None] * len(norm)
-    read_idx = [i for i, (a, _t, _c) in enumerate(norm) if not a.is_write]
-    write_idx = [i for i, (a, _t, _c) in enumerate(norm) if a.is_write]
+    read_idx = [i for i, n in enumerate(norm) if not n[0].is_write]
+    write_idx = [i for i, n in enumerate(norm) if n[0].is_write]
 
     wave_id = uuid.uuid4().hex[:8]
     workers = pool_size if pool_size is not None else _pool_size(max(1, len(read_idx)))
@@ -531,7 +622,8 @@ def run_subagents_parallel(specs, pool_size=None, run_dir=None, on_event=None):
             workers = pool_size if pool_size is not None else _pool_size(len(read_idx))
             workers = max(1, min(workers, len(read_idx)))
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(run_subagent, norm[i][0], norm[i][1], norm[i][2], run_dir, on_event): i
+                futs = {ex.submit(run_subagent, norm[i][0], norm[i][1], norm[i][2], run_dir, on_event,
+                                  **_route_kwargs(norm[i][3], norm[i][4])): i
                         for i in read_idx}
                 for fut in concurrent.futures.as_completed(futs):
                     i = futs[fut]
@@ -543,7 +635,8 @@ def run_subagents_parallel(specs, pool_size=None, run_dir=None, on_event=None):
                         results[i] = r
 
         for i in write_idx:  # sequential; each write subagent takes the workspace lock
-            results[i] = run_subagent(norm[i][0], norm[i][1], norm[i][2], run_dir, on_event)
+            results[i] = run_subagent(norm[i][0], norm[i][1], norm[i][2], run_dir, on_event,
+                                      **_route_kwargs(norm[i][3], norm[i][4]))
     finally:
         _emit_event(on_event, {"type": "wave_done", "wave_id": wave_id})
     return results
