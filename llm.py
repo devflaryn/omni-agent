@@ -1857,7 +1857,12 @@ def models_for_tier(tier, ladder=None):
         matches = [e for e in ladder if e["tier"] == DEFAULT_SUBAGENT_TIER]
     if not matches:
         matches = ladder[:1]        # degenerate ladder — every tier is the top rung
-    # Prefer tagged models (explicit tier) over derived ones; within each, keep ladder order
+    # Prefer tagged models (explicit tier) over derived ones; within each, keep ladder order.
+    # This means an explicitly-tagged model *always* heads its tier's slice, even if an
+    # untagged model happens to derive the same tier from a cheaper rung. The untagged
+    # same-tier model then lands in the tail — a cost guard. This preserves "never
+    # silently pay premium": exhaust the cost tier fully before escalating to more
+    # expensive rungs. An explicit tag is a stronger signal than position-based derivation.
     matches = sorted(matches, key=lambda e: (not e["tagged"], e["rung"]))
     start = matches[0]["rung"]
     body = [e["model"] for e in ladder[start:]]

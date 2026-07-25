@@ -119,6 +119,27 @@ def test_tagged_model_does_not_drift_when_ladder_grows():
     assert llm.models_for_tier("premium", big)[0] == "m1"
 
 
+def test_dual_match_tagged_heads_slice_untagged_same_tier_goes_to_tail():
+    """When a tier has both TAGGED and untagged (derived) models, the tagged one
+    heads the slice and the untagged same-tier model goes to last-resort tail.
+
+    This pins the dual-match ordering: m0 derives premium at rung 0; m1 is
+    explicitly tagged premium at rung 1. m0 must end up in the tail (after
+    cheaper models) to preserve "never silently pay premium" — exhaust the
+    cost tier fully before escalating."""
+    big = _ladder(("m0", ""), ("m1", "premium"), ("x", ""), ("y", ""), ("m2", ""))
+    # m0: rung 0, derived premium (untagged)
+    # m1: rung 1, tagged premium
+    # x:  rung 2, derived standard
+    # y:  rung 3, derived standard
+    # m2: rung 4, derived cheap
+    result = llm.models_for_tier("premium", big)
+    # Body starts at m1 (tagged wins): [m1, x, y, m2]
+    # Tail: rungs before m1 in reverse: [m0]
+    # Full result: [m1, x, y, m2, m0] — m0 lands last despite being same tier
+    assert result == ["m1", "x", "y", "m2", "m0"]
+
+
 def test_model_ladder_shape(monkeypatch):
     cfgs = [{"id": "c1", "provider": "nvidia", "base_url": "", "label": "nv",
              "api_keys": ["k"], "models": ["a", "b"], "vision_models": [],
