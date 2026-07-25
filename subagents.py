@@ -278,6 +278,7 @@ def resolve_model_ladder(agent_def, tier=None, models=None):
     if not spine:
         return None, ""
     known = {e["model"] for e in spine}
+    known_tiers = {e["tier"] for e in spine}
     notes = []
 
     def _from_list(candidate):
@@ -292,11 +293,22 @@ def resolve_model_ladder(agent_def, tier=None, models=None):
         rest = [e["model"] for e in spine if e["model"] not in picked]
         return picked + rest, True
 
+    def _check_tier(t):
+        """Tier names are deliberately OPEN strings (see llm._norm_tier), so an
+        unrecognized tier is never rejected — but silently falling back to
+        DEFAULT_SUBAGENT_TIER on a typo (e.g. 'cheep') would quietly cost
+        standard-rung tokens forever with no diagnostic. Note it, same as an
+        unknown model id is noted above."""
+        norm = llm._norm_tier(t)
+        if norm and norm not in known_tiers:
+            notes.append(f"unknown tier '{t}' — falling back to '{llm.DEFAULT_SUBAGENT_TIER}'")
+
     if models:
         ladder, ok = _from_list(models)
         if ok:
             return ladder, "; ".join(notes)
     if tier:
+        _check_tier(tier)
         return llm.models_for_tier(tier, spine), "; ".join(notes)
     if agent_def.models:
         ladder, ok = _from_list(agent_def.models)
@@ -304,8 +316,38 @@ def resolve_model_ladder(agent_def, tier=None, models=None):
             return ladder, "; ".join(notes)
     for t in (agent_def.tier, llm.DEFAULT_SUBAGENT_TIER):
         if t:
+            if t != llm.DEFAULT_SUBAGENT_TIER:
+                _check_tier(t)
             return llm.models_for_tier(t, spine), "; ".join(notes)
     return None, "; ".join(notes)
+
+
+def effective_tier(agent_def, tier, models):
+    """The tier that ACTUALLY drove routing, mirroring resolve_model_ladder's own
+    precedence order exactly (explicit models > explicit tier > persona models >
+    persona tier > default) — for telemetry, not routing.
+
+    Two bugs this fixes vs. a naive `tier or agent_def.tier or DEFAULT`:
+      * a spec passing only 'models' routes on that explicit ladder but would
+        still report DEFAULT_SUBAGENT_TIER ('standard') as if a tier had chosen
+        it. Returns None in that case (no single tier describes an explicit
+        list) — callers may render that as "explicit".
+      * a malformed, non-string tier (e.g. 'tier': 5 from hand-edited JSON) is
+        truthy and would silently override a persona's own tier default.
+        Ignored here, same as llm._norm_tier ignores it for real routing."""
+    def _valid(t):
+        return t if isinstance(t, str) and t.strip() else None
+
+    spine = llm.model_ladder()
+    known = {e["model"] for e in spine}
+    if models and any(m in known for m in models):
+        return None
+    tier = _valid(tier)
+    if tier:
+        return tier
+    if agent_def.models and any(m in known for m in agent_def.models):
+        return None
+    return _valid(agent_def.tier) or llm.DEFAULT_SUBAGENT_TIER
 
 
 def escalate_ladder(ladder):
@@ -467,7 +509,7 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
         ladder, ladder_note = resolve_model_ladder(agent_def, tier, models)
         if ladder_note:
             result["note"] = ladder_note
-        eff_tier = (tier or agent_def.tier or llm.DEFAULT_SUBAGENT_TIER)
+        eff_tier = effective_tier(agent_def, tier, models)
     except Exception as e:
         result["report"] = f"(subagent setup failed: {e})"
         return result

@@ -705,6 +705,13 @@ function _ensureWave() { if (!_wave || _wave.done) _startWave(); }
 
 function waveStarted(ev) { _hudEnsure(); _startWave(); }
 
+// Compact "tier · model" label for the HUD row, e.g. "cheap · gpt-4o-mini".
+// Either half may be absent (an explicit model list has no tier; a ladder-less
+// spec has no model yet) — never render a dangling separator.
+function _modelTierLabel(tier, model) {
+  return [tier, model].filter(Boolean).join(' · ');
+}
+
 function subagentStarted(ev) {
   _ensureWave();
   _hudOnStart(ev);
@@ -714,14 +721,16 @@ function subagentStarted(ev) {
   row.className = 'cbar';
   row.innerHTML =
     '<div class="cbar-label"><span class="cbar-name"></span><span class="cbar-task"></span>' +
-    '<span class="cbar-key"></span><span class="cbar-stat"></span></div>' +
+    '<span class="cbar-model"></span><span class="cbar-key"></span><span class="cbar-stat"></span></div>' +
     '<div class="cbar-track"><div class="cbar-fill"></div></div>';
   row.querySelector('.cbar-name').textContent = ev.agent || '';
   row.querySelector('.cbar-task').textContent = ev.task || '';
+  row.querySelector('.cbar-model').textContent = _modelTierLabel(ev.tier, ev.model);
   row.querySelector('.cbar-key').textContent = ev.key_label || '';
   _dock().querySelector('.cdock-body').appendChild(row);
   _wave.bars.set(key, { row, startOffsetMs: now - _wave.originTs, endOffsetMs: null,
-                        ok: null, steps: 0, tokens: 0, name: ev.agent, running: true });
+                        ok: null, steps: 0, tokens: 0, name: ev.agent, running: true,
+                        tier: ev.tier });
   _renderWave();
 }
 
@@ -743,6 +752,14 @@ function subagentDone(ev) {
   bar.row.querySelector('.cbar-fill').classList.add(ev.ok ? 'ok' : 'failed');
   bar.row.querySelector('.cbar-stat').textContent =
     `${ev.ok ? '✓' : '✗'} ${ev.elapsed_s}s · ${ev.tokens} tok · ${ev.steps} steps`;
+  // The model actually served can differ from the one advertised at start
+  // (mid-run fallback) and/or have escalated after repeated protocol errors —
+  // refresh the label so the HUD reflects what really ran.
+  if (ev.model) {
+    const modelEl = bar.row.querySelector('.cbar-model');
+    modelEl.textContent = _modelTierLabel(bar.tier, ev.model) + (ev.escalated ? ' ⇡' : '');
+    if (ev.escalated) modelEl.title = 'escalated to a stronger model after repeated protocol errors';
+  }
   _hudOnDone(ev);
   _renderWave();
   // Singleton (write) waves have no wave_done: freeze when nothing is running.

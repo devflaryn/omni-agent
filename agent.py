@@ -3137,7 +3137,11 @@ class AgentApi:
             # in an isolated subagent and fold back its report.
             if not tool_failed:
                 self._maybe_dispatch_delegated_steps()
-                self._maybe_nudge_plan_delegation(s)
+                # Suppress nudge #2 if nudge #1 (the solo-read-streak nudge) already
+                # fired earlier THIS turn. Only plan_view can reach both nudges in
+                # one turn — it's the one plan tool that's also read-only.
+                if not s.get("_delegation_nudge_fired_this_turn"):
+                    self._maybe_nudge_plan_delegation(s)
             # A phase advance is a natural re-grounding point (GSD phases).
             if tool_name == "plan_advance_phase" and not tool_failed:
                 self._maybe_reground(force=True)
@@ -3180,6 +3184,7 @@ class AgentApi:
         if s["solo_read_streak"] < SOLO_READ_NUDGE or s.get("_solo_read_nudged"):
             return
         s["_solo_read_nudged"] = True
+        s["_delegation_nudge_fired_this_turn"] = True
         s["messages"].append({"role": "user", "content": (
             f"[SYSTEM] That's {s['solo_read_streak']} read-only tool calls in a row in your OWN "
             "context. Independent look-ups like these are exactly what a parallel subagent wave "
@@ -3523,10 +3528,18 @@ class AgentApi:
                 )})
 
         # Delegation nudges: a long inline read streak is a subagent wave not taken.
+        # The two nudges are mutually exclusive for every tool except plan_view (the
+        # one plan tool that's also READONLY, so it can trip nudge #1 here AND fall
+        # into _plan_bookkeeping_after_tool's plan-tool branch below for nudge #2) —
+        # reset the per-turn flag first so a stale True from a PRIOR turn can't
+        # suppress a nudge that should fire now.
+        s["_delegation_nudge_fired_this_turn"] = False
         self._maybe_nudge_delegation(s, tool_name)
 
         # Plan bookkeeping: gate-clear on a real plan, delegation dispatch,
-        # phase-change re-grounding, and the plan-touch nudge.
+        # phase-change re-grounding, and the plan-touch nudge. Nudge #2 inside it
+        # is suppressed below when nudge #1 already fired this turn, so the model
+        # never gets two "[SYSTEM]" delegation lectures back to back.
         self._plan_bookkeeping_after_tool(s, tool_name, tool_failed)
 
         # GSD context-hygiene: periodic re-grounding tick (once per tool

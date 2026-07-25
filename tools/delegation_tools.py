@@ -86,9 +86,12 @@ def _synthesizer():
     )
 
 
-@registry.register(
-    name="dispatch_agents",
-    description=(
+def _dispatch_agents_description():
+    """Built at PROMPT-RENDER time (registry resolves a callable description
+    lazily), not at import/decoration time — so if the user reorders providers
+    mid-run, the advertised ladder here stays in sync instead of freezing at
+    whatever `_ladder_hint()` returned when this module was first imported."""
+    return (
         "Run a WAVE of read-only subagents IN PARALLEL, each in its own isolated context, and get back only "
         "their distilled reports — the dozens of reads/queries they make never touch your context. Use it to "
         "chase several INDEPENDENT questions at once (e.g. 'locate the root check', 'locate the signature "
@@ -97,7 +100,27 @@ def _synthesizer():
         "the job — a symbol lookup does NOT need your most expensive model." + _ladder_hint() +
         " Read-only by design: for an actual code change, tag a plan step with delegate=<write-agent> instead. "
         "This is the ad-hoc fan-out path; a planned, self-contained step should use the plan's delegate field."
-    ),
+    )
+
+
+def _normalize_models(models):
+    """A spec's 'models' should be a list of model ids, best first. A model
+    routinely hands over a bare string (e.g. "deepseek-chat") meaning ONE model,
+    not a ladder — passed through unvalidated, subagents._from_list would iterate
+    its CHARACTERS and report a wall of bogus "unknown model(s) ignored: d, e, e,
+    p, ..." notes. Coerce a non-empty string to a single-element list; drop
+    anything else that isn't a list (routing already degrades safely to the
+    default ladder when models=None)."""
+    if isinstance(models, str):
+        return [models] if models.strip() else None
+    if isinstance(models, list):
+        return models
+    return None
+
+
+@registry.register(
+    name="dispatch_agents",
+    description=_dispatch_agents_description,
     params_schema={
         "specs": ("array of objects, each {\"agent\": \"<subagent name>\", \"task\": \"<what to investigate>\", "
                   "\"context\": \"<optional focusing hints>\", \"tier\": \"<optional cheap|standard|premium>\", "
@@ -138,7 +161,7 @@ def dispatch_agents(specs, synthesize=False):
                             "— delegate a write agent via a plan step instead")
             continue
         runnable.append({"agent_def": ad, "task": task, "context": spec.get("context", ""),
-                         "tier": spec.get("tier"), "models": spec.get("models")})
+                         "tier": spec.get("tier"), "models": _normalize_models(spec.get("models"))})
 
     if not runnable:
         return {"error": "No runnable read-only specs. " + "; ".join(problems)}

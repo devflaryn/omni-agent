@@ -1840,12 +1840,17 @@ def _derived_tier(rung, n):
     """Positional tier for an UNTAGGED model at `rung` of a ladder of length `n`.
     Top rung is premium, bottom rung is cheap, everything between is standard —
     a labeling rule (not a starting-rung rule) so every model has exactly one
-    tier and tagged/untagged models resolve through the same code path."""
+    tier and tagged/untagged models resolve through the same code path.
+
+    Sourced from BUILTIN_TIERS so that tuple is the single place these three
+    names are spelled — this function was the only place they were duplicated
+    as bare literals."""
+    premium, standard, cheap = BUILTIN_TIERS
     if n <= 1 or rung <= 0:
-        return "premium"
+        return premium
     if rung >= n - 1:
-        return "cheap"
-    return "standard"
+        return cheap
+    return standard
 
 
 def model_ladder():
@@ -2192,22 +2197,56 @@ def _await_or_stop(fn, poll=0.1):
     blocking, non-streaming requests.post mid-flight: the orphan thread finishes on
     its own and its result is discarded (its tokens are forfeit — the accepted cost
     of an instant Stop). A worker exception is re-raised so existing error handling
-    in _run_group's callers is preserved."""
+    in _run_group's callers is preserved.
+
+    Thread-locals do NOT propagate to a fresh threading.Thread, so without help
+    fn() (which runs _run_group under the hood) would run "context-blind": the
+    subagent pin/ladder set on the CALLER's thread would be invisible inside the
+    worker, and anything the worker records (last_model/last_usage for
+    take_last_model()/take_last_usage(), the subagent-vs-main badge guard) would
+    land on the ephemeral worker thread and vanish. So this function ferries the
+    caller's subagent context IN to the worker before calling fn(), and ferries the
+    worker's produced telemetry back OUT to the caller's thread-local afterward."""
+    caller_pinned_key = _pinned_key()
+    caller_is_subagent = _is_subagent_thread()
+    caller_model_ladder = _thread_model_ladder()
+
     result = {}
     done = threading.Event()
 
     def _worker():
+        # Carry the caller's subagent context onto this ephemeral thread so
+        # _pinned_key() / _is_subagent_thread() / _thread_model_ladder() read
+        # correctly from anywhere inside fn().
+        _TL.pinned_key = caller_pinned_key
+        _TL.model_ladder = caller_model_ladder
+        _TL.is_subagent = caller_is_subagent
+        _TL.last_usage = None
+        _TL.last_model = None
         try:
             result["value"] = fn()
         except BaseException as e:  # noqa: BLE001 — re-raised below, nothing swallowed
             result["error"] = e
         finally:
+            # Stash what THIS thread produced so the caller can copy it back —
+            # but only if the caller is still waiting for it (see below).
+            result["last_model"] = getattr(_TL, "last_model", None)
+            result["last_usage"] = getattr(_TL, "last_usage", None)
             done.set()
 
     threading.Thread(target=_worker, daemon=True).start()
     while not done.wait(poll):
         if _stop_requested():
             return {"__stopped__": True}
+    # Reached only when the worker finished WITHOUT an intervening stop. An
+    # orphan worker abandoned via the stop path above still runs this function's
+    # `finally` block on its own thread, but nobody ever reaches these lines for
+    # it — so a late-finishing orphan cannot clobber the caller's `_TL` (and thus
+    # cannot clobber a subsequent, unrelated request's telemetry).
+    if result.get("last_model") is not None:
+        _TL.last_model = result["last_model"]
+    if result.get("last_usage") is not None:
+        _TL.last_usage = result["last_usage"]
     if "error" in result:
         raise result["error"]
     return result["value"]

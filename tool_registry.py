@@ -80,7 +80,13 @@ class ToolRegistry:
 
         Args:
             name:           The tool name the LLM uses to call it.
-            description:    WHAT the tool does (plain language).
+            description:    WHAT the tool does (plain language). May be a
+                            zero-arg callable instead of a str — it is then
+                            invoked at PROMPT-RENDER time (not at decoration/
+                            import time), for a description that must reflect
+                            state which can change mid-run (e.g. the live
+                            provider/model list). Resolved lazily everywhere a
+                            tool's description is read.
             params_schema:  Dict of {param_name: type_description}.
             output:         (optional) Description of the exact output the tool
                             returns — what the LLM will see in TOOL RESULT.
@@ -134,11 +140,18 @@ class ToolRegistry:
     def tools_in_group(self, group):
         return [n for n in self._tools if self.group_of(n) == group]
 
+    @staticmethod
+    def _resolve_description(data):
+        """A tool's description as registered (str), or resolved fresh from a
+        callable — see register()'s docstring for why a tool needs that."""
+        d = data["description"]
+        return d() if callable(d) else d
+
     def _summary_line(self, name):
         data = self._tools[name]
         if data["summary"]:
             return data["summary"]
-        d = (data["description"] or "").strip().replace("\n", " ")
+        d = (self._resolve_description(data) or "").strip().replace("\n", " ")
         cut = d.find(". ")
         if 0 < cut <= 100:
             return d[:cut]
@@ -146,7 +159,7 @@ class ToolRegistry:
 
     def _full_block(self, name):
         data = self._tools[name]
-        block = f"\n### {name}\n{data['description']}\n"
+        block = f"\n### {name}\n{self._resolve_description(data)}\n"
         if data["when_to_use"]:
             block += f"When: {data['when_to_use']}\n"
         block += f"Params: {json.dumps(data['params'])}\n"
@@ -268,7 +281,7 @@ class ToolRegistry:
 
     def list_tools(self):
         """Returns a list of (name, description) for all registered tools."""
-        return [(name, data["description"]) for name, data in self._tools.items()]
+        return [(name, self._resolve_description(data)) for name, data in self._tools.items()]
 
     @staticmethod
     def _validate_args(name, func, kwargs):

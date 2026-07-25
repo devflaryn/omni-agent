@@ -22,13 +22,17 @@ _TYPE_MAP = {str: "string", int: "integer", float: "number", bool: "boolean",
              dict: "object", list: "array"}
 
 
-def _fingerprint(name, func, params):
+def _fingerprint(name, func, params, description=""):
     try:
         sig = str(inspect.signature(func))
     except (TypeError, ValueError):
         sig = ""
+    # `description` is included so a tool whose description is a callable (built
+    # fresh at render time — e.g. dispatch_agents' live model-ladder hint) still
+    # auto-invalidates the cache when the rendered text changes, same as a code
+    # change to the signature/params does.
     return hashlib.sha256(
-        (name + "|" + sig + "|" + json.dumps(params, sort_keys=True)).encode()
+        (name + "|" + sig + "|" + json.dumps(params, sort_keys=True) + "|" + description).encode()
     ).hexdigest()
 
 
@@ -77,7 +81,8 @@ def build_openai_schema(name):
     """The OpenAI `tools` entry for one registered tool, from its live signature."""
     data = registry._tools[name]
     func, params_text = data["func"], data.get("params") or {}
-    fp = _fingerprint(name, func, params_text)
+    description = registry._resolve_description(data)
+    fp = _fingerprint(name, func, params_text, description)
     cached = _CACHE.get(name)
     if cached and cached[0] == fp:
         return cached[1]
@@ -103,7 +108,7 @@ def build_openai_schema(name):
         "type": "function",
         "function": {
             "name": name,
-            "description": (data.get("description") or "").strip(),
+            "description": (description or "").strip(),
             "parameters": {"type": "object", "properties": properties, "required": required},
         },
     }
