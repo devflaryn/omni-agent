@@ -401,3 +401,38 @@ def test_auto_delegate_never_hijacks_a_judgment_call(monkeypatch):
     assert plan.items[0]["delegate"] == agent_mod.AUTO_DELEGATE_READ_TAG
     assert plan.items[1]["delegate"] == agent_mod.AUTO_DELEGATE_READ_TAG
     assert plan.items[2]["delegate"] == ""          # judgment stays with main
+
+
+# --- review-round-2 regressions: keyword-list cross-category leakage ----------
+
+def test_auto_delegate_does_not_route_research_with_change_words_to_writer(monkeypatch):
+    """REGRESSION: bare "build"/"sign"/"fix" in the change hints made a research
+    step like "investigate how the release build signs the apk" match change,
+    which auto-routed a LOOKUP to a workspace-lock-holding implementer. Such a
+    step must land in NEITHER auto pool — it stays with the main agent."""
+    plan = _AutoPlan([_spec_step(1, "investigate how the release build pipeline signs the apk"),
+                      _spec_step(2, "identify the fix for the license check")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert plan.items[0]["delegate"] == ""
+    assert plan.items[1]["delegate"] == ""
+
+
+def test_plan_nudge_excludes_judgment_steps(monkeypatch):
+    """REGRESSION: _auto_delegate_untagged_steps excludes judgment calls but the
+    plan-shape NUDGE did not, so the model was told to tag "decide which approach"
+    delegate=researcher@cheap — the exact reasoning-offload the feature forbids."""
+    plan = _PlanStub([_step(1, "locate the root check"),
+                      _step(2, "decide which bypass approach to take"),
+                      _step(3, "decide which strategy to use")])
+    monkeypatch.setattr(planning, "get_active_plan", lambda: plan)
+    s, a = _sess2(), _Stub2()
+    a._maybe_nudge_plan_delegation(s)
+    # step 1 alone is <2 candidates after the two judgment steps are excluded
+    assert _sys_msgs(s) == []
+
+
+def test_ordinal_suffix_handles_teens_and_ones():
+    assert [agent_mod._ordinal_suffix(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23)] == \
+        ["st", "nd", "rd", "th", "th", "th", "th", "st", "nd", "rd"]

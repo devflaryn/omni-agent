@@ -493,6 +493,15 @@ _JUDGMENT_HINTS = ("decide", "choose", "which approach", "strategy", "trade-off"
                    "recommend", "prioritize", "prioritise")
 
 
+def _ordinal_suffix(n):
+    """'st'/'nd'/'rd'/'th' for a positive int, handling the 11-13 exception
+    (11th/12th/13th, not 11st). Used in the escalating nudge wording, which
+    reaches counts like 21 in a long run (21st, not 21th)."""
+    if 10 <= (n % 100) <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
 def _step_text(item):
     """The wording of a plan step, for the research/change heuristics."""
     return " ".join(str(item.get(k) or "")
@@ -520,6 +529,18 @@ def _looks_like_change(item):
     The inverse gate to _looks_like_research — used to route a self-contained
     change step to a WRITE subagent instead of a read-only researcher."""
     return _hits_hints(_step_text(item), _CHANGE_HINTS)
+
+
+def _is_clear_change(item):
+    """A change step SAFE to auto-route to a write subagent: it uses change
+    wording AND carries no investigation lead verb. Several change hints are
+    ordinary words ("build", "sign", "fix") that also appear in research steps —
+    "investigate how the release build signs the apk" is a lookup, not an edit.
+    Requiring the absence of a research verb keeps those with the main agent
+    (they end up in neither auto pool) rather than handing a read task to a
+    workspace-lock-holding implementer at the standard tier."""
+    text = _step_text(item)
+    return _hits_hints(text, _CHANGE_HINTS) and not _hits_hints(text, _RESEARCH_HINTS)
 
 
 def _is_self_contained(item):
@@ -1563,7 +1584,7 @@ class AgentApi:
         write_tag = _live(AUTO_DELEGATE_WRITE_TAG)
         if write_tag:
             picks += [(it, write_tag) for it in pool
-                      if _looks_like_change(it) and _is_self_contained(it)]
+                      if _is_clear_change(it) and _is_self_contained(it)]
         if not picks:
             return
 
@@ -3345,7 +3366,7 @@ class AgentApi:
         sent = s["solo_read_nudges_sent"] = s.get("solo_read_nudges_sent", 0) + 1
         s["_delegation_nudge_fired_this_turn"] = True
         again = ("" if sent == 1 else
-                 f" This is the {sent}{'nd' if sent == 2 else 'rd' if sent == 3 else 'th'} time "
+                 f" This is the {sent}{_ordinal_suffix(sent)} time "
                  "this task — every one of those batches could have been running in parallel "
                  "while you did something else.")
         s["messages"].append({"role": "user", "content": (
@@ -3378,7 +3399,8 @@ class AgentApi:
                  and it.get("status") not in planning.DONE_STATUSES
                  and not (it.get("delegate") or "").strip()
                  and not [d for d in (it.get("depends_on") or []) if d]
-                 and _looks_like_research(it)]
+                 and _looks_like_research(it)
+                 and not _hits_hints(_step_text(it), _JUDGMENT_HINTS)]
         if len(cands) < 2:
             return
         sig = (plan.current_phase_id, frozenset(str(it["id"]) for it in cands))
