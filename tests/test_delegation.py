@@ -109,7 +109,7 @@ def test_delegated_write_sets_unverified_change(monkeypatch):
     investigation.set_active(investigation.ensure_active("patch the check"), notify=False)
 
     monkeypatch.setattr(subagents, "run_subagent",
-                        lambda ad, task, context="", run_dir=None:
+                        lambda ad, task, context="", run_dir=None, tier=None:
                         {"agent": ad.name, "ok": True, "report": "patched X.smali:10; verified via re-read",
                          "artifacts": [], "verified": True, "steps": 5, "tools_used": []})
     api = _bare_api()

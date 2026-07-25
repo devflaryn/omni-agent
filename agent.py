@@ -429,6 +429,17 @@ _PATH_ARG_KEYS = ("path", "file_path", "so_path", "smali_path", "dex_path",
                   "dest", "destination", "class_name")
 
 
+def _split_delegate(raw):
+    """Split a plan step's delegate tag into (agent_name, tier).
+
+    'researcher@cheap' -> ('researcher', 'cheap'); a bare 'researcher' ->
+    ('researcher', None), meaning the persona's own default tier applies. The
+    tier rides inside the existing string field so no new plan-step column has
+    to be threaded through planning.py and plan_tools.py."""
+    name, _, tier = (raw or "").strip().partition("@")
+    return name.strip(), (tier.strip().lower() or None)
+
+
 def _best_path_arg(args):
     """Best-effort: the most path-like value among a tool call's args, for
     recording which file a mutating tool changed. Empty string if none found."""
@@ -1421,9 +1432,9 @@ class AgentApi:
         parallel = s.get("parallel_execution_enabled", True)
 
         def _resolve(step):
-            """Return the AgentDef for a step's delegate, or None (and surface the
-            unknown-agent nudge, marking it dispatched so we don't retry it)."""
-            name = (step.get("delegate") or "").strip()
+            """Return (AgentDef, tier) for a step's delegate, or (None, None) — and
+            surface the unknown-agent nudge, marking it dispatched so we don't retry."""
+            name, tier = _split_delegate(step.get("delegate"))
             ad = reg.get_agent(name)
             if ad is None:
                 dispatched.add(step["id"])
@@ -1433,8 +1444,8 @@ class AgentApi:
                 s["messages"].append({"role": "user", "content": (
                     f"[SYSTEM] Plan step ({step['id']}) is tagged delegate='{name}', but no such subagent "
                     f"exists (available: {names}). Do this step yourself, or fix/clear the delegate name.")})
-                return None
-            return ad
+                return None, None
+            return ad, tier
 
         # Bounded loop: each pass dispatches the currently-ready batch; a completed
         # dependency can make more steps ready on the next pass. Capped so a
@@ -1452,7 +1463,7 @@ class AgentApi:
 
             reads, writes = [], []
             for step in candidates:
-                ad = _resolve(step)
+                ad, tier = _resolve(step)
                 if ad is None:
                     continue
                 dispatched.add(step["id"])
@@ -1460,26 +1471,27 @@ class AgentApi:
                     # Harness-initiated start of a pulled-forward step: mark it live so
                     # the plan/UI reflect it, exactly like a model-started step.
                     plan.update_item(step["id"], status="in_progress")
-                (writes if ad.is_write else reads).append((step, ad.name, ad))
+                (writes if ad.is_write else reads).append((step, ad.name, ad, tier))
             planning.notify_updated()
 
             if reads:
                 try:
                     self._run_delegated_read_wave(plan, reads)
                 except Exception as e:
-                    for step, _name, _ad in reads:
+                    for step, _name, _ad, _tier in reads:
                         s["messages"].append({"role": "user", "content": (
                             f"[SYSTEM] Delegation of step ({step['id']}) failed to start ({e}). "
                             "Handle this step yourself.")})
 
-            for step, name, ad in writes:
+            for step, name, ad, tier in writes:
                 try:
                     task = self._compose_delegate_task(step)
                     context = self._compose_delegate_context(plan)
                     self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
                                 "content": f"Delegating step ({step['id']}) to subagent '{name}' ({ad.mode})…"})
                     result = subagents.run_subagent(ad, task, context=context,
-                                                    run_dir=getattr(self, "_delegate_run_dir", None))
+                                                    run_dir=getattr(self, "_delegate_run_dir", None),
+                                                    tier=tier)
                     self._fold_delegate_result(plan, step, name, ad, result)
                 except Exception as e:
                     s["messages"].append({"role": "user", "content": (
@@ -1503,9 +1515,10 @@ class AgentApi:
         currently set anywhere, so this is a no-op today either way."""
         import queue as _queue
         evq = _queue.Queue()
-        specs = [(ad, self._compose_delegate_task(step), self._compose_delegate_context(plan))
-                 for (step, _name, ad) in reads]
-        for step, name, ad in reads:
+        specs = [{"agent_def": ad, "task": self._compose_delegate_task(step),
+                  "context": self._compose_delegate_context(plan), "tier": tier}
+                 for (step, _name, ad, tier) in reads]
+        for step, name, ad, _tier in reads:
             self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
                         "content": f"Delegating step ({step['id']}) to subagent '{name}' (read) in a parallel wave…"})
         holder = {}
@@ -1535,7 +1548,7 @@ class AgentApi:
             # dispatched_steps, so it must be folded here or it stalls in_progress
             # forever with no failure ever surfaced.
             err = holder.get("error")
-            for step, name, ad in reads:
+            for step, name, ad, _tier in reads:
                 result = {"agent": name, "ok": False,
                           "report": f"(delegation wave failed to start: {err})" if err is not None
                                     else "(delegation wave returned no result for this step)",
@@ -1543,7 +1556,7 @@ class AgentApi:
                 self._fold_delegate_result(plan, step, name, ad, result)
             return
 
-        for (step, name, ad), result in zip(reads, results):
+        for (step, name, ad, _tier), result in zip(reads, results):
             self._fold_delegate_result(plan, step, name, ad, result)
 
     def _compose_delegate_task(self, step):
