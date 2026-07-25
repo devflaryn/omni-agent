@@ -79,6 +79,47 @@ def test_no_configured_models_returns_none(monkeypatch):
     assert ladder is None and note == ""
 
 
+# --- precedence chain: pin EVERY rung against its neighbors ------------------
+# (fix round 1: the original 4b code resolved `agent_def.models` in the same
+# loop as call `models`, so it beat call `tier` — swapping rungs 2 and 3.)
+
+def test_call_tier_beats_frontmatter_models(monkeypatch):
+    _patch_ladder(monkeypatch)
+    ad = AgentDef("a", "p", models=["glm"])
+    ladder, _ = subagents.resolve_model_ladder(ad, tier="cheap")
+    assert ladder[0] == "flash"
+
+
+def test_call_models_beats_call_tier(monkeypatch):
+    _patch_ladder(monkeypatch)
+    ladder, _ = subagents.resolve_model_ladder(
+        AgentDef("a", "p"), tier="cheap", models=["kimi"])
+    assert ladder[0] == "kimi"
+
+
+def test_frontmatter_models_beats_frontmatter_tier_explicit(monkeypatch):
+    _patch_ladder(monkeypatch)
+    ad = AgentDef("a", "p", tier="cheap", models=["kimi"])
+    ladder, _ = subagents.resolve_model_ladder(ad)
+    assert ladder[0] == "kimi"
+
+
+def test_call_models_all_unknown_falls_through_to_call_tier_not_frontmatter_models(monkeypatch):
+    _patch_ladder(monkeypatch)
+    ad = AgentDef("a", "p", models=["glm"])
+    ladder, note = subagents.resolve_model_ladder(ad, tier="cheap", models=["ghost"])
+    assert ladder[0] == "flash"
+    assert "ghost" in note
+
+
+def test_notes_accumulate_across_call_and_frontmatter_unknown_ids(monkeypatch):
+    _patch_ladder(monkeypatch)
+    ad = AgentDef("a", "p", models=["ghost2"])
+    ladder, note = subagents.resolve_model_ladder(ad, models=["ghost1"])
+    assert ladder[0] == "glm"   # falls all the way to DEFAULT_SUBAGENT_TIER ("standard")
+    assert "ghost1" in note and "ghost2" in note
+
+
 def test_normalize_spec_shapes():
     ad = AgentDef("a", "p")
     assert subagents._normalize_spec((ad, "t")) == (ad, "t", "", None, None)

@@ -278,22 +278,34 @@ def resolve_model_ladder(agent_def, tier=None, models=None):
     if not spine:
         return None, ""
     known = {e["model"] for e in spine}
-    note = ""
-    for candidate in (models, agent_def.models):
-        if not candidate:
-            continue
+    notes = []
+
+    def _from_list(candidate):
+        """(ladder, True) for an explicit list that matched at least one known
+        model, else (None, False). Records any dropped ids in `notes`."""
         picked = [m for m in candidate if m in known]
         dropped = [m for m in candidate if m not in known]
         if dropped:
-            note = "unknown model(s) ignored: " + ", ".join(dropped)
-        if picked:
-            rest = [e["model"] for e in spine if e["model"] not in picked]
-            return picked + rest, note
-        break   # every id was bogus -> fall through to the tier paths
-    for t in (tier, agent_def.tier, llm.DEFAULT_SUBAGENT_TIER):
+            notes.append("unknown model(s) ignored: " + ", ".join(dropped))
+        if not picked:
+            return None, False
+        rest = [e["model"] for e in spine if e["model"] not in picked]
+        return picked + rest, True
+
+    if models:
+        ladder, ok = _from_list(models)
+        if ok:
+            return ladder, "; ".join(notes)
+    if tier:
+        return llm.models_for_tier(tier, spine), "; ".join(notes)
+    if agent_def.models:
+        ladder, ok = _from_list(agent_def.models)
+        if ok:
+            return ladder, "; ".join(notes)
+    for t in (agent_def.tier, llm.DEFAULT_SUBAGENT_TIER):
         if t:
-            return llm.models_for_tier(t, spine), note
-    return None, note
+            return llm.models_for_tier(t, spine), "; ".join(notes)
+    return None, "; ".join(notes)
 
 
 def escalate_ladder(ladder):
