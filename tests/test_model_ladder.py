@@ -271,3 +271,15 @@ def test_ask_llm_falls_back_to_full_ladder_when_override_matches_nothing(monkeyp
     llm.set_subagent_context(pinned_key="k", models=["ghost"])
     assert llm.ask_llm([{"role": "user", "content": "hi"}]) == "hi"
     assert tried == ["kimi"]   # full ladder, not an empty group list
+
+
+def test_prompt_contains_delegation_doctrine():
+    p = llm.get_static_system_prompt()
+    assert "DELEGATE BY DEFAULT" in p
+    assert "dispatch_agents" in p
+    assert "@cheap" in p
+
+
+def test_prompt_keeps_parallel_wave_rule():
+    p = llm.get_static_system_prompt()
+    assert "parallel wave" in p.lower()
