@@ -17,6 +17,7 @@ import queue as _queue
 import threading as _threading
 
 from tool_registry import registry
+import llm
 import plugins
 import subagents
 from subagents import AgentDef, run_subagents_parallel, run_subagent
@@ -24,6 +25,17 @@ from subagents import AgentDef, run_subagents_parallel, run_subagent
 # Per-agent report chars folded back inline. Phase 5 (GSD) routes full reports to
 # files under the run dir and returns only summaries + paths; until then we cap.
 _REPORT_CAP = 2400
+
+
+def _ladder_hint():
+    """One-line-per-model rendering of the LIVE cost spine, folded into the tool
+    description so the model always sees the models actually configured right now
+    — adding a provider never requires touching this file or the prompt."""
+    lad = llm.model_ladder()
+    if not lad:
+        return ""
+    rows = " | ".join(f"{e['model']} ({e['tier']})" for e in lad)
+    return " CONFIGURED MODELS, most expensive first: " + rows + "."
 
 
 def _run_with_ui_telemetry(run_fn):
@@ -80,13 +92,17 @@ def _synthesizer():
         "Run a WAVE of read-only subagents IN PARALLEL, each in its own isolated context, and get back only "
         "their distilled reports — the dozens of reads/queries they make never touch your context. Use it to "
         "chase several INDEPENDENT questions at once (e.g. 'locate the root check', 'locate the signature "
-        "check', 'map the license flow'). Name each subagent from AVAILABLE SUBAGENTS. Read-only by design: "
-        "for an actual code change, tag a plan step with delegate=<write-agent> instead. This is the ad-hoc "
-        "fan-out path; a planned, self-contained step should use the plan's delegate field, not this tool."
+        "check', 'map the license flow'). Name each subagent from AVAILABLE SUBAGENTS. Each spec may pick its "
+        "own MODEL: 'tier' (cheap/standard/premium) or an explicit 'models' fallback order. Match the model to "
+        "the job — a symbol lookup does NOT need your most expensive model." + _ladder_hint() +
+        " Read-only by design: for an actual code change, tag a plan step with delegate=<write-agent> instead. "
+        "This is the ad-hoc fan-out path; a planned, self-contained step should use the plan's delegate field."
     ),
     params_schema={
         "specs": ("array of objects, each {\"agent\": \"<subagent name>\", \"task\": \"<what to investigate>\", "
-                  "\"context\": \"<optional focusing hints>\"} — the read-only subagents to run in parallel."),
+                  "\"context\": \"<optional focusing hints>\", \"tier\": \"<optional cheap|standard|premium>\", "
+                  "\"models\": [\"<optional explicit model ids, best first>\"]} — the read-only subagents to "
+                  "run in parallel. Omit tier/models to use the subagent's own default."),
         "synthesize": ("boolean (optional, default false) — if true, a synthesizer subagent distills all the "
                        "reports into ONE merged summary, keeping your context smallest."),
     },
@@ -121,7 +137,8 @@ def dispatch_agents(specs, synthesize=False):
             problems.append(f"agent '{name}' is write-capable; dispatch_agents is read-only fan-out "
                             "— delegate a write agent via a plan step instead")
             continue
-        runnable.append((ad, task, spec.get("context", "")))
+        runnable.append({"agent_def": ad, "task": task, "context": spec.get("context", ""),
+                         "tier": spec.get("tier"), "models": spec.get("models")})
 
     if not runnable:
         return {"error": "No runnable read-only specs. " + "; ".join(problems)}
