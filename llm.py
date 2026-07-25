@@ -1785,6 +1785,86 @@ def _ordered_models(models):
     return available + cooled
 
 
+# --- the COST SPINE: one global model ladder, ordered most-expensive first ----
+# LADDER POSITION IS COST. The operator orders providers (drag-to-reorder,
+# frontend/app.js:1765) and the models within a provider (frontend/app.js:1945);
+# the flattened result is the spine every subagent routes against. A model may
+# ALSO carry an explicit tier tag in model_settings[<model>]["tier"], which always
+# wins over position — so adding a provider never reshuffles a TAGGED model
+# between tiers. Only untagged models drift with position.
+BUILTIN_TIERS = ("premium", "standard", "cheap")
+DEFAULT_SUBAGENT_TIER = "standard"
+
+
+def _derived_tier(rung, n):
+    """Positional tier for an UNTAGGED model at `rung` of a ladder of length `n`.
+    Top rung is premium, bottom rung is cheap, everything between is standard —
+    a labeling rule (not a starting-rung rule) so every model has exactly one
+    tier and tagged/untagged models resolve through the same code path."""
+    if n <= 1 or rung <= 0:
+        return "premium"
+    if rung >= n - 1:
+        return "cheap"
+    return "standard"
+
+
+def model_ladder():
+    """The global cost spine: every configured TEXT model flattened across
+    provider groups in config order, most capable/expensive first.
+
+    Each entry: {rung, id, label, model, tier, tagged}. `tier` is the explicit
+    model_settings tag when present (tagged=True), else derived from position.
+    Returns [] when nothing is configured — callers treat that as "no override"
+    and keep today's behavior."""
+    configs = get_effective_configs()
+    if not configs:
+        return []
+    tags = {}
+    for c in configs:
+        for model, s in (c.get("model_settings") or {}).items():
+            t = _norm_tier((s or {}).get("tier"))
+            if t:
+                tags[model] = t
+    out = []
+    for g in _build_groups(configs):
+        for m in g.get("models") or []:
+            out.append({"id": m.get("id"),
+                        "label": g.get("label") or g.get("provider") or "",
+                        "model": m["model"]})
+    n = len(out)
+    for rung, e in enumerate(out):
+        tag = tags.get(e["model"])
+        e["rung"] = rung
+        e["tier"] = tag or _derived_tier(rung, n)
+        e["tagged"] = bool(tag)
+    return out
+
+
+def models_for_tier(tier, ladder=None):
+    """Ordered model ids a subagent on `tier` should try.
+
+    Body: the first model carrying `tier`, then everything BELOW it in ladder
+    order (so it fails over to cheaper models first). Tail: the rungs ABOVE it,
+    nearest first, appended as a LAST RESORT — this is what preserves ask_llm's
+    "never give up" contract without silently paying premium prices. An unknown
+    tier resolves to DEFAULT_SUBAGENT_TIER; an empty ladder yields []."""
+    ladder = model_ladder() if ladder is None else ladder
+    if not ladder:
+        return []
+    want = _norm_tier(tier) or DEFAULT_SUBAGENT_TIER
+    matches = [e for e in ladder if e["tier"] == want]
+    if not matches:
+        matches = [e for e in ladder if e["tier"] == DEFAULT_SUBAGENT_TIER]
+    if not matches:
+        matches = ladder[:1]        # degenerate ladder — every tier is the top rung
+    # Prefer tagged models (explicit tier) over derived ones; within each, keep ladder order
+    matches = sorted(matches, key=lambda e: (not e["tagged"], e["rung"]))
+    start = matches[0]["rung"]
+    body = [e["model"] for e in ladder[start:]]
+    tail = [e["model"] for e in reversed(ladder[:start])]
+    return body + tail
+
+
 def _live_keys(keys, dead):
     """Keys not marked dead this cycle, ordered to START at the sticky key that
     last worked (so we don't needlessly rotate off a good key), then the rest, with
