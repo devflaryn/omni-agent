@@ -384,6 +384,17 @@ MAX_FINAL_HOOK_NUDGES = 2
 # calls for the whole run, since the goal is a steady cadence, not a one-off hint.
 EXPLANATION_CADENCE_NUDGE = 6
 
+# Read-only tool calls the ORCHESTRATOR may run inline before it's reminded that
+# those are exactly what a parallel subagent wave does for ~0 context. Bounded and
+# self-re-arming (see _maybe_nudge_delegation); 0 disables the nudge entirely.
+try:
+    SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "8")))
+except ValueError:
+    SOLO_READ_NUDGE = 8
+
+# Tools that MEAN the model delegated — they reset the solo-read streak.
+DELEGATION_TOOLS = {"dispatch_agents", "ask_codebase"}
+
 # Narration throttle (the OTHER side of the cadence): a narration line is only
 # surfaced when SWITCHING to a new sub-process AND at least this many tool calls
 # have run since the last line — so the chat shows one line per sub-process, not
@@ -421,6 +432,7 @@ STRATEGY_RESYNC_FINDINGS = 5     # new findings before nudging a brief reconcile
 from tool_policy import (
     MUTATING_TOOLS, VALIDATION_TOOLS,
     NATIVE_SPECULATION_TOOLS, OBSERVE_RUN_TOOLS,
+    is_readonly_tool,
 )
 # Argument names, in priority order, that most likely name the file a mutating
 # tool touched — used to auto-record a "modified file" into investigation memory.
@@ -1595,6 +1607,8 @@ class AgentApi:
         MAIN context, persist it into durable investigation memory, and update the
         plan step's status — shared by both the serial dispatch path above and the
         parallel read-wave path (_run_delegated_read_wave)."""
+        self.session["solo_read_streak"] = 0
+        self.session["_solo_read_nudged"] = False
         s = self.session
         report = (result.get("report") or "").strip()
         ok = bool(result.get("ok"))
@@ -2242,6 +2256,10 @@ class AgentApi:
             # Native anti-tamper patching before that is the classic wasted rabbit hole.
             "build_observed": False,
             "assumption_nudges_sent": 0,                # bounded native-speculation nudges this task
+            # --- delegation nudges (bounded; see _maybe_nudge_delegation) ---
+            "solo_read_streak": 0,              # consecutive inline read-only calls
+            "_solo_read_nudged": False,         # streak nudge already fired this streak
+            "_delegation_phase_nudged": set(),  # phase ids already nudged (Task 11)
             # --- adaptive planning loop policy ---
             "adaptive_planning": ADAPTIVE_PLANNING_DEFAULT,
             "mutating_gate_nudged": False,              # one-time soft nudge fired on the first unplanned mutation
@@ -2390,6 +2408,9 @@ class AgentApi:
         s["_validation_nudged_for"] = None
         s["build_observed"] = False
         s["assumption_nudges_sent"] = 0
+        s["solo_read_streak"] = 0
+        s["_solo_read_nudged"] = False
+        s["_delegation_phase_nudged"] = set()
         # Fresh chat -> drop expanded toolsets back to catalog-only (they re-arm
         # as the new task uses domain tools).
         s["active_toolsets"] = set()
@@ -2439,6 +2460,9 @@ class AgentApi:
         self.session["_validation_nudged_for"] = None
         self.session["build_observed"] = False
         self.session["assumption_nudges_sent"] = 0
+        self.session["solo_read_streak"] = 0
+        self.session["_solo_read_nudged"] = False
+        self.session["_delegation_phase_nudged"] = set()
         # New task -> the next tool call is the "first", so guarantee it opens with
         # an explanation (see the emit block in _run_agent_loop).
         self.session["narrated_this_task"] = False
@@ -3109,6 +3133,36 @@ class AgentApi:
                     "reflect it (or plan_add_task if you've discovered new work) before continuing."
                 )})
 
+    def _maybe_nudge_delegation(self, s, tool_name):
+        """Delegation nudge #1 — the SOLO-READ STREAK.
+
+        Read-only calls the orchestrator runs inline are precisely the work a
+        parallel subagent wave does for ~0 main context, so a long streak of them
+        is the delegation opportunity the model is most likely to miss. Any real
+        delegation resets the streak and re-arms the nudge; it fires at most ONCE
+        per streak so it informs instead of nagging. SOLO_READ_NUDGE=0 disables it."""
+        if not SOLO_READ_NUDGE:
+            return
+        if tool_name in DELEGATION_TOOLS:
+            s["solo_read_streak"] = 0
+            s["_solo_read_nudged"] = False
+            return
+        if not is_readonly_tool(tool_name):
+            return
+        s["solo_read_streak"] = s.get("solo_read_streak", 0) + 1
+        if s["solo_read_streak"] < SOLO_READ_NUDGE or s.get("_solo_read_nudged"):
+            return
+        s["_solo_read_nudged"] = True
+        s["messages"].append({"role": "user", "content": (
+            f"[SYSTEM] That's {s['solo_read_streak']} read-only tool calls in a row in your OWN "
+            "context. Independent look-ups like these are exactly what a parallel subagent wave "
+            "does for almost no context cost to you — and they run concurrently, so a batch of "
+            "them takes about as long as one. Group the next batch into ONE dispatch_agents call "
+            "(tier=\"cheap\" for symbol/where-is lookups, \"standard\" for real analysis), or tag "
+            "the corresponding plan steps delegate=\"researcher@cheap\". Keep only the work that "
+            "genuinely needs your own judgment inline."
+        )})
+
     def _code_graph_guard(self, s, tool_name):
         """Catch the "sweeping files one by one" anti-pattern. Any navigation tool
         (graph query or content search) resets the counter; a long run of pure
@@ -3410,6 +3464,9 @@ class AgentApi:
                     "along. Keep narrating each new sub-process this way (about one explanation "
                     "per few related calls) — but don't explain every single call."
                 )})
+
+        # Delegation nudges: a long inline read streak is a subagent wave not taken.
+        self._maybe_nudge_delegation(s, tool_name)
 
         # Plan bookkeeping: gate-clear on a real plan, delegation dispatch,
         # phase-change re-grounding, and the plan-touch nudge.
