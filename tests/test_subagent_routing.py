@@ -174,7 +174,7 @@ def test_escalates_once_after_two_parse_errors(monkeypatch):
     pins = []
     monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
     monkeypatch.setattr(llm, "set_subagent_context",
-                        lambda pinned_key=None, models=None: pins.append(models))
+                        lambda pinned_key=None, models=None: pins.append((pinned_key, models)))
     monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
     monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
     monkeypatch.setattr(llm, "take_last_model", lambda: None)
@@ -183,8 +183,9 @@ def test_escalates_once_after_two_parse_errors(monkeypatch):
     out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="cheap")
     assert out["ok"] is True
     assert out["escalated"] is True
-    assert pins[0][0] == "flash"      # started cheap
-    assert pins[1][0] == "glm"        # escalated exactly one rung up
+    assert pins[0][1][0] == "flash"      # started cheap
+    assert pins[1][1][0] == "glm"        # escalated exactly one rung up
+    assert pins[0][0] == pins[1][0] == "k1"  # SAME key re-pinned — warm cache preserved
     assert "glm" in out["note"]
 
 
@@ -199,10 +200,13 @@ def test_no_escalation_when_already_top_rung(monkeypatch):
                            '{"type":"final_answer","content":"ok"}'])
     out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="premium")
     assert out["escalated"] is False
+    assert out["ok"] is True
+    assert out["report"] == "ok"          # reached the REAL final answer, not a salvage
+    assert "salvaged" not in out["note"]  # distinguishes from a threshold-off-by-one mutant
 
 
-def test_three_parse_errors_still_salvage(monkeypatch):
-    """The escalation must not consume the 3-error salvage backstop."""
+def test_three_parse_errors_salvage_at_top_rung(monkeypatch):
+    """At the top rung, escalation is a no-op — the 3-error salvage backstop still fires."""
     _patch_ladder(monkeypatch)
     monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
     monkeypatch.setattr(llm, "set_subagent_context", lambda pinned_key=None, models=None: None)
@@ -213,6 +217,89 @@ def test_three_parse_errors_still_salvage(monkeypatch):
     out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="premium")
     assert out["ok"] is True
     assert "salvaged" in out["note"]
+    assert out["escalated"] is False   # never left the top rung
+
+
+def test_three_parse_errors_still_salvage_after_escalation(monkeypatch):
+    """The escalation must not consume the 3-error salvage backstop: after a
+    SUCCESSFUL escalation at error #2, a 3rd consecutive error still salvages."""
+    _patch_ladder(monkeypatch)
+    monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
+    monkeypatch.setattr(llm, "set_subagent_context", lambda pinned_key=None, models=None: None)
+    monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
+    monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
+    monkeypatch.setattr(llm, "take_last_model", lambda: None)
+    _replies(monkeypatch, ["bad one", "bad two", "bad three"])
+    out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="cheap")
+    assert out["ok"] is True
+    assert out["escalated"] is True
+    assert "salvaged" in out["note"]
+
+
+def test_escalation_guard_does_not_rearm_after_success(monkeypatch):
+    """The once-per-run guard must stay tripped even after a later successful
+    parse resets the consecutive-error counter."""
+    _patch_ladder(monkeypatch)
+    pins = []
+    monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
+    monkeypatch.setattr(llm, "set_subagent_context",
+                        lambda pinned_key=None, models=None: pins.append(models))
+    monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
+    monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
+    monkeypatch.setattr(llm, "take_last_model", lambda: None)
+    _replies(monkeypatch, [
+        "garbage", "still garbage",                            # -> escalates on error #2
+        '{"type":"tool_call","tool":"nope","args":{}}',        # successful parse, resets the counter
+        "garbage again", "still garbage again",                # 2 more consecutive errors
+        '{"type":"final_answer","content":"done"}',
+    ])
+    out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="cheap")
+    assert out["ok"] is True
+    assert out["escalated"] is True
+    assert out["note"].count("escalated to") == 1   # only ONE escalation ever happened
+    assert len(pins) == 2                            # initial pin + the one escalation re-pin
+
+
+def test_non_consecutive_parse_errors_do_not_escalate(monkeypatch):
+    """Two parse errors separated by a successful parse must NOT count as
+    consecutive — the counter has to reset on success."""
+    _patch_ladder(monkeypatch)
+    pins = []
+    monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
+    monkeypatch.setattr(llm, "set_subagent_context",
+                        lambda pinned_key=None, models=None: pins.append(models))
+    monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
+    monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
+    monkeypatch.setattr(llm, "take_last_model", lambda: None)
+    _replies(monkeypatch, [
+        "garbage",                                              # error #1
+        '{"type":"tool_call","tool":"nope","args":{}}',        # success -> resets the counter
+        "garbage again",                                        # error #1 again, NOT consecutive
+        '{"type":"final_answer","content":"done"}',
+    ])
+    out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="cheap")
+    assert out["ok"] is True
+    assert out["escalated"] is False
+    assert len(pins) == 1   # only the initial pin — escalation never triggered
+
+
+def test_note_accumulates_unknown_models_and_escalation(monkeypatch):
+    """result['note'] must carry BOTH the Task-4 unknown-model note and the
+    Task-5 escalation note — one must not overwrite the other."""
+    _patch_ladder(monkeypatch)
+    monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
+    monkeypatch.setattr(llm, "set_subagent_context", lambda pinned_key=None, models=None: None)
+    monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
+    monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
+    monkeypatch.setattr(llm, "take_last_model", lambda: None)
+    _replies(monkeypatch, ["garbage", "still garbage",
+                           '{"type":"final_answer","content":"ok now"}'])
+    out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t",
+                                 models=["ghost", "flash"])
+    assert out["ok"] is True
+    assert out["escalated"] is True
+    assert "ghost" in out["note"]             # Task-4 unknown-model note survived
+    assert "escalated to glm" in out["note"]  # Task-5 escalation note also present
 
 
 def test_escalate_ladder_helper(monkeypatch):
