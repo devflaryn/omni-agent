@@ -452,6 +452,32 @@ def _split_delegate(raw):
     return name.strip(), (tier.strip().lower() or None)
 
 
+# Wording that reads as INVESTIGATION (a read-only subagent could own it end to
+# end) vs. wording that reads as a CHANGE. Used only to decide whether to NUDGE —
+# never to auto-delegate, so a false positive costs one advisory line, nothing more.
+_RESEARCH_HINTS = ("find", "locate", "identify", "investigate", "research", "map ",
+                   "search", "inspect", "analyze", "analyse", "where", "which",
+                   "how does", "determine", "audit", "survey", "trace", "enumerate")
+_CHANGE_HINTS = ("patch", "edit", "rebuild", "build", "sign", "install", "write",
+                 "modify", "implement", "fix ", "remove", "replace")
+
+
+def _looks_like_research(item):
+    """True when a plan step reads as an investigation rather than a change.
+
+    Matches on WORD boundaries, not raw substrings — a plain `in` check would
+    have "sign" (a change hint) false-hit inside "signature", misreading a step
+    like "locate the signature check" as a change."""
+    text = " ".join(str(item.get(k) or "")
+                    for k in ("content", "action", "purpose")).lower()
+    def _hit(hints):
+        return any(re.search(r"\b" + re.escape(h.strip()) + r"\b", text)
+                   for h in hints)
+    if _hit(_CHANGE_HINTS):
+        return False
+    return _hit(_RESEARCH_HINTS)
+
+
 def _best_path_arg(args):
     """Best-effort: the most path-like value among a tool call's args, for
     recording which file a mutating tool changed. Empty string if none found."""
@@ -3111,6 +3137,7 @@ class AgentApi:
             # in an isolated subagent and fold back its report.
             if not tool_failed:
                 self._maybe_dispatch_delegated_steps()
+                self._maybe_nudge_plan_delegation(s)
             # A phase advance is a natural re-grounding point (GSD phases).
             if tool_name == "plan_advance_phase" and not tool_failed:
                 self._maybe_reground(force=True)
@@ -3161,6 +3188,36 @@ class AgentApi:
             "(tier=\"cheap\" for symbol/where-is lookups, \"standard\" for real analysis), or tag "
             "the corresponding plan steps delegate=\"researcher@cheap\". Keep only the work that "
             "genuinely needs your own judgment inline."
+        )})
+
+    def _maybe_nudge_plan_delegation(self, s):
+        """Delegation nudge #2 — PLAN SHAPE.
+
+        A phase holding 2+ independent, still-pending, research-flavored steps
+        with no `delegate` is a parallel wave the model left on the table. Name
+        the exact step ids and the exact tag to add. Fires at most ONCE per phase,
+        and never auto-delegates — tagging stays the model's decision."""
+        plan = planning.get_active_plan()
+        if plan is None or not getattr(plan, "current_phase_id", None):
+            return
+        nudged = s.setdefault("_delegation_phase_nudged", set())
+        if plan.current_phase_id in nudged:
+            return
+        cands = [it for it in plan.items
+                 if it.get("phase_id") == plan.current_phase_id
+                 and it.get("status") not in planning.DONE_STATUSES
+                 and not (it.get("delegate") or "").strip()
+                 and not [d for d in (it.get("depends_on") or []) if d]
+                 and _looks_like_research(it)]
+        if len(cands) < 2:
+            return
+        nudged.add(plan.current_phase_id)
+        ids = ", ".join(str(it["id"]) for it in cands)
+        s["messages"].append({"role": "user", "content": (
+            f"[SYSTEM] Steps {ids} in this phase are independent research with no delegate. "
+            "Tag each one delegate=\"researcher@cheap\" (plan_update_task) — they'll fan out as "
+            "ONE parallel wave, run on a cheap model, and cost you almost no context. Leave "
+            "untagged only the steps that genuinely need your own judgment."
         )})
 
     def _code_graph_guard(self, s, tool_name):
