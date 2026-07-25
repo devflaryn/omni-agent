@@ -25,6 +25,8 @@ import importlib.util
 import json
 import os
 
+import llm
+
 from skills_loader import _parse_frontmatter, register_skill_root, clear_skill_roots
 from subagents import AgentDef, DEFAULT_MAX_STEPS
 
@@ -78,6 +80,8 @@ def _load_agent_md(path):
         temperature=_as_float(meta.get("temperature")),
         max_steps=_as_int(meta.get("max_steps"), DEFAULT_MAX_STEPS),
         allow_optin_read=_as_bool(meta.get("allow_optin_read")),
+        tier=meta.get("tier"),
+        models=_as_list(meta.get("models", "")) or None,
     )
 
 
@@ -235,17 +239,28 @@ class PluginRegistry:
 
     def get_agents_prompt(self):
         """System-prompt segment describing the delegatable subagents, so the
-        planner can target them with a plan step's `delegate` field (Phase 4)."""
+        planner can target them with a plan step's `delegate` field (Phase 4).
+        Each agent shows its DEFAULT cost tier, and the live model ladder is
+        appended so the model can pick a cheaper rung per dispatch without any
+        hardcoded model names in this file."""
         if not self.agents:
             return ""
         lines = ["\nAVAILABLE SUBAGENTS (delegation targets)",
                  ("Delegate a bounded sub-task to one of these by tagging a plan step with "
-                  "delegate=\"<name>\" (or via dispatch_agents for a parallel wave). Each runs in its OWN "
-                  "isolated context and returns only a distilled report — keeping this conversation lean. "
-                  "READ agents can run in parallel; WRITE agents run one at a time.\n")]
+                  "delegate=\"<name>\" (or delegate=\"<name>@<tier>\" to pick the model tier; or via "
+                  "dispatch_agents for a parallel wave). Each runs in its OWN isolated context and returns "
+                  "only a distilled report — keeping this conversation lean. READ agents can run in "
+                  "parallel; WRITE agents run one at a time.\n")]
         for a in self.list_agents():
             ts = f" [toolsets: {', '.join(sorted(a.toolsets))}]" if a.toolsets else ""
-            lines.append(f"- {a.name} ({a.mode}){ts}: {a.description}")
+            tier = f" [tier: {a.tier}]" if getattr(a, "tier", None) else ""
+            lines.append(f"- {a.name} ({a.mode}){ts}{tier}: {a.description}")
+        ladder = llm.model_ladder()
+        if ladder:
+            lines.append("\nMODEL LADDER (cost spine — most expensive first). Pick the CHEAPEST rung "
+                         "that can actually do the job:")
+            for e in ladder:
+                lines.append(f"  {e['rung']}. {e['model']} — tier: {e['tier']}")
         lines.append("END OF SUBAGENTS.\n")
         return "\n".join(lines)
 

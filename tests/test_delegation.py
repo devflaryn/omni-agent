@@ -222,6 +222,45 @@ def test_ladder_hint_empty_when_unconfigured(monkeypatch):
     assert delegation_tools._ladder_hint() == ""
 
 
+# --- persona default tiers + subagents prompt --------------------------------
+
+def test_agent_md_parses_tier_and_models(tmp_path):
+    p = tmp_path / "x.md"
+    p.write_text("---\nname: x\nmode: read\ntier: cheap\n"
+                 "models: a, b\n---\nbody\n", encoding="utf-8")
+    ad = plugins._load_agent_md(str(p))
+    assert ad.tier == "cheap"
+    assert ad.models == ["a", "b"]
+
+
+def test_agent_md_without_tier_defaults_to_none(tmp_path):
+    p = tmp_path / "y.md"
+    p.write_text("---\nname: y\nmode: read\n---\nbody\n", encoding="utf-8")
+    ad = plugins._load_agent_md(str(p))
+    assert ad.tier is None and ad.models is None
+
+
+def test_agents_prompt_shows_tier_and_ladder(monkeypatch):
+    monkeypatch.setattr(llm, "model_ladder", lambda: [
+        {"rung": 0, "id": "c", "label": "L", "model": "kimi",
+         "tier": "premium", "tagged": False},
+        {"rung": 1, "id": "c", "label": "L", "model": "flash",
+         "tier": "cheap", "tagged": False}])
+    reg = plugins.PluginRegistry()
+    reg.agents = {"r": _subagents.AgentDef("r", "p", mode="read",
+                                           description="d", tier="cheap")}
+    text = reg.get_agents_prompt()
+    assert "tier: cheap" in text
+    assert "MODEL LADDER" in text
+    assert "kimi" in text and "flash" in text
+
+
+def test_researcher_persona_defaults_to_cheap():
+    reg = plugins.get_registry()
+    ad = reg.get_agent("researcher")
+    assert ad is not None and ad.tier == "cheap"
+
+
 if __name__ == "__main__":
     import types
     mp = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
