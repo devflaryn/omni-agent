@@ -424,8 +424,14 @@ def _norm_tier(value):
     Tier names are deliberately OPEN — 'premium'/'standard'/'cheap' are only the
     names the system prompt advertises, so tagging a model 'fast' works with no
     code change. Kept to a slug so it round-trips through JSON and the UI select."""
-    v = re.sub(r"[^a-z0-9_-]+", "-", (value or "").strip().lower()).strip("-")
-    return v[:32]
+    # Handle non-string input by silently degrading to empty tier (malformed input).
+    # This ensures hand-edited JSON with "tier": 5 degrades gracefully to no tier,
+    # rather than raising (which would crash config loading).
+    if not isinstance(value, str):
+        return ""
+    v = re.sub(r"[^a-z0-9_-]+", "-", value.strip().lower())
+    v = v[:32].strip("-")
+    return v
 
 
 def _norm_model_settings(value, model_ids=None):

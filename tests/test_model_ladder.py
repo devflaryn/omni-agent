@@ -9,6 +9,24 @@ def test_norm_tier_slugifies_and_blanks():
     assert llm._norm_tier(None) == ""
 
 
+def test_norm_tier_handles_non_string_input():
+    """Non-string input must degrade gracefully to '', not raise."""
+    assert llm._norm_tier(5) == ""
+    assert llm._norm_tier([1]) == ""
+    assert llm._norm_tier({"a": 1}) == ""
+    assert llm._norm_tier(True) == ""
+
+
+def test_norm_tier_no_trailing_hyphen_after_truncation():
+    """A >32-char tier name with hyphens must not end in '-' after truncation."""
+    # Create a tier name that's long and has hyphens at position 32+
+    # "hello-world-this-is-a-long-tier-name-here" is ~43 chars
+    long_tier = "hello-world-this-is-a-long-tier-name-here"
+    result = llm._norm_tier(long_tier)
+    assert len(result) <= 32
+    assert not result.endswith("-"), f"Result '{result}' should not end with '-'"
+
+
 def test_model_settings_preserves_tier():
     out = llm._norm_model_settings(
         {"m-1": {"reasoning_effort": "high", "tier": "Premium"},
