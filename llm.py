@@ -1608,20 +1608,30 @@ def _anthropic_request(cfg, messages, temperature):
 # wasting a slow probe on a model that failed milliseconds ago.
 _TL = threading.local()
 
-def set_subagent_context(pinned_key=None):
-    """Mark THIS thread as a subagent: pin its API key, suppress the main-thread
-    provider badge, and start fresh usage accounting."""
+def set_subagent_context(pinned_key=None, models=None):
+    """Mark THIS thread as a subagent: pin its API key, optionally pin its own
+    MODEL LADDER (ordered model ids — see subagents.resolve_model_ladder),
+    suppress the main-thread provider badge, and start fresh usage accounting.
+    Thread-local, so the main thread's ask_llm is entirely unaffected."""
     _TL.pinned_key = pinned_key
+    _TL.model_ladder = list(models) if models else None
     _TL.is_subagent = True
     _TL.last_usage = None
+    _TL.last_model = None
 
 def clear_subagent_context():
     _TL.pinned_key = None
+    _TL.model_ladder = None
     _TL.is_subagent = False
     _TL.last_usage = None
+    _TL.last_model = None
 
 def _pinned_key():
     return getattr(_TL, "pinned_key", None)
+
+def _thread_model_ladder():
+    """This thread's pinned model ladder, or None to use the global one."""
+    return getattr(_TL, "model_ladder", None)
 
 def _is_subagent_thread():
     return getattr(_TL, "is_subagent", False)
@@ -1635,6 +1645,14 @@ def take_last_usage():
     u = getattr(_TL, "last_usage", None)
     _TL.last_usage = None
     return u
+
+def take_last_model():
+    """Model id that served the last successful request on THIS thread, or None.
+    Cleared on read, like take_last_usage — feeds per-subagent cost telemetry so
+    the UI can show which model actually answered, not just which was requested."""
+    m = getattr(_TL, "last_model", None)
+    _TL.last_model = None
+    return m
 
 
 _ACTIVE_CONFIG_ID = None   # representative entry id of the group now serving (badge)
@@ -2087,6 +2105,35 @@ def _apply_preference(groups, pref):
     return groups
 
 
+def _apply_model_override(groups, model_ids):
+    """Re-emit `groups` so models are tried in EXACTLY `model_ids` order.
+
+    Consecutive ids belonging to the SAME source group are merged into one
+    emitted group so `_run_group`'s per-call dead-key set is still shared between
+    them — splitting every model into its own group would re-probe keys already
+    known dead. Ids not present in `groups` are skipped; returns [] if none match
+    (the caller then keeps the full ladder rather than having nothing to call)."""
+    index = {}
+    for g in groups:
+        for m in g.get("models") or []:
+            index.setdefault(m["model"], (g, m))
+    out = []
+    cur_src = None
+    for mid in model_ids:
+        hit = index.get(mid)
+        if hit is None:
+            continue
+        src, m = hit
+        if out and cur_src is src:
+            out[-1]["models"].append(m)
+            continue
+        ng = dict(src)
+        ng["models"] = [m]
+        out.append(ng)
+        cur_src = src
+    return out
+
+
 def _one_request(cfg, messages, temperature):
     if cfg["protocol"] == "anthropic":
         return _anthropic_request(cfg, messages, temperature)
@@ -2224,6 +2271,7 @@ def _run_group(group, messages, temperature, ladder=None, track_active=True, act
             res = _one_request(cfg, messages, temperature)
             if res.get("ok"):
                 _MODEL_COOLDOWN.pop(m["model"], None)   # it works again
+                _TL.last_model = m["model"]             # thread-local; feeds take_last_model()
                 if not _is_subagent_thread():
                     _ACTIVE_KEY = key                   # shared key pool (text + vision)
                     if track_active:
@@ -2290,9 +2338,16 @@ def ask_llm(messages, temperature=0.7, active_groups=None):
             cycle += 1
             continue
 
-        # Start at the user's selected model (composer dropdown) and fall DOWNWARD
-        # only; re-read each cycle so changing the selection mid-run takes effect.
-        groups = _apply_preference(_build_groups(configs), get_preferred_model())
+        # A SUBAGENT thread routes on its own pinned ladder (cost-aware, chosen by
+        # the orchestrator); the MAIN thread starts at the user's selected model
+        # (composer dropdown) and falls DOWNWARD only. Re-read each cycle so a
+        # changed selection — or a changed config — takes effect mid-run.
+        groups = _build_groups(configs)
+        override = _thread_model_ladder()
+        if override:
+            groups = _apply_model_override(groups, override) or groups
+        else:
+            groups = _apply_preference(groups, get_preferred_model())
         errors = []
         all_keys_dead = True   # only meaningful if we never got a non-key failure
         for gi, group in enumerate(groups):

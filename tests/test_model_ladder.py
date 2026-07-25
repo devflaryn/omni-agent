@@ -155,3 +155,119 @@ def test_model_ladder_shape(monkeypatch):
 def test_model_ladder_empty_when_unconfigured(monkeypatch):
     monkeypatch.setattr(llm, "get_effective_configs", lambda: [])
     assert llm.model_ladder() == []
+
+
+import threading
+
+
+def teardown_function():
+    llm.clear_subagent_context()
+
+
+def _groups():
+    def mk(model):
+        return {"id": "c", "name": "n", "model": model, "cfg": {"model": model}}
+    return [
+        {"provider": "cline", "label": "cline", "keys": ["k1"], "models": [mk("kimi")]},
+        {"provider": "nvidia", "label": "nv", "keys": ["k2", "k3"],
+         "models": [mk("glm"), mk("pro"), mk("flash")]},
+    ]
+
+
+def test_apply_model_override_honours_exact_order():
+    out = llm._apply_model_override(_groups(), ["flash", "kimi"])
+    assert [[m["model"] for m in g["models"]] for g in out] == [["flash"], ["kimi"]]
+
+
+def test_apply_model_override_merges_consecutive_same_provider():
+    out = llm._apply_model_override(_groups(), ["pro", "flash", "kimi"])
+    assert [[m["model"] for m in g["models"]] for g in out] == [["pro", "flash"], ["kimi"]]
+    assert out[0]["keys"] == ["k2", "k3"]   # key pool preserved for dead-key sharing
+
+
+def test_apply_model_override_splits_non_consecutive_same_provider():
+    out = llm._apply_model_override(_groups(), ["pro", "kimi", "flash"])
+    assert [[m["model"] for m in g["models"]] for g in out] == [["pro"], ["kimi"], ["flash"]]
+
+
+def test_apply_model_override_skips_unknown_ids():
+    out = llm._apply_model_override(_groups(), ["nope", "glm"])
+    assert [[m["model"] for m in g["models"]] for g in out] == [["glm"]]
+
+
+def test_apply_model_override_all_unknown_returns_empty():
+    assert llm._apply_model_override(_groups(), ["nope", "nada"]) == []
+
+
+def test_apply_model_override_does_not_mutate_source_groups():
+    src = _groups()
+    llm._apply_model_override(src, ["pro", "flash"])
+    assert [m["model"] for m in src[1]["models"]] == ["glm", "pro", "flash"]
+
+
+def test_set_subagent_context_stores_and_clears_ladder():
+    llm.set_subagent_context(pinned_key="k", models=["a", "b"])
+    assert llm._thread_model_ladder() == ["a", "b"]
+    llm.clear_subagent_context()
+    assert llm._thread_model_ladder() is None
+
+
+def test_take_last_model_roundtrip_and_clear():
+    llm._TL.last_model = "some-model"
+    assert llm.take_last_model() == "some-model"
+    assert llm.take_last_model() is None
+
+
+def test_override_is_thread_local(monkeypatch):
+    """A subagent thread's ladder must never leak into the main thread."""
+    llm.clear_subagent_context()
+    seen = {}
+
+    def worker():
+        llm.set_subagent_context(pinned_key="k", models=["flash"])
+        seen["sub"] = llm._thread_model_ladder()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert seen["sub"] == ["flash"]
+    assert llm._thread_model_ladder() is None
+
+
+def test_ask_llm_uses_override_on_subagent_thread(monkeypatch):
+    """With an override set, ask_llm must try the overridden model and must NOT
+    consult get_preferred_model()."""
+    monkeypatch.setattr(llm, "get_effective_configs", lambda: [{"x": 1}])
+    monkeypatch.setattr(llm, "_build_groups", lambda cfgs: _groups())
+    monkeypatch.setattr(llm, "get_preferred_model",
+                        lambda: (_ for _ in ()).throw(AssertionError("preference consulted")))
+    tried = []
+
+    def fake_run_group(group, messages, temperature, **kw):
+        tried.append(group["models"][0]["model"])
+        return {"ok": True, "content": "hi", "model": group["models"][0],
+                "key": "k", "cfg": {}}
+
+    monkeypatch.setattr(llm, "_run_group", fake_run_group)
+    monkeypatch.setattr(llm, "_await_or_stop", lambda fn, poll=0.1: fn())
+    llm.set_subagent_context(pinned_key="k", models=["flash"])
+    assert llm.ask_llm([{"role": "user", "content": "hi"}]) == "hi"
+    assert tried == ["flash"]
+
+
+def test_ask_llm_falls_back_to_full_ladder_when_override_matches_nothing(monkeypatch):
+    monkeypatch.setattr(llm, "get_effective_configs", lambda: [{"x": 1}])
+    monkeypatch.setattr(llm, "_build_groups", lambda cfgs: _groups())
+    monkeypatch.setattr(llm, "get_preferred_model", lambda: None)
+    tried = []
+
+    def fake_run_group(group, messages, temperature, **kw):
+        tried.append(group["models"][0]["model"])
+        return {"ok": True, "content": "hi", "model": group["models"][0],
+                "key": "k", "cfg": {}}
+
+    monkeypatch.setattr(llm, "_run_group", fake_run_group)
+    monkeypatch.setattr(llm, "_await_or_stop", lambda fn, poll=0.1: fn())
+    llm.set_subagent_context(pinned_key="k", models=["ghost"])
+    assert llm.ask_llm([{"role": "user", "content": "hi"}]) == "hi"
+    assert tried == ["kimi"]   # full ladder, not an empty group list
