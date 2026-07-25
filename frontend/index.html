@@ -343,6 +343,16 @@
       transform: translateX(100%); transition: transform .22s ease;
     }
     #concurrency-dock.cdock-open { transform: translateX(0); }
+    /* The dock is fixed so it can slide, which means it would otherwise COVER the
+       chat and sidebar. Reserve its width on the app shell while it's open so the
+       panels reflow narrower instead of being hidden underneath. Same duration and
+       easing as the slide, so the two move as one. Below 900px there isn't room to
+       give up 340px, so it goes back to overlaying. */
+    #app { transition: padding-right .22s ease; }
+    body.cdock-pushed #app { padding-right: 340px; }
+    @media (max-width: 900px) {
+      body.cdock-pushed #app { padding-right: 0; }
+    }
     /* persistent session HUD: elapsed / running-done / cumulative tokens */
     .cdock-session {
       padding: 7px 11px; border-bottom: 1px solid rgb(var(--term-line));

@@ -395,6 +395,27 @@ except ValueError:
 # Tools that MEAN the model delegated — they reset the solo-read streak.
 DELEGATION_TOOLS = {"dispatch_agents", "ask_codebase"}
 
+# --- Auto-delegation ---------------------------------------------------------
+# Nudges alone measurably under-deliver: an observed 300-step run produced only
+# TWO subagents, because an advisory line is easy to read past. So the harness
+# also TAGS obviously-delegatable plan steps itself. It only ever touches steps
+# that are pending, unblocked and carry no `delegate` of their own — the model
+# can always retag or clear one, and every auto-tag is announced in the chat.
+#   * a wave of independent RESEARCH steps -> researcher (cheap): they fan out.
+#   * a self-contained CHANGE step         -> implementer (standard). Writes
+#     still SERIALIZE on the workspace lock (two agents editing one decompiled
+#     tree corrupts it) — the win there is isolated context + a cheaper model,
+#     not speed.
+# Set OMNI_AUTO_DELEGATE=0 to turn the whole behaviour off and go back to
+# advisory-only nudges.
+AUTO_DELEGATE = (os.environ.get("OMNI_AUTO_DELEGATE", "1").strip().lower()
+                 not in ("0", "false", "no", "off"))
+# Independent research steps needed before a wave is auto-tagged. One lone
+# lookup is not a wave, and hijacking it would just annoy; two is a real fan-out.
+AUTO_DELEGATE_READ_MIN = 2
+AUTO_DELEGATE_READ_TAG = "researcher@cheap"
+AUTO_DELEGATE_WRITE_TAG = "implementer@standard"
+
 # Narration throttle (the OTHER side of the cadence): a narration line is only
 # surfaced when SWITCHING to a new sub-process AND at least this many tool calls
 # have run since the last line — so the chat shows one line per sub-process, not
@@ -453,29 +474,62 @@ def _split_delegate(raw):
 
 
 # Wording that reads as INVESTIGATION (a read-only subagent could own it end to
-# end) vs. wording that reads as a CHANGE. Used only to decide whether to NUDGE —
-# never to auto-delegate, so a false positive costs one advisory line, nothing more.
+# end) vs. wording that reads as a CHANGE (a write-capable subagent's job). These
+# drive the delegation nudges AND auto-delegation, so a false positive costs a
+# misrouted subagent — recoverable (the model retags), but not free. Both sides
+# match on WORD BOUNDARIES; see _looks_like_research for why that matters.
 _RESEARCH_HINTS = ("find", "locate", "identify", "investigate", "research", "map ",
                    "search", "inspect", "analyze", "analyse", "where", "which",
                    "how does", "determine", "audit", "survey", "trace", "enumerate")
 _CHANGE_HINTS = ("patch", "edit", "rebuild", "build", "sign", "install", "write",
                  "modify", "implement", "fix ", "remove", "replace")
+# Wording that reads as an ORCHESTRATOR JUDGMENT CALL — deciding between
+# approaches, choosing a strategy, weighing trade-offs. These must never be
+# auto-delegated: handing "decide which bypass to use" to a cheap researcher
+# offloads exactly the reasoning the main agent is supposed to keep. A nudge is
+# fine (the model can still choose to delegate), but the harness won't do it.
+_JUDGMENT_HINTS = ("decide", "choose", "which approach", "strategy", "trade-off",
+                   "tradeoff", "weigh", "evaluate whether", "assess whether",
+                   "recommend", "prioritize", "prioritise")
+
+
+def _step_text(item):
+    """The wording of a plan step, for the research/change heuristics."""
+    return " ".join(str(item.get(k) or "")
+                    for k in ("content", "action", "purpose")).lower()
+
+
+def _hits_hints(text, hints):
+    """True if any hint appears in `text` as a WHOLE WORD. A plain `in` check
+    would have "sign" (a change hint) false-hit inside "signature", misreading
+    "locate the signature check" as a change."""
+    return any(re.search(r"\b" + re.escape(h.strip()) + r"\b", text) for h in hints)
 
 
 def _looks_like_research(item):
     """True when a plan step reads as an investigation rather than a change.
-
-    Matches on WORD boundaries, not raw substrings — a plain `in` check would
-    have "sign" (a change hint) false-hit inside "signature", misreading a step
-    like "locate the signature check" as a change."""
-    text = " ".join(str(item.get(k) or "")
-                    for k in ("content", "action", "purpose")).lower()
-    def _hit(hints):
-        return any(re.search(r"\b" + re.escape(h.strip()) + r"\b", text)
-                   for h in hints)
-    if _hit(_CHANGE_HINTS):
+    CHANGE wording wins: a step that both investigates and edits is a change."""
+    text = _step_text(item)
+    if _hits_hints(text, _CHANGE_HINTS):
         return False
-    return _hit(_RESEARCH_HINTS)
+    return _hits_hints(text, _RESEARCH_HINTS)
+
+
+def _looks_like_change(item):
+    """True when a plan step reads as an edit/build/install rather than a lookup.
+    The inverse gate to _looks_like_research — used to route a self-contained
+    change step to a WRITE subagent instead of a read-only researcher."""
+    return _hits_hints(_step_text(item), _CHANGE_HINTS)
+
+
+def _is_self_contained(item):
+    """True when a step carries enough spec for a subagent to own it end to end:
+    an explicit action or a "done when" check. Auto-delegating a one-line stub
+    with no success criterion just moves the ambiguity into an isolated context
+    where the orchestrator can't see it, so those stay with the main loop."""
+    return bool((item.get("action") or "").strip()
+                or (item.get("verification") or "").strip()
+                or (item.get("expected") or "").strip())
 
 
 def _best_path_arg(args):
@@ -1451,6 +1505,99 @@ class AgentApi:
         self._emit({"type": "strategy_update", "strategy": brief_dict})
 
     # --- plan-driven delegation ------------------------------------------------
+    def _auto_delegate_untagged_steps(self, plan):
+        """Tag obviously-delegatable steps of the ACTIVE phase, so fan-out does
+        not depend on the model remembering to ask for it.
+
+        Advisory nudges alone were not enough — an observed 300-step run produced
+        two subagents. This closes the gap for the cases where delegation is
+        unambiguous, and deliberately leaves everything else alone:
+
+          * A WAVE of >=2 independent research steps -> researcher (cheap). They
+            run concurrently, so this is the real speed win.
+          * A self-contained CHANGE step -> implementer (standard). Write
+            subagents still SERIALIZE behind the workspace lock (two agents
+            editing one decompiled tree corrupts it), so the win here is the
+            isolated context and the cheaper model, not parallelism.
+
+        Only PENDING, unblocked, untagged steps are eligible — an in_progress
+        step may be one the model is actively doing itself, and a step with
+        unmet dependencies is not ready for anyone. Every tag is announced in
+        the chat and to the model, which stays free to retag or clear it.
+        OMNI_AUTO_DELEGATE=0 disables this entirely."""
+        s = self.session
+        if not AUTO_DELEGATE or not s.get("delegation_enabled", True):
+            return
+        if not getattr(plan, "current_phase_id", None):
+            return
+        reg = plugins.get_registry()
+
+        def _live(tag):
+            """The tag, if its agent actually exists — else None, so a missing
+            persona degrades to no auto-delegation instead of manufacturing the
+            'Unknown delegate agent' error path."""
+            return tag if reg.get_agent(_split_delegate(tag)[0]) is not None else None
+
+        pool = [it for it in plan.items
+                if it.get("phase_id") == plan.current_phase_id
+                and it.get("status") == "pending"
+                and not (it.get("delegate") or "").strip()
+                and not [d for d in (it.get("depends_on") or []) if d]]
+        if not pool:
+            return
+
+        # A judgment call (deciding between approaches, choosing a strategy) may
+        # read as "research" by keyword, but auto-delegating it offloads the
+        # orchestrator's own reasoning to a cheap agent — never do that. The
+        # nudge still mentions these; the harness just won't tag them itself.
+        pool = [it for it in pool
+                if not _hits_hints(_step_text(it), _JUDGMENT_HINTS)]
+        if not pool:
+            return
+
+        picks = []
+        read_tag = _live(AUTO_DELEGATE_READ_TAG)
+        reads = [it for it in pool if _looks_like_research(it)]
+        if read_tag and len(reads) >= AUTO_DELEGATE_READ_MIN:
+            picks += [(it, read_tag) for it in reads]
+        write_tag = _live(AUTO_DELEGATE_WRITE_TAG)
+        if write_tag:
+            picks += [(it, write_tag) for it in pool
+                      if _looks_like_change(it) and _is_self_contained(it)]
+        if not picks:
+            return
+
+        done = []
+        for step, tag in picks:
+            try:
+                plan.update_item(step["id"], delegate=tag)
+            except Exception:
+                continue          # a plan mutation must never break the loop
+            done.append((step["id"], tag))
+        if not done:
+            return
+        planning.notify_updated()
+
+        n_read = sum(1 for _i, t in done if t == read_tag)
+        n_write = len(done) - n_read
+        bits = []
+        if n_read:
+            bits.append(f"{n_read} research step{'s' if n_read != 1 else ''} → "
+                        f"{_split_delegate(read_tag)[0]} (parallel)")
+        if n_write:
+            bits.append(f"{n_write} change step{'s' if n_write != 1 else ''} → "
+                        f"{_split_delegate(write_tag)[0]} (serialized)")
+        self._emit({"type": "system",
+                    "content": "Auto-delegated " + ", ".join(bits) + "."})
+        listing = "; ".join(f"({i}) → {t}" for i, t in done)
+        s["messages"].append({"role": "user", "content": (
+            f"[SYSTEM] Auto-delegated these unblocked, untagged steps: {listing}. Read agents "
+            "run as ONE parallel wave; write agents run one at a time on the shared workspace. "
+            "Their distilled reports fold back here — you do NOT need to redo their work. If one "
+            "was a bad fit, retag it (plan_update_task delegate=\"<agent>@<tier>\") or clear the "
+            "delegate to take it back."
+        )})
+
     def _maybe_dispatch_delegated_steps(self):
         """Dispatch delegated plan steps of the ACTIVE phase. Parallel-by-default:
         every ready independent READ step (deps satisfied) fans out in ONE wide wave
@@ -1465,6 +1612,10 @@ class AgentApi:
         plan = s.get("plan") or planning.get_active_plan()
         if plan is None:
             return
+        # Tag obviously-delegatable steps BEFORE candidates are computed, so a
+        # freshly auto-tagged step joins THIS dispatch pass instead of waiting
+        # for the next plan tool call.
+        self._auto_delegate_untagged_steps(plan)
         dispatched = s.setdefault("dispatched_steps", set())
         reg = plugins.get_registry()
         parallel = s.get("parallel_execution_enabled", True)
@@ -1634,7 +1785,6 @@ class AgentApi:
         plan step's status — shared by both the serial dispatch path above and the
         parallel read-wave path (_run_delegated_read_wave)."""
         self.session["solo_read_streak"] = 0
-        self.session["_solo_read_nudged"] = False
         s = self.session
         report = (result.get("report") or "").strip()
         ok = bool(result.get("ok"))
@@ -2284,8 +2434,8 @@ class AgentApi:
             "assumption_nudges_sent": 0,                # bounded native-speculation nudges this task
             # --- delegation nudges (bounded; see _maybe_nudge_delegation) ---
             "solo_read_streak": 0,              # consecutive inline read-only calls
-            "_solo_read_nudged": False,         # streak nudge already fired this streak
-            "_delegation_phase_nudged": set(),  # phase ids already nudged (Task 11)
+            "solo_read_nudges_sent": 0,         # streak nudges fired this task (escalates wording)
+            "_delegation_phase_nudged": set(),  # (phase_id, candidate-set) sigs already nudged
             # --- adaptive planning loop policy ---
             "adaptive_planning": ADAPTIVE_PLANNING_DEFAULT,
             "mutating_gate_nudged": False,              # one-time soft nudge fired on the first unplanned mutation
@@ -2435,7 +2585,7 @@ class AgentApi:
         s["build_observed"] = False
         s["assumption_nudges_sent"] = 0
         s["solo_read_streak"] = 0
-        s["_solo_read_nudged"] = False
+        s["solo_read_nudges_sent"] = 0
         s["_delegation_phase_nudged"] = set()
         # Fresh chat -> drop expanded toolsets back to catalog-only (they re-arm
         # as the new task uses domain tools).
@@ -2487,7 +2637,7 @@ class AgentApi:
         self.session["build_observed"] = False
         self.session["assumption_nudges_sent"] = 0
         self.session["solo_read_streak"] = 0
-        self.session["_solo_read_nudged"] = False
+        self.session["solo_read_nudges_sent"] = 0
         self.session["_delegation_phase_nudged"] = set()
         # New task -> the next tool call is the "first", so guarantee it opens with
         # an explanation (see the emit block in _run_agent_loop).
@@ -3169,27 +3319,40 @@ class AgentApi:
 
         Read-only calls the orchestrator runs inline are precisely the work a
         parallel subagent wave does for ~0 main context, so a long streak of them
-        is the delegation opportunity the model is most likely to miss. Any real
-        delegation resets the streak and re-arms the nudge; it fires at most ONCE
-        per streak so it informs instead of nagging. SOLO_READ_NUDGE=0 disables it."""
+        is the delegation opportunity the model is most likely to miss.
+
+        RE-ARMS every SOLO_READ_NUDGE read-only calls, exactly like the
+        explanation-cadence guardrail above — it does NOT fire once and go quiet.
+        The one-shot version of this shipped first and was effectively silent: in
+        a 300-step autonomous run inside a single user turn it fired once, and
+        only a real delegation could re-arm it, so the observed result was two
+        subagents in three hundred steps. A steady cadence is the whole point.
+        Each repeat states how many chances have now passed, so ignoring it reads
+        as a growing cost rather than the same line again. SOLO_READ_NUDGE=0
+        disables it."""
         if not SOLO_READ_NUDGE:
             return
         if tool_name in DELEGATION_TOOLS:
             s["solo_read_streak"] = 0
-            s["_solo_read_nudged"] = False
             return
         if not is_readonly_tool(tool_name):
             return
         s["solo_read_streak"] = s.get("solo_read_streak", 0) + 1
-        if s["solo_read_streak"] < SOLO_READ_NUDGE or s.get("_solo_read_nudged"):
+        if s["solo_read_streak"] < SOLO_READ_NUDGE:
             return
-        s["_solo_read_nudged"] = True
+        run = s["solo_read_streak"]
+        s["solo_read_streak"] = 0                       # re-arm: steady cadence
+        sent = s["solo_read_nudges_sent"] = s.get("solo_read_nudges_sent", 0) + 1
         s["_delegation_nudge_fired_this_turn"] = True
+        again = ("" if sent == 1 else
+                 f" This is the {sent}{'nd' if sent == 2 else 'rd' if sent == 3 else 'th'} time "
+                 "this task — every one of those batches could have been running in parallel "
+                 "while you did something else.")
         s["messages"].append({"role": "user", "content": (
-            f"[SYSTEM] That's {s['solo_read_streak']} read-only tool calls in a row in your OWN "
-            "context. Independent look-ups like these are exactly what a parallel subagent wave "
-            "does for almost no context cost to you — and they run concurrently, so a batch of "
-            "them takes about as long as one. Group the next batch into ONE dispatch_agents call "
+            f"[SYSTEM] That's {run} read-only tool calls in a row in your OWN context.{again} "
+            "Independent look-ups like these are exactly what a parallel subagent wave does for "
+            "almost no context cost to you — and they run concurrently, so a batch of them takes "
+            "about as long as one. Group the next batch into ONE dispatch_agents call "
             "(tier=\"cheap\" for symbol/where-is lookups, \"standard\" for real analysis), or tag "
             "the corresponding plan steps delegate=\"researcher@cheap\". Keep only the work that "
             "genuinely needs your own judgment inline."
@@ -3199,14 +3362,16 @@ class AgentApi:
         """Delegation nudge #2 — PLAN SHAPE.
 
         A phase holding 2+ independent, still-pending, research-flavored steps
-        with no `delegate` is a parallel wave the model left on the table. Name
-        the exact step ids and the exact tag to add. Fires at most ONCE per phase,
-        and never auto-delegates — tagging stays the model's decision."""
+        with no `delegate` is a parallel wave the model left on the table. Names
+        the exact step ids and the exact tag to add; never delegates by itself
+        (that is _auto_delegate_untagged_steps' job, and it runs first).
+
+        Keyed on the CANDIDATE SET, not just the phase id: once-per-phase meant a
+        phase that later grew three new untagged research steps stayed silent
+        forever. Re-fires whenever the set of untagged candidates actually
+        changes, and stays quiet while it doesn't."""
         plan = planning.get_active_plan()
         if plan is None or not getattr(plan, "current_phase_id", None):
-            return
-        nudged = s.setdefault("_delegation_phase_nudged", set())
-        if plan.current_phase_id in nudged:
             return
         cands = [it for it in plan.items
                  if it.get("phase_id") == plan.current_phase_id
@@ -3216,13 +3381,20 @@ class AgentApi:
                  and _looks_like_research(it)]
         if len(cands) < 2:
             return
-        nudged.add(plan.current_phase_id)
+        sig = (plan.current_phase_id, frozenset(str(it["id"]) for it in cands))
+        nudged = s.setdefault("_delegation_phase_nudged", set())
+        if sig in nudged:
+            return
+        nudged.add(sig)
         ids = ", ".join(str(it["id"]) for it in cands)
         s["messages"].append({"role": "user", "content": (
             f"[SYSTEM] Steps {ids} in this phase are independent research with no delegate. "
             "Tag each one delegate=\"researcher@cheap\" (plan_update_task) — they'll fan out as "
-            "ONE parallel wave, run on a cheap model, and cost you almost no context. Leave "
-            "untagged only the steps that genuinely need your own judgment."
+            "ONE parallel wave, run on a cheap model, and cost you almost no context. A "
+            "self-contained CHANGE step can be delegated too — tag it "
+            "delegate=\"implementer@standard\" (write subagents run one at a time on the shared "
+            "workspace, so you get the isolated context and the cheaper model, not extra speed). "
+            "Leave untagged only the steps that genuinely need your own judgment."
         )})
 
     def _code_graph_guard(self, s, tool_name):

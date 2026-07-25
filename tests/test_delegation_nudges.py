@@ -7,7 +7,7 @@ class _Stub:
 
 
 def _sess():
-    return {"messages": [], "solo_read_streak": 0, "_solo_read_nudged": False}
+    return {"messages": [], "solo_read_streak": 0, "solo_read_nudges_sent": 0}
 
 
 def _sys_msgs(s):
@@ -23,11 +23,26 @@ def test_streak_nudge_fires_at_threshold():
     assert "dispatch_agents" in msgs[0]["content"]
 
 
-def test_streak_nudge_fires_only_once_per_streak():
+def test_streak_nudge_rearms_every_n_calls():
+    """REGRESSION: the first version fired once and then went silent until a
+    delegation happened, so a 300-step autonomous run inside ONE user turn got a
+    single nudge and produced two subagents. It must re-arm on a steady cadence,
+    like the explanation-cadence guardrail it sits beside."""
     s, a = _sess(), _Stub()
     for _ in range(agent_mod.SOLO_READ_NUDGE * 3):
         a._maybe_nudge_delegation(s, "grep_directory")
-    assert len(_sys_msgs(s)) == 1
+    assert len(_sys_msgs(s)) == 3          # old (buggy) behaviour: 1
+    assert s["solo_read_nudges_sent"] == 3
+
+
+def test_streak_nudge_escalates_when_ignored():
+    """Repeats must read as a growing cost, not the same line again."""
+    s, a = _sess(), _Stub()
+    for _ in range(agent_mod.SOLO_READ_NUDGE * 2):
+        a._maybe_nudge_delegation(s, "grep_directory")
+    msgs = _sys_msgs(s)
+    assert "time this task" not in msgs[0]["content"]
+    assert "2nd time this task" in msgs[1]["content"]
 
 
 def test_delegation_resets_the_streak_and_rearms():
@@ -190,7 +205,7 @@ class _Stub3:
 
 
 def _sess3():
-    return {"messages": [], "solo_read_streak": 0, "_solo_read_nudged": False,
+    return {"messages": [], "solo_read_streak": 0, "solo_read_nudges_sent": 0,
             "_delegation_phase_nudged": set(), "tools_since_plan_touch": 0,
             "_plan_touch_nudge_sent": False}
 
@@ -244,3 +259,145 @@ def test_plan_nudge_ignores_steps_missing_optional_keys(monkeypatch):
     s, a = _sess2(), _Stub2()
     a._maybe_nudge_plan_delegation(s)
     assert len(_sys_msgs(s)) == 1
+
+
+# --- plan nudge re-arms on a CHANGED candidate set ---------------------------
+
+def test_plan_nudge_refires_when_new_untagged_steps_appear(monkeypatch):
+    """REGRESSION: keyed on the phase id alone, a phase that later GREW three
+    new untagged research steps stayed silent forever. The key is the candidate
+    SET, so a changed set re-fires while an unchanged one stays quiet."""
+    plan = _PlanStub([_step(1, "locate the root check"),
+                      _step(2, "locate the signature check")])
+    monkeypatch.setattr(planning, "get_active_plan", lambda: plan)
+    s, a = _sess2(), _Stub2()
+    a._maybe_nudge_plan_delegation(s)
+    a._maybe_nudge_plan_delegation(s)          # unchanged set -> still quiet
+    assert len(_sys_msgs(s)) == 1
+
+    plan.items.append(_step(3, "locate the license validator"))
+    a._maybe_nudge_plan_delegation(s)           # set grew -> speaks up again
+    assert len(_sys_msgs(s)) == 2
+    assert "3" in _sys_msgs(s)[1]["content"]
+
+
+# --- auto-delegation ---------------------------------------------------------
+
+class _AutoPlan(_PlanStub):
+    """_PlanStub + the update_item the harness calls to tag a step."""
+    def update_item(self, item_id, **fields):
+        for it in self.items:
+            if it["id"] == item_id:
+                it.update(fields)
+                return it
+        return None
+
+
+class _AutoStub:
+    _auto_delegate_untagged_steps = agent_mod.AgentApi._auto_delegate_untagged_steps
+
+    def __init__(self, session):
+        self.session = session
+        self.emitted = []
+
+    def _emit(self, ev):
+        self.emitted.append(ev)
+
+
+def _auto_sess():
+    return {"messages": [], "delegation_enabled": True}
+
+
+def _spec_step(sid, content, **kw):
+    """A step self-contained enough for a WRITE subagent to own."""
+    st = _step(sid, content, **kw)
+    st["verification"] = "done when it builds"
+    return st
+
+
+def test_auto_delegates_a_research_wave(monkeypatch):
+    plan = _AutoPlan([_step(1, "locate the root check"),
+                      _step(2, "locate the signature check")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert [it["delegate"] for it in plan.items] == \
+        [agent_mod.AUTO_DELEGATE_READ_TAG] * 2
+    assert any("Auto-delegated" in e.get("content", "") for e in a.emitted)
+
+
+def test_auto_delegate_leaves_a_lone_research_step_alone(monkeypatch):
+    """One lookup is not a wave; hijacking it would just annoy."""
+    plan = _AutoPlan([_step(1, "locate the root check")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert plan.items[0]["delegate"] == ""
+
+
+def test_auto_delegates_a_self_contained_change_step(monkeypatch):
+    """The user's ask: subagents must be used for EDITS too, not only research."""
+    plan = _AutoPlan([_spec_step(1, "patch the root check in Root.smali")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert plan.items[0]["delegate"] == agent_mod.AUTO_DELEGATE_WRITE_TAG
+
+
+def test_auto_delegate_skips_underspecified_change_step(monkeypatch):
+    """No action/verification/expected -> the ambiguity would just move into an
+    isolated context where the orchestrator can no longer see it."""
+    plan = _AutoPlan([_step(1, "patch the root check")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert plan.items[0]["delegate"] == ""
+
+
+def test_auto_delegate_never_touches_tagged_inprogress_or_blocked(monkeypatch):
+    plan = _AutoPlan([
+        _step(1, "locate the root check", delegate="verifier@premium"),
+        _step(2, "locate the signature check", status="in_progress"),
+        _step(3, "locate the license flow", deps=[1]),
+    ])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert plan.items[0]["delegate"] == "verifier@premium"   # model's tag wins
+    assert plan.items[1]["delegate"] == ""                   # may be running now
+    assert plan.items[2]["delegate"] == ""                   # blocked
+
+
+def test_auto_delegate_kill_switch(monkeypatch):
+    monkeypatch.setattr(agent_mod, "AUTO_DELEGATE", False)
+    plan = _AutoPlan([_step(1, "locate the root check"),
+                      _step(2, "locate the signature check")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert all(it["delegate"] == "" for it in plan.items)
+
+
+def test_auto_delegate_respects_delegation_disabled(monkeypatch):
+    plan = _AutoPlan([_step(1, "locate the root check"),
+                      _step(2, "locate the signature check")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    s = _auto_sess(); s["delegation_enabled"] = False
+    a = _AutoStub(s)
+    a._auto_delegate_untagged_steps(plan)
+    assert all(it["delegate"] == "" for it in plan.items)
+
+
+def test_auto_delegate_never_hijacks_a_judgment_call(monkeypatch):
+    """A "decide which approach" step reads as research by keyword but is exactly
+    the orchestrator's own reasoning — the harness must leave it with the main
+    agent even inside an otherwise-delegatable research wave."""
+    plan = _AutoPlan([_step(1, "locate the root check"),
+                      _step(2, "locate the signature check"),
+                      _step(3, "decide which bypass approach to take")])
+    monkeypatch.setattr(planning, "notify_updated", lambda: None)
+    a = _AutoStub(_auto_sess())
+    a._auto_delegate_untagged_steps(plan)
+    assert plan.items[0]["delegate"] == agent_mod.AUTO_DELEGATE_READ_TAG
+    assert plan.items[1]["delegate"] == agent_mod.AUTO_DELEGATE_READ_TAG
+    assert plan.items[2]["delegate"] == ""          # judgment stays with main

@@ -654,9 +654,15 @@ function _dock() {
   return el;
 }
 
-function _toggleSubagents() { _dock().classList.toggle('cdock-open'); }
-function _openSubagents() { _dock().classList.add('cdock-open'); }
-function _closeSubagents() { _dock().classList.remove('cdock-open'); }
+// The dock is position:fixed so it can slide in. `cdock-pushed` on <body> is what
+// makes the app shell reserve its width (see index.html) so the chat and sidebar
+// shrink instead of being covered — keep the two classes in lockstep.
+function _syncDockPush() {
+  document.body.classList.toggle('cdock-pushed', _dock().classList.contains('cdock-open'));
+}
+function _toggleSubagents() { _dock().classList.toggle('cdock-open'); _syncDockPush(); }
+function _openSubagents() { _dock().classList.add('cdock-open'); _syncDockPush(); }
+function _closeSubagents() { _dock().classList.remove('cdock-open'); _syncDockPush(); }
 
 // Reflect live subagent counts on the always-visible FAB so it's informative even
 // while the sidebar is closed.
