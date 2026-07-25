@@ -57,6 +57,19 @@ Pick the specific skill that matches the check you're actually bypassing or the 
 
 ## Critical Rules
 - ALWAYS call `verify_apk` after signing. Never report an APK as done until it passes all checks.
+- KNOW YOUR DECODED LAYOUT before writing paths. `decode_apk` uses apktool for most
+  APKs (libs at `lib/<abi>/`) but auto-switches to APKEditor for multi-package apps
+  **like Roblox**, which puts libs/assets/resources under **`root/`** (ABIs at
+  `root/lib/<abi>/`). Check for a `root/` dir / `.apkeditor_decoded` marker first —
+  see the `apk-toolchain` skill's `reference/decoded-tree-layout.md`. Deleting
+  top-level `lib/` on an APKEditor tree silently does nothing.
+- DON'T CHASE ANTI-TAMPER BLIND. On native game APKs the reflex to patch a native
+  integrity check is usually wrong: a plain re-signed APK often launches fine.
+  Build → sign → verify → **install and observe whether it actually crashes** BEFORE
+  patching any `.so`. A native `bl→RET`/NOP that yields `UnsatisfiedLinkError` broke
+  JNI `RegisterNatives`, not an anti-tamper check. See `apk-toolchain`'s
+  `reference/known-traps.md` (also: `sign_apk` uses `apk_filename`; `$` in
+  inner-class smali filenames; verify dex count after adding a dex).
 - `recompile_apk` is the single rebuild tool for BOTH paths: it auto-detects whether the directory is an `unzip_apk` raw tree (zip repack) or a `decode_apk` apktool tree (apktool build), so you don't pick the rebuild method — just point it at the directory you edited.
 - After modifying a .so, recompile and re-sign the APK. The APK signature changes, so any signature verification in the app may need to be patched too — see `signature-bypass`.
 - Use `get_apk_signature_hash` BEFORE modifying to record the original signature, then search smali for checks comparing against it.

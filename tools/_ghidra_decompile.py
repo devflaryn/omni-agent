@@ -1,4 +1,11 @@
+# -*- coding: utf-8 -*-
 # Ghidra headless post-script (Jython) — decompile function(s) to C pseudocode.
+#
+# NOTE: this runs under Ghidra's bundled Jython (Python 2 semantics), which
+# raises SyntaxError on any non-ASCII byte (the em-dashes below) UNLESS this
+# PEP-263 coding line is present on line 1/2. Without it the whole script fails
+# to parse, no markers are emitted, and ghidra_decompile always reports "no
+# decompiler output" even when Ghidra ran fine. Keep this line first.
 #
 # Run by tools/binary_analysis.py::ghidra_decompile via analyzeHeadless with
 #   -postScript _ghidra_decompile.py <target_substring> <max_functions>

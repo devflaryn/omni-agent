@@ -112,6 +112,31 @@ RUN GHIDRA_VERSION=11.3.2 && \
     rm /tmp/ghidra.zip && \
     chmod +x /opt/ghidra/support/analyzeHeadless
 
+# Ghidra ships prebuilt DECOMPILER natives only for linux_x86_64 / mac_* / win —
+# NOT linux_arm_64. On an Apple-Silicon host this image builds as arm64 Linux, so
+# the decompiler is MISSING and every ghidra_decompile fails with
+# "os/linux_arm_64/decompile does not exist" (analysis succeeds; only the
+# decompiler can't launch). Ghidra bundles the decompiler C++ source, so on arm64
+# we build it from source and place it where the analyzer looks. The stock
+# Makefile assumes x86 (defaults ARCH_TYPE to -m32); clearing ARCH_TYPE builds a
+# native 64-bit aarch64 binary. On x86_64 the shipped native is used and this is a
+# no-op. Build takes ~20s. See tools/binary_analysis.py::ghidra_decompile.
+RUN ARCH="$(uname -m)"; \
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends g++ bison flex && \
+        rm -rf /var/lib/apt/lists/* && \
+        cd /opt/ghidra/Ghidra/Features/Decompiler/src/decompile/cpp && \
+        make ARCH_TYPE= -j"$(nproc)" ghidra_opt && \
+        NATIVE_DIR=/opt/ghidra/Ghidra/Features/Decompiler/os/linux_arm_64 && \
+        mkdir -p "$NATIVE_DIR" && \
+        cp ghidra_opt "$NATIVE_DIR/decompile" && \
+        chmod +x "$NATIVE_DIR/decompile" && \
+        test -x "$NATIVE_DIR/decompile" && \
+        echo "Built linux_arm_64 Ghidra decompiler native."; \
+    else \
+        echo "x86_64 build — using Ghidra's shipped decompiler native."; \
+    fi
+
 # NOTE: the Android emulator itself is NOT installed here. It runs natively on
 # the Windows host — by default via the bundled qemu-manager.exe (headless
 # QEMU/Android-x86), or optionally LDPlayer / Android Studio's emulator.exe —

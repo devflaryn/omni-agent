@@ -110,6 +110,24 @@ inspect_apk            # census: dex count, ABIs, resources, signature scheme
 Then re-run `inspect_apk` on the output and confirm it differs from the original
 **only** as you intended (android-package-anatomy › "the one habit").
 
+## Before you write a path or chase a crash — read the bundled references
+
+Two lookups that prevent the most expensive mistakes on native-app targets
+(Roblox/Arceus-style). Pull them with `read_skill_resource` when relevant:
+
+- **`reference/decoded-tree-layout.md`** — the ACTUAL on-disk layout `decode_apk`
+  produces. It has two backends: apktool (libs at `lib/<abi>/`) and APKEditor,
+  which `decode_apk` auto-selects for multi-package apps **like Roblox** and which
+  puts libs/assets/resources under **`root/`** (so ABIs are at `root/lib/<abi>/`).
+  Read this before deleting an ABI, swapping a `.so`, or wondering why an edit
+  "did nothing" — you were almost certainly writing the wrong layout's path.
+- **`reference/known-traps.md`** — verified failure modes and their fixes:
+  re-signing usually beats chasing a native "anti-tamper" patch (confirm the
+  crash first); native `bl→RET` patches that break JNI `RegisterNatives`;
+  `sign_apk` uses `apk_filename`; `$` in inner-class smali filenames; assembling a
+  dex when the tool finds 0 files; verifying dex count after adding `classes4.dex`;
+  and emulator account/signature-mismatch pitfalls.
+
 ## Related skills
 - **android-package-anatomy** — what each member of the APK is and why signing breaks.
 - **apk-modding** — the guided end-to-end modification workflow.

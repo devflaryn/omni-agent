@@ -46,6 +46,29 @@ VALIDATION_TOOLS = {
     "run_command", "adb_shell",
 }
 
+# --- Anti-rabbit-hole: costly native speculation vs the cheap check ----------
+# Native .so patch tools that are EXPENSIVE to get right and are the classic
+# anti-tamper rabbit hole: the agent patches a native "integrity" check that was
+# never the cause, when the plain re-signed APK would have launched fine. Before
+# any of these, the cheap check is to build → sign → install → OBSERVE whether the
+# current APK actually crashes. The assumption gate (agent.py) nudges once toward
+# that check when none of the observe-run tools below has run for the current build.
+NATIVE_SPECULATION_TOOLS = {
+    "nop_function", "patch_function_return",
+    "binary_patch", "patch_at_offset_with_bytes", "patch_bytes_at_offset",
+    "patch_binary_string", "assemble_and_patch", "compile_c_and_patch",
+}
+
+# Tools whose success means the CURRENT build was actually run and observed on the
+# emulator (installed / launched / test-driven / its logs read). A success here
+# satisfies the "confirm the crash before patching native code" precondition; a
+# fresh recompile/sign invalidates it (a new build hasn't been observed yet).
+OBSERVE_RUN_TOOLS = {
+    "install_apk_on_emulator", "launch_app_on_emulator", "run_apk_test_session",
+    "get_logcat", "monitor_logcat",
+}
+
+
 # --- Read-only inspection allowlist (for isolated subagents) ------------------
 # Pure-inspection tools, verified against the live registry (112 tools as of
 # 2026-07). Grouped by concern for readability; the set is what matters. Anything

@@ -113,6 +113,38 @@ class KeyAllocator:
 _KEY_ALLOCATOR = KeyAllocator()
 
 
+# --- UI telemetry sink -------------------------------------------------------
+# A process-global callback the desktop agent wires to its own `_emit` (which
+# pushes an event to the browser). Tools that spawn subagents OUTSIDE the
+# planner's read-wave — notably `dispatch_agents` — have no handle on the
+# agent's `_emit`, so without this bridge their wave/subagent telemetry never
+# reaches the frontend and the Subagents HUD stays empty. The agent sets it once
+# via `set_ui_sink`; `ui_emit` is a no-op until then (e.g. under tests/headless).
+# Single desktop agent instance, so a module global is sufficient.
+_UI_SINK = None
+
+
+def set_ui_sink(fn):
+    """Register the callback used to forward subagent telemetry to the UI."""
+    global _UI_SINK
+    _UI_SINK = fn
+
+
+def ui_emit(ev):
+    """Forward one telemetry event to the UI sink, if one is registered.
+
+    MUST be called from the agent-loop thread (the same thread that owns the
+    other `_emit` calls) — callers that receive events on subagent worker
+    threads should funnel them through a queue and drain it here, mirroring
+    agent.py's `_run_delegated_read_wave`."""
+    if _UI_SINK is None:
+        return
+    try:
+        _UI_SINK(ev)
+    except Exception:
+        pass  # telemetry must never break a run
+
+
 def _emit_event(on_event, ev):
     if on_event is None:
         return

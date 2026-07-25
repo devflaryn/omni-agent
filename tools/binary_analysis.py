@@ -296,16 +296,41 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
     detail = (out or res.get("stderr", "") or "").strip()
     low = detail.lower()
 
-    # A JDK version / JVM launch failure is the classic cause of an empty
-    # .ghidra_proj (Ghidra 11.2+ needs JDK 21). Flag it explicitly so it's not
-    # mistaken for a bad path — the sandbox image must be rebuilt with JDK 21.
+    # Missing arm64 DECOMPILER native. Ghidra ships prebuilt decompiler binaries
+    # only for linux_x86_64 / mac_* / win — NOT linux_arm_64. On an Apple-Silicon
+    # host the sandbox is arm64 Linux, so analysis succeeds but the decompiler
+    # can't launch ("os/linux_arm_64/decompile does not exist"). The Dockerfile
+    # now builds this native from Ghidra's bundled C++ source on arm64; a stale
+    # image predates that. This is NOT a JDK problem.
+    if "decompile does not exist" in low or "decompileprocessfactory" in low:
+        return {"error": (
+            "Ghidra's decompiler native for this architecture is missing "
+            "(os/linux_arm_64/decompile). Ghidra doesn't ship an arm64-Linux decompiler; the "
+            "Dockerfile now builds it from source on arm64. Rebuild the sandbox image (restart the "
+            "app) so the native is compiled and placed.\n\n"
+            f"Ghidra output (tail):\n{detail[-1500:]}"
+        )}
+
+    # A non-ASCII SyntaxError means the Jython post-script failed to parse (it runs
+    # under Python 2 and needs a PEP-263 coding line). This is a code bug, not an
+    # environment one — surface it plainly instead of blaming the path/JDK.
+    if "non-ascii character" in low or ("syntaxerror" in low and "_ghidra_decompile" in low):
+        return {"error": (
+            "Ghidra's decompile post-script failed to parse under Jython (non-ASCII without a coding "
+            "declaration). This is an internal bug in _ghidra_decompile.py — its first line must be "
+            "'# -*- coding: utf-8 -*-'.\n\n"
+            f"Ghidra output (tail):\n{detail[-1500:]}"
+        )}
+
+    # A JDK version / JVM launch failure leaves an empty .ghidra_proj (Ghidra
+    # 11.2+ needs JDK 21). Distinct from the arm64-native case above.
     java_markers = ("unsupportedclassversionerror", "class file version",
                     "requires java", "requires jdk", "supported by java runtime",
                     "failed to find a suitable", "no java", "java_home")
     if any(m in low for m in java_markers):
         return {"error": (
             "Ghidra could not start its Java runtime (JDK version mismatch — Ghidra 11.2+ requires "
-            "JDK 21). Rebuild the sandbox image so it has JDK 21 (the Dockerfile now installs "
+            "JDK 21). Rebuild the sandbox image so it has JDK 21 (the Dockerfile installs "
             "openjdk-21-jdk and pins JAVA_HOME); restart the app to trigger the rebuild.\n\n"
             f"Ghidra output (tail):\n{detail[-1500:]}"
         )}
@@ -314,9 +339,10 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
         return res
     return {"error": (
         "Ghidra did not produce decompiler output. Likely causes: the binary path is wrong, the file "
-        "isn't a valid ELF, analysis ran out of time/memory, or Ghidra's JVM failed to launch (needs "
-        "JDK 21). Confirm the path with inspect_apk/list_directory and raise timeout_seconds; if this "
-        "keeps happening the sandbox image likely needs rebuilding with JDK 21.\n\n"
+        "isn't a valid ELF, analysis ran out of time/memory, the arm64 decompiler native is missing "
+        "(stale image — see above), or the JVM failed to launch (needs JDK 21). Confirm the path with "
+        "inspect_apk/list_directory and raise timeout_seconds; if it persists the sandbox image likely "
+        "needs rebuilding.\n\n"
         f"Ghidra output (tail):\n{detail[-1500:] or '(no output captured)'}"
     )}
 

@@ -13,13 +13,53 @@ all, which is why delegation isn't "just another tool" buried in the registry.
 Read-only by construction: write-capable agents are rejected here (a change must go
 through a delegated plan step so it's tracked and serialized on the workspace).
 """
+import queue as _queue
+import threading as _threading
+
 from tool_registry import registry
 import plugins
+import subagents
 from subagents import AgentDef, run_subagents_parallel, run_subagent
 
 # Per-agent report chars folded back inline. Phase 5 (GSD) routes full reports to
 # files under the run dir and returns only summaries + paths; until then we cap.
 _REPORT_CAP = 2400
+
+
+def _run_with_ui_telemetry(run_fn):
+    """Run `run_fn(on_event)` — which spawns subagents and calls `on_event` from
+    worker threads — while streaming its telemetry LIVE to the UI.
+
+    dispatch_agents executes on the agent-loop thread, but run_subagents_parallel
+    fans work out to worker threads that fire on_event concurrently. Calling the
+    UI sink straight from those workers would poke the webview from many threads
+    at once; instead we run the wave in a background thread, funnel its events
+    through a thread-safe queue, and drain that queue HERE on the agent-loop
+    thread — so `subagents.ui_emit` is only ever called from one thread, exactly
+    like agent.py's `_run_delegated_read_wave`. Returns whatever run_fn returns."""
+    q = _queue.Queue()
+    _SENTINEL = object()
+    holder = {}
+
+    def work():
+        try:
+            holder["result"] = run_fn(q.put)
+        except Exception as e:  # noqa: BLE001 — surfaced to the caller below
+            holder["error"] = e
+        finally:
+            q.put(_SENTINEL)
+
+    t = _threading.Thread(target=work, daemon=True)
+    t.start()
+    while True:
+        ev = q.get()
+        if ev is _SENTINEL:
+            break
+        subagents.ui_emit(ev)
+    t.join()
+    if holder.get("error") is not None:
+        raise holder["error"]
+    return holder.get("result")
 
 
 def _synthesizer():
@@ -86,14 +126,17 @@ def dispatch_agents(specs, synthesize=False):
     if not runnable:
         return {"error": "No runnable read-only specs. " + "; ".join(problems)}
 
-    results = run_subagents_parallel(runnable)
+    results = _run_with_ui_telemetry(
+        lambda on_event: run_subagents_parallel(runnable, on_event=on_event))
 
     if synthesize and len(runnable) > 1:
         concat = "\n\n".join(
             f"### report from {r.get('agent')}\n{(r.get('report') or '').strip()}" for r in results)
-        syn = run_subagent(_synthesizer(),
-                           task="Synthesize the reports below into one merged summary.",
-                           context=concat)
+        syn = _run_with_ui_telemetry(
+            lambda on_event: run_subagent(
+                _synthesizer(),
+                task="Synthesize the reports below into one merged summary.",
+                context=concat, on_event=on_event))
         out = f"SYNTHESIZED SUMMARY of {len(runnable)} subagent reports:\n{(syn.get('report') or '').strip()}"
         if problems:
             out += "\n\n[skipped specs: " + "; ".join(problems) + "]"

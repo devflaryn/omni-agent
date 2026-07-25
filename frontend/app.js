@@ -169,6 +169,9 @@ function formatInline(text) {
 function renderUserMessage(content) {
   if (currentGroup) completeGroup(currentGroup); // settle/collapse any lingering group
   currentGroup = null; // a new user turn starts a fresh set of action groups
+  // A genuine new user turn starts the run clock for the Thinking… elapsed readout.
+  // (Skip during transcript replay on reopen — those aren't a live run.)
+  if (!replaying) { runStartTs = performance.now(); sessionTokens = 0; }
   const el = document.createElement('div');
   el.className = 'py-1 user-row';
   el.innerHTML = `
@@ -217,21 +220,46 @@ function spinTick() {
 let thinkingEl = null;     // the live "Thinking…" shimmer line, if any
 let currentGroup = null;   // the action group following the most recent thought
 
+// Live run telemetry surfaced on the Thinking… line: "Thinking… 214k tokens 31m 5s".
+// sessionTokens = current context size in tokens (from 'status' events); runStartTs
+// = wall-clock origin of the current run (set on each user message).
+let sessionTokens = 0;
+let runStartTs = null;
+let _thinkTicker = null;
+
 // Reset the live-render state (called whenever the chat is cleared/replaced).
 function resetActivityState() {
+  if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
   thinkingEl = null;
   currentGroup = null;
+  sessionTokens = 0;
+  runStartTs = null;
   resetConcurrencyDock();
 }
 
+// Fill the tokens/elapsed suffix on the live Thinking… line.
+function _updateThinkingMeta() {
+  if (!thinkingEl) return;
+  const meta = thinkingEl.querySelector('.think-meta');
+  if (!meta) return;
+  const parts = [];
+  if (sessionTokens > 0) parts.push(`${window.formatTokens(sessionTokens)} tokens`);
+  if (runStartTs != null) parts.push(window.formatClock(performance.now() - runStartTs));
+  meta.textContent = parts.length ? '  ' + parts.join('  ') : '';
+}
+
 function startThinking() {
-  if (thinkingEl) return; // JSON-retry leg: reuse the existing line
+  if (thinkingEl) { _updateThinkingMeta(); return; } // JSON-retry leg: reuse the existing line
   const el = document.createElement('div');
   el.className = 'py-0.5 font-mono text-[12px] leading-5';
-  el.innerHTML = `<span class="braille-spin text-term-cyan">${SPIN_FRAMES[spinFrame]}</span> <span class="shimmer">Thinking…</span>`;
+  el.innerHTML = `<span class="braille-spin text-term-cyan">${SPIN_FRAMES[spinFrame]}</span> ` +
+    `<span class="shimmer">Thinking…</span><span class="think-meta text-term-muted"></span>`;
   appendRow(el);
   registerSpinners(el);
   thinkingEl = el;
+  _updateThinkingMeta();
+  if (_thinkTicker) clearInterval(_thinkTicker);
+  _thinkTicker = setInterval(_updateThinkingMeta, 1000); // tick elapsed while thinking
 }
 
 // An explanation arrived (as a 'thought' event). Complete the current action
@@ -240,6 +268,7 @@ function startThinking() {
 // tool call opens a fresh group folded beneath this explanation. Events with no
 // text fall through, so their action just extends the current group.
 function finishThinking(ev) {
+  if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
   const text = (ev.text || '').trim();
   if (!text) return;
@@ -420,6 +449,7 @@ function finishTool(ev) {
 // End of a run (done / stop / session change): complete the current group so
 // its silver title settles solid and it collapses (freezing any live row).
 function finalizeLiveLines() {
+  if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
   if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
   if (currentGroup) completeGroup(currentGroup);
 }
@@ -501,14 +531,12 @@ function renderError(content) {
 }
 
 function renderStatus(ev) {
-  setStatus('statSteps', ev.step_count);
-  // Prefer the cumulative tools-used count (persisted across reopen); fall back to
-  // the per-leg consecutive count for any older event that lacks it.
-  const tools = (ev.tools_used !== undefined && ev.tools_used !== null) ? ev.tools_used : ev.consecutive_tools;
-  setStatus('statTools', tools);
-  const ctx = (ev.ctx_chars !== undefined && ev.ctx_chars !== null) ? ev.ctx_chars : 0;
-  setStatus('statCtx', Number(ctx).toLocaleString());
-  setStatus('statResets', ev.summary_resets);
+  // The steps / tools / ctx / resets header counters were removed; the only status
+  // field still surfaced is the token count, which rides on the live Thinking… line.
+  if (ev.ctx_tokens !== undefined && ev.ctx_tokens !== null) {
+    sessionTokens = ev.ctx_tokens;
+    _updateThinkingMeta();
+  }
 }
 
 // ---------- concurrency dock: live parallel-wave timeline ----------
@@ -518,25 +546,127 @@ function renderStatus(ev) {
 // subagent_started|progress|done / wave_done. Bars grow via a local ticker, not
 // per-step events, so they glide smoothly regardless of event cadence.
 // computeWaveStats comes from wave_stats.js (loaded before this script).
-let _wave = null;          // { originTs, bars: Map<rowKey,bar>, done, manualCollapsed }
+let _wave = null;          // { originTs, bars: Map<rowKey,bar>, done }
 let _waveTicker = null;
 
+// ---------- persistent session HUD ----------
+// Unlike a single wave (which comes and goes), the HUD spans a whole run of
+// subagent activity: it appears with the first subagent, survives across every
+// wave in the run, and shows the three things the run cares about — elapsed time
+// since the first subagent started, how many are running vs done, and the
+// cumulative token spend across ALL subagents. Its epoch resets when a new run's
+// first subagent activity arrives after the previous run ended (see _hudEnsure).
+// All HUD accounting lives in the DOM-free SessionHudModel (wave_stats.js); this
+// layer is only the ticker + DOM writes. wave_stats.js is deferred and app.js is
+// not, so it isn't defined at parse time — instantiate lazily on first use.
+let _hud = null;
+let _hudTicker = null;
+function _hudModel() {
+  if (!_hud) _hud = new window.SessionHudModel();
+  return _hud;
+}
+
+function _hudShowPanel() {
+  const sess = _dock().querySelector('.cdock-session');
+  if (sess) sess.style.display = '';
+  if (!_hudTicker) _hudTicker = setInterval(_hudRender, 1000);
+}
+
+function _hudEnsure() {
+  // Reveal the panel + start ticking. The model owns epoch lifecycle; a snapshot
+  // stays null (render no-ops) until the first subagent actually starts.
+  _hudShowPanel();
+}
+
+function _hudOnStart(ev) {
+  _hudModel().onStart(_waveRowKey(ev), performance.now());
+  _hudShowPanel();
+  _hudRender();
+}
+
+function _hudOnProgress(ev) {
+  _hudModel().onProgress(_waveRowKey(ev), ev.tokens || 0);
+  _hudRender();
+}
+
+function _hudOnDone(ev) {
+  _hudModel().onDone(_waveRowKey(ev), ev.tokens || 0);
+  _hudRender();
+}
+
+function _hudEnd() {
+  // Whole run finished: freeze the elapsed timer, keep the final tally on screen
+  // until the next run's first subagent (a fresh epoch) or a session reset.
+  if (_hud) _hud.end();
+  if (_hudTicker) { clearInterval(_hudTicker); _hudTicker = null; }
+  _hudRender();
+}
+
+function _hudRender() {
+  if (!_hud) return;
+  const el = document.getElementById('concurrency-dock');
+  if (!el) return;
+  const sess = el.querySelector('.cdock-session');
+  if (!sess) return;
+  const stats = _hud.snapshot(performance.now());
+  if (!stats) return;
+  sess.querySelector('.cdock-sess-elapsed').textContent = stats.elapsed;
+  sess.querySelector('.cdock-sess-count').textContent = stats.countLabel;
+  sess.querySelector('.cdock-sess-tokens').textContent = stats.tokensLabel;
+  sess.classList.toggle('cdock-sess-idle', _hud.idle);
+}
+
+function resetSessionHud() {
+  if (_hudTicker) { clearInterval(_hudTicker); _hudTicker = null; }
+  if (_hud) _hud.reset();
+}
+
+// The Subagents UI is a right slide-in SIDEBAR (#concurrency-dock) plus a small
+// persistent toggle button (#subagents-fab) pinned bottom-right. Clicking the FAB
+// slides the sidebar in/out; the sidebar's × closes it. Both are created together
+// on first subagent activity and removed together on reset.
 function _dock() {
   let el = document.getElementById('concurrency-dock');
   if (!el) {
+    // Bottom-right toggle button — the thing the user clicks to reveal the sidebar.
+    const fab = document.createElement('button');
+    fab.id = 'subagents-fab';
+    fab.type = 'button';
+    fab.innerHTML = '<span>⚡</span><span class="fab-label">Subagents</span><span class="fab-count"></span>';
+    fab.addEventListener('click', _toggleSubagents);
+    document.body.appendChild(fab);
+
     el = document.createElement('div');
     el.id = 'concurrency-dock';
     el.innerHTML =
       '<div class="cdock-header"><span>⚡</span><span class="cdock-title">Subagents</span>' +
-      '<span class="cdock-count"></span></div>' +
+      '<span class="cdock-count"></span>' +
+      '<button class="cdock-close" type="button" title="Close">✕</button></div>' +
+      '<div class="cdock-session" style="display:none">' +
+      '<div class="cdock-sess-line"><span class="cdock-sess-elapsed">00:00</span>' +
+      '<span class="cdock-sess-count">0 running · 0 done</span></div>' +
+      '<div class="cdock-sess-line"><span class="cdock-sess-toklabel">session tokens</span>' +
+      '<span class="cdock-sess-tokens">0</span></div></div>' +
       '<div class="cdock-body"></div><div class="cdock-summary" style="display:none"></div>';
-    el.querySelector('.cdock-header').addEventListener('click', () => {
-      if (_wave) _wave.manualCollapsed = !el.classList.contains('cdock-collapsed');
-      el.classList.toggle('cdock-collapsed');
-    });
+    el.querySelector('.cdock-close').addEventListener('click', _closeSubagents);
     document.body.appendChild(el);
   }
   return el;
+}
+
+function _toggleSubagents() { _dock().classList.toggle('cdock-open'); }
+function _openSubagents() { _dock().classList.add('cdock-open'); }
+function _closeSubagents() { _dock().classList.remove('cdock-open'); }
+
+// Reflect live subagent counts on the always-visible FAB so it's informative even
+// while the sidebar is closed.
+function _updateFab(runningCount, done) {
+  const fab = document.getElementById('subagents-fab');
+  if (!fab) return;
+  fab.classList.add('fab-visible');
+  const c = fab.querySelector('.fab-count');
+  if (c) c.textContent = runningCount > 0 ? String(runningCount) : (done ? '✓' : '');
+  fab.classList.toggle('fab-active', runningCount > 0);
 }
 
 function _waveRowKey(ev) {
@@ -552,28 +682,32 @@ function resetConcurrencyDock() {
   if (_waveTicker) { clearInterval(_waveTicker); _waveTicker = null; }
   if (_freezeTimer) { clearTimeout(_freezeTimer); _freezeTimer = null; }
   _wave = null;
+  resetSessionHud();
   const el = document.getElementById('concurrency-dock');
   if (el) el.remove();
+  const fab = document.getElementById('subagents-fab');
+  if (fab) fab.remove();
 }
 
 function _startWave() {
   if (_waveTicker) clearInterval(_waveTicker);
   if (_freezeTimer) { clearTimeout(_freezeTimer); _freezeTimer = null; }
-  _wave = { originTs: performance.now(), bars: new Map(), done: false, manualCollapsed: false };
+  _wave = { originTs: performance.now(), bars: new Map(), done: false };
   const el = _dock();
-  el.classList.remove('cdock-collapsed');
   el.querySelector('.cdock-body').innerHTML = '';
   el.querySelector('.cdock-summary').style.display = 'none';
+  _openSubagents(); // auto-reveal the sidebar when a wave starts so the work is visible
   _waveTicker = setInterval(_renderWave, 200);
   _renderWave();
 }
 
 function _ensureWave() { if (!_wave || _wave.done) _startWave(); }
 
-function waveStarted(ev) { _startWave(); }
+function waveStarted(ev) { _hudEnsure(); _startWave(); }
 
 function subagentStarted(ev) {
   _ensureWave();
+  _hudOnStart(ev);
   const key = _waveRowKey(ev);
   const now = performance.now();
   const row = document.createElement('div');
@@ -597,6 +731,7 @@ function subagentProgress(ev) {
   if (!bar) return;
   bar.steps = ev.step; bar.tokens = ev.tokens;
   bar.row.querySelector('.cbar-stat').textContent = `${ev.tokens} tok · step ${ev.step}/${ev.max_steps}`;
+  _hudOnProgress(ev);
 }
 
 function subagentDone(ev) {
@@ -608,6 +743,7 @@ function subagentDone(ev) {
   bar.row.querySelector('.cbar-fill').classList.add(ev.ok ? 'ok' : 'failed');
   bar.row.querySelector('.cbar-stat').textContent =
     `${ev.ok ? '✓' : '✗'} ${ev.elapsed_s}s · ${ev.tokens} tok · ${ev.steps} steps`;
+  _hudOnDone(ev);
   _renderWave();
   // Singleton (write) waves have no wave_done: freeze when nothing is running.
   if (![..._wave.bars.values()].some(b => b.running)) _freezeWaveSoon();
@@ -640,6 +776,7 @@ function waveDone(ev) {
     `${stats.wallS}s wall vs ${stats.summedS}s summed → ` +
     `<span class="cdock-speedup">${stats.speedup}× faster</span>`;
   el.querySelector('.cdock-count').textContent = '';
+  _updateFab(0, true);
 }
 
 function _renderWave() {
@@ -651,13 +788,13 @@ function _renderWave() {
   bars.forEach(b => { const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs; if (end > span) span = end; });
   const runningCount = bars.filter(b => b.running).length;
   el.querySelector('.cdock-count').textContent = _wave.done ? '' : `${runningCount} running`;
+  _updateFab(runningCount, _wave.done);
   bars.forEach(b => {
     const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs;
     const fill = b.row.querySelector('.cbar-fill');
     fill.style.left = `${(b.startOffsetMs / span) * 100}%`;
     fill.style.width = `${Math.max(1, ((end - b.startOffsetMs) / span) * 100)}%`;
   });
-  if (!_wave.manualCollapsed) el.classList.remove('cdock-collapsed');
 }
 
 // Dev-only: fire a synthetic parallel wave so the dock can be verified without a
@@ -1268,6 +1405,7 @@ function setBusy(busy) {
 function onDone() {
   finalizeLiveLines();
   setBusy(false);
+  _hudEnd(); // freeze the session HUD's elapsed timer; keep the final tally visible
   // refresh tree after a generation finishes (files may have changed)
   if (session) pywebview.api.get_file_tree().then(r => { if (r && r.ok) renderFileTree(r.tree); }).catch(() => {});
   // the run may have changed the knowledge graph: rebuild it now if it's on
@@ -1315,9 +1453,6 @@ function onSessionStarted(ev) {
   $('treeProjectName').textContent = ev.project;
   $('chat').innerHTML = '';
   resetActivityState();
-  // Zero the header stats up front; a 'status' event fired right after this (when
-  // the project has saved history) restores the real steps / tools / ctx / resets.
-  setStatus('statSteps', 0); setStatus('statTools', 0); setStatus('statCtx', 0); setStatus('statResets', 0);
   expandedDirs.clear(); // a new/re-opened workspace starts with nothing expanded
   autoScroll = true;
   setBusy(!!ev.busy);

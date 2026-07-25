@@ -117,13 +117,29 @@ def write_file(filepath, content):
     
     # Write using a base64 encoded string to avoid shell escaping issues
     import base64
-    b64_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+    content_bytes = content.encode('utf-8')
+    b64_content = base64.b64encode(content_bytes).decode('utf-8')
     cmd = f"mkdir -p $(dirname /workspace/{filepath}) && echo '{b64_content}' | base64 -d > /workspace/{filepath}"
     res = run_cmd(cmd)
-    
-    if res['returncode'] == 0:
-        return {"stdout": f"Successfully wrote to /workspace/{filepath}"}
-    return res
+    if res['returncode'] != 0:
+        return res
+
+    # Ground-truth the write: a returncode of 0 is NOT proof the bytes landed
+    # (wrong path, unmounted workspace, an APKEditor root/ tree the caller didn't
+    # expect). Confirm the file exists and its on-disk size matches what we wrote,
+    # so a silent no-op is surfaced as an error instead of a phantom success that
+    # survives to a downstream verify. Same discipline as delete_path.
+    expected = len(content_bytes)
+    probe = run_cmd(f"stat -c %s /workspace/{filepath} 2>/dev/null || echo MISSING")
+    size_str = (probe.get("stdout") or "").strip().splitlines()[-1] if (probe.get("stdout") or "").strip() else ""
+    if size_str == "MISSING" or not size_str.isdigit():
+        return {"error": (f"write_file: /workspace/{filepath} not found after write — the write did "
+                          "not take effect (check the path / that the workspace is mounted; for an "
+                          "APKEditor-decoded tree, files live under root/).")}
+    if int(size_str) != expected:
+        return {"error": (f"write_file: /workspace/{filepath} is {size_str} bytes on disk but "
+                          f"{expected} were written — the write was truncated/partial, do not trust it.")}
+    return {"stdout": f"Successfully wrote {expected} bytes to /workspace/{filepath}"}
 
 @registry.register(
     name="replace_in_file",
@@ -184,18 +200,33 @@ def replace_in_file(filepath, old_string, new_string, replace_all=False):
     name="delete_path",
     description="Deletes a file or directory recursively inside the workspace. Use this to remove files the user asks you to remove, or to clean up temporary artifacts.",
     params_schema={"filepath": "string (path relative to workspace)"},
-    output="A confirmation line 'Successfully deleted /workspace/<filepath>' on success, or an error if the path is the workspace root or the shell command fails.",
+    output="A confirmation line 'Successfully deleted /workspace/<filepath>' on success. If the path did NOT exist, returns an error (NOT a false success) — because `rm -rf` exits 0 on a missing path, a silent no-op would otherwise look identical to a real delete and mask a wrong path / unmounted workspace. Also errors if the path is the workspace root or the shell command fails.",
     when_to_use="Use this when the user asks to remove a file or folder, or when you need to clean up temporary/intermediate artifacts you created."
 )
 def delete_path(filepath):
     filepath = normalize_path(filepath)
     if not filepath or filepath == ".":
         return {"error": "Cannot delete root workspace directory."}
-    cmd = f"rm -rf /workspace/{filepath}"
-    res = run_cmd(cmd)
-    if res['returncode'] == 0:
-        return {"stdout": f"Successfully deleted /workspace/{filepath}"}
-    return res
+    # `rm -rf` exits 0 even when the target doesn't exist, so a no-op (typo'd
+    # path, wrong decoded-tree layout, workspace not mounted where expected) would
+    # otherwise be reported as success — the exact false-positive that lets an
+    # intended change (e.g. an ABI strip) silently not happen while downstream
+    # verify still "passes". Check existence first, then confirm removal, so a
+    # no-op is surfaced as an error the agent must react to instead of trusting.
+    existed = run_cmd(f"test -e /workspace/{filepath} && echo YES || echo NO")
+    if (existed.get("stdout") or "").strip() == "NO":
+        return {"error": (f"Nothing deleted: /workspace/{filepath} does not exist. "
+                          "Check the path — for an APKEditor-decoded tree, native libs and "
+                          "assets live under root/ (e.g. root/lib/<abi>), not at the top level. "
+                          "See the apk-toolchain skill's reference/decoded-tree-layout.md.")}
+    res = run_cmd(f"rm -rf /workspace/{filepath}")
+    if res['returncode'] != 0:
+        return res
+    still = run_cmd(f"test -e /workspace/{filepath} && echo YES || echo NO")
+    if (still.get("stdout") or "").strip() == "YES":
+        return {"error": f"Delete reported no error but /workspace/{filepath} is still present — "
+                         "the removal did not take effect (check permissions / mount)."}
+    return {"stdout": f"Successfully deleted /workspace/{filepath}"}
 
 @registry.register(
     name="move_file",
@@ -224,9 +255,20 @@ def move_file(source, destination):
         f"mv /workspace/{source} /workspace/{destination}"
     )
     res = run_cmd(cmd)
-    if res['returncode'] == 0:
-        return {"stdout": f"Moved /workspace/{source} -> /workspace/{destination}"}
-    return res
+    if res['returncode'] != 0:
+        return res
+    # Ground-truth the move: confirm the source is gone AND the destination exists.
+    # A returncode of 0 alone can hide a no-op (wrong path) — surface it as an error.
+    chk = run_cmd(f"echo src=$(test -e /workspace/{source} && echo 1 || echo 0) "
+                  f"dst=$(test -e /workspace/{destination} && echo 1 || echo 0)")
+    out = (chk.get("stdout") or "")
+    if "dst=1" not in out:
+        return {"error": (f"move_file: destination /workspace/{destination} is missing after the move "
+                          "— it did not take effect (check the source path / decoded-tree layout).")}
+    if "src=1" in out:
+        return {"error": (f"move_file: source /workspace/{source} is still present after the move — "
+                          "the move did not complete (do not trust it as done).")}
+    return {"stdout": f"Moved /workspace/{source} -> /workspace/{destination}"}
 
 @registry.register(
     name="duplicate_file",
@@ -256,6 +298,11 @@ def duplicate_file(source, destination):
         f"cp -r /workspace/{source} /workspace/{destination}"
     )
     res = run_cmd(cmd)
-    if res['returncode'] == 0:
-        return {"stdout": f"Duplicated /workspace/{source} -> /workspace/{destination}"}
-    return res
+    if res['returncode'] != 0:
+        return res
+    # Ground-truth the copy: confirm the destination actually exists.
+    chk = run_cmd(f"test -e /workspace/{destination} && echo YES || echo NO")
+    if "YES" not in (chk.get("stdout") or ""):
+        return {"error": (f"duplicate_file: destination /workspace/{destination} not found after copy "
+                          "— it did not take effect (check the source path / decoded-tree layout).")}
+    return {"stdout": f"Duplicated /workspace/{source} -> /workspace/{destination}"}

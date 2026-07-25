@@ -32,6 +32,31 @@ def set_timeout_decider(fn):
     _timeout_decider = fn
 
 
+# A stop predicate the app registers (agent.py passes `lambda: self._stop`) so a
+# running tool subprocess can be aborted the INSTANT the user hits Stop, rather
+# than blocking for the whole timeout window. Polled inside _run_polling.
+_STOP_CHECK = None
+# How often _run_polling checks the stop predicate while waiting on a process.
+_STOP_POLL_SECONDS = 0.2
+
+
+def set_stop_check(fn):
+    """Register callable() -> bool that returns True when the user asked to stop.
+    Lets _run_polling kill an in-flight command immediately. None clears it."""
+    global _STOP_CHECK
+    _STOP_CHECK = fn
+
+
+def _stop_requested():
+    fn = _STOP_CHECK
+    if fn:
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return False
+
+
 def _kill_proc(proc):
     try:
         proc.kill()
@@ -259,7 +284,27 @@ def _run_polling(cmd, timeout, display, timeout_msg):
     window = timeout
     rounds = 0
     while True:
-        reader.join(window)
+        # Wait up to `window` seconds for the process, but poll the stop predicate
+        # in short ticks so a user Stop aborts the command immediately instead of
+        # blocking for the whole window. (The inner tick also ends early the moment
+        # the process finishes.)
+        waited = 0.0
+        while waited < window:
+            tick = min(_STOP_POLL_SECONDS, window - waited)
+            reader.join(tick)
+            if not reader.is_alive():
+                break
+            if _stop_requested():
+                _kill_proc(proc)
+                reader.join(2)
+                return {
+                    "stdout": captured.get("stdout", ""),
+                    "stderr": "[stopped by user]",
+                    "returncode": 130,
+                    "stopped": True,
+                }
+            waited += tick
+
         if not reader.is_alive():
             # Process finished and its output has been fully drained.
             return {

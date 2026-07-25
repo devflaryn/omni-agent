@@ -582,6 +582,22 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
             res = run_cmd(cmd, timeout=360)
 
     res = _apply_constraint_gate(res, constraints_list, original_apk, output_apk)
+
+    # Ground-truth the build: a clean-looking result is not proof an APK landed.
+    # If the build reported no error, confirm the output APK exists and is
+    # non-empty, so an empty/again-not-written output can't be signed and shipped
+    # as a phantom success (sign_apk/verify_apk would otherwise fail confusingly
+    # downstream, or worse, "pass" on a stale file at that path).
+    if isinstance(res, dict) and not res.get("error") and res.get("returncode", 0) == 0:
+        probe = run_cmd(f"stat -c %s /workspace/{output_apk} 2>/dev/null || echo MISSING", timeout=10)
+        raw = (probe.get("stdout") or "").strip().splitlines()
+        sz = raw[-1] if raw else ""
+        if sz == "MISSING" or not sz.isdigit() or int(sz) == 0:
+            msg = (f"recompile_apk: no non-empty APK at /workspace/{output_apk} after the build "
+                   "reported success — the rebuild did not actually produce output (do not sign it). "
+                   "Re-check input_dir and the build log above.")
+            res["error"] = msg
+            res["stdout"] = (res.get("stdout", "") + "\n\n" + msg)
     return res
 
 

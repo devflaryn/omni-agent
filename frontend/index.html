@@ -312,27 +312,61 @@
     @keyframes toast-in { from { opacity: 0; transform: translateX(16px); } to { opacity: 1; transform: none; } }
     @keyframes toast-out { to { opacity: 0; transform: translateX(16px); } }
 
-    /* --- concurrency dock: live parallel-wave timeline --- */
-    #concurrency-dock {
-      position: fixed; right: 16px; bottom: 16px; z-index: 40;
-      width: 380px; max-width: calc(100vw - 32px);
-      max-height: 40vh; display: flex; flex-direction: column;
+    /* --- Subagents: bottom-right toggle FAB + right slide-in sidebar --- */
+    #subagents-fab {
+      position: fixed; right: 16px; bottom: 16px; z-index: 41;
+      display: none; align-items: center; gap: 7px;
+      padding: 8px 13px; border-radius: 999px;
       background: rgb(var(--term-panel)); color: rgb(var(--term-text));
-      border: 1px solid rgb(var(--term-line)); border-radius: 10px;
-      box-shadow: 0 8px 28px rgba(0,0,0,0.32);
-      font-size: 11.5px; overflow: hidden;
+      border: 1px solid rgb(var(--term-line));
+      box-shadow: 0 6px 22px rgba(0,0,0,0.30);
+      font-size: 12px; font-weight: 600; cursor: pointer;
     }
-    #concurrency-dock.cdock-collapsed { width: auto; }
-    #concurrency-dock.cdock-collapsed .cdock-body,
-    #concurrency-dock.cdock-collapsed .cdock-summary { display: none; }
+    #subagents-fab.fab-visible { display: inline-flex; }
+    #subagents-fab:hover { border-color: rgb(var(--term-cyan)); }
+    #subagents-fab .fab-count {
+      min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px;
+      display: inline-grid; place-items: center;
+      background: rgb(var(--term-line)); color: rgb(var(--term-cyan));
+      font-variant-numeric: tabular-nums; font-size: 11px;
+    }
+    #subagents-fab.fab-active .fab-count { background: rgb(var(--term-cyan)); color: rgb(var(--term-bg)); }
+
+    #concurrency-dock {
+      position: fixed; top: 0; right: 0; z-index: 40;
+      width: 340px; max-width: 100vw; height: 100%;
+      display: flex; flex-direction: column;
+      background: rgb(var(--term-panel)); color: rgb(var(--term-text));
+      border-left: 1px solid rgb(var(--term-line));
+      box-shadow: -8px 0 28px rgba(0,0,0,0.32);
+      font-size: 11.5px; overflow: hidden;
+      transform: translateX(100%); transition: transform .22s ease;
+    }
+    #concurrency-dock.cdock-open { transform: translateX(0); }
+    /* persistent session HUD: elapsed / running-done / cumulative tokens */
+    .cdock-session {
+      padding: 7px 11px; border-bottom: 1px solid rgb(var(--term-line));
+      display: flex; flex-direction: column; gap: 3px;
+      font-variant-numeric: tabular-nums;
+    }
+    .cdock-sess-line { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .cdock-sess-elapsed { color: rgb(var(--term-text)); font-weight: 600; }
+    .cdock-sess-count { color: rgb(var(--term-cyan)); }
+    .cdock-sess-toklabel { color: rgb(var(--term-muted)); }
+    .cdock-sess-tokens { color: rgb(var(--term-text)); font-weight: 600; }
+    .cdock-session.cdock-sess-idle { opacity: 0.6; }
     .cdock-header {
-      display: flex; align-items: center; gap: 8px; cursor: pointer;
-      padding: 7px 11px; font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 12px; font-weight: 600;
       border-bottom: 1px solid rgb(var(--term-line));
     }
-    #concurrency-dock.cdock-collapsed .cdock-header { border-bottom: none; }
     .cdock-header .cdock-count { color: rgb(var(--term-cyan)); font-variant-numeric: tabular-nums; }
-    .cdock-body { padding: 8px 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+    .cdock-header .cdock-close {
+      margin-left: auto; cursor: pointer; border: none; background: none;
+      color: rgb(var(--term-muted)); font-size: 14px; line-height: 1; padding: 2px 4px;
+    }
+    .cdock-header .cdock-close:hover { color: rgb(var(--term-text)); }
+    .cdock-body { padding: 8px 10px; overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 6px; }
     .cbar { display: flex; flex-direction: column; gap: 2px; }
     .cbar-label {
       display: flex; gap: 8px; color: rgb(var(--term-muted));
@@ -452,10 +486,6 @@
           <span id="projectBadge" class="truncate font-serif text-[14px] text-term-text">project</span>
         </div>
         <div class="ml-auto flex items-center gap-3 text-[11px] text-term-muted">
-          <span class="tabular-nums" title="Total agent steps this session">steps <span id="statSteps" class="text-term-text">0</span></span>
-          <span class="tabular-nums" title="Total tools used in this chat (persists across reopen)">tools <span id="statTools" class="text-term-text">0</span></span>
-          <span class="tabular-nums" title="Approx. context size (chars)">ctx <span id="statCtx" class="text-term-text">0</span></span>
-          <span class="tabular-nums" title="Memory compactions so far">resets <span id="statResets" class="text-term-text">0</span></span>
           <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60">plan —</button>
           <button id="llmSettingsBtn" title="LLM provider settings" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>

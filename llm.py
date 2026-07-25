@@ -2012,6 +2012,34 @@ def _stop_requested():
     return False
 
 
+def _await_or_stop(fn, poll=0.1):
+    """Run fn() on a daemon thread and return its result — but if a stop is
+    requested while waiting, return the {"__stopped__": True} sentinel IMMEDIATELY
+    and abandon the in-flight call. This is what makes the Stop button abort a
+    blocking, non-streaming requests.post mid-flight: the orphan thread finishes on
+    its own and its result is discarded (its tokens are forfeit — the accepted cost
+    of an instant Stop). A worker exception is re-raised so existing error handling
+    in _run_group's callers is preserved."""
+    result = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            result["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 — re-raised below, nothing swallowed
+            result["error"] = e
+        finally:
+            done.set()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    while not done.wait(poll):
+        if _stop_requested():
+            return {"__stopped__": True}
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 def _interruptible_sleep(seconds):
     """Sleep up to `seconds`, waking early (returning True) if a stop is
     requested. Returns True if interrupted, False if the full time elapsed."""
@@ -2166,7 +2194,13 @@ def ask_llm(messages, temperature=0.7, active_groups=None):
         for gi, group in enumerate(groups):
             if _stop_requested():
                 return _stopped_response()
-            res = _run_group(group, messages, temperature, active_groups=active_groups)
+            # Run the (blocking, non-streaming) provider call on a worker thread so
+            # a mid-flight Stop returns control instantly instead of waiting out the
+            # request. One wrap point covers every provider/protocol.
+            res = _await_or_stop(
+                lambda: _run_group(group, messages, temperature, active_groups=active_groups))
+            if isinstance(res, dict) and res.get("__stopped__"):
+                return _stopped_response()
             if res.get("ok"):
                 if gi > 0 or cycle > 0:
                     _notify_fallback(f"{_model_label(group, res['model'])} responded — continuing.")

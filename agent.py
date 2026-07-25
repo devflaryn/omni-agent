@@ -49,7 +49,11 @@ from llm import (
     reset_salvage_stats,
     SALVAGE_STATS,
 )
-from docker_sandbox import setup_sandbox, set_timeout_decider
+from docker_sandbox import (
+    setup_sandbox,
+    set_timeout_decider,
+    set_stop_check as set_sandbox_stop_check,
+)
 from tool_registry import registry, CORE_GROUP
 import planning
 import investigation
@@ -299,7 +303,15 @@ NAVIGATION_TOOLS = {"build_code_graph", "query_code_graph", "grep_directory",
 # model to use_skill. Like every guard here it only NUDGES — work is never
 # blocked — and it's bounded so it can't spam, and disarms once a skill is loaded.
 SKILL_NUDGE_THRESHOLD = 8
-MAX_SKILL_NUDGES = 2
+# Bounded per task. Raised from 2 because the guard no longer latches OFF after the
+# first skill load — it re-arms so a long run that drifts into a different sub-task
+# (e.g. apk-modding -> anti-debug-bypass) gets steered to the SPECIFIC skill too,
+# not just once at the very start. Still capped so it can never nag.
+MAX_SKILL_NUDGES = 3
+# Anti-rabbit-hole: how many times per task the assumption gate may nudge toward
+# observing the current build before an expensive native patch. Kept tiny (the
+# lesson only needs saying once) so it can never nag.
+MAX_ASSUMPTION_NUDGES = 1
 # Tools representing hands-on APK / reverse-engineering work a skill would guide.
 # Calling these without having consulted a skill advances the skill-nudge counter.
 SKILL_DOMAIN_TOOLS = {
@@ -406,7 +418,10 @@ STRATEGY_RESYNC_FINDINGS = 5     # new findings before nudging a brief reconcile
 # lives in tool_policy.py — the single source of truth shared with subagents.py
 # and the planning gate. Re-exported here so every existing reference in this
 # module (validation gate, planning gate) is unchanged.
-from tool_policy import MUTATING_TOOLS, VALIDATION_TOOLS
+from tool_policy import (
+    MUTATING_TOOLS, VALIDATION_TOOLS,
+    NATIVE_SPECULATION_TOOLS, OBSERVE_RUN_TOOLS,
+)
 # Argument names, in priority order, that most likely name the file a mutating
 # tool touched — used to auto-record a "modified file" into investigation memory.
 _PATH_ARG_KEYS = ("path", "file_path", "so_path", "smali_path", "dex_path",
@@ -1085,6 +1100,13 @@ class AgentApi:
         # Let ask_llm's never-give-up retry/backoff loop see the Stop button, so a
         # long backoff wait (up to 10 min) can still be interrupted by the user.
         set_stop_check(lambda: self._stop)
+        # Same predicate for the sandbox, so a running tool subprocess is killed the
+        # instant Stop is pressed instead of blocking for its whole timeout window.
+        set_sandbox_stop_check(lambda: self._stop)
+        # Bridge subagent telemetry emitted OUTSIDE the planner's read-wave (e.g.
+        # the dispatch_agents tool) to the browser, so the Subagents HUD lights up
+        # for deliberate delegation too, not only auto read-waves.
+        subagents.set_ui_sink(self._emit)
 
     def set_window(self, window):
         self._window = window
@@ -2201,6 +2223,12 @@ class AgentApi:
             "failed_sigs": {},                          # (tool,args) signatures that failed this run
             "failed_sig_warned": set(),                 # signatures we've already nudged about
             "_validation_nudged_for": None,             # last mutating tool we nudged validation for
+            # --- anti-rabbit-hole assumption gate ---
+            # build_observed: has the CURRENT build been installed/launched/tested on
+            # the emulator (its behaviour observed) since the last recompile/sign?
+            # Native anti-tamper patching before that is the classic wasted rabbit hole.
+            "build_observed": False,
+            "assumption_nudges_sent": 0,                # bounded native-speculation nudges this task
             # --- adaptive planning loop policy ---
             "adaptive_planning": ADAPTIVE_PLANNING_DEFAULT,
             "mutating_gate_nudged": False,              # one-time soft nudge fired on the first unplanned mutation
@@ -2347,6 +2375,8 @@ class AgentApi:
         s["failed_sigs"] = {}
         s["failed_sig_warned"] = set()
         s["_validation_nudged_for"] = None
+        s["build_observed"] = False
+        s["assumption_nudges_sent"] = 0
         # Fresh chat -> drop expanded toolsets back to catalog-only (they re-arm
         # as the new task uses domain tools).
         s["active_toolsets"] = set()
@@ -2394,6 +2424,8 @@ class AgentApi:
         self.session["failed_sigs"] = {}
         self.session["failed_sig_warned"] = set()
         self.session["_validation_nudged_for"] = None
+        self.session["build_observed"] = False
+        self.session["assumption_nudges_sent"] = 0
         # New task -> the next tool call is the "first", so guarantee it opens with
         # an explanation (see the emit block in _run_agent_loop).
         self.session["narrated_this_task"] = False
@@ -2427,7 +2459,7 @@ class AgentApi:
         if not self._busy:
             return {"ok": False, "error": "Nothing to stop."}
         self._stop = True
-        self._emit({"type": "system", "content": "Stop requested — will halt before the next LLM call."})
+        self._emit({"type": "system", "content": "Stopping now — aborting the current step (in-flight LLM call / running tool)."})
         return {"ok": True}
 
     def get_file_tree(self):
@@ -2875,37 +2907,68 @@ class AgentApi:
         s["last_status"] = status_ev
         self._emit(status_ev)
 
-    def _skill_guard(self, s, tool_name):
+    def _skill_guard(self, s, tool_name, tool_args=None):
         """Consult a matching skill instead of improvising a whole APK/RE workflow.
-        Loading any skill (use_skill/list_skills) disarms this for the run; otherwise a
-        run of hands-on domain work with no skill consulted triggers a bounded nudge
-        toward use_skill. Only ever nudges — the work is never blocked."""
+
+        A run of hands-on domain work with no skill consulted triggers a bounded
+        nudge toward use_skill. Loading a skill resets the counter (so following a
+        skill correctly never nags) but — unlike before — does NOT permanently
+        disarm the guard: sub-tasks shift mid-run (the general modding flow drifts
+        into a signature check, SSL pinning, or an anti-tamper rabbit hole), and a
+        long improvisation streak AFTER a skill was loaded should still steer to the
+        SPECIFIC skill for the new problem. Only ever nudges — work is never blocked."""
         if tool_name in SKILL_TOOLS:
             s["skill_loaded"] = True
             s["domain_tools_since_skill"] = 0
-        elif tool_name in SKILL_DOMAIN_TOOLS and not s.get("skill_loaded"):
+            if tool_name == "use_skill" and isinstance(tool_args, dict):
+                name = (tool_args.get("skill_name") or "").strip()
+                if name:
+                    s["last_skill_loaded"] = name
+        elif tool_name in SKILL_DOMAIN_TOOLS:
             s["domain_tools_since_skill"] = s.get("domain_tools_since_skill", 0) + 1
             if (s["domain_tools_since_skill"] >= SKILL_NUDGE_THRESHOLD
                     and s.get("skill_nudges_sent", 0) < MAX_SKILL_NUDGES):
                 s["domain_tools_since_skill"] = 0
                 s["skill_nudges_sent"] = s.get("skill_nudges_sent", 0) + 1
-                self._emit({"type": "system", "content": (
-                    "SYSTEM GUARD: substantial APK/RE work without consulting a "
-                    "skill — steering to use_skill.")})
-                s["messages"].append({"role": "user", "content": (
-                    "[SYSTEM] You've done a lot of hands-on APK / emulator work "
-                    "without loading a skill. Skills are battle-tested workflows with "
-                    "the exact tool order and pitfalls to avoid — for APK/RE: "
-                    "apk-modding, ssl-pinning-bypass, signature-bypass, "
-                    "anti-debug-bypass, string-deobfuscation, manifest-resource-editing, "
-                    "dex-multidex-handling, smali-code-injection, code-graph-analysis; "
-                    "for on-device work: emulator-management (cookie login / saved "
-                    "account / enter a place id / dev instance / lifecycle) and "
-                    "emulator-testing (run + observe + report). Loading a skill also "
-                    "brings its tools online in full. Call list_skills, then use_skill "
-                    "for the ONE that matches this task and follow it. If you've already "
-                    "checked and none apply, just continue."
-                )})
+                if s.get("skill_loaded"):
+                    # Re-arm case: a skill was consulted earlier, but a lot of work has
+                    # happened since with no skill check — likely a shifted sub-task.
+                    last = s.get("last_skill_loaded") or "a"
+                    self._emit({"type": "system", "content": (
+                        "SYSTEM GUARD: lots of hands-on work since the last skill was "
+                        "consulted — checking you're on the right skill for this sub-task.")})
+                    s["messages"].append({"role": "user", "content": (
+                        f"[SYSTEM] You loaded the '{last}' skill earlier, but have since done a "
+                        "lot of hands-on APK / emulator work without consulting a skill again. "
+                        "Sub-tasks shift mid-run — if you've moved from the general modding flow "
+                        "to a SPECIFIC problem, load the skill for THAT problem now: "
+                        "signature-bypass, ssl-pinning-bypass, anti-debug-bypass, "
+                        "string-deobfuscation, manifest-resource-editing, dex-multidex-handling, "
+                        "native-patching, smali-code-injection, or code-graph-analysis for a huge "
+                        "decompiled tree. Each encodes the exact tool order and the pitfalls — "
+                        "e.g. do NOT chase a native anti-tamper patch before you've confirmed the "
+                        "plain re-signed APK actually crashes (re-signing alone often works). If "
+                        "the skill you already have still fits this work, just continue."
+                    )})
+                else:
+                    # First-time case: substantial domain work, no skill ever consulted.
+                    self._emit({"type": "system", "content": (
+                        "SYSTEM GUARD: substantial APK/RE work without consulting a "
+                        "skill — steering to use_skill.")})
+                    s["messages"].append({"role": "user", "content": (
+                        "[SYSTEM] You've done a lot of hands-on APK / emulator work "
+                        "without loading a skill. Skills are battle-tested workflows with "
+                        "the exact tool order and pitfalls to avoid — for APK/RE: "
+                        "apk-modding, ssl-pinning-bypass, signature-bypass, "
+                        "anti-debug-bypass, string-deobfuscation, manifest-resource-editing, "
+                        "dex-multidex-handling, smali-code-injection, code-graph-analysis; "
+                        "for on-device work: emulator-management (cookie login / saved "
+                        "account / enter a place id / dev instance / lifecycle) and "
+                        "emulator-testing (run + observe + report). Loading a skill also "
+                        "brings its tools online in full. Call list_skills, then use_skill "
+                        "for the ONE that matches this task and follow it. If you've already "
+                        "checked and none apply, just continue."
+                    )})
 
     def _watchdog_after_tool(self, s, tool_name, tool_failed):
         """The SAME tool failing WATCHDOG_FAIL_THRESHOLD times in a row means retrying
@@ -2968,6 +3031,13 @@ class AgentApi:
             if tool_name in VALIDATION_TOOLS and not tool_failed:
                 s["unverified_change"] = None
                 s["_validation_nudged_for"] = None
+            # Anti-rabbit-hole tracking: observing the current build running satisfies
+            # the "confirm the crash before native patching" precondition; a fresh
+            # recompile/sign invalidates it (the new build hasn't been observed yet).
+            if tool_name in OBSERVE_RUN_TOOLS and not tool_failed:
+                s["build_observed"] = True
+            elif tool_name in ("recompile_apk", "sign_apk") and not tool_failed:
+                s["build_observed"] = False
 
     def _maybe_compact_long_run(self, s):
         """Long-run compaction: once we've done a lot of tool steps, fold the history
@@ -3181,6 +3251,31 @@ class AgentApi:
                     self._emit({"type": "system", "content": "Proceeding without an explicit plan after repeated attempts to prompt for one."})
                     s["needs_plan"] = False
 
+        # Anti-rabbit-hole assumption gate: before an EXPENSIVE native .so patch,
+        # confirm the cheap check was done first — that the current (plain re-signed)
+        # build was actually installed and observed. The overnight failure was burning
+        # effort on a native anti-tamper patch that was never the cause; the re-signed
+        # APK would have launched fine. Fires at most MAX_ASSUMPTION_NUDGES times per
+        # task and only while no run of the current build has been observed, so it can
+        # never nag and never blocks once the agent has looked.
+        if (s.get("evidence_guards")
+                and tool_name in NATIVE_SPECULATION_TOOLS
+                and not s.get("build_observed")
+                and s.get("assumption_nudges_sent", 0) < MAX_ASSUMPTION_NUDGES):
+            s["assumption_nudges_sent"] = s.get("assumption_nudges_sent", 0) + 1
+            self._emit({"type": "system", "content": (
+                "About to patch native code without having run the current build — "
+                "asking to confirm the crash first.")})
+            s["messages"].append({"role": "user", "content": (
+                f"[SYSTEM] Before patching native code with '{tool_name}', CONFIRM THE ASSUMPTION "
+                "that a native check is actually the problem: build → sign → install → launch the "
+                "current (plain re-signed) APK and OBSERVE whether it really crashes. On native game "
+                "APKs a plain re-signed APK often launches fine, and a native bl→RET/NOP that yields "
+                "UnsatisfiedLinkError breaks JNI RegisterNatives rather than defeating an anti-tamper "
+                "check — a wasted rabbit hole. If you have already observed a crash and identified the "
+                "specific check, repeat the call to proceed.")})
+            return "continue"
+
         # Repeat-failure guard: this EXACT call already failed earlier in the run (not
         # just the immediately-previous call, which the loop-repeat guard covers).
         # Nudge once — skipping execution this turn — so the worker reconsiders instead
@@ -3324,7 +3419,7 @@ class AgentApi:
 
         # Skill guard: consult a matching skill instead of improvising a
         # whole APK/RE workflow.
-        self._skill_guard(s, tool_name)
+        self._skill_guard(s, tool_name, tool_args)
 
         # NOTE: the raw tool output is deliberately NOT sent to the UI
         # — the chat shows only the action, never its output (the full
