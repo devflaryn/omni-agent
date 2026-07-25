@@ -247,12 +247,38 @@ def test_agents_prompt_shows_tier_and_ladder(monkeypatch):
         {"rung": 1, "id": "c", "label": "L", "model": "flash",
          "tier": "cheap", "tagged": False}])
     reg = plugins.PluginRegistry()
+    # Agent tier is deliberately DIFFERENT from every tier in the ladder fixture
+    # (premium/cheap), so a ladder assertion below can never be accidentally
+    # satisfied by the unrelated per-agent "[tier: ...]" tag line.
+    reg.agents = {"r": _subagents.AgentDef("r", "p", mode="read",
+                                           description="d", tier="standard")}
+    text = reg.get_agents_prompt()
+    assert "tier: standard" in text
+    assert "MODEL LADDER" in text
+
+    # Order: rung 0 (kimi, premium) must render BEFORE rung 1 (flash, cheap).
+    # Catches a ladder loop that iterates in reverse (cheapest-first), which
+    # would actively mislead the orchestrator about relative cost.
+    assert text.index("kimi") < text.index("flash")
+
+    # Per-row tier labels: each ladder row must carry ITS OWN tier — assert on
+    # the specific line, not just that the word appears anywhere in the whole
+    # prompt. Catches a ladder loop that dropped "— tier: {e['tier']}".
+    lines = text.splitlines()
+    kimi_line = next(l for l in lines if "kimi" in l)
+    flash_line = next(l for l in lines if "flash" in l)
+    assert "premium" in kimi_line
+    assert "cheap" in flash_line
+
+
+def test_agents_prompt_omits_ladder_section_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(llm, "model_ladder", lambda: [])
+    reg = plugins.PluginRegistry()
     reg.agents = {"r": _subagents.AgentDef("r", "p", mode="read",
                                            description="d", tier="cheap")}
     text = reg.get_agents_prompt()
-    assert "tier: cheap" in text
-    assert "MODEL LADDER" in text
-    assert "kimi" in text and "flash" in text
+    assert "- r (read)" in text
+    assert "MODEL LADDER" not in text
 
 
 def test_researcher_persona_defaults_to_cheap():
