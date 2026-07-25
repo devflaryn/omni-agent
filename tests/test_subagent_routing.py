@@ -161,3 +161,63 @@ def test_run_subagent_emits_tier_and_model_telemetry(monkeypatch):
     done = next(e for e in events if e["type"] == "subagent_done")
     assert started["tier"] == "cheap" and started["model"] == "flash"
     assert done["model"] == "flash"
+
+
+def _replies(monkeypatch, seq):
+    """Feed ask_llm a fixed sequence of raw replies."""
+    it = iter(seq)
+    monkeypatch.setattr(subagents, "ask_llm", lambda messages, temperature=0.3: next(it))
+
+
+def test_escalates_once_after_two_parse_errors(monkeypatch):
+    _patch_ladder(monkeypatch)
+    pins = []
+    monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
+    monkeypatch.setattr(llm, "set_subagent_context",
+                        lambda pinned_key=None, models=None: pins.append(models))
+    monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
+    monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
+    monkeypatch.setattr(llm, "take_last_model", lambda: None)
+    _replies(monkeypatch, ["garbage", "still garbage",
+                           '{"type":"final_answer","content":"ok now"}'])
+    out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="cheap")
+    assert out["ok"] is True
+    assert out["escalated"] is True
+    assert pins[0][0] == "flash"      # started cheap
+    assert pins[1][0] == "glm"        # escalated exactly one rung up
+    assert "glm" in out["note"]
+
+
+def test_no_escalation_when_already_top_rung(monkeypatch):
+    _patch_ladder(monkeypatch)
+    monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
+    monkeypatch.setattr(llm, "set_subagent_context", lambda pinned_key=None, models=None: None)
+    monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
+    monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
+    monkeypatch.setattr(llm, "take_last_model", lambda: None)
+    _replies(monkeypatch, ["garbage", "garbage",
+                           '{"type":"final_answer","content":"ok"}'])
+    out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="premium")
+    assert out["escalated"] is False
+
+
+def test_three_parse_errors_still_salvage(monkeypatch):
+    """The escalation must not consume the 3-error salvage backstop."""
+    _patch_ladder(monkeypatch)
+    monkeypatch.setattr(llm, "active_key_pool", lambda: ["k1"])
+    monkeypatch.setattr(llm, "set_subagent_context", lambda pinned_key=None, models=None: None)
+    monkeypatch.setattr(llm, "clear_subagent_context", lambda: None)
+    monkeypatch.setattr(llm, "take_last_usage", lambda: {"total": 1})
+    monkeypatch.setattr(llm, "take_last_model", lambda: None)
+    _replies(monkeypatch, ["bad one", "bad two", "bad three"])
+    out = subagents.run_subagent(AgentDef("a", "p", allowed_tools=set()), "t", tier="premium")
+    assert out["ok"] is True
+    assert "salvaged" in out["note"]
+
+
+def test_escalate_ladder_helper(monkeypatch):
+    _patch_ladder(monkeypatch)
+    assert subagents.escalate_ladder(["flash", "kimi"]) == ["glm", "flash", "kimi"]
+    assert subagents.escalate_ladder(["kimi", "glm"]) is None
+    assert subagents.escalate_ladder(["ghost"]) is None
+    assert subagents.escalate_ladder([]) is None

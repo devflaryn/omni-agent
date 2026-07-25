@@ -538,11 +538,28 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
 
         if rtype == "error":
             parse_errors += 1
+            # SAFETY VALVE for a cheap default: a weak model failing the strict JSON
+            # protocol twice in a row is a routing problem, not a prompting one. Step
+            # ONE rung up the cost spine (keeping the rest of the ladder behind it)
+            # and keep going. Fires at most once per run; the 3-error salvage below
+            # is still the final backstop.
+            if parse_errors == 2 and not escalated and ladder:
+                up = escalate_ladder(ladder)
+                if up:
+                    escalated = True
+                    ladder = up
+                    llm.set_subagent_context(pinned_key=key, models=ladder)
+                    result["escalated"] = True
+                    msg = f"escalated to {ladder[0]} after repeated protocol errors"
+                    result["note"] = "; ".join(p for p in (result.get("note"), msg) if p)
+                    messages.append({"role": "user", "content": _JSON_NUDGE})
+                    continue
             if parse_errors >= 3:
                 salvage = strip_reasoning(raw)
+                note = "; ".join(p for p in (result.get("note"),
+                                             "salvaged from non-JSON output") if p)
                 result.update(ok=True, report=salvage, raw_report=salvage, steps=steps,
-                              tools_used=tools_used, note="salvaged from non-JSON output",
-                              tokens=tokens)
+                              tools_used=tools_used, note=note, tokens=tokens)
                 return result
             messages.append({"role": "user", "content": _JSON_NUDGE})
             continue
