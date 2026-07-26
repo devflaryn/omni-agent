@@ -341,6 +341,40 @@
     .composer-model-item.active { color: rgb(var(--term-cyan)); font-weight: 500; }
     .composer-model-item-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .composer-model-check { flex-shrink: 0; }
+
+    /* Active effort, shown on the trigger so the level is legible without
+       opening the menu. Hidden when the model has nothing to configure. */
+    .composer-model-effort {
+      flex-shrink: 0; padding: 1px 6px; border-radius: var(--radius-full);
+      background: rgb(var(--term-cyan) / .15); color: rgb(var(--term-cyan-fg));
+      font-size: var(--text-2xs); line-height: 1.5;
+    }
+    .composer-model-effort.hidden { display: none; }
+
+    /* Effort picker pinned to the foot of the model menu. Separated by a rule so
+       it reads as a setting for the selected model, not another model choice. */
+    .composer-effort {
+      margin-top: 4px; padding: 8px 10px 6px;
+      border-top: 1px solid rgb(var(--term-line));
+    }
+    .composer-effort-head {
+      font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: .08em;
+      color: rgb(var(--term-muted)); margin-bottom: 6px;
+    }
+    .composer-effort-row { display: flex; flex-wrap: wrap; gap: 4px; }
+    .composer-effort-btn {
+      padding: 3px 9px; border-radius: var(--radius-full);
+      border: 1px solid rgb(var(--term-line)); background: transparent;
+      color: rgb(var(--term-muted)); font-size: var(--text-2xs);
+      cursor: pointer; white-space: nowrap;
+    }
+    .composer-effort-btn:hover { background: rgb(var(--term-line) / .5); color: rgb(var(--term-text)); }
+    .composer-effort-btn.active {
+      background: rgb(var(--term-cyan) / .18);
+      border-color: rgb(var(--term-cyan) / .55);
+      color: rgb(var(--term-cyan-fg));
+      font-weight: 500;
+    }
     /* display is controlled here (not by Tailwind's .grid/.hidden) so the JS
        busy-toggle of `hidden` wins deterministically regardless of CSS order */
     .composer-btn {
@@ -627,66 +661,113 @@
     /* Cap prose columns at a readable measure on very wide windows. The chat
        already does this inline; the plan tab did not and ran edge to edge. */
     .measure { max-width: var(--measure); margin-inline: auto; width: 100%; }
+
+    /* ================= workspace picker =================
+       Replaces the single <select> the start screen used to be. */
+    .ws-row {
+      display: flex; align-items: center; gap: var(--space-3);
+      width: 100%; padding: var(--space-2) var(--space-3);
+      border: 1px solid transparent; border-radius: var(--radius-md);
+      text-align: left; background: transparent; cursor: pointer;
+    }
+    .ws-row:hover { background: rgb(var(--term-line) / .45); }
+    .ws-row.selected { background: rgb(var(--term-cyan) / .14); border-color: rgb(var(--term-cyan) / .5); }
+    .ws-row:focus-visible { outline: 2px solid rgb(var(--term-cyan)); outline-offset: -2px; }
+    .ws-main { min-width: 0; flex: 1; }
+    .ws-name {
+      color: rgb(var(--term-text)); font-size: var(--text-base); font-weight: 500;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    /* Paths matter at the END (which project), so clip the front, not the tail. */
+    .ws-path {
+      color: rgb(var(--term-muted)); font-size: var(--text-xs);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
+    }
+    .ws-meta {
+      display: flex; align-items: center; gap: var(--space-2); flex-shrink: 0;
+      color: rgb(var(--term-muted)); font-size: var(--text-2xs);
+      font-variant-numeric: tabular-nums;
+    }
+    /* Row actions stay hidden until the row is hovered/selected, so a long list
+       reads as a list rather than a wall of buttons. */
+    .ws-actions { display: flex; gap: 2px; flex-shrink: 0; opacity: 0; }
+    .ws-row:hover .ws-actions,
+    .ws-row.selected .ws-actions,
+    .ws-row:focus-within .ws-actions { opacity: 1; }
   </style>
 </head>
 <body class="h-full font-sans text-[13px] text-term-text antialiased">
 
   <!-- ============ START / SESSION SELECT SCREEN ============ -->
-  <div id="startScreen" class="absolute inset-0 z-30 flex items-center justify-center bg-term-bg">
-    <button id="themeToggleStart" title="Toggle light / dark mode"
-      class="absolute right-4 top-4 grid h-9 w-9 place-items-center rounded-full border border-term-line text-term-muted hover:bg-term-panel hover:text-term-text"></button>
-    <button id="llmSettingsBtnStart" title="LLM provider settings" style="right:3.75rem"
-      class="absolute top-4 grid h-9 w-9 place-items-center rounded-full border border-term-line text-term-muted hover:bg-term-panel hover:text-term-text">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
-    </button>
+  <div id="startScreen" class="absolute inset-0 z-30 flex bg-term-bg">
 
-    <div class="w-[560px] max-w-[94vw] rounded-3xl border border-term-line bg-term-panel p-8 shadow-xl">
-      <div class="mb-6 flex items-center gap-3">
-        <div class="grid h-10 w-10 place-items-center rounded-2xl bg-term-cyan font-serif text-lg italic text-white">O</div>
-        <div>
-          <h1 class="font-serif text-xl text-term-text">Omni Agent</h1>
-          <p class="text-[12px] text-term-muted">Select a workspace to begin.</p>
+    <!-- LEFT RAIL: identity + the two ways in -->
+    <div class="flex shrink-0 flex-col border-r border-term-line bg-term-panel p-6 hide-narrow" style="width:300px">
+      <div class="mb-8 flex items-center gap-3">
+        <div class="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-term-cyan font-serif italic text-white" style="font-size:var(--text-lg)">O</div>
+        <div class="min-w-0">
+          <h1 class="font-serif text-term-text" style="font-size:var(--text-xl)">Omni Agent</h1>
+          <p class="text-term-muted" style="font-size:var(--text-xs)">Open a workspace to begin</p>
         </div>
       </div>
 
-      <div class="mb-6">
-        <div class="mb-1.5 flex items-center justify-between">
-          <span class="text-[11px] uppercase tracking-wider text-term-muted">Workspace folder</span>
-          <div class="flex items-center gap-3">
-            <button id="newProjectBtn" class="text-[11px] text-term-cyan hover:underline">Select folder…</button>
-          </div>
-        </div>
-        <div class="flex items-center gap-2">
-          <select id="projectSelect" title="Recently used workspace folders" class="w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan"></select>
-          <button id="deleteProjectBtn" title="Forget this folder (removes it from the list + its saved chat; does NOT delete the folder)" class="shrink-0 rounded-xl border border-term-line px-3 py-2.5 text-term-muted hover:border-term-red hover:text-term-red">forget</button>
-        </div>
-
-        <div id="newProjectBox" class="mt-2 hidden gap-2">
-          <input id="newProjectInput" placeholder="new-project-name" class="flex-1 rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
-          <button id="createProjectConfirm" class="rounded-xl bg-term-cyan/15 px-4 py-2.5 font-medium text-term-cyan hover:bg-term-cyan/25">create</button>
-        </div>
-
-        <div id="importFolderBox" class="mt-2 hidden flex-col gap-2">
-          <div class="flex items-center gap-2">
-            <input id="importSourcePath" placeholder="No folder selected" readonly
-              class="flex-1 cursor-default rounded-xl border border-term-line bg-term-bg px-3 py-2.5 text-term-muted" />
-            <button id="importBrowseBtn" class="rounded-xl border border-term-line px-4 py-2.5 hover:bg-term-line/60 hover:text-term-text">browse…</button>
-          </div>
-          <div class="flex items-center gap-2">
-            <input id="importProjectNameInput" placeholder="new-project-name" class="flex-1 rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
-            <button id="importConfirmBtn" class="rounded-xl bg-term-cyan/15 px-4 py-2.5 font-medium text-term-cyan hover:bg-term-cyan/25">import &amp; copy in</button>
-          </div>
-          <p class="leading-4 text-term-muted" style="font-size:var(--text-2xs)">Copies the folder into the agent's own workspace, so your original files are never edited directly.</p>
-        </div>
-      </div>
-
-      <div class="flex items-center justify-between">
-        <span id="startError" class="text-[11px] text-term-red"></span>
-        <button id="startSessionBtn" class="rounded-full bg-term-cyan px-6 py-2.5 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">
-          Start session
+      <div class="flex flex-col gap-2">
+        <button id="openFolderBtn" class="btn btn-primary btn-lg w-full justify-start">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          Open Folder…
+        </button>
+        <button id="importFolderBtn" class="btn btn-lg w-full justify-start">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          Import a copy…
         </button>
       </div>
-      <p class="mt-5 text-center text-[10.5px] text-term-muted">A Docker sandbox is started for the selected workspace.</p>
+
+      <!-- import sub-form, revealed by the button above -->
+      <div id="importFolderBox" class="mt-3 hidden flex-col gap-2 rounded-lg border border-term-line bg-term-bg p-3">
+        <div class="eyebrow">Import a copy</div>
+        <input id="importSourcePath" placeholder="No folder selected" readonly class="field field-sm" />
+        <button id="importBrowseBtn" class="btn btn-sm w-full">browse…</button>
+        <input id="importProjectNameInput" placeholder="new-project-name" class="field field-sm" />
+        <button id="importConfirmBtn" class="btn btn-sm btn-primary w-full">import &amp; copy in</button>
+        <p class="leading-4 text-term-muted" style="font-size:var(--text-2xs)">
+          Copies the folder into the agent's own workspace, so your original files are never edited directly.
+        </p>
+      </div>
+
+      <div class="mt-auto flex items-center gap-1 pt-6">
+        <button id="llmSettingsBtnStart" title="LLM provider settings" class="icon-btn icon-btn-md icon-btn-bordered">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+        </button>
+        <button id="themeToggleStart" title="Toggle light / dark mode" class="icon-btn icon-btn-md icon-btn-bordered"></button>
+      </div>
+    </div>
+
+    <!-- RIGHT: recent workspaces -->
+    <div class="flex min-w-0 flex-1 flex-col">
+      <div class="flex items-center gap-3 border-b border-term-line px-6 py-4">
+        <div class="min-w-0 flex-1">
+          <div class="eyebrow">Recent</div>
+          <div id="recentCount" class="text-term-muted" style="font-size:var(--text-xs)">—</div>
+        </div>
+        <input id="recentFilter" type="text" placeholder="Filter folders…  ( / )" autocomplete="off"
+          class="field field-sm shrink-0" style="width:220px" />
+      </div>
+
+      <div id="recentList" class="scroll-y flex-1 px-3 py-2" role="listbox" aria-label="Recent workspaces"></div>
+
+      <div id="recentEmpty" class="hidden flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
+        <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="text-term-muted"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        <div class="text-term-text" style="font-size:var(--text-base)">No workspaces yet</div>
+        <div class="text-term-muted" style="max-width:320px;font-size:var(--text-xs)">
+          Open a folder to start. The agent works inside a Docker sandbox mounted on the folder you pick.
+        </div>
+      </div>
+
+      <div class="flex items-center gap-3 border-t border-term-line px-6 py-3">
+        <span id="startError" class="min-w-0 flex-1 truncate text-term-red" style="font-size:var(--text-xs)"></span>
+        <span class="shrink-0 text-term-muted" style="font-size:var(--text-2xs)">A Docker sandbox is started for the selected workspace.</span>
+        <button id="startSessionBtn" class="btn btn-primary btn-lg shrink-0" disabled>Open</button>
+      </div>
     </div>
   </div>
 
@@ -776,6 +857,7 @@
                   <select id="modelSelect"></select>
                   <button id="modelSelectBtn" type="button" aria-haspopup="listbox" aria-expanded="false" class="composer-model-btn">
                     <span id="modelSelectLabel" class="composer-model-label">—</span>
+                    <span class="composer-model-effort hidden"></span>
                     <svg class="composer-model-caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
                   </button>
                   <div id="modelMenu" class="composer-model-menu hidden" role="listbox"></div>

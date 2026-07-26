@@ -1796,7 +1796,12 @@ def _build_groups(configs):
                 mcfg["reasoning_effort"] = ""
                 mcfg["reasoning_style"] = "none"
             out.append({"id": settings.get("id"), "name": settings.get("name", ""),
-                        "model": model, "cfg": mcfg})
+                        "model": model, "cfg": mcfg,
+                        # The user's RAW per-model choice, kept beside cfg because
+                        # cfg cannot represent it: 'off' is flattened to '' above so
+                        # the request builder sends no reasoning params. The UI needs
+                        # to tell "explicitly off" from "not set", so it reads this.
+                        "effort_override": eff})
         return out
 
     for g in groups:
@@ -2096,22 +2101,89 @@ def set_preferred_model(config_id, model):
 def list_model_options():
     """Every text-model rung across all provider groups, flattened in fallback
     order, for the composer's model selector. Marks the user's preferred rung
-    (defaulting to the primary when nothing is pinned)."""
+    (defaulting to the primary when nothing is pinned).
+
+    Each rung also carries its CURRENT reasoning effort and the resolved
+    reasoning STYLE, so the composer's effort menu can render the right control
+    for that model (a thinking toggle for GLM, a level list for OpenAI-style,
+    nothing at all for a model that always reasons) without a second round trip.
+    """
     pref = get_preferred_model()
     out = []
     for g in _build_groups(get_effective_configs()):
         for m in g.get("models") or []:
+            cfg = m.get("cfg") or {}
             out.append({
                 "config_id": m.get("id"),
                 "name": m.get("name") or g.get("label") or g.get("provider"),
                 "label": g.get("label") or g.get("provider"),
                 "model": m["model"],
+                # The user's own per-model choice, not cfg's request-ready value:
+                # cfg flattens an explicit 'off' to '' (see _ladder), which would
+                # make the composer show "Default" for a model whose thinking the
+                # user had deliberately turned off. Falls back to the group-level
+                # effort when no per-model override exists.
+                "reasoning_effort": (m.get("effort_override")
+                                     or _norm_reasoning(cfg.get("reasoning_effort"))),
+                "reasoning_style": _resolve_reasoning_style(cfg) or "",
                 "preferred": bool(pref and pref["model"] == m["model"]
                                   and (not pref.get("config_id") or pref["config_id"] == m.get("id"))),
             })
     if out and not any(o["preferred"] for o in out):
         out[0]["preferred"] = True
     return out
+
+
+def set_model_effort(config_id, model, effort):
+    """Set (or clear, with a falsy effort) one model's reasoning effort.
+
+    Writes configs[i].model_settings[model].reasoning_effort — the same field the
+    LLM settings modal edits — so the composer's inline effort menu and the
+    settings panel are two views of one value rather than competing stores.
+    Returns True when the config file was written.
+    """
+    model = (model or "").strip()
+    if not model:
+        return False
+    data = _read_config_file()
+    if not isinstance(data, dict) or not isinstance(data.get("configs"), list):
+        data = {"version": 2, "configs": [_minimize_entry(c) for c in load_configs()]}
+
+    cid = (config_id or "").strip()
+    # Without a config_id, fall back to whichever entry actually lists the model.
+    target = None
+    for c in data["configs"]:
+        if not isinstance(c, dict):
+            continue
+        if cid and c.get("id") != cid:
+            continue
+        models = c.get("models") or ([c["model"]] if c.get("model") else [])
+        if model in models:
+            target = c
+            break
+    if target is None:
+        return False
+
+    ms = target.get("model_settings")
+    if not isinstance(ms, dict):
+        ms = {}
+        target["model_settings"] = ms
+    entry = ms.get(model)
+    if not isinstance(entry, dict):
+        entry = {}
+        ms[model] = entry
+
+    level = _norm_model_effort(effort)
+    if level:
+        entry["reasoning_effort"] = level
+    else:
+        entry.pop("reasoning_effort", None)
+        # Drop empties so clearing an override leaves no residue behind.
+        if not entry:
+            ms.pop(model, None)
+        if not ms:
+            target.pop("model_settings", None)
+    return _write_config_file(data)
 
 
 def _apply_preference(groups, pref):

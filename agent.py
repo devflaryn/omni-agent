@@ -40,6 +40,7 @@ from llm import (
     native_tools_payload_chars,
     get_preferred_model,
     set_preferred_model,
+    set_model_effort,
     list_model_options,
     set_stop_check,
     test_connection,
@@ -111,7 +112,10 @@ def set_active_workspace(path):
     s["last"] = ap
     recent = [r for r in s.get("recent", [])
               if isinstance(r, dict) and r.get("path") != ap]
-    recent.insert(0, {"label": _ws_label(ap), "path": ap})
+    # opened_at drives the "2 hours ago" column in the workspace picker. Entries
+    # written before this field existed simply have no timestamp; the picker
+    # renders those as "—" rather than pretending they were opened just now.
+    recent.insert(0, {"label": _ws_label(ap), "path": ap, "opened_at": time.time()})
     s["recent"] = recent[:12]
     _save_ws_settings(s)
     return ap
@@ -2040,13 +2044,60 @@ class AgentApi:
 
     # --- public API (called from JS) ----------------------------------------
     def get_projects(self):
-        """Recently-used workspace folders (label + abspath), most-recent first,
-        plus the persisted last-used default. A 'project' is now just a host
-        folder you picked (no fixed workspace dir)."""
+        """Recently-used workspace folders, most-recent first, plus the persisted
+        last-used default. A 'project' is just a host folder you picked.
+
+        Each entry carries what the picker shows in its list: label, absolute
+        path, when it was last opened, and how many messages its saved chat holds
+        (0 when there is no saved chat). Folders that no longer exist are dropped.
+        """
         s = _load_ws_settings()
-        recent = [r for r in s.get("recent", [])
-                  if isinstance(r, dict) and r.get("path") and os.path.isdir(r["path"])]
+        recent = []
+        for r in s.get("recent", []):
+            if not isinstance(r, dict):
+                continue
+            path = r.get("path")
+            if not path or not os.path.isdir(path):
+                continue
+            recent.append({
+                "label": r.get("label") or _ws_label(path),
+                "path": path,
+                "opened_at": r.get("opened_at"),
+                "message_count": self._saved_message_count(path),
+            })
         return {"ok": True, "recent": recent, "last": s.get("last")}
+
+    @staticmethod
+    def _saved_message_count(root):
+        """How many turns the saved chat for this folder holds, for the picker's
+        list. Counts the UI transcript rather than the LLM message list, since
+        that is what the user would actually see on reopening. Best-effort: any
+        unreadable or absent file simply reports 0."""
+        try:
+            path = os.path.join(_memory_dir_for(root), TRANSCRIPT_FILENAME)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return len(data) if isinstance(data, list) else 0
+        except (OSError, ValueError):
+            return 0
+
+    def reveal_in_finder(self, path):
+        """Open a workspace folder in the host file manager. Used by the picker's
+        per-row action and the file tree's context menu."""
+        target = os.path.abspath(path or "")
+        if not os.path.exists(target):
+            return {"ok": False, "error": f"Not found: {target}"}
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["open", "-R", target], check=False)
+            elif sys.platform.startswith("win"):
+                os.startfile(os.path.dirname(target) if os.path.isfile(target) else target)  # noqa: S606
+            else:
+                subprocess.run(["xdg-open", target if os.path.isdir(target)
+                                else os.path.dirname(target)], check=False)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True}
 
     def select_workspace(self, path=None):
         """Pick (or accept) a host folder to use as the workspace ROOT: validate
@@ -2407,6 +2458,18 @@ class AgentApi:
             if not set_preferred_model(config_id, model):
                 return {"ok": False, "error": "Failed to write llm_config.json."}
             return {"ok": True, "preferred": get_preferred_model()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def set_model_effort(self, config_id, model, effort):
+        """Set one model's reasoning effort from the composer's inline menu.
+        Writes the same model_settings field the LLM settings panel edits, and
+        returns the refreshed option list so the composer re-renders from truth
+        rather than assuming the write landed."""
+        try:
+            if not set_model_effort(config_id, model, effort):
+                return {"ok": False, "error": "Could not save the effort setting."}
+            return {"ok": True, "options": list_model_options()}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 

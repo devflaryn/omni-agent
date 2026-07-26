@@ -1277,6 +1277,21 @@ function _syncModelTrigger() {
   label.textContent = opt ? opt.textContent : (sel.value || '—');
   btn.disabled = sel.disabled;
   btn.title = (opt && opt.title) || '';
+
+  // Surface the active effort on the trigger, so the current level is visible
+  // without opening the menu. Hidden when the model has nothing to configure.
+  const suffix = btn.querySelector('.composer-model-effort');
+  if (suffix) {
+    const meta = _modelOptions.find(m => m.model === sel.value);
+    const fam = meta && (meta.reasoning_style || detectReasoningFamily(sel.value));
+    const def = fam && _REASONING_FAMILIES[fam];
+    const eff = meta && _coerceEffort(fam, meta.reasoning_effort || '');
+    const known = def && def.options && def.options.find(([v]) => v === eff);
+    // "Default" carries no information on the trigger — only show a real level.
+    const show = known && eff ? known[1] : '';
+    suffix.textContent = show;
+    suffix.classList.toggle('hidden', !show);
+  }
 }
 
 function _closeModelMenu() {
@@ -1308,10 +1323,70 @@ function _openModelMenu() {
     });
     menu.appendChild(it);
   });
+  _appendEffortSection(menu, sel.value);
   menu.classList.remove('hidden');
   $('modelSelectBtn').setAttribute('aria-expanded', 'true');
   const act = menu.querySelector('.active');
   if (act) act.scrollIntoView({ block: 'nearest' });
+}
+
+// The effort control that lives at the FOOT of the model menu. Which levels are
+// offered depends on the selected model's reasoning family — a GLM model gets a
+// thinking on/off toggle, an OpenAI-style model gets Off..Max, and a model that
+// always reasons (DeepSeek R1) gets no control at all. Families and their option
+// lists are the same _REASONING_FAMILIES table the LLM settings panel uses, so
+// the two surfaces can never disagree about what a model supports.
+function _appendEffortSection(menu, model) {
+  const opt = _modelOptions.find(m => m.model === model);
+  if (!opt) return;
+  const fam = opt.reasoning_style || detectReasoningFamily(model);
+  const def = _REASONING_FAMILIES[fam];
+  if (!def || !def.options) return;   // family reasons unconditionally
+
+  const current = _coerceEffort(fam, opt.reasoning_effort || '');
+
+  const sec = document.createElement('div');
+  sec.className = 'composer-effort';
+
+  const head = document.createElement('div');
+  head.className = 'composer-effort-head';
+  head.textContent = 'Effort';
+  head.title = def.label;
+  sec.appendChild(head);
+
+  const row = document.createElement('div');
+  row.className = 'composer-effort-row';
+  def.options.forEach(([value, label]) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'composer-effort-btn' + (value === current ? ' active' : '');
+    b.textContent = label;
+    b.title = def.label;
+    b.addEventListener('click', (e) => {
+      // Keep the menu open: changing effort is a setting, not a selection, and
+      // closing here would make comparing levels needlessly fiddly.
+      e.stopPropagation();
+      setModelEffort(opt.config_id || '', model, value);
+    });
+    row.appendChild(b);
+  });
+  sec.appendChild(row);
+  menu.appendChild(sec);
+}
+
+async function setModelEffort(configId, model, effort) {
+  const target = _modelOptions.find(m => m.model === model);
+  if (target) target.reasoning_effort = effort;   // optimistic, for instant feedback
+  _syncModelTrigger();
+  if (!$('modelMenu').classList.contains('hidden')) _openModelMenu();  // re-render the row
+  try {
+    const res = await pywebview.api.set_model_effort(configId, model, effort);
+    if (res && res.ok && res.options) {
+      _modelOptions = res.options;
+      _syncModelTrigger();
+      if (!$('modelMenu').classList.contains('hidden')) _openModelMenu();
+    }
+  } catch (e) { /* non-fatal: the optimistic value stands until the next refresh */ }
 }
 
 function _renderModelSelect() {
@@ -1886,44 +1961,180 @@ function onSessionEnded() {
 }
 
 // ---------- start screen ----------
+// ---------- workspace picker (start screen) ----------
+// A VS Code-style recent list, not a <select>: each row shows the folder name,
+// its full path, when it was last opened and how big its saved chat is, with
+// per-row actions revealed on hover.
+let _recent = [];            // [{label, path, opened_at, message_count}]
+let _selectedWs = null;      // path of the highlighted row
+
+// "3 minutes ago" / "2 days ago". Entries saved before opened_at existed have
+// no timestamp and render as an em dash rather than a fabricated "just now".
+function relativeTime(epochSeconds) {
+  if (!epochSeconds) return '—';
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds));
+  if (s < 60) return 'just now';
+  const units = [['minute', 60], ['hour', 3600], ['day', 86400], ['month', 2592000], ['year', 31536000]];
+  let label = 'just now';
+  for (const [name, secs] of units) {
+    if (s < secs) break;
+    const n = Math.floor(s / secs);
+    label = `${n} ${name}${n === 1 ? '' : 's'} ago`;
+  }
+  return label;
+}
+
+function _wsIconBtn(title, svg, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'icon-btn';
+  b.title = title;
+  b.innerHTML = svg;
+  b.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+  return b;
+}
+
+const _WS_REVEAL_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
+const _WS_FORGET_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+
+function _wsRow(entry) {
+  const row = document.createElement('div');
+  row.className = 'ws-row' + (entry.path === _selectedWs ? ' selected' : '');
+  row.tabIndex = 0;
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', entry.path === _selectedWs ? 'true' : 'false');
+  row.dataset.path = entry.path;
+
+  const main = document.createElement('div');
+  main.className = 'ws-main';
+  const name = document.createElement('div');
+  name.className = 'ws-name';
+  name.textContent = entry.label;
+  const path = document.createElement('div');
+  path.className = 'ws-path';
+  path.title = entry.path;
+  // The RTL trick clips the front of the path; bidi marks keep the text itself
+  // reading left-to-right so separators don't get reordered.
+  path.textContent = '‪' + entry.path + '‬';
+  main.appendChild(name);
+  main.appendChild(path);
+
+  const meta = document.createElement('div');
+  meta.className = 'ws-meta';
+  const when = document.createElement('span');
+  when.textContent = relativeTime(entry.opened_at);
+  meta.appendChild(when);
+  if (entry.message_count > 0) {
+    const chat = document.createElement('span');
+    chat.className = 'chip';
+    chat.textContent = `${entry.message_count} msg`;
+    chat.title = 'This folder has a saved chat that will be restored';
+    meta.appendChild(chat);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'ws-actions';
+  actions.appendChild(_wsIconBtn('Reveal in file manager', _WS_REVEAL_SVG,
+    () => pywebview.api.reveal_in_finder(entry.path)));
+  actions.appendChild(_wsIconBtn(
+    'Forget this folder (removes it from the list and its saved chat; does NOT delete the folder)',
+    _WS_FORGET_SVG, () => forgetWorkspace(entry.path)));
+
+  row.appendChild(main);
+  row.appendChild(meta);
+  row.appendChild(actions);
+
+  row.addEventListener('click', () => selectWorkspace(entry.path));
+  row.addEventListener('dblclick', () => { selectWorkspace(entry.path); startSession(); });
+  row.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); selectWorkspace(entry.path); startSession(); }
+  });
+  return row;
+}
+
+function selectWorkspace(path) {
+  _selectedWs = path;
+  $('startSessionBtn').disabled = !path;
+  [...$('recentList').children].forEach(el => {
+    const on = el.dataset.path === path;
+    el.classList.toggle('selected', on);
+    el.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+}
+
+function renderRecent() {
+  const q = $('recentFilter').value.trim().toLowerCase();
+  const shown = q
+    ? _recent.filter(r => r.label.toLowerCase().includes(q) || r.path.toLowerCase().includes(q))
+    : _recent;
+
+  const list = $('recentList');
+  list.innerHTML = '';
+  shown.forEach(r => list.appendChild(_wsRow(r)));
+
+  // The empty state distinguishes "nothing yet" from "nothing matched", which a
+  // single blank pane would not.
+  const noneAtAll = _recent.length === 0;
+  $('recentEmpty').classList.toggle('hidden', !noneAtAll);
+  $('recentEmpty').classList.toggle('flex', noneAtAll);
+  list.classList.toggle('hidden', noneAtAll);
+  $('recentCount').textContent = noneAtAll
+    ? 'no folders yet'
+    : (q ? `${shown.length} of ${_recent.length} folders` : `${_recent.length} folder${_recent.length === 1 ? '' : 's'}`);
+
+  // Keep a valid selection: if the highlighted row got filtered away, move to
+  // the first visible one so Enter/Open always does something sensible.
+  if (!shown.some(r => r.path === _selectedWs)) {
+    selectWorkspace(shown.length ? shown[0].path : null);
+  }
+}
+
 async function loadStartScreen() {
   try {
-    // A "project" is now a host folder you picked. get_projects returns the
-    // recently-used folders {label, path} + the last-used default.
     const res = await pywebview.api.get_projects();
-    const recent = (res && res.recent) || [];
-    const projSel = $('projectSelect');
-    projSel.innerHTML = '';
-    recent.forEach(r => {
-      const o = document.createElement('option');
-      o.value = r.path; o.textContent = r.label + '  —  ' + r.path; o.title = r.path;
-      projSel.appendChild(o);
-    });
-    if (!recent.length) {
-      const o = document.createElement('option'); o.value = '';
-      o.textContent = '(no folders yet — click “Select folder”)'; projSel.appendChild(o);
-    } else if (res.last) {
-      projSel.value = res.last;
-    }
+    _recent = (res && res.recent) || [];
+    _selectedWs = (res && res.last && _recent.some(r => r.path === res.last))
+      ? res.last
+      : (_recent[0] ? _recent[0].path : null);
+    renderRecent();
+    selectWorkspace(_selectedWs);
   } catch (e) {
     $('startError').textContent = 'Failed to load: ' + e;
   }
 }
 
+// Move the highlight by `delta` rows within the currently filtered list.
+function moveWsSelection(delta) {
+  const rows = [...$('recentList').children];
+  if (!rows.length) return;
+  const i = rows.findIndex(el => el.dataset.path === _selectedWs);
+  const next = Math.min(rows.length - 1, Math.max(0, (i < 0 ? 0 : i + delta)));
+  selectWorkspace(rows[next].dataset.path);
+  rows[next].scrollIntoView({ block: 'nearest' });
+}
+
+async function forgetWorkspace(path) {
+  $('startError').textContent = '';
+  try {
+    const res = await pywebview.api.delete_workspace(path);
+    if (res && !res.ok) { $('startError').textContent = res.error || 'Could not forget that folder.'; return; }
+    await loadStartScreen();
+  } catch (e) {
+    $('startError').textContent = '' + e;
+  }
+}
+
 async function startSession() {
   $('startError').textContent = '';
-  const path = $('projectSelect').value;   // value is now an absolute folder path
-  if (!path || path.startsWith('(')) {
-    $('startError').textContent = 'Select a workspace folder first.'; return;
-  }
+  if (!_selectedWs) { $('startError').textContent = 'Select a workspace folder first.'; return; }
   const btn = $('startSessionBtn'); btn.disabled = true; btn.textContent = 'Starting sandbox…';
   try {
-    const res = await pywebview.api.start_session(path);
+    const res = await pywebview.api.start_session(_selectedWs);
     if (!res.ok) $('startError').textContent = res.error || 'Failed to start session.';
   } catch (e) {
     $('startError').textContent = '' + e;
   } finally {
-    btn.disabled = false; btn.textContent = 'Start session';
+    btn.disabled = false; btn.textContent = 'Open';
   }
 }
 
@@ -1931,7 +2142,7 @@ async function startSession() {
 // container, then start the session on it. The picked folder is the project root.
 async function pickWorkspaceAndStart() {
   $('startError').textContent = '';
-  const btn = $('newProjectBtn');
+  const btn = $('openFolderBtn');
   const prev = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Selecting + mounting…'; }
   try {
@@ -1939,7 +2150,7 @@ async function pickWorkspaceAndStart() {
     if (res && res.cancelled) return;
     if (!res || !res.ok) { $('startError').textContent = (res && res.error) || 'Could not select folder.'; return; }
     await loadStartScreen();
-    $('projectSelect').value = res.path;
+    selectWorkspace(res.path);
     await startSession();
   } catch (e) {
     $('startError').textContent = '' + e;
@@ -1949,6 +2160,13 @@ async function pickWorkspaceAndStart() {
 }
 
 // ---------- import from folder ----------
+function toggleImportBox() {
+  const box = $('importFolderBox');
+  const showing = box.classList.contains('hidden');
+  box.classList.toggle('hidden', !showing);
+  box.classList.toggle('flex', showing);
+}
+
 async function browseImportFolder() {
   try {
     const res = await pywebview.api.pick_folder();
@@ -1979,8 +2197,7 @@ async function confirmImport() {
       return;
     }
     await loadStartScreen();
-    $('projectSelect').value = name;
-    $('importFolderBox').classList.add('hidden'); $('importFolderBox').classList.remove('flex');
+    toggleImportBox();
     $('importSourcePath').value = '';
     $('importProjectNameInput').value = '';
   } catch (e) {
@@ -3421,44 +3638,28 @@ async function init() {
     if (st && st.active) await pywebview.api.restore_session();
   } catch (e) { /* stay on the start screen */ }
 
-  // "Select folder": pick a host folder at runtime, mount it, and start on it.
-  // No fixed workspace, no copy-in. (Import-from-folder button was removed.)
-  $('newProjectBtn').addEventListener('click', pickWorkspaceAndStart);
-  $('createProjectConfirm').addEventListener('click', async () => {
-    const name = $('newProjectInput').value.trim();
-    if (!name) return;
-    const res = await pywebview.api.create_project(name);
-    if (res.ok) {
-      await loadStartScreen();
-      $('projectSelect').value = name;
-      $('newProjectInput').value = '';
-      $('newProjectBox').classList.add('hidden'); $('newProjectBox').classList.remove('flex');
-    } else { $('startError').textContent = res.error; }
-  });
-
-  $('deleteProjectBtn').addEventListener('click', async () => {
-    $('startError').textContent = '';
-    const path = $('projectSelect').value;
-    if (!path || path.startsWith('(')) {
-      $('startError').textContent = 'Select a workspace folder to forget.'; return;
-    }
-    if (!confirm(`Forget workspace "${path}"?\n\nThis removes it from the recent list and deletes its saved chat. Your folder on disk is NOT touched.`)) return;
-    const btn = $('deleteProjectBtn'); btn.disabled = true;
-    try {
-      const res = await pywebview.api.delete_workspace(path);
-      if (res.ok) await loadStartScreen();
-      else $('startError').textContent = res.error || 'Failed to forget workspace.';
-    } catch (e) {
-      $('startError').textContent = '' + e;
-    } finally {
-      btn.disabled = false;
-    }
-  });
-
-  // Import-from-folder is gone (the picked folder is mounted + edited in place,
-  // no copy). The "Select folder" button above is the single entry point.
-
+  // "Open Folder…": pick a host folder at runtime, mount it, and start on it.
+  $('openFolderBtn').addEventListener('click', pickWorkspaceAndStart);
+  $('importFolderBtn').addEventListener('click', toggleImportBox);
+  $('importBrowseBtn').addEventListener('click', browseImportFolder);
+  $('importConfirmBtn').addEventListener('click', confirmImport);
   $('startSessionBtn').addEventListener('click', startSession);
+
+  $('recentFilter').addEventListener('input', renderRecent);
+  // Keyboard navigation over the recent list. Only while the picker is up, so it
+  // can never swallow keys meant for the chat composer.
+  document.addEventListener('keydown', (e) => {
+    if ($('startScreen').classList.contains('hidden')) return;
+    const typing = e.target === $('recentFilter');
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveWsSelection(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveWsSelection(-1); }
+    else if (e.key === 'Enter' && !typing) { e.preventDefault(); startSession(); }
+    else if (e.key === 'Enter' && typing) { e.preventDefault(); startSession(); }
+    else if (e.key === '/' && !typing) { e.preventDefault(); $('recentFilter').focus(); }
+    else if (e.key === 'Escape' && typing && $('recentFilter').value) {
+      e.preventDefault(); $('recentFilter').value = ''; renderRecent();
+    }
+  });
 
   $('themeToggle').addEventListener('click', toggleTheme);
   $('themeToggleStart').addEventListener('click', toggleTheme);
