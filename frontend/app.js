@@ -761,14 +761,18 @@ function renderFinalAnswer(ev) {
 
 // System messages surface as auto-dismissing toasts in the bottom-right
 // corner instead of cluttering the transcript. Each hides itself after 10s.
-function renderSystem(content) {
+// One toast. `kind` sets the label and colour: 'sys' for agent system messages,
+// 'error' / 'warn' / 'info' for the file-tree operations, which need to report
+// failures somewhere the user will actually see them in a packaged desktop app.
+function toast(kind, content) {
   const host = document.getElementById('toasts');
   if (!host) return; // fall back to nothing if the container isn't present
 
+  const label = { error: 'error', warn: 'warn', info: 'ok', sys: 'sys' }[kind] || 'sys';
   const el = document.createElement('div');
-  el.className = 'toast';
+  el.className = 'toast toast-' + (kind === 'sys' ? 'sys' : kind);
   el.innerHTML = `
-    <span class="toast-label">sys</span>
+    <span class="toast-label">${label}</span>
     <span class="toast-msg">${escapeHtml(content)}</span>
     <button class="toast-close" title="Dismiss" aria-label="Dismiss">×</button>`;
 
@@ -785,6 +789,8 @@ function renderSystem(content) {
   const timer = setTimeout(dismiss, 10000);
   host.appendChild(el);
 }
+
+function renderSystem(content) { toast('sys', content); }
 
 function renderLog(content) {
   const el = document.createElement('div');
@@ -1585,17 +1591,246 @@ function countTreeFiles(node) {
 // created only the first time the folder is expanded. This bounds the live DOM
 // to what the user has actually opened, instead of eagerly materializing every
 // file in a huge (decompiled-APK) workspace, which is what OOM'd the renderer.
+// ---------- file tree: selection, drag/drop, context menu ----------
+// Behaviour follows the VS Code explorer: click selects, ctrl/cmd-click and
+// shift-click extend, drag moves onto a folder or the trash, right-click opens
+// a menu. Every mutation goes through the sandboxed fs_* APIs, which return the
+// refreshed tree so the view re-renders from truth.
+
+const TRASH_DIR = '.omni-trash';
+
+let _treeSelection = new Set();   // selected workspace paths
+let _treeOrder = [];              // visible rows in order, for shift-range select
+let _treeAnchor = null;           // where a shift-range starts
+let _treeDragPaths = [];          // paths being dragged right now
+
+function _isInTrash(p) { return p === TRASH_DIR || p.startsWith(TRASH_DIR + '/'); }
+
+function _applyTreeSelection() {
+  $('fileTree').querySelectorAll('.tree-row').forEach(r => {
+    r.classList.toggle('sel', _treeSelection.has(r.dataset.path));
+  });
+}
+
+function _selectTreeRow(path, ev) {
+  const multi = ev && (ev.metaKey || ev.ctrlKey);
+  const range = ev && ev.shiftKey;
+  if (range && _treeAnchor) {
+    const a = _treeOrder.indexOf(_treeAnchor);
+    const b = _treeOrder.indexOf(path);
+    if (a >= 0 && b >= 0) {
+      _treeSelection = new Set(_treeOrder.slice(Math.min(a, b), Math.max(a, b) + 1));
+    }
+  } else if (multi) {
+    if (_treeSelection.has(path)) _treeSelection.delete(path); else _treeSelection.add(path);
+    _treeAnchor = path;
+  } else {
+    _treeSelection = new Set([path]);
+    _treeAnchor = path;
+  }
+  _applyTreeSelection();
+}
+
+// A drag carries the whole selection when the dragged row is part of it, so
+// dragging one of five selected files moves all five (as VS Code does).
+function _dragPathsFor(path) {
+  return _treeSelection.has(path) ? [..._treeSelection] : [path];
+}
+
+// Refuse a drop that would put a folder inside itself — the backend refuses it
+// too, but the cursor should say no before the drop happens.
+function _dropAllowed(destPath) {
+  return !_treeDragPaths.some(p => destPath === p || destPath.startsWith(p + '/'));
+}
+
+async function _fsCall(fn, ...args) {
+  try {
+    const res = await pywebview.api[fn](...args);
+    if (!res || !res.ok) { toast('error', (res && res.error) || `${fn} failed.`); return null; }
+    if (res.tree) renderFileTree(res.tree);
+    const skipped = res.skipped || [];
+    if (skipped.length) toast('warn', skipped.map(s => `${s.path}: ${s.reason}`).join(' · '));
+    return res;
+  } catch (e) {
+    toast('error', '' + e);
+    return null;
+  }
+}
+
+function moveTreePaths(paths, destDir) {
+  if (!paths.length) return;
+  _treeSelection.clear();
+  return _fsCall('fs_move', paths, destDir);
+}
+
+function deleteTreePaths(paths) {
+  if (!paths.length) return;
+  _treeSelection.clear();
+  return _fsCall('fs_delete', paths);
+}
+
+// ---------- context menu ----------
+let _ctxMenu = null;
+
+function closeContextMenu() {
+  if (_ctxMenu) { _ctxMenu.remove(); _ctxMenu = null; }
+}
+
+function openContextMenu(x, y, items) {
+  closeContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  items.forEach(item => {
+    if (item === '-') {
+      const sep = document.createElement('div');
+      sep.className = 'ctx-sep';
+      menu.appendChild(sep);
+      return;
+    }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ctx-item' + (item.danger ? ' danger' : '');
+    b.textContent = item.label;
+    b.addEventListener('click', () => { closeContextMenu(); item.run(); });
+    menu.appendChild(b);
+  });
+  document.body.appendChild(menu);
+  // Flip the menu back inside the window when it would overflow the edge.
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = Math.min(x, window.innerWidth - w - 8) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - h - 8) + 'px';
+  _ctxMenu = menu;
+}
+
+function _promptName(title, initial) {
+  const v = prompt(title, initial || '');
+  return v == null ? null : v.trim();
+}
+
+function treeContextItems(node) {
+  const path = node.path;
+  const isDir = node.type === 'dir';
+  const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+  const selected = _treeSelection.has(path) ? [..._treeSelection] : [path];
+
+  if (_isInTrash(path)) {
+    return [
+      { label: 'Restore to workspace', run: () => moveTreePaths([path], '') },
+      '-',
+      { label: 'Empty Trash', danger: true, run: () => {
+        if (confirm('Permanently delete everything in the trash? This cannot be undone.')) {
+          _fsCall('fs_trash_empty');
+        }
+      } },
+    ];
+  }
+
+  const items = [];
+  if (!isDir) items.push({ label: 'Open', run: () => openFileViewer(path) });
+  if (isDir) {
+    items.push({ label: 'New File…', run: () => {
+      const n = _promptName('New file name');
+      if (n) _fsCall('fs_new_file', `${path}/${n}`);
+    } });
+    items.push({ label: 'New Folder…', run: () => {
+      const n = _promptName('New folder name');
+      if (n) _fsCall('fs_mkdir', `${path}/${n}`);
+    } });
+  }
+  items.push('-');
+  items.push({ label: 'Rename…', run: () => {
+    const n = _promptName('Rename to', node.name);
+    if (n && n !== node.name) _fsCall('fs_rename', path, n);
+  } });
+  items.push({ label: 'Duplicate', run: () => _fsCall('fs_duplicate', path) });
+  items.push({ label: 'Copy Path', run: () => {
+    try { navigator.clipboard.writeText(path); toast('info', 'Path copied'); }
+    catch (e) { toast('error', 'Could not copy'); }
+  } });
+  items.push({ label: 'Reveal in File Manager', run: () => revealTreePath(path) });
+  items.push('-');
+  items.push({
+    label: selected.length > 1 ? `Delete ${selected.length} items` : 'Delete',
+    danger: true,
+    run: () => deleteTreePaths(selected),
+  });
+  return items;
+}
+
+async function revealTreePath(rel) {
+  try {
+    const res = await pywebview.api.reveal_in_finder(rel);
+    if (res && !res.ok) toast('error', res.error || 'Could not reveal that path.');
+  } catch (e) { toast('error', '' + e); }
+}
+
 function buildTreeNode(node, depth) {
   const row = document.createElement('div');
   row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
   row.style.paddingLeft = (depth * 12 + 4) + 'px';
+  row.dataset.path = node.path;
+  row.draggable = true;
+  _treeOrder.push(node.path);
+  if (_treeSelection.has(node.path)) row.classList.add('sel');
+
+  // --- drag source: a drag carries the whole selection when the row is in it ---
+  row.addEventListener('dragstart', (e) => {
+    _treeDragPaths = _dragPathsFor(node.path);
+    e.dataTransfer.effectAllowed = 'move';
+    // Some payload is required for the drag to start at all in WebKit.
+    try { e.dataTransfer.setData('text/plain', _treeDragPaths.join('\n')); } catch (_) {}
+    row.classList.add('dragging');
+  });
+  row.addEventListener('dragend', () => {
+    _treeDragPaths = [];
+    row.classList.remove('dragging');
+    $('fileTree').querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+  });
+
+  row.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    // Right-clicking outside the current selection moves the selection there
+    // first, so the menu always acts on what the user is pointing at.
+    if (!_treeSelection.has(node.path)) _selectTreeRow(node.path, null);
+    openContextMenu(e.clientX, e.clientY, treeContextItems(node));
+  });
 
   if (node.type === 'dir') {
     const caret = document.createElement('span');
     caret.className = 'caret text-term-muted w-3 inline-block text-[10px]'; caret.textContent = '▶';
-    const icon = document.createElement('span'); icon.textContent = '📁'; icon.className = 'text-[12px]';
-    const name = document.createElement('span'); name.textContent = node.name; name.className = 'text-term-text truncate';
+    const isTrash = node.path === TRASH_DIR;
+    const icon = document.createElement('span');
+    icon.textContent = isTrash ? '🗑' : '📁';
+    icon.className = 'text-[12px]';
+    const name = document.createElement('span');
+    name.textContent = isTrash ? 'Trash' : node.name;
+    name.className = 'text-term-text truncate';
     row.append(caret, icon, name);
+    if (isTrash) row.classList.add('tree-trash');
+
+    // --- drop target: folders (and the trash) accept a dragged selection ---
+    row.addEventListener('dragover', (e) => {
+      if (!_treeDragPaths.length) return;
+      if (!isTrash && !_dropAllowed(node.path)) { e.dataTransfer.dropEffect = 'none'; return; }
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      row.classList.add('drop-target');
+    });
+    row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+    row.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      row.classList.remove('drop-target');
+      // A drop from OUTSIDE the app carries files; a drop from inside carries paths.
+      if (e.dataTransfer.items && e.dataTransfer.items.length && !_treeDragPaths.length) {
+        uploadDroppedItems(e.dataTransfer, isTrash ? '' : node.path);
+        return;
+      }
+      const paths = _treeDragPaths.slice();
+      if (!paths.length) return;
+      if (isTrash) deleteTreePaths(paths);
+      else if (_dropAllowed(node.path)) moveTreePaths(paths, node.path);
+    });
 
     const childWrap = document.createElement('div');
     childWrap.className = 'hidden';
@@ -1611,11 +1846,14 @@ function buildTreeNode(node, depth) {
     const setOpen = (open) => {
       childWrap.classList.toggle('hidden', !open);
       caret.classList.toggle('open', open);
-      icon.textContent = open ? '📂' : '📁';
+      if (!isTrash) icon.textContent = open ? '📂' : '📁';
       if (open) { buildChildren(); expandedDirs.add(node.path); }
       else expandedDirs.delete(node.path);
     };
-    row.addEventListener('click', () => setOpen(childWrap.classList.contains('hidden')));
+    row.addEventListener('click', (e) => {
+      _selectTreeRow(node.path, e);
+      setOpen(childWrap.classList.contains('hidden'));
+    });
     // Re-expand a folder that was open before this re-render (recurses into its
     // children, which restore their own state — only the previously-open subtree).
     if (expandedDirs.has(node.path)) setOpen(true);
@@ -1630,10 +1868,12 @@ function buildTreeNode(node, depth) {
     const name = document.createElement('span'); name.textContent = node.name; name.className = 'text-term-text truncate flex-1';
     const size = document.createElement('span'); size.textContent = humanSize(node.size); size.className = 'text-[10px] text-term-muted';
     row.append(spacer, icon, name, size);
-    row.addEventListener('click', () => {
+    row.addEventListener('click', (e) => {
+      _selectTreeRow(node.path, e);
       $('fileTree').querySelectorAll('.tree-row.active').forEach(r => r.classList.remove('active'));
       row.classList.add('active');
-      openFileViewer(node.path);
+      // A modifier click is a selection gesture, not a request to open the file.
+      if (!(e.metaKey || e.ctrlKey || e.shiftKey)) openFileViewer(node.path);
     });
     return row;
   }
@@ -1642,16 +1882,170 @@ function buildTreeNode(node, depth) {
 function renderFileTree(tree) {
   const root = $('fileTree');
   root.innerHTML = '';
+  _treeOrder = [];
   let count = 0;
   if (tree && tree.children) {
+    // The trash sorts to the bottom regardless of alphabetical position, the way
+    // a real explorer pins it.
+    const children = tree.children.filter(c => c.path !== TRASH_DIR);
+    const trash = tree.children.find(c => c.path === TRASH_DIR);
     const frag = document.createDocumentFragment();
-    for (const c of tree.children) {
+    for (const c of children) {
       frag.appendChild(buildTreeNode(c, 0)); // only the top level is built up front
       count += countTreeFiles(c);
     }
+    if (trash) frag.appendChild(buildTreeNode(trash, 0));
     root.appendChild(frag);
   }
+  // Selections referring to rows that no longer exist would otherwise linger and
+  // be sent to fs_move/fs_delete on the next gesture.
+  _treeSelection = new Set([..._treeSelection].filter(p => _treeOrder.includes(p)));
   setStatus('treeFileCount', count);
+}
+
+// ---------- drag-and-drop upload from the host ----------
+// pywebview 6.2.1 exposes no native file-drop event, so a host->app drop has to
+// go through the HTML5 DataTransfer API and be streamed over the JS bridge.
+// webkitGetAsEntry() is what makes dropped FOLDERS possible: it distinguishes a
+// file from a directory and lets us walk the directory recursively.
+//
+// Chunked because the bridge serializes arguments as JSON — one large file in a
+// single call is a memory spike on both sides. 256 KB of raw bytes becomes ~344 KB
+// of base64, which the bridge handles comfortably.
+const UPLOAD_CHUNK_BYTES = 256 * 1024;
+const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;   // per file
+
+// Walk a dropped DataTransfer into a flat [{file, relPath}] list. Directory
+// entries recurse; readEntries() must be called repeatedly because it returns
+// at most 100 entries per call, which is a classic source of silent truncation.
+async function _collectDropEntries(dataTransfer) {
+  const roots = [];
+  for (const item of dataTransfer.items) {
+    if (item.kind !== 'file') continue;
+    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+    if (entry) roots.push(entry);
+    else {
+      const f = item.getAsFile();
+      if (f) roots.push({ isFile: true, name: f.name, _file: f });
+    }
+  }
+
+  const out = [];
+  const readAll = (reader) => new Promise((resolve, reject) => {
+    const acc = [];
+    const step = () => reader.readEntries(batch => {
+      if (!batch.length) { resolve(acc); return; }
+      acc.push(...batch);
+      step();
+    }, reject);
+    step();
+  });
+
+  const walk = async (entry, prefix) => {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isFile) {
+      const file = entry._file
+        ? entry._file
+        : await new Promise((res, rej) => entry.file(res, rej));
+      out.push({ file, relPath: rel });
+      return;
+    }
+    if (entry.isDirectory) {
+      const children = await readAll(entry.createReader());
+      for (const c of children) await walk(c, rel);
+    }
+  };
+
+  for (const r of roots) await walk(r, '');
+  return out;
+}
+
+function _readSliceAsBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(fr.error || new Error('read failed'));
+    fr.onload = () => {
+      // readAsDataURL gives "data:<mime>;base64,<payload>" — take the payload.
+      const s = String(fr.result);
+      resolve(s.slice(s.indexOf(',') + 1));
+    };
+    fr.readAsDataURL(blob);
+  });
+}
+
+async function _uploadOneFile(file, relPath, destDir) {
+  if (file.size > UPLOAD_MAX_BYTES) {
+    return { ok: false, error: `${relPath} is ${humanSize(file.size)} — over the ${humanSize(UPLOAD_MAX_BYTES)} limit` };
+  }
+  // A zero-byte file still needs one call, or it would never be created.
+  const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
+  for (let i = 0; i < total; i++) {
+    const slice = file.slice(i * UPLOAD_CHUNK_BYTES, (i + 1) * UPLOAD_CHUNK_BYTES);
+    const b64 = await _readSliceAsBase64(slice);
+    const res = await pywebview.api.fs_write_upload(
+      destDir, relPath, b64, i === 0, i === total - 1);
+    if (!res || !res.ok) return { ok: false, error: (res && res.error) || `${relPath} failed` };
+    if (res.tree) renderFileTree(res.tree);
+  }
+  return { ok: true };
+}
+
+let _uploadBusy = false;
+
+async function uploadDroppedItems(dataTransfer, destDir) {
+  if (_uploadBusy) { toast('warn', 'An upload is already running.'); return; }
+  let entries;
+  try {
+    entries = await _collectDropEntries(dataTransfer);
+  } catch (e) {
+    toast('error', 'Could not read the dropped items: ' + e);
+    return;
+  }
+  if (!entries.length) return;
+
+  _uploadBusy = true;
+  const where = destDir || 'the workspace root';
+  toast('info', `Uploading ${entries.length} file${entries.length === 1 ? '' : 's'} to ${where}…`);
+  const failures = [];
+  try {
+    for (const { file, relPath } of entries) {
+      const res = await _uploadOneFile(file, relPath, destDir);
+      if (!res.ok) failures.push(res.error);
+    }
+  } finally {
+    _uploadBusy = false;
+  }
+  if (failures.length) toast('error', failures.join(' · '));
+  else toast('info', `Uploaded ${entries.length} file${entries.length === 1 ? '' : 's'}.`);
+}
+
+// Drop anywhere on the tree that isn't a folder row lands in the workspace root.
+function wireTreeDropZone() {
+  const zone = $('fileTree');
+  const isExternal = (e) => !_treeDragPaths.length;
+
+  zone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    if (isExternal(e)) { e.dataTransfer.dropEffect = 'copy'; zone.classList.add('drop-zone'); }
+  });
+  zone.addEventListener('dragleave', (e) => {
+    if (e.target === zone) zone.classList.remove('drop-zone');
+  });
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    zone.classList.remove('drop-zone');
+    if (isExternal(e) && e.dataTransfer.items && e.dataTransfer.items.length) {
+      uploadDroppedItems(e.dataTransfer, '');
+    } else if (_treeDragPaths.length) {
+      // Dropping on empty space moves to the workspace root.
+      moveTreePaths(_treeDragPaths.slice(), '');
+    }
+  });
+
+  // The window must swallow stray drops, or WebKit NAVIGATES to the dropped
+  // file and the whole app is replaced by a file view.
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => e.preventDefault());
 }
 
 // ---------- file viewer ----------
@@ -3744,6 +4138,11 @@ async function init() {
   });
   $('uploadFilesBtn').addEventListener('click', uploadFiles);
   $('composerUploadBtn').addEventListener('click', uploadFiles);
+  wireTreeDropZone();
+  // The context menu closes on any outside click, Escape, or scroll — leaving it
+  // pinned over a re-rendered tree would let it act on a stale path.
+  document.addEventListener('click', () => closeContextMenu());
+  document.addEventListener('scroll', () => closeContextMenu(), true);
   $('sidebarCollapseBtn').addEventListener('click', () => setSidebarCollapsed(true));
   $('sidebarExpandBtn').addEventListener('click', () => setSidebarCollapsed(false));
   applySidebarState();
@@ -3794,6 +4193,7 @@ async function init() {
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      closeContextMenu();
       $('fileViewer').classList.add('hidden');
       closeLlmModal();
       _closeModelMenu();

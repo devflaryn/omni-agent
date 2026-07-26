@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import base64
+import binascii
 import datetime
 import json
 import glob
@@ -2082,9 +2083,21 @@ class AgentApi:
             return 0
 
     def reveal_in_finder(self, path):
-        """Open a workspace folder in the host file manager. Used by the picker's
-        per-row action and the file tree's context menu."""
-        target = os.path.abspath(path or "")
+        """Open a path in the host file manager.
+
+        Accepts either an absolute host path (the workspace picker passes one,
+        and has no session yet) or a workspace-relative path (the file tree's
+        context menu). Relative paths go through _safe_abs, so the tree can never
+        use this to reveal something outside the workspace.
+        """
+        raw = (path or "").strip()
+        if os.path.isabs(raw):
+            target = os.path.abspath(raw)
+        else:
+            try:
+                target = self._safe_abs(raw, must_exist=True)
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
         if not os.path.exists(target):
             return {"ok": False, "error": f"Not found: {target}"}
         try:
@@ -2883,6 +2896,208 @@ class AgentApi:
             return {"ok": False, "error": "No active session."}
         return read_project_archive_member(self.session["project"], rel_path, member)
 
+    # --- workspace file operations (file-tree drag/drop + context menu) -------
+    # Everything here funnels through _safe_abs, which is the ONLY thing standing
+    # between a frontend-supplied relative path and arbitrary host filesystem
+    # access. It resolves symlinks before comparing, so a symlink inside the
+    # workspace cannot be used to escape it.
+
+    TRASH_DIRNAME = ".omni-trash"
+
+    def _safe_abs(self, rel, *, must_exist=False):
+        """Resolve a workspace-relative path to an absolute one, or raise
+        ValueError if it would land outside the workspace root."""
+        if not self.session:
+            raise ValueError("No active session.")
+        root = os.path.realpath(self.session.get("root") or _project_root())
+        cleaned = (rel or "").strip().replace("\\", "/").strip("/")
+        target = os.path.realpath(os.path.join(root, *[p for p in cleaned.split("/") if p]))
+        if target != root and not target.startswith(root + os.sep):
+            raise ValueError("Path is outside the workspace.")
+        if must_exist and not os.path.exists(target):
+            raise ValueError(f"Not found: {cleaned or '/'}")
+        return target
+
+    def _tree_result(self, **extra):
+        """Standard success shape: every mutation returns the refreshed tree so
+        the frontend re-renders from truth instead of patching its own state."""
+        self._refresh_tree(force=True)
+        out = {"ok": True, "tree": build_file_tree(self.session["project"])}
+        out.update(extra)
+        return out
+
+    @staticmethod
+    def _unique_path(path):
+        """A non-colliding variant of `path` ('a.txt' -> 'a (2).txt'). Used so a
+        move or restore never silently overwrites an existing file."""
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        for n in range(2, 1000):
+            candidate = f"{base} ({n}){ext}"
+            if not os.path.exists(candidate):
+                return candidate
+        raise ValueError("Could not find a free filename.")
+
+    def fs_move(self, rel_paths, dest_dir_rel):
+        """Move files/folders into dest_dir_rel (drag and drop in the tree)."""
+        try:
+            dest = self._safe_abs(dest_dir_rel, must_exist=True)
+            if not os.path.isdir(dest):
+                return {"ok": False, "error": "Destination is not a folder."}
+            moved, skipped = [], []
+            for rel in (rel_paths or []):
+                try:
+                    src = self._safe_abs(rel, must_exist=True)
+                except ValueError as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+                    continue
+                # Moving a folder into itself or its own descendant would destroy
+                # it; the frontend guards this too, but never trust the caller.
+                if os.path.isdir(src) and (dest == src or dest.startswith(src + os.sep)):
+                    skipped.append({"path": rel, "reason": "cannot move a folder into itself"})
+                    continue
+                if os.path.dirname(src) == dest:
+                    continue  # already there — a no-op drop, not an error
+                try:
+                    shutil.move(src, self._unique_path(os.path.join(dest, os.path.basename(src))))
+                    moved.append(rel)
+                except (OSError, ValueError) as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+            return self._tree_result(moved=moved, skipped=skipped)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_delete(self, rel_paths):
+        """Move files/folders to the workspace's .omni-trash (recoverable).
+
+        Deliberately not an unlink: a mis-drop on the trash node has to be
+        undoable, and the agent's own tools already treat the workspace as the
+        unit of state.
+        """
+        try:
+            root = self._safe_abs("")
+            trash = os.path.join(root, self.TRASH_DIRNAME)
+            os.makedirs(trash, exist_ok=True)
+            trashed, skipped = [], []
+            for rel in (rel_paths or []):
+                try:
+                    src = self._safe_abs(rel, must_exist=True)
+                except ValueError as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+                    continue
+                if src == root:
+                    skipped.append({"path": rel, "reason": "cannot delete the workspace root"})
+                    continue
+                if src == trash or src.startswith(trash + os.sep):
+                    skipped.append({"path": rel, "reason": "already in the trash"})
+                    continue
+                try:
+                    shutil.move(src, self._unique_path(os.path.join(trash, os.path.basename(src))))
+                    trashed.append(rel)
+                except (OSError, ValueError) as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+            return self._tree_result(trashed=trashed, skipped=skipped)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_trash_empty(self):
+        """Permanently delete everything in the workspace trash."""
+        try:
+            trash = self._safe_abs(self.TRASH_DIRNAME)
+            if not os.path.isdir(trash):
+                return self._tree_result(removed=0)
+            removed = 0
+            for name in os.listdir(trash):
+                path = os.path.join(trash, name)
+                try:
+                    shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+            return self._tree_result(removed=removed)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_mkdir(self, rel):
+        """Create a new folder."""
+        try:
+            target = self._safe_abs(rel)
+            if os.path.exists(target):
+                return {"ok": False, "error": "That name is already taken."}
+            os.makedirs(target)
+            return self._tree_result(path=rel)
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_new_file(self, rel):
+        """Create an empty file."""
+        try:
+            target = self._safe_abs(rel)
+            if os.path.exists(target):
+                return {"ok": False, "error": "That name is already taken."}
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "x", encoding="utf-8"):
+                pass
+            return self._tree_result(path=rel)
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_rename(self, rel, new_name):
+        """Rename in place. new_name is a bare name, never a path — accepting a
+        path here would let a rename act as a move outside the workspace."""
+        try:
+            src = self._safe_abs(rel, must_exist=True)
+            name = (new_name or "").strip()
+            if not name or "/" in name or "\\" in name or name in (".", ".."):
+                return {"ok": False, "error": "Enter a valid file name."}
+            dest = os.path.join(os.path.dirname(src), name)
+            if os.path.exists(dest):
+                return {"ok": False, "error": "That name is already taken."}
+            os.rename(src, dest)
+            return self._tree_result()
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_duplicate(self, rel):
+        """Copy a file or folder beside itself."""
+        try:
+            src = self._safe_abs(rel, must_exist=True)
+            dest = self._unique_path(src)
+            if os.path.isdir(src):
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
+            return self._tree_result()
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_write_upload(self, dest_dir_rel, name, b64_chunk, first=True, last=True):
+        """Append one base64 chunk of a dropped file.
+
+        Chunked because the pywebview JS bridge serializes arguments as JSON —
+        handing it a whole large file in one call is a memory spike on both
+        sides. `first` truncates (starting a new file), `last` finalizes.
+        `name` may contain forward slashes so a dropped FOLDER can recreate its
+        structure; each segment is still resolved through _safe_abs.
+        """
+        try:
+            rel_name = (name or "").strip().replace("\\", "/").strip("/")
+            if not rel_name or ".." in rel_name.split("/"):
+                return {"ok": False, "error": "Invalid file name."}
+            base = (dest_dir_rel or "").strip().strip("/")
+            target = self._safe_abs(f"{base}/{rel_name}" if base else rel_name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb" if first else "ab") as f:
+                f.write(base64.b64decode(b64_chunk or ""))
+            # Only refresh the tree when the file is complete; doing it per chunk
+            # would rebuild the whole tree hundreds of times for one large file.
+            if last:
+                return self._tree_result(path=rel_name)
+            return {"ok": True}
+        except (ValueError, OSError, binascii.Error) as e:
+            return {"ok": False, "error": str(e)}
+
     def upload_files(self, dest_dir=""):
         """Opens a native multi-select file picker and copies the chosen host
         files into the current project's workspace (optionally into a subfolder
@@ -2927,8 +3142,12 @@ class AgentApi:
                 skipped.append({"name": name, "reason": str(e)})
 
         self._refresh_tree(force=True)
+        # `project` was undefined here — every successful upload raised NameError
+        # on its way out, so the caller saw a failure after the copy had already
+        # happened. The session's project name is what build_file_tree wants.
         return {"ok": True, "cancelled": False, "copied": copied, "skipped": skipped,
-                "dest": rel or "(workspace root)", "tree": build_file_tree(project)}
+                "dest": rel or "(workspace root)",
+                "tree": build_file_tree(self.session["project"])}
 
     def get_code_graph(self, graph_id=None):
         """Reads a chunked code knowledge graph from the project workspace and

@@ -17,7 +17,8 @@ export class El {
   constructor(tag = 'div') {
     this.tagName = tag; this.id = ''; this._text = ''; this._html = '';
     this.style = {}; this.children = []; this._parent = null;
-    this.title = ''; this.className = '';
+    this.dataset = {};   // data-* attributes, as the real DOM exposes them
+    this.title = '';
     this._classes = new Set();
     this._q = new Map();
     this._listeners = {};
@@ -32,6 +33,12 @@ export class El {
       contains: (c) => this._classes.has(c),
     };
   }
+  // className and classList must share one store, or code that sets
+  // `el.className = 'a b'` becomes invisible to classList.contains().
+  set className(v) {
+    this._classes = new Set(String(v).split(/\s+/).filter(Boolean));
+  }
+  get className() { return [...this._classes].join(' '); }
   set textContent(v) { this._text = String(v); }
   get textContent() { return this._text; }
   set innerHTML(v) { this._html = String(v); }
@@ -39,7 +46,16 @@ export class El {
   addEventListener(type, fn) { this._listeners[type] = fn; }
   removeEventListener(type) { delete this._listeners[type]; }
   click() { const f = this._listeners.click; if (f) f(); }
-  appendChild(c) { c._parent = this; this.children.push(c); return c; }
+  appendChild(c) {
+    if (c._isFragment) {
+      c.children.forEach(g => { g._parent = this; this.children.push(g); });
+      c.children = [];
+      return c;
+    }
+    c._parent = this; this.children.push(c); return c;
+  }
+  append(...cs) { cs.forEach(c => this.appendChild(c)); }
+  get firstChild() { return this.children[0] || null; }
   insertAdjacentHTML(_pos, html) { this._html += html; }
   remove() {
     const p = this._parent;
@@ -50,7 +66,18 @@ export class El {
   }
   scrollIntoView() {}
   querySelector(sel) { if (!this._q.has(sel)) this._q.set(sel, new El()); return this._q.get(sel); }
-  querySelectorAll() { return []; }
+  // Depth-first search over real children, so tests can assert on rendered
+  // trees rather than only on return values.
+  querySelectorAll(sel) {
+    const cls = sel.startsWith('.') ? sel.slice(1) : null;
+    const out = [];
+    const walk = (n) => n.children.forEach(c => {
+      if (cls && c._classes.has(cls)) out.push(c);
+      walk(c);
+    });
+    walk(this);
+    return out;
+  }
   setAttribute(k, v) { this[k] = v; }
   getAttribute(k) { return this[k]; }
 }
@@ -64,6 +91,13 @@ export function loadApp() {
       return this._byId.get(id);
     },
     createElement(tag) { return new El(tag); },
+    // A fragment is just a detached parent for these purposes; appendChild
+    // on the real container then re-parents its children.
+    createDocumentFragment() {
+      const f = new El('#fragment');
+      f._isFragment = true;
+      return f;
+    },
     addEventListener() {},
   };
   doc.body = new El('body');
