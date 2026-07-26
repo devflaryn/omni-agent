@@ -140,6 +140,77 @@ function resetInputHeight() {
   if (ta) { ta.style.height = 'auto'; ta.style.overflowY = 'hidden'; }
 }
 
+// ---------- loading states ----------
+// Every async surface in this app used to jump straight from empty to
+// populated, so a slow bridge call was indistinguishable from an empty result.
+// These fill the gap. aria-busy is set alongside the visual state so the
+// condition is announced rather than only drawn.
+function showSkeleton(el, rows = 5) {
+  if (!el) return;
+  el.setAttribute('aria-busy', 'true');
+  el.innerHTML = Array.from({ length: rows },
+    () => '<div class="skeleton skeleton-row"></div>').join('');
+}
+
+// Paired with showSkeleton. Renderers overwrite the placeholder markup on their
+// own, so this only has to clear the flag — but it must ALWAYS run, including
+// on the error path, or the surface stays marked busy forever.
+function clearSkeleton(el) {
+  if (el) el.removeAttribute('aria-busy');
+}
+
+function setBusy(btn, busy) {
+  if (!btn) return;
+  btn.classList.toggle('is-busy', !!busy);
+  if (busy) btn.setAttribute('aria-busy', 'true');
+  else btn.removeAttribute('aria-busy');
+}
+
+// ---------- modal shell ----------
+// Both modals used to be opened by toggling a class alone. Consequences:
+// keyboard focus stayed on the page underneath, Tab walked straight out of the
+// dialog into the app behind it, Esc closed only the file viewer, and on close
+// focus was dropped to <body> instead of returning to whatever opened it.
+let _modalOpener = null;
+
+function _focusables(el) {
+  return Array.from(el.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  )).filter(n => !n.disabled && !n.closest('.hidden'));
+}
+
+function _trapKeydown(e) {
+  const el = e.currentTarget;
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(el); return; }
+  if (e.key !== 'Tab') return;
+  const f = _focusables(el);
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  // Wrap at both ends so Tab cycles inside the dialog instead of escaping it.
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+function openModal(el) {
+  if (!el) return;
+  // Only record the opener on a genuine open — openFileViewer can be called
+  // again while the viewer is already up (drilling into an archive), and
+  // re-recording would trap the restore target inside the dialog itself.
+  if (el.classList.contains('hidden')) _modalOpener = document.activeElement || null;
+  el.classList.remove('hidden');
+  el.addEventListener('keydown', _trapKeydown);
+  const f = _focusables(el);
+  if (f.length && f[0].focus) f[0].focus();
+}
+
+function closeModal(el) {
+  if (!el) return;
+  el.classList.add('hidden');
+  el.removeEventListener('keydown', _trapKeydown);
+  if (_modalOpener && _modalOpener.focus) _modalOpener.focus();
+  _modalOpener = null;
+}
+
 // ---------- markdown ----------
 function renderMarkdown(text) {
   try {
@@ -199,7 +270,7 @@ function renderUserMessage(content) {
   const el = document.createElement('div');
   el.className = 'py-1 user-row';
   el.innerHTML = `
-    <div class="msg-meta mb-0.5 text-[10px] text-term-muted"><span class="text-term-green">user</span> <span>${nowTime()}</span></div>
+    <div class="msg-meta mb-0.5 t-2xs text-term-muted"><span class="text-term-green">user</span> <span>${nowTime()}</span></div>
     <div class="user-bubble msg-fmt whitespace-pre-wrap text-term-text">${formatInline(content)}</div>`;
   appendRow(el);
 }
@@ -283,7 +354,7 @@ function _updateThinkingMeta() {
 function startThinking() {
   if (thinkingEl) { _updateThinkingMeta(); return; } // JSON-retry leg: reuse the existing line
   const el = document.createElement('div');
-  el.className = 'py-0.5 font-mono text-[12px] leading-5';
+  el.className = 'py-0.5 font-mono t-sm leading-5';
   el.innerHTML = `<span class="braille-spin text-term-cyan">${SPIN_FRAMES[spinFrame]}</span> ` +
     `<span class="shimmer">Thinking…</span><span class="think-meta text-term-muted"></span>`;
   appendRow(el);
@@ -633,13 +704,13 @@ function startActionGroup() {
   // active); the body is a short, self-scrolling container so a long burst of
   // tool calls never fills the whole chat — newest calls sit at the bottom.
   el.innerHTML = `
-    <button type="button" class="group-head flex w-full items-center gap-2 rounded-lg px-1.5 py-0.5 text-left font-mono text-[12px] leading-5 hover:bg-term-line/30">
-      <span class="group-caret caret shrink-0 select-none text-[9px] leading-none text-term-muted">▶</span>
+    <button type="button" class="group-head flex w-full items-center gap-2 rounded-lg px-1.5 py-0.5 text-left font-mono t-sm leading-5 hover:bg-term-line/30">
+      <span class="group-caret caret shrink-0 select-none t-2xs leading-none text-term-muted">▶</span>
       <span class="group-title min-w-0 flex-1 truncate text-term-text"></span>
-      <span class="group-meta ml-auto shrink-0 text-[10.5px] tabular-nums text-term-muted"></span>
+      <span class="group-meta ml-auto shrink-0 t-2xs tabular-nums text-term-muted"></span>
     </button>
     <div class="group-body"><div class="group-body-clip"><div class="group-scroll">
-      <div class="group-list space-y-px py-0.5 pl-5 font-mono text-[12px] text-term-muted"></div>
+      <div class="group-list space-y-px py-0.5 pl-5 font-mono t-sm text-term-muted"></div>
     </div></div></div>`;
   const g = {
     el,
@@ -754,8 +825,8 @@ function renderFinalAnswer(ev) {
   const el = document.createElement('div');
   el.className = 'py-1';
   el.innerHTML = `
-    <div class="mb-0.5 text-[10px] text-term-muted"><span class="text-term-magenta">answer</span> <span>${ev.time}</span> <span>${ev.steps} steps</span></div>
-    <div class="markdown text-term-text text-[13px] leading-6">${renderMarkdown(ev.content)}</div>`;
+    <div class="mb-0.5 t-2xs text-term-muted"><span class="text-term-magenta">answer</span> <span>${ev.time}</span> <span>${ev.steps} steps</span></div>
+    <div class="markdown text-term-text t-base leading-6">${renderMarkdown(ev.content)}</div>`;
   appendRow(el);
 }
 
@@ -794,7 +865,7 @@ function renderSystem(content) { toast('sys', content); }
 
 function renderLog(content) {
   const el = document.createElement('div');
-  el.className = 'px-2 py-0.5 text-[10px] text-term-muted';
+  el.className = 'px-2 py-0.5 t-2xs text-term-muted';
   el.textContent = content;
   chat.appendChild(el);
   scrollDown();
@@ -1239,7 +1310,7 @@ function planOutcomeChip(outcome) {
     blocked: 'text-term-red border-term-red/40',
     needs_different_approach: 'text-term-red border-term-red/40',
   }[outcome] || 'text-term-muted border-term-line';
-  return `<span class="ml-2 rounded-full border px-2 py-0.5 text-[10px] ${color}">${escapeHtml(outcome.replace(/_/g, ' '))}</span>`;
+  return `<span class="ml-2 rounded-full border px-2 py-0.5 t-2xs ${color}">${escapeHtml(outcome.replace(/_/g, ' '))}</span>`;
 }
 
 // ---------- composer model selector + fallback indicator ----------
@@ -1463,18 +1534,18 @@ function _planStepRow(it, plan) {
     it.fallback ? ['fallback', it.fallback] : null,
   ].filter(Boolean);
   const detailHtml = detail.length ? `
-    <div class="text-[11px] text-term-muted mt-1 space-y-0.5">
+    <div class="t-xs text-term-muted mt-1 space-y-0.5">
       ${detail.map(([k, v]) => `<div><span class="text-term-muted/70">${k}:</span> ${escapeHtml(v)}</div>`).join('')}
     </div>` : '';
   return `
     <div class="flex items-start gap-2 rounded-lg px-2 py-1.5 ${active ? 'bg-term-cyan/10 border border-term-cyan/30' : 'border border-transparent'}">
-      <span class="${planStatusColor(it.status)} shrink-0 mt-0.5 text-[13px]">${planStatusIcon(it.status)}</span>
+      <span class="${planStatusColor(it.status)} shrink-0 mt-0.5 t-base">${planStatusIcon(it.status)}</span>
       <div class="min-w-0 flex-1">
-        <div class="${contentClass} text-[13px] leading-5">${escapeHtml(it.content)}</div>
-        ${it.notes ? `<div class="text-[11px] text-term-muted mt-0.5">${escapeHtml(it.notes)}</div>` : ''}
+        <div class="${contentClass} t-base leading-5">${escapeHtml(it.content)}</div>
+        ${it.notes ? `<div class="t-xs text-term-muted mt-0.5">${escapeHtml(it.notes)}</div>` : ''}
         ${detailHtml}
       </div>
-      <span class="text-[10px] text-term-muted shrink-0 mt-0.5">${escapeHtml(it.status.replace('_', ' '))}</span>
+      <span class="t-2xs text-term-muted shrink-0 mt-0.5">${escapeHtml(it.status.replace('_', ' '))}</span>
     </div>`;
 }
 
@@ -1482,8 +1553,8 @@ function _planBullets(label, values) {
   if (!values || !values.length) return '';
   return `
     <div class="mt-2">
-      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">${label}</div>
-      <ul class="text-[12px] text-term-text/90 space-y-0.5">
+      <div class="t-2xs uppercase tracking-wider text-term-muted mb-0.5">${label}</div>
+      <ul class="t-sm text-term-text/90 space-y-0.5">
         ${values.map(v => `<li class="flex gap-1.5"><span class="text-term-muted">•</span><span>${escapeHtml(v)}</span></li>`).join('')}
       </ul>
     </div>`;
@@ -1509,26 +1580,26 @@ function renderPlanTab(plan) {
 
   const phasesHtml = hasPhases ? `
     <div class="mt-2">
-      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">phases</div>
+      <div class="t-2xs uppercase tracking-wider text-term-muted mb-0.5">phases</div>
       <div class="space-y-0.5">
         ${plan.phases.map(p => {
           const cur = p.id === plan.current_phase_id;
-          return `<div class="flex items-start gap-2 text-[12px] ${cur ? 'text-term-cyan' : ''}">
-            <span class="${planStatusColor(p.status)} shrink-0 text-[12px]">${planStatusIcon(p.status)}</span>
+          return `<div class="flex items-start gap-2 t-sm ${cur ? 'text-term-cyan' : ''}">
+            <span class="${planStatusColor(p.status)} shrink-0 t-sm">${planStatusIcon(p.status)}</span>
             <span class="min-w-0 flex-1 ${p.status === 'completed' ? 'text-term-muted' : ''}">${escapeHtml(p.title)}${p.note ? ` <span class="text-term-muted">— ${escapeHtml(p.note)}</span>` : ''}</span>
-            ${cur ? '<span class="text-[9px] uppercase tracking-wider text-term-cyan shrink-0">current</span>' : ''}
+            ${cur ? '<span class="t-2xs uppercase tracking-wider text-term-cyan shrink-0">current</span>' : ''}
           </div>`;
         }).join('')}
       </div>
     </div>` : '';
 
   const rows = hasItems ? plan.items.map(it => _planStepRow(it, plan)).join('') :
-    `<div class="text-[12px] text-term-muted italic px-2 py-3">No steps in the current phase yet.</div>`;
+    `<div class="t-sm text-term-muted italic px-2 py-3">No steps in the current phase yet.</div>`;
 
   const nextHtml = plan.next_action ? `
     <div class="px-4 py-2.5 border-t border-term-line shrink-0 bg-term-cyan/5">
-      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">next action</div>
-      <div class="text-[13px] text-term-text">${escapeHtml(plan.next_action)}</div>
+      <div class="t-2xs uppercase tracking-wider text-term-muted mb-0.5">next action</div>
+      <div class="t-base text-term-text">${escapeHtml(plan.next_action)}</div>
     </div>` : '';
 
   // Header + steps share one scroll region: with long criteria/phases the
@@ -1536,12 +1607,12 @@ function renderPlanTab(plan) {
   root.innerHTML = `
     <div class="flex-1 min-h-0 overflow-y-auto">
       <div class="px-4 py-3 border-b border-term-line">
-        <div class="text-[10px] uppercase tracking-wider text-term-muted mb-1">current task ${planOutcomeChip(plan.outcome)}</div>
-        <div class="text-term-text text-[13px] mb-2">${escapeHtml(plan.task)}${plan.outcome_note ? ` <span class="text-term-muted">— ${escapeHtml(plan.outcome_note)}</span>` : ''}</div>
+        <div class="t-2xs uppercase tracking-wider text-term-muted mb-1">current task ${planOutcomeChip(plan.outcome)}</div>
+        <div class="text-term-text t-base mb-2">${escapeHtml(plan.task)}${plan.outcome_note ? ` <span class="text-term-muted">— ${escapeHtml(plan.outcome_note)}</span>` : ''}</div>
         <div class="h-1.5 rounded-full bg-term-line overflow-hidden">
           <div class="h-full bg-term-cyan transition-all" style="width:${pct}%"></div>
         </div>
-        <div class="text-[10px] text-term-muted mt-1">${done}/${total} steps complete (${pct}%)${plan.replans && plan.replans.length ? ` · replanned ${plan.replans.length}×` : ''}</div>
+        <div class="t-2xs text-term-muted mt-1">${done}/${total} steps complete (${pct}%)${plan.replans && plan.replans.length ? ` · replanned ${plan.replans.length}×` : ''}</div>
         ${_planBullets('success criteria', plan.success_criteria)}
         ${_planBullets('constraints', plan.constraints)}
         ${_planBullets('unknowns', plan.unknowns)}
@@ -1797,11 +1868,11 @@ function buildTreeNode(node, depth) {
 
   if (node.type === 'dir') {
     const caret = document.createElement('span');
-    caret.className = 'caret text-term-muted w-3 inline-block text-[10px]'; caret.textContent = '▶';
+    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.textContent = '▶';
     const isTrash = node.path === TRASH_DIR;
     const icon = document.createElement('span');
     icon.textContent = isTrash ? '🗑' : '📁';
-    icon.className = 'text-[12px]';
+    icon.className = 't-sm';
     const name = document.createElement('span');
     name.textContent = isTrash ? 'Trash' : node.name;
     name.className = 'text-term-text truncate';
@@ -1864,9 +1935,9 @@ function buildTreeNode(node, depth) {
     return wrap;
   } else {
     const spacer = document.createElement('span'); spacer.className = 'w-3 inline-block';
-    const icon = document.createElement('span'); icon.textContent = fileIcon(node.name); icon.className = 'text-[12px]';
+    const icon = document.createElement('span'); icon.textContent = fileIcon(node.name); icon.className = 't-sm';
     const name = document.createElement('span'); name.textContent = node.name; name.className = 'text-term-text truncate flex-1';
-    const size = document.createElement('span'); size.textContent = humanSize(node.size); size.className = 'text-[10px] text-term-muted';
+    const size = document.createElement('span'); size.textContent = humanSize(node.size); size.className = 't-2xs text-term-muted';
     row.append(spacer, icon, name, size);
     row.addEventListener('click', (e) => {
       _selectTreeRow(node.path, e);
@@ -2090,10 +2161,12 @@ async function openFileViewer(path) {
   archiveViewer = null;
   $('viewerPath').textContent = path;
   $('viewerSize').textContent = 'loading…';
-  $('viewerContent').textContent = '';
   $('viewerImage').querySelector('img').removeAttribute('src');
   viewerShowPane('text');
-  $('fileViewer').classList.remove('hidden');
+  // Placeholder lines rather than a blank pane — reading a large file over the
+  // bridge is slow enough that empty read as "this file is empty".
+  showSkeleton($('viewerContent'), 6);
+  openModal($('fileViewer'));
   try {
     const res = await pywebview.api.read_file(path);
     if (!res.ok) { viewerShowError(res.error); return; }
@@ -2102,6 +2175,8 @@ async function openFileViewer(path) {
     if (archiveViewer) archiveViewer.sizeLabel = $('viewerSize').textContent;
   } catch (e) {
     viewerShowError(e);
+  } finally {
+    clearSkeleton($('viewerContent'));
   }
 }
 
@@ -2134,8 +2209,8 @@ function appendArchiveLevel(container, node, depth) {
     row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
     row.style.paddingLeft = (depth * 12 + 4) + 'px';
     const caret = document.createElement('span');
-    caret.className = 'caret text-term-muted w-3 inline-block text-[10px]'; caret.textContent = '▶';
-    const icon = document.createElement('span'); icon.textContent = '📁'; icon.className = 'text-[12px]';
+    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.textContent = '▶';
+    const icon = document.createElement('span'); icon.textContent = '📁'; icon.className = 't-sm';
     const name = document.createElement('span'); name.textContent = dirName; name.className = 'text-term-text truncate';
     row.append(caret, icon, name);
     const childWrap = document.createElement('div');
@@ -2155,9 +2230,9 @@ function appendArchiveLevel(container, node, depth) {
     row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
     row.style.paddingLeft = (depth * 12 + 4) + 'px';
     const spacer = document.createElement('span'); spacer.className = 'w-3 inline-block';
-    const icon = document.createElement('span'); icon.textContent = fileIcon(f.name); icon.className = 'text-[12px]';
+    const icon = document.createElement('span'); icon.textContent = fileIcon(f.name); icon.className = 't-sm';
     const name = document.createElement('span'); name.textContent = f.name; name.className = 'text-term-text truncate flex-1';
-    const size = document.createElement('span'); size.textContent = humanSize(f.size); size.className = 'text-[10px] text-term-muted';
+    const size = document.createElement('span'); size.textContent = humanSize(f.size); size.className = 't-2xs text-term-muted';
     row.append(spacer, icon, name, size);
     row.addEventListener('click', () => openArchiveMember(f.full));
     container.appendChild(row);
@@ -2170,7 +2245,7 @@ function renderArchiveListing(res) {
   appendArchiveLevel(root, buildArchiveTree(res.entries), 0);
   if (res.truncated) {
     const note = document.createElement('div');
-    note.className = 'text-[10px] text-term-muted mt-2 px-1';
+    note.className = 't-2xs text-term-muted mt-2 px-1';
     note.textContent = `Showing ${res.entries.length.toLocaleString()} of ${res.entry_count.toLocaleString()} entries.`;
     root.appendChild(note);
   }
@@ -2484,6 +2559,7 @@ function renderRecent() {
 }
 
 async function loadStartScreen() {
+  showSkeleton($('recentList'), 4);
   try {
     const res = await pywebview.api.get_projects();
     _recent = (res && res.recent) || [];
@@ -2494,6 +2570,9 @@ async function loadStartScreen() {
     selectWorkspace(_selectedWs);
   } catch (e) {
     $('startError').textContent = 'Failed to load: ' + e;
+    $('recentList').innerHTML = '';
+  } finally {
+    clearSkeleton($('recentList'));
   }
 }
 
@@ -2614,13 +2693,15 @@ function _llmProvider(id) { return _llmProviders.find(p => p.id === id) || null;
 async function openLlmModal() {
   $('llmError').textContent = '';
   $('llmListStatus').textContent = '';
-  $('llmModal').classList.remove('hidden');
+  openModal($('llmModal'));
   llmShowList();
+  showSkeleton($('llmList'), 4);
   try {
     const res = await pywebview.api.get_llm_configs();
     if (!res || !res.ok) {
       _llmStatusKind('error');
       $('llmListStatus').textContent = (res && res.error) || 'Failed to load LLM configs.';
+      $('llmList').innerHTML = '';
       return;
     }
     _llmProviders = res.providers || [];
@@ -2629,6 +2710,11 @@ async function openLlmModal() {
   } catch (e) {
     _llmStatusKind('error');
     $('llmListStatus').textContent = '' + e;
+    $('llmList').innerHTML = '';
+  } finally {
+    // Both failure paths return before renderLlmList, so without this the
+    // placeholder rows would sit there looking like they are still loading.
+    clearSkeleton($('llmList'));
   }
 }
 
@@ -2642,7 +2728,7 @@ function _llmStatusKind(kind) {
     : kind === 'ok' ? 'text-term-green' : 'text-term-muted');
 }
 
-function closeLlmModal() { $('llmModal').classList.add('hidden'); }
+function closeLlmModal() { closeModal($('llmModal')); }
 
 // ----- switch between the list view and the add/edit form -----
 // The panel is master-detail now: the provider list is ALWAYS visible on the
@@ -2804,7 +2890,7 @@ function renderLlmTabs() {
     b.type = 'button';
     b.dataset.pid = p.id;
     b.textContent = p.label;
-    b.className = 'rounded-full border px-3 py-1 text-[12px] border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
+    b.className = 'rounded-full border px-3 py-1 t-sm border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
     b.addEventListener('click', () => selectLlmProvider(p.id, null));
     wrap.appendChild(b);
   });
@@ -2828,7 +2914,7 @@ function _miniBtn(label, title, onClick) {
   b.type = 'button';
   b.textContent = label;
   b.title = title || '';
-  b.className = 'shrink-0 rounded-lg border border-term-line px-2 py-1 text-[11px] leading-none text-term-muted hover:bg-term-line/60 hover:text-term-text';
+  b.className = 'shrink-0 rounded-lg border border-term-line px-2 py-1 t-xs leading-none text-term-muted hover:bg-term-line/60 hover:text-term-text';
   b.addEventListener('click', onClick);
   return b;
 }
@@ -2844,7 +2930,7 @@ function _renderListEditor(containerId, values, opts) {
     const inp = document.createElement('input');
     inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
     inp.placeholder = opts.placeholder || '';
-    inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
+    inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono t-xs outline-none focus:border-term-cyan';
     row.appendChild(inp);
     if (opts.ordered) {
       const up = _miniBtn('↑', 'move up (higher priority)', () => _moveListItem(containerId, i, -1, opts));
@@ -2860,7 +2946,7 @@ function _renderListEditor(containerId, values, opts) {
   });
   if (!values || !values.length) {
     const empty = document.createElement('div');
-    empty.className = 'text-[11px] italic text-term-muted';
+    empty.className = 't-xs italic text-term-muted';
     empty.textContent = opts.emptyText || '(none)';
     host.appendChild(empty);
   }
@@ -2983,7 +3069,7 @@ function _coerceEffort(fam, eff) {
 
 function _miniSelect(extraCls, options, value) {
   const sel = document.createElement('select');
-  sel.className = extraCls + ' flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2 py-1 text-[10px] text-term-muted outline-none focus:border-term-cyan';
+  sel.className = extraCls + ' flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2 py-1 t-2xs text-term-muted outline-none focus:border-term-cyan';
   options.forEach(([v, label]) => {
     const o = document.createElement('option');
     o.value = v; o.textContent = label;
@@ -3054,7 +3140,7 @@ function _modelRow(containerId, val, i, s, openPanel) {
   const inp = document.createElement('input');
   inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
   inp.placeholder = _LLM_MODEL_OPTS.placeholder;
-  inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
+  inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono t-xs outline-none focus:border-term-cyan';
   // A rename can change the model family — rebuild so the ⚙ panel shows the
   // right reasoning control for the new name.
   inp.addEventListener('change', () => {
@@ -3083,14 +3169,14 @@ function _modelRow(containerId, val, i, s, openPanel) {
   const fam = detectReasoningFamily(val);
   const famDef = _REASONING_FAMILIES[fam] || _REASONING_FAMILIES.openai;
   const famLine = document.createElement('div');
-  famLine.className = 'text-[10px] text-term-muted';
+  famLine.className = 't-2xs text-term-muted';
   famLine.textContent = 'detected: ' + famDef.label;
   panel.appendChild(famLine);
   if (famDef.options) {
     const rowEl = document.createElement('div');
     rowEl.className = 'flex items-center gap-1.5';
     const lab = document.createElement('span');
-    lab.className = 'shrink-0 text-[10px] uppercase tracking-wider text-term-muted';
+    lab.className = 'shrink-0 t-2xs uppercase tracking-wider text-term-muted';
     lab.textContent = 'reasoning';
     rowEl.append(lab, _miniSelect('llm-model-effort', famDef.options, _coerceEffort(fam, s.reasoning_effort)));
     panel.appendChild(rowEl);
@@ -3098,7 +3184,7 @@ function _modelRow(containerId, val, i, s, openPanel) {
   const tierRow = document.createElement('div');
   tierRow.className = 'flex items-center gap-1.5';
   const tierLab = document.createElement('span');
-  tierLab.className = 'shrink-0 text-[10px] uppercase tracking-wider text-term-muted';
+  tierLab.className = 'shrink-0 t-2xs uppercase tracking-wider text-term-muted';
   tierLab.textContent = 'cost tier';
   tierRow.append(tierLab, _miniSelect('llm-model-tier', _tierOptions(s.tier), s.tier || ''));
   panel.appendChild(tierRow);
@@ -3106,7 +3192,7 @@ function _modelRow(containerId, val, i, s, openPanel) {
   testRow.className = 'flex min-w-0 items-center gap-2';
   testRow.appendChild(_miniBtn('test this model', 'send a tiny probe using this key pool + model + reasoning', () => _testModelRow(card)));
   const result = document.createElement('span');
-  result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-muted';
+  result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-muted';
   testRow.appendChild(result);
   panel.appendChild(testRow);
   card.appendChild(panel);
@@ -3125,7 +3211,7 @@ function _renderModelLadder(containerId, models, modelSettings, openSet) {
   });
   if (!list.length) {
     const empty = document.createElement('div');
-    empty.className = 'text-[11px] italic text-term-muted';
+    empty.className = 't-xs italic text-term-muted';
     empty.textContent = _LLM_MODEL_OPTS.emptyText;
     host.appendChild(empty);
   }
@@ -3144,7 +3230,7 @@ async function _testModelRow(card) {
   const result = card.querySelector('.llm-model-test-result');
   const model = card.querySelector('input.llm-list-input').value.trim();
   if (!model) {
-    result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+    result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
     result.textContent = 'enter a model id first';
     return;
   }
@@ -3164,21 +3250,21 @@ async function _testModelRow(card) {
   if (mt) payload.max_tokens = parseInt(mt, 10);
   const temp = $('llmTemperature').value.trim();
   if (temp !== '') payload.temperature = parseFloat(temp);
-  result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-muted';
+  result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-muted';
   result.textContent = 'testing…';
   result.title = '';
   try {
     const res = await pywebview.api.test_llm_config(payload);
     if (res && res.ok) {
-      result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-green';
+      result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-green';
       result.textContent = `✓ ${res.model}` + (res.reply ? ` — “${res.reply}”` : ' — reachable');
     } else {
-      result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+      result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
       result.textContent = '✕ ' + ((res && res.error) || 'connection failed');
       result.title = (res && res.error) || '';
     }
   } catch (e) {
-    result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+    result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
     result.textContent = '✕ ' + e;
   }
 }
@@ -3193,7 +3279,7 @@ function selectLlmProvider(id, existing) {
 
   for (const b of $('llmProviderTabs').children) {
     const active = b.dataset.pid === p.id;
-    b.className = 'rounded-full border px-3 py-1 text-[12px] ' + (active
+    b.className = 'rounded-full border px-3 py-1 t-sm ' + (active
       ? 'bg-term-cyan text-white border-term-cyan'
       : 'border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text');
   }
@@ -3441,16 +3527,20 @@ function switchTab(tab) {
   allTabs.forEach(el => el.classList.add('hidden'));
   graphTab.classList.remove('flex');
   planTab.classList.remove('flex');
+  // The tab strip is the shared .llm-tabs segmented control. This used to
+  // toggle border-term-cyan / border-transparent, which rendered nothing: the
+  // buttons carry no border width, so only the text colour ever changed.
   allBtns.forEach(btn => {
-    btn.classList.remove('border-term-cyan', 'text-term-cyan');
-    btn.classList.add('border-transparent', 'text-term-muted');
+    btn.classList.remove('active');
+    btn.setAttribute('aria-selected', 'false');
   });
+  const activeBtn = tab === 'graph' ? tabGraph : tab === 'plan' ? tabPlan : tabChat;
+  activeBtn.classList.add('active');
+  activeBtn.setAttribute('aria-selected', 'true');
 
   if (tab === 'graph') {
     graphTab.classList.remove('hidden');
     graphTab.classList.add('flex');
-    tabGraph.classList.add('border-term-cyan', 'text-term-cyan');
-    tabGraph.classList.remove('border-transparent', 'text-term-muted');
     // Rebuilding the graph (fetch + layout) on every tab visit is expensive;
     // reuse it until a finished run invalidates it. The tab was hidden (and so
     // zero-size) while off-screen, so nudge the active engine to re-fit.
@@ -3464,13 +3554,9 @@ function switchTab(tab) {
   } else if (tab === 'plan') {
     planTab.classList.remove('hidden');
     planTab.classList.add('flex');
-    tabPlan.classList.add('border-term-cyan', 'text-term-cyan');
-    tabPlan.classList.remove('border-transparent', 'text-term-muted');
     renderPlanTab(currentPlan);
   } else {
     chatTab.classList.remove('hidden');
-    tabChat.classList.add('border-term-cyan', 'text-term-cyan');
-    tabChat.classList.remove('border-transparent', 'text-term-muted');
   }
 }
 
@@ -3602,12 +3688,13 @@ async function runManualBuild() {
   const status = $('graphBuildStatus');
   const btn = $('graphBuildRun');
   btn.disabled = true;
-  status.className = 'text-[11px] text-term-muted';
+  setBusy(btn, true);
+  status.className = 't-xs text-term-muted';
   status.textContent = 'Building… indexing files (this can take a moment).';
   try {
     const res = await pywebview.api.build_code_graph_ui(target, name, so, true);
     if (!res || !res.ok) {
-      status.className = 'text-[11px] text-term-red';
+      status.className = 't-xs text-term-red';
       status.textContent = 'Build failed: ' + escapeHtml((res && res.error) || 'unknown error');
       return;
     }
@@ -3615,11 +3702,11 @@ async function runManualBuild() {
     currentGraphId = res.graph_id;
     graphLoaded = false;
     if (res.empty) {
-      status.className = 'text-[11px] text-term-orange';
+      status.className = 't-xs text-term-orange';
       status.textContent = 'Built "' + escapeHtml(res.graph_id) + '" but it has no indexable code — pick a folder that contains source.';
       return;
     }
-    status.className = 'text-[11px] text-term-green';
+    status.className = 't-xs text-term-green';
     // Report HOW MUCH was indexed + WHERE the cache landed, so it's clear the
     // (whole-workspace) build actually covered the tree and wrote .codegraph.
     const c = res.counts || {};
@@ -3633,10 +3720,11 @@ async function runManualBuild() {
     else loadGraph(res.graph_id);
     setTimeout(() => { if (buildFormOpen) setBuildFormOpen(false); }, 1400);
   } catch (e) {
-    status.className = 'text-[11px] text-term-red';
+    status.className = 't-xs text-term-red';
     status.textContent = 'Build error: ' + escapeHtml('' + e);
   } finally {
     btn.disabled = false;
+    setBusy(btn, false);
   }
 }
 
@@ -3735,7 +3823,7 @@ function makeComparePane(graphs, chosenId, withDivider) {
   const head = document.createElement('div');
   head.className = 'flex items-center gap-2 px-2 py-1 border-b border-term-line bg-term-panel';
   const sel = document.createElement('select');
-  sel.className = 'min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-1.5 py-0.5 text-[11px] outline-none focus:border-term-cyan';
+  sel.className = 'min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-1.5 py-0.5 t-xs outline-none focus:border-term-cyan';
   for (const g of graphs) {
     const o = document.createElement('option');
     o.value = g.id;
@@ -3744,7 +3832,7 @@ function makeComparePane(graphs, chosenId, withDivider) {
     sel.appendChild(o);
   }
   const stat = document.createElement('div');
-  stat.className = 'text-[10px] text-term-muted shrink-0';
+  stat.className = 't-2xs text-term-muted shrink-0';
   head.append(sel, stat);
   const canvas = document.createElement('div');
   canvas.className = 'flex-1 relative bg-term-bg';
@@ -3763,13 +3851,13 @@ async function drawComparePane(pane, graphId) {
     if (!res || !res.ok || !res.graph || !res.graph.nodes || !res.graph.nodes.length) {
       pane.canvas.innerHTML =
         '<div class="absolute inset-0 flex items-center justify-center p-4 text-center">' +
-        '<span class="text-term-muted text-[12px]">' +
+        '<span class="text-term-muted t-sm">' +
         escapeHtml((res && res.error) || 'This graph has no nodes.') + '</span></div>';
       pane.stat.textContent = '';
       return;
     }
     if (typeof vis === 'undefined') {
-      pane.canvas.innerHTML = '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-muted text-[12px]">2D graph library unavailable.</span></div>';
+      pane.canvas.innerHTML = '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-muted t-sm">2D graph library unavailable.</span></div>';
       return;
     }
     pane.net = buildStandaloneNetwork(pane.canvas, res.graph);
@@ -3777,7 +3865,7 @@ async function drawComparePane(pane, graphId) {
     pane.stat.textContent = s.total_nodes + 'n · ' + s.total_edges + 'e';
   } catch (e) {
     pane.canvas.innerHTML =
-      '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-red text-[12px]">' +
+      '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-red t-sm">' +
       escapeHtml('' + e) + '</span></div>';
   }
 }
@@ -3883,7 +3971,7 @@ function renderGraph(data) {
 function showGraphError(container, msg) {
   container.innerHTML =
     '<div class="absolute inset-0 flex items-center justify-center p-6 text-center">' +
-    '<span class="text-term-muted text-[13px] max-w-sm leading-relaxed">' + escapeHtml(msg) + '</span></div>';
+    '<span class="text-term-muted t-base max-w-sm leading-relaxed">' + escapeHtml(msg) + '</span></div>';
   $('graphStats').textContent = '';
 }
 
@@ -3909,14 +3997,14 @@ function renderNodeInfo(nodeId) {
   const items = neighbors.map(nid => {
     const nb = _nodesById.get(nid);
     const color = (nb && nb.color && nb.color.background) || '#555';
-    return `<span class="block rounded-md px-1.5 py-0.5 text-[11px] cursor-pointer hover:bg-term-line" style="border-left:3px solid ${color}" onclick="focusGraphNode(${JSON.stringify(nid)})">${escapeHtml(nb ? nb.label : nid)}</span>`;
+    return `<span class="block rounded-md px-1.5 py-0.5 t-xs cursor-pointer hover:bg-term-line" style="border-left:3px solid ${color}" onclick="focusGraphNode(${JSON.stringify(nid)})">${escapeHtml(nb ? nb.label : nid)}</span>`;
   }).join('');
   $('graphInfo').innerHTML = `
     <div class="font-semibold text-term-text mb-1">${escapeHtml(n.label)}</div>
-    <div class="text-[11px] text-term-muted mb-0.5">community: ${escapeHtml(n.community_name)}</div>
-    <div class="text-[11px] text-term-muted mb-0.5">source: ${escapeHtml(n.source_file || '-')}</div>
-    <div class="text-[11px] text-term-muted mb-1">degree: ${n.degree}</div>
-    ${neighbors.length ? `<div class="text-[10px] text-term-muted mb-1">neighbors (${neighbors.length})</div><div class="space-y-0.5 max-h-32 overflow-y-auto">${items}</div>` : ''}`;
+    <div class="t-xs text-term-muted mb-0.5">community: ${escapeHtml(n.community_name)}</div>
+    <div class="t-xs text-term-muted mb-0.5">source: ${escapeHtml(n.source_file || '-')}</div>
+    <div class="t-xs text-term-muted mb-1">degree: ${n.degree}</div>
+    ${neighbors.length ? `<div class="t-2xs text-term-muted mb-1">neighbors (${neighbors.length})</div><div class="space-y-0.5 max-h-32 overflow-y-auto">${items}</div>` : ''}`;
 }
 
 // Center/select a node in whichever engine is active, then show its info.
@@ -3933,7 +4021,7 @@ function renderGraphLegend(data) {
   legendEl.innerHTML = '';
   data.legend.forEach(c => {
     const item = document.createElement('label');
-    item.className = 'flex items-center gap-1.5 py-0.5 cursor-pointer text-[11px] hover:text-term-text';
+    item.className = 'flex items-center gap-1.5 py-0.5 cursor-pointer t-xs hover:text-term-text';
     const cb = document.createElement('input');
     cb.type = 'checkbox'; cb.checked = true; cb.className = 'accent-term-cyan';
     cb.onchange = () => {
@@ -3942,7 +4030,7 @@ function renderGraphLegend(data) {
     };
     const dot = document.createElement('span'); dot.className = 'w-2.5 h-2.5 rounded-full inline-block'; dot.style.background = c.color;
     const label = document.createElement('span'); label.className = 'flex-1 truncate text-term-muted'; label.textContent = c.label;
-    const count = document.createElement('span'); count.className = 'text-[10px] text-term-muted'; count.textContent = c.count;
+    const count = document.createElement('span'); count.className = 't-2xs text-term-muted'; count.textContent = c.count;
     item.append(cb, dot, label, count);
     legendEl.appendChild(item);
   });
@@ -4133,8 +4221,14 @@ async function init() {
 
   $('refreshTreeBtn').addEventListener('click', async () => {
     if (!session) return;
-    const r = await pywebview.api.get_file_tree();
-    if (r && r.ok) renderFileTree(r.tree);
+    showSkeleton($('fileTree'), 7);
+    try {
+      const r = await pywebview.api.get_file_tree();
+      if (r && r.ok) renderFileTree(r.tree);
+      else $('fileTree').innerHTML = '';
+    } finally {
+      clearSkeleton($('fileTree'));
+    }
   });
   $('uploadFilesBtn').addEventListener('click', uploadFiles);
   $('composerUploadBtn').addEventListener('click', uploadFiles);
@@ -4171,9 +4265,9 @@ async function init() {
   if (window.ResizeObserver) {
     new ResizeObserver(() => { if (activeTab === 'graph') resizeGraph3D(); }).observe($('graphContainer'));
   }
-  $('viewerClose').addEventListener('click', () => $('fileViewer').classList.add('hidden'));
+  $('viewerClose').addEventListener('click', () => closeModal($('fileViewer')));
   $('viewerBack').addEventListener('click', backToArchiveListing);
-  $('fileViewer').addEventListener('click', (e) => { if (e.target.id === 'fileViewer') $('fileViewer').classList.add('hidden'); });
+  $('fileViewer').addEventListener('click', (e) => { if (e.target.id === 'fileViewer') closeModal($('fileViewer')); });
 
 
   $('modelSelect').addEventListener('change', onModelSelected);
@@ -4194,7 +4288,7 @@ async function init() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeContextMenu();
-      $('fileViewer').classList.add('hidden');
+      closeModal($('fileViewer'));
       closeLlmModal();
       _closeModelMenu();
     }

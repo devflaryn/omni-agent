@@ -7,10 +7,17 @@
 // sites and matched nothing, so those labels rendered at whatever size they
 // inherited rather than the intended one.
 //
-// Arbitrary-value utilities (text-[11px], w-[560px], ...) are the dangerous ones,
-// since they only exist if some source file already used that exact value. Named
-// utilities are checked too, minus the ones this project defines in its own
-// <style> block.
+// Arbitrary-value utilities (text-[11px], w-[560px], ...) are the most dangerous,
+// since they only exist if some source file already used that exact value.
+//
+// This file used to claim it checked named utilities too. It did not — the loop
+// skipped everything that was not an arbitrary value, and 17 plain utilities
+// were sitting dead in the markup as a result: `mt-auto` (the start rail's
+// footer never pinned to the bottom), `max-h-full` / `max-w-full` /
+// `object-contain` (the file viewer's image rendered unconstrained), plus a
+// dozen spacing utilities. Named utilities are now genuinely checked, against a
+// list of prefixes that are unambiguously Tailwind so component and JS-hook
+// class names are not swept in.
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -25,8 +32,10 @@ const appJs = fs.readFileSync(path.join(FRONTEND, 'app.js'), 'utf8');
 
 // Classes defined by the project itself, in index.html's <style> block.
 const styleBlock = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+// Un-escape first: the block now defines selectors like .p-1\.5 and
+// .text-term-text\/90, whose names only match once the backslashes are gone.
 const localClasses = new Set(
-  [...styleBlock.matchAll(/\.([a-zA-Z][\w-]*)/g)].map(m => m[1]));
+  [...styleBlock.replace(/\\/g, '').matchAll(/\.([a-zA-Z][\w./-]*)/g)].map(m => m[1]));
 
 // Tailwind escapes selector characters inconsistently from a naive `\` + char:
 // a comma becomes the CSS unicode escape `\2c ` while `[`, `(`, `%`, `.` and `/`
@@ -66,8 +75,31 @@ for (const cls of used) {
     .test(unescaped)) missing.push(cls);
 }
 
+// Named utilities whose prefix is unambiguously Tailwind. Anything matching one
+// of these must resolve to a rule; a component class like `tree-row` or a JS
+// hook like `llm-model-row` does not match, so it is never judged here.
+const NAMED_UTILITY = new RegExp('^(?:' + [
+  'm[trblxy]?-', 'p[trblxy]?-', 'gap-', 'space-[xy]-',
+  'w-', 'h-', 'min-[wh]-', 'max-[wh]-', 'inset-', 'top-', 'left-', 'right-', 'bottom-',
+  'flex-', 'grid-', 'col-', 'row-', 'justify-', 'items-', 'self-', 'place-', 'order-',
+  'text-', 'font-', 'leading-', 'tracking-', 'align-', 'whitespace-', 'break-',
+  'bg-', 'border-', 'rounded-', 'ring-', 'shadow-', 'opacity-', 'object-',
+  'overflow-', 'z-', 'cursor-', 'select-', 'pointer-events-', 'truncate$',
+].join('|') + ')');
+
+for (const cls of used) {
+  if (localClasses.has(cls)) continue;
+  if (ARBITRARY.test(cls) || VARIANT_ARBITRARY.test(cls)) continue; // handled above
+  if (cls.includes('${')) continue;                                 // template fragment
+  const bare = cls.includes(':') ? cls.slice(cls.lastIndexOf(':') + 1) : cls;
+  if (!NAMED_UTILITY.test(bare)) continue;
+  // The base class of an escaped selector (p-1.5 -> .p-1\.5) survives unescaping.
+  if (!new RegExp('\\.' + cls.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&') + '[{,:> ]')
+    .test(unescaped) && !localClasses.has(bare)) missing.push(cls);
+}
+
 assert.deepEqual(missing.sort(), [],
-  'these arbitrary Tailwind classes are used in the markup but produce NO rule in '
+  'these Tailwind classes are used in the markup but produce NO rule in '
   + 'the precompiled tailwind.css, so they silently do nothing. Either use a value '
   + 'that is already compiled, move the style into the <style> block, or rebuild '
   + 'tailwind.css:\n  ' + missing.join('\n  '));
@@ -78,8 +110,24 @@ assert.deepEqual(missing.sort(), [],
 const arbitraryCount = [...used].filter(c => ARBITRARY.test(c)).length;
 assert.ok(used.size > 200,
   `only extracted ${used.size} classes from the markup — the extractor is broken`);
-assert.ok(arbitraryCount >= 12,
-  `only found ${arbitraryCount} arbitrary classes — the extractor is broken`);
+
+// This used to assert a MINIMUM number of arbitrary classes found in the app
+// (>= 12), as a proxy for "the ARBITRARY regex still matches things". That is
+// the wrong instrument: the count legitimately falls as ad-hoc values are
+// replaced by the .t-* ramp and the component classes, so a healthier codebase
+// kept failing the guard. It went 30+ -> 9 -> 3 over two migrations.
+//
+// Test the regex against fixtures instead. That proves the matcher works
+// deterministically, and stays true whether the app has three arbitrary
+// classes or three hundred.
+for (const good of ['text-[11px]', 'w-[560px]', 'min-h-[120px]']) {
+  assert.ok(ARBITRARY.test(good), `ARBITRARY regex no longer matches ${good}`);
+}
+for (const bad of ['t-xs', 'flex', 'text-term-cyan']) {
+  assert.ok(!ARBITRARY.test(bad), `ARBITRARY regex wrongly matches ${bad}`);
+}
+assert.ok(VARIANT_ARBITRARY.test('md:w-[10px]'),
+  'VARIANT_ARBITRARY regex no longer matches md:w-[10px]');
 
 // The escaping this test relies on must keep working: these two are the most
 // heavily escaped selectors in the sheet (comma -> \2c, parens, %, /).
@@ -88,4 +136,33 @@ for (const cls of ['mx-[max(20px,calc((100%-64rem)/2))]', 'text-[10.5px]']) {
     `un-escaping is broken: could not find .${cls} after normalising tailwind.css`);
 }
 
-console.log(`tailwind classes: OK (${used.size} classes, ${arbitraryCount} arbitrary verified)`);
+// A `hidden` that does not hide.
+//
+// Component classes in the <style> block set `display`, and Tailwind's .hidden
+// has the same specificity — but this block is served AFTER tailwind.css, so
+// the component wins and the element stays visible. #viewerBack shipped this
+// way for one build: "← archive" rendered on every plain text file because
+// `.btn { display: inline-flex }` beat `.hidden`.
+//
+// Any element combining `hidden` with a display-setting component class must
+// therefore have an explicit `.component.hidden { display: none }` guard.
+const displayComponents = new Set(
+  [...styleBlock.matchAll(/\.([\w-]+)[^{]*\{[^}]*\bdisplay\s*:/g)].map(m => m[1]));
+const guarded = new Set(
+  [...styleBlock.matchAll(/\.([\w-]+)\.hidden\b/g)].map(m => m[1]));
+
+const unguarded = [];
+for (const m of html.slice(html.indexOf('</style>')).matchAll(/class="([^"]*\bhidden\b[^"]*)"/g)) {
+  for (const c of m[1].split(/\s+/)) {
+    if (c === 'hidden' || !displayComponents.has(c) || guarded.has(c)) continue;
+    unguarded.push(`${c}  (on class="${m[1].slice(0, 60)}")`);
+  }
+}
+assert.deepEqual([...new Set(unguarded)].sort(), [],
+  'these elements combine Tailwind\'s .hidden with a component class that sets '
+  + 'display. The component wins on source order, so the element stays VISIBLE. '
+  + 'Add a `.<component>.hidden { display: none; }` rule:\n  '
+  + [...new Set(unguarded)].join('\n  '));
+
+console.log(`tailwind classes: OK (${used.size} classes, ${arbitraryCount} arbitrary verified, `
+  + `${guarded.size} hidden-guards)`);

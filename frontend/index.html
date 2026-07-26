@@ -81,6 +81,16 @@
       /* ---- layout ---- */
       --sidebar-w: 288px;   /* was a hard-coded Tailwind w-72 */
       --measure: 64rem;     /* max readable column width */
+
+      /* ---- motion ----
+         Twelve transitions were written with hand-picked durations (.12s .18s
+         .2s .22s .24s .28s) and two easing curves that were already being used
+         interchangeably. Naming them is what makes an inconsistency visible;
+         --dur-fast is for state flips the eye should not track, --dur-base for
+         most UI, --dur-slow for something entering or leaving the screen. */
+      --dur-fast: 120ms; --dur-base: 200ms; --dur-slow: 280ms;
+      --ease-out: cubic-bezier(.21, 1.02, .47, 1);
+      --ease-inout: cubic-bezier(.4, 0, .2, 1);
     }
     html.light {
       color-scheme: light;
@@ -114,7 +124,7 @@
        `*` rule, which made every style/class change in a 1000+ row chat DOM a
        transition candidate and dominated style-recalc time.) */
     button, a, input, select, textarea, label, .tree-row, .group-head, .step-head {
-      transition: background-color .2s ease, border-color .2s ease, color .2s ease, opacity .2s ease;
+      transition: background-color var(--dur-base) ease, border-color var(--dur-base) ease, color var(--dur-base) ease, opacity var(--dur-base) ease;
     }
     ::selection { background: rgb(var(--term-cyan) / .3); }
     ::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -170,7 +180,7 @@
        keeps a full 1400-row transcript cheap to live with. */
     #chat > * { content-visibility: auto; contain-intrinsic-size: auto 32px; }
 
-    .msg-enter { animation: rise .28s cubic-bezier(.21, 1.02, .47, 1); }
+    .msg-enter { animation: rise var(--dur-slow) var(--ease-out); }
     @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
     .thought-text { color: rgb(var(--term-muted)); }
 
@@ -185,11 +195,11 @@
        because the global * rule whitelists only color/background/etc.) */
     .step-detail {
       display: grid; grid-template-rows: 0fr;
-      transition: grid-template-rows .22s cubic-bezier(.4, 0, .2, 1);
+      transition: grid-template-rows var(--dur-base) var(--ease-inout);
     }
     .step-detail.open { grid-template-rows: 1fr; }
     .step-detail > .step-detail-inner { overflow: hidden; min-height: 0; }
-    .caret { transition: transform .18s ease; }
+    .caret { transition: transform var(--dur-fast) ease; }
     .caret.open { transform: rotate(90deg); }
 
     /* --- grouped tool-call widget (the "Ran N tools · read N files · changed N
@@ -199,7 +209,7 @@
        collapses via the grid-rows trick. --- */
     .group-body {
       display: grid; grid-template-rows: 0fr;
-      transition: grid-template-rows .24s cubic-bezier(.4, 0, .2, 1);
+      transition: grid-template-rows var(--dur-base) var(--ease-inout);
     }
     .group-body.open { grid-template-rows: 1fr; }
     .group-body-clip { overflow: hidden; min-height: 0; }
@@ -288,7 +298,7 @@
       border-radius: 20px;
       padding: 10px 10px 8px 14px;
       box-shadow: 0 6px 24px rgb(0 0 0 / .10);
-      transition: border-color .2s ease;
+      transition: border-color var(--dur-base) ease;
     }
     .composer:focus-within { border-color: rgb(var(--term-cyan) / .55); }
     .composer-input {
@@ -321,7 +331,7 @@
     .composer-model-btn:hover { background: rgb(var(--term-line) / .5); }
     .composer-model-btn:disabled { color: rgb(var(--term-muted)); cursor: default; }
     .composer-model-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .composer-model-caret { flex-shrink: 0; color: rgb(var(--term-muted)); transition: transform .18s ease; }
+    .composer-model-caret { flex-shrink: 0; color: rgb(var(--term-muted)); transition: transform var(--dur-fast) ease; }
     .composer-model-btn[aria-expanded="true"] .composer-model-caret { transform: rotate(180deg); }
     .composer-model-menu {
       position: absolute; right: 0; bottom: calc(100% + 8px); z-index: 50;
@@ -405,9 +415,9 @@
       border-radius: 10px; padding: 10px 12px;
       font-size: 12px; line-height: 1.45;
       box-shadow: 0 6px 24px rgb(0 0 0 / .28);
-      animation: toast-in .28s cubic-bezier(.21, 1.02, .47, 1);
+      animation: toast-in var(--dur-slow) var(--ease-out);
     }
-    .toast.toast-out { animation: toast-out .25s ease forwards; }
+    .toast.toast-out { animation: toast-out var(--dur-base) ease forwards; }
     .toast .toast-label {
       color: rgb(var(--term-cyan)); font-weight: 600; font-size: 10px;
       text-transform: uppercase; letter-spacing: .04em; margin-top: 1px;
@@ -449,7 +459,7 @@
       border-left: 1px solid rgb(var(--term-line));
       box-shadow: -8px 0 28px rgba(0,0,0,0.32);
       font-size: 11.5px; overflow: hidden;
-      transform: translateX(100%); transition: transform .22s ease;
+      transform: translateX(100%); transition: transform var(--dur-base) ease;
     }
     #concurrency-dock.cdock-open { transform: translateX(0); }
     /* The dock is fixed so it can slide, which means it would otherwise COVER the
@@ -457,7 +467,7 @@
        panels reflow narrower instead of being hidden underneath. Same duration and
        easing as the slide, so the two move as one. Below 900px there isn't room to
        give up 340px, so it goes back to overlaying. */
-    #app { transition: padding-right .22s ease; }
+    #app { transition: padding-right var(--dur-base) ease; }
     body.cdock-pushed #app { padding-right: 340px; }
     @media (max-width: 900px) {
       body.cdock-pushed #app { padding-right: 0; }
@@ -498,7 +508,7 @@
     .cbar-track { position: relative; height: 8px; border-radius: 4px; background: rgb(var(--term-bg)); overflow: hidden; }
     .cbar-fill {
       position: absolute; top: 0; height: 100%; border-radius: 4px;
-      background: rgb(var(--term-cyan)); transition: left .12s linear, width .12s linear;
+      background: rgb(var(--term-cyan)); transition: left var(--dur-fast) linear, width var(--dur-fast) linear;
     }
     .cbar-fill.ok { background: rgb(var(--term-green)); }
     .cbar-fill.failed { background: rgb(var(--term-red)); }
@@ -548,8 +558,19 @@
     .btn-ghost:hover:not(:disabled) { background: rgb(var(--term-line) / .6); color: rgb(var(--term-text)); }
     .btn-danger { color: rgb(var(--term-red-fg)); }
     .btn-danger:hover:not(:disabled) { border-color: rgb(var(--term-red)); background: rgb(var(--term-red) / .12); }
+    /* Outlined accent. The graph panel hand-rolled this string three times
+       ("border-term-cyan … text-term-cyan … hover:bg-term-line/60"); naming it
+       is what lets those three controls sit on the shared control scale. */
+    .btn-accent { border-color: rgb(var(--term-cyan)); color: rgb(var(--term-cyan-fg)); font-weight: 600; }
+    .btn-accent:hover:not(:disabled) { background: rgb(var(--term-cyan) / .12); }
     .btn-sm { height: var(--control-h-sm); padding: 0 var(--space-3); font-size: var(--text-xs); }
     .btn-lg { height: var(--control-h-lg); padding: 0 var(--space-5); font-size: var(--text-base); }
+    /* .btn sets display, and Tailwind's .hidden has the SAME specificity — this
+       block comes after tailwind.css, so .btn would win and a button marked
+       hidden would still render. #viewerBack hit exactly this: "← archive"
+       showed on every plain text file. Same guard as .composer-btn.hidden and
+       .modal-backdrop.hidden already carry. */
+    .btn.hidden, .icon-btn.hidden { display: none; }
 
     /* Square icon-only button. Was five different sizings (h-7 w-7, h-9 w-9,
        px-2 py-1) that never lined up with each other in a toolbar. */
@@ -591,6 +612,118 @@
       font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: .08em;
       color: rgb(var(--term-muted));
     }
+
+    /* ---- type ramp as CLASSES ----
+       The ramp existed as variables but was applied two ways that both defeat
+       it: Tailwind arbitrary values (text-[11px]) and inline
+       style="font-size:var(--text-xs)". Neither is greppable as a system,
+       overridable by a media query, or assertable by a test — which is exactly
+       how the old seven-size mix crept back after it was removed. These are
+       declared AFTER .btn/.btn-sm so an explicit size on a control wins.
+       tests/frontend/test_type_ramp.mjs asserts the markup uses nothing else. */
+    .t-2xs { font-size: var(--text-2xs); }
+    .t-xs { font-size: var(--text-xs); }
+    .t-sm { font-size: var(--text-sm); }
+    .t-base { font-size: var(--text-base); }
+    .t-lg { font-size: var(--text-lg); }
+    .t-xl { font-size: var(--text-xl); }
+
+    /* ================= utilities missing from the precompiled sheet =========
+       tailwind.css is built ahead of time and had drifted behind the markup:
+       these 17 utilities are used in index.html / app.js and produce NO rule,
+       so they silently did nothing. Found by auditing every class in the
+       frontend against the compiled sheet, not just the arbitrary-value ones
+       the old guard covered. Visible symptoms included the start-screen rail's
+       footer never pinning to the bottom (mt-auto) and the file viewer's image
+       rendering unconstrained (max-h-full / max-w-full / object-contain).
+
+       Defined here rather than by rebuilding tailwind.css, per the same rule the
+       rest of this block follows. tests/frontend/test_tailwind_classes.mjs now
+       fails on any class that resolves nowhere, so this cannot silently recur. */
+    .mt-auto { margin-top: auto; }
+    .mb-8 { margin-bottom: 2rem; }
+    .mt-3 { margin-top: .75rem; }
+    .pt-6 { padding-top: 1.5rem; }
+    .p-3 { padding: .75rem; }
+    .p-1\.5 { padding: .375rem; }
+    .px-8 { padding-left: 2rem; padding-right: 2rem; }
+    .px-0\.5 { padding-left: .125rem; padding-right: .125rem; }
+    .flex-wrap { flex-wrap: wrap; }
+    .justify-start { justify-content: flex-start; }
+    .leading-relaxed { line-height: 1.625; }
+    .max-h-full { max-height: 100%; }
+    .max-w-full { max-width: 100%; }
+    .object-contain { object-fit: contain; }
+    .opacity-30 { opacity: .3; }
+    .text-term-text\/90 { color: rgb(var(--term-text) / .9); }
+    .bg-term-cyan\/5 { background-color: rgb(var(--term-cyan) / .05); }
+
+    /* ================= interaction feedback =================
+       Three things the app had almost none of: a visible focus ring outside
+       three components, any press confirmation at all, and any indication that
+       something is loading. */
+
+    /* One ring for everything. :where() contributes ZERO specificity, so the
+       per-component rules below (.btn, .icon-btn, .ws-row — which need an inset
+       offset so the ring is not clipped by its scroll container) still win
+       without !important, and controls added later are covered for free. */
+    :where(button, a, input, select, textarea, [tabindex]):focus-visible {
+      outline: 2px solid rgb(var(--term-cyan));
+      outline-offset: 2px;
+    }
+    /* The composer already signals focus by lighting its whole border via
+       :focus-within; a second ring inside the rounded box reads as a bug. */
+    .composer-input:focus-visible { outline: none; }
+
+    /* Press. The background step is deliberately NOT gated by reduced motion —
+       only the 0.5px nudge is — so the affordance survives for users who turn
+       animation off. */
+    .btn:active:not(:disabled),
+    .icon-btn:active:not(:disabled),
+    .composer-btn:active:not(:disabled),
+    .composer-icon-btn:active:not(:disabled),
+    .composer-model-item:active,
+    .ctx-item:active,
+    .llm-tab:active,
+    .ws-row:active,
+    .tree-row:active {
+      transform: translateY(.5px);
+      background-color: rgb(var(--term-line) / .85);
+    }
+    /* Filled buttons darken instead, since a line-coloured wash would erase them. */
+    .btn-primary:active:not(:disabled),
+    .composer-send:active:not(:disabled),
+    .composer-stop:active:not(:disabled) {
+      background-color: rgb(var(--term-cyan)); filter: brightness(.88);
+    }
+    .composer-stop:active:not(:disabled) { background-color: rgb(var(--term-red)); }
+
+    /* Loading. Reuses the shimmer variables the thinking-line already defines,
+       at a low alpha so a block of these reads as "pending", not as content. */
+    .skeleton {
+      background-image: linear-gradient(90deg,
+        rgb(var(--shimmer-base) / .16) 0%,
+        rgb(var(--shimmer-base) / .30) 50%,
+        rgb(var(--shimmer-base) / .16) 100%);
+      background-size: 200% 100%;
+      border-radius: var(--radius-sm);
+      animation: skeleton-sweep 1.4s linear infinite;
+    }
+    @keyframes skeleton-sweep { 0% { background-position: 200% 0; } 100% { background-position: 0% 0; } }
+    .skeleton-row { height: 12px; margin: 7px var(--space-2); }
+    /* Staggered so the block reads as a list settling rather than one flat bar. */
+    .skeleton-row:nth-child(2n) { width: 72%; animation-delay: .12s; }
+    .skeleton-row:nth-child(3n) { width: 54%; animation-delay: .24s; }
+
+    /* Busy button: keeps its label (so the action stays readable) and gains a
+       spinner as a flex item, which .btn's inline-flex + gap positions for us. */
+    .btn.is-busy { pointer-events: none; opacity: .75; }
+    .btn.is-busy::before {
+      content: ''; width: 12px; height: 12px; flex-shrink: 0;
+      border: 2px solid currentColor; border-right-color: transparent;
+      border-radius: 50%; animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
 
     /* --- modal chrome. #fileViewer and #llmModal each hand-rolled
        their own header/body/footer with different paddings and title sizes. --- */
@@ -637,7 +770,7 @@
     #sidebar {
       width: var(--sidebar-w);
       flex-shrink: 0;
-      transition: width .18s ease;
+      transition: width var(--dur-fast) ease;
     }
     #app.sidebar-collapsed #sidebar {
       width: 0;
@@ -780,9 +913,49 @@
     .toast-error .toast-label { color: rgb(var(--term-red-fg)); }
     .toast-warn .toast-label { color: rgb(var(--term-orange-fg)); }
     .toast-info .toast-label { color: rgb(var(--term-green-fg)); }
+
+    /* ================= reduced motion =================
+       There was no such block at all, against five keyframe animations — one of
+       them a 2.4s shimmer that loops for the entire duration of every thinking
+       phase, which is exactly the kind of sustained movement this query exists
+       to switch off. */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: .01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: .01ms !important;
+        scroll-behavior: auto !important;
+      }
+      /* The blanket rule above is NOT sufficient for the two text sweeps. Both
+         paint their glyphs through background-clip:text with
+         color: transparent, so merely stopping the animation freezes the
+         gradient mid-sweep — and at some offsets that renders the text in the
+         page background colour, i.e. invisible. They have to be returned to a
+         flat, opaque colour explicitly. */
+      .shimmer, .group-title-wave {
+        background-image: none;
+        -webkit-background-clip: border-box;
+        background-clip: border-box;
+        color: rgb(var(--term-muted));
+        animation: none;
+      }
+      /* Press feedback keeps its colour change but loses the nudge. */
+      .btn:active:not(:disabled),
+      .icon-btn:active:not(:disabled),
+      .composer-btn:active:not(:disabled),
+      .composer-icon-btn:active:not(:disabled),
+      .composer-model-item:active,
+      .ctx-item:active,
+      .llm-tab:active,
+      .ws-row:active,
+      .tree-row:active { transform: none; }
+      /* A looping placeholder sweep is the same problem as the shimmer; the
+         flat wash still reads as "pending". */
+      .skeleton { animation: none; background-image: none; background-color: rgb(var(--shimmer-base) / .22); }
+    }
   </style>
 </head>
-<body class="h-full font-sans text-[13px] text-term-text antialiased">
+<body class="h-full font-sans t-base text-term-text antialiased">
 
   <!-- ============ START / SESSION SELECT SCREEN ============ -->
   <div id="startScreen" class="absolute inset-0 z-30 flex bg-term-bg">
@@ -790,10 +963,10 @@
     <!-- LEFT RAIL: identity + the two ways in -->
     <div class="flex shrink-0 flex-col border-r border-term-line bg-term-panel p-6 hide-narrow" style="width:300px">
       <div class="mb-8 flex items-center gap-3">
-        <div class="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-term-cyan font-serif italic text-white" style="font-size:var(--text-lg)">O</div>
+        <div class="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-term-cyan font-serif italic text-white t-lg" >O</div>
         <div class="min-w-0">
-          <h1 class="font-serif text-term-text" style="font-size:var(--text-xl)">Omni Agent</h1>
-          <p class="text-term-muted" style="font-size:var(--text-xs)">Open a workspace to begin</p>
+          <h1 class="font-serif text-term-text t-xl" >Omni Agent</h1>
+          <p class="text-term-muted t-xs" >Open a workspace to begin</p>
         </div>
       </div>
 
@@ -815,7 +988,7 @@
         <button id="importBrowseBtn" class="btn btn-sm w-full">browse…</button>
         <input id="importProjectNameInput" placeholder="new-project-name" class="field field-sm" />
         <button id="importConfirmBtn" class="btn btn-sm btn-primary w-full">import &amp; copy in</button>
-        <p class="leading-4 text-term-muted" style="font-size:var(--text-2xs)">
+        <p class="leading-4 text-term-muted t-2xs" >
           Copies the folder into the agent's own workspace, so your original files are never edited directly.
         </p>
       </div>
@@ -833,7 +1006,7 @@
       <div class="flex items-center gap-3 border-b border-term-line px-6 py-4">
         <div class="min-w-0 flex-1">
           <div class="eyebrow">Recent</div>
-          <div id="recentCount" class="text-term-muted" style="font-size:var(--text-xs)">—</div>
+          <div id="recentCount" class="text-term-muted t-xs" >—</div>
         </div>
         <input id="recentFilter" type="text" placeholder="Filter folders…  ( / )" autocomplete="off"
           class="field field-sm shrink-0" style="width:220px" />
@@ -843,15 +1016,15 @@
 
       <div id="recentEmpty" class="hidden flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
         <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="text-term-muted"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-        <div class="text-term-text" style="font-size:var(--text-base)">No workspaces yet</div>
-        <div class="text-term-muted" style="max-width:320px;font-size:var(--text-xs)">
+        <div class="text-term-text t-base" >No workspaces yet</div>
+        <div class="text-term-muted t-xs" style="max-width:320px">
           Open a folder to start. The agent works inside a Docker sandbox mounted on the folder you pick.
         </div>
       </div>
 
       <div class="flex items-center gap-3 border-t border-term-line px-6 py-3">
-        <span id="startError" class="min-w-0 flex-1 truncate text-term-red" style="font-size:var(--text-xs)"></span>
-        <span class="shrink-0 text-term-muted" style="font-size:var(--text-2xs)">A Docker sandbox is started for the selected workspace.</span>
+        <span id="startError" class="min-w-0 flex-1 truncate text-term-red t-xs" ></span>
+        <span class="shrink-0 text-term-muted t-2xs" >A Docker sandbox is started for the selected workspace.</span>
         <button id="startSessionBtn" class="btn btn-primary btn-lg shrink-0" disabled>Open</button>
       </div>
     </div>
@@ -865,7 +1038,7 @@
       <div class="flex items-center justify-between gap-2 border-b border-term-line px-3 py-2">
         <div class="min-w-0">
           <div class="eyebrow">workspace</div>
-          <div id="treeProjectName" class="truncate font-serif text-term-text" style="font-size:var(--text-lg)">—</div>
+          <div id="treeProjectName" class="truncate font-serif text-term-text t-lg" >—</div>
         </div>
         <div class="flex items-center gap-0.5 shrink-0">
           <button id="uploadFilesBtn" title="Upload files into the workspace" class="icon-btn">
@@ -879,11 +1052,11 @@
           </button>
         </div>
       </div>
-      <div id="importBanner" class="hidden border-b border-term-line px-3 py-2 text-term-muted" style="font-size:var(--text-2xs)">
+      <div id="importBanner" class="hidden border-b border-term-line px-3 py-2 text-term-muted t-2xs" >
         imported from <span id="importSourceLabel" class="text-term-text"></span>
       </div>
-      <div id="fileTree" class="scroll-y flex-1 px-1.5 py-2 leading-5" style="font-size:var(--text-sm)"></div>
-      <div class="border-t border-term-line px-3 py-2 text-term-muted" style="font-size:var(--text-2xs)">
+      <div id="fileTree" class="scroll-y flex-1 px-1.5 py-2 leading-5 t-sm" ></div>
+      <div class="border-t border-term-line px-3 py-2 text-term-muted t-2xs" >
         <span id="treeFileCount">0</span> files · click a file to view
       </div>
     </aside>
@@ -897,9 +1070,9 @@
         </button>
         <div class="flex items-center gap-2 min-w-0">
           <span class="h-2 w-2 shrink-0 rounded-full bg-term-green"></span>
-          <span id="projectBadge" class="truncate font-serif text-term-text" style="font-size:var(--text-lg)">project</span>
+          <span id="projectBadge" class="truncate font-serif text-term-text t-lg" >project</span>
         </div>
-        <div class="ml-auto flex items-center gap-1 text-term-muted" style="font-size:var(--text-xs)">
+        <div class="ml-auto flex items-center gap-1 text-term-muted t-xs" >
           <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="chip text-term-cyan hover:bg-term-line/60" style="height:var(--control-h-sm)">plan —</button>
           <button id="llmSettingsBtn" title="LLM provider settings" class="icon-btn">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
@@ -911,10 +1084,14 @@
 
       <!-- tab bar -->
       <div class="flex items-center border-b border-term-line bg-term-panel px-3 py-1.5">
-        <div class="flex items-center gap-0.5 rounded-full border border-term-line/70 bg-term-bg/60 p-0.5">
-          <button id="tabChat" class="tab-btn rounded-full px-3.5 py-1 text-[12px] hover:text-term-text">Chat</button>
-          <button id="tabPlan" class="tab-btn rounded-full px-3.5 py-1 text-[12px] hover:text-term-text">Plan</button>
-          <button id="tabGraph" class="tab-btn rounded-full px-3.5 py-1 text-[12px] hover:text-term-text">Knowledge Graph</button>
+        <!-- Same segmented control as the Text/Vision switch in LLM settings.
+             It was a bespoke pill group whose active state came only from text
+             colour — switchTab toggled border-term-cyan on buttons that have no
+             border width, so half that styling never rendered. -->
+        <div class="llm-tabs" role="tablist" aria-label="View" style="margin-bottom:0">
+          <button id="tabChat" class="llm-tab" role="tab" aria-selected="true" aria-controls="chatTab">Chat</button>
+          <button id="tabPlan" class="llm-tab" role="tab" aria-selected="false" aria-controls="planTab">Plan</button>
+          <button id="tabGraph" class="llm-tab" role="tab" aria-selected="false" aria-controls="graphTab">Knowledge Graph</button>
         </div>
       </div>
 
@@ -924,7 +1101,7 @@
         <div id="chat" class="flex-1 overflow-y-auto py-4 space-y-1 px-[max(20px,calc((100%-64rem)/2))]"></div>
 
         <!-- memory summary banner -->
-        <div id="memoryBanner" class="hidden mb-2 rounded-xl border border-term-orange/40 bg-term-orange/10 px-3 py-2 text-[11px] text-term-orange mx-[max(20px,calc((100%-64rem)/2))]">
+        <div id="memoryBanner" class="hidden mb-2 rounded-xl border border-term-orange/40 bg-term-orange/10 px-3 py-2 t-xs text-term-orange mx-[max(20px,calc((100%-64rem)/2))]">
           <span class="font-semibold">Resumed from memory:</span> <span id="memoryBannerText"></span>
         </div>
 
@@ -936,9 +1113,9 @@
               <button id="composerUploadBtn" title="Upload files into the workspace" class="composer-icon-btn">
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
               </button>
-              <span id="hint" class="min-w-0 truncate text-[11px] text-term-muted">ready</span>
+              <span id="hint" class="min-w-0 truncate t-xs text-term-muted">ready</span>
               <div class="ml-auto flex min-w-0 shrink-0 items-center gap-1.5">
-                <span id="fallbackBadge" class="hidden shrink-0 cursor-default rounded-full border border-term-orange/40 bg-term-orange/10 px-1.5 py-0.5 text-[10px] text-term-orange" title="">⤵ fallback</span>
+                <span id="fallbackBadge" class="hidden shrink-0 cursor-default rounded-full border border-term-orange/40 bg-term-orange/10 px-1.5 py-0.5 t-2xs text-term-orange" title="">⤵ fallback</span>
                 <div class="composer-model" title="Model requests start at — on failure the engine falls back to the next model BELOW and returns here as soon as it recovers">
                   <select id="modelSelect"></select>
                   <button id="modelSelectBtn" type="button" aria-haspopup="listbox" aria-expanded="false" class="composer-model-btn">
@@ -972,81 +1149,78 @@
           <div class="flex flex-col gap-2 px-3 py-2 border-b border-term-line">
             <div class="flex items-center gap-2">
               <button id="graphBuildBtn" title="Build a knowledge graph for the whole workspace or a specific project folder"
-                class="flex-1 rounded-lg border border-term-cyan px-2 py-1 text-[11px] font-semibold text-term-cyan hover:bg-term-line/60">Build graph</button>
+                class="btn btn-sm btn-accent flex-1">Build graph</button>
               <button id="graphCompareBtn" title="Show two built graphs side by side (needs two projects built)"
-                class="flex-1 rounded-lg border border-term-line px-2 py-1 text-[11px] font-semibold text-term-muted hover:text-term-text hover:bg-term-line/60">Compare</button>
+                class="btn btn-sm flex-1">Compare</button>
             </div>
             <!-- inline build form (hidden until Build is clicked) -->
             <div id="graphBuildForm" class="hidden flex-col gap-2 rounded-lg border border-term-line bg-term-bg p-2">
-              <label class="text-[10px] uppercase tracking-wider text-term-muted">project / folder to index</label>
-              <select id="graphBuildTarget"
-                class="w-full rounded-lg border border-term-line bg-term-panel px-2 py-1 text-[12px] outline-none focus:border-term-cyan"></select>
-              <label class="text-[10px] uppercase tracking-wider text-term-muted">graph name (optional)</label>
+              <label class="eyebrow" for="graphBuildTarget">project / folder to index</label>
+              <select id="graphBuildTarget" class="field field-sm"></select>
+              <label class="eyebrow" for="graphBuildName">graph name (optional)</label>
               <input id="graphBuildName" type="text" placeholder="auto from folder" autocomplete="off"
-                class="w-full rounded-lg border border-term-line bg-term-panel px-2 py-1 text-[12px] outline-none focus:border-term-cyan" />
-              <label class="flex items-center gap-1.5 text-[11px] text-term-muted cursor-pointer">
+                class="field field-sm" />
+              <label class="flex items-center gap-1.5 t-xs text-term-muted cursor-pointer">
                 <input id="graphBuildSo" type="checkbox" class="accent-term-cyan" /> include native .so symbols
               </label>
               <div class="flex items-center gap-2">
-                <button id="graphBuildRun"
-                  class="flex-1 rounded-lg border border-term-cyan px-2 py-1 text-[11px] font-semibold text-term-cyan hover:bg-term-line/60">Build</button>
-                <button id="graphBuildCancel"
-                  class="rounded-lg border border-term-line px-2 py-1 text-[11px] text-term-muted hover:text-term-text">Cancel</button>
+                <button id="graphBuildRun" class="btn btn-sm btn-accent flex-1">Build</button>
+                <button id="graphBuildCancel" class="btn btn-sm btn-ghost">Cancel</button>
               </div>
-              <div id="graphBuildStatus" class="text-[11px] text-term-muted"></div>
+              <div id="graphBuildStatus" class="t-xs text-term-muted" role="status"></div>
             </div>
           </div>
           <!-- per-version graph selector (shown only when >1 graph has been built) -->
           <div id="graphSelectRow" class="hidden items-center gap-2 px-3 py-2 border-b border-term-line">
-            <span class="shrink-0 text-[10px] uppercase tracking-wider text-term-muted">graph</span>
+            <span class="eyebrow shrink-0">graph</span>
             <select id="graphSelect" title="Which built graph to view — build each app version separately to compare"
-              class="min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-2 py-1 text-[12px] outline-none focus:border-term-cyan"></select>
+              class="field field-sm min-w-0 flex-1"></select>
             <button id="graphDeleteBtn" title="Delete the selected graph instance (does not touch your files)"
-              class="shrink-0 rounded-lg border border-term-line px-2 py-1 text-[11px] text-term-muted hover:text-term-text hover:bg-term-line/60">✕</button>
+              class="icon-btn icon-btn-bordered">✕</button>
           </div>
           <div class="flex items-center gap-2 px-3 py-2 border-b border-term-line">
             <input id="graphSearch" type="text" placeholder="Search nodes…" autocomplete="off"
-              class="flex-1 rounded-xl border border-term-line bg-term-bg px-2.5 py-1.5 text-[12px] outline-none focus:border-term-cyan" />
+              class="field field-sm min-w-0 flex-1" />
             <button id="graphModeToggle" title="Toggle 2D / 3D view — drag to orbit, scroll to zoom in 3D"
-              class="shrink-0 rounded-lg border border-term-cyan px-2 py-1 text-[11px] font-semibold text-term-cyan hover:bg-term-line/60">3D</button>
+              class="btn btn-sm btn-accent shrink-0">3D</button>
           </div>
-          <div id="graphInfo" class="px-3 py-2 border-b border-term-line min-h-[120px] text-[12px] text-term-text">
+          <div id="graphInfo" class="px-3 py-2 border-b border-term-line min-h-[120px] t-sm text-term-text">
             <span class="text-term-muted italic">Click a node to inspect it</span>
           </div>
-          <div class="px-3 py-1 border-b border-term-line text-[10px] uppercase tracking-wider text-term-muted">communities</div>
+          <div class="eyebrow px-3 py-1 border-b border-term-line">communities</div>
           <div id="graphLegend" class="flex-1 overflow-y-auto px-2 py-1"></div>
-          <div id="graphStats" class="px-3 py-2 border-t border-term-line text-[10px] text-term-muted"></div>
+          <div id="graphStats" class="px-3 py-2 border-t border-term-line t-2xs text-term-muted"></div>
         </div>
       </div>
     </main>
   </div>
 
   <!-- ============ FILE VIEWER MODAL ============ -->
-  <div id="fileViewer" class="hidden absolute inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-    <div class="flex h-[82vh] w-[80vw] max-w-[1100px] flex-col rounded-3xl border border-term-line bg-term-panel shadow-2xl">
-      <div class="flex items-center justify-between border-b border-term-line px-5 py-3">
-        <div class="min-w-0">
-          <div class="text-[10px] uppercase tracking-wider text-term-muted">file</div>
-          <div id="viewerPath" class="truncate font-mono text-term-text">—</div>
+  <div id="fileViewer" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="viewerPath">
+    <div class="modal-shell" style="width:80vw;max-width:1100px;height:82vh">
+      <div class="modal-head">
+        <div class="min-w-0 flex-1">
+          <div class="eyebrow">file</div>
+          <!-- deliberately NOT .modal-title: that class sets a serif family that
+               would override font-mono, and a file path must stay monospaced. -->
+          <div id="viewerPath" class="t-base truncate font-mono text-term-text">—</div>
         </div>
-        <div class="flex items-center gap-3">
-          <button id="viewerBack" class="hidden rounded-full px-2.5 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text">← archive</button>
-          <span id="viewerSize" class="text-[11px] text-term-muted"></span>
-          <button id="viewerClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
-        </div>
+        <button id="viewerBack" class="btn btn-sm btn-ghost hidden shrink-0">← archive</button>
+        <span id="viewerSize" class="t-xs shrink-0 text-term-muted"></span>
+        <button id="viewerClose" title="Close" class="icon-btn">✕</button>
       </div>
-      <div class="flex-1 overflow-auto rounded-b-3xl bg-term-bg p-4">
-        <pre id="viewerContent" class="font-mono text-[12px] leading-5 text-term-text"></pre>
+      <div class="modal-body scroll-both bg-term-bg">
+        <pre id="viewerContent" class="font-mono t-sm leading-5 text-term-text"></pre>
         <div id="viewerImage" class="hidden h-full items-center justify-center">
           <img class="max-h-full max-w-full rounded-lg object-contain" alt="" />
         </div>
-        <div id="viewerArchive" class="hidden font-mono text-[12px] leading-5 text-term-text"></div>
+        <div id="viewerArchive" class="hidden font-mono t-sm leading-5 text-term-text"></div>
       </div>
     </div>
   </div>
 
   <!-- ============ LLM SETTINGS MODAL ============ -->
-  <div id="llmModal" class="modal-backdrop hidden">
+  <div id="llmModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="llmModalTitle">
     <div class="modal-shell" style="width:940px;max-width:96vw;height:640px">
       <div class="modal-head">
         <div class="min-w-0 flex-1">
@@ -1062,12 +1236,12 @@
         <div class="flex shrink-0 flex-col border-r border-term-line" style="width:272px">
           <div class="border-b border-term-line px-4 py-3">
             <div class="eyebrow mb-1">fallback order</div>
-            <p class="leading-4 text-term-muted" style="font-size:var(--text-2xs)">
+            <p class="leading-4 text-term-muted t-2xs" >
               Tried top to bottom. Drag ⠿ to reorder — the top one is primary.
             </p>
           </div>
           <div id="llmList" class="scroll-y flex flex-1 flex-col gap-1 p-2"></div>
-          <div id="llmListEmpty" class="hidden px-4 py-3 text-term-muted" style="font-size:var(--text-xs)">
+          <div id="llmListEmpty" class="hidden px-4 py-3 text-term-muted t-xs" >
             No providers yet — add one to get started.
           </div>
           <div class="border-t border-term-line p-2">
@@ -1080,15 +1254,15 @@
 
           <!-- nothing selected -->
           <div id="llmEmptyDetail" class="flex flex-1 flex-col items-center justify-center gap-2 px-8 text-center">
-            <div class="text-term-text" style="font-size:var(--text-base)">Select a provider</div>
-            <div class="text-term-muted" style="max-width:340px;font-size:var(--text-xs)">
+            <div class="text-term-text t-base" >Select a provider</div>
+            <div class="text-term-muted t-xs" style="max-width:340px">
               Pick one on the left to edit its keys, models and limits — or add a new one.
             </div>
           </div>
 
           <!-- edit form, grouped into three sections -->
           <div id="llmEditView" class="scroll-y flex-1" style="display:none">
-            <div class="p-4" style="font-size:var(--text-sm)">
+            <div class="p-4 t-sm" >
 
               <section class="llm-section">
                 <h3 class="llm-section-title">Connection</h3>
@@ -1100,7 +1274,7 @@
                 <div class="llm-field">
                   <span class="eyebrow">provider</span>
                   <div id="llmProviderTabs" class="flex flex-wrap items-center gap-1.5"></div>
-                  <div id="llmProviderNotes" class="text-term-muted" style="font-size:var(--text-xs)"></div>
+                  <div id="llmProviderNotes" class="text-term-muted t-xs" ></div>
                 </div>
                 <div class="llm-field">
                   <label class="eyebrow" for="llmBaseUrl">base URL</label>
@@ -1113,7 +1287,7 @@
                     <button id="llmKeysAdd" type="button" class="btn btn-sm">+ add key</button>
                   </div>
                   <div id="llmKeysList" class="flex flex-col gap-1.5"></div>
-                  <p class="text-term-muted" style="font-size:var(--text-2xs)">
+                  <p class="text-term-muted t-2xs" >
                     Any key serves any model; rotated automatically on rate limits.
                   </p>
                 </div>
@@ -1133,7 +1307,7 @@
                       <button id="llmModelsAdd" type="button" class="btn btn-sm">+ add model</button>
                     </div>
                     <div id="llmModelsList" class="flex flex-col gap-1.5"></div>
-                    <p class="text-term-muted" style="font-size:var(--text-2xs)">
+                    <p class="text-term-muted t-2xs" >
                       Top = primary. Drag ⠿ to reorder · ⚙ for reasoning, cost tier &amp; test.
                     </p>
                   </div>
@@ -1146,7 +1320,7 @@
                       <button id="llmVisionAdd" type="button" class="btn btn-sm">+ add vision model</button>
                     </div>
                     <div id="llmVisionList" class="flex flex-col gap-1.5"></div>
-                    <p class="text-term-muted" style="font-size:var(--text-2xs)">
+                    <p class="text-term-muted t-2xs" >
                       Optional — used to analyze screenshots and images. Same key pool.
                     </p>
                   </div>
@@ -1180,8 +1354,8 @@
       </div>
 
       <div class="modal-foot">
-        <span id="llmError" class="min-w-0 flex-1 truncate text-term-red" style="font-size:var(--text-xs)"></span>
-        <span id="llmListStatus" class="shrink-0 text-term-muted" style="font-size:var(--text-xs)"></span>
+        <span id="llmError" class="min-w-0 flex-1 truncate text-term-red t-xs" ></span>
+        <span id="llmListStatus" class="shrink-0 text-term-muted t-xs" ></span>
         <div id="llmEditFoot" class="flex shrink-0 items-center gap-2" style="display:none">
           <button id="llmBackBtn" class="btn">cancel</button>
           <button id="llmSaveBtn" class="btn btn-primary">save</button>

@@ -29,6 +29,7 @@ class El {
   insertAdjacentHTML(_p,h){ this._h+=h; }
   remove(){ const p=this._parent; if(!p) return; const i=p.children.indexOf(this); if(i>=0) p.children.splice(i,1); this._parent=null; }
   scrollIntoView(){} setAttribute(k,v){ this[k]=v; } getAttribute(k){ return this[k]; }
+  removeAttribute(k){ delete this[k]; } hasAttribute(k){ return this[k]!==undefined; }
   querySelector(s){ if(!this._q.has(s)) this._q.set(s,new El()); return this._q.get(s); }
   querySelectorAll(){ return []; }
   closest(){ return null; }

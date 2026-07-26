@@ -80,6 +80,21 @@ export class El {
   }
   setAttribute(k, v) { this[k] = v; }
   getAttribute(k) { return this[k]; }
+  // Real elements have these; the shim did not, so any code path that cleared
+  // or probed an attribute blew up here while working fine in the webview.
+  // test_boot.mjs caught it the first time aria-busy was cleared during init.
+  removeAttribute(k) { delete this[k]; }
+  hasAttribute(k) { return this[k] !== undefined; }
+  // Used to skip focusables inside a hidden subtree in the modal focus trap.
+  closest(sel) {
+    const cls = sel.startsWith('.') ? sel.slice(1) : null;
+    let n = this;
+    while (n) {
+      if (cls && n._classes && n._classes.has(cls)) return n;
+      n = n._parent || null;
+    }
+    return null;
+  }
 }
 
 // Load app.js into a fresh sandbox. `now` is a mutable clock the caller can drive.
