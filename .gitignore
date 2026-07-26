@@ -65,3 +65,6 @@ launch_out.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# git worktrees for isolated task execution
+.worktrees/
