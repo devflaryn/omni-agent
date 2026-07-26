@@ -82,6 +82,7 @@ def _load_agent_md(path):
         allow_optin_read=_as_bool(meta.get("allow_optin_read")),
         tier=meta.get("tier"),
         models=_as_list(meta.get("models", "")) or None,
+        skills=_as_list(meta.get("skills", "")) or None,
     )
 
 

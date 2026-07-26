@@ -197,7 +197,7 @@ class AgentDef:
     def __init__(self, name, system_prompt, mode="read", description="",
                  toolsets=None, allowed_tools=None, temperature=None,
                  max_steps=DEFAULT_MAX_STEPS, allow_optin_read=False,
-                 include_contract=True, tier=None, models=None):
+                 include_contract=True, tier=None, models=None, skills=None):
         self.name = name
         self.system_prompt = system_prompt or ""
         self.mode = "write" if str(mode).lower().startswith("w") else "read"
@@ -213,6 +213,10 @@ class AgentDef:
         # Both are overridable per dispatch — see resolve_model_ladder.
         self.tier = (tier or "").strip().lower() or None
         self.models = list(models) if models else None
+        # Skills this persona wants PRELOADED (bodies injected up front); every
+        # other skill stays reachable on demand via the skills index (see
+        # _build_messages). Empty list, never None, so callers can iterate freely.
+        self.skills = [str(s).strip() for s in (skills or []) if str(s).strip()]
 
     @property
     def is_write(self):
