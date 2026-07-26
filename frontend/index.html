@@ -694,6 +694,53 @@
     .ws-row:hover .ws-actions,
     .ws-row.selected .ws-actions,
     .ws-row:focus-within .ws-actions { opacity: 1; }
+
+    /* ================= LLM settings =================
+       The edit form used to be one undifferentiated scroll of eight blocks.
+       These group it into Connection / Models / Limits with real separation. */
+    .llm-section {
+      padding-bottom: var(--space-5);
+      margin-bottom: var(--space-5);
+      border-bottom: 1px solid rgb(var(--term-line));
+    }
+    .llm-section-last { padding-bottom: 0; margin-bottom: 0; border-bottom: 0; }
+    .llm-section-title {
+      margin-bottom: var(--space-3);
+      color: rgb(var(--term-text));
+      font-size: var(--text-lg);
+      font-family: var(--font-serif, inherit);
+    }
+    /* Every labelled control in the form shares one vertical rhythm, instead of
+       the mb-1 / mb-1.5 / mb-3 mix it grew. */
+    .llm-field { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-4); }
+    .llm-field:last-child { margin-bottom: 0; }
+
+    .llm-tabs {
+      display: inline-flex; gap: 2px; margin-bottom: var(--space-3); padding: 2px;
+      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-full);
+      background: rgb(var(--term-bg) / .6);
+    }
+    .llm-tab {
+      padding: 3px 14px; border: 0; border-radius: var(--radius-full);
+      background: transparent; color: rgb(var(--term-muted));
+      font-size: var(--text-xs); cursor: pointer;
+    }
+    .llm-tab:hover { color: rgb(var(--term-text)); }
+    .llm-tab.active { background: rgb(var(--term-line)); color: rgb(var(--term-text)); font-weight: 500; }
+
+    /* Provider rows in the master column. */
+    .llm-prow {
+      display: flex; align-items: center; gap: var(--space-2);
+      padding: var(--space-2); border: 1px solid transparent;
+      border-radius: var(--radius-md); cursor: pointer;
+    }
+    .llm-prow:hover { background: rgb(var(--term-line) / .45); }
+    .llm-prow.selected { background: rgb(var(--term-cyan) / .14); border-color: rgb(var(--term-cyan) / .5); }
+    .llm-prow-rank {
+      flex-shrink: 0; width: 18px; text-align: center;
+      color: rgb(var(--term-muted)); font-size: var(--text-2xs);
+      font-variant-numeric: tabular-nums;
+    }
   </style>
 </head>
 <body class="h-full font-sans text-[13px] text-term-text antialiased">
@@ -960,96 +1007,147 @@
   </div>
 
   <!-- ============ LLM SETTINGS MODAL ============ -->
-  <div id="llmModal" class="hidden absolute inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-    <div class="flex max-h-[82vh] w-[640px] max-w-[94vw] flex-col rounded-3xl border border-term-line bg-term-panel shadow-2xl">
-      <div class="flex items-center justify-between border-b border-term-line px-5 py-3.5">
-        <div class="min-w-0">
-          <div class="text-[10px] uppercase tracking-wider text-term-muted">model provider</div>
-          <div id="llmModalTitle" class="font-serif text-[14px] text-term-text">LLM Providers</div>
+  <div id="llmModal" class="modal-backdrop hidden">
+    <div class="modal-shell" style="width:940px;max-width:96vw;height:640px">
+      <div class="modal-head">
+        <div class="min-w-0 flex-1">
+          <div class="eyebrow">model providers</div>
+          <div id="llmModalTitle" class="modal-title">LLM Providers</div>
         </div>
-        <button id="llmModalClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
+        <button id="llmModalClose" title="Close" class="icon-btn">✕</button>
       </div>
 
-      <!-- ===== LIST VIEW: configured providers, in fallback order ===== -->
-      <div id="llmListView" style="display:flex;flex-direction:column;flex:1 1 auto;min-height:0">
-        <div class="flex-1 overflow-y-auto px-5 py-4 text-[12px]" style="min-height:0">
-          <div class="mb-3 text-[11px] text-term-muted">
-            Requests try these providers top-to-bottom. If one fails (bad key, rate limit, outage), the next
-            is used automatically. Drag the ⠿ handle to reorder — the top provider is primary.
+      <div class="flex min-h-0 flex-1">
+
+        <!-- MASTER: providers, in fallback order -->
+        <div class="flex shrink-0 flex-col border-r border-term-line" style="width:272px">
+          <div class="border-b border-term-line px-4 py-3">
+            <div class="eyebrow mb-1">fallback order</div>
+            <p class="leading-4 text-term-muted" style="font-size:var(--text-2xs)">
+              Tried top to bottom. Drag ⠿ to reorder — the top one is primary.
+            </p>
           </div>
-          <div id="llmList" class="flex flex-col gap-2"></div>
-          <div id="llmListEmpty" class="hidden text-[11px] text-term-muted" style="padding:10px 0">
-            No providers configured yet — add one to get started.
+          <div id="llmList" class="scroll-y flex flex-1 flex-col gap-1 p-2"></div>
+          <div id="llmListEmpty" class="hidden px-4 py-3 text-term-muted" style="font-size:var(--text-xs)">
+            No providers yet — add one to get started.
           </div>
-          <button id="llmAddBtn" class="mt-2 rounded-full border border-term-line px-4 py-2 text-term-text hover:bg-term-line/60">+ add new LLM</button>
+          <div class="border-t border-term-line p-2">
+            <button id="llmAddBtn" class="btn btn-sm w-full">+ add provider</button>
+          </div>
         </div>
-        <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
-          <span id="llmListStatus" class="text-[11px] text-term-muted"></span>
-          <button id="llmDoneBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90">done</button>
+
+        <!-- DETAIL -->
+        <div class="flex min-w-0 flex-1 flex-col">
+
+          <!-- nothing selected -->
+          <div id="llmEmptyDetail" class="flex flex-1 flex-col items-center justify-center gap-2 px-8 text-center">
+            <div class="text-term-text" style="font-size:var(--text-base)">Select a provider</div>
+            <div class="text-term-muted" style="max-width:340px;font-size:var(--text-xs)">
+              Pick one on the left to edit its keys, models and limits — or add a new one.
+            </div>
+          </div>
+
+          <!-- edit form, grouped into three sections -->
+          <div id="llmEditView" class="scroll-y flex-1" style="display:none">
+            <div class="p-4" style="font-size:var(--text-sm)">
+
+              <section class="llm-section">
+                <h3 class="llm-section-title">Connection</h3>
+                <div class="llm-field">
+                  <label class="eyebrow" for="llmName">display name</label>
+                  <input id="llmName" type="text" autocomplete="off" spellcheck="false"
+                    placeholder="e.g. Primary — Cline GLM" class="field" />
+                </div>
+                <div class="llm-field">
+                  <span class="eyebrow">provider</span>
+                  <div id="llmProviderTabs" class="flex flex-wrap items-center gap-1.5"></div>
+                  <div id="llmProviderNotes" class="text-term-muted" style="font-size:var(--text-xs)"></div>
+                </div>
+                <div class="llm-field">
+                  <label class="eyebrow" for="llmBaseUrl">base URL</label>
+                  <input id="llmBaseUrl" type="text" autocomplete="off" spellcheck="false"
+                    placeholder="https://…/v1" class="field font-mono" />
+                </div>
+                <div class="llm-field">
+                  <div class="flex items-center justify-between">
+                    <span class="eyebrow">API keys — shared pool</span>
+                    <button id="llmKeysAdd" type="button" class="btn btn-sm">+ add key</button>
+                  </div>
+                  <div id="llmKeysList" class="flex flex-col gap-1.5"></div>
+                  <p class="text-term-muted" style="font-size:var(--text-2xs)">
+                    Any key serves any model; rotated automatically on rate limits.
+                  </p>
+                </div>
+              </section>
+
+              <section class="llm-section">
+                <h3 class="llm-section-title">Models</h3>
+                <div class="llm-tabs">
+                  <button id="llmTabText" type="button" class="llm-tab active">Text</button>
+                  <button id="llmTabVision" type="button" class="llm-tab">Vision</button>
+                </div>
+
+                <div id="llmTextPane">
+                  <div class="llm-field">
+                    <div class="flex items-center justify-between">
+                      <span class="eyebrow">fallback order</span>
+                      <button id="llmModelsAdd" type="button" class="btn btn-sm">+ add model</button>
+                    </div>
+                    <div id="llmModelsList" class="flex flex-col gap-1.5"></div>
+                    <p class="text-term-muted" style="font-size:var(--text-2xs)">
+                      Top = primary. Drag ⠿ to reorder · ⚙ for reasoning, cost tier &amp; test.
+                    </p>
+                  </div>
+                </div>
+
+                <div id="llmVisionPane" style="display:none">
+                  <div class="llm-field">
+                    <div class="flex items-center justify-between">
+                      <span class="eyebrow">image-to-text</span>
+                      <button id="llmVisionAdd" type="button" class="btn btn-sm">+ add vision model</button>
+                    </div>
+                    <div id="llmVisionList" class="flex flex-col gap-1.5"></div>
+                    <p class="text-term-muted" style="font-size:var(--text-2xs)">
+                      Optional — used to analyze screenshots and images. Same key pool.
+                    </p>
+                  </div>
+                </div>
+              </section>
+
+              <section class="llm-section llm-section-last">
+                <h3 class="llm-section-title">Limits</h3>
+                <div class="flex flex-wrap items-end gap-3">
+                  <div class="llm-field" style="flex:0 0 auto">
+                    <label class="eyebrow" for="llmMaxTokens">max output tokens</label>
+                    <input id="llmMaxTokens" type="number" min="256" placeholder="default"
+                      class="field font-mono" style="width:140px" />
+                  </div>
+                  <div class="llm-field" style="flex:0 0 auto">
+                    <label class="eyebrow" for="llmContextWindow">context window</label>
+                    <input id="llmContextWindow" type="number" min="1000" placeholder="1000000"
+                      class="field font-mono" style="width:140px" />
+                  </div>
+                  <div class="llm-field" style="flex:0 0 auto">
+                    <label class="eyebrow" for="llmTemperature">temperature</label>
+                    <input id="llmTemperature" type="number" step="0.1" min="0" max="2" placeholder="default"
+                      class="field font-mono" style="width:120px" />
+                  </div>
+                </div>
+              </section>
+
+            </div>
+          </div>
         </div>
       </div>
 
-      <!-- ===== EDIT VIEW: add / edit a single provider ===== -->
-      <div id="llmEditView" style="display:none;flex-direction:column;flex:1 1 auto;min-height:0">
-        <div class="flex-1 overflow-y-auto px-5 py-4 text-[12px]" style="min-height:0">
-          <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">display name</label>
-          <input id="llmName" type="text" autocomplete="off" spellcheck="false" placeholder="e.g. Primary — Cline GLM"
-            class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
-
-          <div class="mb-1.5 text-[10px] uppercase tracking-wider text-term-muted">provider</div>
-          <div id="llmProviderTabs" class="mb-3 flex items-center gap-1.5" style="flex-wrap:wrap"></div>
-          <div id="llmProviderNotes" class="mb-3 text-[11px] text-term-muted"></div>
-
-          <div class="mb-1 flex items-center justify-between">
-            <label class="block text-[10px] uppercase tracking-wider text-term-muted">API keys — shared pool</label>
-            <button id="llmKeysAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add key</button>
-          </div>
-          <div id="llmKeysList" class="mb-1 flex flex-col gap-1.5"></div>
-          <div class="mb-3 text-[11px] text-term-muted">Any key serves any model; rotated automatically on rate limits.</div>
-
-          <div class="mb-1 flex items-center justify-between">
-            <label class="block text-[10px] uppercase tracking-wider text-term-muted">text models — fallback order</label>
-            <button id="llmModelsAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add model</button>
-          </div>
-          <div id="llmModelsList" class="mb-1 flex flex-col gap-1.5"></div>
-          <div class="mb-3 text-[11px] text-term-muted">Top = primary. Drag ⠿ to reorder · ⚙ for reasoning &amp; test.</div>
-
-          <div class="mb-1 flex items-center justify-between">
-            <label class="block text-[10px] uppercase tracking-wider text-term-muted">vision models — image-to-text</label>
-            <button id="llmVisionAdd" type="button" class="rounded-full border border-term-line px-2 py-0.5 text-[10px] text-term-muted hover:bg-term-line/60 hover:text-term-text">+ add vision model</button>
-          </div>
-          <div id="llmVisionList" class="mb-1 flex flex-col gap-1.5"></div>
-          <div class="mb-3 text-[11px] text-term-muted">Optional — used to analyze screenshots/images. Same key pool.</div>
-
-          <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">base URL</label>
-          <input id="llmBaseUrl" type="text" autocomplete="off" spellcheck="false" placeholder="https://…/v1"
-            class="mb-3 w-full rounded-xl border border-term-line bg-term-bg px-3 py-2.5 font-mono outline-none focus:border-term-cyan" />
-
-          <div class="mb-1 flex items-end gap-3" style="flex-wrap:wrap">
-            <div>
-              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">max output tokens</label>
-              <input id="llmMaxTokens" type="number" min="256" placeholder="default" style="width:130px"
-                class="rounded-xl border border-term-line bg-term-bg px-3 py-2 font-mono outline-none focus:border-term-cyan" />
-            </div>
-            <div>
-              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">context window</label>
-              <input id="llmContextWindow" type="number" min="1000" placeholder="1000000" style="width:130px"
-                class="rounded-xl border border-term-line bg-term-bg px-3 py-2 font-mono outline-none focus:border-term-cyan" />
-            </div>
-            <div>
-              <label class="mb-1 block text-[10px] uppercase tracking-wider text-term-muted">temperature</label>
-              <input id="llmTemperature" type="number" step="0.1" min="0" max="2" placeholder="default" style="width:110px"
-                class="rounded-xl border border-term-line bg-term-bg px-3 py-2 font-mono outline-none focus:border-term-cyan" />
-            </div>
-          </div>
+      <div class="modal-foot">
+        <span id="llmError" class="min-w-0 flex-1 truncate text-term-red" style="font-size:var(--text-xs)"></span>
+        <span id="llmListStatus" class="shrink-0 text-term-muted" style="font-size:var(--text-xs)"></span>
+        <div id="llmEditFoot" class="flex shrink-0 items-center gap-2" style="display:none">
+          <button id="llmBackBtn" class="btn">cancel</button>
+          <button id="llmSaveBtn" class="btn btn-primary">save</button>
         </div>
-        <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
-          <span id="llmError" class="text-[11px] text-term-red"></span>
-          <div class="flex items-center gap-2">
-            <button id="llmBackBtn" class="rounded-full border border-term-line px-4 py-2 text-term-muted hover:bg-term-line/60 hover:text-term-text">cancel</button>
-            <button id="llmSaveBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">save to list</button>
-          </div>
-        </div>
+        <button id="llmDoneBtn" class="btn btn-primary shrink-0">done</button>
       </div>
     </div>
   </div>

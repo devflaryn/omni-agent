@@ -2213,6 +2213,7 @@ let _llmConfigs = [];          // ordered list of saved providers (order = fallb
 let _llmActiveProvider = null; // provider selected in the edit form
 let _llmEditingId = null;      // id being edited in the form, or null when adding
 let _llmDragId = null;         // id of the row currently being dragged
+let _llmSelectedId = null;     // id highlighted in the master column
 
 function _llmProvider(id) { return _llmProviders.find(p => p.id === id) || null; }
 
@@ -2224,7 +2225,7 @@ async function openLlmModal() {
   try {
     const res = await pywebview.api.get_llm_configs();
     if (!res || !res.ok) {
-      $('llmListStatus').className = 'text-[11px] text-term-red';
+      _llmStatusKind('error');
       $('llmListStatus').textContent = (res && res.error) || 'Failed to load LLM configs.';
       return;
     }
@@ -2232,23 +2233,61 @@ async function openLlmModal() {
     _llmConfigs = (res.configs || []).map(c => ({ ...c }));
     renderLlmList();
   } catch (e) {
-    $('llmListStatus').className = 'text-[11px] text-term-red';
+    _llmStatusKind('error');
     $('llmListStatus').textContent = '' + e;
   }
+}
+
+// The status line now lives in the SHARED modal footer, so replacing its
+// className (as this used to) also stripped its layout classes. Set only the
+// colour and leave the rest of the class list alone.
+function _llmStatusKind(kind) {
+  const el = $('llmListStatus');
+  el.classList.remove('text-term-red', 'text-term-green', 'text-term-muted');
+  el.classList.add(kind === 'error' ? 'text-term-red'
+    : kind === 'ok' ? 'text-term-green' : 'text-term-muted');
 }
 
 function closeLlmModal() { $('llmModal').classList.add('hidden'); }
 
 // ----- switch between the list view and the add/edit form -----
+// The panel is master-detail now: the provider list is ALWAYS visible on the
+// left, and the right column shows either the edit form or a placeholder. These
+// two functions therefore toggle the DETAIL column (and which footer buttons
+// apply), not two mutually exclusive full-panel views.
 function llmShowList() {
   $('llmModalTitle').textContent = 'LLM Providers';
-  $('llmListView').style.display = 'flex';
   $('llmEditView').style.display = 'none';
+  $('llmEmptyDetail').style.display = 'flex';
+  $('llmEditFoot').style.display = 'none';
+  $('llmDoneBtn').style.display = '';
+  $('llmError').textContent = '';
+  _llmSelectedId = null;
+  _markSelectedProvider();
 }
 function llmShowEdit() {
   $('llmModalTitle').textContent = _llmEditingId ? 'Edit provider' : 'Add provider';
-  $('llmListView').style.display = 'none';
-  $('llmEditView').style.display = 'flex';
+  $('llmEditView').style.display = 'block';
+  $('llmEmptyDetail').style.display = 'none';
+  $('llmEditFoot').style.display = 'flex';
+  $('llmDoneBtn').style.display = 'none';
+  llmShowModelPane('text');
+  _llmSelectedId = _llmEditingId;
+  _markSelectedProvider();
+}
+
+// Text / Vision tabs inside the Models section.
+function llmShowModelPane(which) {
+  const text = which !== 'vision';
+  $('llmTextPane').style.display = text ? '' : 'none';
+  $('llmVisionPane').style.display = text ? 'none' : '';
+  $('llmTabText').classList.toggle('active', text);
+  $('llmTabVision').classList.toggle('active', !text);
+}
+
+function _markSelectedProvider() {
+  [...$('llmList').children].forEach(el =>
+    el.classList.toggle('selected', el.dataset.id === _llmSelectedId));
 }
 
 // ----- list of saved providers (drag to reorder = change fallback priority) -----
@@ -2263,61 +2302,76 @@ function _llmRow(c, idx) {
   const prov = _llmProvider(c.provider);
   const label = (prov && prov.label) || c.label || c.provider;
   const row = document.createElement('div');
-  row.className = 'flex items-center gap-2 rounded-xl border border-term-line bg-term-bg px-3 py-2';
+  // Narrow master column: rank + name on one line, a compact summary beneath,
+  // actions revealed on hover. The old row put edit/remove buttons inline and
+  // spelled every model out, which no longer fits.
+  row.className = 'llm-prow' + (c.id === _llmSelectedId ? ' selected' : '');
   row.dataset.id = c.id;
   row.draggable = true;
+  row.title = 'Click to edit · drag ⠿ to change fallback priority';
 
   const handle = document.createElement('span');
   handle.textContent = '⠿';
   handle.title = 'drag to reorder';
-  handle.className = 'text-term-muted';
+  handle.className = 'text-term-muted shrink-0';
   handle.style.cursor = 'grab';
   row.appendChild(handle);
+
+  // Explicit priority number: "top is primary" is much easier to read when the
+  // position is stated rather than inferred from the order.
+  const rank = document.createElement('span');
+  rank.className = 'llm-prow-rank';
+  rank.textContent = String(idx + 1);
+  row.appendChild(rank);
 
   const mid = document.createElement('div');
   mid.className = 'min-w-0';
   mid.style.flex = '1 1 auto';
+
   const title = document.createElement('div');
-  title.className = 'text-term-text';
+  title.className = 'truncate text-term-text';
   title.textContent = c.name || label;
   if (idx === 0) {
     const badge = document.createElement('span');
     badge.textContent = 'primary';
-    badge.className = 'ml-2 rounded-full border border-term-line text-[10px] text-term-muted';
-    badge.style.padding = '1px 6px';
+    badge.className = 'chip ml-2';
     title.appendChild(badge);
   }
-  const sub = document.createElement('div');
-  sub.className = 'text-[11px] text-term-muted';
-  sub.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-  // Decoupled view: a shared key POOL + a separate model LADDER.
+
   const keys = Array.isArray(c.api_keys) && c.api_keys.length ? c.api_keys : (c.api_key ? [c.api_key] : []);
   const models = Array.isArray(c.models) && c.models.length ? c.models : (c.model ? [c.model] : []);
-  const nKeys = keys.length;
-  const keyPart = (prov && prov.requires_key)
-    ? (nKeys ? ` · ${nKeys} key${nKeys === 1 ? '' : 's'}` : ' · ⚠ no key')
-    : '';
-  const modelPart = models.length
-    ? (models.length === 1 ? ` · ${models[0]}` : ` · ${models.length} models: ${models.join(', ')}`)
-    : ' · default model';
   const vision = Array.isArray(c.vision_models) ? c.vision_models : (c.vision_model ? [c.vision_model] : []);
-  const visionPart = vision.length ? ` · ${vision.length} vision` : '';
-  sub.textContent = `${label}${modelPart}${visionPart}${keyPart}`;
-  mid.appendChild(title); mid.appendChild(sub);
+
+  const sub = document.createElement('div');
+  sub.className = 'truncate text-term-muted';
+  sub.style.fontSize = 'var(--text-2xs)';
+  // Counts, not a full model list: the detail pane shows the ladder itself.
+  const parts = [label];
+  parts.push(models.length ? `${models.length} model${models.length === 1 ? '' : 's'}` : 'default model');
+  if (vision.length) parts.push(`${vision.length} vision`);
+  if (prov && prov.requires_key) {
+    parts.push(keys.length ? `${keys.length} key${keys.length === 1 ? '' : 's'}` : '⚠ no key');
+  }
+  sub.textContent = parts.join(' · ');
+  sub.title = models.join(', ');
+
+  mid.appendChild(title);
+  mid.appendChild(sub);
   row.appendChild(mid);
 
-  const editBtn = document.createElement('button');
-  editBtn.textContent = 'edit';
-  editBtn.className = 'rounded-full border border-term-line px-3 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text';
-  editBtn.addEventListener('click', () => llmEditEntry(c.id));
-  row.appendChild(editBtn);
-
+  const actions = document.createElement('div');
+  actions.className = 'ws-actions';
   const delBtn = document.createElement('button');
+  delBtn.type = 'button';
   delBtn.textContent = '✕';
-  delBtn.title = 'remove';
-  delBtn.className = 'rounded-full border border-term-line px-2 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text';
-  delBtn.addEventListener('click', () => llmDeleteEntry(c.id));
-  row.appendChild(delBtn);
+  delBtn.title = 'Remove this provider';
+  delBtn.className = 'icon-btn';
+  delBtn.addEventListener('click', (e) => { e.stopPropagation(); llmDeleteEntry(c.id); });
+  actions.appendChild(delBtn);
+  row.appendChild(actions);
+
+  // The whole row is the edit affordance now — there is no separate edit button.
+  row.addEventListener('click', () => llmEditEntry(c.id));
 
   // HTML5 drag-and-drop reorder. Order in _llmConfigs IS the fallback priority.
   row.addEventListener('dragstart', () => { _llmDragId = c.id; row.style.opacity = '0.4'; });
@@ -2340,6 +2394,9 @@ function llmReorder(srcId, dstId) {
 
 function llmDeleteEntry(id) {
   _llmConfigs = _llmConfigs.filter(c => c.id !== id);
+  // If the detail pane was editing the row just removed, fall back to the
+  // placeholder rather than leaving a form bound to a deleted provider.
+  if (_llmEditingId === id) { _llmEditingId = null; llmShowList(); }
   renderLlmList();
   persistLlmConfigs('provider removed');
 }
@@ -2869,7 +2926,7 @@ async function persistLlmConfigs(statusMsg) {
     }));
     const res = await pywebview.api.save_llm_configs(payload);
     if (!res || !res.ok) {
-      $('llmListStatus').className = 'text-[11px] text-term-red';
+      _llmStatusKind('error');
       $('llmListStatus').textContent = (res && res.error) || 'Save failed.';
       return false;
     }
@@ -2879,7 +2936,7 @@ async function persistLlmConfigs(statusMsg) {
       _llmProviders = fresh.providers || _llmProviders;
       renderLlmList();
     }
-    $('llmListStatus').className = 'text-[11px] text-term-green';
+    _llmStatusKind('ok');
     $('llmListStatus').textContent = '✓ ' + (statusMsg || 'saved') + (res.primary
       ? ` — primary: ${res.primary.name} (${res.primary.label} · ${res.primary.model})`
       : ' — no providers left');
@@ -2889,7 +2946,7 @@ async function persistLlmConfigs(statusMsg) {
     }
     return true;
   } catch (e) {
-    $('llmListStatus').className = 'text-[11px] text-term-red';
+    _llmStatusKind('error');
     $('llmListStatus').textContent = '' + e;
     return false;
   }
@@ -3726,6 +3783,8 @@ async function init() {
   $('llmModalClose').addEventListener('click', closeLlmModal);
   $('llmDoneBtn').addEventListener('click', closeLlmModal);
   $('llmAddBtn').addEventListener('click', llmAddEntry);
+  $('llmTabText').addEventListener('click', () => llmShowModelPane('text'));
+  $('llmTabVision').addEventListener('click', () => llmShowModelPane('vision'));
   $('llmBackBtn').addEventListener('click', () => { $('llmError').textContent = ''; llmShowList(); });
   $('llmSaveBtn').addEventListener('click', saveLlmEntry);
   $('llmKeysAdd').addEventListener('click', () => _addListItem('llmKeysList', _LLM_KEY_OPTS));
