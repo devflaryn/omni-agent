@@ -131,6 +131,45 @@ opposite safety net so a capped/rate-limited premium never *fails* a step:
 - `engineer` / `debugger` writes serialize on `_WORKSPACE_LOCK` exactly like
   `implementer`. No write-parallelism.
 
+### F. Domain-knowledge access for subagents (quality win)
+
+**The gap:** a subagent's system prompt is only `persona body + contract + tool
+list` (`subagents._build_messages`). It never receives the skills index and
+cannot call `use_skill`. So `native-analyst`, `implementer`, and the new personas
+run *without* the repo's deep APK skill library (`android-package-anatomy`,
+`apk-modding`, `apk-toolchain`, `dex-multidex-handling`,
+`manifest-resource-editing`, `native-code-injection`, `native-patching`,
+`signature-bypass`, `smali-code-injection`, `ssl-pinning-bypass`,
+`root-detection-bypass`, `string-deobfuscation`, `anti-debug-bypass`, …). Those
+skills ARE the "know exactly how APKs are structured, how to modify them, what
+returns what" knowledge the agent's core mission needs — subagents just can't
+reach them today. This directly serves result quality.
+
+**The fix** (mirror how the orchestrator already uses skills — index + load on
+demand, so context stays lean):
+
+1. **Inject the skills index into subagent prompts.** Add `get_skills_prompt()`
+   output to `_build_messages` (the index is compact — name/description/when —
+   full bodies stay on demand). Scope it to subagents that can act on skills
+   (i.e. skip `researcher` if the extra tokens aren't worth it; definitely
+   include the RE + write personas).
+2. **Grant `use_skill` + `read_skill_resource`** to the personas that get the
+   index, so they can pull a skill's full body and bring its toolset online on
+   demand — exactly like the orchestrator. (Loading a skill already folds its
+   toolset's full schemas into the live tool list, per `skill_toolsets`.)
+3. **Persona-pinned skills (optional preload).** Let a persona declare
+   `skills:` in its `.md` frontmatter to preload 1–2 core skill bodies up front
+   for that role, e.g. `native-analyst` → `android-package-anatomy`,
+   `native-patching`; `implementer` → `smali-code-injection`,
+   `manifest-resource-editing`; `engineer` → `apk-modding`, `apk-toolchain`;
+   `debugger` → `frida-dynamic-instrumentation`, `anti-debug-bypass`. Everything
+   else stays reachable on demand via the index.
+
+**Cost note:** the index is small and load-on-demand keeps bodies out of the base
+prompt, so this adds little steady-state cost while sharply raising the ceiling on
+what a subagent can do correctly the first time — fewer failed attempts, which
+*also* reduces premium escalations (D) and total spend.
+
 ## Testing
 
 Extend existing offline suites (`test_subagent_routing.py`,
@@ -143,6 +182,9 @@ Extend existing offline suites (`test_subagent_routing.py`,
 4. Over-budget premium dispatch degrades to `standard` (does not fail).
 5. Simulated 429 on premium degrades to `standard` (does not fail).
 6. `standard` default routing is unaffected when nothing tags premium.
+7. Subagent prompts include the skills index and `use_skill` is in their allowed
+   tools; a persona's pinned `skills:` frontmatter preloads those bodies
+   (`test_skill_toolsets.py`, `test_subagents.py`).
 
 ## Adjustable defaults (flag for user review)
 
@@ -156,8 +198,11 @@ Extend existing offline suites (`test_subagent_routing.py`,
 - `plugins/omni-agents/agents/{engineer,consultant,debugger}.md` (new)
 - `AGENTS.md` — "Spending premium" doctrine + roster-routing guidance
 - `subagents.py` — `resolve_model_ladder` fallback-down tail; premium-dispatch
-  counter hook
+  counter hook; `_build_messages` skills-index injection; `AgentDef` `skills`
+  field + preload
 - `agent.py` — budget counter state + `_refresh_system_prompt` injection +
   re-arming premium nudge
 - `llm.py` — surface a premium rate-limit / unavailable signal for the degrade
+- `plugins.py` — parse `skills:` from persona frontmatter into `AgentDef`
+- `skills_loader.py` — reuse `get_skills_prompt()` / body loader for subagents
 - tests as listed above
