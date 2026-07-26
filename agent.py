@@ -46,6 +46,7 @@ from llm import (
     extract_json_action,
     strip_reasoning,
     get_context_window,
+    take_last_usage,
     reset_salvage_stats,
     SALVAGE_STATS,
 )
@@ -241,6 +242,14 @@ TRANSCRIPT_MAX_EVENTS = 500
 # Event types that make up the visible chat and are persisted for replay.
 RENDERABLE_EVENT_TYPES = {"user_message", "thought", "tool_result", "final_answer", "system", "error"}
 
+# Subagent-dock lifecycle events. These are NOT chat transcript events (they drive
+# the Subagents sidebar, not the message list), so they're captured into a separate
+# compact snapshot (session["dock"]) that is persisted and replayed on reopen — so
+# the Subagents menu doesn't vanish on a refresh.
+DOCK_EVENT_TYPES = {"wave_started", "subagent_started", "subagent_progress",
+                    "subagent_done", "wave_done"}
+DOCK_MAX_ROWS = 24           # cap restored rows so a long multi-wave run stays bounded
+
 
 def _ui_trunc(text, cap):
     """Cap text shown in the UI. The full text still lives in the agent's own
@@ -387,10 +396,13 @@ EXPLANATION_CADENCE_NUDGE = 6
 # Read-only tool calls the ORCHESTRATOR may run inline before it's reminded that
 # those are exactly what a parallel subagent wave does for ~0 context. Bounded and
 # self-re-arming (see _maybe_nudge_delegation); 0 disables the nudge entirely.
+# Default matches EXPLANATION_CADENCE_NUDGE (6) — a sub-process is ~2-6 calls, so a
+# streak past that many pure look-ups is a fan-out the model has clearly not taken.
+# Was 8; lowered to catch chronic solo-reading a step sooner.
 try:
-    SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "8")))
+    SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "6")))
 except ValueError:
-    SOLO_READ_NUDGE = 8
+    SOLO_READ_NUDGE = 6
 
 # Tools that MEAN the model delegated — they reset the solo-read streak.
 DELEGATION_TOOLS = {"dispatch_agents", "ask_codebase"}
@@ -1263,10 +1275,18 @@ class AgentApi:
                 stored["text"] = _ui_trunc(stored["text"], UI_THOUGHT_CAP)
             if "content" in stored:
                 stored["content"] = _ui_trunc(stored["content"], UI_TEXT_CAP)
+            # Wall-clock stamp so a REPLAYED transcript can show the real elapsed
+            # per action group instead of ~0s (the frontend has no live clock on
+            # reopen — it derives group durations from these stamps).
+            stored.setdefault("ts", int(time.time() * 1000))
             tr = self.session.setdefault("transcript", [])
             tr.append(stored)
             if len(tr) > TRANSCRIPT_MAX_EVENTS:
                 del tr[:len(tr) - TRANSCRIPT_MAX_EVENTS]
+        # Keep a compact snapshot of the subagent dock so the Subagents menu
+        # survives a refresh / reopen (the wave/subagent events are NOT part of
+        # the chat transcript).
+        self._track_dock(event)
         if self._window is None:
             return
         try:
@@ -1274,6 +1294,65 @@ class AgentApi:
             self._window.evaluate_js(js)
         except Exception:
             pass
+
+    def _track_dock(self, event):
+        """Fold a subagent/wave event into session['dock'] — a compact, JSON-safe
+        snapshot of the Subagents dock (one row per subagent, plus a wave-done
+        flag) so the menu can be rebuilt after a refresh / reopen. Best-effort:
+        never raises into the emit path."""
+        s = self.session
+        if s is None:
+            return
+        et = event.get("type")
+        if et not in DOCK_EVENT_TYPES:
+            return
+        try:
+            dock = s.setdefault("dock", {"rows": [], "index": {}, "done": False, "wave_id": None})
+
+            def _key(ev):
+                return ev.get("sub_id") or f"{ev.get('agent') or ''}::{ev.get('key_label') or ''}"
+
+            if et == "wave_started":
+                # A fresh parallel wave replaces the previous snapshot.
+                dock["rows"] = []
+                dock["index"] = {}
+                dock["done"] = False
+                dock["wave_id"] = event.get("wave_id")
+            elif et == "subagent_started":
+                k = _key(event)
+                row = {"sub_id": event.get("sub_id"), "agent": event.get("agent"),
+                       "task": event.get("task"), "tier": event.get("tier"),
+                       "model": event.get("model"), "key_label": event.get("key_label"),
+                       "running": True, "ok": None, "steps": 0, "tokens": 0,
+                       "elapsed_s": 0, "escalated": False}
+                if k in dock["index"]:
+                    dock["rows"][dock["index"][k]].update(row)
+                else:
+                    # Bound the snapshot: drop the oldest rows and reindex.
+                    dock["rows"].append(row)
+                    if len(dock["rows"]) > DOCK_MAX_ROWS:
+                        dock["rows"] = dock["rows"][-DOCK_MAX_ROWS:]
+                    dock["index"] = {(_key(r)): i for i, r in enumerate(dock["rows"])}
+            elif et in ("subagent_progress", "subagent_done"):
+                idx = dock["index"].get(_key(event))
+                if idx is not None:
+                    row = dock["rows"][idx]
+                    for f in ("tokens", "elapsed_s", "model", "escalated"):
+                        if event.get(f) is not None:
+                            row[f] = event.get(f)
+                    # progress emits `step` (singular); done emits `steps` (plural).
+                    step = event.get("steps", event.get("step"))
+                    if step is not None:
+                        row["steps"] = step
+                    if et == "subagent_done":
+                        row["running"] = False
+                        row["ok"] = bool(event.get("ok"))
+            elif et == "wave_done":
+                dock["done"] = True
+                for row in dock["rows"]:
+                    row["running"] = False
+        except Exception:
+            pass  # a dock-snapshot hiccup must never break the emit path
 
     # --- long-running command supervision ------------------------------------
     def _decide_on_timeout(self, display, elapsed_s, base_timeout, rounds):
@@ -1371,6 +1450,8 @@ class AgentApi:
             # reopened long run keeps their full schemas instead of dropping back
             # to catalog-only until the next domain call re-arms them.
             "active_toolsets": sorted(s.get("active_toolsets") or []),
+            # Subagents-dock snapshot so the menu survives a reopen (see _track_dock).
+            "dock": s.get("dock"),
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         })
         _write_json_atomic(os.path.join(mem, TRANSCRIPT_FILENAME), _cap_transcript(s.get("transcript", [])))
@@ -1396,9 +1477,11 @@ class AgentApi:
         conv_path = os.path.join(memory_dir, CONVERSATION_FILENAME)
         tr_path = os.path.join(memory_dir, TRANSCRIPT_FILENAME)
         messages, transcript, original_task, stats = None, [], None, None
-        # Restored progressive-disclosure toolsets are stashed on self (rather than
-        # widening this method's return tuple) and read back in start_session.
+        # Restored progressive-disclosure toolsets + dock snapshot are stashed on
+        # self (rather than widening this method's return tuple) and read back in
+        # start_session.
         self._restored_active_toolsets = set()
+        self._restored_dock = None
         try:
             if os.path.isfile(conv_path):
                 with open(conv_path, "r", encoding="utf-8") as f:
@@ -1413,6 +1496,9 @@ class AgentApi:
                 ts = data.get("active_toolsets")
                 if isinstance(ts, list):
                     self._restored_active_toolsets = set(ts)
+                dk = data.get("dock")
+                if isinstance(dk, dict) and isinstance(dk.get("rows"), list) and dk["rows"]:
+                    self._restored_dock = dk
         except (OSError, json.JSONDecodeError, AttributeError):
             messages, original_task, stats = None, None, None
         try:
@@ -2412,11 +2498,23 @@ class AgentApi:
             # to full schemas. Starts from whatever a reopened run had active;
             # grows as the model uses/expands domain tools (see the loop).
             "active_toolsets": set(getattr(self, "_restored_active_toolsets", set()) or set()),
+            # Subagents-dock snapshot restored from disk, so the menu reappears on
+            # reopen (see _track_dock / _emit_session_started).
+            "dock": getattr(self, "_restored_dock", None),
             # Long-run context editing: stub out stale tool results (keep recent).
             "context_editing": True,
             "max_consecutive_tools": MAX_CONSECUTIVE_TOOLS,
             "loop_repeat_threshold": LOOP_REPEAT_THRESHOLD,
             "summary_resets": 0,
+            # Size of the main conversation in real provider-reported tokens, and
+            # the previous call's usage the per-turn delta is measured against.
+            # All three are restored together: the first call after a reopen
+            # re-sends the whole restored history, so without its matching prompt
+            # baseline the delta would count that entire history a second time.
+            # See _count_conversation_usage.
+            "convo_tokens": (saved_stats or {}).get("convo_tokens", 0),
+            "usage_prev_prompt": (saved_stats or {}).get("usage_prev_prompt", 0),
+            "usage_prev_completion": (saved_stats or {}).get("usage_prev_completion", 0),
             "needs_plan": saved_task is None,
             "tools_since_plan_touch": 0,
             "_plan_touch_nudge_sent": False,
@@ -2552,6 +2650,11 @@ class AgentApi:
         last_status = s.get("last_status")
         if isinstance(last_status, dict):
             self._emit(last_status)
+        # Rebuild the Subagents dock from its snapshot so the menu doesn't vanish on
+        # a refresh / reopen. Purely a UI restore — emitted after the chat is built.
+        dock = s.get("dock")
+        if isinstance(dock, dict) and dock.get("rows"):
+            self._emit({"type": "wave_restore", "dock": dock})
         active_plan = planning.get_active_plan()
         self._on_plan_update(active_plan.to_dict() if active_plan else None)
         active_inv = investigation.get_active()
@@ -2583,6 +2686,10 @@ class AgentApi:
         s["step_count"] = 0
         s["consecutive_tools"] = 0
         s["summary_resets"] = 0
+        # A cleared chat IS a new conversation, so its token size starts over.
+        s["convo_tokens"] = 0
+        s["usage_prev_prompt"] = 0
+        s["usage_prev_completion"] = 0
         s["tools_since_plan_touch"] = 0
         s["_plan_touch_nudge_sent"] = False
         s["reads_since_nav"] = 0
@@ -2613,12 +2720,14 @@ class AgentApi:
         s["active_toolsets"] = set()
         self._emit({"type": "status", "step_count": 0, "consecutive_tools": 0,
                     "tools_used": 0, "ctx_chars": 0, "ctx_tokens": 0,
+                    "convo_tokens": 0,
                     "ctx_budget": context_token_budget(), "summary_resets": 0})
         # A fresh chat only needs a new plan if there isn't an in-progress one.
         active_plan = planning.get_active_plan()
         s["needs_plan"] = active_plan is None or active_plan.is_complete()
         s["mutating_gate_nudged"] = False  # re-arm the one-time unplanned-mutation nudge
         s["dispatched_steps"] = set()      # fresh chat -> nothing delegated yet
+        s["dock"] = None                   # fresh chat -> drop the subagents snapshot
         s["steps_since_reground"] = 0
         # Fold the (unchanged) live plan back into the fresh system prompt.
         self._refresh_system_prompt()
@@ -3126,6 +3235,38 @@ class AgentApi:
             s["consecutive_tools"] = 0
             s["summary_resets"] += 1
 
+    def _count_conversation_usage(self, s):
+        """Fold the just-completed main-loop call into the running size of the
+        MAIN conversation, in real provider-reported tokens.
+
+        Must be called IMMEDIATELY after the conversation's own ask_llm. The
+        review gate, strategy review and summarizer also call ask_llm on this
+        thread, and their spend is not part of the conversation — reading the
+        usage right here means theirs is never attributed to the counter.
+        Subagents are excluded for free: take_last_usage is thread-local.
+
+        Each turn contributes only what is genuinely NEW — the growth in the
+        prompt since the last call (i.e. the tool results that were appended)
+        plus the reply itself. Without the delta, re-sending the whole history
+        every turn would count the same messages over and over.
+
+        The max(0, ...) clamp is what makes the number monotonic. It also means
+        that on the turn where _maybe_summarize_context fires, the prompt
+        collapses, the delta floors at zero, and that one turn's tool-result
+        tokens go uncounted. That undercounts by a few thousand tokens once per
+        summarization, which is preferred over filling the gap with a chars/4
+        estimate — the fake number this counter exists to replace.
+        """
+        usage = take_last_usage() or {}
+        prompt = int(usage.get("prompt") or 0)
+        completion = int(usage.get("completion") or 0)
+        if not prompt and not completion:
+            return  # provider reported no usage — leave the counter untouched
+        prev = s.get("usage_prev_prompt", 0) + s.get("usage_prev_completion", 0)
+        s["convo_tokens"] = s.get("convo_tokens", 0) + max(0, prompt - prev) + completion
+        s["usage_prev_prompt"] = prompt
+        s["usage_prev_completion"] = completion
+
     def _emit_status(self, s):
         """Emit the per-iteration telemetry status event and remember it so the
         stats can be persisted and restored into the header when the project is
@@ -3136,6 +3277,12 @@ class AgentApi:
                      "tools_used": s.get("tools_used", 0),
                      "ctx_chars": session_context_chars(s),
                      "ctx_tokens": session_context_tokens(s),
+                     "convo_tokens": s.get("convo_tokens", 0),
+                     # Carried so the delta baseline survives a reopen — this event
+                     # doubles as the persisted stats snapshot (see _persist_session).
+                     # The frontend ignores both.
+                     "usage_prev_prompt": s.get("usage_prev_prompt", 0),
+                     "usage_prev_completion": s.get("usage_prev_completion", 0),
                      "ctx_budget": context_token_budget(),
                      "summary_resets": s["summary_resets"]}
         s["last_status"] = status_ev
@@ -3378,6 +3525,22 @@ class AgentApi:
             "the corresponding plan steps delegate=\"researcher@cheap\". Keep only the work that "
             "genuinely needs your own judgment inline."
         )})
+        # TEETH: an advisory line alone is easy to read past — that was the ORIGINAL
+        # failure (two subagents in a 300-step run). Dispatch is otherwise only
+        # triggered by a plan_* tool call (_plan_bookkeeping_after_tool), so a long
+        # inline-read streak that never touches the plan leaves any already-delegatable
+        # steps sitting undispatched while the model reads on. When the streak trips,
+        # proactively run the auto-tag + fan-out pass: if a plan with ready research/
+        # change steps exists, they go out as a real wave NOW instead of only being
+        # talked about. Idempotent (dispatched steps are tracked) and a no-op when no
+        # plan/step qualifies — so pure free-exploration (no plan yet) still degrades
+        # to advisory-only, where the harness genuinely can't author the sub-tasks.
+        disp = getattr(self, "_maybe_dispatch_delegated_steps", None)
+        if callable(disp):
+            try:
+                disp()
+            except Exception:
+                pass  # a dispatch hiccup must never break the main tool loop
 
     def _maybe_nudge_plan_delegation(self, s):
         """Delegation nudge #2 — PLAN SHAPE.
@@ -3856,6 +4019,7 @@ class AgentApi:
         start_time = time.time()
         raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
                                active_groups=s.get("active_toolsets"))
+        self._count_conversation_usage(s)
         elapsed_ms = int((time.time() - start_time) * 1000)
         self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
 
@@ -3872,6 +4036,7 @@ class AgentApi:
             start_time = time.time()
             raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
                                active_groups=s.get("active_toolsets"))
+            self._count_conversation_usage(s)
             elapsed_ms += int((time.time() - start_time) * 1000)
             self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
             response_type, payload = parse_response(raw_response)
@@ -4223,7 +4388,10 @@ def main():
         except Exception as e:
             print(f"[api-server] failed to start: {e}")
 
-    webview.start(debug=True)
+    # DevTools (Web Inspector) no longer auto-opens on launch. Opt back in with
+    # OMNI_DEVTOOLS=1 when you actually need to debug the renderer.
+    _devtools = os.environ.get("OMNI_DEVTOOLS", "0").strip().lower() in ("1", "true", "yes", "on")
+    webview.start(debug=_devtools)
 
 
 if __name__ == "__main__":

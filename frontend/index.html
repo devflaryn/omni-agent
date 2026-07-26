@@ -90,6 +90,16 @@
     }
     @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: 0% 0; } }
 
+    /* Separator inside the Thinking… suffix "(1h 55m 4s · 56k tokens)". Sized
+       well below the surrounding text so it reads as punctuation between two
+       figures rather than as a third glyph competing with them. */
+    .think-dot {
+      font-size: .72em;
+      opacity: .55;
+      margin: 0 .4em;
+      vertical-align: .08em;
+    }
+
     /* Offscreen chat rows skip layout + paint entirely; `auto` keeps each
        row's last rendered size so scroll position stays stable. This is what
        keeps a full 1400-row transcript cheap to live with. */
@@ -393,6 +403,20 @@
     }
     .cbar-fill.ok { background: rgb(var(--term-green)); }
     .cbar-fill.failed { background: rgb(var(--term-red)); }
+    .cdock-active { display: flex; flex-direction: column; gap: 6px; }
+    .cdock-completed { display: flex; flex-direction: column; gap: 4px; }
+    .cdock-done-title {
+      color: rgb(var(--term-muted)); font-weight: 600; text-transform: uppercase;
+      font-size: 10px; letter-spacing: .06em; padding: 6px 0 1px; margin-top: 2px;
+      border-top: 1px solid rgb(var(--term-line));
+    }
+    .cdock-done-title .cdock-done-count { opacity: .7; font-weight: 400; }
+    /* A completed subagent keeps only its label line — the timeline track is removed
+       (its Gantt bar only ever spanned its slice of the shared axis, reading as
+       unfinished). The ✓/✗ stat carries the outcome instead. */
+    .cbar-done { opacity: .8; }
+    .cbar-ok .cbar-stat { color: rgb(var(--term-green)); }
+    .cbar-failed .cbar-stat { color: rgb(var(--term-red)); }
     .cdock-summary {
       padding: 7px 11px; border-top: 1px solid rgb(var(--term-line));
       color: rgb(var(--term-muted)); font-variant-numeric: tabular-nums;

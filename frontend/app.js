@@ -8,6 +8,7 @@ const chat = $('chat');
 let session = null;        // {project}
 let autoScroll = true;
 let replaying = false;     // true while a saved transcript is being replayed
+let replayTs = null;       // wall-clock ms of the event being replayed (for real elapsed)
 
 // ---------- small utilities ----------
 function escapeHtml(s) {
@@ -171,7 +172,9 @@ function renderUserMessage(content) {
   currentGroup = null; // a new user turn starts a fresh set of action groups
   // A genuine new user turn starts the run clock for the Thinking… elapsed readout.
   // (Skip during transcript replay on reopen — those aren't a live run.)
-  if (!replaying) { runStartTs = performance.now(); sessionTokens = 0; }
+  // Only the clock restarts per turn — convoTokens is the size of the WHOLE
+  // conversation and must keep climbing across turns.
+  if (!replaying) runStartTs = performance.now();
   const el = document.createElement('div');
   el.className = 'py-1 user-row';
   el.innerHTML = `
@@ -220,10 +223,13 @@ function spinTick() {
 let thinkingEl = null;     // the live "Thinking…" shimmer line, if any
 let currentGroup = null;   // the action group following the most recent thought
 
-// Live run telemetry surfaced on the Thinking… line: "Thinking… 214k tokens 31m 5s".
-// sessionTokens = current context size in tokens (from 'status' events); runStartTs
-// = wall-clock origin of the current run (set on each user message).
-let sessionTokens = 0;
+// Live run telemetry surfaced on the Thinking… line: "Thinking… (31m 5s · 214k tokens)".
+// convoTokens = total size of the MAIN conversation in real provider-reported
+// tokens (from the 'status' event's convo_tokens). It counts every main-thread
+// message ever sent — including ones auto-summarization later discarded — so it
+// only ever climbs. Subagent spend is deliberately excluded. runStartTs = the
+// wall-clock origin of the current run, reset on each user message.
+let convoTokens = 0;
 let runStartTs = null;
 let _thinkTicker = null;
 
@@ -232,20 +238,25 @@ function resetActivityState() {
   if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
   thinkingEl = null;
   currentGroup = null;
-  sessionTokens = 0;
+  convoTokens = 0;
   runStartTs = null;
   resetConcurrencyDock();
 }
 
-// Fill the tokens/elapsed suffix on the live Thinking… line.
+// Fill the elapsed/tokens suffix on the live Thinking… line, rendered as
+// "(1h 55m 4s · 56k tokens)" — elapsed first, joined by a deliberately small
+// middot. With only one value available the parens hold just that value; with
+// neither, nothing is rendered (no empty parens).
 function _updateThinkingMeta() {
   if (!thinkingEl) return;
   const meta = thinkingEl.querySelector('.think-meta');
   if (!meta) return;
   const parts = [];
-  if (sessionTokens > 0) parts.push(`${window.formatTokens(sessionTokens)} tokens`);
-  if (runStartTs != null) parts.push(window.formatClock(performance.now() - runStartTs));
-  meta.textContent = parts.length ? '  ' + parts.join('  ') : '';
+  if (runStartTs != null) parts.push(escapeHtml(window.formatClock(performance.now() - runStartTs)));
+  if (convoTokens > 0) parts.push(escapeHtml(`${window.formatTokens(convoTokens)} tokens`));
+  meta.innerHTML = parts.length
+    ? ` (${parts.join('<span class="think-dot">·</span>')})`
+    : '';
 }
 
 function startThinking() {
@@ -284,39 +295,273 @@ function finishThinking(ev) {
   scrollDown();
 }
 
-// Which tools count as "reading a file" vs "changing a file" for the group's
-// summary title ("Ran N tools · read N files · changed N files"). Files are
-// deduped by path, so touching the same file twice still counts once.
-const READ_FILE_TOOLS = new Set([
-  'read_file_chunk', 'read_binary_range', 'tail_file', 'grep_file', 'read_archive_member',
-]);
-const CHANGE_FILE_TOOLS = new Set([
-  'write_file', 'replace_in_file', 'delete_path', 'move_file', 'duplicate_file',
-  'patch_smali_method', 'insert_smali_code', 'assemble_dex',
-  'patch_binary_string', 'binary_patch', 'nop_function', 'patch_function_return',
-  'patch_at_offset_with_bytes', 'patch_bytes_at_offset',
-  'replace_file_in_apk', 'recompile_apk', 'sign_apk',
-  'assemble_and_patch', 'compile_c_and_patch',
+// ---------- tool metadata: display names + summary categories ----------
+// One entry per registered tool: the human-facing name shown on an action row,
+// and which of the six summary buckets it counts toward. Kept in sync with the
+// Python registry by tests/test_tool_meta_coverage.py, which fails if a
+// registered tool has no entry here.
+const TOOL_META = {
+  // read: reads content out of the workspace — counted by distinct path
+  read_file_chunk:         { name: 'Read File', cat: 'read' },
+  read_binary_range:       { name: 'Read Binary Range', cat: 'read' },
+  tail_file:               { name: 'Tail File', cat: 'read' },
+  read_skill_resource:     { name: 'Read Skill Resource', cat: 'read' },
+  read_auto_screenshots:   { name: 'Read Screenshots', cat: 'read' },
+  use_skill:               { name: 'Use Skill', cat: 'read' },
+  extract_manifest_info:   { name: 'Read Manifest', cat: 'read' },
+  extract_strings:         { name: 'Extract Strings', cat: 'read' },
+  analyze_image:           { name: 'Analyze Image', cat: 'read' },
+  analyze_keyframes:       { name: 'Analyze Keyframes', cat: 'read' },
+  ghidra_decompile:        { name: 'Decompile (Ghidra)', cat: 'read' },
+  jadx_decompile:          { name: 'Decompile (JADX)', cat: 'read' },
+  decode_apk:              { name: 'Decode APK', cat: 'read' },
+  unzip_apk:               { name: 'Unzip APK', cat: 'read' },
+  disassemble_dex:         { name: 'Disassemble DEX', cat: 'read' },
+  disassemble_range:       { name: 'Disassemble Range', cat: 'read' },
+  llvm_objdump_disasm:     { name: 'Disassemble (objdump)', cat: 'read' },
+  readelf_info:            { name: 'Read ELF Info', cat: 'read' },
+  nm_symbols:              { name: 'Read Symbol Table', cat: 'read' },
+  rabin2_info:             { name: 'Read Binary Info', cat: 'read' },
+  inspect_apk:             { name: 'Inspect APK', cat: 'read' },
+  list_dex_classes:        { name: 'List DEX Classes', cat: 'read' },
+  analyze_function_calls:  { name: 'Analyze Function Calls', cat: 'read' },
+  get_apk_signature_hash:  { name: 'Read APK Signature', cat: 'read' },
+  verify_apk:              { name: 'Verify APK', cat: 'read' },
+  compute_sha256:          { name: 'Compute SHA-256', cat: 'read' },
+  compare_files_sha256:    { name: 'Compare File Hashes', cat: 'read' },
+  diff_binary_files:       { name: 'Diff Binaries', cat: 'read' },
+  compare_directories:     { name: 'Compare Directories', cat: 'read' },
+  generate_test_report:    { name: 'Generate Test Report', cat: 'read' },
+  get_logcat:              { name: 'Read Logcat', cat: 'run' },
+  monitor_logcat:          { name: 'Monitor Logcat', cat: 'run' },
+  read_archive_member:     { name: 'Read Archive Member', cat: 'read' },
+
+  // change: writes or mutates files — counted by distinct path
+  write_file:                  { name: 'Write File', cat: 'change' },
+  replace_in_file:             { name: 'Edit File', cat: 'change' },
+  delete_path:                 { name: 'Delete Path', cat: 'change' },
+  move_file:                   { name: 'Move File', cat: 'change' },
+  duplicate_file:              { name: 'Duplicate File', cat: 'change' },
+  patch_smali_method:          { name: 'Patch Smali Method', cat: 'change' },
+  insert_smali_code:           { name: 'Insert Smali Code', cat: 'change' },
+  assemble_dex:                { name: 'Assemble DEX', cat: 'change' },
+  patch_binary_string:         { name: 'Patch Binary String', cat: 'change' },
+  binary_patch:                { name: 'Patch Binary', cat: 'change' },
+  nop_function:                { name: 'NOP Function', cat: 'change' },
+  patch_function_return:       { name: 'Patch Function Return', cat: 'change' },
+  patch_at_offset_with_bytes:  { name: 'Patch At Offset', cat: 'change' },
+  patch_bytes_at_offset:       { name: 'Patch Bytes At Offset', cat: 'change' },
+  replace_file_in_apk:         { name: 'Replace File In APK', cat: 'change' },
+  recompile_apk:               { name: 'Recompile APK', cat: 'change' },
+  sign_apk:                    { name: 'Sign APK', cat: 'change' },
+  assemble_and_patch:          { name: 'Assemble & Patch', cat: 'change' },
+  compile_c_and_patch:         { name: 'Compile C & Patch', cat: 'change' },
+  inject_session_bootstrap:    { name: 'Inject Session Bootstrap', cat: 'change' },
+  hide_root_from_app:          { name: 'Hide Root From App', cat: 'run' },
+  find_code_cave:              { name: 'Find Code Cave', cat: 'change' },
+
+  // search: locating / querying — counted by call
+  list_directory:            { name: 'List Directory', cat: 'search' },
+  find_files:                { name: 'Find Files', cat: 'search' },
+  grep_file:                 { name: 'Search In File', cat: 'search' },
+  grep_directory:            { name: 'Search In Directory', cat: 'search' },
+  search_java:               { name: 'Search Java', cat: 'search' },
+  search_smali:              { name: 'Search Smali', cat: 'search' },
+  query_code_graph:          { name: 'Query Code Graph', cat: 'search' },
+  ask_codebase:              { name: 'Ask The Codebase', cat: 'search' },
+  build_code_graph:          { name: 'Build Code Graph', cat: 'search' },
+  diff_code_graphs:          { name: 'Diff Code Graphs', cat: 'search' },
+  list_code_graphs:          { name: 'List Code Graphs', cat: 'search' },
+  list_skills:               { name: 'List Skills', cat: 'search' },
+  list_commands:             { name: 'List Commands', cat: 'search' },
+  web_search:                { name: 'Search The Web', cat: 'search' },
+  read_webpage:              { name: 'Read Webpage', cat: 'search' },
+  download_file:             { name: 'Download File', cat: 'search' },
+  find_byte_sequence_in_so:  { name: 'Find Byte Sequence', cat: 'search' },
+  frida_list_processes:      { name: 'List Processes', cat: 'search' },
+  list_roblox_accounts:      { name: 'List Roblox Accounts', cat: 'search' },
+  expand_tools:              { name: 'Expand Tools', cat: 'search' },
+
+  // run: executes something — counted by call
+  run_command:                   { name: 'Run Command', cat: 'run' },
+  use_command:                   { name: 'Use Command', cat: 'run' },
+  adb_shell:                     { name: 'ADB Shell', cat: 'run' },
+  radare2_cmd:                   { name: 'Radare2 Command', cat: 'run' },
+  frida_run_script:              { name: 'Run Frida Script', cat: 'run' },
+  frida_trace:                   { name: 'Frida Trace', cat: 'run' },
+  frida_bypass_ssl_pinning:      { name: 'Bypass SSL Pinning', cat: 'run' },
+  ensure_frida_server:           { name: 'Start Frida Server', cat: 'run' },
+  ensure_emulator_running:       { name: 'Start Emulator', cat: 'run' },
+  install_apk_on_emulator:       { name: 'Install APK', cat: 'run' },
+  launch_app_on_emulator:        { name: 'Launch App', cat: 'run' },
+  stop_emulator:                 { name: 'Stop Emulator', cat: 'run' },
+  run_apk_test_session:          { name: 'Run APK Test Session', cat: 'run' },
+  record_and_capture_keyframes:  { name: 'Record Keyframes', cat: 'run' },
+  take_emulator_screenshot:      { name: 'Take Screenshot', cat: 'run' },
+  tap_screen:                    { name: 'Tap Screen', cat: 'run' },
+  swipe_screen:                  { name: 'Swipe Screen', cat: 'run' },
+  press_key:                     { name: 'Press Key', cat: 'run' },
+  type_text:                     { name: 'Type Text', cat: 'run' },
+  set_emulator_ui:               { name: 'Set Emulator UI', cat: 'run' },
+  launch_roblox_build:           { name: 'Launch Roblox Build', cat: 'run' },
+  login_roblox_account:          { name: 'Log In Roblox Account', cat: 'run' },
+  set_roblox_account:            { name: 'Set Roblox Account', cat: 'run' },
+  play_roblox:                   { name: 'Play Roblox', cat: 'run' },
+
+  // delegate: fans work out to subagents
+  dispatch_agents:  { name: 'Dispatch Subagents', cat: 'delegate' },
+
+  // plan: plan / investigation / strategy bookkeeping — counted by call
+  plan_create:                  { name: 'Create Plan', cat: 'plan' },
+  plan_add_task:                { name: 'Add Plan Step', cat: 'plan' },
+  plan_update_task:             { name: 'Update Plan Step', cat: 'plan' },
+  plan_advance_phase:           { name: 'Advance Phase', cat: 'plan' },
+  plan_reorder:                 { name: 'Reorder Plan', cat: 'plan' },
+  plan_replan:                  { name: 'Replan', cat: 'plan' },
+  plan_set_next_action:         { name: 'Set Next Action', cat: 'plan' },
+  plan_set_outcome:             { name: 'Set Step Outcome', cat: 'plan' },
+  plan_view:                    { name: 'View Plan', cat: 'plan' },
+  investigation_view:           { name: 'View Investigation', cat: 'plan' },
+  record_assumption:            { name: 'Record Assumption', cat: 'plan' },
+  record_decision:              { name: 'Record Decision', cat: 'plan' },
+  record_failed_attempt:        { name: 'Record Failed Attempt', cat: 'plan' },
+  record_finding:               { name: 'Record Finding', cat: 'plan' },
+  record_hypothesis:            { name: 'Record Hypothesis', cat: 'plan' },
+  record_learned_technique:     { name: 'Record Learned Technique', cat: 'plan' },
+  record_open_question:         { name: 'Record Open Question', cat: 'plan' },
+  record_test_result:           { name: 'Record Test Result', cat: 'plan' },
+  update_assumption:            { name: 'Update Assumption', cat: 'plan' },
+  update_hypothesis:            { name: 'Update Hypothesis', cat: 'plan' },
+  declare_constraints:          { name: 'Declare Constraints', cat: 'plan' },
+  clear_technique_constraints:  { name: 'Clear Constraints', cat: 'plan' },
+  set_next_steps:               { name: 'Set Next Steps', cat: 'plan' },
+  strategy_set:                 { name: 'Set Strategy', cat: 'plan' },
+  strategy_update:              { name: 'Update Strategy', cat: 'plan' },
+  review_conclusion:            { name: 'Review Conclusion', cat: 'plan' },
+};
+
+// Acronyms that must stay upper-case when a tool falls through to the mechanical
+// fallback below (i.e. a tool added after this table was last regenerated).
+const _TOOL_ACRONYMS = new Set([
+  'apk', 'dex', 'elf', 'so', 'adb', 'url', 'id', 'ui', 'kg', 'js', 'nm', 'plt',
+  'ssl', 'os', 'io', 'api', 'cli', 'sdk', 'jvm', 'xml', 'json',
 ]);
 
-// The workspace path a tool operates on, used to dedupe file counts. Mirrors the
-// arg keys the backend tools actually use (filepath / file_path / so_path / …).
+// Human-facing name for a tool. Curated entries win; anything unmapped is
+// Title-Cased mechanically, so a newly added tool degrades to "Some New Tool"
+// instead of leaking `some_new_tool` into the transcript.
+function toolDisplayName(tool) {
+  const meta = TOOL_META[tool];
+  if (meta) return meta.name;
+  const raw = String(tool || '');
+  const words = raw.split('_').filter(Boolean).map(w =>
+    _TOOL_ACRONYMS.has(w.toLowerCase())
+      ? w.toUpperCase()
+      : w.charAt(0).toUpperCase() + w.slice(1));
+  return words.join(' ') || raw;
+}
+
+// Which of the six summary buckets a tool belongs to. Unmapped tools land in
+// 'other', which renders as a trailing "Ran N tools" so they never disappear
+// from the count.
+function toolCategory(tool) {
+  const meta = TOOL_META[tool];
+  return meta ? meta.cat : 'other';
+}
+
+// Derived views, kept because other call sites still read them.
+const READ_FILE_TOOLS = new Set(
+  Object.keys(TOOL_META).filter(t => TOOL_META[t].cat === 'read'));
+const CHANGE_FILE_TOOLS = new Set(
+  Object.keys(TOOL_META).filter(t => TOOL_META[t].cat === 'change'));
+
+// The identity a tool operates on, used to dedupe read/changed counts so that
+// touching the same target twice still counts once. Mirrors the arg names the
+// backend tools actually declare — kept honest by
+// tests/test_tool_meta_coverage.py, which fails if a read/change tool takes none
+// of these. Not every key is a filesystem path: a skill name or capture-session
+// name identifies the thing just as well for counting purposes.
+const _TOOL_PATH_ARGS = [
+  // workspace files
+  'filepath', 'file_path', 'path', 'destination', 'source', 'output', 'out_path', 'target',
+  // binaries / native
+  'binary_path', 'so_path', 'so_filename',
+  // dex / smali
+  'smali_file', 'smali_dir', 'dex_path', 'output_dex', 'decompiled_dir',
+  // apk
+  'apk_filename', 'apk_path', 'output_apk', 'manifest_path',
+  // media
+  'image_path', 'image_paths',
+  // comparisons name two operands; the first is a stable enough identity
+  'dir_a', 'file_a', 'file1',
+  // non-filesystem identities
+  'skill_name', 'resource_path', 'session_name',
+];
+
 function toolPathKey(args) {
   if (!args || typeof args !== 'object') return null;
-  return args.filepath || args.file_path || args.path || args.so_path || args.smali_file
-    || args.dex_path || args.apk_filename || args.apk_path || args.output_apk
-    || args.destination || args.source || args.output || args.out_path || args.target || null;
+  for (const k of _TOOL_PATH_ARGS) {
+    const v = args[k];
+    if (Array.isArray(v)) { if (v.length) return v.join(','); continue; }
+    if (v) return v;
+  }
+  return null;
 }
 
-// The count summary shown as the group's title. Pluralized, tools first.
+// Fresh per-group counters. read/change dedupe by workspace path, so touching
+// the same file twice still counts once; every other bucket counts calls.
+function newGroupCounts() {
+  return { read: new Set(), change: new Set(), run: 0, search: 0, delegate: 0, plan: 0, other: 0 };
+}
+
+// How many subagents one dispatch_agents call fanned out to. The arg is a list
+// of specs; anything unreadable counts as a single delegation.
+function dispatchedAgentCount(args) {
+  const specs = args && (args.agents || args.specs || args.tasks);
+  return (Array.isArray(specs) && specs.length) ? specs.length : 1;
+}
+
+// Record one tool call into a group's counters. `seq` disambiguates calls that
+// carry no path, so two pathless reads don't collapse into one.
+function countToolCall(counts, ev, seq) {
+  const cat = toolCategory(ev.tool);
+  if (cat === 'read' || cat === 'change') {
+    counts[cat].add(toolPathKey(ev.args) || `${ev.tool}#${seq}`);
+  } else if (cat === 'delegate') {
+    counts.delegate += dispatchedAgentCount(ev.args);
+  } else {
+    counts[cat] += 1;
+  }
+}
+
+// The group's summary title: categorized counts in a fixed order, joined by "·",
+// zero segments omitted. Replaces the old undifferentiated "Ran N tools".
+const _GROUP_SEGMENTS = [
+  ['read',     (n) => `Read ${n} ${n === 1 ? 'file' : 'files'}`],
+  ['change',   (n) => `Changed ${n} ${n === 1 ? 'file' : 'files'}`],
+  ['run',      (n) => `Ran ${n} ${n === 1 ? 'command' : 'commands'}`],
+  ['search',   (n) => `Searched ${n === 1 ? 'once' : n + ' times'}`],
+  ['delegate', (n) => `Delegated to ${n} ${n === 1 ? 'subagent' : 'subagents'}`],
+  ['plan',     (n) => `Planned ${n} ${n === 1 ? 'step' : 'steps'}`],
+  ['other',    (n) => `Ran ${n} ${n === 1 ? 'tool' : 'tools'}`],
+];
+
 function groupTitleText(g) {
-  const plur = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
-  const parts = [`Ran ${plur(g.n, 'tool')}`];
-  if (g.readFiles.size) parts.push(`read ${plur(g.readFiles.size, 'file')}`);
-  if (g.changedFiles.size) parts.push(`changed ${plur(g.changedFiles.size, 'file')}`);
+  const c = g.counts;
+  const parts = [];
+  for (const [key, fmt] of _GROUP_SEGMENTS) {
+    const n = (key === 'read' || key === 'change') ? c[key].size : c[key];
+    if (n > 0) parts.push(fmt(n));
+  }
+  if (!parts.length) return `Ran ${g.n} ${g.n === 1 ? 'tool' : 'tools'}`;
   return parts.join(' · ');
 }
-function updateGroupTitle(g) { g.titleEl.textContent = groupTitleText(g); }
+
+function updateGroupTitle(g) {
+  g.titleEl.textContent = groupTitleText(g);
+  // The raw total stays reachable without cluttering the line.
+  g.titleEl.title = `${g.n} ${g.n === 1 ? 'tool call' : 'tool calls'}`;
+}
 
 // Keep the newest tool calls visible: pin the group's scroll region to the
 // bottom (rows are appended there). rAF-batched so a burst of calls costs one
@@ -352,7 +597,11 @@ function completeGroup(g) {
     g.titleEl.addEventListener('animationend',
       () => g.titleEl.classList.remove('group-title-wave'), { once: true });
   }
-  g.metaEl.textContent = fmtElapsed(Date.now() - g.startTs);
+  // On replay the wall clock is meaningless (everything happens "now"); use the
+  // timestamp of the event that closed the group so the shown elapsed is the real
+  // historical duration, not ~0s.
+  const nowTs = (replaying && replayTs != null) ? replayTs : Date.now();
+  g.metaEl.textContent = fmtElapsed(nowTs - g.startTs);
   setGroupOpen(g, false);
 }
 
@@ -380,9 +629,12 @@ function startActionGroup() {
     scrollEl: el.querySelector('.group-scroll'),
     listEl: el.querySelector('.group-list'),
     caret: el.querySelector('.group-caret'),
-    n: 0, readFiles: new Set(), changedFiles: new Set(),
+    n: 0, counts: newGroupCounts(),
     liveId: null, liveEv: null, liveRow: null,
-    startTs: Date.now(), completed: false, open: true,
+    // On replay, anchor the group's clock to the event's real timestamp so its
+    // completed elapsed reflects history, not the instant of the rebuild.
+    startTs: (replaying && replayTs != null) ? replayTs : Date.now(),
+    completed: false, open: true,
   };
   g.titleEl.classList.add('shimmer'); // active → silver sweep until completed
   g.head.addEventListener('click', () => setGroupOpen(g, !g.open));
@@ -401,7 +653,7 @@ function actionInner(ev, state) {
     interrupted: '<span class="text-term-muted">○</span>',
   }[state];
   const nameCls = state === 'warn' ? 'text-term-red' : 'text-term-text';
-  return `${icon} <span class="${nameCls}">${escapeHtml(ev.tool)}</span>` +
+  return `${icon} <span class="${nameCls}">${escapeHtml(toolDisplayName(ev.tool))}</span>` +
     ` <span class="text-term-muted">${escapeHtml(argSummary(ev.args))}</span>` +
     (state === 'warn' ? ' <span class="text-term-red">loop warning</span>' : '');
 }
@@ -418,9 +670,7 @@ function pushAction(ev, state) {
   g.listEl.appendChild(row);
   if (state === 'live') { registerSpinners(row); g.liveId = ev.id; g.liveEv = ev; g.liveRow = row; }
   g.n += 1;
-  const key = toolPathKey(ev.args) || `${ev.tool}#${g.n}`;
-  if (READ_FILE_TOOLS.has(ev.tool)) g.readFiles.add(key);
-  else if (CHANGE_FILE_TOOLS.has(ev.tool)) g.changedFiles.add(key);
+  countToolCall(g.counts, ev, g.n);
   updateGroupTitle(g);
   if (g.open) scrollGroupToBottom(g);
   return row;
@@ -533,8 +783,13 @@ function renderError(content) {
 function renderStatus(ev) {
   // The steps / tools / ctx / resets header counters were removed; the only status
   // field still surfaced is the token count, which rides on the live Thinking… line.
-  if (ev.ctx_tokens !== undefined && ev.ctx_tokens !== null) {
-    sessionTokens = ev.ctx_tokens;
+  // Prefer convo_tokens (real provider counts, monotonic). Transcripts recorded
+  // before that field existed still replay, falling back to the old ctx_tokens
+  // estimate rather than showing zero.
+  const tokens = (ev.convo_tokens !== undefined && ev.convo_tokens !== null)
+    ? ev.convo_tokens : ev.ctx_tokens;
+  if (tokens !== undefined && tokens !== null) {
+    convoTokens = tokens;
     _updateThinkingMeta();
   }
 }
@@ -700,7 +955,9 @@ function _startWave() {
   if (_freezeTimer) { clearTimeout(_freezeTimer); _freezeTimer = null; }
   _wave = { originTs: performance.now(), bars: new Map(), done: false };
   const el = _dock();
-  el.querySelector('.cdock-body').innerHTML = '';
+  // Running bars live in .cdock-active; finished ones are moved into a lazily
+  // created .cdock-completed group below them (see subagentDone).
+  el.querySelector('.cdock-body').innerHTML = '<div class="cdock-active"></div>';
   el.querySelector('.cdock-summary').style.display = 'none';
   _openSubagents(); // auto-reveal the sidebar when a wave starts so the work is visible
   _waveTicker = setInterval(_renderWave, 200);
@@ -708,6 +965,45 @@ function _startWave() {
 }
 
 function _ensureWave() { if (!_wave || _wave.done) _startWave(); }
+
+// Rebuild the Subagents dock from a persisted snapshot after a refresh / reopen,
+// so the menu doesn't vanish. This is a STATIC restore — no live timeline or
+// ticker (the run that produced these subagents is over from the dock's view);
+// every row renders in its final label-only form. A subsequent live wave_started
+// clears this and takes over.
+function waveRestore(ev) {
+  const dock = ev && ev.dock;
+  const rows = dock && Array.isArray(dock.rows) ? dock.rows : [];
+  if (!rows.length) return;
+  _hudEnsure();
+  const el = _dock();
+  const body = el.querySelector('.cdock-body');
+  body.innerHTML = '<div class="cdock-active"></div>';
+  el.querySelector('.cdock-summary').style.display = 'none';
+  _wave = null; // static — not a live wave
+  let doneCount = 0;
+  rows.forEach(r => {
+    const row = document.createElement('div');
+    row.className = 'cbar cbar-done ' + (r.running ? '' : (r.ok ? 'cbar-ok' : 'cbar-failed'));
+    row.innerHTML =
+      '<div class="cbar-label"><span class="cbar-name"></span><span class="cbar-task"></span>' +
+      '<span class="cbar-model"></span><span class="cbar-key"></span><span class="cbar-stat"></span></div>';
+    row.querySelector('.cbar-name').textContent = r.agent || '';
+    row.querySelector('.cbar-task').textContent = r.task || '';
+    row.querySelector('.cbar-model').textContent =
+      _modelTierLabel(r.tier, r.model) + (r.escalated ? ' ⇡' : '');
+    row.querySelector('.cbar-key').textContent = r.key_label || '';
+    row.querySelector('.cbar-stat').textContent = r.running
+      ? `⋯ interrupted · ${r.tokens || 0} tok · step ${r.steps || 0}`
+      : `${r.ok ? '✓' : '✗'} ${r.elapsed_s || 0}s · ${r.tokens || 0} tok · ${r.steps || 0} steps`;
+    _completedSection().appendChild(row);
+    if (!r.running) doneCount++;
+  });
+  const cnt = _completedSection().querySelector('.cdock-done-count');
+  if (cnt) cnt.textContent = String(rows.length);
+  el.querySelector('.cdock-count').textContent = '';
+  _updateFab(0, doneCount > 0); // surface the FAB so the menu is reachable; don't auto-open
+}
 
 function waveStarted(ev) { _hudEnsure(); _startWave(); }
 
@@ -733,11 +1029,26 @@ function subagentStarted(ev) {
   row.querySelector('.cbar-task').textContent = ev.task || '';
   row.querySelector('.cbar-model').textContent = _modelTierLabel(ev.tier, ev.model);
   row.querySelector('.cbar-key').textContent = ev.key_label || '';
-  _dock().querySelector('.cdock-body').appendChild(row);
+  const active = _dock().querySelector('.cdock-active') || _dock().querySelector('.cdock-body');
+  active.appendChild(row);
   _wave.bars.set(key, { row, startOffsetMs: now - _wave.originTs, endOffsetMs: null,
                         ok: null, steps: 0, tokens: 0, name: ev.agent, running: true,
                         tier: ev.tier });
   _renderWave();
+}
+
+// Lazily create (once per wave) the "Completed" group that finished subagent
+// rows are moved into, appended below the live .cdock-active bars in the body.
+function _completedSection() {
+  const body = _dock().querySelector('.cdock-body');
+  let sec = body.querySelector('.cdock-completed');
+  if (!sec) {
+    sec = document.createElement('div');
+    sec.className = 'cdock-completed';
+    sec.innerHTML = '<div class="cdock-done-title">Completed <span class="cdock-done-count">0</span></div>';
+    body.appendChild(sec);
+  }
+  return sec;
 }
 
 function subagentProgress(ev) {
@@ -766,6 +1077,17 @@ function subagentDone(ev) {
     modelEl.textContent = _modelTierLabel(bar.tier, ev.model) + (ev.escalated ? ' ⇡' : '');
     if (ev.escalated) modelEl.title = 'escalated to a stronger model after repeated protocol errors';
   }
+  // Retire the finished row: its timeline bar only ever spanned its slice of the
+  // shared wall-clock axis (green but never "full", which misreads as still
+  // running), so drop the track entirely and file the row under a "Completed"
+  // title. The ✓/✗ stat line now carries the outcome.
+  const track = bar.row.querySelector('.cbar-track');
+  if (track) track.remove();
+  bar.row.classList.add('cbar-done', ev.ok ? 'cbar-ok' : 'cbar-failed');
+  const sec = _completedSection();
+  sec.appendChild(bar.row);
+  const cnt = sec.querySelector('.cdock-done-count');
+  if (cnt) cnt.textContent = String(sec.querySelectorAll('.cbar-done').length);
   _hudOnDone(ev);
   _renderWave();
   // Singleton (write) waves have no wave_done: freeze when nothing is running.
@@ -813,8 +1135,9 @@ function _renderWave() {
   el.querySelector('.cdock-count').textContent = _wave.done ? '' : `${runningCount} running`;
   _updateFab(runningCount, _wave.done);
   bars.forEach(b => {
-    const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs;
     const fill = b.row.querySelector('.cbar-fill');
+    if (!fill) return;   // a completed row: its timeline track was removed on done
+    const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs;
     fill.style.left = `${(b.startOffsetMs / span) * 100}%`;
     fill.style.width = `${Math.max(1, ((end - b.startOffsetMs) / span) * 100)}%`;
   });
@@ -1405,6 +1728,7 @@ window.__agent = {
       case 'status': renderStatus(ev); break;
       case 'file_tree': renderFileTree(ev.tree); break;
       case 'plan_update': renderPlan(ev.plan); break;
+      case 'wave_restore': waveRestore(ev); break;
       case 'wave_started': waveStarted(ev); break;
       case 'subagent_started': subagentStarted(ev); break;
       case 'subagent_progress': subagentProgress(ev); break;
@@ -1489,9 +1813,16 @@ function onSessionStarted(ev) {
     // scroll/layout — one scroll to the bottom once the DOM is rebuilt.
     replaying = true;
     try {
-      for (const e of transcript) { try { window.__agent.onEvent(e); } catch (_) {} }
+      for (const e of transcript) {
+        replayTs = (typeof e.ts === 'number') ? e.ts : null;
+        try { window.__agent.onEvent(e); } catch (_) {}
+      }
+      // If the run isn't still live, settle the last open action group using the
+      // final event's timestamp so it shows its real elapsed and collapses.
+      if (!ev.busy) finalizeLiveLines();
     } finally {
       replaying = false;
+      replayTs = null;
     }
     chat.scrollTop = chat.scrollHeight;
   } else {

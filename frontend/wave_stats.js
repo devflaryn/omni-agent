@@ -40,7 +40,8 @@ function formatClock(ms) {
   return `${s}s`;
 }
 
-// Compact token count: 940 -> "940", 12400 -> "12.4k", 2_100_000 -> "2.1M".
+// Compact token count. One decimal is kept only below 10 of a unit, so:
+// 940 -> "940", 9400 -> "9.4k", 12400 -> "12k", 2_100_000 -> "2.1M".
 function formatTokens(n) {
   n = Math.max(0, Math.round(n || 0));
   if (n < 1000) return String(n);
