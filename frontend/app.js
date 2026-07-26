@@ -95,6 +95,27 @@ const INPUT_MAX_H = 260;
 // to dark) in sync with the <html class="light"> flag.
 const _THEME_SUN = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
 const _THEME_MOON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+// ---------- sidebar collapse ----------
+// The file tree is a fixed --sidebar-w column. On a narrow window that column is
+// most of the usable width, so it can be folded away entirely; the chat reclaims
+// the space and a matching expand button appears in the header. Persisted so the
+// choice survives a reload.
+const SIDEBAR_KEY = 'omni-sidebar-collapsed';
+
+function setSidebarCollapsed(collapsed) {
+  $('app').classList.toggle('sidebar-collapsed', collapsed);
+  try { localStorage.setItem(SIDEBAR_KEY, collapsed ? '1' : '0'); } catch (e) { /* private mode */ }
+  // The graph canvases size themselves to their container, so a width change
+  // has to be announced or the 3D view keeps rendering at the old width.
+  resizeGraph3D();
+}
+
+function applySidebarState() {
+  let collapsed = false;
+  try { collapsed = localStorage.getItem(SIDEBAR_KEY) === '1'; } catch (e) { /* private mode */ }
+  $('app').classList.toggle('sidebar-collapsed', collapsed);
+}
+
 function applyThemeIcons() {
   const light = document.documentElement.classList.contains('light');
   const icon = light ? _THEME_MOON : _THEME_SUN;
@@ -1969,109 +1990,6 @@ async function confirmImport() {
   }
 }
 
-// ---------- export workspace ----------
-function renderExportDiff(diff) {
-  const listEl = $('exportDiffList');
-  const summaryEl = $('exportDiffSummary');
-  const groups = [
-    ['added', 'text-term-green', '+'],
-    ['modified', 'text-term-orange', '~'],
-    ['deleted', 'text-term-red', '-'],
-  ];
-  const total = diff.added.length + diff.modified.length + diff.deleted.length;
-  summaryEl.textContent = total === 0
-    ? 'No changes since import — exporting will not modify the target folder.'
-    : `${diff.added.length} added, ${diff.modified.length} modified, ${diff.deleted.length} deleted.`;
-  listEl.innerHTML = '';
-  for (const [key, color, sign] of groups) {
-    const files = diff[key];
-    if (!files.length) continue;
-    const section = document.createElement('div');
-    const label = document.createElement('div');
-    label.className = `text-[10px] uppercase tracking-wider ${color} mb-1`;
-    label.textContent = `${key} (${files.length})`;
-    section.appendChild(label);
-    const list = document.createElement('div');
-    list.className = 'space-y-0.5 max-h-40 overflow-y-auto rounded-lg border border-term-line bg-term-bg p-2';
-    files.forEach(f => {
-      const row = document.createElement('div');
-      row.className = `${color} text-[11px] font-mono`;
-      row.textContent = `${sign} ${f}`;
-      list.appendChild(row);
-    });
-    section.appendChild(list);
-    listEl.appendChild(section);
-  }
-}
-
-let _exportDiffCache = null;
-
-async function openExportModal() {
-  if (!session) return;
-  $('exportError').textContent = '';
-  $('exportTargetPath').textContent = '—';
-  $('exportDiffSummary').textContent = 'Pick a target folder…';
-  $('exportDiffList').innerHTML = '';
-  $('exportApproveBtn').disabled = true;
-  _exportDiffCache = null;
-
-  let targetPath;
-  try {
-    const pick = await pywebview.api.pick_folder();
-    if (!pick || !pick.ok || !pick.path) return; // cancelled
-    targetPath = pick.path;
-  } catch (e) {
-    $('exportError').textContent = '' + e;
-    return;
-  }
-
-  $('exportModal').classList.remove('hidden');
-  $('exportTargetPath').textContent = targetPath;
-  $('exportDiffSummary').textContent = 'Computing changes…';
-
-  try {
-    const res = await pywebview.api.compute_export_diff(session.project);
-    if (!res.ok) {
-      $('exportDiffSummary').textContent = '';
-      $('exportError').textContent = res.error || 'Failed to compute diff.';
-      return;
-    }
-    _exportDiffCache = { targetPath, diff: res.diff };
-    renderExportDiff(res.diff);
-    $('exportApproveBtn').disabled = false;
-  } catch (e) {
-    $('exportError').textContent = '' + e;
-  }
-}
-
-function closeExportModal() {
-  $('exportModal').classList.add('hidden');
-  _exportDiffCache = null;
-}
-
-async function approveExport() {
-  if (!session || !_exportDiffCache) return;
-  $('exportError').textContent = '';
-  const btn = $('exportApproveBtn'); btn.disabled = true; btn.textContent = 'exporting…';
-  try {
-    const res = await pywebview.api.export_workspace(session.project, _exportDiffCache.targetPath);
-    if (!res.ok) {
-      $('exportError').textContent = res.error || 'Export failed.';
-      return;
-    }
-    const a = res.applied;
-    $('exportDiffSummary').textContent = `Done: ${a.copied.length} file(s) copied, ${a.deleted.length} deleted` +
-      (a.errors.length ? `, ${a.errors.length} error(s)` : '') + '.';
-    if (a.errors.length) $('exportError').textContent = a.errors.join(' | ');
-    $('exportDiffList').innerHTML = '';
-    _exportDiffCache = null;
-  } catch (e) {
-    $('exportError').textContent = '' + e;
-  } finally {
-    btn.disabled = false; btn.textContent = 'approve & export';
-  }
-}
-
 // ---------- LLM provider settings (multiple providers + fallback order) ----------
 let _llmProviders = [];        // preset metadata from the backend
 let _llmConfigs = [];          // ordered list of saved providers (order = fallback priority)
@@ -3568,6 +3486,9 @@ async function init() {
   });
   $('uploadFilesBtn').addEventListener('click', uploadFiles);
   $('composerUploadBtn').addEventListener('click', uploadFiles);
+  $('sidebarCollapseBtn').addEventListener('click', () => setSidebarCollapsed(true));
+  $('sidebarExpandBtn').addEventListener('click', () => setSidebarCollapsed(false));
+  applySidebarState();
   $('changeSessionBtn').addEventListener('click', async () => {
     await pywebview.api.end_session();
   });
@@ -3597,11 +3518,6 @@ async function init() {
   $('viewerBack').addEventListener('click', backToArchiveListing);
   $('fileViewer').addEventListener('click', (e) => { if (e.target.id === 'fileViewer') $('fileViewer').classList.add('hidden'); });
 
-  $('exportWorkspaceBtn').addEventListener('click', openExportModal);
-  $('exportModalClose').addEventListener('click', closeExportModal);
-  $('exportCancelBtn').addEventListener('click', closeExportModal);
-  $('exportApproveBtn').addEventListener('click', approveExport);
-  $('exportModal').addEventListener('click', (e) => { if (e.target.id === 'exportModal') closeExportModal(); });
 
   $('modelSelect').addEventListener('change', onModelSelected);
   $('llmSettingsBtn').addEventListener('click', openLlmModal);
@@ -3619,7 +3535,6 @@ async function init() {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       $('fileViewer').classList.add('hidden');
-      closeExportModal();
       closeLlmModal();
       _closeModelMenu();
     }

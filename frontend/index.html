@@ -43,6 +43,44 @@
       --shimmer-base: 146 143 135;
       --shimmer-hi: 253 252 248;
       --shimmer-glow: rgba(255, 255, 255, .16);
+
+      /* TEXT variants of the accents. The values above are tuned for fills,
+         borders and dots; as small text on --term-panel several of them fell
+         under the WCAG AA 4.5:1 floor (cyan 4.24, red 4.46, gray 3.69). These
+         hold hue and saturation and move only lightness until they clear 4.5
+         against BOTH --term-panel and --term-bg. Use -fg for any text; use the
+         plain variable for everything else.
+         Asserted by tests/frontend/test_contrast.mjs. */
+      --term-cyan-fg: 219 128 98;     /* #DB8062 — panel 4.58, bg 5.25 */
+      --term-red-fg: 230 120 109;     /* #E6786D — panel 4.58, bg 5.25 */
+      --term-gray-fg: 154 152 145;    /* #9A9891 — panel 4.58, bg 5.25 */
+      --term-green-fg: 133 165 113;   /* already 4.80 / 5.50 */
+      --term-magenta-fg: 140 169 198; /* already 5.42 / 6.21 */
+      --term-orange-fg: 217 164 91;   /* already 5.93 / 6.79 */
+
+      /* ---- spacing: 4px grid ---- */
+      --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
+      --space-4: 16px; --space-5: 24px; --space-6: 32px;
+
+      /* ---- type ramp. Replaces the ad-hoc 10/10.5/11/12/12.5/13/14 mix. ---- */
+      --text-2xs: 10px;   /* eyebrow labels, tree meta */
+      --text-xs: 11px;    /* secondary / muted */
+      --text-sm: 12px;    /* dense UI, tree rows, chat meta */
+      --text-base: 13px;  /* body */
+      --text-lg: 15px;    /* panel + modal titles */
+      --text-xl: 20px;    /* start screen heading */
+      --leading-tight: 1.35;
+      --leading-normal: 1.55;
+
+      /* ---- control heights: every button/input/select lands on one ---- */
+      --control-h-sm: 26px; --control-h-md: 32px; --control-h-lg: 38px;
+
+      /* ---- radii ---- */
+      --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px; --radius-full: 999px;
+
+      /* ---- layout ---- */
+      --sidebar-w: 288px;   /* was a hard-coded Tailwind w-72 */
+      --measure: 64rem;     /* max readable column width */
     }
     html.light {
       color-scheme: light;
@@ -61,6 +99,15 @@
       --shimmer-base: 168 165 155;
       --shimmer-hi: 66 63 55;
       --shimmer-glow: rgba(0, 0, 0, .05);
+
+      /* Light theme failed AA on panel across the board (every accent landed
+         between 3.4 and 4.4). Darkened to clear 4.5 on both surfaces. */
+      --term-cyan-fg: 171 81 51;      /* #AB5133 — panel 4.57, bg 5.04 */
+      --term-red-fg: 189 64 53;       /* #BD4035 — panel 4.58, bg 5.05 */
+      --term-green-fg: 82 116 66;     /* #527442 — panel 4.59, bg 5.06 */
+      --term-magenta-fg: 81 110 141;  /* #516E8D — panel 4.56, bg 5.03 */
+      --term-orange-fg: 144 98 30;    /* #90621E — panel 4.57, bg 5.04 */
+      --term-gray-fg: 110 107 101;    /* #6E6B65 — panel 4.57, bg 5.04 */
     }
     html, body { background: rgb(var(--term-bg)); }
     /* Smooth hovers on interactive elements only. (This used to be a universal
@@ -74,6 +121,24 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgb(var(--term-line)); border-radius: 8px; }
     ::-webkit-scrollbar-thumb:hover { background: rgb(var(--term-muted) / .55); }
+
+    /* Repoint the accent TEXT utilities at the AA-compliant -fg variants. Doing
+       it here rather than at ~50 markup sites means bg-/border-/fill- utilities
+       keep the vivid base colors, which is what they should use — only text had
+       a contrast problem. These win over tailwind.css purely by source order
+       (same specificity, this <style> comes after the <link>), so no rebuild is
+       needed. Opacity modifiers like text-term-cyan/70 would bypass this, so
+       none are used on accents — enforced by tests/frontend/test_contrast.mjs
+       having a matching audit in the UI review. */
+    .text-term-cyan { color: rgb(var(--term-cyan-fg)); }
+    .text-term-red { color: rgb(var(--term-red-fg)); }
+    .text-term-green { color: rgb(var(--term-green-fg)); }
+    .text-term-magenta { color: rgb(var(--term-magenta-fg)); }
+    .text-term-orange { color: rgb(var(--term-orange-fg)); }
+    .text-term-gray { color: rgb(var(--term-gray-fg)); }
+    /* Hover variants resolve to the same utility name in tailwind's output. */
+    .hover\:text-term-cyan:hover { color: rgb(var(--term-cyan-fg)); }
+    .hover\:text-term-red:hover { color: rgb(var(--term-red-fg)); }
 
     /* Liquid-silver sweep for in-progress thinking text. No filter here: an
        animated drop-shadow forced a full repaint of the line every frame for
@@ -422,6 +487,146 @@
       color: rgb(var(--term-muted)); font-variant-numeric: tabular-nums;
     }
     .cdock-summary .cdock-speedup { color: rgb(var(--term-green)); font-weight: 600; }
+
+    /* ================= shared controls =================
+       Appearance + sizing for the widgets that used to carry ad-hoc utility
+       strings (px-3 py-2.5 rounded-xl border border-term-line ... repeated at
+       ~40 sites with four different paddings). Layout stays with Tailwind;
+       these own the scale so every control lands on the same grid. */
+
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
+      height: var(--control-h-md); padding: 0 var(--space-4);
+      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-full);
+      background: transparent; color: rgb(var(--term-text));
+      font-size: var(--text-sm); font-weight: 500; line-height: 1;
+      white-space: nowrap; cursor: pointer;
+    }
+    .btn:hover:not(:disabled) { background: rgb(var(--term-line) / .6); }
+    .btn:disabled { opacity: .4; cursor: default; }
+    .btn:focus-visible { outline: 2px solid rgb(var(--term-cyan)); outline-offset: 2px; }
+
+    .btn-primary {
+      background: rgb(var(--term-cyan)); border-color: transparent; color: #fff; font-weight: 600;
+    }
+    .btn-primary:hover:not(:disabled) { background: rgb(var(--term-cyan)); opacity: .9; }
+    .btn-ghost { border-color: transparent; color: rgb(var(--term-muted)); }
+    .btn-ghost:hover:not(:disabled) { background: rgb(var(--term-line) / .6); color: rgb(var(--term-text)); }
+    .btn-danger { color: rgb(var(--term-red-fg)); }
+    .btn-danger:hover:not(:disabled) { border-color: rgb(var(--term-red)); background: rgb(var(--term-red) / .12); }
+    .btn-sm { height: var(--control-h-sm); padding: 0 var(--space-3); font-size: var(--text-xs); }
+    .btn-lg { height: var(--control-h-lg); padding: 0 var(--space-5); font-size: var(--text-base); }
+
+    /* Square icon-only button. Was five different sizings (h-7 w-7, h-9 w-9,
+       px-2 py-1) that never lined up with each other in a toolbar. */
+    .icon-btn {
+      display: inline-grid; place-items: center; flex-shrink: 0;
+      width: var(--control-h-sm); height: var(--control-h-sm);
+      border: 0; border-radius: var(--radius-full);
+      background: transparent; color: rgb(var(--term-muted)); cursor: pointer;
+    }
+    .icon-btn:hover:not(:disabled) { background: rgb(var(--term-line) / .6); color: rgb(var(--term-text)); }
+    .icon-btn:disabled { opacity: .4; cursor: default; }
+    .icon-btn:focus-visible { outline: 2px solid rgb(var(--term-cyan)); outline-offset: 2px; }
+    .icon-btn-md { width: var(--control-h-md); height: var(--control-h-md); }
+    .icon-btn-bordered { border: 1px solid rgb(var(--term-line)); }
+
+    .field {
+      width: 100%; height: var(--control-h-md);
+      padding: 0 var(--space-3);
+      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-md);
+      background: rgb(var(--term-bg)); color: rgb(var(--term-text));
+      font-size: var(--text-sm); font-family: inherit;
+      outline: none;
+    }
+    .field:focus { border-color: rgb(var(--term-cyan)); }
+    .field::placeholder { color: rgb(var(--term-muted)); }
+    .field:disabled, .field[readonly] { color: rgb(var(--term-muted)); cursor: default; }
+    .field-sm { height: var(--control-h-sm); font-size: var(--text-xs); padding: 0 var(--space-2); }
+    textarea.field { height: auto; padding: var(--space-2) var(--space-3); line-height: var(--leading-normal); }
+
+    .chip {
+      display: inline-flex; align-items: center; gap: var(--space-1);
+      padding: 2px var(--space-2);
+      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-full);
+      font-size: var(--text-2xs); line-height: 1.5; white-space: nowrap;
+      color: rgb(var(--term-muted));
+    }
+
+    .eyebrow {
+      font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: .08em;
+      color: rgb(var(--term-muted));
+    }
+
+    /* --- modal chrome. #fileViewer and #llmModal each hand-rolled
+       their own header/body/footer with different paddings and title sizes. --- */
+    .modal-backdrop {
+      position: absolute; inset: 0; z-index: 40;
+      display: flex; align-items: center; justify-content: center;
+      padding: var(--space-5);
+      background: rgb(0 0 0 / .5); backdrop-filter: blur(4px);
+    }
+    .modal-backdrop.hidden { display: none; }
+    .modal-shell {
+      display: flex; flex-direction: column;
+      width: 100%; min-height: 0;
+      /* Never taller than the window: the body scrolls, the shell does not. */
+      max-height: 100%;
+      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-lg);
+      background: rgb(var(--term-panel));
+      box-shadow: 0 20px 50px rgb(0 0 0 / .35);
+      overflow: hidden;
+    }
+    .modal-head {
+      display: flex; align-items: center; gap: var(--space-3); flex-shrink: 0;
+      padding: var(--space-3) var(--space-4);
+      border-bottom: 1px solid rgb(var(--term-line));
+    }
+    .modal-title { font-family: var(--font-serif, inherit); font-size: var(--text-lg); color: rgb(var(--term-text)); }
+    .modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: var(--space-4); }
+    .modal-foot {
+      display: flex; align-items: center; gap: var(--space-3); flex-shrink: 0;
+      padding: var(--space-3) var(--space-4);
+      border-top: 1px solid rgb(var(--term-line));
+    }
+
+    /* ================= layout / responsive =================
+       "Resizings": the app must stay usable at the 980x600 minimum window and
+       not stretch into unreadable line lengths at the wide end. */
+
+    /* The page itself never scrolls sideways; individual regions opt in. */
+    html, body { overflow: hidden; }
+    .scroll-y { overflow-y: auto; overflow-x: hidden; }
+    .scroll-both { overflow: auto; }
+
+    /* Collapsible file-tree sidebar (was a hard-coded Tailwind w-72). */
+    #sidebar {
+      width: var(--sidebar-w);
+      flex-shrink: 0;
+      transition: width .18s ease;
+    }
+    #app.sidebar-collapsed #sidebar {
+      width: 0;
+      border-right-width: 0;
+      overflow: hidden;
+      pointer-events: none;
+    }
+    /* The re-open affordance only exists while collapsed. */
+    #sidebarExpandBtn { display: none; }
+    #app.sidebar-collapsed #sidebarExpandBtn { display: inline-grid; }
+
+    /* Narrow windows: shed the labels that push the header past its width
+       before anything gets clipped. */
+    @media (max-width: 1100px) {
+      .hide-narrow { display: none !important; }
+    }
+    @media (max-width: 900px) {
+      :root { --sidebar-w: 232px; }
+    }
+
+    /* Cap prose columns at a readable measure on very wide windows. The chat
+       already does this inline; the plan tab did not and ran edge to edge. */
+    .measure { max-width: var(--measure); margin-inline: auto; width: 100%; }
   </style>
 </head>
 <body class="h-full font-sans text-[13px] text-term-text antialiased">
@@ -471,7 +676,7 @@
             <input id="importProjectNameInput" placeholder="new-project-name" class="flex-1 rounded-xl border border-term-line bg-term-bg px-3 py-2.5 outline-none focus:border-term-cyan" />
             <button id="importConfirmBtn" class="rounded-xl bg-term-cyan/15 px-4 py-2.5 font-medium text-term-cyan hover:bg-term-cyan/25">import &amp; copy in</button>
           </div>
-          <p class="text-[10.5px] leading-4 text-term-muted">Copies the folder into the agent's own workspace — your original files are never edited directly. Use "export changes" later (in the workspace panel) to apply the exact changes back out, after you approve them.</p>
+          <p class="leading-4 text-term-muted" style="font-size:var(--text-2xs)">Copies the folder into the agent's own workspace, so your original files are never edited directly.</p>
         </div>
       </div>
 
@@ -489,25 +694,29 @@
   <div id="app" class="hidden h-full w-full flex">
 
     <!-- LEFT: FILE TREE -->
-    <aside class="w-72 shrink-0 flex flex-col border-r border-term-line bg-term-panel">
-      <div class="flex items-center justify-between border-b border-term-line px-3 py-2.5">
+    <aside id="sidebar" class="flex flex-col border-r border-term-line bg-term-panel">
+      <div class="flex items-center justify-between gap-2 border-b border-term-line px-3 py-2">
         <div class="min-w-0">
-          <div class="text-[10px] uppercase tracking-wider text-term-muted">workspace</div>
-          <div id="treeProjectName" class="truncate font-serif text-[14px] text-term-text">—</div>
+          <div class="eyebrow">workspace</div>
+          <div id="treeProjectName" class="truncate font-serif text-term-text" style="font-size:var(--text-lg)">—</div>
         </div>
-        <div class="flex items-center gap-1 shrink-0">
-          <button id="uploadFilesBtn" title="Upload files into the workspace" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text">
+        <div class="flex items-center gap-0.5 shrink-0">
+          <button id="uploadFilesBtn" title="Upload files into the workspace" class="icon-btn">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
           </button>
-          <button id="exportWorkspaceBtn" title="Export changes to a folder" class="rounded-full px-2 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">⇪</button>
-          <button id="refreshTreeBtn" title="Refresh" class="rounded-full px-2 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">⟳</button>
+          <button id="refreshTreeBtn" title="Refresh" class="icon-btn">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+          </button>
+          <button id="sidebarCollapseBtn" title="Hide the file tree" class="icon-btn">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
         </div>
       </div>
-      <div id="importBanner" class="hidden border-b border-term-line px-3 py-2 text-[10px] text-term-muted">
+      <div id="importBanner" class="hidden border-b border-term-line px-3 py-2 text-term-muted" style="font-size:var(--text-2xs)">
         imported from <span id="importSourceLabel" class="text-term-text"></span>
       </div>
-      <div id="fileTree" class="flex-1 overflow-auto px-1.5 py-2 text-[12px] leading-5"></div>
-      <div class="border-t border-term-line px-3 py-2 text-[10px] text-term-muted">
+      <div id="fileTree" class="scroll-y flex-1 px-1.5 py-2 leading-5" style="font-size:var(--text-sm)"></div>
+      <div class="border-t border-term-line px-3 py-2 text-term-muted" style="font-size:var(--text-2xs)">
         <span id="treeFileCount">0</span> files · click a file to view
       </div>
     </aside>
@@ -515,18 +724,21 @@
     <!-- RIGHT: CHAT -->
     <main class="flex-1 flex flex-col min-w-0 bg-term-bg">
       <!-- top bar -->
-      <header class="flex h-12 items-center gap-3 border-b border-term-line bg-term-panel px-4">
+      <header class="flex h-12 items-center gap-2 border-b border-term-line bg-term-panel px-3">
+        <button id="sidebarExpandBtn" title="Show the file tree" class="icon-btn">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+        </button>
         <div class="flex items-center gap-2 min-w-0">
           <span class="h-2 w-2 shrink-0 rounded-full bg-term-green"></span>
-          <span id="projectBadge" class="truncate font-serif text-[14px] text-term-text">project</span>
+          <span id="projectBadge" class="truncate font-serif text-term-text" style="font-size:var(--text-lg)">project</span>
         </div>
-        <div class="ml-auto flex items-center gap-3 text-[11px] text-term-muted">
-          <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="rounded-full border border-term-line px-2.5 py-0.5 text-term-cyan hover:bg-term-line/60">plan —</button>
-          <button id="llmSettingsBtn" title="LLM provider settings" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text">
+        <div class="ml-auto flex items-center gap-1 text-term-muted" style="font-size:var(--text-xs)">
+          <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="chip text-term-cyan hover:bg-term-line/60" style="height:var(--control-h-sm)">plan —</button>
+          <button id="llmSettingsBtn" title="LLM provider settings" class="icon-btn">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           </button>
-          <button id="themeToggle" title="Toggle light / dark mode" class="grid h-7 w-7 place-items-center rounded-full text-term-muted hover:bg-term-line/60 hover:text-term-text"></button>
-          <button id="changeSessionBtn" class="rounded-full border border-term-line px-3 py-1 hover:bg-term-line/60 hover:text-term-text">change</button>
+          <button id="themeToggle" title="Toggle light / dark mode" class="icon-btn"></button>
+          <button id="changeSessionBtn" title="Switch workspace" class="btn btn-sm">change</button>
         </div>
       </header>
 
@@ -661,30 +873,6 @@
           <img class="max-h-full max-w-full rounded-lg object-contain" alt="" />
         </div>
         <div id="viewerArchive" class="hidden font-mono text-[12px] leading-5 text-term-text"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ============ EXPORT WORKSPACE MODAL ============ -->
-  <div id="exportModal" class="hidden absolute inset-0 z-40 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-    <div class="flex max-h-[82vh] w-[640px] max-w-[92vw] flex-col rounded-3xl border border-term-line bg-term-panel shadow-2xl">
-      <div class="flex items-center justify-between border-b border-term-line px-5 py-3.5">
-        <div class="min-w-0">
-          <div class="text-[10px] uppercase tracking-wider text-term-muted">export changes to</div>
-          <div id="exportTargetPath" class="truncate font-mono text-[12.5px] text-term-text">—</div>
-        </div>
-        <button id="exportModalClose" class="rounded-full px-2.5 py-1 text-term-muted hover:bg-term-line/60 hover:text-term-text">✕</button>
-      </div>
-      <div class="flex-1 overflow-y-auto px-5 py-3 text-[12px]">
-        <div id="exportDiffSummary" class="mb-3 text-term-muted">Computing changes…</div>
-        <div id="exportDiffList" class="space-y-3"></div>
-      </div>
-      <div class="flex items-center justify-between border-t border-term-line px-5 py-3.5">
-        <span id="exportError" class="text-[11px] text-term-red"></span>
-        <div class="flex items-center gap-2">
-          <button id="exportCancelBtn" class="rounded-full border border-term-line px-4 py-2 text-term-muted hover:bg-term-line/60 hover:text-term-text">cancel</button>
-          <button id="exportApproveBtn" class="rounded-full bg-term-cyan px-5 py-2 font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-40">approve &amp; export</button>
-        </div>
       </div>
     </div>
   </div>
