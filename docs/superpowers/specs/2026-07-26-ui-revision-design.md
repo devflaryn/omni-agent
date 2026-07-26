@@ -1,6 +1,8 @@
 # Omni Agent — UI Revision Design
 
 Date: 2026-07-26
+Status: **implemented** on branch `ui-revision`. See "Implementation notes" at the
+end for where the build diverged from this design and what it uncovered.
 
 ## Problem
 
@@ -449,3 +451,71 @@ a button that has been removed.
 - Any change to the LLM config file format.
 - Cumulative *billing* telemetry (tokens across subagents) — the counter is
   main-conversation size only.
+
+---
+
+# Implementation notes
+
+All three milestones landed. Where the build diverged from the design above, and
+what it turned up:
+
+## Corrections to this document
+
+- **§1.1 wrongly implied `text-[10.5px]` was dead.** It is not: Tailwind escapes
+  a `.` inside an arbitrary value as `\.`, which a naive grep misses. The class
+  compiles fine. The real dead classes were three widths *introduced* by the new
+  picker and LLM markup (`w-[300px]`, `w-[220px]`, `max-w-[320px]`, `w-[272px]`),
+  caught by `test_tailwind_classes.mjs` and moved to inline styles.
+- **The `-fg` colors are applied by overriding the `.text-term-*` utilities**, not
+  by editing markup. `bg-`/`border-`/`fill-` keep the vivid base values, since
+  only text ever had a contrast problem. This changed ~50 sites with 8 CSS rules.
+- **`reveal_in_finder` takes either an absolute or a workspace-relative path.**
+  The picker has no session and passes an absolute path; the file tree passes a
+  relative one, which goes through `_safe_abs`.
+
+## Bugs found while building
+
+1. **`upload_files` raised `NameError` on its success path** (`build_file_tree(project)`,
+   undefined) — as predicted in §3.1, now fixed and regression-tested.
+2. **`tests/frontend/test_hud_integration.mjs` was already broken** and had been
+   for some time; nothing ran it. The DOM shim lacked `remove()`.
+3. **`list_model_options` could not represent "reasoning explicitly off".**
+   `_ladder` deliberately flattens a per-model `off` to `''` so the request
+   builder sends no reasoning params, so the UI could not distinguish it from
+   "unset" and showed "Default". Models now carry a raw `effort_override`.
+   The first fix attempt used `_norm_reasoning`, which collapses `off` the same
+   way — per-model values need `_norm_model_effort`.
+4. **`toolPathKey` only knew 14 argument names**, so 23 of the read/change tools
+   could not dedupe by path at all. Found by a test that cross-checks the
+   frontend's key list against the Python registry's declared parameters.
+5. **Five LLM-settings call sites set status by replacing `className`**, which in
+   the new shared footer also stripped layout classes.
+6. **`el.className = 'a b'` was invisible to `classList.contains()`** in the test
+   DOM shim — a latent source of false passes, fixed while adding the tree tests.
+
+## Test surface added
+
+`tests/frontend/*.mjs` is now wired into pytest via `tests/test_frontend_js.py`.
+Nine frontend suites plus four Python ones; the whole suite runs **720 passed,
+3 skipped** (baseline before this work: 636/3).
+
+The four guards worth knowing about, because they encode constraints this
+codebase cannot otherwise enforce:
+
+| Test | Catches |
+|------|---------|
+| `test_boot.mjs` | `init()` throwing, or looking up an id the markup lacks — verified against a planted regression |
+| `test_tailwind_classes.mjs` | arbitrary utilities absent from the precompiled sheet, which fail silently |
+| `test_contrast.mjs` | any accent dropping below WCAG AA, re-derived from the shipped CSS |
+| `test_tool_meta_coverage.py` | a registered tool with no display name, filtered by defining module so other suites' fixtures don't false-positive |
+
+## Deliberate tradeoffs
+
+- **`.omni-trash` lives inside the workspace**, so the agent's own `list_directory`
+  and greps will see deleted files. Accepted: recoverability was the requirement,
+  and the trash is visible rather than hidden state.
+- **The conversation token counter undercounts by one turn's tool output per
+  auto-summarization** (§1.6). Preferred over reintroducing a `chars ÷ 4` estimate.
+- **No draggable panel splitters** — explicitly declined during design.
+- **`compute_export_diff` / `export_workspace` remain in `agent.py`** with no UI
+  entry point, since the import-a-copy workflow is their other half.
