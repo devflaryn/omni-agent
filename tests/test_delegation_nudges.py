@@ -57,6 +57,49 @@ def test_delegation_resets_the_streak_and_rearms():
     assert len(_sys_msgs(s)) == 2
 
 
+class _TeethStub:
+    """Streak nudge + a spy on the dispatch pass, to prove the nudge now has
+    TEETH: when it trips it doesn't only TALK, it triggers the auto-tag + fan-out
+    pass (the only other place dispatch runs is a plan_* tool call)."""
+    _maybe_nudge_delegation = agent_mod.AgentApi._maybe_nudge_delegation
+
+    def __init__(self):
+        self.dispatch_calls = 0
+
+    def _maybe_dispatch_delegated_steps(self):
+        self.dispatch_calls += 1
+
+
+def test_streak_nudge_triggers_dispatch_when_it_fires():
+    """A tripped streak proactively fans out delegatable plan steps instead of
+    only appending an advisory line — otherwise a long inline-read run with a
+    plan full of ready research steps still produces zero subagents."""
+    s, a = _sess(), _TeethStub()
+    for _ in range(agent_mod.SOLO_READ_NUDGE):
+        a._maybe_nudge_delegation(s, "read_file_chunk")
+    assert len(_sys_msgs(s)) == 1        # the nudge still fires
+    assert a.dispatch_calls == 1         # AND it actually kicked a dispatch pass
+
+
+def test_streak_below_threshold_does_not_dispatch():
+    """Dispatch only rides on an ACTUAL nudge — reads below the threshold must
+    not spawn waves (that would fan out on every single read)."""
+    s, a = _sess(), _TeethStub()
+    for _ in range(agent_mod.SOLO_READ_NUDGE - 1):
+        a._maybe_nudge_delegation(s, "read_file_chunk")
+    assert _sys_msgs(s) == []
+    assert a.dispatch_calls == 0
+
+
+def test_streak_teeth_tolerate_missing_dispatch_method():
+    """The nudge must not require a dispatch method on the instance (the unit
+    stubs above don't have one) — a missing/failed dispatch is swallowed."""
+    s, a = _sess(), _Stub()               # _Stub has no _maybe_dispatch_* method
+    for _ in range(agent_mod.SOLO_READ_NUDGE):
+        a._maybe_nudge_delegation(s, "read_file_chunk")
+    assert len(_sys_msgs(s)) == 1         # still fires, no AttributeError
+
+
 def test_non_readonly_tools_do_not_advance_the_streak():
     s, a = _sess(), _Stub()
     for _ in range(agent_mod.SOLO_READ_NUDGE * 2):

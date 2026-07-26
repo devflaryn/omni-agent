@@ -182,8 +182,13 @@ escalate rather than fail when everything at/below its tier is down; `subagents.
 also steps a subagent ONE rung up after 2 consecutive JSON-protocol parse errors (at most once
 per run — the existing 3-error salvage backstop still applies). Two bounded nudges push more
 delegation: a solo-read streak in the orchestrator's own context (`OMNI_SOLO_READ_NUDGE`,
-default 8, `0` disables) and a plan-shape check that flags 2+ untagged independent research
-steps in the same phase. Both fire at most once per streak/phase.
+default 6, `0` disables) and a plan-shape check that flags 2+ untagged independent research
+steps in the same phase. Both fire at most once per streak/phase. The solo-read streak nudge
+has TEETH: when it trips it also runs the auto-tag + fan-out pass (`_maybe_dispatch_delegated_steps`),
+so a long inline-read run that never touches the plan still gets its ready research/change
+steps dispatched as a real wave — not just an advisory line. It's a no-op when no plan/step
+qualifies (pure free-exploration stays advisory-only, since the harness can't author sub-tasks
+with no plan). Dispatch otherwise only rides on a `plan_*` tool call.
 
 **Commands** (`tools/command_tools.py`) — a plugin's `commands/*.md` are surfaced as an
 `AVAILABLE COMMANDS` index and loaded on demand with `use_command` (the workflow-loader;
