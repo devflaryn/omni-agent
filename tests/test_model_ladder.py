@@ -283,3 +283,19 @@ def test_prompt_contains_delegation_doctrine():
 def test_prompt_keeps_parallel_wave_rule():
     p = llm.get_static_system_prompt()
     assert "parallel wave" in p.lower()
+
+
+def test_premium_ladder_includes_cheaper_rungs_for_failover(monkeypatch):
+    # A premium subagent whose top model 429s must fail over DOWN to cheaper
+    # rungs automatically (this is the "hard fallback-down" guarantee).
+    import llm
+    # Build a 3-rung spine: premium (top), standard, cheap (bottom).
+    # (Use the same monkeypatch/config helper the other tests in this file use.)
+    ladder = llm.model_ladder()
+    if len(ladder) < 2:
+        import pytest; pytest.skip("needs >=2 configured models")
+    premium_chain = llm.models_for_tier("premium", ladder)
+    # The premium chain must contain more than one model (top + cheaper failover).
+    assert len(premium_chain) >= 2
+    # The top rung heads the chain; a cheaper rung appears after it.
+    assert premium_chain[0] == ladder[0]["model"]

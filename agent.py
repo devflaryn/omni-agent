@@ -24,6 +24,7 @@ if sys.platform == "win32":
             _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+import llm
 from llm import (
     ask_llm,
     get_full_system_prompt,
@@ -408,6 +409,13 @@ try:
     SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "6")))
 except ValueError:
     SOLO_READ_NUDGE = 6
+
+# Soft per-session ceiling on PREMIUM subagent dispatches. Advisory: over-budget
+# @premium requests degrade to standard rather than being blocked. 0 = unlimited.
+try:
+    PREMIUM_BUDGET = max(0, int(os.environ.get("OMNI_PREMIUM_BUDGET", "5")))
+except ValueError:
+    PREMIUM_BUDGET = 5
 
 # Tools that MEAN the model delegated — they reset the solo-read streak.
 DELEGATION_TOOLS = {"dispatch_agents", "ask_codebase"}
@@ -1592,6 +1600,10 @@ class AgentApi:
                 "current with record_finding / record_hypothesis / update_hypothesis / record_failed_attempt "
                 "/ record_decision / record_test_result / set_next_steps):\n" + inv.to_markdown()
             )
+        if PREMIUM_BUDGET:
+            used = self.session.get("premium_dispatches", 0)
+            section += (f"\n\n[premium budget: {used}/{PREMIUM_BUDGET} premium "
+                         "subagent dispatches used this session]")
         self.session["messages"][0]["content"] = (
             self.session["base_system_prompt"] + "\n" + tools_section + section
         )
@@ -1710,6 +1722,23 @@ class AgentApi:
             "delegate to take it back."
         )})
 
+    def _premium_budget_gate(self, tier):
+        """Ration premium. Returns (effective_tier, note). A premium request over
+        the soft cap degrades to 'standard' (never blocked); an allowed premium
+        request increments the session counter. Non-premium tiers pass untouched.
+        PREMIUM_BUDGET == 0 disables the cap entirely. (Rate-limit degradation is
+        already handled by models_for_tier's failover body — this only rations.)"""
+        if llm._norm_tier(tier) != "premium":
+            return tier, ""
+        if not PREMIUM_BUDGET:
+            return "premium", ""
+        used = self.session.get("premium_dispatches", 0)
+        if used >= PREMIUM_BUDGET:
+            return "standard", (f"premium budget exhausted ({used}/{PREMIUM_BUDGET}) "
+                                "— ran standard")
+        self.session["premium_dispatches"] = used + 1
+        return "premium", ""
+
     def _maybe_dispatch_delegated_steps(self):
         """Dispatch delegated plan steps of the ACTIVE phase. Parallel-by-default:
         every ready independent READ step (deps satisfied) fans out in ONE wide wave
@@ -1767,6 +1796,10 @@ class AgentApi:
                 ad, tier = _resolve(step)
                 if ad is None:
                     continue
+                tier, budget_note = self._premium_budget_gate(tier)
+                if budget_note:
+                    self._emit({"type": "delegate_note", "agent": ad.name,
+                                "content": budget_note})
                 dispatched.add(step["id"])
                 if parallel and step.get("status") != "in_progress":
                     # Harness-initiated start of a pulled-forward step: mark it live so
@@ -2630,6 +2663,8 @@ class AgentApi:
             # --- delegation nudges (bounded; see _maybe_nudge_delegation) ---
             "solo_read_streak": 0,              # consecutive inline read-only calls
             "solo_read_nudges_sent": 0,         # streak nudges fired this task (escalates wording)
+            "premium_dispatches": 0,            # premium subagent dispatches this session
+            "premium_budget_nudged": 0,         # escalating near-cap nudges sent (Task 6)
             "_delegation_phase_nudged": set(),  # (phase_id, candidate-set) sigs already nudged
             # --- adaptive planning loop policy ---
             "adaptive_planning": ADAPTIVE_PLANNING_DEFAULT,
@@ -3864,6 +3899,32 @@ class AgentApi:
             "Leave untagged only the steps that genuinely need your own judgment."
         )})
 
+    def _maybe_nudge_premium_budget(self, s):
+        """Advisory, escalating, fire-once-per-threshold: warn when premium is
+        nearly (1 left) then fully spent, so the orchestrator reserves it for the
+        highest-value remaining step. `premium_budget_nudged` is the level already
+        announced (0 none / 1 nearly / 2 spent) so neither message repeats every
+        turn. Silent when PREMIUM_BUDGET is disabled or there is >1 headroom."""
+        if not PREMIUM_BUDGET:
+            return None
+        used = s.get("premium_dispatches", 0)
+        remaining = PREMIUM_BUDGET - used
+        sent = s.get("premium_budget_nudged", 0)
+        if remaining <= 0:
+            if sent >= 2:
+                return None
+            s["premium_budget_nudged"] = 2
+            return ("[SYSTEM] Premium budget is spent for this session — further "
+                    "@premium delegations will run on the standard model. Reserve any "
+                    "remaining hard problem for where standard is genuinely insufficient.")
+        if remaining == 1:
+            if sent >= 1:
+                return None
+            s["premium_budget_nudged"] = 1
+            return ("[SYSTEM] Premium budget nearly spent (1 premium dispatch left). "
+                    "Reserve it for the single highest-value remaining step.")
+        return None
+
     def _code_graph_guard(self, s, tool_name):
         """Catch the "sweeping files one by one" anti-pattern. Any navigation tool
         (graph query or content search) resets the counter; a long run of pure
@@ -4174,6 +4235,13 @@ class AgentApi:
         # suppress a nudge that should fire now.
         s["_delegation_nudge_fired_this_turn"] = False
         self._maybe_nudge_delegation(s, tool_name)
+
+        # Premium budget nudge: re-arming advisory when the premium dispatch cap
+        # is within 1 (or already spent), so the orchestrator reserves whatever's
+        # left for the highest-value remaining step (see _maybe_nudge_premium_budget).
+        pn = self._maybe_nudge_premium_budget(s)
+        if pn:
+            s["messages"].append({"role": "user", "content": pn})
 
         # Plan bookkeeping: gate-clear on a real plan, delegation dispatch,
         # phase-change re-grounding, and the plan-touch nudge. Nudge #2 inside it

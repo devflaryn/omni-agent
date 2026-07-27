@@ -197,7 +197,7 @@ class AgentDef:
     def __init__(self, name, system_prompt, mode="read", description="",
                  toolsets=None, allowed_tools=None, temperature=None,
                  max_steps=DEFAULT_MAX_STEPS, allow_optin_read=False,
-                 include_contract=True, tier=None, models=None):
+                 include_contract=True, tier=None, models=None, skills=None):
         self.name = name
         self.system_prompt = system_prompt or ""
         self.mode = "write" if str(mode).lower().startswith("w") else "read"
@@ -213,6 +213,10 @@ class AgentDef:
         # Both are overridable per dispatch — see resolve_model_ladder.
         self.tier = (tier or "").strip().lower() or None
         self.models = list(models) if models else None
+        # Skills this persona wants PRELOADED (bodies injected up front); every
+        # other skill stays reachable on demand via the skills index (see
+        # _build_messages). Empty list, never None, so callers can iterate freely.
+        self.skills = [str(s).strip() for s in (skills or []) if str(s).strip()]
 
     @property
     def is_write(self):
@@ -252,8 +256,20 @@ def resolve_allowed_tools(agent_def):
         tools = {n for n in tools if not is_mutating_tool(n)}
     # No subagent may spawn nested subagents (bounds delegation depth + cost).
     tools -= SUBAGENT_EXCLUDED
+    if _wants_skill_index(agent_def):
+        tools |= {t for t in _SKILL_TOOLS if registry.is_registered(t)}
     # Only real, registered tools survive (drops typos in an override / stale name).
     return {n for n in tools if registry.is_registered(n)}
+
+
+_SKILL_TOOLS = ("use_skill", "read_skill_resource", "list_skills")
+
+
+def _wants_skill_index(agent_def):
+    """True for personas that can ACT on domain knowledge — write agents, or read
+    agents scoped to a toolset (native-analyst), or any persona that pins skills.
+    A bare read researcher stays lean (no index tokens, no skill tools)."""
+    return bool(agent_def.is_write or agent_def.toolsets or agent_def.skills)
 
 
 # --- cost routing ------------------------------------------------------------
@@ -445,6 +461,19 @@ def _build_messages(agent_def, allowed, task, context, run_dir):
     parts = [agent_def.system_prompt.strip()]
     if contract:
         parts.append(contract)
+    if _wants_skill_index(agent_def):
+        import skills_loader
+        # Preload the bodies this persona pinned, so its core domain knowledge is
+        # present up front; everything else stays reachable on demand via the index.
+        if agent_def.skills:
+            catalog = skills_loader.load_skills()
+            for sk in agent_def.skills:
+                entry = catalog.get(sk)
+                if entry and entry.get("body"):
+                    parts.append(f"PRELOADED SKILL — {sk}\n{entry['body'].strip()}")
+        idx = skills_loader.get_skills_prompt()
+        if idx:
+            parts.append(idx)
     parts.append(tool_prompt)
     system_prompt = "\n\n".join(p for p in parts if p)
 
