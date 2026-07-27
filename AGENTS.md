@@ -190,6 +190,33 @@ steps dispatched as a real wave — not just an advisory line. It's a no-op when
 qualifies (pure free-exploration stays advisory-only, since the harness can't author sub-tasks
 with no plan). Dispatch otherwise only rides on a `plan_*` tool call.
 
+**Spending premium** — the premium model is a SCARCE resource (usage limits) and
+you (the orchestrator) run on a cheap model, so you decide when premium is worth
+it by tagging a step or dispatch `@premium` (e.g. `delegate="engineer@premium"`,
+or `"tier":"premium"` in `dispatch_agents`). A live `[premium budget: N/M ...]`
+line shows what you have spent; over-budget `@premium` requests degrade to
+standard automatically, so do not hoard — but do not waste it either.
+
+Spend premium ONLY when at least one holds:
+- the change is cross-cutting / multi-file with non-obvious interactions;
+- a standard attempt already failed or was reverted;
+- the decision is high-stakes and hard to reverse;
+- correctness is subtle (concurrency, security, protocol/format edge cases).
+
+Do NOT spend premium for: research, reads, search, summarization, mechanical or
+localized edits, formatting, or anything a standard attempt has not yet been
+given a shot at. Default is cheap; when unsure, try standard first and escalate
+only on evidence it is insufficient.
+
+**Using the full roster** — do not route everything to researcher + implementer:
+- `engineer@<tier>` for general (non-RE) source edits; `@premium` for complex ones.
+- `debugger@premium` for a stubborn failure a standard attempt already missed.
+- `consultant@premium` when you face ONE hard decision — ask it, then act on the
+  recommendation. This is the sanctioned way to get expensive reasoning into an
+  otherwise-cheap run; judgment steps are still not auto-delegated.
+- `brainstormer` / `architect` when a goal is big or ambiguous, BEFORE planning.
+- `verifier` after a completion claim (the verification plugin also triggers it).
+
 **Commands** (`tools/command_tools.py`) — a plugin's `commands/*.md` are surfaced as an
 `AVAILABLE COMMANDS` index and loaded on demand with `use_command` (the workflow-loader;
 distinct from the core `run_command` shell tool). A command is broader than a skill — it
