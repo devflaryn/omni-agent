@@ -3899,6 +3899,25 @@ class AgentApi:
             "Leave untagged only the steps that genuinely need your own judgment."
         )})
 
+    def _maybe_nudge_premium_budget(self, s):
+        """Advisory, escalating: warn when premium is nearly/fully spent so the
+        orchestrator reserves it for the highest-value remaining step. Silent when
+        PREMIUM_BUDGET is disabled or there is still comfortable headroom (>1 left)."""
+        if not PREMIUM_BUDGET:
+            return None
+        used = s.get("premium_dispatches", 0)
+        remaining = PREMIUM_BUDGET - used
+        if remaining > 1:
+            return None
+        sent = s.get("premium_budget_nudged", 0)
+        s["premium_budget_nudged"] = sent + 1
+        if remaining <= 0:
+            return ("[SYSTEM] Premium budget is spent for this session — further "
+                    "@premium delegations will run on the standard model. Reserve any "
+                    "remaining hard problem for where standard is genuinely insufficient.")
+        return ("[SYSTEM] Premium budget nearly spent (1 premium dispatch left). "
+                "Reserve it for the single highest-value remaining step.")
+
     def _code_graph_guard(self, s, tool_name):
         """Catch the "sweeping files one by one" anti-pattern. Any navigation tool
         (graph query or content search) resets the counter; a long run of pure
@@ -4209,6 +4228,13 @@ class AgentApi:
         # suppress a nudge that should fire now.
         s["_delegation_nudge_fired_this_turn"] = False
         self._maybe_nudge_delegation(s, tool_name)
+
+        # Premium budget nudge: re-arming advisory when the premium dispatch cap
+        # is within 1 (or already spent), so the orchestrator reserves whatever's
+        # left for the highest-value remaining step (see _maybe_nudge_premium_budget).
+        pn = self._maybe_nudge_premium_budget(s)
+        if pn:
+            s["messages"].append({"role": "user", "content": pn})
 
         # Plan bookkeeping: gate-clear on a real plan, delegation dispatch,
         # phase-change re-grounding, and the plan-touch nudge. Nudge #2 inside it
