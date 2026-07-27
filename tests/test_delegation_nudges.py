@@ -479,3 +479,34 @@ def test_plan_nudge_excludes_judgment_steps(monkeypatch):
 def test_ordinal_suffix_handles_teens_and_ones():
     assert [agent_mod._ordinal_suffix(n) for n in (1, 2, 3, 4, 11, 12, 13, 21, 22, 23)] == \
         ["st", "nd", "rd", "th", "th", "th", "th", "st", "nd", "rd"]
+
+
+# --- premium budget gate ------------------------------------------------------
+
+def test_premium_budget_gate_downgrades_over_cap(monkeypatch):
+    import agent
+    monkeypatch.setattr(agent, "PREMIUM_BUDGET", 2, raising=False)
+    api = agent.AgentApi.__new__(agent.AgentApi)     # bare instance; no full boot
+    api.session = {"premium_dispatches": 0}
+    # first two premium calls pass through and increment
+    t1, n1 = api._premium_budget_gate("premium")
+    t2, n2 = api._premium_budget_gate("premium")
+    assert t1 == "premium" and t2 == "premium"
+    assert api.session["premium_dispatches"] == 2
+    # third is over cap -> downgraded to standard, note explains it, no increment
+    t3, n3 = api._premium_budget_gate("premium")
+    assert t3 == "standard" and "premium" in n3.lower()
+    assert api.session["premium_dispatches"] == 2
+    # non-premium tiers are never touched or counted
+    t4, n4 = api._premium_budget_gate("cheap")
+    assert t4 == "cheap" and n4 == ""
+
+
+def test_premium_budget_disabled_when_zero(monkeypatch):
+    import agent
+    monkeypatch.setattr(agent, "PREMIUM_BUDGET", 0, raising=False)
+    api = agent.AgentApi.__new__(agent.AgentApi)
+    api.session = {"premium_dispatches": 0}
+    for _ in range(5):
+        t, n = api._premium_budget_gate("premium")
+        assert t == "premium" and n == ""
