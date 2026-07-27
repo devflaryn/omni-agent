@@ -532,3 +532,15 @@ def test_premium_nudge_silent_when_disabled(monkeypatch):
     api = agent.AgentApi.__new__(agent.AgentApi)
     assert api._maybe_nudge_premium_budget({"premium_dispatches": 9,
                                             "premium_budget_nudged": 0}) is None
+
+
+def test_premium_nudge_fires_once_per_threshold(monkeypatch):
+    import agent
+    monkeypatch.setattr(agent, "PREMIUM_BUDGET", 3, raising=False)
+    api = agent.AgentApi.__new__(agent.AgentApi)
+    s = {"premium_dispatches": 2, "premium_budget_nudged": 0}   # remaining == 1
+    assert api._maybe_nudge_premium_budget(s) is not None        # "nearly" fires
+    assert api._maybe_nudge_premium_budget(s) is None            # does NOT repeat
+    s["premium_dispatches"] = 3                                  # remaining == 0
+    assert api._maybe_nudge_premium_budget(s) is not None        # "spent" fires once
+    assert api._maybe_nudge_premium_budget(s) is None            # does NOT repeat

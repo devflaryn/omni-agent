@@ -3900,23 +3900,30 @@ class AgentApi:
         )})
 
     def _maybe_nudge_premium_budget(self, s):
-        """Advisory, escalating: warn when premium is nearly/fully spent so the
-        orchestrator reserves it for the highest-value remaining step. Silent when
-        PREMIUM_BUDGET is disabled or there is still comfortable headroom (>1 left)."""
+        """Advisory, escalating, fire-once-per-threshold: warn when premium is
+        nearly (1 left) then fully spent, so the orchestrator reserves it for the
+        highest-value remaining step. `premium_budget_nudged` is the level already
+        announced (0 none / 1 nearly / 2 spent) so neither message repeats every
+        turn. Silent when PREMIUM_BUDGET is disabled or there is >1 headroom."""
         if not PREMIUM_BUDGET:
             return None
         used = s.get("premium_dispatches", 0)
         remaining = PREMIUM_BUDGET - used
-        if remaining > 1:
-            return None
         sent = s.get("premium_budget_nudged", 0)
-        s["premium_budget_nudged"] = sent + 1
         if remaining <= 0:
+            if sent >= 2:
+                return None
+            s["premium_budget_nudged"] = 2
             return ("[SYSTEM] Premium budget is spent for this session — further "
                     "@premium delegations will run on the standard model. Reserve any "
                     "remaining hard problem for where standard is genuinely insufficient.")
-        return ("[SYSTEM] Premium budget nearly spent (1 premium dispatch left). "
-                "Reserve it for the single highest-value remaining step.")
+        if remaining == 1:
+            if sent >= 1:
+                return None
+            s["premium_budget_nudged"] = 1
+            return ("[SYSTEM] Premium budget nearly spent (1 premium dispatch left). "
+                    "Reserve it for the single highest-value remaining step.")
+        return None
 
     def _code_graph_guard(self, s, tool_name):
         """Catch the "sweeping files one by one" anti-pattern. Any navigation tool
