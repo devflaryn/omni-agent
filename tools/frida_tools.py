@@ -1,11 +1,11 @@
-"""Frida runtime hooking / dynamic-instrumentation tools for the DEV BASE.
+"""Frida runtime hooking / dynamic-instrumentation tools for a DEBUG BOOT.
 
 These run NATIVELY on the host (like tools/android_emulator.py), using the host
-`frida` Python binding against the android-arm64 frida-server carried on the dev
-base's devkit disk (base_arm_devkit.qcow2, attached to dev accounts as vdc). They
-ONLY work on an omnidroid account booted from the dev base
-(ensure_emulator_running dev=true / OMNI_USE_DEV_BASE=1) whose boot is Magisk-
-rooted; on a production account (or an un-rooted dev boot) every tool here returns
+`frida` Python binding against the native-arch frida-server carried on the
+devkit disk (base_<arch>_devkit.qcow2, attached as vdc only on a --debug boot).
+They ONLY work on an omnidroid instance booted with the devkit attached
+(ensure_emulator_running debug=true / OMNI_DEBUG_BOOT=1) whose base is Magisk-
+rooted; on a plain production boot (or an un-rooted base) every tool here returns
 a clear error.
 
 Connection model: the frida-server listens on a CUSTOM loopback port inside the
@@ -236,7 +236,7 @@ def _format_result(info, res, header):
     description=(
         "Lists processes/apps visible to the DEV-BASE frida-server (through the hidden port). Proves "
         "frida connectivity and gives you exact process names/pids to target with frida_run_script / "
-        "frida_trace. Dev base only (ensure_emulator_running dev=true)."
+        "frida_trace. Debug boot only (ensure_emulator_running debug=true)."
     ),
     params_schema={
         "filter": "string (optional — case-insensitive substring to filter process names, e.g. 'roblox')",
@@ -244,7 +244,7 @@ def _format_result(info, res, header):
         "backend": "string (optional, default 'qemu')"
     },
     output="A list of pid + process name (optionally filtered), or an error if the account isn't a dev base.",
-    when_to_use="Call after ensure_emulator_running(dev=true) to confirm frida is reachable and to find the exact process name/pid of the app under test."
+    when_to_use="Call after ensure_emulator_running(debug=true) to confirm frida is reachable and to find the exact process name/pid of the app under test."
 )
 def frida_list_processes(filter=None, device_name=None, backend=_DEFAULT_BACKEND):
     dev, cleanup, info = _connect(device_name, backend)
@@ -282,19 +282,19 @@ def frida_list_processes(filter=None, device_name=None, backend=_DEFAULT_BACKEND
     params_schema={
         "package_name": "string (the app package / process name, e.g. 'com.roblox.client')",
         "script": "string (optional — the Frida JS agent source, inline. Provide this OR script_path)",
-        "script_path": "string (optional — /workspace-relative path to a .js agent file. Provide this OR script)",
+        "script_path": "string (optional — project-relative path to a .js agent file. Provide this OR script)",
         "mode": "string (optional, default 'attach' — 'attach' hooks the running app; 'spawn' launches it gated so you can hook startup, then resumes)",
         "duration_seconds": "integer (optional, default 12, max 120 — how long to keep the agent loaded and collect output)",
         "device_name": "string (optional — the omnidroid dev account name, default 'omniagent')",
         "backend": "string (optional, default 'qemu')"
     },
     output="The agent's captured output: send() payloads, console.log lines, and any script errors, plus whether the target stayed alive (a crash/self-kill right after injection is a strong sign the app detected instrumentation).",
-    when_to_use="Use to dynamically hook/observe an app: bypass a Java-layer check, dump decrypted strings, trace auth/network calls, read return values, etc. Call ensure_emulator_running(dev=true) first (frida_run_script also auto-starts the hidden frida-server)."
+    when_to_use="Use to dynamically hook/observe an app: bypass a Java-layer check, dump decrypted strings, trace auth/network calls, read return values, etc. Call ensure_emulator_running(debug=true) first (frida_run_script also auto-starts the hidden frida-server)."
 )
 def frida_run_script(package_name, script=None, script_path=None, mode="attach",
                      duration_seconds=12, device_name=None, backend=_DEFAULT_BACKEND):
     if not script and not script_path:
-        return {"error": "provide either 'script' (inline JS) or 'script_path' (/workspace .js file)."}
+        return {"error": "provide either 'script' (inline JS) or 'script_path' (a .js file in the project)."}
     js = script
     if script_path:
         try:

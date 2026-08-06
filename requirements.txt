@@ -2,12 +2,15 @@
 # installs. requests is pinned to 2.32.5 (2.32.x line) to move off the
 # vulnerable 2.31.0 (GHSA-9wx4-h78v-vm56: .netrc credential leak on redirect).
 #
-# No full transitive lockfile is committed: this project is developed on macOS
-# (where pywebview pulls macOS-only pyobjc-* wheels) but the RE sandbox runs on
-# Ubuntu (Dockerfile: FROM ubuntu:22.04), so a lockfile generated from either
-# host pins platform-specific transitive deps that fail to install on the other.
-# Without pip-tools + a per-platform clean venv, a portable lock is not practical;
+# No full transitive lockfile is committed: on macOS pywebview pulls macOS-only
+# pyobjc-* wheels, so a lockfile generated there pins platform-specific
+# transitive deps that fail to install on Linux (and vice versa). Without
+# pip-tools + a per-platform clean venv, a portable lock is not practical;
 # pinning the direct deps here is the reproducibility guarantee that travels.
+#
+# The reverse-engineering toolchain the agent shells out to (JDK, apktool, jadx,
+# radare2, Ghidra, llvm/binutils, ...) is NOT a Python dependency — install it
+# with scripts/install_tools.py.
 requests==2.32.5
 questionary==2.0.1
 rich==13.7.0

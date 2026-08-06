@@ -2,13 +2,13 @@
 """Headless task runner for omni-agent — drive a full agent run WITHOUT the GUI.
 
 The desktop app normally launches a pywebview window; this instead instantiates
-the same `AgentApi`, mounts the Docker sandbox on the given workspace, submits one
+the same `AgentApi`, activates the given workspace, submits one
 task, streams a compact live log of what the agent does, and exits when the run
 finishes (or a wall-clock cap is hit). It exercises the REAL loop, tools, guards,
 skills, code-graph, and subagent telemetry — i.e. the actual model choosing and
 executing actions.
 
-  python3 run_headless.py --project /path/to/workspace --task "…" [--max-seconds 900]
+  python3 run_headless.py --project /path/to/project --task "…" [--max-seconds 900]
 
 ⚠ A real run calls the configured LLM (llm_config.json) — it spends that provider's
 quota. Point --project at a folder that already contains the APK(s) to work on.

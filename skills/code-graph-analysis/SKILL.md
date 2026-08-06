@@ -14,7 +14,7 @@ After decoding an APK with `decode_apk`, call:
 ```
 build_code_graph(root_dir="app_decompiled", include_so=true)
 ```
-This indexes every .smali file and every .so symbol table. It only needs to run once (it caches and only rebuilds when files change). The graph is stored as small chunked JSON files under /workspace/.codegraph/.
+This indexes every .smali file and every .so symbol table. It only needs to run once (it caches and only rebuilds when files change). The graph is stored as small chunked JSON files in the project folder/.codegraph/.
 
 ## Step 2 — Get an overview
 Call `query_code_graph(query_type="stats")` to see total smali files, classes, methods, call edges, string references, and the top 10 classes by method count (usually the most important).

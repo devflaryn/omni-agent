@@ -15,27 +15,39 @@ belong in the investigation_* tools (the evidence memory), not here.
 from tool_registry import registry
 import planning
 
+# The step-object contract, documented ONCE and reused by every tool that accepts
+# steps. It deliberately leads with the parallel fields: a step list authored
+# without `delegate`/`depends_on` is a serial plan, and a serial plan is the single
+# biggest thing standing between this agent and a large piece of work finishing in
+# reasonable time.
+_STEP_SHAPE = (
+    "Each element is either a short concrete string, or an OBJECT: {"
+    "\"content\": short concrete description (required), "
+    "\"delegate\": subagent that runs this step in its own isolated context — optionally "
+    "\"<agent>@<tier>\" (cheap|standard|premium); see AVAILABLE SUBAGENTS, "
+    "\"depends_on\": [ids or same-batch \"key\"s this step must WAIT for — OMIT IT unless the "
+    "step genuinely needs another's result, because steps without dependencies RUN AT THE SAME "
+    "TIME], "
+    "\"key\": a short local name (e.g. \"decompile\") other steps in THIS SAME call may list in "
+    "their depends_on — ids don't exist yet when you write the batch, so this is how you wire a "
+    "batch's internal order, "
+    "\"scope\": [workspace path globs this step OWNS while it runs, e.g. "
+    "[\"smali/com/foo/**\"] — write steps with DISJOINT scopes execute CONCURRENTLY instead of "
+    "queueing behind one another, so always scope a write step that touches only part of the tree], "
+    "\"purpose\": why this step matters, \"expected\": the result that proves it worked, "
+    "\"verification\": how you'll check (command/build/test/file:line/log), "
+    "\"fallback\": what to try if it fails, "
+    "\"explanation\": a short first-person narration shown to the user when the step starts}"
+)
 
-def _add_step(plan, step, after_id=None):
-    """Add one step to the plan. `step` may be a plain string (just a description)
-    or a dict with any of content/action/purpose/expected/verification/fallback —
-    so an important step can be created fully-formed in one shot."""
-    if isinstance(step, dict):
-        content = (step.get("content") or step.get("step") or step.get("action") or "").strip()
-        if not content:
-            return None
-        return plan.add_item(
-            content, after_id=after_id,
-            action=step.get("action"), purpose=step.get("purpose"),
-            expected=step.get("expected"), verification=step.get("verification"),
-            fallback=step.get("fallback"), notes=step.get("notes"),
-            explanation=step.get("explanation"), delegate=step.get("delegate"),
-            depends_on=step.get("depends_on"),
-        )
-    content = str(step or "").strip()
-    if not content:
-        return None
-    return plan.add_item(content, after_id=after_id)
+_PARALLEL_DOCTRINE = (
+    "PLAN WIDE, NOT LONG. Steps in a phase that carry no depends_on are dispatched as ONE "
+    "concurrent wave, so a phase of 12 independent steps costs about as much wall-clock as a "
+    "phase of 1. Put everything that CAN happen at once in the same phase, and use phases only "
+    "for real dependency stages (you can't patch what you haven't decompiled). Tag every "
+    "self-contained step with a delegate so it runs in its own context and only its distilled "
+    "report comes back to you."
+)
 
 
 @registry.register(
@@ -46,13 +58,15 @@ def _add_step(plan, step, after_id=None):
         "the current state (available tools, constraints, success criteria, unknowns), THEN lay out: a "
         "one-sentence task summary; success_criteria (what 'done' objectively looks like); constraints "
         "(hard boundaries); phases (the 3-6 high-level milestones — this is the stable mission plan); and "
-        "an initial set of steps for the FIRST phase. Keep steps small and verifiable (e.g. 'locate the "
+        "the steps for the FIRST phase. Keep steps small and verifiable (e.g. 'locate the "
         "signature check — done when I have its file:line', not 'analyze the app'). Don't over-plan or "
-        "invent details you haven't confirmed; you extend the plan later with plan_add_task as you learn."
+        "invent details you haven't confirmed; you extend the plan later with plan_add_tasks as you learn. "
+        + _PARALLEL_DOCTRINE
     ),
     params_schema={
         "task": "string (a one-sentence summary of what the user asked for)",
-        "steps": "array (the FIRST phase's ordered steps — each a short concrete string, OR an object with content/action/purpose/expected/verification/fallback, plus an optional 'explanation': a short first-person narration shown to the user when this step starts, e.g. \"Now I'll scan the workspace for data.\")",
+        "steps": ("array (the FIRST phase's steps — author ALL of the independent ones here, not just the "
+                  "first one, so they dispatch as a single concurrent wave). " + _STEP_SHAPE),
         "success_criteria": "array of strings (optional but recommended — the objective conditions that mean the task is done)",
         "constraints": "array of strings (optional — hard boundaries/rules the solution must respect)",
         "phases": "array of strings (optional but recommended — the high-level milestones; the first becomes the current phase)",
@@ -71,8 +85,7 @@ def plan_create(task, steps=None, success_criteria=None, constraints=None, phase
     plan.set_orientation(current_state=current_state, unknowns=unknowns, assumptions=assumptions)
     if phases:
         plan.set_phases(phases)
-    for step in (steps or []):
-        _add_step(plan, step)
+    plan.add_items(steps or [])
     if next_action:
         plan.set_next_action(next_action)
     planning.set_active_plan(plan)
@@ -97,22 +110,60 @@ def plan_create(task, steps=None, success_criteria=None, constraints=None, phase
         "fallback": "string (optional — what to do if it fails or the expected result doesn't appear)",
         "explanation": "string (optional — a short first-person narration shown to the user when this step is started, e.g. \"Now I'll patch the license check.\")",
         "delegate": "string (optional — the name of a subagent to run this step in its own isolated context; when you mark the step in_progress the harness auto-dispatches it and folds back only the distilled report. See AVAILABLE SUBAGENTS. Use for a heavy, self-contained sub-task (deep research / analysis / a well-specified implementation) so this conversation stays lean. Append '@<tier>' to pick the model tier for this step (e.g. delegate=\"researcher@cheap\" for a lookup, \"implementer@standard\", \"verifier@premium\"); a bare name uses the subagent's own default tier.)",
-        "depends_on": "array of strings (optional — ids of OTHER steps in the SAME phase that must finish before this one. Omit for independent steps: same-phase steps run IN PARALLEL by default, so only set this when this step truly needs another's result.)",
+        "depends_on": "array of strings (optional — ids of OTHER steps that must finish before this one. Omit for independent steps: steps without dependencies run IN PARALLEL by default, so only set this when this step truly needs another's result.)",
+        "scope": "array of strings (optional — the workspace path globs this step OWNS while it runs, e.g. [\"smali/com/foo/**\"]. Write steps with disjoint scopes run CONCURRENTLY; an unscoped write step takes the whole workspace exclusively.)",
         "after_id": "string (optional — an existing step's id to insert this one right after; omit to append)"
     },
     output="A rendered view of the updated plan including the new step's id.",
-    when_to_use="Call this the moment you realize the plan is missing a step — don't silently do extra work outside the plan; add it first so the plan stays an accurate record. Tag it with delegate=<subagent> to offload a heavy, self-contained step to an isolated context."
+    when_to_use="Call this the moment you realize the plan is missing ONE step — for two or more, use plan_add_tasks so they can dispatch as a wave. Don't silently do extra work outside the plan; add it first so the plan stays an accurate record. Tag it with delegate=<subagent> to offload a heavy, self-contained step to an isolated context."
 )
 def plan_add_task(content, purpose=None, expected=None, verification=None, fallback=None,
-                  after_id=None, explanation=None, delegate=None, depends_on=None):
+                  after_id=None, explanation=None, delegate=None, depends_on=None, scope=None):
     plan = planning.get_active_plan()
     if plan is None:
         return {"error": "No active plan. Call plan_create first."}
     plan.add_item(content, after_id=after_id, purpose=purpose, expected=expected,
                   verification=verification, fallback=fallback, explanation=explanation,
-                  delegate=delegate, depends_on=depends_on)
+                  delegate=delegate, depends_on=depends_on, scope=scope)
     planning.notify_updated()
     return {"stdout": plan.to_markdown()}
+
+
+@registry.register(
+    name="plan_add_tasks",
+    description=(
+        "Adds MANY steps to the current plan in ONE call — the tool to reach for whenever you're about "
+        "to add more than one step. Use it to lay out a whole wave of work at once: enumerate every "
+        "component of a large change (each smali package, each native library, each module to port) as "
+        "its own scoped, delegated step, and they dispatch CONCURRENTLY. Adding those steps one at a "
+        "time instead costs a full round-trip each and produces a plan the harness can only run "
+        "serially. Steps may reference each other by 'key' in depends_on to express order inside the "
+        "batch. " + _PARALLEL_DOCTRINE
+    ),
+    params_schema={
+        "steps": "array (the steps to add, in order). " + _STEP_SHAPE,
+        "after_id": "string (optional — an existing step's id to insert the batch right after, in order; omit to append)",
+    },
+    output="A rendered view of the updated plan including every new step's id, and which steps are ready to run concurrently.",
+    when_to_use=(
+        "Call this instead of repeated plan_add_task whenever you have 2+ steps to add — especially "
+        "right after planning a phase of a large modification, where the whole point is that the "
+        "independent pieces run at the same time."),
+    summary="add a whole wave of plan steps (with delegates, scopes and dependencies) in one call",
+)
+def plan_add_tasks(steps, after_id=None):
+    plan = planning.get_active_plan()
+    if plan is None:
+        return {"error": "No active plan. Call plan_create first."}
+    if not isinstance(steps, list) or not steps:
+        return {"error": "plan_add_tasks needs a non-empty 'steps' array. For a single step, plan_add_task also works."}
+    created = plan.add_items(steps, after_id=after_id)
+    if not created:
+        return {"error": "None of the given steps had usable content (each needs a 'content' string)."}
+    planning.notify_updated()
+    return {"stdout": f"Added {len(created)} step(s): "
+                      + ", ".join(f"({it['id']}) {it['content'][:60]}" for it in created)
+                      + "\n\n" + plan.to_markdown()}
 
 
 @registry.register(
@@ -137,14 +188,15 @@ def plan_add_task(content, purpose=None, expected=None, verification=None, fallb
         "fallback": "string (optional — the fallback if it fails)",
         "explanation": "string (optional — set/refine the first-person narration shown when this step starts)",
         "delegate": "string (optional — set/clear the subagent that runs this step in isolation; marking the step in_progress then auto-dispatches it. Pass an empty string to clear a previously-set delegate. Append '@<tier>' to pick the model tier for this step (e.g. delegate=\"researcher@cheap\" for a lookup, \"implementer@standard\", \"verifier@premium\"); a bare name uses the subagent's own default tier.)",
-        "depends_on": "array of strings (optional — replace this step's same-phase dependencies; pass [] to clear them)."
+        "depends_on": "array of strings (optional — replace this step's dependencies; pass [] to clear them and make it immediately eligible for a parallel wave).",
+        "scope": "array of strings (optional — replace the workspace path globs this step owns; pass [] to clear. Disjoint-scoped write steps run concurrently.)"
     },
     output="A rendered view of the updated plan, or an error if the task_id doesn't exist or the status is invalid.",
     when_to_use="Call this to START a step (status='in_progress' — this narrates the subprocess to the user, and auto-dispatches it if the step has a delegate) and again to complete it once it's DONE AND VERIFIED. Don't batch updates until the end; the GUI, the chat narration, and progress tracking all depend on these happening as you go."
 )
 def plan_update_task(task_id, status=None, content=None, notes=None,
                      purpose=None, expected=None, verification=None, fallback=None,
-                     explanation=None, delegate=None, depends_on=None):
+                     explanation=None, delegate=None, depends_on=None, scope=None):
     plan = planning.get_active_plan()
     if plan is None:
         return {"error": "No active plan. Call plan_create first."}
@@ -152,7 +204,7 @@ def plan_update_task(task_id, status=None, content=None, notes=None,
                             purpose=purpose, expected=expected,
                             verification=verification, fallback=fallback,
                             explanation=explanation, delegate=delegate,
-                            depends_on=depends_on)
+                            depends_on=depends_on, scope=scope)
     if item is None:
         return {"error": f"Step '{task_id}' not found (or invalid status). Call plan_view to see current step ids."}
     planning.notify_updated()
@@ -204,7 +256,7 @@ def plan_set_next_action(next_action):
         "Marks the current phase COMPLETED and moves to the next one, so the high-level mission plan "
         "tracks real progress. By default the next pending phase becomes current; pass phase_id to jump "
         "to a specific phase instead. Add a note summarizing what the finished phase established. After "
-        "advancing, add the new phase's steps with plan_add_task."
+        "advancing, add the new phase's steps with plan_add_tasks — the whole wave in one call."
     ),
     params_schema={
         "phase_id": "string (optional — the phase to make current; omit to advance to the next pending phase)",
@@ -238,7 +290,8 @@ def plan_advance_phase(phase_id=None, note=None):
     ),
     params_schema={
         "reason": "string (what new evidence/failure forces the replan — recorded in the plan's history)",
-        "steps": "array (the new current-phase steps — strings or objects with content/action/purpose/expected/verification/fallback)",
+        "steps": ("array (the new current-phase steps — author the whole wave, not just the next move). "
+                  + _STEP_SHAPE),
         "phases": "array of strings (optional — re-cut the high-level milestones; omit to keep the existing phases)",
         "next_action": "string (optional — the new single precise next action)",
         "keep_completed": "boolean (optional, default true — keep finished steps as a record of preserved progress; false clears all steps)"
@@ -259,8 +312,7 @@ def plan_replan(reason, steps=None, phases=None, next_action=None, keep_complete
         plan.items = []
     if phases:
         plan.set_phases(phases)
-    for step in (steps or []):
-        _add_step(plan, step)
+    plan.add_items(steps or [])
     if next_action is not None:
         plan.set_next_action(next_action)
     planning.notify_updated()

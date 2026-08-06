@@ -35,13 +35,28 @@ function nearBottom() {
 // Coalesce scroll requests to one real scroll per animation frame. Events can
 // arrive far faster than the display refreshes, and every `scrollTop =
 // scrollHeight` forces a synchronous layout of the whole transcript.
+// True while the user has an active (non-collapsed) text selection inside the
+// transcript. Streaming auto-scroll must stand down for the duration, or a
+// drag-select gets yanked out from under the cursor on the next event. Written
+// defensively: the test DOM shim has neither getSelection nor Node.contains.
+function hasChatSelection() {
+  try {
+    const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    if (typeof chat.contains !== 'function') return false;
+    return chat.contains(sel.getRangeAt(0).commonAncestorContainer);
+  } catch {
+    return false;
+  }
+}
+
 let scrollQueued = false;
 function scrollDown() {
-  if (!autoScroll || replaying || scrollQueued) return;
+  if (!autoScroll || replaying || scrollQueued || hasChatSelection()) return;
   scrollQueued = true;
   requestAnimationFrame(() => {
     scrollQueued = false;
-    if (autoScroll) chat.scrollTop = chat.scrollHeight;
+    if (autoScroll && !hasChatSelection()) chat.scrollTop = chat.scrollHeight;
   });
 }
 
@@ -419,6 +434,7 @@ const TOOL_META = {
   analyze_function_calls:  { name: 'Analyze Function Calls', cat: 'read' },
   get_apk_signature_hash:  { name: 'Read APK Signature', cat: 'read' },
   verify_apk:              { name: 'Verify APK', cat: 'read' },
+  verify_hooks_applied:    { name: 'Verify Hooks Applied', cat: 'read' },
   compute_sha256:          { name: 'Compute SHA-256', cat: 'read' },
   compare_files_sha256:    { name: 'Compare File Hashes', cat: 'read' },
   diff_binary_files:       { name: 'Diff Binaries', cat: 'read' },
@@ -430,6 +446,7 @@ const TOOL_META = {
 
   // change: writes or mutates files — counted by distinct path
   write_file:                  { name: 'Write File', cat: 'change' },
+  append_to_file:              { name: 'Append To File', cat: 'change' },
   replace_in_file:             { name: 'Edit File', cat: 'change' },
   delete_path:                 { name: 'Delete Path', cat: 'change' },
   move_file:                   { name: 'Move File', cat: 'change' },
@@ -490,6 +507,8 @@ const TOOL_META = {
   run_apk_test_session:          { name: 'Run APK Test Session', cat: 'run' },
   record_and_capture_keyframes:  { name: 'Record Keyframes', cat: 'run' },
   take_emulator_screenshot:      { name: 'Take Screenshot', cat: 'run' },
+  observe_screen:                { name: 'Observe Screen', cat: 'run' },
+  tap_element:                   { name: 'Tap Element', cat: 'run' },
   tap_screen:                    { name: 'Tap Screen', cat: 'run' },
   swipe_screen:                  { name: 'Swipe Screen', cat: 'run' },
   press_key:                     { name: 'Press Key', cat: 'run' },
@@ -506,6 +525,7 @@ const TOOL_META = {
   // plan: plan / investigation / strategy bookkeeping — counted by call
   plan_create:                  { name: 'Create Plan', cat: 'plan' },
   plan_add_task:                { name: 'Add Plan Step', cat: 'plan' },
+  plan_add_tasks:               { name: 'Add Plan Steps', cat: 'plan' },
   plan_update_task:             { name: 'Update Plan Step', cat: 'plan' },
   plan_advance_phase:           { name: 'Advance Phase', cat: 'plan' },
   plan_reorder:                 { name: 'Reorder Plan', cat: 'plan' },
@@ -527,6 +547,12 @@ const TOOL_META = {
   declare_constraints:          { name: 'Declare Constraints', cat: 'plan' },
   clear_technique_constraints:  { name: 'Clear Constraints', cat: 'plan' },
   set_next_steps:               { name: 'Set Next Steps', cat: 'plan' },
+  ledger_add_component:         { name: 'Ledger: Add Component', cat: 'plan' },
+  ledger_set_component_status:  { name: 'Ledger: Set Component Status', cat: 'plan' },
+  ledger_record_artifact:       { name: 'Ledger: Record Artifact', cat: 'plan' },
+  ledger_record_patch:          { name: 'Ledger: Record Patch', cat: 'plan' },
+  ledger_record_verification:   { name: 'Ledger: Record Verification', cat: 'plan' },
+  ledger_status:                { name: 'Ledger: Status', cat: 'plan' },
   strategy_set:                 { name: 'Set Strategy', cat: 'plan' },
   strategy_update:              { name: 'Update Strategy', cat: 'plan' },
   review_conclusion:            { name: 'Review Conclusion', cat: 'plan' },
@@ -585,7 +611,7 @@ const _TOOL_PATH_ARGS = [
   // media
   'image_path', 'image_paths',
   // comparisons name two operands; the first is a stable enough identity
-  'dir_a', 'file_a', 'file1',
+  'dir_a', 'file_a', 'file1', 'base_dir', 'output_dir',
   // non-filesystem identities
   'skill_name', 'resource_path', 'session_name',
 ];
@@ -729,7 +755,12 @@ function startActionGroup() {
     completed: false, open: true,
   };
   g.titleEl.classList.add('shimmer'); // active → silver sweep until completed
-  g.head.addEventListener('click', () => setGroupOpen(g, !g.open));
+  // Finishing a drag-select over the summary line still fires a click; toggling
+  // the group there would collapse the very text the user just highlighted.
+  g.head.addEventListener('click', () => {
+    if (hasChatSelection()) return;
+    setGroupOpen(g, !g.open);
+  });
   currentGroup = g;
   updateGroupTitle(g);
   setGroupOpen(g, true); // auto-expanded while the group is the live one
@@ -1665,7 +1696,7 @@ function countTreeFiles(node) {
 // ---------- file tree: selection, drag/drop, context menu ----------
 // Behaviour follows the VS Code explorer: click selects, ctrl/cmd-click and
 // shift-click extend, drag moves onto a folder or the trash, right-click opens
-// a menu. Every mutation goes through the sandboxed fs_* APIs, which return the
+// a menu. Every mutation goes through the path-scoped fs_* APIs, which return the
 // refreshed tree so the view re-renders from truth.
 
 const TRASH_DIR = '.omni-trash';
@@ -2125,25 +2156,53 @@ function wireTreeDropZone() {
 // re-reading the zip. null whenever the viewer shows a plain workspace file.
 let archiveViewer = null;
 
-// Switches which pane of the viewer body is visible ('text' | 'image' | 'archive').
+// What "View as text" should re-request when the backend declined to preview a
+// file: {path} for a workspace file, {path, entry} for an archive member.
+// Cleared whenever the viewer successfully renders something.
+let viewerForceTarget = null;
+
+// Switches which pane of the viewer body is visible
+// ('text' | 'image' | 'archive' | 'unsupported').
 // The back button shows only while previewing an entry *inside* an open archive.
 function viewerShowPane(mode) {
   $('viewerContent').classList.toggle('hidden', mode !== 'text');
   $('viewerImage').classList.toggle('hidden', mode !== 'image');
   $('viewerImage').classList.toggle('flex', mode === 'image');
   $('viewerArchive').classList.toggle('hidden', mode !== 'archive');
+  $('viewerUnsupported').classList.toggle('hidden', mode !== 'unsupported');
+  $('viewerUnsupported').classList.toggle('flex', mode === 'unsupported');
   $('viewerBack').classList.toggle('hidden', !(archiveViewer && mode !== 'archive'));
 }
 
 function viewerShowError(msg) {
   $('viewerSize').textContent = '';
+  viewerForceTarget = null;
   $('viewerContent').textContent = 'Error: ' + msg;
   viewerShowPane('text');
 }
 
+// Renders the backend's "I won't guess at this" payload: what the file appears
+// to be, plus the escape hatch that re-reads it with force_text.
+function renderViewerUnsupported(res, target) {
+  viewerForceTarget = target;
+  const label = res.label || 'This file';
+  $('viewerUnsupportedTitle').textContent = `${label} — preview not supported`;
+  $('viewerUnsupportedReason').textContent =
+    res.reason || `This looks like a ${label}, which the viewer can't render.`;
+  $('viewerForceText').classList.toggle('hidden', res.can_force_text === false);
+  viewerShowPane('unsupported');
+}
+
 // Renders a typed read_file / read_archive_member payload into the viewer body.
-function renderViewerResult(res) {
+// `target` is what a later "View as text" would re-request; pass null when the
+// payload is already a forced text read (there is nothing left to escalate to).
+function renderViewerResult(res, target) {
   $('viewerSize').textContent = humanSize(res.size) + (res.truncated ? ' (truncated)' : '');
+  if (res.kind === 'unsupported') {
+    renderViewerUnsupported(res, target || null);
+    return;
+  }
+  viewerForceTarget = null;
   if (res.kind === 'image') {
     $('viewerImage').querySelector('img').src = `data:${res.mime};base64,${res.data}`;
     viewerShowPane('image');
@@ -2159,6 +2218,7 @@ function renderViewerResult(res) {
 async function openFileViewer(path) {
   if (!session) return;
   archiveViewer = null;
+  viewerForceTarget = null;
   $('viewerPath').textContent = path;
   $('viewerSize').textContent = 'loading…';
   $('viewerImage').querySelector('img').removeAttribute('src');
@@ -2171,12 +2231,34 @@ async function openFileViewer(path) {
     const res = await pywebview.api.read_file(path);
     if (!res.ok) { viewerShowError(res.error); return; }
     if (res.kind === 'archive') archiveViewer = { path };
-    renderViewerResult(res);
+    renderViewerResult(res, { path });
     if (archiveViewer) archiveViewer.sizeLabel = $('viewerSize').textContent;
   } catch (e) {
     viewerShowError(e);
   } finally {
     clearSkeleton($('viewerContent'));
+  }
+}
+
+// "View as text": re-read the file the viewer just declined, with the binary
+// sniff bypassed. The result is always kind="text" (mojibake included), so the
+// panel can't bounce the user straight back to itself.
+async function viewerForceAsText() {
+  const target = viewerForceTarget;
+  if (!target || !session) return;
+  const btn = $('viewerForceText');
+  btn.disabled = true;
+  $('viewerSize').textContent = 'loading…';
+  try {
+    const res = target.entry
+      ? await pywebview.api.read_archive_member(target.path, target.entry, true)
+      : await pywebview.api.read_file(target.path, true);
+    if (!res.ok) { viewerShowError(res.error); return; }
+    renderViewerResult(res, null);
+  } catch (e) {
+    viewerShowError(e);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -2259,7 +2341,7 @@ async function openArchiveMember(entry) {
   try {
     const res = await pywebview.api.read_archive_member(archiveViewer.path, entry);
     if (!res.ok) { viewerShowError(res.error); return; }
-    renderViewerResult(res);
+    renderViewerResult(res, { path: archiveViewer.path, entry });
   } catch (e) {
     viewerShowError(e);
   }
@@ -2268,6 +2350,7 @@ async function openArchiveMember(entry) {
 // "← archive": return from an entry preview to the still-rendered listing.
 function backToArchiveListing() {
   if (!archiveViewer) return;
+  viewerForceTarget = null;
   $('viewerPath').textContent = archiveViewer.path;
   $('viewerSize').textContent = archiveViewer.sizeLabel || '';
   viewerShowPane('archive');
@@ -2600,7 +2683,7 @@ async function forgetWorkspace(path) {
 async function startSession() {
   $('startError').textContent = '';
   if (!_selectedWs) { $('startError').textContent = 'Select a workspace folder first.'; return; }
-  const btn = $('startSessionBtn'); btn.disabled = true; btn.textContent = 'Starting sandbox…';
+  const btn = $('startSessionBtn'); btn.disabled = true; btn.textContent = 'Starting session…';
   try {
     const res = await pywebview.api.start_session(_selectedWs);
     if (!res.ok) $('startError').textContent = res.error || 'Failed to start session.';
@@ -3647,7 +3730,7 @@ async function loadGraph(graphId) {
 // ---------- manual graph build (Build button on the Graph tab) ----------
 // Building on demand fixes the "No knowledge graph found" dead-end: the user no
 // longer has to ask the agent to run build_code_graph. The backend indexes on
-// the host (no Docker round-trip) straight into <workspace>/.codegraph/<id>/,
+// the host in-process straight into <workspace>/.codegraph/<id>/,
 // which is exactly where this tab reads — so the folder always appears.
 let buildFormOpen = false;
 
@@ -4267,6 +4350,13 @@ async function init() {
   }
   $('viewerClose').addEventListener('click', () => closeModal($('fileViewer')));
   $('viewerBack').addEventListener('click', backToArchiveListing);
+  $('viewerForceText').addEventListener('click', viewerForceAsText);
+  // Inside an open archive, "Close" on the unsupported panel means "back to the
+  // listing" — dumping the user out of the whole archive would lose their place.
+  $('viewerUnsupportedClose').addEventListener('click', () => {
+    if (archiveViewer) backToArchiveListing();
+    else closeModal($('fileViewer'));
+  });
   $('fileViewer').addEventListener('click', (e) => { if (e.target.id === 'fileViewer') closeModal($('fileViewer')); });
 
 

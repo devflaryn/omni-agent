@@ -127,6 +127,28 @@
       transition: background-color var(--dur-base) ease, border-color var(--dur-base) ease, color var(--dur-base) ease, opacity var(--dur-base) ease;
     }
     ::selection { background: rgb(var(--term-cyan) / .3); }
+
+    /* ================= text selection policy =================
+       pywebview used to inject `body { -webkit-user-select: none }` into the
+       whole webview (its create_window default is text_select=False), so NOTHING
+       was selectable — you could not drag-select or copy a chat message. The
+       window now passes text_select=True and the policy lives here instead:
+       chrome stays unselectable so drag/click affordances feel native, and
+       anything the agent produced (transcript, tool output, file contents,
+       plan/report prose) selects and copies like normal text.
+
+       This works by inheritance, not by descendant selectors: `user-select` is
+       an inherited property, so `.selectable` flips the whole subtree, and any
+       `.select-none` island inside it (draggable tree rows, carets) flips its
+       own subtree back. No specificity fights, no `*` selector cost. */
+    body { -webkit-user-select: none; user-select: none; cursor: default; }
+    .selectable { -webkit-user-select: text; user-select: text; cursor: auto; }
+    .select-none { -webkit-user-select: none; user-select: none; }
+    /* Form fields must always take a caret, wherever they sit in the tree. */
+    input, textarea, [contenteditable="true"] {
+      -webkit-user-select: text; user-select: text; cursor: auto;
+    }
+
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: rgb(var(--term-line)); border-radius: 8px; }
@@ -1018,13 +1040,13 @@
         <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="text-term-muted"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
         <div class="text-term-text t-base" >No workspaces yet</div>
         <div class="text-term-muted t-xs" style="max-width:320px">
-          Open a folder to start. The agent works inside a Docker sandbox mounted on the folder you pick.
+          Open a folder to start. The agent works directly on this machine, in the folder you pick.
         </div>
       </div>
 
       <div class="flex items-center gap-3 border-t border-term-line px-6 py-3">
         <span id="startError" class="min-w-0 flex-1 truncate text-term-red t-xs" ></span>
-        <span class="shrink-0 text-term-muted t-2xs" >A Docker sandbox is started for the selected workspace.</span>
+        <span class="shrink-0 text-term-muted t-2xs" >Tools run on this machine, scoped to the selected workspace.</span>
         <button id="startSessionBtn" class="btn btn-primary btn-lg shrink-0" disabled>Open</button>
       </div>
     </div>
@@ -1098,7 +1120,7 @@
       <!-- CHAT TAB -->
       <div id="chatTab" class="flex-1 flex flex-col min-h-0">
         <!-- transcript (padding centers a readable column, like claude.ai) -->
-        <div id="chat" class="flex-1 overflow-y-auto py-4 space-y-1 px-[max(20px,calc((100%-64rem)/2))]"></div>
+        <div id="chat" class="selectable flex-1 overflow-y-auto py-4 space-y-1 px-[max(20px,calc((100%-64rem)/2))]"></div>
 
         <!-- memory summary banner -->
         <div id="memoryBanner" class="hidden mb-2 rounded-xl border border-term-orange/40 bg-term-orange/10 px-3 py-2 t-xs text-term-orange mx-[max(20px,calc((100%-64rem)/2))]">
@@ -1138,7 +1160,7 @@
       </div>
 
       <!-- PLAN TAB -->
-      <div id="planTab" class="hidden flex-1 flex-col min-h-0 overflow-hidden"></div>
+      <div id="planTab" class="selectable hidden flex-1 flex-col min-h-0 overflow-hidden"></div>
 
       <!-- GRAPH TAB -->
       <div id="graphTab" class="hidden flex-1 flex min-h-0">
@@ -1203,18 +1225,38 @@
           <div class="eyebrow">file</div>
           <!-- deliberately NOT .modal-title: that class sets a serif family that
                would override font-mono, and a file path must stay monospaced. -->
-          <div id="viewerPath" class="t-base truncate font-mono text-term-text">—</div>
+          <div id="viewerPath" class="selectable t-base truncate font-mono text-term-text">—</div>
         </div>
         <button id="viewerBack" class="btn btn-sm btn-ghost hidden shrink-0">← archive</button>
         <span id="viewerSize" class="t-xs shrink-0 text-term-muted"></span>
         <button id="viewerClose" title="Close" class="icon-btn">✕</button>
       </div>
       <div class="modal-body scroll-both bg-term-bg">
-        <pre id="viewerContent" class="font-mono t-sm leading-5 text-term-text"></pre>
+        <pre id="viewerContent" class="selectable font-mono t-sm leading-5 text-term-text"></pre>
         <div id="viewerImage" class="hidden h-full items-center justify-center">
           <img class="max-h-full max-w-full rounded-lg object-contain" alt="" />
         </div>
         <div id="viewerArchive" class="hidden font-mono t-sm leading-5 text-term-text"></div>
+        <!-- Shown when the backend declines to render a file (binary, unknown
+             container, oversized image). Offers the "decode as text anyway"
+             escape hatch rather than silently dumping mojibake into the <pre>. -->
+        <div id="viewerUnsupported" class="hidden h-full items-center justify-center p-6">
+          <div class="max-w-sm text-center">
+            <div class="mb-3 t-xl leading-none" aria-hidden="true">🚫</div>
+            <div id="viewerUnsupportedTitle" class="mb-1.5 t-base font-semibold text-term-text">
+              Preview not supported
+            </div>
+            <p id="viewerUnsupportedReason" class="selectable mb-1 t-sm leading-5 text-term-muted"></p>
+            <p class="mb-3 t-xs leading-5 text-term-muted">
+              You can still decode it as UTF-8 text — expect unreadable characters
+              where the bytes aren't text.
+            </p>
+            <div class="flex items-center justify-center gap-2">
+              <button id="viewerForceText" class="btn btn-sm btn-primary">View as text</button>
+              <button id="viewerUnsupportedClose" class="btn btn-sm btn-ghost">Close</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>

@@ -1,5 +1,5 @@
 """Host-side (Windows) frame-capture algorithm — imported directly by
-tools/android_emulator.py, NOT shipped into any sandbox. The emulator runs
+tools/android_emulator.py, not shipped through the shell. The emulator runs
 natively on Windows, so this samples it via the host's adb.exe directly.
 
 Screenshots come from `adb exec-out screencap -p`, which reads the emulated

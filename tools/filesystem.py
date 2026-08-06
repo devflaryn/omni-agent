@@ -1,18 +1,18 @@
 from tool_registry import registry
-from tools.common import normalize_path
-from docker_sandbox import run_cmd
+from tools.common import normalize_path, encode_script, wpath
+from host_exec import run_cmd
 import os
 
 @registry.register(
     name="list_directory",
     description="Lists files and folders inside a given directory in the workspace. Use this FIRST to see what files are available. Example: '.' lists the root of the active project workspace.",
-    params_schema={"directory": "string (path relative to workspace or absolute starting with /workspace, default '.')"},
+    params_schema={"directory": "string (path relative to the project root, default '.')"},
     output="A text listing (ls -la format) with file permissions, owner, size, date, and name for each entry. Directories end with '/'. Hidden files are shown.",
     when_to_use="Call this first whenever you enter a new workspace or need to discover what files/folders exist before reading or editing them."
 )
 def list_directory(directory="."):
     directory = normalize_path(directory)
-    cmd = f"ls -la /workspace/{directory}"
+    cmd = f"ls -la {wpath(directory)}"
     return run_cmd(cmd)
 
 @registry.register(
@@ -26,11 +26,11 @@ def list_directory(directory="."):
     ),
     params_schema={
         "name_pattern": "string (glob against the filename, e.g. '*.so', 'MainActivity.smali', '*Login*')",
-        "directory": "string (optional, directory to search under, relative to /workspace, default '.')",
+        "directory": "string (optional, directory to search under, relative to the project root, default '.')",
         "type": "string (optional, 'f' for files only, 'd' for directories only, omit for both)",
         "max_results": "integer (optional, default 200)"
     },
-    output="One matching path per line (relative to /workspace). Capped at max_results. Says so if nothing matches.",
+    output="One matching path per line (relative to the project root). Capped at max_results. Says so if nothing matches.",
     when_to_use="Use this to locate files by name in a big tree (which .dex has a class, where a .so lives, finding a specific smali/java/xml file) instead of walking directories manually. To search file CONTENTS instead of names, use grep_directory / search_smali."
 )
 def find_files(name_pattern, directory=".", type=None, max_results=200):
@@ -42,11 +42,12 @@ def find_files(name_pattern, directory=".", type=None, max_results=200):
     type_flag = ""
     if type in ("f", "d"):
         type_flag = f"-type {type} "
-    # -iname for case-insensitive name matching; strip the /workspace/ prefix so
-    # results are workspace-relative like every other tool's paths.
+    # -iname for case-insensitive name matching. `find .` prefixes every hit with
+    # "./", which is noise in a result list — strip it so paths read the same way
+    # every other tool reports them.
     cmd = (
-        f"find /workspace/{directory} {type_flag}-iname '{name_pattern}' 2>/dev/null "
-        f"| sed 's#^/workspace/##' | head -n {max_results}"
+        f"find {wpath(directory)} {type_flag}-iname '{name_pattern}' 2>/dev/null "
+        f"| sed 's#^\\./##' | head -n {max_results}"
     )
     res = run_cmd(cmd, timeout=90)
     if res.get("returncode") == 0 and not res.get("stdout", "").strip():
@@ -77,7 +78,7 @@ def read_file_chunk(filepath, start_line=1, num_lines=150):
     filepath = normalize_path(filepath)
     end_line = start_line + num_lines - 1
     # Check total lines to give context to the LLM
-    count_cmd = f"wc -l < /workspace/{filepath}"
+    count_cmd = f"wc -l < {wpath(filepath)}"
     count_res = run_cmd(count_cmd)
     
     total_lines = "Unknown"
@@ -85,7 +86,7 @@ def read_file_chunk(filepath, start_line=1, num_lines=150):
         total_lines = count_res['stdout'].strip()
 
     # Read the actual lines
-    cmd = f"sed -n '{start_line},{end_line}p' /workspace/{filepath}"
+    cmd = f"sed -n '{start_line},{end_line}p' {wpath(filepath)}"
     res = run_cmd(cmd)
     
     if res['returncode'] == 0:
@@ -98,28 +99,24 @@ def read_file_chunk(filepath, start_line=1, num_lines=150):
 
 @registry.register(
     name="write_file",
-    description="Writes text content to a file in the workspace. Overwrites existing content. Use this to edit smali files, scripts, or any text artifact. The path is relative to /workspace.",
+    description="Writes text content to a file in the workspace. Overwrites existing content. Use this to edit smali files, scripts, or any text artifact. The path is relative to the project root.",
     params_schema={"filepath": "string (path relative to workspace)", "content": "string"},
-    output="A confirmation line 'Successfully wrote to /workspace/<filepath>' on success, or the stderr/error from the shell command on failure.",
+    output="A confirmation line 'Successfully wrote to <filepath>' on success, or the stderr/error from the shell command on failure.",
     when_to_use="Use this to CREATE new files or FULLY OVERWRITE existing ones. To edit only part of a file, read it first with read_file_chunk, modify the content in memory, then write the full content back."
 )
 def write_file(filepath, content):
     filepath = normalize_path(filepath)
-    # Easiest way to write a file from host to sandbox safely is via the mounted host volume.
-    # Note: this assumes we are dealing with the current project's workspace.
-    # A more robust way is to run a command inside docker using tee, but host write is fine if CWD is correct.
-    
-    # We should actually use the run_cmd to echo/tee into it if we want it completely safe from project switching,
-    # but let's stick to the host-side write for large contents, just fixing the path issue.
-    # Actually, the agent.py dynamically mounts the project directory. If write_file just uses ./workspace/ it might write to the root workspace folder, not the project workspace folder.
-    # Wait, the current project's directory is passed to docker, but not saved globally for `write_file`? 
-    # Let's fix that by writing via Docker! It's much safer!
-    
-    # Write using a base64 encoded string to avoid shell escaping issues
+    # Route the write through run_cmd rather than opening the file here, so the
+    # destination is always resolved against whichever workspace is CURRENTLY
+    # active — a host-side write would have to re-derive that itself and could
+    # land in a stale project after the user switches folders.
+    #
+    # Content is base64-encoded so arbitrary bytes (quotes, newlines, $,
+    # backticks) survive the trip through the shell unescaped.
     import base64
     content_bytes = content.encode('utf-8')
     b64_content = base64.b64encode(content_bytes).decode('utf-8')
-    cmd = f"mkdir -p $(dirname /workspace/{filepath}) && echo '{b64_content}' | base64 -d > /workspace/{filepath}"
+    cmd = f"mkdir -p \"$(dirname {wpath(filepath)})\" && echo '{b64_content}' | base64 -d > {wpath(filepath)}"
     res = run_cmd(cmd)
     if res['returncode'] != 0:
         return res
@@ -130,16 +127,63 @@ def write_file(filepath, content):
     # so a silent no-op is surfaced as an error instead of a phantom success that
     # survives to a downstream verify. Same discipline as delete_path.
     expected = len(content_bytes)
-    probe = run_cmd(f"stat -c %s /workspace/{filepath} 2>/dev/null || echo MISSING")
+    probe = run_cmd(f"stat -c %s {wpath(filepath)} 2>/dev/null || echo MISSING")
     size_str = (probe.get("stdout") or "").strip().splitlines()[-1] if (probe.get("stdout") or "").strip() else ""
     if size_str == "MISSING" or not size_str.isdigit():
-        return {"error": (f"write_file: /workspace/{filepath} not found after write — the write did "
+        return {"error": (f"write_file: {filepath} not found after write — the write did "
                           "not take effect (check the path / that the workspace is mounted; for an "
                           "APKEditor-decoded tree, files live under root/).")}
     if int(size_str) != expected:
-        return {"error": (f"write_file: /workspace/{filepath} is {size_str} bytes on disk but "
+        return {"error": (f"write_file: {filepath} is {size_str} bytes on disk but "
                           f"{expected} were written — the write was truncated/partial, do not trust it.")}
-    return {"stdout": f"Successfully wrote {expected} bytes to /workspace/{filepath}"}
+    return {"stdout": f"Successfully wrote {expected} bytes to {filepath}"}
+
+@registry.register(
+    name="append_to_file",
+    description=(
+        "APPENDS text to the end of a file (creating it if it doesn't exist) WITHOUT sending the whole file "
+        "back through context. This is how you author a LARGE generated artifact incrementally — write it in "
+        "many small append calls instead of one giant write_file whose entire content must pass through the "
+        "model's output tokens (which caps out and wastes context on a big file). The append is size-verified: "
+        "the file's on-disk size must grow by exactly the bytes you sent, or an error is returned so a partial "
+        "append is never trusted."
+    ),
+    params_schema={
+        "filepath": "string (path relative to workspace)",
+        "content": "string (the text to append to the end of the file)",
+    },
+    output="A confirmation with the appended byte count and the file's new total size, or an error if the size didn't grow by exactly what was sent.",
+    when_to_use="Use this to build a big file piece by piece (a large smali table, a generated source file, a long asset). For creating/overwriting a whole small file use write_file; for a surgical in-place edit use replace_in_file.",
+)
+def append_to_file(filepath, content):
+    filepath = normalize_path(filepath)
+    import base64
+    content_bytes = (content or "").encode('utf-8')
+    added = len(content_bytes)
+    # Measure the pre-append size (MISSING -> 0, i.e. the file will be created).
+    before = run_cmd(f"stat -c %s {wpath(filepath)} 2>/dev/null || echo MISSING")
+    before_str = (before.get("stdout") or "").strip().splitlines()[-1] if (before.get("stdout") or "").strip() else ""
+    prev = int(before_str) if before_str.isdigit() else 0
+    b64_content = base64.b64encode(content_bytes).decode('utf-8')
+    # `>>` appends; base64 -d of an empty payload appends nothing (a valid no-op).
+    cmd = f"mkdir -p \"$(dirname {wpath(filepath)})\" && echo '{b64_content}' | base64 -d >> {wpath(filepath)}"
+    res = run_cmd(cmd)
+    if res['returncode'] != 0:
+        return res
+    # Ground-truth: the on-disk size must have grown by exactly `added`, or the
+    # append was partial/misdirected and must not be trusted (same discipline as
+    # write_file / delete_path).
+    probe = run_cmd(f"stat -c %s {wpath(filepath)} 2>/dev/null || echo MISSING")
+    size_str = (probe.get("stdout") or "").strip().splitlines()[-1] if (probe.get("stdout") or "").strip() else ""
+    if size_str == "MISSING" or not size_str.isdigit():
+        return {"error": (f"append_to_file: {filepath} not found after append — the write did "
+                          "not take effect (check the path / that the workspace is mounted; for an "
+                          "APKEditor-decoded tree, files live under root/).")}
+    new_size = int(size_str)
+    if new_size - prev != added:
+        return {"error": (f"append_to_file: {filepath} grew by {new_size - prev} bytes but "
+                          f"{added} were appended — the append was truncated/partial, do not trust it.")}
+    return {"stdout": f"Appended {added} bytes to {filepath} (now {new_size} bytes)."}
 
 @registry.register(
     name="replace_in_file",
@@ -153,7 +197,7 @@ def write_file(filepath, content):
         "newlines). This is far cheaper and safer than read_file_chunk + write_file for small edits."
     ),
     params_schema={
-        "filepath": "string (path to the text file, relative to /workspace)",
+        "filepath": "string (path to the text file, relative to the project root)",
         "old_string": "string (the exact text to find, including whitespace/indentation; make it unique unless replace_all=true)",
         "new_string": "string (the replacement text; use '' to delete the matched text)",
         "replace_all": "boolean (optional, default false — replace every occurrence instead of requiring a single unique match)"
@@ -169,11 +213,11 @@ def replace_in_file(filepath, old_string, new_string, replace_all=False):
     all_flag = "1" if replace_all in (True, "true", "True", 1, "1") else "0"
     b64_old = base64.b64encode(old_string.encode("utf-8")).decode("ascii")
     b64_new = base64.b64encode((new_string or "").encode("utf-8")).decode("ascii")
-    # Ship a python editor into the sandbox (base64 args, same trick as patch_smali_method)
+    # Pipe a python editor into python3 (base64 args, same trick as patch_smali_method)
     # so arbitrary code/whitespace in the strings can't break shell quoting.
     script = (
         "import sys, base64\n"
-        f"fp = '/workspace/{filepath}'\n"
+        f"fp = '{filepath}'\n"
         "old = base64.b64decode(sys.argv[1]).decode('utf-8')\n"
         "new = base64.b64decode(sys.argv[2]).decode('utf-8')\n"
         "replace_all = sys.argv[3] == '1'\n"
@@ -192,7 +236,7 @@ def replace_in_file(filepath, old_string, new_string, replace_all=False):
         "    f.write(data)\n"
         "print('Replaced ' + str(count) + ' occurrence(s) in ' + fp + '.')\n"
     )
-    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64_script = encode_script(script)
     cmd = f"echo '{b64_script}' | base64 -d | python3 - {b64_old} {b64_new} {all_flag}"
     return run_cmd(cmd, timeout=30)
 
@@ -200,7 +244,7 @@ def replace_in_file(filepath, old_string, new_string, replace_all=False):
     name="delete_path",
     description="Deletes a file or directory recursively inside the workspace. Use this to remove files the user asks you to remove, or to clean up temporary artifacts.",
     params_schema={"filepath": "string (path relative to workspace)"},
-    output="A confirmation line 'Successfully deleted /workspace/<filepath>' on success. If the path did NOT exist, returns an error (NOT a false success) — because `rm -rf` exits 0 on a missing path, a silent no-op would otherwise look identical to a real delete and mask a wrong path / unmounted workspace. Also errors if the path is the workspace root or the shell command fails.",
+    output="A confirmation line 'Successfully deleted <filepath>' on success. If the path did NOT exist, returns an error (NOT a false success) — because `rm -rf` exits 0 on a missing path, a silent no-op would otherwise look identical to a real delete and mask a wrong path. Also errors if the path is the workspace root or the shell command fails.",
     when_to_use="Use this when the user asks to remove a file or folder, or when you need to clean up temporary/intermediate artifacts you created."
 )
 def delete_path(filepath):
@@ -213,34 +257,34 @@ def delete_path(filepath):
     # intended change (e.g. an ABI strip) silently not happen while downstream
     # verify still "passes". Check existence first, then confirm removal, so a
     # no-op is surfaced as an error the agent must react to instead of trusting.
-    existed = run_cmd(f"test -e /workspace/{filepath} && echo YES || echo NO")
+    existed = run_cmd(f"test -e {wpath(filepath)} && echo YES || echo NO")
     if (existed.get("stdout") or "").strip() == "NO":
-        return {"error": (f"Nothing deleted: /workspace/{filepath} does not exist. "
+        return {"error": (f"Nothing deleted: {filepath} does not exist. "
                           "Check the path — for an APKEditor-decoded tree, native libs and "
                           "assets live under root/ (e.g. root/lib/<abi>), not at the top level. "
                           "See the apk-toolchain skill's reference/decoded-tree-layout.md.")}
-    res = run_cmd(f"rm -rf /workspace/{filepath}")
+    res = run_cmd(f"rm -rf {wpath(filepath)}")
     if res['returncode'] != 0:
         return res
-    still = run_cmd(f"test -e /workspace/{filepath} && echo YES || echo NO")
+    still = run_cmd(f"test -e {wpath(filepath)} && echo YES || echo NO")
     if (still.get("stdout") or "").strip() == "YES":
-        return {"error": f"Delete reported no error but /workspace/{filepath} is still present — "
+        return {"error": f"Delete reported no error but {filepath} is still present — "
                          "the removal did not take effect (check permissions / mount)."}
-    return {"stdout": f"Successfully deleted /workspace/{filepath}"}
+    return {"stdout": f"Successfully deleted {filepath}"}
 
 @registry.register(
     name="move_file",
     description=(
         "Moves or renames a file or directory inside the workspace. "
         "Use this to relocate files or rename them. "
-        "Both source and destination are relative to /workspace. "
+        "Both source and destination are relative to the project root. "
         "Parent directories of the destination are created automatically if they do not exist."
     ),
     params_schema={
         "source": "string (path relative to workspace, e.g. 'lib/arm64-v8a/libfoo.so')",
         "destination": "string (path relative to workspace, e.g. 'backup/libfoo.so')"
     },
-    output="A confirmation line 'Moved /workspace/<source> -> /workspace/<destination>' on success, or an error if either path is the workspace root or the move fails.",
+    output="A confirmation line 'Moved <source> -> <destination>' on success, or an error if either path is the workspace root or the move fails.",
     when_to_use="Use this to relocate or rename a file/folder. To copy without removing the original, use duplicate_file instead."
 )
 def move_file(source, destination):
@@ -251,24 +295,24 @@ def move_file(source, destination):
     if not destination or destination == ".":
         return {"error": "Destination path cannot be the workspace root."}
     cmd = (
-        f"mkdir -p $(dirname /workspace/{destination}) && "
-        f"mv /workspace/{source} /workspace/{destination}"
+        f"mkdir -p \"$(dirname {wpath(destination)})\" && "
+        f"mv {wpath(source)} {wpath(destination)}"
     )
     res = run_cmd(cmd)
     if res['returncode'] != 0:
         return res
     # Ground-truth the move: confirm the source is gone AND the destination exists.
     # A returncode of 0 alone can hide a no-op (wrong path) — surface it as an error.
-    chk = run_cmd(f"echo src=$(test -e /workspace/{source} && echo 1 || echo 0) "
-                  f"dst=$(test -e /workspace/{destination} && echo 1 || echo 0)")
+    chk = run_cmd(f"echo src=$(test -e {wpath(source)} && echo 1 || echo 0) "
+                  f"dst=$(test -e {wpath(destination)} && echo 1 || echo 0)")
     out = (chk.get("stdout") or "")
     if "dst=1" not in out:
-        return {"error": (f"move_file: destination /workspace/{destination} is missing after the move "
+        return {"error": (f"move_file: destination {destination} is missing after the move "
                           "— it did not take effect (check the source path / decoded-tree layout).")}
     if "src=1" in out:
-        return {"error": (f"move_file: source /workspace/{source} is still present after the move — "
+        return {"error": (f"move_file: source {source} is still present after the move — "
                           "the move did not complete (do not trust it as done).")}
-    return {"stdout": f"Moved /workspace/{source} -> /workspace/{destination}"}
+    return {"stdout": f"Moved {source} -> {destination}"}
 
 @registry.register(
     name="duplicate_file",
@@ -276,14 +320,14 @@ def move_file(source, destination):
         "Finds a file (or directory) in the workspace and places an exact copy of it at a new location. "
         "Use this when you need to duplicate a file without removing the original — for example, "
         "backing up a .so library before patching it, or copying a config into a different folder. "
-        "Source is found anywhere under /workspace; the copy is placed at the given destination path. "
+        "Source is found anywhere in the project folder; the copy is placed at the given destination path. "
         "Parent directories of the destination are created automatically if they do not exist."
     ),
     params_schema={
         "source": "string (path relative to workspace of the file or directory to copy, e.g. 'lib/arm64-v8a/libfoo.so')",
         "destination": "string (path relative to workspace for the copy, e.g. 'backup/libfoo.so')"
     },
-    output="A confirmation line 'Duplicated /workspace/<source> -> /workspace/<destination>' on success, or an error if either path is the workspace root or the copy fails.",
+    output="A confirmation line 'Duplicated <source> -> <destination>' on success, or an error if either path is the workspace root or the copy fails.",
     when_to_use="Use this to back up a file before modifying it (e.g. copy a .so before hex-patching), or to place a copy of a file/template into a new location. To move (remove original), use move_file."
 )
 def duplicate_file(source, destination):
@@ -294,15 +338,15 @@ def duplicate_file(source, destination):
     if not destination or destination == ".":
         return {"error": "Destination path cannot be the workspace root."}
     cmd = (
-        f"mkdir -p $(dirname /workspace/{destination}) && "
-        f"cp -r /workspace/{source} /workspace/{destination}"
+        f"mkdir -p \"$(dirname {wpath(destination)})\" && "
+        f"cp -r {wpath(source)} {wpath(destination)}"
     )
     res = run_cmd(cmd)
     if res['returncode'] != 0:
         return res
     # Ground-truth the copy: confirm the destination actually exists.
-    chk = run_cmd(f"test -e /workspace/{destination} && echo YES || echo NO")
+    chk = run_cmd(f"test -e {wpath(destination)} && echo YES || echo NO")
     if "YES" not in (chk.get("stdout") or ""):
-        return {"error": (f"duplicate_file: destination /workspace/{destination} not found after copy "
+        return {"error": (f"duplicate_file: destination {destination} not found after copy "
                           "— it did not take effect (check the source path / decoded-tree layout).")}
-    return {"stdout": f"Duplicated /workspace/{source} -> /workspace/{destination}"}
+    return {"stdout": f"Duplicated {source} -> {destination}"}

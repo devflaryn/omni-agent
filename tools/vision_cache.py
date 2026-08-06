@@ -13,7 +13,7 @@ subprocess output) and silently drops any other key — so a naive
 cache.store("vision_analyze", path, {"analysis": text}) call would write an
 entry with no "analysis" in it, and every read would look like a miss. On top
 of that, cache.py's keying resolves the target through
-resolve_workspace_path(), which expects a /workspace-relative path; vision
+resolve_workspace_path(), which expects a project-relative path; vision
 call sites pass host-absolute image paths, which resolve fragile-to-wrong.
 
 Keying here is purely on the image BYTES (sha256) + the prompt, not the path,

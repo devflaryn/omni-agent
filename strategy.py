@@ -11,7 +11,7 @@ It is ORCHESTRATOR-SESSION STATE WITH EXACTLY ONE WRITER (the main loop). Subage
 never mutate it — that single-writer placement is what keeps the parallel
 subagent stack unaffected (see subagents.py / agent.py delegation).
 
-Kept free of any pywebview/Docker/LLM imports so it tests in isolation; agent.py
+Kept free of any pywebview/shell/LLM imports so it tests in isolation; agent.py
 is the only bridge (AgentApi._on_strategy_update).
 """
 import json

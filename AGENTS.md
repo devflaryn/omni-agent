@@ -11,6 +11,79 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
+## Execution model: real paths on the real machine
+
+Tools run **directly on the user's machine**, in the user's project folder, the
+way a person would run them in a terminal opened there. `host_exec.py` is the
+single entry point every tool shells through.
+
+There is no container, no virtual filesystem root, and no path rewriting. Two
+earlier designs had one — first Docker, then a "host sandbox" that faked a
+`/workspace` root via a symlink — and both were removed because the translation
+layer between *what the tool wrote* and *what actually ran* is where the bugs
+lived. It produced failures that looked like nothing at all: `find /workspace`
+returning zero files with exit code 0, scripts opening a root that did not exist,
+the user's home directory leaking into the model's context.
+
+What replaced it:
+
+- **cwd is the project folder.** `run_cmd` sets it, so a relative path in a
+  command means what it says. `run_command` needs no `cd` prologue.
+- **Paths are shell-quoted** via `tools.common.wpath`. Real project folders
+  contain spaces (this app lives in `~/Desktop/Omni Apps/`), and an unquoted path
+  silently splits one argument into several — which surfaces as a confusing "No
+  such file", not as a quoting error. `wpath` is for command ARGUMENTS only:
+  result messages and `echo` text take the plain path, or the quotes end up in
+  the model's transcript.
+- **`normalize_path` still accepts a legacy `/workspace/...` prefix** and strips
+  it. That convention outlives the container in old transcripts and in the
+  model's habits; accepting it costs one comparison, rejecting it would turn a
+  cosmetic mismatch into a failed tool call.
+
+Guards live in `tests/test_host_exec.py`, and every path test runs twice — once
+against a folder whose path contains a space.
+
+**Portability.** Tool commands are POSIX shell with GNU-style options, so a POSIX
+shell is required everywhere: `/bin/sh` on macOS/Linux, and on Windows the
+`bash.exe` from Git for Windows / MSYS2 / WSL (cmd.exe and PowerShell cannot
+interpret these commands, so `host_exec` detects the shell and says so plainly
+rather than emitting thousands of syntax errors). The GNU userland is put first
+on PATH for tool commands only — never the user's own shell — because the
+commands use `sha256sum`, `stat -c`, `sed -i`, `grep -P`, `find -printf`, which
+BSD/macOS userland rejects.
+
+**The machine has to have the toolchain.** `scripts/install_tools.py` installs
+it (idempotent; `--check` reports without changing anything) via Homebrew, apt/
+dnf/pacman/zypper, or winget/choco as appropriate: JDK 21, apktool, jadx,
+radare2, Ghidra, LLVM/binutils, Android build-tools, APKEditor, and the
+baksmali/smali wrappers built from `shims/*.java`. Wrappers land in
+`~/.omni-agent/bin`, which `host_exec` puts first on PATH. `set_workspace()`
+reports anything missing when the project opens, instead of letting it surface as
+"command not found" mid-task.
+
+Three pins are load-bearing and will look like staleness to a future reader. All
+three were found by running the tools, not by reading code:
+
+- **Ghidra is pinned to 11.3.2.** `ghidra_decompile` drives Ghidra through
+  `tools/_ghidra_decompile.py`, a *Jython* post-script. Ghidra 12 dropped bundled
+  Jython for PyGhidra, so on 12.x analysis succeeds and then the script dies with
+  "Ghidra was not started with PyGhidra" — yielding no output at all. Bumping the
+  version requires porting that script first.
+- **A separate apktool 2.9.3 jar backs the baksmali/smali shims.** apktool 3.x
+  ships a minimized shaded jar that keeps `Baksmali` but strips `DexFileFactory`,
+  `Opcodes`, `MultiDexContainer` and `SmaliMod` — the exact entry points
+  `shims/*.java` call. The packaged apktool is still what decode/recompile use;
+  only the shim classpath is pinned.
+- **Ghidra's project cache lives outside the project folder** (see
+  `_ghidra_project_root`). Ghidra refuses any path containing a dot-prefixed
+  element, which rules out the old `.ghidra_proj` and any project that happens to
+  sit under a hidden directory.
+
+The tool cache (`tools/cache.py`) is global and keyed on file BYTES, so its
+`_CACHE_VERSION` had to be bumped: entries written when tools reported a
+`/workspace` root would otherwise be replayed verbatim into the model's context,
+handing it paths that no longer resolve.
+
 ## Context & memory architecture (2026-07 upgrade)
 
 Built to keep an hours-to-days run cheap and focused on a fixed model (GLM 5.2 +
@@ -30,6 +103,56 @@ session and re-armed on use.
 `TOOL RESULT` messages collapse to short stubs once past a recent-keep window, so
 history stays lean between summaries (the plan + investigation + knowledge graph
 retain what mattered). Toggle via the session `context_editing` flag.
+
+**Build Ledger** (`ledger.py`, `tools/ledger_tools.py`) — the physical manifest
+of a large, multi-artifact modification, kept separate from investigation memory
+(which records *reasoning*). The ledger records the *build accounting*:
+components planned vs done, files produced (path/bytes/sha), binary offsets
+patched (keyed `target@offset`, deduped), and verifications (pass/fail). Its
+prompt view is **aggregate-first and bounded** — it leads with completion as
+numbers (`3/7 components done (43%) | artifacts: 12 files, 4.3 MB | patches: 5 |
+verify: 2 pass / 1 fail`) and an OPEN/REMAINING worklist, and never dumps the
+full set no matter how many artifacts a 10 MB build produces. It is a
+module-level singleton persisted to `memory_dir/ledger.json`, folded into the
+system prompt in `_refresh_system_prompt`, and **SURVIVES summarization/reset**
+exactly like the plan and investigation memory, so a many-hour / many-subagent
+build never loses track of what's built or what remains. `merge()` folds a
+subagent's returned build delta into the authoritative ledger without
+duplicating. This is what makes the agent *eligible* for very large modifications
+— it answers "did I already patch this offset / is component Y done / how many MB
+are built" from structured state instead of re-reading a 100 MB library or
+trusting lossy prose. Write with `ledger_add_component` /
+`ledger_set_component_status` / `ledger_record_artifact` / `ledger_record_patch`
+/ `ledger_record_verification`; read the compact "where am I" view with
+`ledger_status`. Offline tests: `tests/test_ledger.py`.
+
+### Large modifications (10 MB+ / thousands of files)
+
+For a very large change (e.g. injecting a complete Luau runtime, ~10 MB) the
+build only stays coherent if durable structured state — not the transcript — is
+the source of truth. The doctrine:
+
+1. **Enumerate first.** Break the build into components in the Build Ledger
+   (`ledger_add_component`) before touching code, so progress is countable.
+2. **Fan out — including the writes.** Delegate bounded, independent components to
+   parallel subagents (`dispatch_agents` / `run_subagents_parallel`); each returns a
+   *distilled* report, and its build delta merges into the shared ledger. Cut the
+   work by **ownership** and give every change step a `scope`, so disjoint writers
+   build concurrently instead of queueing (see *Parallel execution & scoped
+   writes*). Keep the orchestrator's own context lean.
+3. **Record as you go.** After producing a file, patching an offset, or finishing
+   a component, log it to the ledger immediately — that record, not the raw tool
+   output (which is stubbed/evicted), is what survives the next reset.
+4. **Author big files incrementally.** Never round-trip a large generated
+   artifact through `write_file` (its whole body burns output tokens and caps
+   out). Build it with `append_to_file` across many small, size-verified appends,
+   or generate it with a script run via `run_command`.
+5. **Read narrow.** In a huge decompiled tree, orient with the code graph
+   (`build_code_graph` / `query_code_graph`) and page with `read_file_chunk`;
+   let noisy-tool distillers keep logcat/build output out of context.
+6. **Run longer between resets when safe.** A build carrying full state in the
+   plan + investigation + ledger can raise `session["max_steps_before_summary"]`;
+   the token/char pressure guard is still the hard ceiling.
 
 **Code knowledge graph usability** (`tools/code_graph.py`, `tools/_kg_query.py`)
 — the existing auto-derived code graph (`build_code_graph`/`query_code_graph`)
@@ -114,7 +237,7 @@ memory dir, so it **survives a context-window summarization/reset intact**.
 
 ### Running / testing
 - Launch the app: `python agent.py` (pywebview desktop UI).
-- Fast, offline regression tests for this workflow (no Docker/network needed):
+- Fast, offline regression tests for this workflow (no network or RE toolchain needed):
   ```
   python tests/test_investigation_memory.py
   python tests/test_reviewer.py
@@ -123,7 +246,7 @@ memory dir, so it **survives a context-window summarization/reset intact**.
   python tests/test_autonomous_loop.py
   python tests/test_tool_limits.py
   ```
-  (Tests under `tests/` that need Docker, a live LLM provider, or APK fixtures —
+  (Tests under `tests/` that need the host RE toolchain, a live LLM provider, or APK fixtures —
   e.g. `test_code_graph`, `test_llm_live`, `test_abi_contract` — are environment
   dependent and unrelated to this workflow.)
 
@@ -237,3 +360,111 @@ Offline tests: `tests/test_plugins.py`, `tests/test_subagents.py`,
 `tests/test_context_hygiene.py`, `tests/test_planning_superpowers.py`,
 `tests/test_model_ladder.py`, `tests/test_subagent_routing.py`,
 `tests/test_delegation_nudges.py`, `tests/test_agent_delegation_wave.py`.
+
+## Superpowers Mode (auto-brainstorm + subagent-driven-by-default)
+
+A "just build it well, don't ask me" layer that wires the personas above to fire
+**automatically** on a new task, so quality workflows don't depend on the
+orchestrator remembering to reach for them. It reuses existing primitives — no new
+personas, no new hook events. Behind `superpowers_enabled` (default on, env
+`OMNI_SUPERPOWERS=0` disables); **OFF is byte-identical to a pre-feature build**.
+Store + pure classifiers live in `superpowers.py` (sibling of `strategy.py` /
+`planning.py`); the gates live in `agent.py`.
+
+**Auto-brainstorm gate** (`agent._maybe_run_brainstorm_gate`) — the FIRST thing on
+a genuinely new, **non-trivial** task (before the strategy/plan gates). It runs the
+`brainstormer` persona synchronously with an **autonomy override**: it must NOT
+defer to the user or emit OPEN QUESTIONS — it resolves each into a labeled
+ASSUMPTION and picks ONE approach. The distilled result is parsed into a
+**Design Brief** (`superpowers.DesignBrief`: clarified goal / chosen approach +
+rationale / rejected alternatives / assumptions / risks), stored to
+`<memory_dir>/design_brief.json`, and **pinned into the system prompt** just below
+the Strategic Brief so the plan is built against it. Fires **once per task** (clears
+its own `needs_brainstorm` up front), never blocks reads, and never raises — any
+failure (missing persona, subagent error, unparseable report) degrades to an
+**inline self-brainstorm** steering message instead. The brainstormer is
+`tier: premium`, so it obeys the existing premium budget/degrade path.
+
+**Architect gate** (`agent._maybe_run_architect_gate`) — runs immediately after the
+brainstorm, before any planning. The orchestrator plans from whatever it happens to
+have read, under its own context pressure, and reliably produces a **serial** list;
+a serial plan then executes serially no matter how much parallel machinery sits
+underneath it. So the `architect` persona (read-only, premium, inspects freely in
+its own context) designs the plan instead and answers with a **JSON plan proposal**
+in the plan's own vocabulary — phases, plus first-phase steps carrying
+`delegate` / `depends_on` / `scope`, plus `components` for a multi-artifact build.
+`superpowers.parse_plan_proposal` parses it and `_install_proposed_plan` installs it
+as the live plan (seeding the ledger's components), so the parallel shape survives
+into execution instead of being flattened by re-transcription. Fires **once per
+task**, never in inline-only mode, and degrades at every step — no persona, a failed
+run, or a prose answer all fall back to the orchestrator planning for itself (a
+prose proposal is still handed over as text). Tests: `tests/test_architect_gate.py`.
+
+**Subagent-driven execution by default** — when superpowers is on (and not
+inline-only), the auto-delegate read floor drops from 2 to **1**
+(`_auto_delegate_untagged_steps`), so even a lone independent research step fans out
+to a subagent. Delegation becomes the normal path, not a threshold nudge. Explicit
+`delegate=` tags are unchanged. Writes no longer serialize globally — see
+**Parallel execution & scoped writes** below.
+
+**Inline-only override** — `superpowers.detect_inline_only(text)` matches only
+CLEAR phrasings ("inline only", "no subagents", "don't delegate", "do it yourself"),
+setting a per-task `inline_only` flag. Effect: auto-tagging/auto-dispatch is
+suppressed (execution stays in the orchestrator's context) and the auto-brainstorm
+runs **inline** instead of dispatching a subagent. A passing mention of the word
+"inline" does not trip it.
+
+**Triviality escape** — `superpowers.is_trivial_task(text)` fails safe (unsure →
+non-trivial): only short single-edit requests (rename/typo/one-line/bump/format)
+skip the pipeline and run inline as before.
+
+**Verify before done** — no new code; the `verification` plugin's `on_final_answer`
+hook already sends an unverified completion claim back for a verifier pass.
+
+Design spec: `docs/superpowers/specs/2026-07-27-superpowers-mode-design.md`.
+Offline tests: `tests/test_superpowers.py`.
+
+## Parallel execution & scoped writes
+
+The plan is the parallelism primitive: **steps with no `depends_on` run at the same
+time**, so the *width* of a phase largely decides how long a job takes. Phases are
+dependency STAGES, not a to-do list.
+
+**Plan wide, not long.** `plan_create` / `plan_replan` / `plan_add_tasks` all accept
+full step objects (`delegate`, `depends_on`, `scope`, plus the evidence fields), and
+a step may carry a local `key` that its siblings name in `depends_on` — so one call
+can lay out a whole wave *and* its internal dependency graph before any id exists.
+`plan_add_tasks` is the batch path: adding 30 steps one at a time costs 30 LLM
+round-trips and yields a plan the harness can only run serially. `Plan.ready_steps()`
+computes what may start right now, and `to_markdown()` prints it ("Ready NOW —
+independent, may run concurrently"), calling out ready steps that carry no delegate.
+
+**Scoped concurrent writes** (`subagents.ScopedWorkspaceLock`) — a write step
+declares the workspace paths it owns (`scope: ["smali/com/foo/**"]`). Writers with
+**disjoint** scopes run genuinely concurrently; overlapping ones queue; a write step
+with **no** scope claims the whole workspace exclusively (the old behavior, still the
+safe default). Overlap is computed by reducing each pattern to its literal prefix and
+comparing at segment boundaries — deliberately *over*-approximating, so it may report
+a collision that could not really happen but never misses one. The queue is fair, so
+an exclusive writer can't be starved by a stream of scoped ones. `agent.py` routes
+reads *and* scoped writes into one `_run_delegated_wave`; unscoped writes stay on the
+serial path. For a large multi-package change, cut the work by **ownership** (one
+step per package / `.so` / module, each scoped) so the pieces build in parallel.
+
+**Long-running build subagents** — `MAX_STEPS_CAP` is 120 (env
+`OMNI_SUBAGENT_MAX_STEPS_CAP`), sized for incremental authoring rather than lookups.
+Crossing `CONTEXT_CHAR_LIMIT` no longer forces an immediate answer: the sub-run
+**compacts** its own transcript (system prompt + task + recent tail kept, middle
+elided with a "don't redo that work" marker) up to `OMNI_SUBAGENT_COMPACTIONS`
+(default 4) times, because a build subagent's real output is on disk and in the
+ledger, not in its messages. Once that budget is spent the original force-final
+behavior remains.
+
+**Multi-phase completion** — `Plan.is_complete()` is false while any phase is still
+pending, so finishing phase 1 of 5 of a long build is no longer mistaken for
+finishing the task (which previously made the next user message start a brand-new
+task, re-brainstormed and re-planned). An explicit `plan_set_outcome "completed"`
+still wins, and the final-answer gate already requires one.
+
+Offline tests: `tests/test_plan_parallel_shape.py`, `tests/test_scoped_writes.py`,
+`tests/test_large_build_budget.py`.

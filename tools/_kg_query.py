@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Code knowledge-graph query engine (runs INSIDE the Docker sandbox).
+"""Code knowledge-graph query engine (runs as a standalone script on the host).
 
 Usage:
     python3 _kg_query.py <query_type> [name] [limit] [graph_id] [graph_id_b]
@@ -21,9 +21,9 @@ query_type:
 
 NAMED GRAPHS
 ------------
-Graphs live in per-namespace subdirs /workspace/.codegraph/<graph_id>/ so several
+Graphs live in per-namespace subdirs <project>/.codegraph/<graph_id>/ so several
 can coexist (e.g. two app versions). If <graph_id> is omitted, the most recently
-built graph is used. A legacy flat graph at /workspace/.codegraph/ (built before
+built graph is used. A legacy flat graph at <project>/.codegraph/ (built before
 namespacing) is still read as graph_id '(default)'.
 
 Reads only the chunked shards it needs — never the whole graph at once.
@@ -32,7 +32,7 @@ import sys
 import os
 import json
 
-WORKSPACE = os.environ.get("CODEGRAPH_WORKSPACE", "/workspace")
+WORKSPACE = os.path.abspath(os.environ.get("CODEGRAPH_WORKSPACE") or os.getcwd())
 GRAPH_ROOT = os.path.join(WORKSPACE, ".codegraph")
 GRAPH_INDEX_PATH = os.path.join(GRAPH_ROOT, "graphs.json")
 

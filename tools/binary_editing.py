@@ -14,8 +14,8 @@ import base64
 import shlex
 
 from tool_registry import registry
-from tools.common import normalize_path, detect_elf_arch
-from docker_sandbox import run_cmd
+from tools.common import normalize_path, detect_elf_arch, encode_script, wpath
+from host_exec import run_cmd
 
 
 def _clean_hex(hex_str):
@@ -71,7 +71,7 @@ _RET_patches = {
 def _find_symbol_offset(so_path, symbol_name):
     """Find the FILE OFFSET (not virtual address) of a symbol using rabin2 and readelf."""
     # Get the symbol's virtual address via rabin2
-    res = run_cmd(f"rabin2 -s /workspace/{so_path} | grep -w '{symbol_name}' | head -1", timeout=30)
+    res = run_cmd(f"rabin2 -s {wpath(so_path)} | grep -w '{symbol_name}' | head -1", timeout=30)
     stdout = res.get("stdout", "").strip()
     if not stdout:
         return None, f"Symbol '{symbol_name}' not found in {so_path}. Use rabin2_info with '-s' to list symbols first."
@@ -89,7 +89,7 @@ def _find_symbol_offset(so_path, symbol_name):
 
     # Convert virtual address to file offset using readelf -l (program headers)
     # We need the LOAD segment that contains this vaddr
-    res2 = run_cmd(f"readelf -l /workspace/{so_path}", timeout=10)
+    res2 = run_cmd(f"readelf -l {wpath(so_path)}", timeout=10)
     segments = res2.get("stdout", "")
     for line in segments.splitlines():
         if "LOAD" not in line:
@@ -140,7 +140,7 @@ def _find_symbol_offset(so_path, symbol_name):
         "breaking offsets. For longer replacements, use patch_bytes_at_offset at the string's offset."
     ),
     params_schema={
-        "so_path": "string (path to the .so file, relative to /workspace)",
+        "so_path": "string (path to the .so file, relative to the project root)",
         "old_string": "string (the exact string to find in the binary)",
         "new_string": "string (the replacement string — must be same length or shorter than old_string)"
     },
@@ -158,7 +158,7 @@ def patch_binary_string(so_path, old_string, new_string):
     b64_new = base64.b64encode(padded.encode("latin-1")).decode("ascii")
     script = (
         "import sys, base64\n"
-        f"filepath = '/workspace/{so_path}'\n"
+        f"filepath = '{so_path}'\n"
         # argv[0] is '-' (the stdin-script placeholder); the real args start at [1].
         "old = base64.b64decode(sys.argv[1])\n"
         "new = base64.b64decode(sys.argv[2])\n"
@@ -174,7 +174,7 @@ def patch_binary_string(so_path, old_string, new_string):
         "    f.write(data)\n"
         f"print('Replaced ' + str(count) + ' occurrence(s) at offset 0x' + format(idx, 'x') + ' in {so_path}. ' + str(len(new)) + ' byte(s) patched per occurrence.')\n"
     )
-    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64_script = encode_script(script)
     # base64 args are passed positionally after '-'; the script reads them from argv[1:].
     cmd = f"echo '{b64_script}' | base64 -d | python3 - {b64_old} {b64_new}"
     return run_cmd(cmd, timeout=30)
@@ -195,7 +195,7 @@ def patch_binary_string(so_path, old_string, new_string):
         "The tool reports the offset patched and reads the bytes back so you can confirm the write."
     ),
     params_schema={
-        "filepath": "string (path to the binary, relative to /workspace)",
+        "filepath": "string (path to the binary, relative to the project root)",
         "find_hex": "string (hex byte sequence to locate, e.g. '1f2003d5' or '1f 20 03 d5'; whitespace/\\x ignored)",
         "replace_hex": "string (hex bytes to write; same length as find_hex unless allow_length_change=true)",
         "offset": "string (optional, anchor the patch at this file offset — '0x1a2b' hex or a decimal number; find_hex is verified to sit there before writing)",
@@ -245,7 +245,7 @@ def binary_patch(filepath, find_hex, replace_hex, offset=None, occurrence=0, all
     # normalized above.
     script = (
         "import sys\n"
-        f"fp = '/workspace/{filepath}'\n"
+        f"fp = '{filepath}'\n"
         "find = bytes.fromhex(sys.argv[1])\n"
         "repl = bytes.fromhex(sys.argv[2])\n"
         "off_arg = sys.argv[3]\n"
@@ -284,12 +284,12 @@ def binary_patch(filepath, find_hex, replace_hex, offset=None, occurrence=0, all
         "    f.write(data)\n"
         "with open(fp, 'rb') as f:\n"
         "    f.seek(target); verify = f.read(len(repl))\n"
-        "print('Patched ' + str(len(repl)) + ' byte(s) at offset ' + hex(target) + ' in ' + fp.split('/workspace/')[-1] + '.')\n"
+        "print('Patched ' + str(len(repl)) + ' byte(s) at offset ' + hex(target) + ' in ' + fp + '.')\n"
         "print('Original bytes: ' + orig.hex())\n"
         "print('New bytes:      ' + repl.hex())\n"
         "print('Verification (read back): ' + verify.hex() + ('  OK' if verify == repl else '  MISMATCH!'))\n"
     )
-    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64_script = encode_script(script)
     cmd = f"echo '{b64_script}' | base64 -d | python3 - {find_clean} {repl_clean} '{off_arg}' {occurrence}"
     return run_cmd(cmd, timeout=60)
 
@@ -304,7 +304,7 @@ def binary_patch(filepath, find_hex, replace_hex, offset=None, occurrence=0, all
         "the correct NOP instruction. You don't need to look up the address yourself."
     ),
     params_schema={
-        "so_path": "string (path to the .so file, relative to /workspace)",
+        "so_path": "string (path to the .so file, relative to the project root)",
         "function_name": "string (exact symbol name, e.g. 'Java_com_example_NativeLib_checkLicense')",
         "num_instructions": "integer (optional, number of instructions to NOP, default 4)"
     },
@@ -343,8 +343,8 @@ def nop_function(so_path, function_name, num_instructions=4):
     formatted = "\\x" + "\\x".join(full_nop[i:i+2] for i in range(0, len(full_nop), 2))
     cmd = (
         f'echo -n -e "{formatted}" | '
-        f'dd of=/workspace/{so_path} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
-        f'dd if=/workspace/{so_path} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p'
+        f'dd of={wpath(so_path)} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
+        f'dd if={wpath(so_path)} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p'
     )
     res = run_cmd(cmd, timeout=30)
     stdout = res.get("stdout", "")
@@ -360,7 +360,7 @@ def nop_function(so_path, function_name, num_instructions=4):
         "MOV + RET instructions at the function's entry point. You don't need to look up the address."
     ),
     params_schema={
-        "so_path": "string (path to the .so file, relative to /workspace)",
+        "so_path": "string (path to the .so file, relative to the project root)",
         "function_name": "string (exact symbol name, e.g. 'Java_com_example_NativeLib_isValid')",
         "return_value": "string (one of: 'true', 'false', 'zero', 'null' — 'false'/'zero'/'null' all write 0; 'true' writes 1)"
     },
@@ -396,8 +396,8 @@ def patch_function_return(so_path, function_name, return_value="true"):
     formatted = "\\x" + "\\x".join(patch_hex[i:i+2] for i in range(0, len(patch_hex), 2))
     cmd = (
         f'echo -n -e "{formatted}" | '
-        f'dd of=/workspace/{so_path} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
-        f'dd if=/workspace/{so_path} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p'
+        f'dd of={wpath(so_path)} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
+        f'dd if={wpath(so_path)} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p'
     )
     res = run_cmd(cmd, timeout=30)
     stdout = res.get("stdout", "")
@@ -492,7 +492,7 @@ with open(fp, "rb") as f:
     f.seek(offset)
     verify = f.read(len(new))
 
-name = fp.split("/workspace/")[-1]
+name = fp
 print("Patched %d byte(s) at offset 0x%x (%d) in %s" % (len(new), offset, offset, name))
 print("Previous bytes (for rollback): " + prev.hex())
 print("New bytes:                     " + new.hex())
@@ -516,7 +516,7 @@ if seg_note:
         "0x-prefixed hex; the tool verifies the offset is in range and reads the bytes back to confirm the write."
     ),
     params_schema={
-        "file_path": "string (path to the binary/file, relative to /workspace)",
+        "file_path": "string (path to the binary/file, relative to the project root)",
         "offset": "string or integer (file offset to patch at — decimal '4660' or 0x-hex '0x1234')",
         "new_hex_bytes": "string (even-length hex bytes to write, e.g. 'c0035fd6'; whitespace/\\x ignored)",
         "make_writable": "boolean (optional, default true; if the file is an ELF, add PF_W to the PT_LOAD segment containing the offset. Set false to leave segment permissions untouched)"
@@ -543,8 +543,8 @@ def patch_at_offset_with_bytes(file_path, offset, new_hex_bytes, make_writable=T
         return {"error": "new_hex_bytes must be a non-empty hex byte sequence."}
 
     mkw = make_writable in (True, "true", "True", 1, "1")
-    args = [f"/workspace/{file_path}", str(off_int), clean, "1" if mkw else "0"]
-    b64 = base64.b64encode(_PATCH_AT_OFFSET_SCRIPT.encode("utf-8")).decode("ascii")
+    args = [f"{wpath(file_path)}", str(off_int), clean, "1" if mkw else "0"]
+    b64 = encode_script(_PATCH_AT_OFFSET_SCRIPT)
     arg_str = " ".join(shlex.quote(a) for a in args)
     cmd = f"echo '{b64}' | base64 -d | python3 - {arg_str}"
     return run_cmd(cmd, timeout=60)

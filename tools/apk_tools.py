@@ -14,11 +14,11 @@ import zipfile
 
 from tool_registry import registry
 from tools.common import (normalize_path, build_paginated_command, append_page_hint,
-                          resolve_workspace_path)
+                          resolve_workspace_path, encode_script, wpath)
 from tools import cache
 from tools import constraints as _constraints
 from tools import mission_constraints as _mission
-from docker_sandbox import run_cmd
+from host_exec import run_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ from docker_sandbox import run_cmd
 @registry.register(
     name="unzip_apk",
     description="Unzips an APK file to extract its raw contents (assets, lib, META-INF, etc). This is a NARROW tool, NOT the decompile path: reach for it ONLY when the task is purely adding/removing/replacing WHOLE files or folders (e.g. deleting lib/x86, lib/x86_64, lib/armeabi-v7a, or swapping a .so/asset) and you do NOT need to read or edit code. For ANYTHING involving smali, XML, the manifest, or understanding the app, do NOT unzip — use decode_apk (apktool) for editable smali/resources, or jadx_decompile for readable Java. After whole-file edits, rebuild with recompile_apk (it auto-detects a raw unzipped directory), then sign_apk.",
-    params_schema={"apk_filename": "string (relative or absolute starting with /workspace)", "output_dir": "string"},
+    params_schema={"apk_filename": "string (relative to the project root)", "output_dir": "string"},
     output="The stdout/stderr of the unzip command listing every file extracted. If the APK is large this can take a moment. Returns an error dict if the APK path is wrong.",
     when_to_use="Use this ONLY for whole-file swaps (replace a .so, delete an arch folder, replace an asset) where you do NOT need to read/edit smali/XML/manifest. This is not how you reverse-engineer or patch code: for smali/resource/manifest edits use decode_apk, and to read the app's Java logic use jadx_decompile. Prefer those unless the task is literally just swapping whole files."
 )
@@ -43,7 +43,7 @@ def unzip_apk(apk_filename, output_dir):
     if hit is not None:
         return hit
 
-    cmd = f"unzip -o /workspace/{apk_filename} -d /workspace/{output_dir}"
+    cmd = f"unzip -o {wpath(apk_filename)} -d {wpath(output_dir)}"
     res = run_cmd(cmd, timeout=240)
     if isinstance(res, dict) and not res.get("error") and res.get("returncode") == 0:
         cache.store("unzip_apk", apk_filename, res, capture_dir=output_dir)
@@ -101,7 +101,7 @@ def _apkeditor_normalize_smali(output_dir):
     smali_classes2/, ... (sibling dirs). Safe to call when smali/classes
     doesn't exist (no-op)."""
     cmd = (
-        f"cd /workspace/{output_dir} && "
+        f"cd {wpath(output_dir)} && "
         "if [ -d smali/classes ]; then "
         "mv smali smali_apkeditor_src && mkdir smali && "
         "find smali_apkeditor_src/classes -mindepth 1 -maxdepth 1 -exec mv {} smali/ \\; && "
@@ -121,7 +121,7 @@ def _apkeditor_denormalize_smali(output_dir):
     """Reverse of _apkeditor_normalize_smali — restores APKEditor's own
     smali/classes, smali/classes2, ... layout so `APKEditor b` can read it."""
     cmd = (
-        f"cd /workspace/{output_dir} && "
+        f"cd {wpath(output_dir)} && "
         "mkdir -p smali_apkeditor_src/classes && "
         "find smali -mindepth 1 -maxdepth 1 -exec mv {} smali_apkeditor_src/classes/ \\; && "
         "rmdir smali && "
@@ -135,6 +135,28 @@ def _apkeditor_denormalize_smali(output_dir):
     return run_cmd(cmd, timeout=60)
 
 
+_APKTOOL_HAS_USE_AAPT2 = None
+
+
+def _apktool_takes_use_aapt2():
+    """True when the installed apktool still accepts `--use-aapt2`.
+
+    apktool 2.x needed the flag to opt into aapt2. apktool 3.x made aapt2 the
+    only backend and REMOVED the flag, so passing it there makes the build abort
+    with "Unrecognized option: --use-aapt2", print its usage, and exit 1 —
+    producing no APK while the surrounding command still looks like it ran. The
+    old Dockerfile pinned 2.9.3, so this only shows up now that the machine's own
+    apktool is used. Probed once and cached; unknown output is treated as
+    "doesn't take it", because omitting the flag is harmless on both versions.
+    """
+    global _APKTOOL_HAS_USE_AAPT2
+    if _APKTOOL_HAS_USE_AAPT2 is None:
+        probe = run_cmd("apktool b 2>&1 | head -40", timeout=60)
+        blob = (probe.get("stdout") or "") + (probe.get("stderr") or "")
+        _APKTOOL_HAS_USE_AAPT2 = "--use-aapt2" in blob
+    return _APKTOOL_HAS_USE_AAPT2
+
+
 def _decode_with_apkeditor(apk_filename, output_dir):
     """Fallback decoder for APKs with more than one app-defined resource
     package (e.g. Roblox, which bundles a personasdk package alongside its
@@ -145,10 +167,22 @@ def _decode_with_apkeditor(apk_filename, output_dir):
     packages correctly, so this is what gets a REAL text AndroidManifest.xml
     (needed by inject_session_bootstrap's <queries> edit) instead of only the
     binary -r fallback."""
-    cmd = f"rm -rf /workspace/{output_dir} && java -jar /usr/local/bin/APKEditor.jar d -i /workspace/{apk_filename} -o /workspace/{output_dir} -t xml -f"
+    # `apkeditor` comes from PATH (scripts/install_tools.py writes a wrapper
+    # into ~/.omni-agent/bin) rather than a hardcoded jar location.
+    cmd = f"rm -rf {wpath(output_dir)} && apkeditor d -i {wpath(apk_filename)} -o {wpath(output_dir)} -t xml -f"
     res = run_cmd(cmd, timeout=600)
     if not isinstance(res, dict) or res.get("error"):
         return res
+    # A non-zero exit means nothing was decoded. Without this the caller fell
+    # through and appended the "decoded with APKEditor" note to a FAILED run,
+    # reporting success for an output directory that was never created.
+    if res.get("returncode"):
+        detail = (res.get("stderr") or res.get("stdout") or "").strip()[:400]
+        return {"error": (
+            "APKEditor could not decode this APK, and apktool had already failed on its "
+            "multiple resource packages — so no decoded directory exists.\n"
+            "If APKEditor is missing, run scripts/install_tools.py.\n\n"
+            f"APKEditor said: {detail or '(no output)'}")}
     norm = _apkeditor_normalize_smali(output_dir)
     if isinstance(norm, dict) and norm.get("error"):
         return norm
@@ -171,7 +205,7 @@ def _output_has_smali(output_dir):
     output_dir — the marker of a successful SOURCE decode (baksmali). A
     res-only folder (resource decoding threw before sources were disassembled)
     has none, so this is how we tell a full decode from a partial one."""
-    res = run_cmd(f"ls -d /workspace/{output_dir}/smali* 2>/dev/null | head -1", timeout=20)
+    res = run_cmd(f"ls -d {wpath(output_dir)}/smali* 2>/dev/null | head -1", timeout=20)
     return bool((res.get("stdout") or "").strip())
 
 
@@ -201,7 +235,7 @@ def decode_apk(apk_filename, output_dir, no_resources=False, auto_graph=True):
 
     def _decode(no_res):
         res_flag = "-r " if no_res else ""
-        cmd = f"apktool d {res_flag}-f /workspace/{apk_filename} -o /workspace/{output_dir}"
+        cmd = f"apktool d {res_flag}-f {wpath(apk_filename)} -o {wpath(output_dir)}"
         return run_cmd(cmd, timeout=600)  # apktool on large APKs can take several minutes
 
     # Cache: apktool decode is a pure function of the APK bytes + whether
@@ -217,7 +251,7 @@ def decode_apk(apk_filename, output_dir, no_resources=False, auto_graph=True):
     else:
         res = _decode(want_no_res)
 
-        # If the command couldn't run at all (sandbox down / timeout — run_cmd sets
+        # If the command couldn't run at all (no project folder / timeout — run_cmd sets
         # 'error'), don't do the resource-fallback retry (it just fails again) and
         # don't pretend nothing happened: surface the real reason so the user sees
         # WHY no folder appeared instead of a bare "no output".
@@ -296,7 +330,7 @@ def decode_apk(apk_filename, output_dir, no_resources=False, auto_graph=True):
         "Read individual .java files with read_file_chunk, or search across them with grep_directory / find_files."
     ),
     params_schema={
-        "apk_filename": "string (path to the APK/.dex/.jar, relative or absolute starting with /workspace)",
+        "apk_filename": "string (path to the APK/.dex/.jar, relative to the project root)",
         "output_dir": "string (directory to write decompiled Java + resources to)",
         "deobf": "boolean (optional, default false; true renames obfuscated identifiers to stable readable names)",
         "no_resources": "boolean (optional, default false; true skips resource decoding for a faster, Java-only run)",
@@ -336,7 +370,7 @@ def jadx_decompile(apk_filename, output_dir, deobf=False, no_resources=False, si
     # --show-bad-code keeps partially-decompiled methods instead of dropping them,
     # which matters on obfuscated apps where some methods fail to fully decompile.
     cmd = (
-        f"jadx {flag_str}--show-bad-code -d /workspace/{output_dir} /workspace/{apk_filename}"
+        f"jadx {flag_str}--show-bad-code -d {wpath(output_dir)} {wpath(apk_filename)}"
     )
     res = run_cmd(cmd, timeout=600)
     ok = isinstance(res, dict) and not res.get("error") and res.get("returncode") == 0
@@ -358,12 +392,12 @@ def _zip_repack(input_dir, output_apk):
     directories and raw unzip_apk directories. `input_dir`/`output_apk` are
     already normalized by the caller (recompile_apk)."""
     cmd = (
-        f"cd /workspace/{input_dir} && "
+        f"cd {wpath(input_dir)} && "
         # Remove old signatures so apksigner doesn't clash or fail
         "rm -f META-INF/*.RSA META-INF/*.SF META-INF/*.DSA META-INF/MANIFEST.MF && "
         # Build a fresh APK with correct compression: store uncompressed the file types Android requires uncompressed
-        f"zip -r -X /workspace/{output_apk} . -x '*.DS_Store' '*.so' '*.arsc' '*.png' '*.jpg' '*.jpeg' '*.webp' '*.mp3' '*.mp4' '*.ogg' '*.wav' && "
-        f"zip -r -X -0 /workspace/{output_apk} . -i '*.so' '*.arsc' '*.png' '*.jpg' '*.jpeg' '*.webp' '*.mp3' '*.mp4' '*.ogg' '*.wav'"
+        f"zip -r -X {wpath(output_apk)} . -x '*.DS_Store' '*.so' '*.arsc' '*.png' '*.jpg' '*.jpeg' '*.webp' '*.mp3' '*.mp4' '*.ogg' '*.wav' && "
+        f"zip -r -X -0 {wpath(output_apk)} . -i '*.so' '*.arsc' '*.png' '*.jpg' '*.jpeg' '*.webp' '*.mp3' '*.mp4' '*.ogg' '*.wav'"
     )
     return run_cmd(cmd, timeout=240)
 
@@ -376,7 +410,7 @@ def _zip_repack(input_dir, output_apk):
 # f-string-formatted, so the braces below survive.
 _APKTOOL_YML_PATCH = r'''
 import sys
-p = "/workspace/__YMLPATH__"
+p = "__YMLPATH__"
 required = ["resources.arsc", "arsc", "so", "png", "jpg", "jpeg", "gif", "webp", "bmp",
             "wav", "mp2", "mp3", "ogg", "aac", "mpg", "mpeg", "mid", "midi", "smf", "jet",
             "rtttl", "imy", "xmf", "mp4", "m4a", "m4v", "3gp", "3gpp", "3g2", "3gpp2",
@@ -423,7 +457,7 @@ def _recompile_with_apkeditor(input_dir, output_apk):
     denorm = _apkeditor_denormalize_smali(input_dir)
     if isinstance(denorm, dict) and denorm.get("error"):
         return denorm
-    cmd = f"java -jar /usr/local/bin/APKEditor.jar b -i /workspace/{input_dir} -o /workspace/{output_apk} -f"
+    cmd = f"apkeditor b -i {wpath(input_dir)} -o {wpath(output_apk)} -f"
     res = run_cmd(cmd, timeout=600)
     renorm = _apkeditor_normalize_smali(input_dir)
     if isinstance(renorm, dict) and renorm.get("error") and isinstance(res, dict):
@@ -544,7 +578,7 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
     # multi-package limitation, #2514) must be rebuilt with `APKEditor b`, not
     # `apktool b` — it has no apktool.yml and a different on-disk resource
     # representation. Check this BEFORE the apktool.yml test below.
-    apke_check = run_cmd(f"test -f /workspace/{input_dir}/{APKEDITOR_MARKER}", timeout=10)
+    apke_check = run_cmd(f"test -f {wpath(input_dir)}/{APKEDITOR_MARKER}", timeout=10)
     if apke_check["returncode"] == 0:
         res = _recompile_with_apkeditor(input_dir, output_apk)
     else:
@@ -553,29 +587,31 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
         # it is repacked with zip (the former repack_apk path, folded into
         # _zip_repack). This keeps unzip_apk's whole-file-swap workflow working
         # now that the separate repack_apk tool is gone.
-        check = run_cmd(f"test -f /workspace/{input_dir}/apktool.yml", timeout=10)
+        check = run_cmd(f"test -f {wpath(input_dir)}/apktool.yml", timeout=10)
         if check["returncode"] != 0:
             res = _zip_repack(input_dir, output_apk)
         else:
             # 1) Normalize doNotCompress so the mmap-sensitive/media types stay stored.
             patch_script = _APKTOOL_YML_PATCH.replace("__YMLPATH__", f"{input_dir}/apktool.yml")
-            b64 = base64.b64encode(patch_script.encode("utf-8")).decode("ascii")
-            aapt2_flag = "--use-aapt2 " if use_aapt2 in (True, "true", "True", 1, "1") else ""
+            b64 = encode_script(patch_script)
+            aapt2_flag = ("--use-aapt2 "
+                          if use_aapt2 in (True, "true", "True", 1, "1") and _apktool_takes_use_aapt2()
+                          else "")
             size_cmp = ""
             if original_apk:
                 orig = normalize_path(original_apk)
                 size_cmp = (
                     f' && echo "--- SIZE COMPARISON ---" '
-                    f'&& echo "original: $(stat -c%s /workspace/{orig} 2>/dev/null || echo ?) bytes" '
-                    f'&& echo "rebuilt:  $(stat -c%s /workspace/{output_apk} 2>/dev/null || echo ?) bytes"'
+                    f'&& echo "original: $(stat -c%s {wpath(orig)} 2>/dev/null || echo ?) bytes" '
+                    f'&& echo "rebuilt:  $(stat -c%s {wpath(output_apk)} 2>/dev/null || echo ?) bytes"'
                 )
 
             cmd = (
                 f"echo '{b64}' | base64 -d | python3 - && "
                 f"echo '--- APKTOOL BUILD ---' && "
-                f"apktool b {aapt2_flag}/workspace/{input_dir} -o /workspace/{output_apk} && "
+                f"apktool b {aapt2_flag}{wpath(input_dir)} -o {wpath(output_apk)} && "
                 f"echo '--- COMPRESSION SUMMARY (Stored = uncompressed, good for arsc/.so) ---' && "
-                f"unzip -v /workspace/{output_apk} 2>/dev/null | grep -E 'resources\\.arsc|\\.so' | "
+                f"unzip -v {wpath(output_apk)} 2>/dev/null | grep -E 'resources\\.arsc|\\.so' | "
                 f"awk '{{print $8\"  method=\"$2\"  length=\"$1\" bytes\"}}' | head -n 40"
                 f"{size_cmp}"
             )
@@ -589,11 +625,11 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
     # as a phantom success (sign_apk/verify_apk would otherwise fail confusingly
     # downstream, or worse, "pass" on a stale file at that path).
     if isinstance(res, dict) and not res.get("error") and res.get("returncode", 0) == 0:
-        probe = run_cmd(f"stat -c %s /workspace/{output_apk} 2>/dev/null || echo MISSING", timeout=10)
+        probe = run_cmd(f"stat -c %s {wpath(output_apk)} 2>/dev/null || echo MISSING", timeout=10)
         raw = (probe.get("stdout") or "").strip().splitlines()
         sz = raw[-1] if raw else ""
         if sz == "MISSING" or not sz.isdigit() or int(sz) == 0:
-            msg = (f"recompile_apk: no non-empty APK at /workspace/{output_apk} after the build "
+            msg = (f"recompile_apk: no non-empty APK at {wpath(output_apk)} after the build "
                    "reported success — the rebuild did not actually produce output (do not sign it). "
                    "Re-check input_dir and the build log above.")
             res["error"] = msg
@@ -617,16 +653,16 @@ def sign_apk(apk_filename):
     apk_filename = normalize_path(apk_filename)
 
     cmd = (
-        f"zipalign -p -f 4 /workspace/{apk_filename} /workspace/{apk_filename}.aligned && "
-        f"mv /workspace/{apk_filename}.aligned /workspace/{apk_filename} && "
-        "if [ ! -f /workspace/debug.keystore ]; then "
-        "keytool -genkey -v -keystore /workspace/debug.keystore -alias androiddebugkey "
+        f"zipalign -p -f 4 {wpath(apk_filename)} {wpath(apk_filename)}.aligned && "
+        f"mv {wpath(apk_filename)}.aligned {wpath(apk_filename)} && "
+        "if [ ! -f debug.keystore ]; then "
+        "keytool -genkey -v -keystore debug.keystore -alias androiddebugkey "
         "-storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 "
         "-dname \"CN=Android Debug,O=Android,C=US\"; "
         "fi && "
-        f"apksigner sign --ks /workspace/debug.keystore --ks-pass pass:android --key-pass pass:android "
+        f"apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android "
         f"--v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true "
-        f"/workspace/{apk_filename}"
+        f"{wpath(apk_filename)}"
     )
     return run_cmd(cmd, timeout=60)
 
@@ -648,7 +684,7 @@ def verify_apk(apk_filename):
     results = []
 
     # 1. Signature verification
-    sig_cmd = f"apksigner verify --verbose /workspace/{apk_filename}"
+    sig_cmd = f"apksigner verify --verbose {wpath(apk_filename)}"
     sig_res = run_cmd(sig_cmd, timeout=30)
     results.append("=== SIGNATURE VERIFICATION ===")
     if sig_res["returncode"] == 0:
@@ -657,7 +693,7 @@ def verify_apk(apk_filename):
         results.append("FAIL: " + sig_res.get("stderr", "").strip() or sig_res.get("stdout", "").strip())
 
     # 2. Zipalign check
-    align_cmd = f"zipalign -c -v 4 /workspace/{apk_filename}"
+    align_cmd = f"zipalign -c -v 4 {wpath(apk_filename)}"
     align_res = run_cmd(align_cmd, timeout=30)
     results.append("\n=== ZIPALIGN CHECK ===")
     if align_res["returncode"] == 0:
@@ -668,7 +704,7 @@ def verify_apk(apk_filename):
         results.append("FAIL: APK has alignment issues:\n" + unaligned[:2000])
 
     # 3. Required files check
-    list_cmd = f"unzip -l /workspace/{apk_filename}"
+    list_cmd = f"unzip -l {wpath(apk_filename)}"
     list_res = run_cmd(list_cmd, timeout=30)
     results.append("\n=== REQUIRED FILES CHECK ===")
     listing = list_res.get("stdout", "")
@@ -712,7 +748,7 @@ def inspect_apk(apk_filename, filter_pattern=None):
     if hit is not None:
         return hit
 
-    base = f"unzip -l /workspace/{apk_filename}"
+    base = f"unzip -l {wpath(apk_filename)}"
     if filter_pattern:
         base += f" | grep -i '{filter_pattern}'"
     res = run_cmd(base, timeout=30)
@@ -744,7 +780,7 @@ _APK_STORED_EXTS = (".arsc", ".so", ".png", ".jpg", ".jpeg", ".webp", ".gif",
         "call sign_apk (then verify_apk) next."
     ),
     params_schema={
-        "apk_filename": "string (path to the APK to modify in place, relative to /workspace)",
+        "apk_filename": "string (path to the APK to modify in place, relative to the project root)",
         "entry_path": "string (the path of the entry INSIDE the APK to replace/add, e.g. 'classes.dex' or 'lib/arm64-v8a/libfoo.so')",
         "replacement_file": "string (workspace path of the file whose contents should become that entry)"
     },
@@ -755,7 +791,7 @@ def replace_file_in_apk(apk_filename, entry_path, replacement_file):
     apk_filename = normalize_path(apk_filename)
     replacement_file = normalize_path(replacement_file)
     # The entry path is relative *inside* the zip; keep it clean but don't route it
-    # through normalize_path (which would strip a leading '/workspace' it never has).
+    # through normalize_path (it is already project-relative).
     entry = (entry_path or "").strip().lstrip("/")
     if not entry:
         return {"error": "entry_path must name a file inside the APK, e.g. 'classes.dex'."}
@@ -768,12 +804,12 @@ def replace_file_in_apk(apk_filename, entry_path, replacement_file):
     # re-signed anyway. Finally echo the entry's `unzip -l` line back for confirmation.
     cmd = (
         f"set -e; "
-        f"if [ ! -f /workspace/{apk_filename} ]; then echo 'ERROR: APK not found: /workspace/{apk_filename}'; exit 1; fi; "
-        f"if [ ! -f /workspace/{replacement_file} ]; then echo 'ERROR: replacement file not found: /workspace/{replacement_file}'; exit 1; fi; "
+        f"if [ ! -f {wpath(apk_filename)} ]; then echo 'ERROR: APK not found: {wpath(apk_filename)}'; exit 1; fi; "
+        f"if [ ! -f {wpath(replacement_file)} ]; then echo 'ERROR: replacement file not found: {wpath(replacement_file)}'; exit 1; fi; "
         f"STAGE=$(mktemp -d); "
         f"mkdir -p \"$STAGE/$(dirname '{entry}')\"; "
-        f"cp /workspace/{replacement_file} \"$STAGE/{entry}\"; "
-        f"APK=$(readlink -f /workspace/{apk_filename}); "
+        f"cp {wpath(replacement_file)} \"$STAGE/{entry}\"; "
+        f"APK=$(readlink -f {wpath(apk_filename)}); "
         f"( cd \"$STAGE\" && zip {store_flag}-X \"$APK\" '{entry}' >/dev/null ); "
         f"zip -d \"$APK\" 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.DSA' 'META-INF/MANIFEST.MF' >/dev/null 2>&1 || true; "
         f"rm -rf \"$STAGE\"; "
@@ -800,7 +836,7 @@ def replace_file_in_apk(apk_filename, entry_path, replacement_file):
         "'certificate', 'checksum', 'integrity'. Paginate large result sets with skip."
     ),
     params_schema={
-        "decompiled_dir": "string (path to the apktool-decompiled directory, relative to /workspace)",
+        "decompiled_dir": "string (path to the apktool-decompiled directory, relative to the project root)",
         "pattern": "string (EXTENDED regex; '|' alternation supported, e.g. 'verify|checksum')",
         "max_results": "integer (optional, max matching lines to return, default 50)",
         "skip": "integer (optional, matches to skip for pagination, default 0)",
@@ -813,7 +849,7 @@ def search_smali(decompiled_dir, pattern, max_results=50, skip=0, case_insensiti
     decompiled_dir = normalize_path(decompiled_dir)
     ci = "-i " if case_insensitive in (True, "true", "True", 1, "1") else ""
     # -E so alternation (verify|checksum) works; --include restricts to smali.
-    base = f"grep -rnE {ci}--include='*.smali' '{pattern}' /workspace/{decompiled_dir}"
+    base = f"grep -rnE {ci}--include='*.smali' '{pattern}' {wpath(decompiled_dir)}"
     cmd = build_paginated_command(base, max_lines=max_results, skip=skip)
     res = run_cmd(cmd, timeout=120)
     if res.get("returncode") == 0 or res.get("stdout"):
@@ -837,7 +873,7 @@ def search_smali(decompiled_dir, pattern, max_results=50, skip=0, case_insensiti
         "obfuscated check lives, then read_file_chunk only that slice. Paginate with skip."
     ),
     params_schema={
-        "decompiled_dir": "string (directory of jadx Java output, relative to /workspace, e.g. 'app_jadx/sources')",
+        "decompiled_dir": "string (directory of jadx Java output, relative to the project root, e.g. 'app_jadx/sources')",
         "pattern": "string (EXTENDED regex; '|' alternation supported)",
         "max_results": "integer (optional, max matching lines to return, default 50)",
         "skip": "integer (optional, matches to skip for pagination, default 0)",
@@ -852,7 +888,7 @@ def search_java(decompiled_dir, pattern, max_results=50, skip=0, case_insensitiv
     # Search both Java and Kotlin sources produced by jadx / other decompilers.
     base = (
         f"grep -rnE {ci}--include='*.java' --include='*.kt' "
-        f"'{pattern}' /workspace/{decompiled_dir}"
+        f"'{pattern}' {wpath(decompiled_dir)}"
     )
     cmd = build_paginated_command(base, max_lines=max_results, skip=skip)
     res = run_cmd(cmd, timeout=120)
@@ -888,7 +924,7 @@ def get_apk_signature_hash(apk_path):
 
     cmd = (
         f"cd /tmp && "
-        f"unzip -o /workspace/{apk_path} 'META-INF/*.RSA' -d /tmp/sig_extract >/dev/null 2>&1 && "
+        f"unzip -o {wpath(apk_path)} 'META-INF/*.RSA' -d /tmp/sig_extract >/dev/null 2>&1 && "
         f"keytool -printcert -file /tmp/sig_extract/META-INF/*.RSA 2>/dev/null && "
         f"rm -rf /tmp/sig_extract"
     )
@@ -902,7 +938,7 @@ def get_apk_signature_hash(apk_path):
 # Manifest parsing
 # ---------------------------------------------------------------------------
 
-# Runs inside the sandbox. Handles BOTH a decoded (plain-text) AndroidManifest.xml
+# Runs in the project folder. Handles BOTH a decoded (plain-text) AndroidManifest.xml
 # from decode_apk AND a raw .apk (binary manifest decoded via aapt/aapt2). The
 # path is substituted in (not f-string-formatted) so the many braces/backslashes
 # below survive untouched.
@@ -910,7 +946,7 @@ _MANIFEST_SCRIPT = r'''
 import sys, re, subprocess
 import xml.etree.ElementTree as ET
 
-path = "/workspace/__FILEPATH__"
+path = "__FILEPATH__"
 AND = "{http://schemas.android.com/apk/res/android}"
 
 def resolve(pkg, name):
@@ -1062,7 +1098,7 @@ else:
         "package-qualified class."
     ),
     params_schema={
-        "manifest_path": "string (path to a decoded AndroidManifest.xml, OR to an .apk, relative to /workspace)"
+        "manifest_path": "string (path to a decoded AndroidManifest.xml, OR to an .apk, relative to the project root)"
     },
     output="A compact summary: package, application_class, launcher_activity (+ any other launchers), version, sdk levels, and permission list (first 40). If given a binary manifest with no aapt available, an error tells you to decompile first.",
     when_to_use="Use this right after decode_apk (or on the APK directly) to learn the package name, entry Application class, and launcher Activity — e.g. to know what to launch on the emulator, where the app bootstraps, or which component to target. For arbitrary manifest attributes not summarized here, read the decoded AndroidManifest.xml with read_file_chunk."
@@ -1078,7 +1114,7 @@ def extract_manifest_info(manifest_path):
         return hit
 
     script = _MANIFEST_SCRIPT.replace("__FILEPATH__", manifest_path)
-    b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64 = encode_script(script)
     cmd = f"echo '{b64}' | base64 -d | python3 -"
     res = run_cmd(cmd, timeout=90)
     if isinstance(res, dict) and not res.get("error") and res.get("returncode") == 0 and res.get("stdout"):

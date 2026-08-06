@@ -53,15 +53,17 @@ from llm import (
     reset_salvage_stats,
     SALVAGE_STATS,
 )
-from docker_sandbox import (
-    setup_sandbox,
+from host_exec import (
+    set_workspace,
     set_timeout_decider,
-    set_stop_check as set_sandbox_stop_check,
+    set_stop_check as set_exec_stop_check,
 )
 from tool_registry import registry, CORE_GROUP
 import planning
 import investigation
+import ledger
 import strategy
+import superpowers
 import tools  # Triggers the __init__.py which loads all tool categories
 from tools.reviewer import run_review, run_strategy_review
 from tools import mission_constraints
@@ -74,8 +76,7 @@ MEMORY_DIR = "./memory"
 # --- Workspace selection (Part 2 redesign) -----------------------------------
 # There is NO fixed workspace folder any more. The user PICKS a host folder at
 # runtime (native folder dialog); that folder IS the project root (no
-# project-subfolder layer) and is bind-mounted straight into the Docker
-# sandbox. The last-used pick is persisted so it's the default next launch, but
+# project-subfolder layer) and is the working directory every tool command runs in. The last-used pick is persisted so it's the default next launch, but
 # the user can always re-pick. Conversation/memory is kept OUTSIDE the picked
 # folder, under MEMORY_DIR keyed by the folder's absolute path.
 _WS_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -196,7 +197,7 @@ PERSIST_MIN_INTERVAL_S = 15
 # switch strategy instead of blindly retrying the same failing command.
 WATCHDOG_FAIL_THRESHOLD = 5
 # --- Long-running command timeout decisions ----------------------------------
-# When a sandbox command outruns its timeout we don't kill it outright — the LLM
+# When a tool command outruns its timeout we don't kill it outright — the LLM
 # is asked whether it's stuck (kill) or a slow-but-progressing job (keep going).
 # See AgentApi._decide_on_timeout.
 TIMEOUT_EXTEND_CAP = 3600            # max seconds granted per "continue" decision
@@ -470,6 +471,17 @@ REVIEW_MAX_STEPS = 8           # verification tool calls the reviewer may make
 STRATEGY_BRIEF_DEFAULT = True
 MAX_STRATEGY_REVIEW_ROUNDS = 2   # revise rounds before the gate forces a mutation through
 STRATEGY_RESYNC_FINDINGS = 5     # new findings before nudging a brief reconcile
+
+# Superpowers Mode: on a NON-TRIVIAL new task, auto-brainstorm the goal into a
+# chosen approach (autonomously — never asks the user) BEFORE planning, then make
+# subagent-driven execution the DEFAULT (unless the user clearly asked for inline).
+# Behind superpowers_enabled; OFF (OMNI_SUPERPOWERS=0) is byte-identical to today.
+SUPERPOWERS_DEFAULT = (os.environ.get("OMNI_SUPERPOWERS", "1").strip().lower()
+                       not in ("0", "false", "no", "off"))
+# The persona the auto-brainstorm dispatches (must exist on disk / in a plugin).
+SUPERPOWERS_BRAINSTORMER = "brainstormer"
+SUPERPOWERS_ARCHITECT = "architect"
+SUPERPOWERS_BRAINSTORM_MAX_STEPS = 12
 
 # The workspace-mutation classification (MUTATING_TOOLS / VALIDATION_TOOLS) now
 # lives in tool_policy.py — the single source of truth shared with subagents.py
@@ -1069,10 +1081,105 @@ _VIEWER_ARCHIVE_EXTS = {".zip", ".apk", ".jar", ".aar", ".xapk", ".apks"}
 _VIEWER_TEXT_CAP = 2_000_000       # 2MB text cap for the viewer
 _VIEWER_IMAGE_CAP = 20_000_000     # refuse to inline images bigger than this
 _VIEWER_MAX_ARCHIVE_ENTRIES = 20_000
+_VIEWER_SNIFF_BYTES = 8192         # how much of a file the binary sniff looks at
+
+# Magic-number → human label, so "this isn't previewable" can say WHAT the file
+# actually is instead of just "binary". Matching one of these is on its own proof
+# the file is not text, so every entry must be a signature no plausible text file
+# could open with — that rules out short/printable prefixes like "MZ" (a CSV
+# could start "MZ,…") and "BZh". Those formats are still caught, just by the byte
+# sniff below rather than by name. Longer prefixes come first where they overlap.
+_VIEWER_MAGIC = (
+    (b"%PDF-", "PDF document"),
+    (b"\x7fELF", "ELF binary"),
+    (b"\xca\xfe\xba\xbe", "Mach-O universal binary"),
+    (b"\xcf\xfa\xed\xfe", "Mach-O binary"),
+    (b"\xce\xfa\xed\xfe", "Mach-O binary (32-bit)"),
+    (b"dex\n", "Android DEX bytecode"),
+    (b"\x00\x61\x73\x6d", "WebAssembly module"),
+    (b"\x1f\x8b", "gzip archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"Rar!\x1a\x07", "RAR archive"),
+    (b"\xfd7zXZ\x00", "XZ archive"),
+    (b"SQLite format 3\x00", "SQLite database"),
+    (b"OggS", "Ogg media"),
+    (b"fLaC", "FLAC audio"),
+    (b"\xff\xd8\xff", "JPEG image"),
+    (b"wOFF", "WOFF font"),
+    (b"wOF2", "WOFF2 font"),
+    (b"\x00\x01\x00\x00\x00", "TrueType font"),
+)
+# Offset-4 magics (media containers put the brand after a size field).
+_VIEWER_MAGIC_AT_4 = ((b"ftyp", "video/audio container"),)
+
+
+def _viewer_known_binary(head):
+    """The format's own signature, or None if we don't recognize it. A hit is
+    conclusive — no byte sniffing needed, and no threshold to get wrong on a
+    small file (a short PDF stub is mostly printable ASCII, but it is still a
+    PDF and rendering it as text helps nobody)."""
+    for magic, label in _VIEWER_MAGIC:
+        if head.startswith(magic):
+            return label
+    for magic, label in _VIEWER_MAGIC_AT_4:
+        if head[4:4 + len(magic)] == magic:
+            return label
+    return None
+
+
+def _viewer_describe_binary(head, ext):
+    """Best-effort human label for an unpreviewable file, from magic bytes and
+    then the extension. Never raises — worst case it says 'binary file'."""
+    known = _viewer_known_binary(head)
+    if known:
+        return known
+    if ext:
+        return f"{ext.lstrip('.').upper()} file"
+    return "binary file"
+
+
+def _viewer_looks_binary(head):
+    """True when `head` (the first few KB of a file) is not plausibly text.
+
+    Three signals, cheapest-first: a recognized binary signature, a NUL byte
+    (which almost never appears in real text), and a low share of printable
+    bytes. UTF-16 text trips the NUL check on purpose — the viewer decodes
+    UTF-8, so showing it is exactly the mojibake this guard exists to prevent."""
+    if not head:
+        return False  # an empty file is a perfectly fine empty text file
+    if _viewer_known_binary(head):
+        return True
+    if b"\x00" in head:
+        return True
+    try:
+        head.decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        pass
+    # Not valid UTF-8: fall back to a printable-ratio test so latin-1/cp1252 text
+    # still opens while real binaries don't. The two populations sit far apart —
+    # accented characters are a few percent of Western European prose, whereas
+    # NUL-free binary (compressed/encrypted payloads) is near-uniform random and
+    # lands around 39% printable. 0.80 is the gap between them.
+    printable = sum(1 for b in head if 32 <= b < 127 or b in (9, 10, 13, 12))
+    return printable / len(head) < 0.80
+
+
+def _viewer_unsupported(rel, size, label, *, detail=None):
+    """The payload the frontend turns into the 'not supported / view as text
+    anyway' panel. kind='unsupported' is always ok=True: nothing failed, we're
+    just declining to guess at a rendering."""
+    # Phrased around the label rather than pluralizing it: labels range from
+    # "PDF document" to "ELF binary" to "XYZ file", and "ELF binarys" is not a
+    # word.
+    return {"ok": True, "kind": "unsupported", "path": rel, "size": size,
+            "label": label,
+            "reason": detail or f"This looks like a {label}, which the viewer can't render.",
+            "can_force_text": True}
 
 
 def _resolve_project_file(project_name, rel_path):
-    """Normalizes rel_path and sandboxes it inside the project root.
+    """Normalizes rel_path and confines it to the project root.
     Returns (full_path, rel, None) or (None, None, error)."""
     if not rel_path:
         return None, None, "No path provided."
@@ -1090,24 +1197,29 @@ def _resolve_project_file(project_name, rel_path):
     return full, rel, None
 
 
-def read_project_file(project_name, rel_path):
+def read_project_file(project_name, rel_path, force_text=False):
     """Reads a file from the project workspace (host side) for the frontend
     viewer. Returns a typed payload: kind="image" (base64 + mime),
-    kind="archive" (zip/apk entry listing), or kind="text" (the default)."""
+    kind="archive" (zip/apk entry listing), kind="unsupported" (binary we
+    decline to render), or kind="text" (the default).
+
+    force_text=True is the frontend's "view as text anyway" escape hatch: it
+    skips the binary sniff and decodes with errors="replace"."""
     full, rel, err = _resolve_project_file(project_name, rel_path)
     if err:
         return {"ok": False, "error": err}
     ext = os.path.splitext(full)[1].lower()
     try:
         size = os.path.getsize(full)
-        if ext in _VIEWER_IMAGE_MIME:
+        if ext in _VIEWER_IMAGE_MIME and not force_text:
             if size > _VIEWER_IMAGE_CAP:
-                return {"ok": False, "error": f"Image too large to preview ({size:,} bytes)."}
+                return _viewer_unsupported(
+                    rel, size, "Image", detail=f"Image too large to preview ({size:,} bytes).")
             with open(full, "rb") as f:
                 data = base64.b64encode(f.read()).decode("ascii")
             return {"ok": True, "kind": "image", "path": rel, "size": size,
                     "mime": _VIEWER_IMAGE_MIME[ext], "data": data}
-        if ext in _VIEWER_ARCHIVE_EXTS and zipfile.is_zipfile(full):
+        if ext in _VIEWER_ARCHIVE_EXTS and not force_text and zipfile.is_zipfile(full):
             with zipfile.ZipFile(full) as zf:
                 infos = zf.infolist()
             entries = [{"name": i.filename, "size": i.file_size, "dir": i.is_dir()}
@@ -1115,6 +1227,11 @@ def read_project_file(project_name, rel_path):
             return {"ok": True, "kind": "archive", "path": rel, "size": size,
                     "entries": entries, "entry_count": len(infos),
                     "truncated": len(infos) > _VIEWER_MAX_ARCHIVE_ENTRIES}
+        if not force_text:
+            with open(full, "rb") as f:
+                head = f.read(_VIEWER_SNIFF_BYTES)
+            if _viewer_looks_binary(head):
+                return _viewer_unsupported(rel, size, _viewer_describe_binary(head, ext))
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(_VIEWER_TEXT_CAP)
         return {"ok": True, "kind": "text", "path": rel, "size": size, "content": content,
@@ -1123,10 +1240,11 @@ def read_project_file(project_name, rel_path):
         return {"ok": False, "error": str(e)}
 
 
-def read_project_archive_member(project_name, rel_path, member):
+def read_project_archive_member(project_name, rel_path, member, force_text=False):
     """Reads a single entry out of a zip-based archive (zip/apk/jar/…) in the
     workspace, for previewing inside the frontend's archive explorer. Entries
-    get the same typed treatment as read_project_file (image or text)."""
+    get the same typed treatment as read_project_file (image, text, or the
+    'unsupported' decline), including the force_text escape hatch."""
     full, rel, err = _resolve_project_file(project_name, rel_path)
     if err:
         return {"ok": False, "error": err}
@@ -1140,17 +1258,24 @@ def read_project_archive_member(project_name, rel_path, member):
                 return {"ok": False, "error": "Entry not found in archive."}
             if info.is_dir():
                 return {"ok": False, "error": "Entry is a directory."}
+            entry_path = f"{rel} › {member}"
             ext = os.path.splitext(member)[1].lower()
-            if ext in _VIEWER_IMAGE_MIME:
+            if ext in _VIEWER_IMAGE_MIME and not force_text:
                 if info.file_size > _VIEWER_IMAGE_CAP:
-                    return {"ok": False, "error": f"Image too large to preview ({info.file_size:,} bytes)."}
+                    return _viewer_unsupported(
+                        entry_path, info.file_size, "Image",
+                        detail=f"Image too large to preview ({info.file_size:,} bytes).")
                 with zf.open(info) as f:
                     data = base64.b64encode(f.read()).decode("ascii")
-                return {"ok": True, "kind": "image", "path": f"{rel} › {member}",
+                return {"ok": True, "kind": "image", "path": entry_path,
                         "size": info.file_size, "mime": _VIEWER_IMAGE_MIME[ext], "data": data}
             with zf.open(info) as f:
                 raw = f.read(_VIEWER_TEXT_CAP)
-            return {"ok": True, "kind": "text", "path": f"{rel} › {member}",
+            if not force_text and _viewer_looks_binary(raw[:_VIEWER_SNIFF_BYTES]):
+                return _viewer_unsupported(
+                    entry_path, info.file_size,
+                    _viewer_describe_binary(raw[:_VIEWER_SNIFF_BYTES], ext))
+            return {"ok": True, "kind": "text", "path": entry_path,
                     "size": info.file_size, "content": raw.decode("utf-8", errors="replace"),
                     "truncated": info.file_size > _VIEWER_TEXT_CAP}
     except (OSError, zipfile.BadZipFile) as e:
@@ -1238,7 +1363,7 @@ class AgentApi:
         # Counts consecutive ambiguous timeout-decision replies for the command
         # currently running, so a confused model can't pin a process open forever.
         self._timeout_ambiguous_streak = 0
-        # Route sandbox command timeouts through the LLM instead of a hard kill.
+        # Route command timeouts through the LLM instead of a hard kill.
         set_timeout_decider(self._decide_on_timeout)
         # Surface LLM fallbacks (primary provider failed -> using the next one) as
         # system lines in the chat so the user can see which provider is in play.
@@ -1249,9 +1374,9 @@ class AgentApi:
         # Let ask_llm's never-give-up retry/backoff loop see the Stop button, so a
         # long backoff wait (up to 10 min) can still be interrupted by the user.
         set_stop_check(lambda: self._stop)
-        # Same predicate for the sandbox, so a running tool subprocess is killed the
+        # Same predicate for the executor, so a running tool subprocess is killed the
         # instant Stop is pressed instead of blocking for its whole timeout window.
-        set_sandbox_stop_check(lambda: self._stop)
+        set_exec_stop_check(lambda: self._stop)
         # Bridge subagent telemetry emitted OUTSIDE the planner's read-wave (e.g.
         # the dispatch_agents tool) to the browser, so the Subagents HUD lights up
         # for deliberate delegation too, not only auto read-waves.
@@ -1369,7 +1494,7 @@ class AgentApi:
 
     # --- long-running command supervision ------------------------------------
     def _decide_on_timeout(self, display, elapsed_s, base_timeout, rounds):
-        """Called by the sandbox when a command outruns its timeout instead of
+        """Called by the executor when a command outruns its timeout instead of
         killing it. Asks the LLM whether the process looks stuck (kill it) or is
         a slow-but-progressing job (keep waiting). Returns ("kill", None) or
         ("extend", seconds). Never raises — any failure falls back to extending
@@ -1584,6 +1709,17 @@ class AgentApi:
                     "strategy_update; a complete brief must pass an independent strategy review before you "
                     "may change the workspace):\n" + brief.to_markdown()
                 )
+        # Design Brief pins just below the Strategic Brief: the autonomously-chosen
+        # approach from the auto-brainstorm, so the plan is built against it. Only
+        # rendered when Superpowers is on AND a brief exists — otherwise byte-identical.
+        if self.session.get("superpowers_enabled"):
+            design = superpowers.get_active()
+            if design is not None and not design.is_empty():
+                section += (
+                    "\n\nDESIGN BRIEF (auto-brainstormed approach chosen for this task — plan and execute "
+                    "against it; the assumptions were resolved without asking, so proceed on them unless "
+                    "the user corrects one):\n" + design.to_markdown()
+                )
         if plan is not None:
             section += (
                 "\n\nCURRENT PLAN (auto-synchronized — this reflects your own plan_* tool calls in "
@@ -1599,6 +1735,20 @@ class AgentApi:
                 "\n\nINVESTIGATION MEMORY (structured & evidence-first; survives context resets — keep it "
                 "current with record_finding / record_hypothesis / update_hypothesis / record_failed_attempt "
                 "/ record_decision / record_test_result / set_next_steps):\n" + inv.to_markdown()
+            )
+        # Fold the BUILD LEDGER in too — the physical manifest of a large,
+        # multi-artifact modification (components done vs planned, files produced,
+        # offsets patched, verifications). Aggregate-first and bounded, it rides in
+        # the prompt and SURVIVES a summarization/reset just like investigation
+        # memory, so a many-hour / many-subagent build never loses track of how
+        # much is done or what's left.
+        lg = ledger.get_active()
+        if lg is not None and not lg.is_empty():
+            section += (
+                "\n\nBUILD LEDGER (physical build accounting; survives context resets — keep it current with "
+                "ledger_add_component / ledger_set_component_status / ledger_record_artifact / "
+                "ledger_record_patch / ledger_record_verification; treat THIS, not the transcript, as the "
+                "source of truth for what's built and what remains):\n" + lg.to_markdown()
             )
         if PREMIUM_BUDGET:
             used = self.session.get("premium_dispatches", 0)
@@ -1622,11 +1772,25 @@ class AgentApi:
         self._refresh_system_prompt()
         self._emit({"type": "investigation_update", "investigation": inv_dict})
 
+    def _on_ledger_update(self, ledger_dict):
+        """Bridge from ledger.py's notify callback to the live prompt + event
+        stream (mirrors _on_investigation_update). Keeps the physical build
+        manifest visible in the prompt in real time."""
+        self._refresh_system_prompt()
+        self._emit({"type": "ledger_update", "ledger": ledger_dict})
+
     def _on_strategy_update(self, brief_dict):
         """Bridge from strategy.py's notify callback to the live prompt + event
         stream (mirrors _on_plan_update / _on_investigation_update)."""
         self._refresh_system_prompt()
         self._emit({"type": "strategy_update", "strategy": brief_dict})
+
+    def _on_design_brief_update(self, brief_dict):
+        """Bridge from superpowers.py's notify callback to the live prompt + event
+        stream (mirrors _on_strategy_update). Keeps the auto-brainstorm's Design
+        Brief pinned in the prompt in real time."""
+        self._refresh_system_prompt()
+        self._emit({"type": "design_brief_update", "design_brief": brief_dict})
 
     # --- plan-driven delegation ------------------------------------------------
     def _auto_delegate_untagged_steps(self, plan):
@@ -1651,6 +1815,11 @@ class AgentApi:
         OMNI_AUTO_DELEGATE=0 disables this entirely."""
         s = self.session
         if not AUTO_DELEGATE or not s.get("delegation_enabled", True):
+            return
+        # Superpowers inline-only: the user asked to keep execution in this context,
+        # so the harness never auto-tags steps for subagents (explicit delegate= tags
+        # the model sets itself are still honored downstream).
+        if s.get("superpowers_enabled") and s.get("inline_only"):
             return
         if not getattr(plan, "current_phase_id", None):
             return
@@ -1682,7 +1851,11 @@ class AgentApi:
         picks = []
         read_tag = _live(AUTO_DELEGATE_READ_TAG)
         reads = [it for it in pool if _looks_like_research(it)]
-        if read_tag and len(reads) >= AUTO_DELEGATE_READ_MIN:
+        # Superpowers makes subagent-driven execution the DEFAULT: a single independent
+        # research step is enough to fan out (floor 1), vs the conservative 2+ otherwise.
+        read_min = (1 if (s.get("superpowers_enabled") and not s.get("inline_only"))
+                    else AUTO_DELEGATE_READ_MIN)
+        if read_tag and len(reads) >= read_min:
             picks += [(it, read_tag) for it in reads]
         write_tag = _live(AUTO_DELEGATE_WRITE_TAG)
         if write_tag:
@@ -1791,7 +1964,7 @@ class AgentApi:
             if not candidates:
                 return
 
-            reads, writes = [], []
+            wave, writes = [], []
             for step in candidates:
                 ad, tier = _resolve(step)
                 if ad is None:
@@ -1805,14 +1978,23 @@ class AgentApi:
                     # Harness-initiated start of a pulled-forward step: mark it live so
                     # the plan/UI reflect it, exactly like a model-started step.
                     plan.update_item(step["id"], status="in_progress")
-                (writes if ad.is_write else reads).append((step, ad.name, ad, tier))
+                # Reads always fan out. A WRITE step joins the same wave as soon as it
+                # declares the paths it owns (`scope`): subagents.ScopedWorkspaceLock
+                # lets disjoint owners run at once and makes overlapping ones queue, so
+                # a many-package change progresses in parallel while staying safe. A
+                # write step with no scope claims the whole workspace, so it stays on
+                # the serial path below.
+                if not ad.is_write or step.get("scope"):
+                    wave.append((step, ad.name, ad, tier))
+                else:
+                    writes.append((step, ad.name, ad, tier))
             planning.notify_updated()
 
-            if reads:
+            if wave:
                 try:
-                    self._run_delegated_read_wave(plan, reads)
+                    self._run_delegated_wave(plan, wave)
                 except Exception as e:
-                    for step, _name, _ad, _tier in reads:
+                    for step, _name, _ad, _tier in wave:
                         s["messages"].append({"role": "user", "content": (
                             f"[SYSTEM] Delegation of step ({step['id']}) failed to start ({e}). "
                             "Handle this step yourself.")})
@@ -1823,9 +2005,13 @@ class AgentApi:
                     context = self._compose_delegate_context(plan)
                     self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
                                 "content": f"Delegating step ({step['id']}) to subagent '{name}' ({ad.mode})…"})
+                    # Only pass `scope` when the step actually declares one, keeping
+                    # the historical call shape for unscoped writes (which is all
+                    # that reaches this serial path) intact.
+                    _extra = {"scope": step["scope"]} if step.get("scope") else {}
                     result = subagents.run_subagent(ad, task, context=context,
                                                     run_dir=getattr(self, "_delegate_run_dir", None),
-                                                    tier=tier)
+                                                    tier=tier, **_extra)
                     self._fold_delegate_result(plan, step, name, ad, result)
                 except Exception as e:
                     s["messages"].append({"role": "user", "content": (
@@ -1836,13 +2022,17 @@ class AgentApi:
                 # Legacy path handled the started step(s) once; don't loop-pull more.
                 return
 
-    def _run_delegated_read_wave(self, plan, reads):
-        """Run a batch of independent READ-delegated steps as ONE parallel wave
+    def _run_delegated_wave(self, plan, reads):
+        """Run a batch of independent delegated steps as ONE parallel wave
         (subagents.run_subagents_parallel), streaming each worker's live telemetry
         to self._emit as it arrives instead of buffering it until the whole wave
         finishes. Runs the wave in a background thread and drains a thread-safe
         queue on the calling (main) thread — self._emit is only ever called from
         the main thread this way, same as the rest of the event stream.
+
+        The wave carries every READ step plus every SCOPED write step; each spec
+        passes its step's `scope` down so writers that own disjoint paths execute
+        concurrently and overlapping ones serialize inside the subagent layer.
 
         NOTE: run_dir is intentionally NOT threaded into run_subagents_parallel
         here (unlike the serial write path below) — _delegate_run_dir is not
@@ -1850,11 +2040,14 @@ class AgentApi:
         import queue as _queue
         evq = _queue.Queue()
         specs = [{"agent_def": ad, "task": self._compose_delegate_task(step),
-                  "context": self._compose_delegate_context(plan), "tier": tier}
+                  "context": self._compose_delegate_context(plan), "tier": tier,
+                  "scope": step.get("scope")}
                  for (step, _name, ad, tier) in reads]
         for step, name, ad, _tier in reads:
+            _how = ("read" if not ad.is_write
+                    else "write, owns " + ", ".join(step.get("scope") or []))
             self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
-                        "content": f"Delegating step ({step['id']}) to subagent '{name}' (read) in a parallel wave…"})
+                        "content": f"Delegating step ({step['id']}) to subagent '{name}' ({_how}) in a parallel wave…"})
         holder = {}
         _SENTINEL = {"type": "__wave_done__"}
 
@@ -1928,7 +2121,7 @@ class AgentApi:
         """Post-`run_subagent` fold-back: distill the subagent's report into the
         MAIN context, persist it into durable investigation memory, and update the
         plan step's status — shared by both the serial dispatch path above and the
-        parallel read-wave path (_run_delegated_read_wave)."""
+        parallel wave path (_run_delegated_wave)."""
         self.session["solo_read_streak"] = 0
         s = self.session
         report = (result.get("report") or "").strip()
@@ -2147,10 +2340,10 @@ class AgentApi:
 
     def select_workspace(self, path=None):
         """Pick (or accept) a host folder to use as the workspace ROOT: validate
-        it, persist it as last-used, and bind-mount it into the Docker sandbox
-        (the mount step also runs the Docker-shareable preflight). Selecting a
-        new folder re-runs the container against the new mount. Pass an explicit
-        `path` to skip the dialog (recent list / automation)."""
+        it, persist it as last-used, and make it the folder every tool command
+        runs in (set_workspace also reports any missing tools). Selecting a new
+        folder just re-points it. Pass an explicit `path` to skip the dialog
+        (recent list / automation)."""
         if not path:
             picked = self.pick_folder()
             if not picked.get("ok"):
@@ -2161,9 +2354,9 @@ class AgentApi:
         if not os.path.isdir(path):
             return {"ok": False, "error": f"Not a folder: {path}"}
         root = set_active_workspace(path)
-        self._emit({"type": "log", "content": f"[Sandbox] Mounting {root} into the container..."})
+        self._emit({"type": "log", "content": f"[Workspace] Activating {root}..."})
         try:
-            setup_sandbox(root)   # bind-mount + Docker-shareable preflight
+            set_workspace(root)   # make it the command cwd + tool preflight
         except Exception as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "path": root, "label": _ws_label(root)}
@@ -2215,12 +2408,12 @@ class AgentApi:
 
     def import_workspace(self, project_name=None, source_path=None):
         """Deprecated: the agent no longer copies an external folder into a fixed
-        workspace. Pick the folder directly with select_workspace — it is
-        mounted into the container and edited in place, so there is nothing to
-        copy in or export back out."""
+        workspace. Pick the folder directly with select_workspace — it is used
+        and edited in place on this machine, so there is nothing to copy in or
+        export back out."""
         return {"ok": False,
                 "error": "Import/copy is gone — pick the folder itself with "
-                         "'Select workspace folder'; it is mounted and edited in place."}
+                         "'Select workspace folder'; it is edited in place."}
 
     def get_import_status(self, project_name=None):
         try:
@@ -2532,21 +2725,20 @@ class AgentApi:
         memory_dir = _memory_dir_for(root)
         os.makedirs(memory_dir, exist_ok=True)
 
-        # Ensure the picked folder is mounted. Skip if select_workspace already
-        # mounted this exact root (avoids rebuilding/re-running the container
-        # twice for the same folder).
+        # Ensure the picked folder is the active workspace. Skip if
+        # select_workspace already activated this exact root.
         try:
-            from docker_sandbox import get_workspace_host_path
-            already_mounted = (get_workspace_host_path() == root)
+            from host_exec import workspace_root
+            already_active = (workspace_root() == root)
         except Exception:
-            already_mounted = False
-        if not already_mounted:
-            self._emit({"type": "log", "content": f"[Sandbox] Mounting {root} into the container..."})
+            already_active = False
+        if not already_active:
+            self._emit({"type": "log", "content": f"[Workspace] Activating {root}..."})
             try:
-                setup_sandbox(root)
+                set_workspace(root)
             except Exception as e:
-                return {"ok": False, "error": f"Docker sandbox failed to start: {e}"}
-        self._emit({"type": "log", "content": "[Sandbox] Container is ready."})
+                return {"ok": False, "error": f"Workspace could not be activated: {e}"}
+        self._emit({"type": "log", "content": "[Workspace] Ready."})
 
         # Build the static base to MATCH how requests are sent: native-aware when
         # the active model uses the function-calling interface. _refresh_system_prompt
@@ -2648,6 +2840,11 @@ class AgentApi:
             # --- Strategic Brief workflow state ---
             "strategy_brief_enabled": STRATEGY_BRIEF_DEFAULT,
             "strategy_review_rounds": 0,        # strategy-review revise rounds this task
+            # --- Superpowers Mode state ---
+            "superpowers_enabled": SUPERPOWERS_DEFAULT,
+            "needs_brainstorm": False,          # set per-task in send_message for non-trivial new tasks
+            "needs_architect": False,           # ditto — the architect designs the plan after the brainstorm
+            "inline_only": False,               # user clearly asked for inline (no subagent) execution
             "findings_since_brief_sync": 0,     # new findings since the last brief reconcile
             "evidence_guards": True,                    # repeat-failure guard + validation nudge + file tracking
             "unverified_change": None,                  # a mutating tool ran but wasn't validated yet
@@ -2716,10 +2913,27 @@ class AgentApi:
         else:
             investigation.clear_active(notify=False)
 
+        # Build ledger (physical manifest of a large modification): wire autosave/
+        # notify and resume any prior ledger for this project, mirroring the plan
+        # and investigation memory so a big build survives reopen + summarization.
+        ledger.set_context(memory_dir, notify_callback=self._on_ledger_update)
+        resumed_ledger = ledger.load(memory_dir)
+        if resumed_ledger is not None:
+            ledger.set_active(resumed_ledger, notify=False)
+        else:
+            ledger.clear_active(notify=False)
+
         strategy.set_context(memory_dir, notify_callback=self._on_strategy_update)
         _restored_brief = strategy.load_brief(memory_dir)
         if _restored_brief is not None:
             strategy.set_active_brief(_restored_brief, notify=False)
+
+        superpowers.set_context(memory_dir, notify_callback=self._on_design_brief_update)
+        _restored_design = superpowers.load_brief(memory_dir)
+        if _restored_design is not None:
+            superpowers.set_active_brief(_restored_design, notify=False)
+        else:
+            superpowers.clear_active_brief(notify=False)
 
         # Per-session ephemeral state (no resume, unlike plan/investigation):
         # mission build-constraints + retry budget, and the tool-call salvage
@@ -2770,6 +2984,8 @@ class AgentApi:
         self._on_plan_update(active_plan.to_dict() if active_plan else None)
         active_inv = investigation.get_active()
         self._on_investigation_update(active_inv.to_dict() if active_inv else None)
+        active_ledger = ledger.get_active()
+        self._on_ledger_update(active_ledger.to_dict() if active_ledger else None)
 
     def restore_session(self):
         """Re-attach the frontend to a still-live backend session after a webview
@@ -2857,6 +3073,12 @@ class AgentApi:
         self.session["messages"].append({"role": "user", "content": text})
         if self.session["original_task"] is None:
             self.session["original_task"] = text
+        # Superpowers: read this turn's execution-mode intent. Inline-only is honored
+        # only on a CLEAR request; it disables subagent-driven execution for the task
+        # (the auto-brainstorm then runs inline instead of dispatching a subagent).
+        self.session["inline_only"] = (
+            bool(self.session.get("superpowers_enabled"))
+            and superpowers.detect_inline_only(text))
         # Fresh user turn -> reset per-task loop/budget state.
         self.session["last_tool_call"] = None
         self.session["consecutive_tools"] = 0
@@ -2898,6 +3120,17 @@ class AgentApi:
             self.session["mutating_gate_nudged"] = False  # re-arm the one-time unplanned-mutation nudge
             self.session["dispatched_steps"] = set()      # new plan -> fresh delegation tracking
             self.session["steps_since_reground"] = 0
+            # Superpowers: a genuinely NEW, non-trivial task earns an autonomous
+            # brainstorm before planning. Trivial one-liners skip straight to work.
+            self.session["needs_brainstorm"] = (
+                bool(self.session.get("superpowers_enabled"))
+                and not superpowers.is_trivial_task(text))
+            # …and the architect designs the plan itself, right after the brainstorm.
+            self.session["needs_architect"] = self.session["needs_brainstorm"]
+        else:
+            # A follow-up continuing an in-progress plan does not re-brainstorm.
+            self.session["needs_brainstorm"] = False
+            self.session["needs_architect"] = False
         self.session["tools_since_plan_touch"] = 0
         self.session["_plan_touch_nudge_sent"] = False
 
@@ -2921,15 +3154,16 @@ class AgentApi:
             return {"ok": False, "error": "No active session."}
         return {"ok": True, "tree": build_file_tree(self.session["project"])}
 
-    def read_file(self, rel_path):
+    def read_file(self, rel_path, force_text=False):
         if not self.session:
             return {"ok": False, "error": "No active session."}
-        return read_project_file(self.session["project"], rel_path)
+        return read_project_file(self.session["project"], rel_path, force_text=bool(force_text))
 
-    def read_archive_member(self, rel_path, member):
+    def read_archive_member(self, rel_path, member, force_text=False):
         if not self.session:
             return {"ok": False, "error": "No active session."}
-        return read_project_archive_member(self.session["project"], rel_path, member)
+        return read_project_archive_member(
+            self.session["project"], rel_path, member, force_text=bool(force_text))
 
     # --- workspace file operations (file-tree drag/drop + context menu) -------
     # Everything here funnels through _safe_abs, which is the ONLY thing standing
@@ -3144,7 +3378,7 @@ class AgentApi:
         if self._window is None:
             return {"ok": False, "error": "Window not ready."}
 
-        # Resolve + sandbox the destination to inside the PICKED project root.
+        # Resolve + confine the destination to inside the PICKED project root.
         root = os.path.abspath(self.session.get("root") or _project_root())
         rel = (dest_dir or "").strip().lstrip("/").lstrip("\\").replace("\\", "/")
         dest_abs = os.path.abspath(os.path.join(root, *rel.split("/"))) if rel else root
@@ -3399,10 +3633,9 @@ class AgentApi:
     def build_code_graph_ui(self, root_dir="", graph_id="", include_so=False, force=True):
         """Manual 'Build graph' action from the Graph tab.
 
-        Runs the code-graph indexer directly on the HOST against the picked
-        workspace (no Docker round-trip), so the .codegraph/<id>/ folder is
-        created exactly where the Graph tab reads it — even if the sandbox
-        container isn't running. Indexing a specific subdirectory gives it its
+        Runs the code-graph indexer in-process against the picked workspace, so
+        the .codegraph/<id>/ folder is created exactly where the Graph tab reads
+        it. Indexing a specific subdirectory gives it its
         OWN graph instance (multi-project): comparing two directories builds two
         separate graphs that stay independent and can be rendered side by side.
         Returns a short summary plus the refreshed graph list for the selector."""
@@ -3413,8 +3646,8 @@ class AgentApi:
 
         root = os.path.abspath(self.session.get("root") or _project_root())
 
-        # Sandbox the target INSIDE the picked workspace.
-        rel = normalize_path(root_dir)  # '', '.', '/workspace' all collapse to '.'
+        # Confine the target INSIDE the picked project folder.
+        rel = normalize_path(root_dir)  # '', '.', legacy '/workspace' -> '.'
         if rel in ("", "."):
             target_abs = root
             rel_disp = "."
@@ -3517,6 +3750,7 @@ class AgentApi:
         planning.clear_active_plan(notify=False)
         planning.set_context(None, notify_callback=None)
         strategy.set_context(None, notify_callback=None)
+        superpowers.set_context(None, notify_callback=None)
         self.session = None
         self._emit({"type": "session_ended"})
         return {"ok": True}
@@ -3539,7 +3773,12 @@ class AgentApi:
         alongside the messages so the guard reflects the true request size (the tool
         schemas never appear in s["messages"])."""
         ctx_overhead = native_tools_payload_chars(s.get("active_toolsets"))
-        if s["step_count"] >= MAX_STEPS_BEFORE_SUMMARY or context_pressure(s["messages"], ctx_overhead):
+        # A large build can carry its durable state in the plan + investigation +
+        # BUILD LEDGER (all folded into the prompt and surviving a reset), so it may
+        # opt to run more steps between summaries via a per-session override. The
+        # token/char pressure guard below is unchanged and still the hard ceiling.
+        step_ceiling = s.get("max_steps_before_summary") or MAX_STEPS_BEFORE_SUMMARY
+        if s["step_count"] >= step_ceiling or context_pressure(s["messages"], ctx_overhead):
             used = estimate_tokens(s["messages"]) + ctx_overhead // CHARS_PER_TOKEN
             self._emit({"type": "system", "content": (
                 f"Context at ~{used} tokens (>= {int(CONTEXT_WINDOW_FRACTION*100)}% of the "
@@ -4007,6 +4246,21 @@ class AgentApi:
         soft nudge on the first un-planned mutation; legacy non-adaptive keeps the old
         "plan before any tool" behavior), and the repeat-failure guard (an EXACT call
         that already failed earlier is nudged once before it's allowed through)."""
+        # Superpowers auto-brainstorm gate: FIRST thing on a new non-trivial task —
+        # turn the goal into a chosen approach (autonomously) before anything else,
+        # so the plan is built against it. Fires at most once per task (clears its own
+        # flag), never blocks reads afterward, and never raises.
+        if self._maybe_run_brainstorm_gate(s, tool_name) == "continue":
+            return "continue"
+
+        # Superpowers architect gate: with the approach chosen, have the architect
+        # design the actual plan (in its own context, on a stronger model) and install
+        # it — so execution starts from a wide, delegated, dependency-shaped plan
+        # instead of whatever serial list the orchestrator would have typed. Fires at
+        # most once per task and degrades to self-planning on any shortfall.
+        if self._maybe_run_architect_gate(s, tool_name) == "continue":
+            return "continue"
+
         # Replan gate: once the watchdog trips (a core approach failed repeatedly),
         # MUTATIONS stay paused until a DELIBERATE plan_replan, so the agent revises
         # the plan instead of grinding a dead end. Read-only inspection stays FREE
@@ -4526,6 +4780,256 @@ class AgentApi:
                 "BRIEF (strategy_update): confirm the diagnosis and top hypothesis still hold, and adjust "
                 "the strategy if the evidence has moved.")})
 
+    # --- Superpowers auto-brainstorm gate --------------------------------------
+    _BRAINSTORM_AUTONOMY = (
+        "AUTONOMOUS MODE: do NOT defer to the user and do NOT return OPEN QUESTIONS. "
+        "This runs unattended — no one will answer questions. Resolve every open "
+        "question yourself with your best-judgment ASSUMPTION and label it. Return "
+        "the brief with an ASSUMPTIONS section (each a decision you made) instead of "
+        "a QUESTIONS section. Be decisive: pick ONE recommended approach."
+    )
+
+    def _brainstorm_context(self):
+        """Light grounding for the brainstormer: workspace root + any existing plan /
+        investigation memory. Kept short — the subagent inspects the workspace itself."""
+        s = self.session
+        bits = []
+        root = s.get("root") or s.get("project")
+        if root:
+            bits.append(f"Workspace root: {root}")
+        _plan = planning.get_active_plan()
+        if _plan is not None and not _plan.is_complete():
+            bits.append("An in-progress plan already exists:\n" + _plan.to_markdown())
+        _inv = investigation.get_active()
+        if _inv is not None and not _inv.is_empty():
+            bits.append("Investigation memory so far:\n" + _inv.to_markdown())
+        return "\n\n".join(bits)
+
+    def _brainstorm_inline_fallback(self, s, note=None):
+        """Inline self-brainstorm: no subagent is dispatched (used for inline-only
+        mode and whenever the brainstormer persona is unavailable or fails). The
+        model does the design thinking itself, in-context, before planning."""
+        if note:
+            self._emit({"type": "system", "content": note})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] Before planning, BRAINSTORM this task inline and DECIDE — do not ask the user "
+            "anything. In a few tight lines: (1) restate the goal crisply; (2) give 2–3 candidate "
+            "approaches with honest trade-offs; (3) pick ONE and say why; (4) list the assumptions "
+            "you're resolving on your own (label them ASSUMPTION); (5) note the key risks. Then plan "
+            "against your chosen approach."
+        )})
+
+    _ARCHITECT_CONTRACT = (
+        "Return your PLAN PROPOSAL as a single JSON object in a ```json fenced block, shaped "
+        "EXACTLY like this (no other text is needed):\n"
+        '{"task": "<one sentence>", "success_criteria": ["<objective, checkable>"], '
+        '"constraints": ["<hard boundary>"], "phases": ["<milestone 1>", "<milestone 2>"], '
+        '"components": ["<named build unit, for a large multi-artifact change>"], '
+        '"risks": ["<risk/unknown>"], "next_action": "<the single next move>", '
+        '"steps": [{"content": "<small verifiable step>", "key": "<short local name>", '
+        '"delegate": "<subagent, optionally agent@tier>", "depends_on": ["<key of a step this '
+        'one truly needs>"], "scope": ["<workspace paths this step owns, e.g. smali/com/x/**>"], '
+        '"purpose": "...", "expected": "...", "verification": "<how it is objectively checked>", '
+        '"fallback": "..."}]}\n'
+        "PLAN FOR PARALLEL EXECUTION — this is the point of the proposal:\n"
+        "- Steps with NO depends_on are dispatched CONCURRENTLY, so put every genuinely "
+        "independent piece of the FIRST phase in `steps` and give depends_on ONLY where one "
+        "step truly consumes another's result. A chain of steps that could have been a wave is "
+        "the single most costly mistake you can make here.\n"
+        "- Decompose by OWNERSHIP for a large change: one step per package / library / module, "
+        "each with a `scope` naming the paths it owns. Disjoint scopes run at the same time; an "
+        "unscoped change step takes the whole workspace and blocks everything else.\n"
+        "- Tag every self-contained step with a `delegate` and match the tier to the job "
+        "(a lookup is cheap, a design decision is not).\n"
+        "- List each build unit of a large modification in `components` so progress is counted "
+        "in artifacts, not in prose."
+    )
+
+    def _maybe_run_architect_gate(self, s, tool_name):
+        """After the brainstorm and BEFORE any planning, have the `architect` persona
+        inspect the workspace and hand back a structured, parallel-shaped plan, which
+        is installed as the active plan directly.
+
+        Why a subagent writes the plan: the orchestrator plans from whatever it has
+        already read, under its own context pressure, and reliably produces a SERIAL
+        list — which then executes serially no matter how much parallel machinery
+        sits underneath. The architect inspects freely in its own context, on a
+        stronger model, and answers in the plan's own vocabulary (delegate /
+        depends_on / scope), so the parallel shape survives into execution instead of
+        being flattened by re-transcription.
+
+        Fires ONCE per new non-trivial task, never in inline-only mode, and degrades
+        safely at every step: no persona, a failed run, or an unparseable answer all
+        fall back to the orchestrator planning for itself (its proposal, if any, is
+        still handed over as text). Never raises."""
+        if not (s.get("superpowers_enabled") and s.get("needs_architect")):
+            return None
+        s["needs_architect"] = False        # spent, whatever happens below
+        if s.get("inline_only") or not s.get("needs_plan"):
+            return None
+        task = (s.get("original_task") or "").strip()
+        if not task:
+            return None
+        agent_def = plugins.get_agent(SUPERPOWERS_ARCHITECT)
+        if agent_def is None:
+            return None
+
+        tier, budget_note = self._premium_budget_gate(getattr(agent_def, "tier", None) or "premium")
+        if budget_note:
+            self._emit({"type": "delegate_note", "agent": agent_def.name, "content": budget_note})
+        self._emit({"type": "system", "content": (
+            "Superpowers: the architect is inspecting the workspace and designing a "
+            "parallel-shaped plan…")})
+
+        context = self._brainstorm_context()
+        brief = superpowers.get_active()
+        if brief is not None and not brief.is_empty():
+            context = ("DESIGN BRIEF (the approach already chosen — plan against it):\n"
+                       + brief.to_markdown() + ("\n\n" + context if context else ""))
+        try:
+            result = subagents.run_subagent(agent_def, task + "\n\n" + self._ARCHITECT_CONTRACT,
+                                            context=context, on_event=self._emit, tier=tier)
+        except Exception as e:
+            self._emit({"type": "system", "content": (
+                f"Superpowers: architect run failed ({e}) — planning inline instead.")})
+            return None
+
+        report = (result or {}).get("report") or ""
+        proposal = superpowers.parse_plan_proposal(report) if report.strip() else None
+        if proposal is None:
+            if report.strip():
+                # Not machine-readable, but the thinking is still worth having.
+                s["messages"].append({"role": "user", "content": (
+                    "[SYSTEM] The architect subagent inspected the workspace and proposed this "
+                    "plan. Turn it into plan_create yourself — and keep its parallel shape: "
+                    "independent steps in the same phase with delegate + scope set, depends_on "
+                    "only where a step truly needs another's result.\n\n" + report)})
+                self._emit({"type": "system", "content": (
+                    "Superpowers: architect returned a prose plan — handing it to the planner.")})
+                return "continue"
+            return None
+
+        try:
+            plan = self._install_proposed_plan(proposal, task, brief)
+        except Exception as e:
+            self._emit({"type": "system", "content": (
+                f"Superpowers: could not install the architect's plan ({e}) — planning inline.")})
+            return None
+
+        s["needs_plan"] = False
+        s["mutating_gate_nudged"] = True     # the plan exists; no un-planned-mutation nudge
+        ready = [it for it in plan.ready_steps() if it["status"] == "pending"]
+        self._emit({"type": "system", "content": (
+            f"Plan installed from the architect: {len(plan.phases)} phase(s), "
+            f"{len(plan.items)} step(s) in the current phase, {len(ready)} runnable right now.")})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] The architect inspected the workspace and its PLAN IS NOW ACTIVE — you did "
+            "not have to write it and you should NOT call plan_create. Read it (it is pinned in "
+            f"your context), then EXECUTE it: {len(ready)} step(s) are independent and ready right "
+            "now, and delegated ones dispatch as a concurrent wave the moment you start them. "
+            "Adjust it as evidence arrives (plan_add_tasks / plan_update_task / plan_replan) — "
+            "but do not quietly re-do the design work, and do not turn its parallel steps into a "
+            "serial march."
+        )})
+        return "continue"
+
+    def _install_proposed_plan(self, proposal, task, brief=None):
+        """Build and activate a Plan from parsed architect proposal args. Also seeds
+        the build ledger with the proposal's components, so a large multi-artifact
+        change starts with a countable worklist instead of prose."""
+        plan = planning.Plan(proposal.get("task") or task)
+        plan.set_mission(success_criteria=proposal.get("success_criteria"),
+                         constraints=proposal.get("constraints"))
+        plan.set_orientation(
+            unknowns=proposal.get("risks"),
+            assumptions=(brief.assumptions if brief is not None else None))
+        if proposal.get("phases"):
+            plan.set_phases(proposal["phases"])
+        plan.add_items(proposal.get("steps") or [])
+        if proposal.get("next_action"):
+            plan.set_next_action(proposal["next_action"])
+        planning.set_active_plan(plan)
+
+        components = proposal.get("components") or []
+        if components:
+            try:
+                lg = ledger.ensure_active(plan.task)
+                for name in components:
+                    lg.add_component(name)
+                ledger.notify_updated()
+            except Exception:
+                pass      # the ledger is an accelerator, never a hard dependency
+        return plan
+
+    def _maybe_run_brainstorm_gate(self, s, tool_name):
+        """On the first tool call of a NEW non-trivial task, brainstorm the goal into
+        a chosen approach BEFORE anything else — autonomously, never asking the user.
+        Default path dispatches the `brainstormer` persona (isolated context, distilled
+        report) and pins the result as a Design Brief; inline-only mode brainstorms
+        in-context instead. Fires ONCE (clears needs_brainstorm up front, so it can
+        never loop), never blocks reads afterward, and never raises."""
+        if not (s.get("superpowers_enabled") and s.get("needs_brainstorm")):
+            return None
+        # Clear immediately: whatever happens below, this task's brainstorm is spent.
+        s["needs_brainstorm"] = False
+
+        task = (s.get("original_task") or "").strip()
+        if not task:
+            return None
+
+        # Inline-only: honor "no subagents" — brainstorm in-context, don't dispatch.
+        if s.get("inline_only"):
+            self._brainstorm_inline_fallback(
+                s, note="Superpowers: brainstorming inline (you asked for inline execution)…")
+            return "continue"
+
+        agent_def = plugins.get_agent(SUPERPOWERS_BRAINSTORMER)
+        if agent_def is None:
+            self._brainstorm_inline_fallback(
+                s, note=("Superpowers: brainstormer persona unavailable — brainstorming inline instead."))
+            return "continue"
+
+        tier, budget_note = self._premium_budget_gate(getattr(agent_def, "tier", None) or "premium")
+        if budget_note:
+            self._emit({"type": "delegate_note", "agent": agent_def.name, "content": budget_note})
+        self._emit({"type": "system", "content": (
+            "Superpowers: auto-brainstorming the goal into a chosen approach before planning "
+            "(autonomous — deciding, not asking)…")})
+
+        sub_task = task + "\n\n" + self._BRAINSTORM_AUTONOMY
+        try:
+            result = subagents.run_subagent(agent_def, sub_task,
+                                            context=self._brainstorm_context(),
+                                            on_event=self._emit, tier=tier)
+        except Exception as e:
+            self._brainstorm_inline_fallback(
+                s, note=f"Superpowers: brainstorm subagent errored ({e}) — brainstorming inline instead.")
+            return "continue"
+
+        report = (result or {}).get("report") or ""
+        if not (result or {}).get("ok") or not report.strip():
+            self._brainstorm_inline_fallback(
+                s, note="Superpowers: brainstorm subagent returned nothing usable — brainstorming inline.")
+            return "continue"
+
+        brief = superpowers.parse_brief_report(report, source="subagent")
+        if brief is None or brief.is_empty():
+            self._brainstorm_inline_fallback(
+                s, note="Superpowers: could not parse a design brief — brainstorming inline.")
+            return "continue"
+
+        superpowers.set_active_brief(brief)  # notifies -> pins into the prompt
+        self._emit({"type": "system", "content": (
+            f"Design brief ready — approach: {brief.one_line()[:160]}")})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] A DESIGN BRIEF for this task has been prepared by the brainstormer and pinned "
+            "in your context (see 'DESIGN BRIEF'). It chose an approach and resolved the open "
+            "questions as ASSUMPTIONS — do NOT ask the user about them. Now create the plan against "
+            "that chosen approach (plan_create), then execute. If you genuinely disagree with the "
+            "brief, say why and adjust — but do not re-brainstorm from scratch."
+        )})
+        return "continue"
+
     def _run_strategy_review_gate(self, s, brief):
         """Independently review the Strategic Brief before the first mutation. On
         approve, mark it reviewed and return None (let the mutation proceed). On
@@ -4719,6 +5223,12 @@ def main():
         width=1320,
         height=840,
         min_size=(980, 600),
+        # pywebview defaults this to False, which injects
+        # `body { -webkit-user-select: none }` into the whole webview — that is
+        # what made chat messages impossible to drag-select or copy. Selection
+        # policy now lives in frontend/index.html instead (chrome stays
+        # unselectable, transcript/output/file text is selectable).
+        text_select=True,
     )
     api.set_window(window)
 

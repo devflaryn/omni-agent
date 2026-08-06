@@ -1,7 +1,7 @@
 """Codebase Q&A tool — `ask_codebase`.
 
-Lets the main agent ask a natural-language question about the project in
-`/workspace` and get back a synthesized answer, WITHOUT flooding its own
+Lets the main agent ask a natural-language question about the active project
+and get back a synthesized answer, WITHOUT flooding its own
 conversation with the dozens of file reads / graph queries the answer took to
 find.
 
@@ -37,7 +37,7 @@ from tool_registry import registry
 # A deliberately conservative, READ-ONLY subset of the registered tools. These
 # only inspect the workspace; none of them mutate files, rebuild/sign APKs, run
 # the emulator, or execute arbitrary radare2 write commands. build_code_graph is
-# included because it only writes a private cache under /workspace/.codegraph and
+# included because it only writes a private cache in the project folder/.codegraph and
 # is what makes navigating a big decompiled tree cheap.
 ASK_CODEBASE_TOOLS = {
     "list_directory",
@@ -73,11 +73,11 @@ REPEAT_LIMIT = 3            # identical tool call this many times in a row -> nu
 
 
 _SUBAGENT_SYSTEM_PROMPT = """You are a codebase question-answering assistant working inside an isolated \
-investigation session. Another AI agent has handed you ONE question about the project currently mounted at \
-`/workspace` (a codebase, or a decompiled/unpacked app). Your job is to investigate that workspace using the \
+investigation session. Another AI agent has handed you ONE question about the project currently open \
+(a codebase, or a decompiled/unpacked app). Your job is to investigate that workspace using the \
 read-only tools below and return a single, accurate, well-grounded answer.
 
-You operate in the same Linux Docker sandbox as the calling agent; every tool path is relative to `/workspace`.
+You operate on the same machine as the calling agent; every tool path is relative to the project root.
 
 HOW TO WORK:
 - Investigate before you answer. Locate the relevant code with the tools instead of guessing.
@@ -202,7 +202,7 @@ def _force_final_answer(messages, tools_used, steps, note):
 @registry.register(
     name="ask_codebase",
     description=(
-        "Ask a natural-language question about the project in /workspace and get back a synthesized answer. "
+        "Ask a natural-language question about the active project and get back a synthesized answer. "
         "This spins up a SEPARATE, isolated LLM conversation (its own context) that investigates the workspace "
         "with read-only tools (code graph, grep, find, read, disassembly, decompilation) and returns ONE concise, "
         "evidence-backed answer. Only that answer comes back to you — all the intermediate file reads and graph "
@@ -211,7 +211,7 @@ def _force_final_answer(messages, tools_used, steps, note):
         "sign, patch, or run anything."
     ),
     params_schema={
-        "question": "string (the question to answer about the codebase/workspace, e.g. 'Where is the license check enforced and what function decides it?')",
+        "question": "string (the question to answer about the project, e.g. 'Where is the license check enforced and what function decides it?')",
         "context": "string (optional — hints to focus the search, e.g. a directory to look in, a class name, or what you've already ruled out)",
         "max_steps": f"integer (optional, default {DEFAULT_MAX_STEPS}, max {MAX_STEPS_CAP}) — how many exploration tool calls the sub-agent may make before it must answer"
     },

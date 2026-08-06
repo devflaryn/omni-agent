@@ -2,7 +2,7 @@
 name: emulator-testing
 description: Actually run a built/signed APK on a persistent Android emulator, watch what happens with automatic smart screenshot capture, pull logcat, and get a Markdown report describing what the test found — so patches can be verified by observation, not just by verify_apk's structural checks.
 when_to_use: Use this skill any time you've built and signed a modified APK and want to confirm it actually WORKS — launches without crashing, the patched check is really bypassed at runtime, a new feature renders correctly — rather than only trusting that the build succeeded. Also use it when the user reports a bug/crash and wants you to reproduce and diagnose it.
-allowed-tools: ensure_emulator_running, install_apk_on_emulator, launch_app_on_emulator, play_roblox, set_roblox_account, list_roblox_accounts, adb_shell, get_logcat, take_emulator_screenshot, record_and_capture_keyframes, analyze_keyframes, generate_test_report, run_apk_test_session, stop_emulator
+allowed-tools: ensure_emulator_running, install_apk_on_emulator, launch_app_on_emulator, play_roblox, set_roblox_account, list_roblox_accounts, adb_shell, get_logcat, take_emulator_screenshot, record_and_capture_keyframes, analyze_keyframes, observe_screen, tap_element, tap_screen, type_text, swipe_screen, press_key, generate_test_report, run_apk_test_session, stop_emulator
 ---
 
 # Emulator Testing Skill
@@ -10,7 +10,7 @@ allowed-tools: ensure_emulator_running, install_apk_on_emulator, launch_app_on_e
 `verify_apk` only checks that an APK is structurally valid (signed, aligned, has the required files) — it says nothing about whether the app actually runs correctly. This skill closes that gap by actually installing and launching the app on a real emulator and observing it.
 
 ## Architecture: omnidroid, native on the host
-The emulator tools run NATIVELY on this host (macOS/Windows/Linux), not through the Linux Docker sandbox.
+The emulator tools run on this host (macOS/Windows/Linux) — as do all the other tools, so they all see the same filesystem.
 
 **One backend: omnidroid.** There is a single backend — the self-contained headless **omnidroid** engine (QEMU + a LineageOS **arm64** base that runs natively on Apple Silicon / arm64 hosts, no translation). The old `ldplayer` and `avd` backends and the x86 Bliss `base.qcow2` are GONE; any `backend` value other than `qemu` is coerced to omnidroid. The engine is resolved by `_find_qemu_manager`: the canonical `omnidroid/manager/omni.py` checkout beside `omni-agent` is preferred, so the agent always drives the current engine (thin username-keyed instances, `accounts.json`, the RGBX colour fix). Base images live in the external `OmniImages` dir, never bundled. On first use the engine self-bootstraps a portable QEMU; these tools call it for lifecycle and read the guest adb serial from its JSON, then use an ordinary host `adb` for screenshots/logcat/keyframes — so those steps are engine-agnostic.
 

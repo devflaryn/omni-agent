@@ -13,10 +13,12 @@ import hashlib
 import os
 import re
 import shlex
+import sys
+import tempfile
 
 from tool_registry import registry
-from tools.common import normalize_path, build_paginated_command, append_page_hint, clean_hex
-from docker_sandbox import run_cmd
+from tools.common import normalize_path, build_paginated_command, append_page_hint, clean_hex, encode_script, wpath
+from host_exec import run_cmd
 
 # Shell snippet that resolves the llvm-objdump binary (the `llvm` package ships an
 # unversioned /usr/bin/llvm-objdump symlink, but fall back to the versioned name
@@ -25,13 +27,54 @@ from docker_sandbox import run_cmd
 _LLVM_OBJDUMP_RESOLVE = (
     'LOBJ=$(command -v llvm-objdump 2>/dev/null || command -v llvm-objdump-14 2>/dev/null); '
     'if [ -z "$LOBJ" ]; then '
-    'echo "ERROR: llvm-objdump is not installed in the sandbox. Rebuild the image '
-    '(the Dockerfile installs the llvm package), or use disassemble_range (objdump) instead."; '
+    'echo "ERROR: llvm-objdump is not installed on this machine. Run '
+    'scripts/install_tools.py (it installs the llvm package), or use '
+    'disassemble_range (objdump) instead."; '
     'exit 1; fi; '
 )
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _GHIDRA_SCRIPT_PATH = os.path.join(_HERE, "_ghidra_decompile.py")
+
+
+def _ghidra_project_root():
+    """A directory for Ghidra's cached analysis projects, guaranteed to contain
+    NO path element starting with a dot.
+
+    Ghidra rejects such paths outright — `analyzeHeadless` aborts with
+    "Path element starting with '.' is not permitted" before any analysis runs.
+    That rules out the old `.ghidra_proj` inside the project, and it rules out
+    keeping the cache under the project at all: that folder is the user's, and
+    may itself sit under a hidden directory.
+
+    Keeping it outside is better anyway — the cache is a rebuildable artifact,
+    not project content, so it shouldn't appear in the user's tree. Each
+    candidate is checked for dot elements before use, so an unusual home
+    directory falls through to the next one instead of failing at analysis
+    time."""
+    candidates = []
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        candidates.append(os.path.join(home, "Library", "Caches", "omni-agent", "ghidra"))
+    elif os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(os.path.join(local, "omni-agent", "ghidra"))
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        candidates.append(os.path.join(xdg, "omni-agent", "ghidra"))
+    candidates.append(os.path.join(tempfile.gettempdir(), "omni-agent", "ghidra"))
+
+    for path in candidates:
+        full = os.path.abspath(path)
+        if any(part.startswith(".") for part in full.split(os.sep) if part):
+            continue  # Ghidra would refuse it
+        try:
+            os.makedirs(full, exist_ok=True)
+            return full
+        except OSError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +103,7 @@ _GHIDRA_SCRIPT_PATH = os.path.join(_HERE, "_ghidra_decompile.py")
 def extract_strings(binary_path, min_length=6, filter_pattern=None, max_lines=200, skip=0):
     binary_path = normalize_path(binary_path)
     cmd = build_paginated_command(
-        f"strings -n {min_length} /workspace/{binary_path}",
+        f"strings -n {min_length} {wpath(binary_path)}",
         filter_pattern=filter_pattern,
         max_lines=max_lines,
         skip=skip,
@@ -98,7 +141,7 @@ def extract_strings(binary_path, min_length=6, filter_pattern=None, max_lines=20
 def rabin2_info(binary_path, mode="-s", filter_pattern=None, max_lines=300, skip=0):
     binary_path = normalize_path(binary_path)
     cmd = build_paginated_command(
-        f"rabin2 {mode} /workspace/{binary_path}",
+        f"rabin2 {mode} {wpath(binary_path)}",
         filter_pattern=filter_pattern,
         max_lines=max_lines,
         skip=skip,
@@ -127,7 +170,7 @@ def rabin2_info(binary_path, mode="-s", filter_pattern=None, max_lines=300, skip
 def nm_symbols(binary_path, filter_pattern=None, max_lines=300, skip=0):
     binary_path = normalize_path(binary_path)
     cmd = build_paginated_command(
-        f"nm -D /workspace/{binary_path} 2>/dev/null",
+        f"nm -D {wpath(binary_path)} 2>/dev/null",
         filter_pattern=filter_pattern,
         max_lines=max_lines,
         skip=skip,
@@ -145,7 +188,7 @@ def nm_symbols(binary_path, filter_pattern=None, max_lines=300, skip=0):
 )
 def readelf_info(so_filename, args="-d"):
     so_filename = normalize_path(so_filename)
-    cmd = f"readelf {args} /workspace/{so_filename}"
+    cmd = f"readelf {args} {wpath(so_filename)}"
     return run_cmd(cmd, timeout=120)
 
 
@@ -176,7 +219,7 @@ def radare2_cmd(binary_path, r2_args, timeout_seconds=30):
     binary_path = normalize_path(binary_path)
     timeout_seconds = max(5, min(int(timeout_seconds), 120))
     # -N skips auto-analysis on startup
-    cmd = f"r2 -N -q {r2_args} /workspace/{binary_path}"
+    cmd = f"r2 -N -q {r2_args} {wpath(binary_path)}"
     return run_cmd(cmd, timeout=timeout_seconds)
 
 
@@ -201,7 +244,7 @@ def disassemble_range(binary_path, start_address, stop_address):
     binary_path = normalize_path(binary_path)
     cmd = (
         f"objdump -d --start-address={start_address} --stop-address={stop_address} "
-        f"/workspace/{binary_path}"
+        f"{wpath(binary_path)}"
     )
     return run_cmd(cmd, timeout=120)
 
@@ -222,11 +265,11 @@ def disassemble_range(binary_path, start_address, stop_address):
         "Leave function_name empty to instead LIST every function name in the binary so you can pick one "
         "(useful when the target isn't obvious). "
         "IMPORTANT: the FIRST call on a given binary is slow (2-5 min) while Ghidra builds and caches its "
-        "analysis database under /workspace/.ghidra_proj; later calls on the same .so reuse that cache and "
+        "analysis database in the project folder/.ghidra_proj; later calls on the same .so reuse that cache and "
         "are fast. Raise timeout_seconds for very large libraries."
     ),
     params_schema={
-        "binary_path": "string (path to the .so file, relative to /workspace, e.g. 'lib/arm64-v8a/libfoo.so')",
+        "binary_path": "string (path to the .so file, relative to the project root, e.g. 'lib/arm64-v8a/libfoo.so')",
         "function_name": "string (optional, case-insensitive substring of the function/symbol name to decompile; empty = list all function names instead)",
         "max_functions": "integer (optional, max matching functions to decompile in one call, default 5)",
         "timeout_seconds": "integer (optional, default 360; raise for large binaries whose first-time analysis is slow)"
@@ -247,17 +290,22 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
 
     target = (function_name or "").strip()
 
-    # Ship the Ghidra Jython post-script into the sandbox (base64, same trick
+    # Stage the Ghidra Jython post-script where analyzeHeadless can load it (base64, same trick
     # write_file / the code-graph scripts use to dodge shell-escaping issues).
     try:
         with open(_GHIDRA_SCRIPT_PATH, encoding="utf-8") as fh:
             script = fh.read()
     except OSError as e:
         return {"error": f"Could not read the bundled Ghidra script: {e}"}
-    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64_script = encode_script(script)
 
     # One cached Ghidra project per binary so re-analysis only happens once.
-    proj_dir = "/workspace/.ghidra_proj"
+    # Lives outside the workspace — see _ghidra_project_root().
+    proj_dir = _ghidra_project_root()
+    if not proj_dir:
+        return {"error": "Could not create a Ghidra project directory (no writable "
+                         "cache location without a dot-prefixed path element)."}
+    proj_dir = shlex.quote(proj_dir)
     proj_name = "gp_" + hashlib.md5(binary_path.encode("utf-8")).hexdigest()[:12]
     b64_target = base64.b64encode(target.encode("utf-8")).decode("ascii")
 
@@ -268,11 +316,14 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
         f"echo '{b64_script}' | base64 -d > /tmp/_ghidra_decompile.py; "
         f"TARGET=$(echo '{b64_target}' | base64 -d); "
         f"if [ -f {proj_dir}/{proj_name}.gpr ]; then "
-        f"  MODE=\"-process $(basename /workspace/{binary_path}) -noanalysis\"; "
+        f"  MODE=\"-process $(basename {wpath(binary_path)}) -noanalysis\"; "
         f"else "
-        f"  MODE=\"-import /workspace/{binary_path}\"; "
+        f"  MODE=\"-import {wpath(binary_path)}\"; "
         f"fi; "
-        f"/opt/ghidra/support/analyzeHeadless {proj_dir} {proj_name} $MODE "
+        # `analyzeHeadless` comes from PATH (scripts/install_tools.py drops a
+        # shim in ~/.omni-agent/bin pointing at the real Ghidra install) rather
+        # than a hardcoded prefix, so it works wherever Ghidra actually landed.
+        f"analyzeHeadless {proj_dir} {proj_name} $MODE "
         f"-scriptPath /tmp -postScript _ghidra_decompile.py \"$TARGET\" \"{max_functions}\" 2>&1"
     )
     res = run_cmd(cmd, timeout=timeout_seconds)
@@ -296,18 +347,18 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
     detail = (out or res.get("stderr", "") or "").strip()
     low = detail.lower()
 
-    # Missing arm64 DECOMPILER native. Ghidra ships prebuilt decompiler binaries
-    # only for linux_x86_64 / mac_* / win — NOT linux_arm_64. On an Apple-Silicon
-    # host the sandbox is arm64 Linux, so analysis succeeds but the decompiler
-    # can't launch ("os/linux_arm_64/decompile does not exist"). The Dockerfile
-    # now builds this native from Ghidra's bundled C++ source on arm64; a stale
-    # image predates that. This is NOT a JDK problem.
+    # Missing DECOMPILER native for this platform. Ghidra ships prebuilt
+    # decompiler binaries per host OS/arch; analysis can succeed while the
+    # decompiler itself fails to launch ("os/<platform>/decompile does not
+    # exist"). scripts/install_tools.py builds it from Ghidra's bundled C++
+    # source when the release didn't include one for this machine. This is NOT a
+    # JDK problem.
     if "decompile does not exist" in low or "decompileprocessfactory" in low:
         return {"error": (
-            "Ghidra's decompiler native for this architecture is missing "
-            "(os/linux_arm_64/decompile). Ghidra doesn't ship an arm64-Linux decompiler; the "
-            "Dockerfile now builds it from source on arm64. Rebuild the sandbox image (restart the "
-            "app) so the native is compiled and placed.\n\n"
+            "Ghidra's decompiler native for this machine's platform is missing "
+            "(os/<platform>/decompile). Re-run scripts/install_tools.py — it builds the "
+            "native from Ghidra's bundled source when the release doesn't ship one for this "
+            "OS/architecture.\n\n"
             f"Ghidra output (tail):\n{detail[-1500:]}"
         )}
 
@@ -330,8 +381,8 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
     if any(m in low for m in java_markers):
         return {"error": (
             "Ghidra could not start its Java runtime (JDK version mismatch — Ghidra 11.2+ requires "
-            "JDK 21). Rebuild the sandbox image so it has JDK 21 (the Dockerfile installs "
-            "openjdk-21-jdk and pins JAVA_HOME); restart the app to trigger the rebuild.\n\n"
+            "JDK 21). Run scripts/install_tools.py to install JDK 21 on this machine, then "
+            "restart the app so it picks up the JAVA_HOME.\n\n"
             f"Ghidra output (tail):\n{detail[-1500:]}"
         )}
 
@@ -339,10 +390,10 @@ def ghidra_decompile(binary_path, function_name="", max_functions=5, timeout_sec
         return res
     return {"error": (
         "Ghidra did not produce decompiler output. Likely causes: the binary path is wrong, the file "
-        "isn't a valid ELF, analysis ran out of time/memory, the arm64 decompiler native is missing "
-        "(stale image — see above), or the JVM failed to launch (needs JDK 21). Confirm the path with "
-        "inspect_apk/list_directory and raise timeout_seconds; if it persists the sandbox image likely "
-        "needs rebuilding.\n\n"
+        "isn't a valid ELF, analysis ran out of time/memory, the decompiler native for this platform "
+        "is missing (see above), or the JVM failed to launch (needs JDK 21). Confirm the path with "
+        "inspect_apk/list_directory and raise timeout_seconds; if it persists, re-run "
+        "scripts/install_tools.py to repair the Ghidra install.\n\n"
         f"Ghidra output (tail):\n{detail[-1500:] or '(no output captured)'}"
     )}
 
@@ -366,7 +417,7 @@ _OFFSET_RE = re.compile(r"[+-]?(0x[0-9a-fA-F]+|[0-9]+)$")
         "bytes at a known offset before/after patching, confirm an instruction's encoding, or peek at a header."
     ),
     params_schema={
-        "file_path": "string (path to the binary, relative to /workspace)",
+        "file_path": "string (path to the binary, relative to the project root)",
         "offset": "integer or hex string (start byte offset, e.g. 4660 or '0x1234')",
         "length": "integer (number of bytes to read, e.g. 16; capped at 65536)"
     },
@@ -390,13 +441,13 @@ def read_binary_range(file_path, offset, length):
         return {"error": "offset must be a decimal number or a 0x-prefixed hex value, e.g. 4660 or '0x1234'."}
 
     cmd = (
-        f"if [ ! -f /workspace/{file_path} ]; then "
-        f"  echo 'ERROR: file not found: /workspace/{file_path}'; exit 1; "
+        f"if [ ! -f {wpath(file_path)} ]; then "
+        f"  echo 'ERROR: file not found: {file_path}'; exit 1; "
         f"fi; "
         f"echo '--- hex ({length} bytes @ {off}) ---'; "
-        f"xxd -s {off} -l {length} -p /workspace/{file_path} | tr -d '\\n'; echo; "
+        f"xxd -s {off} -l {length} -p {wpath(file_path)} | tr -d '\\n'; echo; "
         f"echo '--- annotated (offset | hex | ASCII) ---'; "
-        f"xxd -s {off} -l {length} /workspace/{file_path}"
+        f"xxd -s {off} -l {length} {wpath(file_path)}"
     )
     res = run_cmd(cmd, timeout=60)
     if capped and res.get("stdout"):
@@ -404,14 +455,14 @@ def read_binary_range(file_path, offset, length):
     return res
 
 
-# Byte-level diff runs inside the sandbox. Reads both files, walks the overlapping
+# Byte-level diff runs as a shipped Python script. Reads both files, walks the overlapping
 # region, and reports the offsets that differ with each side's byte in hex. The
 # paths/limit are substituted (not f-string-formatted) so the script body's braces
 # survive untouched.
 _BINDIFF_SCRIPT = r'''
 import sys
-pa = "/workspace/__A__"
-pb = "/workspace/__B__"
+pa = "__A__"
+pb = "__B__"
 max_diff = __MAX__
 try:
     with open(pa, "rb") as f:
@@ -457,8 +508,8 @@ if total > max_diff:
         "bytes around a reported offset use read_binary_range."
     ),
     params_schema={
-        "file1": "string (path to the first/old file, relative to /workspace)",
-        "file2": "string (path to the second/new file, relative to /workspace)",
+        "file1": "string (path to the first/old file, relative to the project root)",
+        "file2": "string (path to the second/new file, relative to the project root)",
         "max_diff": "integer (optional, max differing offsets to list, default 200)"
     },
     output="File sizes for both inputs, a size-difference note if they differ in length, then one line per differing offset ('offset=0x.. (dec)  A=xx  B=yy'), capped at max_diff. Says 'IDENTICAL' if the files are byte-for-byte equal.",
@@ -476,7 +527,7 @@ def diff_binary_files(file1, file2, max_diff=200):
               .replace("__A__", file1)
               .replace("__B__", file2)
               .replace("__MAX__", str(max_diff)))
-    b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64 = encode_script(script)
     cmd = f"echo '{b64}' | base64 -d | python3 -"
     return run_cmd(cmd, timeout=120)
 
@@ -492,14 +543,14 @@ def diff_binary_files(file1, file2, max_diff=200):
         "Disassembles a binary with LLVM's llvm-objdump — the clean-output counterpart to disassemble_range "
         "(objdump) and radare2_cmd. On ARM64 (aarch64) .so files it produces tidy AArch64 assembly and resolves "
         "call targets to symbol names (e.g. 'bl 0x950 <dlopen@plt>') WITHOUT the relocation/analysis noise "
-        "radare2 injects, and it disassembles aarch64 code the sandbox's x86_64 binutils objdump often can't "
+        "radare2 injects, and it annotates aarch64 code a host-native objdump often can't "
         "annotate at all. Give an optional start_address/stop_address (hex or decimal virtual addresses) to "
         "disassemble just one function's range — strongly recommended on large libraries. Leave the range empty "
         "to dump from the start of .text (capped by max_lines). Use filter_pattern to grep the disassembly and "
         "skip/max_lines to paginate."
     ),
     params_schema={
-        "binary_path": "string (path to the .so, relative to /workspace)",
+        "binary_path": "string (path to the .so, relative to the project root)",
         "start_address": "string (optional, hex '0x838' or decimal virtual address to start at)",
         "stop_address": "string (optional, hex or decimal virtual address to stop at)",
         "arch": "string (optional, force a disassembly arch, e.g. 'arm64'; default 'auto' lets llvm-objdump detect it from the ELF header)",
@@ -531,7 +582,7 @@ def llvm_objdump_disasm(binary_path, start_address=None, stop_address=None, arch
             return {"error": "arch must be a simple token like 'arm64', 'aarch64', 'x86-64', or 'auto'."}
         arch_flag = f"--arch={a} "
 
-    base = f'"$LOBJ" -d {arch_flag}{range_flags}/workspace/{binary_path}'
+    base = f'"$LOBJ" -d {arch_flag}{range_flags}{wpath(binary_path)}'
     cmd = _LLVM_OBJDUMP_RESOLVE + build_paginated_command(
         base, filter_pattern=filter_pattern, max_lines=max_lines, skip=skip)
     res = run_cmd(cmd, timeout=120)
@@ -626,7 +677,7 @@ def _parse_plt_calls(disasm_text):
         "anti-tamper imports are flagged separately, and unresolved indirect (blr) calls are counted."
     ),
     params_schema={
-        "binary_path": "string (path to the .so, relative to /workspace)",
+        "binary_path": "string (path to the .so, relative to the project root)",
         "function_name": "string (exact symbol name, or a substring if the exact name isn't found — version suffixes like '@@VERS_1.0' are ignored)",
         "max_window": "integer (optional, bytes to disassemble when the symbol has no size recorded, default 1024)"
     },
@@ -643,7 +694,7 @@ def analyze_function_calls(binary_path, function_name, max_window=1024):
     except (TypeError, ValueError):
         max_window = 1024
 
-    res = run_cmd(f"readelf -sW /workspace/{binary_path} 2>/dev/null", timeout=60)
+    res = run_cmd(f"readelf -sW {wpath(binary_path)} 2>/dev/null", timeout=60)
     symtab = res.get("stdout", "")
     if not symtab.strip():
         return {"error": f"Could not read a symbol table from {binary_path} (readelf produced no output). Confirm the path with list_directory and that it is an ELF .so."}
@@ -664,7 +715,7 @@ def analyze_function_calls(binary_path, function_name, max_window=1024):
         bounded = True
 
     cmd = _LLVM_OBJDUMP_RESOLVE + (
-        f'"$LOBJ" -d --start-address={hex(vaddr)} --stop-address={hex(stop)} /workspace/{binary_path}'
+        f'"$LOBJ" -d --start-address={hex(vaddr)} --stop-address={hex(stop)} {wpath(binary_path)}'
     )
     d = run_cmd(cmd, timeout=90)
     disasm = d.get("stdout", "")
@@ -728,7 +779,7 @@ while True:
 scope = ""
 if start != 0 or end != n:
     scope = " within [" + hex(start) + ", " + hex(end) + ")"
-print("pattern " + pat.hex() + " (" + str(len(pat)) + " byte(s)) found " + str(len(offs)) + " time(s) in " + fp.split("/workspace/")[-1] + scope)
+print("pattern " + pat.hex() + " (" + str(len(pat)) + " byte(s)) found " + str(len(offs)) + " time(s) in " + fp + scope)
 for off in offs[:maxm]:
     c0 = max(0, off - ctx)
     c1 = min(n, off + len(pat) + ctx)
@@ -753,7 +804,7 @@ if len(offs) > maxm:
         "read_binary_range."
     ),
     params_schema={
-        "so_path": "string (path to the binary, relative to /workspace)",
+        "so_path": "string (path to the binary, relative to the project root)",
         "pattern": "string (hex byte sequence to find, e.g. 'c0035fd6' or 'c0 03 5f d6'; whitespace/\\x ignored)",
         "start": "string (optional, start file offset — decimal or 0x-hex; default 0)",
         "end": "string (optional, end file offset exclusive — decimal or 0x-hex; default end of file)",
@@ -799,13 +850,13 @@ def find_byte_sequence_in_so(so_path, pattern, start=0, end=None, context=8, max
 
     args = [
         pat_clean,
-        f"/workspace/{so_path}",
+        f"{wpath(so_path)}",
         str(start_i),
         "-" if end_i is None else str(end_i),
         str(context),
         str(max_matches),
     ]
-    b64 = base64.b64encode(_FIND_BYTES_SCRIPT.encode("utf-8")).decode("ascii")
+    b64 = encode_script(_FIND_BYTES_SCRIPT)
     arg_str = " ".join(shlex.quote(a) for a in args)
     cmd = f"echo '{b64}' | base64 -d | python3 - {arg_str}"
     return run_cmd(cmd, timeout=120)

@@ -6,23 +6,50 @@ hex_patching.py and hash_tools.py.
 """
 import base64
 import os
+import re
 import shlex
 import sys
 
 def normalize_path(path):
-    """Normalize a path so it can be safely appended to ``/workspace``.
+    """Normalize a caller-supplied path to one relative to the project root.
 
-    The LLM sometimes hands us absolute sandbox paths (``/workspace/foo``)
-    and sometimes relative ones (``foo``). Both should resolve to ``foo``
-    so that ``/workspace/{path}`` always points at the right file inside
-    the Docker sandbox.
+    Commands run with the project folder as their working directory, so a
+    relative path is what every tool wants. The model supplies paths in whatever
+    shape it happens to use, so this accepts all of them and returns one:
+
+      ``foo/bar.txt``            -> ``foo/bar.txt``
+      ``./foo/bar.txt``          -> ``foo/bar.txt``
+      ``/workspace/foo/bar.txt`` -> ``foo/bar.txt``   (legacy, see below)
+
+    The ``/workspace`` prefix is a leftover from when tools ran in a container
+    mounted there. It is stripped rather than rejected: the convention survives
+    in old transcripts, cached tool results, and the model's own habits, and
+    silently accepting it costs one comparison while rejecting it would turn a
+    cosmetic mismatch into a failed tool call.
     """
     path = (path or "").strip()
     if path.startswith("/workspace"):
         path = path[len("/workspace"):]
     if path.startswith("/"):
         path = path[1:]
+    while path.startswith("./"):
+        path = path[2:]
     return path if path else "."
+
+
+def wpath(path):
+    """A caller-supplied path, ready to drop into a shell command.
+
+    Normalized to project-relative (see normalize_path) and shell-quoted, so
+    names containing spaces, quotes or ``$`` survive — real project trees are
+    full of them ("Omni Apps", "My Project"), and an unquoted path silently
+    turns one argument into several.
+
+    Use this everywhere a path goes into a command string. It is idempotent with
+    respect to normalize_path, so calling it on an already-normalized path (as
+    most tools do) is fine.
+    """
+    return shlex.quote(normalize_path(path))
 
 
 def clean_hex(hex_str):
@@ -77,12 +104,11 @@ def detect_elf_arch(so_path):
     """Detect the ELF machine architecture of a .so using readelf -h.
 
     Returns one of 'aarch64', 'x86_64', 'x86', 'arm', or None if it can't be
-    determined. ``so_path`` should already be normalize_path()-relative to
-    /workspace. Used by binary_editing.py and native_codegen.py so both the
+    determined. Used by binary_editing.py and native_codegen.py so both the
     canned-patch tools and the assembler/compiler tools agree on arch names.
     """
-    from docker_sandbox import run_cmd
-    res = run_cmd(f"readelf -h /workspace/{so_path} | grep Machine", timeout=10)
+    from host_exec import run_cmd
+    res = run_cmd(f"readelf -h {wpath(so_path)} | grep Machine", timeout=10)
     machine = res.get("stdout", "").lower()
     if "aarch64" in machine:
         return "aarch64"
@@ -95,71 +121,109 @@ def detect_elf_arch(so_path):
     return None
 
 
-# Cross-toolchain binaries for each supported architecture. aarch64/arm use
-# dedicated cross-binutils/cross-gcc packages (installed in the Dockerfile);
-# x86_64/x86 reuse the sandbox's native host toolchain since the container
-# itself is x86_64 Linux.
-TOOLCHAINS = {
-    "aarch64": {
-        "as": "aarch64-linux-gnu-as",
-        "gcc": "aarch64-linux-gnu-gcc",
-        "objcopy": "aarch64-linux-gnu-objcopy",
-        "objdump": "aarch64-linux-gnu-objdump",
-    },
-    "arm": {
-        "as": "arm-linux-gnueabi-as",
-        "gcc": "arm-linux-gnueabi-gcc",
-        "objcopy": "arm-linux-gnueabi-objcopy",
-        "objdump": "arm-linux-gnueabi-objdump",
-    },
-    "x86_64": {
-        "as": "as",
-        "gcc": "gcc",
-        "objcopy": "objcopy",
-        "objdump": "objdump",
-    },
-    "x86": {
-        "as": "as --32",
-        "gcc": "gcc -m32",
-        "objcopy": "objcopy",
-        "objdump": "objdump",
-    },
+# Cross-toolchain commands for each supported architecture, used by
+# native_codegen.py to assemble/compile a self-contained snippet into ELF
+# machine code for an Android target.
+#
+# On macOS there is no `aarch64-linux-gnu-gcc` and the system `as`/`objdump`/
+# `objcopy` are Mach-O-only, so a GNU-style cross toolchain would mean
+# installing four separate cross-compilers. Clang is a cross-compiler by
+# construction instead: `clang -target <triple> -c` emits ELF objects for any
+# supported architecture out of the box, and llvm-objcopy/llvm-objdump read them
+# regardless of the host. Since these tools NEVER link (see the module docstring
+# in native_codegen.py — the snippet must be self-contained), no cross sysroot or
+# cross libc is needed, which is exactly what makes this work with a plain clang.
+#
+# Elsewhere the classic GNU cross names are used, since that is what Linux
+# distributions and MSYS2 package.
+_CLANG_TARGETS = {
+    "aarch64": "aarch64-linux-gnu",
+    "arm": "arm-linux-gnueabi",
+    "x86_64": "x86_64-linux-gnu",
+    "x86": "i386-linux-gnu",
 }
 
+if sys.platform == "darwin":
+    TOOLCHAINS = {
+        arch: {
+            # `clang -c` drives its integrated assembler for a .s input, so the
+            # same command covers both the assemble and the compile path.
+            "as": "clang -target %s -c" % triple,
+            "gcc": "clang -target %s" % triple,
+            "objcopy": "llvm-objcopy",
+            "objdump": "llvm-objdump",
+        }
+        for arch, triple in _CLANG_TARGETS.items()
+    }
+else:
+    TOOLCHAINS = {
+        "aarch64": {
+            "as": "aarch64-linux-gnu-as",
+            "gcc": "aarch64-linux-gnu-gcc",
+            "objcopy": "aarch64-linux-gnu-objcopy",
+            "objdump": "aarch64-linux-gnu-objdump",
+        },
+        "arm": {
+            "as": "arm-linux-gnueabi-as",
+            "gcc": "arm-linux-gnueabi-gcc",
+            "objcopy": "arm-linux-gnueabi-objcopy",
+            "objdump": "arm-linux-gnueabi-objdump",
+        },
+        "x86_64": {
+            "as": "as",
+            "gcc": "gcc",
+            "objcopy": "objcopy",
+            "objdump": "objdump",
+        },
+        "x86": {
+            "as": "as --32",
+            "gcc": "gcc -m32",
+            "objcopy": "objcopy",
+            "objdump": "objdump",
+        },
+    }
 
-def run_script_in_sandbox(script_path, args, timeout):
-    """Ship a host-side Python script into the sandbox and run it with args.
 
-    Used for anything too involved for an inline shell one-liner (currently:
-    the code graph indexer/query scripts) — the script is base64-encoded so
-    there are no shell-escaping issues, matching the same trick write_file
-    uses for arbitrary content.
+def encode_script(script):
+    """base64-encode a script body for `... | base64 -d | python3 -`.
+
+    Piping the source through base64 sidesteps shell escaping entirely: a script
+    full of quotes, newlines, ``$`` and backticks arrives byte-for-byte. The
+    scripts address files with paths RELATIVE to the project folder, which is
+    the interpreter's working directory, so they need no path fixing.
     """
-    from docker_sandbox import run_cmd
+    return base64.b64encode(script.encode("utf-8")).decode("ascii")
+
+
+def run_python_script(script_path, args, timeout):
+    """Run a Python script file in the project folder, with args.
+
+    Used for anything too involved for an inline shell one-liner (currently: the
+    code graph indexer/query scripts). The script is base64-encoded so there are
+    no shell-escaping issues, matching the same trick write_file uses for
+    arbitrary content. Piping the source rather than invoking the file keeps it
+    working no matter where the app itself is installed.
+    """
+    from host_exec import run_cmd
     with open(script_path, encoding="utf-8") as fh:
         script = fh.read()
-    b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64 = encode_script(script)
     arg_str = " ".join(shlex.quote(str(a)) for a in args)
     cmd = "echo '{b64}' | base64 -d | python3 - {args}".format(b64=b64, args=arg_str)
     return run_cmd(cmd, timeout=timeout)
 
 
 def resolve_workspace_path(path):
-    """Resolve a '/workspace'-relative path (the convention every docker-exec
-    tool uses) to the equivalent absolute path on the HOST filesystem, via the
-    bind-mounted project workspace directory.
+    """Resolve a project-relative path to an absolute one.
 
-    Used by tools that need real Python file I/O on the host rather than
-    going through docker exec — currently the Android emulator tools, since
-    the emulator itself runs natively on the host machine (macOS / Linux /
-    Windows) rather than inside the Linux sandbox used for APK static
-    analysis/patching. The file still ends up visible at the same
-    /workspace/<path> location inside the sandbox too, since it's the same
-    bind-mounted directory on both sides.
+    Used by tools that do real Python file I/O instead of shelling out — the
+    Android emulator tools, the code-graph indexer, the web downloader. Both
+    routes address the same files: a shell command gets the same folder as its
+    working directory, so `foo/bar` means the same thing either way.
     """
-    from docker_sandbox import get_workspace_host_path
+    from host_exec import workspace_root
     rel = normalize_path(path)
-    host_root = get_workspace_host_path()
+    host_root = workspace_root()
     if rel == ".":
         return host_root
     return os.path.normpath(os.path.join(host_root, rel))
