@@ -63,8 +63,11 @@ def reset_salvage_stats():
 #   2. `from llm import CLINE_API_URL, API_KEY, MODEL_NAME` still resolves for the
 #      emulator vision tool (which now prefers get_openai_endpoint_config()).
 # Everything routes through the live config via get_effective_config().
+# API_KEY is sourced from the environment, not hardcoded, so no real credential
+# ships in source/history; without it set, first run seeds an empty/unconfigured
+# entry instead of a live key.
 CLINE_API_URL = "https://api.cline.bot/api/v1/chat/completions"
-API_KEY = "REDACTED_API_KEY"
+API_KEY = os.environ.get("OMNI_AGENT_SEED_API_KEY", "")
 MODEL_NAME = "cline-pass/glm-5.2"
 
 # Two request "protocols" cover every provider:
