@@ -94,6 +94,34 @@ Prefer the built-in one-shot: `frida_bypass_ssl_pinning`. If a custom pinner res
 hook the specific `checkServerTrusted` / `CertificatePinner.check` per the
 `ssl-pinning-bypass` skill's patterns.
 
+## Redirect a curl/c-ares app to a local server (by IP — hosts file won't work)
+Native apps using libcurl+**c-ares** ignore `/etc/hosts` AND `getaddrinfo`, so redirect at
+`connect()` **by destination IP**. Rewrite the dest to the host gateway (`10.0.2.2`) + your port.
+```js
+function exp(n,m){ try{ return m?Process.getModuleByName(m).getExportByName(n):Module.getGlobalExportByName(n);}catch(e){} return null; }
+var HOST=[10,0,2,2], PORT=8443;                 // 10.0.2.2 = the QEMU host; your server
+Interceptor.attach(exp('connect','libc.so'), { onEnter:function(a){
+  var sa=a[1]; if (sa.readU16()!==2) return;    // AF_INET only
+  var ip=[sa.add(4).readU8(),sa.add(5).readU8(),sa.add(6).readU8(),sa.add(7).readU8()].join('.');
+  var port=(sa.add(2).readU8()<<8)|sa.add(3).readU8();
+  if (/^185\.199\.(10[89]|11[01])\./.test(ip) && port===443){   // e.g. GitHub Fastly range
+    for (var i=0;i<4;i++) sa.add(4+i).writeU8(HOST[i]);          // dest addr -> 10.0.2.2
+    sa.add(2).writeU8((PORT>>8)&0xff); sa.add(3).writeU8(PORT&0xff);  // dest port -> 8443
+  }
+}});
+```
+Find the target IP first by tracing `getaddrinfo` + `connect` (log the host and the dest IP).
+Full workflow (TLS, the iptables-DNAT alternative, the fake server) is in the
+**`local-server-redirect`** skill.
+
+## API note — Frida 17 removed `Module.getExportByName(null, name)`
+The `null`-module lookups in the recipes above fail on the dev base's Frida (17.x). Use:
+- `Module.getGlobalExportByName('name')` (global), or
+- `Process.getModuleByName('libc.so').getExportByName('name')` (specific module).
+Also: `Java` is **not** a default global — the agent runner injects it; if you drive Frida
+yourself, load the java bridge before `Java.perform`. And native exports resolve to nothing
+if the `.so` is fully stripped — hook by **offset** (`Module.findBaseAddress` + add) then.
+
 ## Notes
 - `frida_trace` is the fastest way to WATCH a set of methods without writing a script —
   reach for it first; write a `frida_run_script` hook when you need to CHANGE behavior.

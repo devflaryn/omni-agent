@@ -9,6 +9,23 @@ allowed-tools: decode_apk, build_code_graph, query_code_graph, search_smali, rea
 
 This agent works statically — it reads and patches code but cannot execute the app's Java/Dalvik bytecode. That shapes the whole approach: prefer bypassing the check over fully "decrypting" the string, unless the plaintext itself is what the user actually needs.
 
+## Step 0 — First ask: is the encrypted thing DOWNLOADED, or baked in?
+Before spending any effort breaking an encoding, find out where the encrypted
+data comes from. Encrypted content that is **fetched from a server at runtime**
+(a config, a script, a payload, further URLs) does **not** need to be decrypted
+at all — if you can point the app at a local server (see the
+`local-server-redirect` skill), **you become the source and serve plaintext**.
+The app's own decrypt routine is irrelevant because you control what it receives.
+You only need to break an encoding when the app-side wrapper is applied to what
+*you* send back — and then you just **replicate it once from a captured sample**
+(e.g. observe that a fetched file is `base64(XOR(payload, key))`, recover the tiny
+key from that one sample, and serve your content the same way) instead of
+reversing the whole scheme. **Reserve real static string-decryption for values
+that are genuinely baked into the binary** (a hardcoded key, a check constant, an
+embedded bootstrap URL). A quick way to tell: trace the app's network calls — if
+the "secret" appears on the heap right after an HTTP response, it's downloaded,
+not embedded.
+
 ## Step 1 — Confirm the string really is obfuscated
 Try the obvious thing first: `search_smali` or `query_code_graph(query_type="string_refs")` for the plaintext value you expect. If it's genuinely not a plain literal, you'll see the check instead reference a byte array (`fill-array-data`), a call to a small static helper class (commonly named `a`, `b`, `aa` after R8 obfuscation), or a native JNI call.
 

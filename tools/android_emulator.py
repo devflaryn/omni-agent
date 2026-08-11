@@ -13,7 +13,7 @@ ONE BACKEND: omnidroid (QEMU). Every "run the app on a VM" flow goes through the
 self-contained headless **omnidroid** engine — a QEMU/Bliss-OS (Android 13,
 x86_64, libndk ARM translation) runner on x86 hosts, and the LineageOS arm64
 base on an arm64 host — driven through the FROZEN CONTRACT (omnidroid-api.md:
-`omni create/start/install/...`, all `--json`). It needs no separately installed
+`omnidroid create/start/install/...`, all `--json`). It needs no separately installed
 emulator: on first use it self-bootstraps its config, resolves QEMU from the
 product dir, and auto-registers the base image (base_x86 / base_arm). It is a
 *per-account* model — each fresh test instance is a named account created from
@@ -23,7 +23,7 @@ QMP 17001+i, VNC 18001+i). These tools drive lifecycle (create / start --wait /
 stop / remove), derive the guest adb serial from the `--json` payload of
 `start`/`list`, and do the adb-based work (screenshot, logcat, keyframes) with an
 ordinary host adb. APK install goes through the contract's ABI-SAFE path
-(`omni install --abi …`), which also sets the locked kiosk's launch target so
+(`omnidroid install --abi …`), which also sets the locked kiosk's launch target so
 the app actually starts under Lock Task Mode.
 
 The Android SDK emulator (`emulator.exe` + AVDs) and LDPlayer paths were REMOVED
@@ -48,7 +48,7 @@ under test, so every test session runs on a provably fresh instance.
 Screenshot capture is window-state-independent. take_emulator_screenshot uses
 `adb exec-out screencap -p` (reads the guest framebuffer over ADB — the omnidroid
 instance is headless, so there is no host window to capture). record_and_capture_
-keyframes PREFERS the engine's millisecond-precise `omni capture` (it observes
+keyframes PREFERS the engine's millisecond-precise `omnidroid capture` (it observes
 every VNC framebuffer update, so a loading screen shown for a few ms before a
 black screen is caught with the true delta_ms) and falls back to adb-screencap
 polling on an engine too old to advertise capture. Both paths feed the SAME
@@ -82,7 +82,7 @@ from llm import get_openai_endpoint_config, get_vision_endpoint_config, has_visi
 # (emulator.exe + AVDs) and LDPlayer launch paths were REMOVED (2026-07-09): they
 # were a pre-contract leftover that could reach for a stock `emulator.exe` and an
 # AVD (`omniagent_avd`) instead of omnidroid. Every "run the app on a VM" flow now
-# goes through `omni create/start` + the ABI-safe install. Any legacy `backend=`
+# goes through `omnidroid create/start` + the ABI-safe install. Any legacy `backend=`
 # argument is coerced to qemu so nothing can ever fall back to an AVD.
 _DEFAULT_BACKEND = "qemu"
 
@@ -180,7 +180,7 @@ def _validate_session_id(sid):
 # exit 1. We drive those for lifecycle, read the guest's adb serial out of the
 # JSON, and reuse the ordinary host adb.exe for screenshots/logcat/shell — the
 # same code path the other backends use. APK install/launch go back through the
-# service (`omni install` / `omni run-app`) since provisioned accounts are locked
+# service (`omnidroid install` / `omnidroid run-app`) since provisioned accounts are locked
 # kiosks; those subcommands are plain-text (no --json).
 
 def _engine_project_dir(path):
@@ -491,7 +491,8 @@ def _agent_ensure_autocap(name, log):
         log.append(f"[autocap] recorder not started ({why}).")
 
 
-def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, debug=False):
+def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, debug=False,
+                         offset=None):
     err = _validate_session_id(name)
     if err:
         return {"error": err}
@@ -501,7 +502,7 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, debug=False):
                    "+ omni-* tools) to the SAME dual-use production image. Start "
                    "frida with ensure_frida_server; hide it with "
                    "hide_root_from_app. (Root is baked into the shipped base; "
-                   "if su is missing, root it with `omni root-base`.)")
+                   "if su is missing, root it with `omnidroid root-base`.)")
         # Do NOT point the engine's boot-time recorder at the workspace yet: there
         # is no APK session named at boot, and we don't want a generic
         # screenshots/auto/ folder. Clear any stale value so the engine records to
@@ -608,6 +609,16 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, debug=False):
         args += ["--mode", mode]
     if mem:
         args += ["--mem", str(mem)]
+    # WHICH Roblox version this boot runs. The base ships none; each version is
+    # an "offset" (a named /data overlay) and one is the default. Omitting the
+    # flag means the default, which is what you almost always want — the point
+    # of naming one is to test a candidate build WITHOUT disturbing the version
+    # everything else is using. "none" boots the clean base, which is correct
+    # when this instance exists to install a different APK anyway.
+    if offset:
+        args += (["--no-offset"] if str(offset).lower() == "none"
+                 else ["--offset", str(offset)])
+        log.append(f"roblox version: offset '{offset}'")
     log.append(
         f"Starting account '{name}' headless (wait up to {wait_timeout}s"
         + (", first boot provisions" if reset else "") + ")..."
@@ -686,7 +697,7 @@ def _resolve_serial(backend, device_name=None):
     name="ensure_emulator_running",
     description=(
         "Boots the project's Android VM through OMNIDROID (the only backend). Omnidroid is the "
-        "self-contained headless QEMU/Bliss-OS runner driven via the frozen contract (omni create/"
+        "self-contained headless QEMU/Bliss-OS runner driven via the frozen contract (omnidroid create/"
         "start, --json); it needs NO separately installed emulator (NO Android SDK emulator.exe, NO "
         "AVDs — that path was removed), self-bootstraps QEMU + the base image on first use, and models "
         "each test instance as a named ACCOUNT (immutable base_x86/base_arm + disposable overlay/data). "
@@ -703,8 +714,9 @@ def _resolve_serial(backend, device_name=None):
         "device_profile": "string (IGNORED — was AVD-only)",
         "reset": "boolean (optional, default true — remove+recreate the account (fresh instance, re-provisions on first boot). Set false to reuse the existing running/provisioned account as-is (much faster).",
         "boot_timeout": "integer (optional, default 300 seconds; a freshly-created account waits up to 1500 s to cover first-boot provisioning regardless of this value)",
-        "mode": "string (optional, default 'playable' — RAM/CPU tier: 'playable' (4G/4c), 'hard' (3G/4c), or 'brutal' (2G/2c))",
-        "ram_mb": "integer (optional — override guest RAM in MB, passed as --mem; overrides the mode's RAM. Engine defaults to the mode's tier if omitted)",
+        "mode": "string (optional, default 'playable' — 'playable' is the MAXIMUM-resource mode and the right one for testing: it sizes itself to the host (4-8 GB / 4-8 vCPU), applies the high render profile (real textures/lighting/post-FX) and pins the game to the top-app cpuset, so screenshots show what a player actually sees. 'hard' (3G/4c) and 'brutal' (2G/2c) are smaller fixed tiers for a tight host. 'gaming' is playable plus a native host window. 'farming' is REFUSED here: it runs at 480x270/5 fps by design, which makes every screenshot and UI assertion worthless.)",
+        "offset": "string (optional — WHICH BAKED ROBLOX VERSION to boot. Omit for the base's DEFAULT version, which is what you almost always want. Name one to test a candidate build without disturbing the version everything else uses; pass 'none' to boot the clean base with no Roblox at all (correct when this instance exists only to install a different APK). List them with manage_roblox_versions(action='list').)",
+        "ram_mb": "integer (optional — override guest RAM in MB, passed as --mem; overrides the mode's host-derived size. Engine defaults to the mode's own sizing if omitted)",
         "cpus": "integer (optional — IGNORED (vCPU count is set by 'mode'))",
         "headless": "boolean (IGNORED — omnidroid instances are always headless; view over the instance's localhost VNC port)",
         "debug": "boolean (optional, default false — DEBUG boot: attach the devkit disk (vdc = base_<arch>_devkit.qcow2, carrying a native frida-server + the omni-* tools) to the SAME dual-use production image for reverse-engineering/runtime-hooking work. Debug is per-BOOT, so the same instance name can boot production or debug on different runs; the base image is identical either way. Also enablable via the OMNI_DEBUG_BOOT env var. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)",
@@ -714,7 +726,8 @@ def _resolve_serial(backend, device_name=None):
 )
 def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_image=_DEFAULT_SYSTEM_IMAGE,
                              device_profile="pixel_5", reset=True, boot_timeout=300, headless=False,
-                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, debug=None):
+                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, debug=None,
+                             offset=None):
     backend = _coerce_backend(backend)   # omnidroid (qemu) only — never an AVD
     device_name = device_name or _default_device_name()
     reset = _truthy(reset)
@@ -724,13 +737,25 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     except (TypeError, ValueError):
         boot_timeout = 300
     mode = (mode or _DEFAULT_QEMU_MODE).strip().lower()
-    if mode not in ("playable", "hard", "brutal"):
-        return {"error": "mode must be 'playable', 'hard', or 'brutal'."}
-    # ALWAYS omnidroid: create/start an account on the base (base_x86 on x86,
+    if mode == "farming":
+        # Refused rather than passed through. Farming shrinks the display to
+        # 480x270 and caps the engine tick at 5 fps ON PURPOSE — it exists to
+        # fit 50 instances on a host, not to be looked at. Every screenshot,
+        # keyframe and UI assertion taken from one is misleading, and the
+        # failure is silent: the tools all still "work".
+        return {"error": (
+            "mode='farming' is not usable for testing: it runs at 480x270 and "
+            "a 5 fps tick, so screenshots and UI checks are worthless. Use "
+            "'playable' (the default, maximum resources + high render "
+            "quality), or 'hard'/'brutal' if the host is tight.")}
+    if mode not in ("playable", "gaming", "hard", "brutal"):
+        return {"error": "mode must be 'playable' (default/recommended), "
+                         "'gaming', 'hard', or 'brutal'."}
+    # ALWAYS omnidroid: start an account on the base (base_x86 on x86,
     # base_arm on an arm64 host) via the frozen contract. system_image/
     # device_profile/headless are ignored (they were AVD-only).
     return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb,
-                                debug=debug)
+                                debug=debug, offset=offset)
 
 
 @registry.register(
@@ -993,7 +1018,7 @@ def press_key(key, backend=_DEFAULT_BACKEND, device_name=None):
     name="install_apk_on_emulator",
     description=(
         "Installs an APK onto the running omnidroid VM via the service "
-        "('omni install <account> <apk> --json'), which installs the APK AND sets it as the locked "
+        "('omnidroid install <account> <apk> --json'), which installs the APK AND sets it as the locked "
         "kiosk's launch target so it starts under Lock Task Mode. It is ABI-SAFE (omnidroid-api.md §5): "
         "a fat APK on an x86 account is installed as arm64-v8a so it exercises libndk ARM TRANSLATION "
         "(the real production path) instead of silently running native x86_64 and bypassing the bridge; "
@@ -1099,7 +1124,7 @@ def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None
     name="launch_app_on_emulator",
     description=(
         "Launches an installed app on the emulator. On the default 'qemu' (omnidroid) backend it uses "
-        "the service ('omni run-app <account> <package>'), which launches the package as the locked "
+        "the service ('omnidroid run-app <account> <package>'), which launches the package as the locked "
         "kiosk allows — note install_apk_on_emulator already auto-launches the freshly installed APK on "
         "qemu, so this is mainly to re-launch it. On 'ldplayer'/'avd', without an activity it uses "
         "'monkey' to fire the app's default launcher intent (works without knowing the exact activity "
@@ -2079,7 +2104,7 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     name="stop_emulator",
     description=(
         "Stops the running emulator/account. For the default 'qemu' (omnidroid) backend this powers the "
-        "instance OFF via the service ('omni stop': in-guest shutdown -> QMP quit -> hard kill), and "
+        "instance OFF via the service ('omnidroid stop': in-guest shutdown -> QMP quit -> hard kill), and "
         "with purge=true instead REMOVES the account entirely (deletes its overlay + /data + state so "
         "the next ensure_emulator_running builds a completely fresh, re-provisioned instance). For "
         "'ldplayer' it quits the instance via ldconsole; for 'avd' it sends 'adb emu kill'. qemu VMs "
@@ -2232,7 +2257,7 @@ def _adb_root(adb, serial):
     under this name for the frida_tools import."""
     if not _su_available(adb, serial):
         return ("no Magisk root (su unavailable) — the dev boot is not patched; "
-                "run `omni root-base`")
+                "run `omnidroid root-base`")
     _ensure_devkit_activated(adb, serial)
     return "Magisk root OK; devkit activated"
 
@@ -2244,11 +2269,11 @@ def _not_dev_base_error(adb, serial, tool):
         return {"error": (
             f"The devkit disk (vdc) is attached but the base is NOT ROOTED — "
             f"Magisk `su` is unavailable, so {tool} cannot run. Root the shipped "
-            f"base once with: `omni root-base` (then reboot the instance).")}
+            f"base once with: `omnidroid root-base` (then reboot the instance).")}
     return {"error": (
         f"This is not a DEBUG boot (no devkit disk / manifest). Reboot with "
         f"ensure_emulator_running(debug=true) (or set OMNI_DEBUG_BOOT=1); if the "
-        f"devkit disk is missing, build it with `omni build-devkit`.")}
+        f"devkit disk is missing, build it with `omnidroid build-devkit`.")}
 
 
 @registry.register(
@@ -2268,7 +2293,7 @@ def _not_dev_base_error(adb, serial, tool):
         "device_name": "string (optional — the omnidroid dev account name; must match the one ensure_emulator_running(debug=true) created, default 'omniagent')",
         "backend": "string (optional, default 'qemu' — omnidroid only)"
     },
-    output="The host frida endpoint ('127.0.0.1:<host_port>') plus the guest port and server status, or an error if the account is not a debug boot / is not rooted (attach it with debug=true; root the base with `omni root-base`).",
+    output="The host frida endpoint ('127.0.0.1:<host_port>') plus the guest port and server status, or an error if the account is not a debug boot / is not rooted (attach it with debug=true; root the base with `omnidroid root-base`).",
     when_to_use="Call after ensure_emulator_running(debug=true) + BOOT_OK, before attaching frida/objection to hook the app under test. Pair with hide_root_from_app to also hide root/frida from the target's detection."
 )
 def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
@@ -2333,3 +2358,165 @@ def hide_root_from_app(package_name=None, device_name=None, backend=_DEFAULT_BAC
     r = _su_sh(adb, serial, cmd, timeout=60)
     out = (r.get("stdout") or r.get("stderr") or "").strip()
     return {"stdout": out or "omni-hide ran (no output)."}
+
+
+# ---------------------------------------------------------------------------
+# Roblox VERSIONS ("offsets") and the high-level debugging surface.
+#
+# All three tools below are thin wrappers over omnidroid commands rather than
+# re-implementations, and that is the point: the engine owns the guest's
+# quirks (Magisk's off-PATH su, its argv permutation, adb's argv re-parse, the
+# devkit-vs-root distinction), and every re-implementation of them so far has
+# got at least one wrong SILENTLY.
+# ---------------------------------------------------------------------------
+
+_OFFSET_ACTIONS = ("list", "create", "default", "remove", "show")
+
+
+@registry.register(
+    name="manage_roblox_versions",
+    description=(
+        "Lists / bakes / selects / deletes the ROBLOX VERSIONS available to omnidroid. A base ships NO "
+        "Roblox; each version is an 'offset' — a named, thin /data overlay carrying one baked build — and "
+        "exactly one is the DEFAULT that a bare launch uses. Offsets are SIBLINGS: baking a new one never "
+        "replaces, deletes or disturbs an existing one, and deleting one cannot affect another, so you can "
+        "add a candidate build next to the version everything else is running. Actions: 'list' (every "
+        "version, which is default, whether its image is present), 'show' (everything recorded about one), "
+        "'create' (bake an APK as a new version, ~2 min, no base rebuild — refuses while any instance is "
+        "running), 'default' (choose which version bare launches use — this is also how you ROLL BACK), "
+        "'remove' (delete a version and its image; refuses while it is in use)."
+    ),
+    params_schema={
+        "action": "string — one of 'list', 'show', 'create', 'default', 'remove'.",
+        "name": "string (the version name. Required for 'default' and 'remove'; optional for 'show' (defaults to the default version) and for 'create' (defaults to the APK's own versionName, e.g. '2.731.944').)",
+        "apk_path": "string (REQUIRED for 'create' — the Roblox APK to bake).",
+        "make_default": "boolean (optional, 'create' only, default false — also make this the version bare launches use. Leave FALSE when baking a candidate you only want to test, so production keeps running the version it was.)",
+        "force": "boolean (optional, 'create' only, default false — re-bake over an existing version of the same name).",
+        "notes": "string (optional, 'create' only — free-text note recorded with the version).",
+    },
+    output="JSON from the engine: for 'list', every version with its default flag, image, package and APK; for 'create'/'default'/'remove', the resulting state.",
+    when_to_use="Call 'list' FIRST whenever a task mentions a specific Roblox version, or when a launch failed with no_offset / no_default_offset. Use 'create' when a build is worth KEEPING (it survives reboots and can be launched by name); use ensure_emulator_running/launch_roblox_build's apk_path instead for a one-off test you will throw away. A 'create' takes ~2 minutes and needs every instance stopped."
+)
+def manage_roblox_versions(action="list", name=None, apk_path=None,
+                           make_default=False, force=False, notes=None):
+    action = (action or "list").strip().lower()
+    if action not in _OFFSET_ACTIONS:
+        return {"error": f"action must be one of {list(_OFFSET_ACTIONS)}"}
+    args = ["offset", action]
+    if action == "create":
+        if not apk_path:
+            return {"error": "action='create' needs apk_path (the Roblox APK "
+                             "to bake as a new version)."}
+        if not os.path.isfile(apk_path):
+            return {"error": f"apk not found: {apk_path}"}
+        if name:
+            args.append(str(name))
+        args += ["--apk", str(apk_path)]
+        if _truthy(make_default):
+            args.append("--default")
+        if _truthy(force):
+            args.append("--force")
+        if notes:
+            args += ["--notes", str(notes)]
+    elif action in ("default", "remove"):
+        if not name:
+            return {"error": f"action='{action}' needs the version name. Run "
+                             f"manage_roblox_versions(action='list') first."}
+        args.append(str(name))
+    elif action == "show" and name:
+        args.append(str(name))
+    args.append("--json")
+    # A bake boots a builder VM, pushes ~130 MB and installs it; the engine's
+    # own timeouts govern, this outer bound only stops a wedged call.
+    timeout = 1800 if action == "create" else 60
+    try:
+        parsed, res, _pd = _run_qemu(args, timeout=timeout)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    if isinstance(parsed, dict) and parsed.get("ok") is False:
+        return {"error": parsed.get("message") or parsed.get("error")
+                or "omnidroid offset failed", "detail": parsed}
+    if parsed is None:
+        return {"error": "omnidroid offset produced no JSON",
+                "detail": (res.get("stdout") or res.get("stderr") or "")[:800]}
+    return {"stdout": json.dumps(parsed, indent=2)}
+
+
+@registry.register(
+    name="run_root_command",
+    description=(
+        "Runs a shell command as ROOT inside the guest, through omnidroid's own `su` path. USE THIS "
+        "instead of adb_shell('su ...') for anything needing root. Three traps make a hand-rolled root "
+        "call fail SILENTLY, and this gets all three right: (1) Magisk's su is not on $PATH (it lives in "
+        "/debug_ramdisk/su); (2) MagiskSU permutes argv, so `su 0 id -u` reads -u as an su OPTION and "
+        "exits 2; (3) `adb shell` does not forward argv — it joins the arguments and re-parses them in the "
+        "guest shell, so an unquoted 'a; b' runs a fragment of itself AND STILL REPORTS SUCCESS. It fails "
+        "with a clear no_root error rather than quietly running as uid shell, because a silent privilege "
+        "downgrade produces wrong output that looks right."
+    ),
+    params_schema={
+        "command": "string — the shell command to run as root, e.g. 'id -u', \"pm list packages | grep roblox\", 'cat /data/data/com.roblox.client/files/ClientSettings/ClientAppSettings.json'. Pipes, redirects and ; are fine: the whole string is quoted as ONE argument.",
+        "device_name": "string (optional — the omnidroid instance/account name; defaults to the single running one)",
+        "timeout_seconds": "integer (optional, default 120)",
+    },
+    output="The command's stdout/stderr and its exit code, or an error naming the fix if root is unavailable on this instance.",
+    when_to_use="Any inspection or change inside the guest that uid 'shell' cannot do: reading an app's private data dir, /proc/sys writes, cpuset/lmkd tuning, resetprop, running the devkit's omni-* helpers. Root is baked into EVERY shipped base, so this needs no debug boot — only frida and omni-hide do."
+)
+def run_root_command(command, device_name=None, timeout_seconds=120):
+    if not (command or "").strip():
+        return {"error": "command is required."}
+    try:
+        timeout_seconds = max(5, min(int(timeout_seconds), 900))
+    except (TypeError, ValueError):
+        timeout_seconds = 120
+    name = device_name or _default_device_name()
+    try:
+        # Flags BEFORE the name: `su`'s trailing argv is argparse.REMAINDER,
+        # which stops option parsing at the first positional — a `--json`
+        # typed after the name would be swallowed into the guest command.
+        parsed, res, _pd = _run_qemu(
+            ["su", "--json", "--timeout", str(timeout_seconds), name,
+             "--", str(command)],
+            timeout=timeout_seconds + 30)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    if isinstance(parsed, dict) and parsed.get("ok") is False:
+        return {"error": parsed.get("message") or parsed.get("error")
+                or "root command failed"}
+    if isinstance(parsed, dict):
+        out = (parsed.get("stdout") or "").rstrip()
+        err = (parsed.get("stderr") or "").rstrip()
+        code = parsed.get("exit_code")
+        return {"stdout": f"exit {code} (su {parsed.get('su')})\n{out}"
+                          + (f"\n[stderr] {err}" if err else "")}
+    return {"stdout": (res.get("stdout") or res.get("stderr") or "")[:4000]}
+
+
+@registry.register(
+    name="emulator_debug_info",
+    description=(
+        "Reports what can ACTUALLY be done to a running instance right now: is Magisk root available, is "
+        "the devkit disk attached (a --debug boot), is frida-server up, which Roblox version (offset) and "
+        "mode the live boot picked, what app is in the foreground, and the adb/VNC/QMP endpoints. Each "
+        "missing capability comes back with its own fix. It reports what IS true, never what was "
+        "requested."
+    ),
+    params_schema={
+        "device_name": "string (optional — the omnidroid instance/account name; defaults to the single running one)",
+    },
+    output="A JSON report: root/devkit/frida state, offset, mode, foreground app, ports, and a 'can' map (screenshot, logcat, install_apk, run_su, frida, hide_root).",
+    when_to_use="Call this FIRST whenever an emulator step failed for an unclear reason, or 'did nothing'. Missing root and a missing devkit disk are completely different problems with different fixes, and from the outside they look identical — every affected tool just appears to do nothing. Also the fastest way to confirm WHICH Roblox version a running instance is on before you trust a test result."
+)
+def emulator_debug_info(device_name=None):
+    name = device_name or _default_device_name()
+    try:
+        parsed, res, _pd = _run_qemu(["debug-info", name, "--json"], timeout=90)
+    except RuntimeError as e:
+        return {"error": str(e)}
+    if isinstance(parsed, dict) and parsed.get("ok") is False:
+        return {"error": parsed.get("message") or parsed.get("error")
+                or "debug-info failed"}
+    if parsed is None:
+        return {"error": "debug-info produced no JSON",
+                "detail": (res.get("stdout") or res.get("stderr") or "")[:800]}
+    return {"stdout": json.dumps(parsed, indent=2)}

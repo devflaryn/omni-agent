@@ -18,3 +18,7 @@ textual==6.2.1
 pillow==11.1.0
 pywebview==6.2.1
 frida==17.15.4
+# selenium drives the headless cookie-login verification (omnidroid accounts.py)
+# and the browser-backed local test servers the agent builds for APK redirect
+# harnesses. Chrome/Firefox must also be available on the host.
+selenium==4.46.0

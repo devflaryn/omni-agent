@@ -196,6 +196,18 @@ PERSIST_MIN_INTERVAL_S = 15
 # Watchdog: if the SAME tool fails this many times in a row, force the agent to
 # switch strategy instead of blindly retrying the same failing command.
 WATCHDOG_FAIL_THRESHOLD = 5
+# Long-run crash resilience. A single turn that raises an UNEXPECTED exception (a
+# tool bug, a proxy/stream fault, a weak-model edge case ask_llm didn't turn into
+# an error reply) must not end a run measured in tens of hours. The loop recovers
+# per-turn: it surfaces the error, tells the model what failed so it can adapt,
+# and continues. Only CONSECUTIVE_CRASH_LIMIT failures IN A ROW — a run that is
+# genuinely stuck and making no progress — trips the circuit breaker and aborts,
+# so a tight crash loop can't burn quota forever. The streak resets after any
+# turn that completes, so sporadic errors never accumulate toward the limit.
+CONSECUTIVE_CRASH_LIMIT = 8
+# Brief, interruptible pause after a crashing turn so a fast-failing loop doesn't
+# spin at full speed. Kept as a module constant so tests can zero it out.
+CRASH_BACKOFF_SECS = 2
 # --- Long-running command timeout decisions ----------------------------------
 # When a tool command outruns its timeout we don't kill it outright — the LLM
 # is asked whether it's stuck (kill) or a slow-but-progressing job (keep going).
@@ -2806,6 +2818,9 @@ class AgentApi:
             "context_editing": True,
             "max_consecutive_tools": MAX_CONSECUTIVE_TOOLS,
             "loop_repeat_threshold": LOOP_REPEAT_THRESHOLD,
+            # Consecutive turns that raised an unexpected exception; the loop's
+            # circuit breaker aborts at CONSECUTIVE_CRASH_LIMIT, resets on success.
+            "turn_crash_streak": 0,
             "summary_resets": 0,
             # Size of the main conversation in real provider-reported tokens, and
             # the previous call's usage the per-turn delta is measured against.
@@ -3141,6 +3156,46 @@ class AgentApi:
         self._thread = threading.Thread(target=self._run_agent_loop, daemon=True)
         self._thread.start()
         return {"ok": True}
+
+    def has_resumable_history(self):
+        """True when the current session was restored from a prior run and has
+        real conversation to continue (more than the system prompt, plus a known
+        original task). Lets a headless supervisor decide resume vs. fresh start."""
+        s = self.session or {}
+        msgs = s.get("messages") or []
+        return len(msgs) > 1 and bool(s.get("original_task"))
+
+    def continue_session(self):
+        """Resume a RESTORED session after an interruption WITHOUT starting a new
+        task — re-enter the agent loop on the existing history so a long
+        (tens-of-hours) run picks up where it left off instead of redoing work.
+
+        start_session already restores the full conversation, plan, investigation
+        and strategy brief from disk; this just re-enters the loop against that
+        state, nudged to continue. Used by the headless supervisor for crash /
+        process-restart resume."""
+        if not self.session:
+            return {"ok": False, "error": "No active session to continue."}
+        with self._lock:
+            if self._busy:
+                return {"ok": False, "error": "Agent is already working."}
+            self._busy = True
+            self._stop = False
+        # A resume nudge as a fresh user turn: the history may end on an assistant
+        # message (crash mid-turn), which some providers reject as the final turn,
+        # and the model needs an explicit "continue" cue rather than re-planning.
+        self.session["messages"].append({"role": "user", "content": (
+            "[SYSTEM] Resuming this run after an interruption. Review the conversation "
+            "above — your plan, investigation notes, and last actions — and CONTINUE "
+            "from where you left off toward the goal. Do NOT restart work already "
+            "completed. Issue the next tool_call, or a final_answer if the task is "
+            "done.")})
+        self.session["turn_crash_streak"] = 0
+        self._emit({"type": "system", "content": "Resuming the previous session…"})
+        self._persist_session()
+        self._thread = threading.Thread(target=self._run_agent_loop, daemon=True)
+        self._thread.start()
+        return {"ok": True, "resumed": True}
 
     def stop(self):
         if not self._busy:
@@ -5146,8 +5201,85 @@ class AgentApi:
                     "time": time_str})
         return "break"
 
+    def _run_one_turn(self, s):
+        """Run ONE turn: call the model, narrate, and dispatch the reply. Extracted
+        so the loop can wrap it in per-turn crash recovery. Returns "break" (the run
+        is finished), "skip" (loop again WITHOUT the summarize/status housekeeping —
+        the old post-dispatch `continue`), or "done" (do the housekeeping)."""
+        # Thinking indicator, LLM call, and bounded JSON-correction retries.
+        response_type, payload, raw_response, elapsed_ms = self._get_model_response(s)
+
+        # Narration: surface the model's per-subtask "explanation" as a throttled
+        # 'thought' so the UI opens a new action group on a shift.
+        time_str = _fmt_elapsed(elapsed_ms)
+        explanation_text = self._emit_narration(s, response_type, payload, elapsed_ms, time_str)
+
+        if response_type == "tool_call":
+            if self._handle_tool_call(s, payload, explanation_text, time_str) == "continue":
+                return "skip"
+        elif response_type == "final_answer":
+            fsig = self._handle_final_answer(s, payload, time_str)
+            if fsig == "break":
+                return "break"
+            if fsig == "continue":
+                return "skip"
+        elif response_type == "truncated":
+            self._handle_truncated(s)
+        else:
+            self._handle_malformed(s, raw_response, time_str)
+        return "done"
+
+    def _recover_from_turn_crash(self, s, exc):
+        """A turn raised an unexpected exception. Keep the run ALIVE unless it is
+        genuinely stuck. Returns True to continue, False to abort (circuit breaker).
+
+        This is the difference between a 10-hour run that survives a transient
+        fault and one that dies on the first tool bug or proxy hiccup. The failed
+        step is reported to the operator AND to the model (so it adapts rather than
+        blindly repeating), and only CONSECUTIVE_CRASH_LIMIT failures in a row —
+        no progress at all — trip the breaker."""
+        streak = s.get("turn_crash_streak", 0) + 1
+        s["turn_crash_streak"] = streak
+        detail = f"{type(exc).__name__}: {exc}"
+        self._emit({"type": "error", "content": (
+            f"Turn failed ({streak}/{CONSECUTIVE_CRASH_LIMIT}): {detail} — "
+            "recovering and continuing.")})
+        if streak >= CONSECUTIVE_CRASH_LIMIT:
+            self._emit({"type": "error", "content": (
+                f"Aborting: {streak} consecutive turn failures with no progress. "
+                f"Last error — {detail}. Fix the environment and resume the run.")})
+            # Best-effort durable save so a resume picks up the full history.
+            try:
+                self._persist_session()
+            except Exception:  # noqa: BLE001
+                pass
+            return False
+        # Tell the model what happened so it can adapt instead of repeating.
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] The previous step raised an internal error and was skipped: "
+            f"{detail}. This is recoverable — do NOT repeat the exact same action. "
+            "Re-check state if useful, then continue toward the goal with a "
+            "different or smaller next step.")})
+        # Persist so the recovery point survives a hard process kill too.
+        try:
+            self._persist_session()
+        except Exception:  # noqa: BLE001
+            pass
+        # Brief, interruptible backoff so a fast-failing loop doesn't spin.
+        self._interruptible_pause(CRASH_BACKOFF_SECS)
+        return True
+
+    def _interruptible_pause(self, seconds):
+        """Sleep up to `seconds`, waking early if the user pressed Stop."""
+        if not seconds or seconds <= 0:
+            return
+        end = time.time() + seconds
+        while time.time() < end and not self._stop:
+            time.sleep(max(0.0, min(0.1, end - time.time())))
+
     def _run_agent_loop(self):
         s = self.session
+        s.setdefault("turn_crash_streak", 0)
         try:
             while True:
                 if self._stop:
@@ -5168,29 +5300,23 @@ class AgentApi:
                 # long-run context is kept in check by the compaction at
                 # MAX_CONSECUTIVE_TOOLS and the context-window guard below.
 
-                # Thinking indicator, LLM call, and bounded JSON-correction retries.
-                response_type, payload, raw_response, elapsed_ms = self._get_model_response(s)
-
-                # Narration: surface the model's per-subtask "explanation" as a
-                # throttled 'thought' so the UI opens a new action group on a shift.
-                time_str = _fmt_elapsed(elapsed_ms)
-                explanation_text = self._emit_narration(s, response_type, payload, elapsed_ms, time_str)
-
-                if response_type == "tool_call":
-                    if self._handle_tool_call(s, payload, explanation_text, time_str) == "continue":
-                        continue
-                elif response_type == "final_answer":
-                    sig = self._handle_final_answer(s, payload, time_str)
-                    if sig == "break":
+                # One full turn (model call + dispatch), guarded so an unexpected
+                # exception recovers-and-continues instead of ending a multi-hour
+                # run. Returns "break" (end), "skip" (loop without housekeeping —
+                # the old post-dispatch `continue`), or "done" (do housekeeping).
+                try:
+                    sig = self._run_one_turn(s)
+                except Exception as e:  # noqa: BLE001 — per-turn resilience is the point
+                    if not self._recover_from_turn_crash(s, e):
                         break
-                    if sig == "continue":
-                        continue
-                elif response_type == "truncated":
-                    self._handle_truncated(s)
-                    # fall through to the context/status housekeeping and loop again
-                else:
-                    self._handle_malformed(s, raw_response, time_str)
-                    # fall through to the context/status housekeeping and loop again
+                    continue
+                # A turn that completed without raising resets the crash breaker.
+                s["turn_crash_streak"] = 0
+
+                if sig == "break":
+                    break
+                if sig == "skip":
+                    continue
 
                 if self._stop:
                     self._emit({"type": "system", "content": "Generation stopped by user."})

@@ -32,7 +32,7 @@ so a timeout means Android didn't reach `sys.boot_completed=1` in time, not that
 adb is unreachable. Options:
 - Raise `boot_timeout`.
 - Watch the boot live: any VNC viewer on `127.0.0.1:<vnc_port>` (printed in the
-  launch log), or `omni view <name>`.
+  launch log), or `omnidroid view <name>`.
 - Read `omnidroid/accounts/<name>/qemu.log` and `serial.log`.
 - **Acceleration:** on Apple Silicon the base runs arm64 natively under HVF (no
   translation) and boots in well under a minute. On an x86 host there is no
@@ -43,7 +43,7 @@ adb is unreachable. Options:
 Only relevant on an OLD base image. The current base ships
 `androidboot.insecure_adb=1` (`ro.adb.secure=0`), so adbd accepts the host key
 with no dialog on a fresh boot. If you see that dialog, the base predates the
-fix — rebuild it with `omni brand-base` (see `omnidroid/LOADING-SCREEN.md`).
+fix — rebuild it with `omnidroid brand-base` (see `omnidroid/LOADING-SCREEN.md`).
 
 ## `INSTALL_FAILED_NO_MATCHING_ABIS` from install_apk_on_emulator
 The base is arm64 (native, no translation layer), so `arm64-v8a` libs run
@@ -54,7 +54,7 @@ native libs at all — `inspect_apk filter_pattern='.so'` to confirm. Fix the AP
 ## Roblox: `no_token` from play_roblox
 `play_roblox(account="<username>")` resolves the cookie from `accounts.json` by
 username. `no_token` means that username isn't saved. `list_roblox_accounts()`
-shows what IS saved. Adding an account is a **human** step — `omni login` opens a
+shows what IS saved. Adding an account is a **human** step — `omnidroid login` opens a
 browser for the person to sign in; the agent cannot log in itself. Alternatively
 pass a raw cookie via `token=...` (override path).
 

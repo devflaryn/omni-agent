@@ -88,6 +88,36 @@ bundles, fonts). Unlike `res/`, assets are **not** compiled or renamed — the
 path you see is the path the app opens. Safe to read; edit only what you
 understand the app expects.
 
+### Compression & size — why a rebuild balloons (the #1 "won't open" cause)
+
+An APK is a ZIP, and every member is stored one of two ways: **DEFLATE**
+(compressed) or **STORE** (uncompressed). Which one is not cosmetic — it is a
+correctness constraint, and getting it wrong is the most common way a rebuild
+ends up bloated or un-launchable.
+
+- **`resources.arsc` MUST be STORED.** Android O+ mmaps it zero-copy; if a
+  rebuild DEFLATES it, the app crashes at load.
+- **Native `.so` compression MUST match `android:extractNativeLibs`:**
+  - `extractNativeLibs="true"` (or absent) — the installer extracts libs to
+    `/data` at install time, so they stay **DEFLATED** inside the APK. This is
+    Roblox's case. **Forcing them STORED is pure bloat** with zero runtime
+    benefit — e.g. `libroblox.so` is ~44MB deflated but ~104MB stored, so
+    blindly storing it turns a 130MB APK into ~193MB. That single mistake is the
+    classic "my rebuild is 60MB bigger and won't open."
+  - `extractNativeLibs="false"` — the loader mmaps each `.so` straight out of
+    the APK, so they **MUST be STORED and page-aligned** or the app can't load
+    its native code.
+- **Everything else keeps the original method.** There is no "optimize by
+  storing uncompressed" — for already-compressed media it does nothing, and for
+  compressible data it makes the APK bigger.
+
+**Size is therefore a correctness signal.** You add a few KB of smali; the
+rebuilt APK should stay within a few percent of the original. A large jump (or a
+large drop) means the toolchain changed compression or dropped content — the
+build is wrong even before you install it. `recompile_apk` reads the manifest
+and applies the `.so` rule for you; `verify_apk` (with `original_apk`) flags a
+size blowup, a `.so` that went DEFLATE→STORE, a dropped dex, and a corrupt zip.
+
 ### META-INF/ + the signing block — see next section
 
 ## Signing — the invariant you keep breaking
@@ -116,10 +146,13 @@ point relative to signing — see the apk-toolchain skill for the correct order.
 ## The one habit that prevents most breakage
 
 Before you change anything, run `inspect_apk` and build a mental census:
-how many dex files, which ABIs under `lib/`, is `resources.arsc` present, what
-signature scheme. After you rebuild, that census should have changed **only in
-the ways you intended**. A dex that disappeared, an ABI folder that appeared, a
-new `.so` — if you did not mean to cause it, the build is wrong even if it runs.
+how many dex files, which ABIs under `lib/`, is `resources.arsc` present, the
+**total APK size**, and what signature scheme. After you rebuild, that census
+should have changed **only in the ways you intended**. A dex that disappeared,
+an ABI folder that appeared, a new `.so`, or a size that jumped tens of MB — if
+you did not mean to cause it, the build is wrong even if it installs. Then prove
+it: `verify_apk` with `original_apk` mechanically diffs the census for you, and
+a clean install+launch on omnidroid is the only proof it actually runs.
 
 ## Related skills
 - **apk-toolchain** — which tool does what, and the decode-vs-unzip decision.

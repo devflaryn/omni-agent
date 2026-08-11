@@ -1,7 +1,7 @@
 """Drive a live omnidroid instance the way the PRODUCT does: pick an account
 (a Roblox token) and a place, and land in the game.
 
-These wrap the engine's `omni play` / `omni session` (contracts/omni-session.md)
+These wrap the engine's `omnidroid play` / `omnidroid session` (contracts/omni-session.md)
 rather than reimplementing them, so the agent exercises the exact path a customer
 gets. That is the point: a test that logs in by tapping through Roblox's UI would
 not be testing the product.
@@ -86,20 +86,22 @@ def _summarize(parsed, res, action):
         "at the app's exported ActivityProtocolLaunch. Login is by .ROBLOSECURITY cookie (the Roblox "
         "Android client has NO auth parameter in its deep-link scheme), which the injected bootstrap "
         "installs into Roblox's own WebView cookie jar — see contracts/omni-session.md. "
-        "MODERN ACCOUNT MODEL: pass `account` (a saved Roblox USERNAME from `omni login`, listed by "
+        "MODERN ACCOUNT MODEL: pass `account` (a saved Roblox USERNAME from `omnidroid login`, listed by "
         "list_roblox_accounts) and the engine looks up its cookie automatically — no token to handle. "
         "The instance is named for the account and is a thin (~0.4 MB) auto-created overlay, so two "
         "different accounts can run at once. Works identically on dev and production bases."
     ),
     params_schema={
         "place_id": "integer or string (REQUIRED — the numeric Roblox placeId to join, e.g. 606849621. NOT a URL: in https://www.roblox.com/games/606849621/Jailbreak the placeId is 606849621)",
-        "account": "string (the saved Roblox USERNAME to play as — from list_roblox_accounts / `omni login`. Its cookie is resolved automatically; this also names the instance. PREFER this over token)",
-        "token": "string (optional OVERRIDE — a raw .ROBLOSECURITY cookie for an account not saved via omni login. Written to a 0600 temp file, never to argv. Usually omit and use `account` instead)",
+        "account": "string (the saved Roblox USERNAME to play as — from list_roblox_accounts / `omnidroid login`. Its cookie is resolved automatically; this also names the instance. PREFER this over token)",
+        "token": "string (optional OVERRIDE — a raw .ROBLOSECURITY cookie for an account not saved via omnidroid login. Written to a 0600 temp file, never to argv. Usually omit and use `account` instead)",
         "session_name": "string (optional — override the instance name; defaults to `account`, else 'omniagent'. Give distinct names to run several instances)",
         "job_id": "string (optional — gameInstanceId/JobId to join a SPECIFIC running server instead of matchmaking)",
         "launch_data": "string (optional — <=200 bytes, readable in-game via Player:GetJoinData())",
         "user_id": "integer (optional — informational: which Roblox user the token belongs to)",
         "debug": "boolean (optional — DEBUG boot: attach the devkit (frida + omni-* tools) to the same dual-use image, for runtime-hooking a Roblox build under test. For the standard 'does this build work' check, leave false. Note: apk_path installs on ANY base and does NOT require this.)",
+        "offset": "string (optional — WHICH BAKED ROBLOX VERSION to launch. Omit for the base's DEFAULT version, which is what you almost always want. Name one to play/test a specific baked build without disturbing the default; pass 'none' to boot the clean base with no Roblox. List them with manage_roblox_versions(action='list'). Ignored in practice when apk_path is given, since that APK IS the version for this launch.)",
+        "mode": "string (optional, default 'playable' — 'playable' is the maximum-resource mode (host-sized RAM/vCPU, high render quality, game on the top-app cpuset) and the right one for both playing and testing. 'gaming' adds a native host window. 'hard'/'brutal' are smaller tiers for a tight host. Do NOT use 'farming' here: 480x270 at 5 fps makes every screenshot and UI check worthless.)",
         "timeout": "integer (optional — seconds to wait for boot; the engine picks a first-boot-aware default)",
     },
     output=("JSON: {ok, place_id, deeplink, booted, launched, session:{...token redacted...}, "
@@ -115,7 +117,7 @@ def _summarize(parsed, res, action):
 )
 def play_roblox(place_id, account=None, token=None, session_name=None,
                 job_id=None, launch_data=None, user_id=None, debug=False,
-                timeout=None, apk_path=None):
+                timeout=None, apk_path=None, offset=None, mode=None):
     # Modern model: the account username IS the instance name, so the engine
     # resolves its saved cookie automatically. `account` therefore takes
     # precedence over session_name for NAMING — otherwise a mismatched
@@ -148,6 +150,17 @@ def play_roblox(place_id, account=None, token=None, session_name=None,
         # dual-use image, for runtime-hooking the build under test. Per-boot, so
         # it applies to THIS boot only.
         argv += ["--debug"]
+    if offset:
+        # WHICH baked Roblox version. Per-LAUNCH, never per-account: the same
+        # account can play 2.731.944 now and a candidate build next time, and
+        # nothing about the cookie/session changes either way.
+        argv += (["--no-offset"] if str(offset).lower() == "none"
+                 else ["--offset", str(offset)])
+    if mode:
+        # Left to the engine's default (`playable`) unless asked. `playable` is
+        # already the maximum-resource, high-quality mode, which is what both
+        # playing and testing want.
+        argv += ["--mode", str(mode)]
     if job_id:
         argv += ["--job", str(job_id)]
     if launch_data:
@@ -226,11 +239,11 @@ def set_roblox_account(token=None, place_id=None, session_name=None, play=None,
     name="login_roblox_account",
     description=(
         "Register (or refresh) a Roblox account from a .ROBLOSECURITY cookie you already have — e.g. a "
-        "cookie.txt you were handed for testing. Wraps the engine's `omni login --token-file` (headless: "
+        "cookie.txt you were handed for testing. Wraps the engine's `omnidroid login --token-file` (headless: "
         "no browser window, nothing to click, nothing for you to sign into). The cookie is held to the "
         "SAME bar as an interactive sign-in — it must actually resolve to a real authenticated Roblox "
         "user, not just be non-empty — and is then saved under that account's real USERNAME (auto-detected "
-        "from Roblox, NOT a name you pick) in the shared accounts.json, the same store `omni login`'s "
+        "from Roblox, NOT a name you pick) in the shared accounts.json, the same store `omnidroid login`'s "
         "browser flow writes to. This is idempotent by construction: the same cookie always resolves to "
         "the same username, so logging in again just refreshes that ONE account's cookie in place — it "
         "never creates a second account or a second instance for the same underlying Roblox account. This "
@@ -338,7 +351,7 @@ def _rm_workspace_artifact(rel_path):
     ),
     params_schema={
         "place_id": "integer or string (REQUIRED — the numeric Roblox placeId to land in)",
-        "account": "string (optional — a saved Roblox USERNAME from `omni login` / list_roblox_accounts. Its cookie is resolved automatically and it names the instance. PREFER this over token/token_file when the account is already saved; give ONE of account / token / token_file)",
+        "account": "string (optional — a saved Roblox USERNAME from `omnidroid login` / list_roblox_accounts. Its cookie is resolved automatically and it names the instance. PREFER this over token/token_file when the account is already saved; give ONE of account / token / token_file)",
         "token": "string (optional — raw .ROBLOSECURITY cookie; give this OR token_file OR account)",
         "token_file": "string (optional — path to a file with the cookie, e.g. 'cookie.txt')",
         "apk_path": "string (optional — a Roblox APK to test, relative to the project root. Omit this to just "
@@ -347,12 +360,17 @@ def _rm_workspace_artifact(rel_path):
         "debug": "boolean (optional, default false — DEBUG boot: attach the devkit (frida + omni-* tools) "
               "for runtime-hooking the build under test. Installing a custom apk_path does NOT require this "
               "(APK swap works on every base); pass debug=true only when you need frida/root hooking.)",
+        "offset": "string (optional — WHICH BAKED ROBLOX VERSION to launch when you are NOT passing "
+                  "apk_path. Omit for the base's default version. Pass 'none' for the clean base. "
+                  "Irrelevant with apk_path, since that build IS the version for this launch.)",
+        "mode": "string (optional, default 'playable' — the maximum-resource, high-render-quality mode, "
+                "and the right one for testing. Never 'farming' (480x270 @ 5 fps).)",
         "timeout": "integer (optional — boot timeout in seconds; the engine picks a first-boot-aware "
                   "default)",
     },
     output=(
-        "JSON: {ok, username, place_id, deeplink, booted, launched, session:{...}}. On failure {error, "
-        "stage} naming exactly which stage failed (login, decode, inject, recompile, sign, install, play) "
+        "JSON: {ok, username, place_id, deeplink, offset, booted, launched, session:{...}}. On failure "
+        "{error, stage} naming exactly which stage failed (login, decode, inject, recompile, sign, install, play) "
         "— fix that stage and re-call; every earlier stage is idempotent, so you do not need to restart "
         "the whole pipeline."
     ),
@@ -366,7 +384,7 @@ def _rm_workspace_artifact(rel_path):
     ),
 )
 def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk_path=None,
-                        debug=None, timeout=None):
+                        debug=None, timeout=None, offset=None, mode=None):
     err = _place_error(place_id)
     if err:
         return {"error": err, "stage": "validate"}
@@ -401,7 +419,7 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
         # old "boot, install, boot again" dance is not just wasteful — the second
         # boot would now hard-fail, because `start` refuses an instance that is
         # already running. Build the APK first, then hand it to a single start.
-        from tools.apk_tools import decode_apk, recompile_apk, sign_apk
+        from tools.apk_tools import decode_apk, recompile_apk, sign_apk, verify_apk
         from tools.session_bootstrap import inject_session_bootstrap
 
         decompiled_dir = f"omni_build/{username}_decoded"
@@ -427,12 +445,25 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
         if _apk_step_failed(sign_res):
             return _apk_stage_error(sign_res, "sign")
 
+        # Gate the build BEFORE we try to boot + install it: a corrupt zip
+        # ("won't open"), a size blowup (native .so wrongly re-STORED), a dropped
+        # dex, or a bad signature must fail HERE with a clear reason, not surface
+        # later as an opaque `apk_install_failed` from the guest. Diff against the
+        # original so the regression checks (size/dex/.so) actually run.
+        verify_res = verify_apk(built_apk, original_apk=apk_path)
+        if "ONE OR MORE CHECKS FAILED" in (verify_res.get("stdout") or ""):
+            return {"error": ("The rebuilt APK failed structural/regression verification "
+                              "(corrupt zip, size blowup, dropped dex, or bad signature) — not "
+                              "installing a broken build. Details:\n"
+                              + (verify_res.get("stdout") or "")[:1500]),
+                    "stage": "verify"}
+
         # `start` refuses a running instance, and this flow owns the whole
         # lifecycle — clear any stale instance so the one-shot below can boot.
         _run_qemu(["stop", username, "--json"], timeout=300)
 
     play_res = play_roblox(place_id=place_id, account=username, debug=use_debug,
-                           timeout=timeout,
+                           timeout=timeout, offset=offset, mode=mode,
                            apk_path=(built_apk if apk_path else None))
     if play_res.get("error"):
         play_res = dict(play_res)
@@ -464,7 +495,7 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
 @registry.register(
     name="list_roblox_accounts",
     description=(
-        "List the Roblox accounts saved on this host (via `omni login`), so you can pick a username to "
+        "List the Roblox accounts saved on this host (via `omnidroid login`), so you can pick a username to "
         "pass to play_roblox(account=...). Accounts live in ONE accounts.json keyed by username; the "
         "cookies themselves are NEVER returned. Use --verify to also check each cookie still "
         "authenticates (Roblox invalidates a cookie on sign-out / password change)."
@@ -476,7 +507,7 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
             "play_roblox(account='<username>', place_id=...)."),
     when_to_use=(
         "Call before play_roblox to see which accounts are available, or to confirm an account's cookie "
-        "is still valid before a test run. A fresh login is a human step (`omni login` opens a browser) "
+        "is still valid before a test run. A fresh login is a human step (`omnidroid login` opens a browser) "
         "— you cannot add accounts, only use the ones already saved."
     ),
 )

@@ -12,7 +12,7 @@ command surface changed across sub-project A2.2 (diskless model: `start` absorbe
 `start --dev --apk` one-shot + loud `not_logged_in`). **omni-agent was never updated**, so
 against the current omnidroid:
 
-- **`play_roblox` is outright broken** — it calls `omni play … --ephemeral`; `play` is no
+- **`play_roblox` is outright broken** — it calls `omnidroid play … --ephemeral`; `play` is no
   longer a subcommand and `--ephemeral` is not a flag. This is the core "boot + join" tool.
 - Three more dead-flag sites (see drift table).
 - The B `--apk` one-shot and its loud `not_logged_in` signal are not used at all.
@@ -32,9 +32,9 @@ path.
 | `launch_roblox_build` apk path | throwaway `play` → `install` → `play` | works but wasteful + silent-Sign-In-prone | collapse to one `start --dev --apk … --place` |
 | `dev-ui --show`, `install`, `list`, `accounts`, `login`, `remove`, `run-app`, `version`, `doctor` | — | ✓ still valid | no change |
 
-`omni start` flags today: `--place --dev --apk --token/--token-file/--token-stdin --no-token
+`omnidroid start` flags today: `--place --dev --apk --token/--token-file/--token-stdin --no-token
 --job --access-code --link-code --launch-data --user-id --window/--no-window --mode --mem
---accel --timeout --json`. `omni session` flags: `--place --play --clear --token* --job
+--accel --timeout --json`. `omnidroid session` flags: `--place --play --clear --token* --job
 --launch-data --user-id --json` (no `--show`).
 
 ## Design
@@ -43,10 +43,10 @@ path.
 
 The old `play` conflated two roles that are now distinct commands:
 
-- **Fresh boot + join a NEW instance** → `omni start <name> --place <id> [--dev] [--apk <apk>]`.
+- **Fresh boot + join a NEW instance** → `omnidroid start <name> --place <id> [--dev] [--apk <apk>]`.
   `start` refuses if the instance is already running (`already running`).
 - **Re-deliver to an ALREADY-RUNNING instance** (switch account/place, cold-restart Roblox,
-  re-join) → `omni session <name> --play [--place …] [--token* …]`. `set_roblox_account`
+  re-join) → `omnidroid session <name> --play [--place …] [--token* …]`. `set_roblox_account`
   already uses `session` and is correct except for the dead `--show`.
 
 `play_roblox` takes the **fresh-boot** role (→ `start`). Re-delivery to a live instance stays
@@ -66,7 +66,7 @@ The old `play` conflated two roles that are now distinct commands:
    outer hint; the existing `--timeout` + the `_run_qemu` outer timeout still govern.
 
 3. **`set_roblox_account`** (`tools/roblox_session.py:205`): in the read-only branch (no token,
-   no place), **drop** the `--show` append — `omni session <name> --json` returns the current
+   no place), **drop** the `--show` append — `omnidroid session <name> --json` returns the current
    session (place_id + redacted token) on its own.
 
 4. **`launch_roblox_build`** (`tools/roblox_session.py`, apk_path branch): replace the current
@@ -74,7 +74,7 @@ The old `play` conflated two roles that are now distinct commands:
    with:
    - build chain unchanged: `decode_apk → inject_session_bootstrap → recompile_apk → sign_apk`
      (produces `omni_build/<user>_build.apk`);
-   - a single **`omni start --dev --apk <built.apk> --place <id>`** (via the same `_run_qemu`
+   - a single **`omnidroid start --dev --apk <built.apk> --place <id>`** (via the same `_run_qemu`
      layer / a `play_roblox`-style call extended with `apk_path`), which on the dev base:
      installs the APK, delivers the cookie, joins, and runs omnidroid's post-delivery
      `OmniBootstrap` probe;
@@ -84,7 +84,7 @@ The old `play` conflated two roles that are now distinct commands:
      result → success.
    - The instance must be freshly bootable for the one-shot. Since `launch_roblox_build` owns
      the whole flow, it targets a stopped instance; if a stale instance is running for that
-     username, stop it first (`omni stop <name>`) before the `start --dev --apk`. (Idempotency:
+     username, stop it first (`omnidroid stop <name>`) before the `start --dev --apk`. (Idempotency:
      the build stages remain re-callable; a re-run stops + re-installs, consistent with the
      diskless "re-install per boot" model.)
    - The wasteful first `play_roblox` boot and the separate `install_apk_on_emulator` call are

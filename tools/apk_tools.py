@@ -385,36 +385,97 @@ def jadx_decompile(apk_filename, output_dir, deobf=False, no_resources=False, si
 # Rebuild / sign
 # ---------------------------------------------------------------------------
 
-def _zip_repack(input_dir, output_apk):
+def _manifest_extract_native_libs(input_dir):
+    """Best-effort read of android:extractNativeLibs from a decoded tree's TEXT
+    AndroidManifest.xml. Returns True, False, or None (unknown).
+
+    This is the ONLY thing that decides whether native .so libraries must be
+    STORED (uncompressed) in the rebuilt APK:
+      - extractNativeLibs="false"  -> the loader mmaps each .so straight out of
+        the APK, so libs MUST be STORED and page-aligned or the app can't load
+        them. Store them.
+      - extractNativeLibs="true" (or absent) -> libs are extracted to /data at
+        install and MAY be compressed in the APK. Forcing them STORED just
+        bloats the file for zero benefit — e.g. Roblox's libroblox.so is 44MB
+        deflated but 104MB stored, which is exactly how a 130MB APK rebuilds to
+        ~193MB. Compress them (i.e. leave them out of the stored set).
+    Reads only the text manifest apktool/APKEditor produce; a binary/-r manifest
+    has no ASCII match, so this returns None and callers default to 'compress'
+    (the no-bloat, most-common-case choice)."""
+    try:
+        mpath = resolve_workspace_path(os.path.join(input_dir, "AndroidManifest.xml"))
+        with open(mpath, "rb") as f:
+            head = f.read(300000)
+    except (OSError, RuntimeError):
+        return None
+    if b"extractNativeLibs" not in head:
+        return None  # binary AXML, or attribute simply not declared -> unknown
+    import re as _re
+    m = _re.search(rb'extractNativeLibs\s*=\s*"(true|false)"', head)
+    if not m:
+        return None
+    return m.group(1) == b"true"
+
+
+# Media/resource types safe to keep STORED on rebuild: resources.arsc MUST be
+# uncompressed on Android O+ (mmap'd zero-copy), and these already-compressed
+# media types gain nothing from deflate. NOTE: `.so` is deliberately NOT here —
+# native libs are stored ONLY when extractNativeLibs="false" (see
+# _manifest_extract_native_libs), because blindly storing them is the #1 cause
+# of a rebuild ballooning far past the original size.
+_ZIP_STORED_GLOBS = ["*.arsc", "*.png", "*.jpg", "*.jpeg", "*.webp",
+                     "*.mp3", "*.mp4", "*.ogg", "*.wav"]
+
+
+def _zip_repack(input_dir, output_apk, store_so=False):
     """Repack a RAW extracted APK tree (from unzip_apk — no apktool.yml) into an
     unsigned APK with zip. Folded in from the former repack_apk tool so that
     recompile_apk is the single rebuild entry point for BOTH apktool-decoded
     directories and raw unzip_apk directories. `input_dir`/`output_apk` are
-    already normalized by the caller (recompile_apk)."""
+    already normalized by the caller (recompile_apk).
+
+    store_so=True adds `.so` to the STORED set (only when the manifest says
+    extractNativeLibs="false"); otherwise native libs are DEFLATED like any
+    other file, so a whole-file .so swap can't silently bloat the APK by tens of
+    megabytes."""
+    stored = list(_ZIP_STORED_GLOBS) + (["*.so"] if store_so else [])
+    excl = " ".join(f"'{g}'" for g in (["*.DS_Store"] + stored))
+    inc = " ".join(f"'{g}'" for g in stored)
     cmd = (
         f"cd {wpath(input_dir)} && "
         # Remove old signatures so apksigner doesn't clash or fail
         "rm -f META-INF/*.RSA META-INF/*.SF META-INF/*.DSA META-INF/MANIFEST.MF && "
-        # Build a fresh APK with correct compression: store uncompressed the file types Android requires uncompressed
-        f"zip -r -X {wpath(output_apk)} . -x '*.DS_Store' '*.so' '*.arsc' '*.png' '*.jpg' '*.jpeg' '*.webp' '*.mp3' '*.mp4' '*.ogg' '*.wav' && "
-        f"zip -r -X -0 {wpath(output_apk)} . -i '*.so' '*.arsc' '*.png' '*.jpg' '*.jpeg' '*.webp' '*.mp3' '*.mp4' '*.ogg' '*.wav'"
+        # Pass 1: deflate everything EXCEPT the stored set (which includes .so
+        # only when extractNativeLibs=false).
+        f"zip -r -X {wpath(output_apk)} . -x {excl} && "
+        # Pass 2: add the stored set uncompressed.
+        f"zip -r -X -0 {wpath(output_apk)} . -i {inc}"
     )
     return run_cmd(cmd, timeout=240)
 
 
-# Ensures apktool.yml keeps the memory-map-sensitive / already-compressed file
-# types STORED (uncompressed) on rebuild. resources.arsc MUST be uncompressed on
-# Android O+ (it's mmap'd zero-copy) and .so should stay stored when
-# extractNativeLibs=false; the rest are the AOSP aapt "no-compress" defaults that
-# are pointless to deflate and only bloat the APK. Path is substituted, not
-# f-string-formatted, so the braces below survive.
+# Base doNotCompress list injected into apktool.yml so the memory-map-sensitive /
+# already-compressed file types stay STORED (uncompressed) on rebuild.
+# resources.arsc MUST be uncompressed on Android O+ (mmap'd zero-copy); the rest
+# are the AOSP aapt "no-compress" defaults that are pointless to deflate.
+#
+# `so` is DELIBERATELY NOT in this base list. Native libs are added to the list
+# by recompile_apk ONLY when the manifest declares extractNativeLibs="false"
+# (they must then be stored+aligned). When extractNativeLibs is true/absent —
+# the common case, and Roblox's — forcing .so STORED does nothing but bloat the
+# APK by however much the libs compressed (libroblox.so: 44MB -> 104MB), which is
+# exactly the 130MB->193MB blowup. See _manifest_extract_native_libs.
+_APKTOOL_DONOTCOMPRESS_BASE = ["resources.arsc", "arsc", "png", "jpg", "jpeg", "gif",
+            "webp", "bmp", "wav", "mp2", "mp3", "ogg", "aac", "mpg", "mpeg", "mid",
+            "midi", "smf", "jet", "rtttl", "imy", "xmf", "mp4", "m4a", "m4v", "3gp",
+            "3gpp", "3g2", "3gpp2", "amr", "awb", "wma", "wmv", "webm", "mkv"]
+
+# Path AND the required list are substituted (not f-string-formatted) so the
+# braces below survive. __REQUIRED__ is replaced with a Python list literal.
 _APKTOOL_YML_PATCH = r'''
 import sys
 p = "__YMLPATH__"
-required = ["resources.arsc", "arsc", "so", "png", "jpg", "jpeg", "gif", "webp", "bmp",
-            "wav", "mp2", "mp3", "ogg", "aac", "mpg", "mpeg", "mid", "midi", "smf", "jet",
-            "rtttl", "imy", "xmf", "mp4", "m4a", "m4v", "3gp", "3gpp", "3g2", "3gpp2",
-            "amr", "awb", "wma", "wmv", "webm", "mkv"]
+required = __REQUIRED__
 with open(p, encoding="utf-8") as f:
     lines = f.read().splitlines()
 out, i, existing, found = [], 0, [], False
@@ -578,6 +639,13 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
     # multi-package limitation, #2514) must be rebuilt with `APKEditor b`, not
     # `apktool b` — it has no apktool.yml and a different on-disk resource
     # representation. Check this BEFORE the apktool.yml test below.
+    # Native-lib compression is governed by extractNativeLibs, read once here and
+    # threaded into whichever build path runs below. None (unknown, e.g. binary
+    # manifest) is treated as "compress .so" — the no-bloat default. Only an
+    # explicit extractNativeLibs="false" forces .so STORED.
+    enl = _manifest_extract_native_libs(input_dir)
+    store_so = (enl is False)
+
     apke_check = run_cmd(f"test -f {wpath(input_dir)}/{APKEDITOR_MARKER}", timeout=10)
     if apke_check["returncode"] == 0:
         res = _recompile_with_apkeditor(input_dir, output_apk)
@@ -589,10 +657,14 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
         # now that the separate repack_apk tool is gone.
         check = run_cmd(f"test -f {wpath(input_dir)}/apktool.yml", timeout=10)
         if check["returncode"] != 0:
-            res = _zip_repack(input_dir, output_apk)
+            res = _zip_repack(input_dir, output_apk, store_so=store_so)
         else:
-            # 1) Normalize doNotCompress so the mmap-sensitive/media types stay stored.
-            patch_script = _APKTOOL_YML_PATCH.replace("__YMLPATH__", f"{input_dir}/apktool.yml")
+            # 1) Normalize doNotCompress so the mmap-sensitive/media types stay
+            # stored — and add `so` ONLY when extractNativeLibs="false".
+            required = list(_APKTOOL_DONOTCOMPRESS_BASE) + (["so"] if store_so else [])
+            patch_script = (_APKTOOL_YML_PATCH
+                            .replace("__YMLPATH__", f"{input_dir}/apktool.yml")
+                            .replace("__REQUIRED__", repr(required)))
             b64 = encode_script(patch_script)
             aapt2_flag = ("--use-aapt2 "
                           if use_aapt2 in (True, "true", "True", 1, "1") and _apktool_takes_use_aapt2()
@@ -617,14 +689,22 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
             )
             res = run_cmd(cmd, timeout=360)
 
+    # Record the native-lib compression decision so the model can SEE why the
+    # size came out the way it did (this is the exact lever behind size blowups).
+    if isinstance(res, dict):
+        enl_note = {True: 'extractNativeLibs=true -> .so DEFLATED (compressed)',
+                    False: 'extractNativeLibs=false -> .so STORED + aligned',
+                    None: 'extractNativeLibs unknown (binary/-r manifest) -> .so DEFLATED (no-bloat default)'}[enl]
+        res["stdout"] = (res.get("stdout", "") + f"\n[native-lib policy] {enl_note}")
+
     res = _apply_constraint_gate(res, constraints_list, original_apk, output_apk)
 
     # Ground-truth the build: a clean-looking result is not proof an APK landed.
-    # If the build reported no error, confirm the output APK exists and is
-    # non-empty, so an empty/again-not-written output can't be signed and shipped
-    # as a phantom success (sign_apk/verify_apk would otherwise fail confusingly
-    # downstream, or worse, "pass" on a stale file at that path).
+    # If the build reported no error, confirm the output APK exists, is a VALID
+    # ZIP, and did not balloon vs the original — the three ways a rebuild silently
+    # ships something un-installable or un-launchable that verify-by-eye misses.
     if isinstance(res, dict) and not res.get("error") and res.get("returncode", 0) == 0:
+        checks = []
         probe = run_cmd(f"stat -c %s {wpath(output_apk)} 2>/dev/null || echo MISSING", timeout=10)
         raw = (probe.get("stdout") or "").strip().splitlines()
         sz = raw[-1] if raw else ""
@@ -634,6 +714,40 @@ def recompile_apk(input_dir, output_apk, use_aapt2=True, original_apk=None,
                    "Re-check input_dir and the build log above.")
             res["error"] = msg
             res["stdout"] = (res.get("stdout", "") + "\n\n" + msg)
+        else:
+            new_size = int(sz)
+            # (1) A rebuilt APK MUST be a valid ZIP with a readable central
+            # directory. A truncated/corrupt archive (seen in the wild at 130MB
+            # with "cannot find central directory") installs never and "doesn't
+            # open" — catch it here, not three tools downstream.
+            valid = run_cmd(
+                f'python3 -c "import zipfile,sys; sys.exit(0 if zipfile.is_zipfile('
+                f"'{wpath(output_apk)}'" f') else 3)"', timeout=60)
+            if valid.get("returncode") != 0:
+                msg = (f"recompile_apk: {wpath(output_apk)} is NOT a valid ZIP/APK "
+                       "(no readable central directory) — it is corrupt and will not install "
+                       "or open. Do NOT sign it; rebuild.")
+                res["error"] = msg
+                res["stdout"] = (res.get("stdout", "") + "\n\n" + msg)
+            # (2) Size sanity vs the original. A >15% growth from a KB-sized code
+            # edit is almost always native libs wrongly re-STORED (extractNativeLibs
+            # policy) — the classic 130MB->193MB blowup. Warn loudly; the app may
+            # still run but it is bloated and often a sign the rebuild is wrong.
+            if original_apk:
+                op = run_cmd(f"stat -c %s {wpath(normalize_path(original_apk))} 2>/dev/null || echo ?", timeout=10)
+                ol = (op.get("stdout") or "").strip().splitlines()
+                osz = ol[-1] if ol else ""
+                if osz.isdigit() and int(osz) > 0:
+                    ratio = new_size / int(osz)
+                    checks.append(f"size: original {int(osz)/1e6:.1f}MB -> rebuilt {new_size/1e6:.1f}MB ({ratio:.2f}x)")
+                    if ratio > 1.15:
+                        checks.append(
+                            "WARNING: the rebuild grew >15%. For a small code edit this almost "
+                            "always means native .so libraries were re-STORED uncompressed when the "
+                            "original DEFLATED them (extractNativeLibs=true). Confirm with verify_apk "
+                            "(pass original_apk) and, if so, this is a broken/bloated build.")
+        if checks:
+            res["stdout"] = (res.get("stdout", "") + "\n--- BUILD SANITY ---\n" + "\n".join(checks))
     return res
 
 
@@ -667,61 +781,152 @@ def sign_apk(apk_filename):
     return run_cmd(cmd, timeout=60)
 
 
+# Self-contained ZIP-level verifier: integrity + (optional) regression vs the
+# original APK. Runs in one python3 subprocess so the raw member listing never
+# enters the agent's context — only the PASS/FAIL verdicts do. Substituted, not
+# f-string-formatted, so its braces survive.
+_VERIFY_ZIP_SCRIPT = r'''
+import zipfile, sys
+apk = "__APK__"
+orig = "__ORIG__" or None
+out = []
+ok = True
+
+# (0) ZIP INTEGRITY — a rebuild can produce a truncated/corrupt archive that has
+# no readable central directory: it installs never and "won't open". This is the
+# first thing to fail, because every other check needs a readable zip.
+out.append("=== ZIP INTEGRITY ===")
+if not zipfile.is_zipfile(apk):
+    out.append("  FAIL: not a valid ZIP/APK (no readable central directory) — corrupt build, will not install.")
+    print("\n".join(out)); print("__OK__=FALSE"); sys.exit(0)
+z = zipfile.ZipFile(apk)
+bad = z.testzip()
+if bad:
+    out.append("  FAIL: corrupt entry in archive: %s" % bad); ok = False
+else:
+    out.append("  PASS: valid ZIP, all entries readable")
+
+infos = z.infolist()
+def method(name):
+    try: return "STORE" if z.getinfo(name).compress_type == 0 else "DEFLATE"
+    except KeyError: return None
+def has(name): return any(i.filename == name for i in infos)
+dex = sorted(i.filename for i in infos if i.filename.startswith("classes") and i.filename.endswith(".dex"))
+abis = sorted(set(i.filename.split("/")[1] for i in infos if i.filename.startswith("lib/") and i.filename.count("/") >= 2))
+
+# (1) REQUIRED MEMBERS
+out.append("=== REQUIRED FILES ===")
+for req in ("AndroidManifest.xml", "classes.dex", "resources.arsc"):
+    if has(req): out.append("  PASS: %s" % req)
+    else: out.append("  FAIL: %s MISSING — APK will crash!" % req); ok = False
+
+# (2) resources.arsc MUST be STORED on Android O+ (mmap'd zero-copy).
+if has("resources.arsc"):
+    m = method("resources.arsc")
+    out.append("=== resources.arsc COMPRESSION ===")
+    if m == "STORE": out.append("  PASS: resources.arsc is STORED")
+    else: out.append("  FAIL: resources.arsc is %s — must be STORED or the app crashes at load." % m); ok = False
+
+out.append("=== CENSUS ===")
+out.append("  dex: %s   ABIs: %s" % (", ".join(dex) or "(none)", ", ".join(abis) or "(none)"))
+
+# (3) REGRESSION vs the ORIGINAL — the census must only change how you intended.
+if orig and zipfile.is_zipfile(orig):
+    zo = zipfile.ZipFile(orig)
+    oi = zo.infolist()
+    odex = sorted(i.filename for i in oi if i.filename.startswith("classes") and i.filename.endswith(".dex"))
+    oabis = sorted(set(i.filename.split("/")[1] for i in oi if i.filename.startswith("lib/") and i.filename.count("/") >= 2))
+    import os
+    osz, nsz = os.path.getsize(orig), os.path.getsize(apk)
+    out.append("=== REGRESSION vs ORIGINAL ===")
+    out.append("  size: %.1fMB -> %.1fMB (%.2fx)" % (osz/1e6, nsz/1e6, nsz/max(osz,1)))
+    if nsz > osz * 1.15:
+        out.append("  WARN: rebuild grew >15% — likely native .so re-STORED when the original DEFLATED them (bloat).")
+    # dex count must not shrink (a dropped classesN.dex = dropped bytecode = crash)
+    if len(dex) < len(odex):
+        out.append("  FAIL: dex count dropped %d -> %d — bytecode was lost, the app will crash." % (len(odex), len(dex))); ok = False
+    else:
+        out.append("  PASS: dex count preserved (%d -> %d)" % (len(odex), len(dex)))
+    # ABI folders should match (a vanished ABI the device needs = UnsatisfiedLinkError)
+    if set(oabis) != set(abis):
+        out.append("  WARN: ABI set changed %s -> %s — intended?" % (oabis, abis))
+    else:
+        out.append("  PASS: ABI set preserved (%s)" % (", ".join(abis) or "none"))
+    # .so bloat: any lib that was DEFLATE in the original but is now STORE
+    bloated = []
+    om = {i.filename: i.compress_type for i in oi}
+    for i in infos:
+        if i.filename.endswith(".so") and i.filename in om:
+            if om[i.filename] != 0 and i.compress_type == 0:
+                bloated.append(i.filename)
+    if bloated:
+        out.append("  WARN: %d native lib(s) went DEFLATE->STORE (bloat, e.g. %s). If extractNativeLibs=true this is wasted space." % (len(bloated), bloated[0]))
+
+print("\n".join(out))
+print("__OK__=" + ("TRUE" if ok else "FALSE"))
+'''
+
+
 @registry.register(
     name="verify_apk",
     description=(
-        "Verifies that an APK is properly signed and zip-aligned. ALWAYS call this after sign_apk "
-        "before reporting the APK as done. Checks: (1) apksigner signature verification, "
-        "(2) zipalign alignment check, (3) presence of required files (AndroidManifest.xml, classes.dex, resources.arsc). "
-        "If any check fails, the APK will crash on launch — fix the issue before delivering."
+        "Verifies a rebuilt/signed APK is actually shippable. ALWAYS call this after sign_apk before "
+        "reporting an APK as done — and pass original_apk so it can catch REGRESSIONS a by-eye check misses. "
+        "Checks: (0) ZIP INTEGRITY — the archive is a valid, non-corrupt zip with a readable central directory "
+        "(a truncated rebuild 'installs never / won't open'); (1) apksigner signature verification; "
+        "(2) zipalign alignment; (3) required members (AndroidManifest.xml, classes.dex, resources.arsc) present; "
+        "(4) resources.arsc is STORED (uncompressed) as Android O+ requires; and — when original_apk is given — "
+        "(5) a REGRESSION diff: size delta (flags >15% bloat), dex-count preserved (a dropped classesN.dex = lost "
+        "bytecode = crash), ABI folders preserved, and any native .so that went DEFLATE->STORE (the classic "
+        "130MB->193MB blowup). If any check FAILs the APK is broken — fix it before delivering."
     ),
-    params_schema={"apk_filename": "string (path to the apk to verify)"},
-    output="Three check sections (signature, zipalign, required-files) each with PASS/FAIL, plus a SUMMARY line: 'ALL CHECKS PASSED' or 'ONE OR MORE CHECKS FAILED'. Read the summary to decide if the APK is ready.",
-    when_to_use="ALWAYS call this after sign_apk before reporting the APK as done. If any check fails the APK will crash on launch — fix the issue first."
+    params_schema={
+        "apk_filename": "string (path to the apk to verify)",
+        "original_apk": "string (optional but STRONGLY recommended — the base APK you rebuilt from; enables the regression diff: size/dex-count/ABI/.so-compression against the original)"
+    },
+    output="Sections: ZIP INTEGRITY, SIGNATURE, ZIPALIGN, REQUIRED FILES, resources.arsc COMPRESSION, CENSUS, and (with original_apk) REGRESSION vs ORIGINAL — each PASS/FAIL/WARN, plus a SUMMARY line 'ALL CHECKS PASSED' or 'ONE OR MORE CHECKS FAILED'. A FAIL means the APK is broken; a WARN means suspicious-but-maybe-intended (read it).",
+    when_to_use="ALWAYS after sign_apk, before reporting an APK done — pass original_apk for the regression diff. Structural PASS is necessary but NOT sufficient: still install+launch on omnidroid (run_apk_test_session / launch_roblox_build) to confirm it actually runs."
 )
-def verify_apk(apk_filename):
+def verify_apk(apk_filename, original_apk=None):
     apk_filename = normalize_path(apk_filename)
     results = []
+    hard_fail = False
 
-    # 1. Signature verification
-    sig_cmd = f"apksigner verify --verbose {wpath(apk_filename)}"
-    sig_res = run_cmd(sig_cmd, timeout=30)
-    results.append("=== SIGNATURE VERIFICATION ===")
+    # ZIP-level integrity + regression (self-contained python; raw listing stays
+    # out of context — only verdicts come back).
+    script = (_VERIFY_ZIP_SCRIPT
+              .replace("__APK__", wpath(apk_filename))
+              .replace("__ORIG__", wpath(normalize_path(original_apk)) if original_apk else ""))
+    b64 = encode_script(script)
+    zres = run_cmd(f"echo '{b64}' | base64 -d | python3 -", timeout=120)
+    zout = zres.get("stdout", "") or ""
+    if "__OK__=FALSE" in zout:
+        hard_fail = True
+    results.append(zout.replace("__OK__=TRUE", "").replace("__OK__=FALSE", "").strip())
+
+    # Signature verification (apksigner — external, needs the signing block).
+    sig_res = run_cmd(f"apksigner verify --verbose {wpath(apk_filename)}", timeout=30)
+    results.append("\n=== SIGNATURE VERIFICATION ===")
     if sig_res["returncode"] == 0:
-        results.append("PASS: " + sig_res.get("stdout", "").strip())
+        results.append("  PASS: " + sig_res.get("stdout", "").strip().splitlines()[0] if sig_res.get("stdout") else "  PASS")
     else:
-        results.append("FAIL: " + sig_res.get("stderr", "").strip() or sig_res.get("stdout", "").strip())
+        results.append("  FAIL: " + ((sig_res.get("stderr", "").strip() or sig_res.get("stdout", "").strip())[:600]))
+        hard_fail = True
 
-    # 2. Zipalign check
-    align_cmd = f"zipalign -c -v 4 {wpath(apk_filename)}"
-    align_res = run_cmd(align_cmd, timeout=30)
+    # Zipalign check.
+    align_res = run_cmd(f"zipalign -c -v 4 {wpath(apk_filename)}", timeout=30)
     results.append("\n=== ZIPALIGN CHECK ===")
     if align_res["returncode"] == 0:
-        results.append("PASS: APK is properly zip-aligned")
+        results.append("  PASS: APK is properly zip-aligned")
     else:
-        # zipalign -c outputs unaligned files to stderr
-        unaligned = align_res.get("stderr", "").strip()
-        results.append("FAIL: APK has alignment issues:\n" + unaligned[:2000])
+        results.append("  FAIL: APK has alignment issues:\n" + align_res.get("stderr", "").strip()[:1500])
+        hard_fail = True
 
-    # 3. Required files check
-    list_cmd = f"unzip -l {wpath(apk_filename)}"
-    list_res = run_cmd(list_cmd, timeout=30)
-    results.append("\n=== REQUIRED FILES CHECK ===")
-    listing = list_res.get("stdout", "")
-    required = ["AndroidManifest.xml", "classes.dex", "resources.arsc"]
-    for req in required:
-        if req in listing:
-            results.append(f"  PASS: {req} found")
-        else:
-            results.append(f"  FAIL: {req} MISSING — APK will crash!")
-
-    # Summary
-    all_pass = (sig_res["returncode"] == 0 and align_res["returncode"] == 0
-                and all(r in listing for r in required))
     results.append("\n=== SUMMARY ===")
-    results.append("ALL CHECKS PASSED — APK is valid and should launch." if all_pass
-                   else "ONE OR MORE CHECKS FAILED — fix issues before delivering the APK.")
-
+    results.append("ONE OR MORE CHECKS FAILED — the APK is broken; fix it before installing/delivering."
+                   if hard_fail else
+                   "ALL CHECKS PASSED — structurally valid. Now INSTALL + LAUNCH it on omnidroid "
+                   "(run_apk_test_session / launch_roblox_build) to confirm it actually runs.")
     return {"stdout": "\n".join(results)}
 
 
@@ -759,11 +964,14 @@ def inspect_apk(apk_filename, filter_pattern=None):
     return res
 
 
-# File types that MUST stay STORED (uncompressed) when written into an APK:
-# resources.arsc is mmap'd zero-copy on Android O+, and .so libs are mmap'd when
-# extractNativeLibs=false. Re-deflating either crashes the app at load. Anything
-# with one of these extensions is added with `zip -0`.
-_APK_STORED_EXTS = (".arsc", ".so", ".png", ".jpg", ".jpeg", ".webp", ".gif",
+# File types kept STORED (uncompressed) when written into an APK: resources.arsc
+# is mmap'd zero-copy on Android O+, and the media types are already-compressed
+# so deflate is pointless. Anything with one of these extensions is added with
+# `zip -0`. NOTE: `.so` is DELIBERATELY NOT here — native libs are stored ONLY
+# when extractNativeLibs=false; replace_file_in_apk decides per-.so by MATCHING
+# the compression of the slot it replaces, so an in-place libroblox.so swap can't
+# balloon the APK by re-storing a lib the original had DEFLATED.
+_APK_STORED_EXTS = (".arsc", ".png", ".jpg", ".jpeg", ".webp", ".gif",
                     ".mp3", ".mp4", ".ogg", ".wav", ".m4a", ".webm", ".mkv")
 
 
@@ -796,7 +1004,22 @@ def replace_file_in_apk(apk_filename, entry_path, replacement_file):
     if not entry:
         return {"error": "entry_path must name a file inside the APK, e.g. 'classes.dex'."}
 
-    stored = entry.lower().endswith(_APK_STORED_EXTS)
+    # Compression of the replacement entry. resources.arsc + already-compressed
+    # media stay STORED. For a native `.so` we do NOT blindly store it (that is
+    # how an in-place libroblox.so swap balloons the APK by ~60MB): instead we
+    # MATCH how that slot was already compressed in this APK — DEFLATE stays
+    # DEFLATE (extractNativeLibs=true), STORE stays STORE (extractNativeLibs=false,
+    # aligned). A brand-new .so with no existing slot defaults to DEFLATE (no bloat).
+    if entry.lower().endswith(".so"):
+        existing = run_cmd(
+            f'python3 -c "import zipfile,sys; '
+            f"z=zipfile.ZipFile('{wpath(apk_filename)}'); "
+            f"i=z.getinfo('{entry}'); "
+            f'print(\'STORE\' if i.compress_type==0 else \'DEFLATE\')" 2>/dev/null',
+            timeout=30)
+        stored = "STORE" in (existing.get("stdout") or "")
+    else:
+        stored = entry.lower().endswith(_APK_STORED_EXTS)
     store_flag = "-0 " if stored else ""
     # Stage the replacement at a temp root under the exact internal entry path, then
     # `zip` that one entry into the APK (zip updates the entry if it already exists,

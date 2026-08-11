@@ -351,6 +351,28 @@ APK MODDING PLAYBOOK (the core mission — decode → map → understand → pat
   fires and what flipping it does BEFORE committing a static patch — then bake the confirmed change into smali/.so.
 - SKILLS: the apk-modding / ssl-pinning-bypass / signature-bypass / anti-debug-bypass / string-deobfuscation skills
   are battle-tested workflows — consult the matching one (use_skill) instead of improvising.
+
+REBUILD PHYSICS — an APK is a signed ZIP; a rebuild REPACKS the same content, it does not regenerate the app (READ THIS, it is where most "my build won't open" failures come from):
+- SIZE IS A CORRECTNESS SIGNAL. You add a few KB of smali; the rebuilt APK must stay within a few % of the
+  original. If a ~130MB input rebuilds to ~190MB, the build is WRONG — do not sign or ship it. The cause is almost
+  always native libraries being re-STORED uncompressed.
+- NATIVE .so COMPRESSION MUST MATCH android:extractNativeLibs. true/absent (Roblox's case) → the loader extracts
+  libs to /data at install, so they stay DEFLATED inside the APK; forcing them STORED just bloats the file for
+  zero benefit (libroblox.so is 44MB deflated but 104MB stored — that IS the 130→193MB blowup). false → libs are
+  mmap'd from the APK and MUST be STORED + page-aligned. recompile_apk reads the manifest and does this for you;
+  do not hand-store .so or fight it.
+- The ONLY member that must always be STORED is resources.arsc (Android O+ mmaps it). Everything else keeps its
+  original compression. Never "optimize" by storing things uncompressed — that only grows the APK.
+- SMALLEST DIFF WINS: inject one class + append one <queries> entry; do not let the toolchain re-encode resources,
+  drop a classesN.dex, or add/remove an ABI folder. A vanished dex = lost bytecode = crash on launch even if it installs.
+- VERIFY THEN RUN — two separate gates, both required. After sign_apk call verify_apk WITH original_apk (it catches a
+  corrupt zip that "won't open", >15% bloat, a dropped dex, and .so re-STORE). A structural PASS is necessary but NOT
+  proof it runs: then INSTALL + LAUNCH on omnidroid — run_apk_test_session for a plain app, or launch_roblox_build
+  for the Roblox session flow — and read the crash/exit verdict. "verify_apk passed" is not "it works"; only a clean
+  launch is. If install/launch fails, the usual root cause is the build above, not omnidroid.
+- ROBLOX BASELINE: ~130MB, arm64-v8a ONLY, 3 dex (classes/2/3), multi-package so decode+rebuild go through APKEditor
+  (tree under root/, .apkeditor_decoded marker), libroblox.so DEFLATED. A Roblox rebuild that isn't ~130MB, drops a
+  dex, or stores libroblox.so is broken regardless of what verify-by-eye says.
 """
 
     prompt = base_prompt + "\n" + get_skills_prompt()

@@ -124,7 +124,7 @@ system prompt from ~39k to ~17k tokens.
 - **generate_test_report** — assemble a Markdown test report (keyframes + logcat).
 - **run_apk_test_session** — one-shot pipeline: boot → install → launch → capture → analyze → report. Always runs on a FRESH instance: reset is forced true and the harness verifies no third-party packages exist (uninstalling leftovers) before installing the APK under test. Pass `debug=true` to attach the frida/omni-* devkit for the whole session (the shipped base is dual-use; APK install itself needs no debug). **Not for Roblox** — it has no concept of accounts/cookies/the session bootstrap and just does a plain install + launcher-intent open; given a Roblox cookie it silently lands on Roblox's own login screen while still reporting success. Use `launch_roblox_build` (or `login_roblox_account` + `play_roblox`) for any Roblox cookie/login/join scenario.
 - **stop_emulator** — stop the running emulator/account.
-- **ensure_frida_server** — *(debug boot only)* start the devkit frida-server hidden (custom port + randomized process name) via Magisk `su` and `adb forward` a host port onto it; returns the `frida -H 127.0.0.1:<port>` endpoint to attach with. Needs a Magisk-rooted base (`omni root-base`) and a debug boot (`debug=true`).
+- **ensure_frida_server** — *(debug boot only)* start the devkit frida-server hidden (custom port + randomized process name) via Magisk `su` and `adb forward` a host port onto it; returns the `frida -H 127.0.0.1:<port>` endpoint to attach with. Needs a Magisk-rooted base (`omnidroid root-base`) and a debug boot (`debug=true`).
 - **hide_root_from_app** — *(debug boot only)* best-effort hide root+Magisk+frida from a target package via the devkit `omni-hide` (Magisk DenyList/Shamiko + `resetprop` prop-spoofs). Run after `ensure_frida_server`, before launching the target.
 
 ## Screen driving (look → act → verify) — `tools/emulator_screen.py`
@@ -146,7 +146,7 @@ screen into coordinates and let the agent USE the app rather than watch it. See 
   several elements match, listing the candidates.
 
 ## Roblox login/join (product session path) — `tools/roblox_session.py`
-Wraps the engine's `omni play` / `omni session` / `omni login` / `omni accounts`
+Wraps the engine's `omnidroid play` / `omnidroid session` / `omnidroid login` / `omnidroid accounts`
 rather than reimplementing them (see `contracts/omni-session.md`), so these
 exercise the exact zero-click path a customer gets: login is a `.ROBLOSECURITY`
 cookie (the Roblox Android client has no deep-link auth parameter), planted into
@@ -156,7 +156,7 @@ production bases.
 
 **Account model:** a saved account is just its cookie in ONE `accounts.json`,
 keyed by Roblox **username** (the login name, never the display name) — either
-added by a human via an interactive `omni login` browser sign-in, OR by the agent
+added by a human via an interactive `omnidroid login` browser sign-in, OR by the agent
 via `login_roblox_account` from a cookie it was already handed (headless, no
 browser). An instance is a THIN (~0.4 MB) overlay auto-created and named for the
 account, so two accounts run at once. The engine refuses to create ANY instance
@@ -200,7 +200,7 @@ for a name with no saved cookie and no explicit override (`no_token` error) —
   still joins the right place but lands on Roblox's own login screen.
 
 ## Frida runtime hooking / instrumentation (debug boot) — `tools/frida_tools.py`
-Run natively on the host via the `frida` Python binding against the devkit frida-server (native arch, hidden custom port, auto-forwarded). Debug boot only (`ensure_emulator_running(debug=true)`, base rooted via `omni root-base`). The base is **arm64 native** (no libndk translation), so BOTH Java/Kotlin hooks AND native `Interceptor`/`Stalker` hooks of the app's own arm64 `.so` code work.
+Run natively on the host via the `frida` Python binding against the devkit frida-server (native arch, hidden custom port, auto-forwarded). Debug boot only (`ensure_emulator_running(debug=true)`, base rooted via `omnidroid root-base`). The base is **arm64 native** (no libndk translation), so BOTH Java/Kotlin hooks AND native `Interceptor`/`Stalker` hooks of the app's own arm64 `.so` code work.
 - **frida_list_processes** — enumerate processes/apps the frida-server sees (confirms connectivity; finds exact process names/pids).
 - **frida_run_script** — inject an arbitrary Frida JS agent (inline or from a `.js` file in the project) into an app (attach or spawn-gated), run it for a window, and return every `send()`/`console.log`/error plus whether the app stayed alive (a crash right after injection ⇒ likely detection).
 - **frida_trace** — auto-generate + run a tracer for named Java methods (`com.pkg.Class.method`, all overloads) and/or native functions (`lib.so!symbol`), logging args + return values.

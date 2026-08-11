@@ -56,7 +56,15 @@ Pick the specific skill that matches the check you're actually bypassing or the 
 - `emulator-testing` — actually running the built/signed APK on an emulator to confirm a patch works, instead of only trusting `verify_apk`'s structural checks
 
 ## Critical Rules
-- ALWAYS call `verify_apk` after signing. Never report an APK as done until it passes all checks.
+- ALWAYS call `verify_apk` after signing — and pass `original_apk` so it diffs the rebuild against the
+  base (size delta, dropped dex, `.so` re-STORE, corrupt zip). A structural PASS is necessary but is NOT
+  proof the app runs: then INSTALL + LAUNCH on omnidroid (`run_apk_test_session`, or `launch_roblox_build`
+  for the Roblox session flow) and read the crash/exit verdict. "verify passed" ≠ "it works".
+- SIZE IS A CORRECTNESS SIGNAL. A few-KB smali edit must yield an APK within a few % of the original. A
+  ~130MB input that rebuilds to ~190MB is broken — almost always native `.so` re-STORED uncompressed when
+  the manifest has `extractNativeLibs=true`. `recompile_apk` handles `.so` compression from the manifest
+  automatically; don't hand-store libs or "optimize" compression. See the `android-package-anatomy` skill's
+  "Compression & size" section. Only `resources.arsc` is ever mandatorily STORED.
 - KNOW YOUR DECODED LAYOUT before writing paths. `decode_apk` uses apktool for most
   APKs (libs at `lib/<abi>/`) but auto-switches to APKEditor for multi-package apps
   **like Roblox**, which puts libs/assets/resources under **`root/`** (ABIs at

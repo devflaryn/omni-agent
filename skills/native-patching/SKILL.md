@@ -9,6 +9,19 @@ allowed-tools: extract_strings, rabin2_info, nm_symbols, disassemble_range, ghid
 
 This skill guides you through locating and patching functions inside native .so libraries.
 
+## Step 0 — Before you invest: does the binary self-verify?
+Reversing and patching a function is expensive; a **self-integrity check** (the
+`.so` checksums its own bytes and aborts on any change) makes that effort wasted.
+Probe it cheaply FIRST: change one **inert** byte — flip a dormant/unused string
+with `patch_binary_string` (same length) — re-sign the APK, and run it on the
+emulator (`emulator-testing`). If the app still works normally, there is **no
+whole-file / `.rodata` checksum** and byte-patching is safe to pursue. If it now
+crashes, refuses, or the feature silently dies, the binary self-checks — find and
+neutralize that check first (`signature-bypass`; hunt for a CRC/hash/`memcmp`
+over its own mapped range) or a real patch won't survive. Note: the APK signature
+covers the `.so`, so a re-sign always satisfies *Android's* check — this probe is
+about the *app's own* integrity check, which is separate.
+
 ## Step 1 — Identify the target library
 1. `inspect_apk` with filter `.so` to list all native libraries and their ABIs.
 2. Pick the right ABI (usually arm64-v8a for modern devices). If multiple exist, you may need to patch all of them.
