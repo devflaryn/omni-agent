@@ -33,7 +33,7 @@ Every task's requirements implicitly include this section.
 - **Semaphore default: `min(16, cpu_count - 2)`**, floor 1.
 - **Workflow nesting: exactly one level.** A `workflow()` call inside a child raises.
 - **No budget controls.** No `budget` global, no per-run ceiling. Treat tokens as unbounded.
-- **If you add new Tailwind utility classes**, rebuild: `npx tailwindcss@3 -c tailwind.config.js -i tailwind.input.css -o tailwind.css --minify` from `frontend/`.
+- **Frontend styling lives in two places, and neither is `tailwind.input.css`.** This project's own component classes are defined in the `<style>` block inside `frontend/index.html` (that is what `tests/frontend/test_tailwind_classes.mjs` reads); `tailwind.input.css` is only three `@tailwind` lines. Tailwind UTILITY classes are generated only from the files in `tailwind.config.js`'s `content` globs — currently `['./index.html', './app.js']` — so a utility used in any new JS file is purged unless that file is added to the globs. After changing markup or the config, rebuild from `frontend/`: `npx tailwindcss@3 -c tailwind.config.js -i tailwind.input.css -o tailwind.css --minify`.
 - **Commit after every task.** Branch is `ui-revision`.
 
 ## File Structure
@@ -3869,7 +3869,21 @@ Add the six cases to the event switch in `frontend/app.js` (~line 2381, beside `
 
 Register `tabWorkflow` / `workflowTab` with whatever function already switches between `tabChat`, `tabPlan` and `tabGraph` — follow that existing code exactly rather than adding a second mechanism.
 
-Add the new classes to `frontend/tailwind.input.css` (`wf-dot`, `wf-dot-run`, `wf-dot-ok`, `wf-dot-fail`, `wf-dot-warn`, `wf-badge`, `wf-card-head`, `wf-card-name`, `wf-card-meta`, `wf-run-head`, `wf-run-name`, `wf-run-desc`, `wf-phase`, `wf-phase-title`, `wf-agent`, `wf-agent-label`, `wf-agent-meta`, `wf-logs`, `wf-log`) using the existing `--term-*` tokens, type ramp and 4px spacing scale — do not introduce new raw colors. Then rebuild:
+**Styling — two traps, both verified in this repo, and both silently ship an UNSTYLED tree rather than an error.**
+
+**Trap 1: the custom classes do NOT go in `tailwind.input.css`.** That file is only three `@tailwind` lines. Every component class this project owns (`btn`, `field`, `icon-btn`, `eyebrow`, `llm-tab`, ...) is defined in the **`<style>` block inside `frontend/index.html`**, and `tests/frontend/test_tailwind_classes.mjs` reads that block to decide whether a class exists. Define the new classes there, beside the existing ones: `wf-dot`, `wf-dot-run`, `wf-dot-ok`, `wf-dot-fail`, `wf-dot-warn`, `wf-badge`, `wf-card-head`, `wf-card-name`, `wf-card-meta`, `wf-run-head`, `wf-run-name`, `wf-run-desc`, `wf-phase`, `wf-phase-title`, `wf-agent`, `wf-agent-label`, `wf-agent-meta`, `wf-logs`, `wf-log` — using the existing `--term-*` tokens, the type ramp (`--text-*`) and the 4px spacing scale. Introduce no new raw colors: `tests/frontend/test_contrast.mjs` asserts the palette's contrast ratios.
+
+**Trap 2: `tailwind.config.js` does not scan `workflow_view.js`.** Its content globs are `['./index.html', './app.js']`, so any Tailwind UTILITY class used only inside the new file is never generated. Add it:
+
+```js
+  content: ['./index.html', './app.js', './workflow_view.js'],
+```
+
+**Also extend the two frontend guards to cover the new file** — both currently scan only `app.js`, which would leave `workflow_view.js` the one UI file in the project with no id or class protection:
+- `tests/frontend/test_element_ids.mjs`: collect `getElementById(...)` lookups from `workflow_view.js` as well, so an id referenced there but missing from `index.html` fails.
+- `tests/frontend/test_tailwind_classes.mjs`: include `workflow_view.js` among the scanned sources.
+
+Then rebuild:
 
 ```bash
 cd frontend && npx tailwindcss@3 -c tailwind.config.js -i tailwind.input.css -o tailwind.css --minify
@@ -3889,8 +3903,9 @@ Expected: `OK` from each. `test_element_ids.mjs` and `test_tailwind_classes.mjs`
 
 ```bash
 git add frontend/workflow_view.js frontend/index.html frontend/app.js \
-        frontend/tailwind.input.css frontend/tailwind.css \
-        tests/frontend/test_workflow_view.mjs
+        frontend/tailwind.config.js frontend/tailwind.css \
+        tests/frontend/test_workflow_view.mjs \
+        tests/frontend/test_element_ids.mjs tests/frontend/test_tailwind_classes.mjs
 git commit -m "feat(ui): workflow progress tree, inline run card and Workflow tab"
 ```
 
