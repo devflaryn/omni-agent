@@ -521,6 +521,7 @@ const TOOL_META = {
 
   // delegate: fans work out to subagents
   dispatch_agents:  { name: 'Dispatch Subagents', cat: 'delegate' },
+  run_workflow:     { name: 'Run Workflow', cat: 'delegate' },
 
   // plan: plan / investigation / strategy bookkeeping — counted by call
   plan_create:                  { name: 'Create Plan', cat: 'plan' },

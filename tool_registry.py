@@ -31,6 +31,7 @@ _GROUP_BY_MODULE = {
     "hash_tools": CORE_GROUP,
     "meta_tools": CORE_GROUP,
     "delegation_tools": CORE_GROUP,
+    "workflow_tools": CORE_GROUP,
     # On-demand domain toolsets:
     "apk_tools": "apk",
     "session_bootstrap": "apk",
