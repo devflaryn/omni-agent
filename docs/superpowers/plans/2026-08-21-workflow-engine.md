@@ -3245,7 +3245,27 @@ Then add one line to `_GROUP_BY_MODULE` in `tool_registry.py`, beside `"delegati
     "workflow_tools": CORE_GROUP,
 ```
 
-Confirm `tools/__init__.py` imports the new module the way it imports the others — check how `delegation_tools` is pulled in and match it exactly.
+**Then TWO more registrations, both mandatory — omitting either is a test failure, not a cosmetic gap:**
+
+**1. `tools/__init__.py`** is an explicit list of `import tools.<module>` lines, and importing the module is what registers its tools. Add, beside `import tools.delegation_tools`:
+
+```python
+import tools.workflow_tools
+```
+
+Without this the tool is never registered at all.
+
+**2. `frontend/app.js` carries a `TOOL_META` table** that every registered tool must appear in — `tests/test_tool_meta_coverage.py` fails the whole suite otherwise (`test_every_registered_tool_has_display_metadata`). Add an entry beside `dispatch_agents:` (around `frontend/app.js:523`):
+
+```javascript
+  run_workflow:     { name: 'Run Workflow', cat: 'delegate' },
+```
+
+The parser is a strict regex — match it exactly:
+- exactly **two** leading spaces before the tool name
+- **single** quotes around both values
+- `cat` must be one of `read`, `change`, `run`, `search`, `delegate`, `plan` (`delegate` is right: it sits with `dispatch_agents`)
+- the display name must start with a capital and contain no underscore (`test_display_names_are_human_readable`)
 
 - [ ] **Step 4: Run test to verify it passes**
 
