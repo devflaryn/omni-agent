@@ -1350,6 +1350,31 @@ def _read_import_meta(project_dir):
         return None
 
 
+_ULTRA_ON = (
+    "ULTRA MODE: ON. For any substantive task — a review, an audit, a migration, "
+    "a research question, a design decision — reach for `run_workflow` BEFORE "
+    "working through it turn by turn. Prefer a library workflow by name. Trivial "
+    "or conversational turns still get a direct answer."
+)
+_ULTRA_OFF = (
+    "ULTRA MODE: OFF. Do not start a workflow on your own judgement — a fan-out "
+    "spends real money. Answer directly, or use dispatch_agents for a single "
+    "parallel wave. If a task genuinely warrants multi-stage orchestration, say so "
+    "and let the user turn ultra mode on. `run_workflow` still runs if they name one."
+)
+
+# Word-boundary match so 'ultrasound' / 'ultrasonic' do not trip it.
+_ULTRA_RE = __import__("re").compile(r"\bultra\b", __import__("re").IGNORECASE)
+
+
+def _ultra_prompt_segment(session):
+    return _ULTRA_ON if (session or {}).get("ultra") else _ULTRA_OFF
+
+
+def _ultra_keyword_requested(text):
+    return bool(_ULTRA_RE.search(text or ""))
+
+
 class AgentApi:
     """Bridge exposed to the webview frontend as `pywebview.api.*`."""
 
@@ -1754,6 +1779,7 @@ class AgentApi:
             used = self.session.get("premium_dispatches", 0)
             section += (f"\n\n[premium budget: {used}/{PREMIUM_BUDGET} premium "
                          "subagent dispatches used this session]")
+        section += "\n\n" + _ultra_prompt_segment(self.session)
         self.session["messages"][0]["content"] = (
             self.session["base_system_prompt"] + "\n" + tools_section + section
         )
@@ -2804,6 +2830,9 @@ class AgentApi:
             "dock": getattr(self, "_restored_dock", None),
             # Long-run context editing: stub out stale tool results (keep recent).
             "context_editing": True,
+            # Ultra mode: whether the model may start workflows on its own
+            # judgement (see _ultra_prompt_segment / set_ultra / get_ultra).
+            "ultra": False,
             "max_consecutive_tools": MAX_CONSECUTIVE_TOOLS,
             "loop_repeat_threshold": LOOP_REPEAT_THRESHOLD,
             "summary_resets": 0,
@@ -3070,6 +3099,10 @@ class AgentApi:
             self._busy = True
             self._stop = False
 
+        if _ultra_keyword_requested(text) and not self.session.get("ultra"):
+            self.session["ultra"] = True
+            self._emit({"type": "ultra_mode", "ultra": True})
+
         self.session["messages"].append({"role": "user", "content": text})
         if self.session["original_task"] is None:
             self.session["original_task"] = text
@@ -3142,10 +3175,34 @@ class AgentApi:
         self._thread.start()
         return {"ok": True}
 
+    def set_ultra(self, on):
+        """Toggle ultra mode. Exposed to the webview as pywebview.api.set_ultra."""
+        self.session["ultra"] = bool(on)
+        self._refresh_system_prompt()
+        self._emit({"type": "ultra_mode", "ultra": self.session["ultra"]})
+        return {"ultra": self.session["ultra"]}
+
+    def get_ultra(self):
+        return {"ultra": bool(self.session.get("ultra"))}
+
+    def _abort_active_workflows(self):
+        """Cancel every running workflow. Called from the same place that sets
+        self._stop, so Stop remains the single cancellation path rather than the
+        engine growing a second one."""
+        try:
+            import workflows
+            n = workflows.abort()
+            if n:
+                self._emit({"type": "log",
+                            "content": f"stopping {n} running workflow(s)…"})
+        except Exception:
+            pass    # stopping must never itself fail
+
     def stop(self):
         if not self._busy:
             return {"ok": False, "error": "Nothing to stop."}
         self._stop = True
+        self._abort_active_workflows()
         self._emit({"type": "system", "content": "Stopping now — aborting the current step (in-flight LLM call / running tool)."})
         return {"ok": True}
 
