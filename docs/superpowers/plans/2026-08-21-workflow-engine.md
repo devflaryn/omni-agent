@@ -18,7 +18,12 @@ Every task's requirements implicitly include this section.
 - **No asyncio.** The codebase is threads-only. Do not introduce an event loop.
 - **Tests run BOTH ways, and must keep doing so.** This repo's convention (see `tests/test_delegation.py`) is: a test needing monkeypatching takes a parameter literally named `monkeypatch` — pytest fills it with its built-in fixture — and the file's `if __name__ == "__main__":` runner passes a hand-rolled shim positionally. Name the parameter `monkeypatch`, never `monkeypatch`, or pytest collection fails with "fixture 'monkeypatch' not found". Every test file also starts with the two-line `sys.path.insert` preamble so standalone runs resolve imports.
 - **Two verification commands, both required.** Standalone (fast, no deps): `.venv/Scripts/python.exe tests/test_x.py` — expect the PASS lines and `OK`. Whole suite (regression check): `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`.
-- **The green baseline for the whole suite is 3 failed, 253 passed, 1 skipped** — NOT zero failures. The 3 are pre-existing and environmental: `test_fs_api.py::test_symlink_out_of_the_workspace_is_rejected` and both `test_host_exec.py::test_tool_directory_is_on_path` params (they need `~/.omni-agent/bin`, which this machine has not installed). Do not try to fix them; do not treat them as your regression. Your bar is: those same 3, and no others, with your new tests added to the passed count.
+- **The green bar is a FAILURE SET, not a count.** Exactly these 3 tests fail, and no others:
+  - `tests/test_fs_api.py::test_symlink_out_of_the_workspace_is_rejected`
+  - `tests/test_host_exec.py::test_tool_directory_is_on_path[plain]`
+  - `tests/test_host_exec.py::test_tool_directory_is_on_path[with space]`
+
+  They are pre-existing and environmental (they need `~/.omni-agent/bin`, which this machine has never had installed). Do not fix them and do not count them as your regression. The passed count RISES with every task as tests are added, so never assert a fixed passed number — assert the failure set. For reference: 229 passed at `1b6f1b6` (before any task), 263 after Tasks 1-3.
 - **pytest is installed as a DEV tool only.** It is deliberately NOT in `requirements.txt` and must not be added there.
 - **Frontend tests run as `node tests/frontend/test_x.mjs`** and load the real `frontend/app.js` through `tests/frontend/_harness.mjs`, asserting against shipped code rather than a reimplementation.
 - **Tests are offline.** No network, no LLM calls. Use subagent doubles.
@@ -1210,7 +1215,7 @@ Expected: 6 × `PASS`, then `OK`, exit 0
 Then confirm nothing regressed in the existing suite:
 
 Run: `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`
-Expected: **3 failed, 253 passed, 1 skipped** plus your new tests in the passed count. Those same 3 pre-existing environmental failures and NO others (see Global Constraints).
+Expected: exactly the 3 pre-existing environmental failures listed in Global Constraints and NO others. The passed count rises as tasks add tests — assert the failure set, not a number.
 
 - [ ] **Step 5: Commit**
 
@@ -3470,7 +3475,7 @@ Expected: 7 × `PASS`, then `OK`, exit 0
 Run the agent-touching suites to confirm nothing regressed:
 
 Run: `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`
-Expected: **3 failed, 253 passed, 1 skipped** plus your new tests in the passed count. Those same 3 pre-existing environmental failures and NO others (see Global Constraints).
+Expected: exactly the 3 pre-existing environmental failures listed in Global Constraints and NO others. The passed count rises as tasks add tests — assert the failure set, not a number.
 
 - [ ] **Step 5: Commit**
 
@@ -4066,7 +4071,7 @@ Expected: `OK` from each, exit 0
 Run the pre-existing suite to confirm no regression:
 
 Run: `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`
-Expected: **3 failed, 253 passed, 1 skipped** plus your new tests in the passed count. Those same 3 pre-existing environmental failures and NO others (see Global Constraints).
+Expected: exactly the 3 pre-existing environmental failures listed in Global Constraints and NO others. The passed count rises as tasks add tests — assert the failure set, not a number.
 
 - [ ] **Step 5: Commit**
 
@@ -4169,8 +4174,8 @@ node tests/frontend/test_workflow_view.mjs
 And the pre-existing suite must still pass — the only files this plan modifies that other tests cover are `subagents.py`, `tool_registry.py`, `agent.py`, `frontend/app.js` and `frontend/index.html`:
 
 ```bash
-# Whole pre-existing suite. Green == 3 failed / 253 passed / 1 skipped + our new tests.
-# The 3 failures are pre-existing and environmental; see Global Constraints.
+# Whole suite. Green == exactly the 3 pre-existing environmental failures, no others.
+# The passed count rises with every task; assert the failure SET, not a count.
 .venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend
 
 node tests/frontend/test_boot.mjs
