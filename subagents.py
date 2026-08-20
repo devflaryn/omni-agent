@@ -33,11 +33,13 @@ import llm
 from llm import ask_llm, extract_json_action, strip_reasoning
 from tool_registry import registry, CORE_GROUP
 from tool_policy import is_readonly_tool, is_mutating_tool, READONLY_TOOLS, SUBAGENT_EXCLUDED
+from workflows import schema as _wf_schema
 
 # --- Bounds (reuse the proven values from codebase_qa / reviewer) ------------
 DEFAULT_MAX_STEPS = 12       # tool calls a subagent may make before it must answer
 SUBAGENT_TEMPERATURE = 0.3   # steady tool use, like the other isolated sub-agents
 PER_RESULT_CHAR_CAP = 6000   # truncate each tool result fed back into the sub-session
+SCHEMA_MAX_TRIES = 3         # initial answer + 2 repairs
 CONTEXT_CHAR_LIMIT = 180_000 # compact (then, if still large, finalize) past this
 REPEAT_LIMIT = 3             # identical call this many times in a row -> steer
 
@@ -580,10 +582,10 @@ def _execute(agent_def, allowed, tool_name, tool_args):
 def _new_result(agent_def):
     return {"agent": agent_def.name, "ok": False, "report": "", "raw_report": None,
             "artifacts": [], "verified": None, "steps": 0, "tools_used": [], "note": "",
-            "tokens": 0, "model": None, "escalated": False}
+            "tokens": 0, "model": None, "escalated": False, "schema_ok": None}
 
 
-def _build_messages(agent_def, allowed, task, context, run_dir):
+def _build_messages(agent_def, allowed, task, context, run_dir, schema=None):
     contract = ""
     if agent_def.include_contract:
         contract = _SUBAGENT_CONTRACT + (_WRITER_CONTRACT if agent_def.is_write else "")
@@ -605,6 +607,8 @@ def _build_messages(agent_def, allowed, task, context, run_dir):
         if idx:
             parts.append(idx)
     parts.append(tool_prompt)
+    if schema:
+        parts.append(_wf_schema.render_contract(schema))
     system_prompt = "\n\n".join(p for p in parts if p)
 
     user = "TASK:\n" + task.strip() + "\n"
@@ -640,7 +644,8 @@ def _compact_messages(messages, keep_tail=COMPACT_KEEP_TAIL):
     return elided
 
 
-def _force_final(agent_def, messages, temperature, steps, tools_used, result, note, tokens=0):
+def _force_final(agent_def, messages, temperature, steps, tools_used, result, note, tokens=0,
+                 schema=None):
     messages.append({"role": "user", "content": (
         "[SYSTEM] Investigation budget reached. Do NOT call more tools. Return your best "
         '{"type":"final_answer","content":"..."} now, based on what you have — say what you found and what '
@@ -655,13 +660,22 @@ def _force_final(agent_def, messages, temperature, steps, tools_used, result, no
     tokens += tokens_here
     rtype, payload = _parse_response(raw)
     content = payload if rtype == "final_answer" else strip_reasoning(raw)
+    if schema:
+        # A forced-final answer under budget/context pressure never went through the
+        # repair loop's validation, so it can never be trusted to satisfy the schema.
+        note = "; ".join(p for p in (note,
+                         "forced final answer could not satisfy the schema") if p)
+        result.update(ok=False, schema_ok=False, report=_content_to_text(content),
+                      raw_report=content, steps=steps, tools_used=tools_used,
+                      note=note, tokens=tokens)
+        return result
     result.update(ok=True, report=_content_to_text(content), raw_report=content,
                   steps=steps, tools_used=tools_used, note=note, tokens=tokens)
     return result
 
 
 def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
-                 tier=None, models=None, scope=None):
+                 tier=None, models=None, scope=None, schema=None):
     """Run one subagent to completion and return a distilled result dict:
     {agent, ok, report, raw_report, artifacts, verified, steps, tools_used, note, tokens,
     model, escalated}.
@@ -687,7 +701,7 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
             max_steps = max(1, min(int(agent_def.max_steps or DEFAULT_MAX_STEPS), MAX_STEPS_CAP))
         except (TypeError, ValueError):
             max_steps = DEFAULT_MAX_STEPS
-        messages = _build_messages(agent_def, allowed, task, context, run_dir)
+        messages = _build_messages(agent_def, allowed, task, context, run_dir, schema=schema)
         ladder, ladder_note = resolve_model_ladder(agent_def, tier, models)
         if ladder_note:
             result["note"] = ladder_note
@@ -715,7 +729,7 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
         out = _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                         on_event=on_event, agent_name=agent_def.name, max_steps_total=max_steps,
                         started=started, key_label=_mask(key), sub_id=sub_id,
-                        ladder=ladder, key=key)
+                        ladder=ladder, key=key, schema=schema)
     except Exception as e:
         result.update(ok=False, report=f"(subagent crashed: {e})")
         out = result
@@ -736,11 +750,12 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
 
 def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
               on_event=None, agent_name="", max_steps_total=None, started=None, key_label="",
-              sub_id="", ladder=None, key=None):
+              sub_id="", ladder=None, key=None, schema=None):
     steps = 0
     last_sig = None
     repeats = 0
     parse_errors = 0
+    schema_tries = 0
     tools_used = []
     tokens = 0
     escalated = False
@@ -759,6 +774,38 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
         messages.append({"role": "assistant", "content": raw})
 
         if rtype == "final_answer":
+            if schema:
+                candidate = payload
+                # Models routinely hand back the JSON as a STRING. Parse before
+                # validating, or every structured call fails on shape.
+                if isinstance(candidate, str):
+                    try:
+                        candidate = json.loads(strip_reasoning(candidate).strip())
+                    except ValueError:
+                        candidate = payload
+                errors = _wf_schema.validate(candidate, schema)
+                if errors:
+                    schema_tries += 1
+                    if schema_tries >= SCHEMA_MAX_TRIES:
+                        note = "; ".join(p for p in (
+                            result.get("note"),
+                            "schema validation failed after "
+                            f"{SCHEMA_MAX_TRIES} attempts: " + "; ".join(errors[:3])
+                        ) if p)
+                        result.update(ok=False, schema_ok=False, steps=steps,
+                                      tools_used=tools_used, note=note, tokens=tokens)
+                        return result
+                    messages.append({"role": "user", "content": (
+                        "[SYSTEM] Your final_answer did not match the required "
+                        "schema. Fix these and answer again:\n- "
+                        + "\n- ".join(errors[:8])
+                    )})
+                    continue
+                result.update(ok=True, schema_ok=True,
+                              report=_content_to_text(candidate),
+                              raw_report=candidate, steps=steps,
+                              tools_used=tools_used, tokens=tokens)
+                return result
             result.update(ok=True, report=_content_to_text(payload), raw_report=payload,
                           steps=steps, tools_used=tools_used, tokens=tokens)
             return result
@@ -782,6 +829,12 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                     messages.append({"role": "user", "content": _JSON_NUDGE})
                     continue
             if parse_errors >= 3:
+                if schema:
+                    result.update(ok=False, schema_ok=False, steps=steps,
+                                  tools_used=tools_used, tokens=tokens,
+                                  note="; ".join(p for p in (result.get("note"),
+                                       "non-JSON output could not satisfy the schema") if p))
+                    return result
                 salvage = strip_reasoning(raw)
                 note = "; ".join(p for p in (result.get("note"),
                                              "salvaged from non-JSON output") if p)
@@ -832,10 +885,12 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                                        "key_label": key_label, "sub_id": sub_id})
                 continue
             return _force_final(agent_def, messages, temperature, steps, tools_used, result,
-                                note="stopped early — sub-context grew large.", tokens=tokens)
+                                note="stopped early — sub-context grew large.", tokens=tokens,
+                                schema=schema)
 
     return _force_final(agent_def, messages, temperature, steps, tools_used, result,
-                        note=f"reached the {max_steps}-step budget.", tokens=tokens)
+                        note=f"reached the {max_steps}-step budget.", tokens=tokens,
+                        schema=schema)
 
 
 # --- parallel waves ----------------------------------------------------------
