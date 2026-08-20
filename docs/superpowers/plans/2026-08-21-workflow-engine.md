@@ -16,7 +16,10 @@ Every task's requirements implicitly include this section.
 
 - **No new Python dependencies.** `requirements.txt` stays at its 7 pinned direct deps. This rules out `jsonschema` — the validator is hand-written. `requirements.txt` documents why a portable lockfile is impractical here; do not add one.
 - **No asyncio.** The codebase is threads-only. Do not introduce an event loop.
-- **There is no pytest in this project.** Tests are pytest-*shaped* (`test_*` functions, some taking a `mp` monkeypatch double) but run standalone: `python tests/test_x.py`. Every test file ends with a `if __name__ == "__main__":` runner that calls each test, prints `PASS`/`FAIL`, and exits non-zero on failure. Copy the pattern from `tests/test_delegation.py`. Every test file starts with the two-line `sys.path.insert` preamble so imports resolve.
+- **Tests run BOTH ways, and must keep doing so.** This repo's convention (see `tests/test_delegation.py`) is: a test needing monkeypatching takes a parameter literally named `monkeypatch` — pytest fills it with its built-in fixture — and the file's `if __name__ == "__main__":` runner passes a hand-rolled shim positionally. Name the parameter `monkeypatch`, never `monkeypatch`, or pytest collection fails with "fixture 'monkeypatch' not found". Every test file also starts with the two-line `sys.path.insert` preamble so standalone runs resolve imports.
+- **Two verification commands, both required.** Standalone (fast, no deps): `.venv/Scripts/python.exe tests/test_x.py` — expect the PASS lines and `OK`. Whole suite (regression check): `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`.
+- **The green baseline for the whole suite is 3 failed, 253 passed, 1 skipped** — NOT zero failures. The 3 are pre-existing and environmental: `test_fs_api.py::test_symlink_out_of_the_workspace_is_rejected` and both `test_host_exec.py::test_tool_directory_is_on_path` params (they need `~/.omni-agent/bin`, which this machine has not installed). Do not try to fix them; do not treat them as your regression. Your bar is: those same 3, and no others, with your new tests added to the passed count.
+- **pytest is installed as a DEV tool only.** It is deliberately NOT in `requirements.txt` and must not be added there.
 - **Frontend tests run as `node tests/frontend/test_x.mjs`** and load the real `frontend/app.js` through `tests/frontend/_harness.mjs`, asserting against shipped code rather than a reimplementation.
 - **Tests are offline.** No network, no LLM calls. Use subagent doubles.
 - **Do not add a second execution path.** Every tool shells through `host_exec.run_cmd`; nothing here may bypass it.
@@ -993,7 +996,7 @@ def _agent():
                     mode="read", allowed_tools=set(), max_steps=3)
 
 
-def _script(replies, mp):
+def _script(replies, monkeypatch):
     """Replace ask_llm with a scripted sequence, capturing the messages it saw."""
     seen = {"messages": []}
     box = {"i": 0}
@@ -1004,31 +1007,31 @@ def _script(replies, mp):
         box["i"] += 1
         return r
 
-    mp.setattr(subagents, "ask_llm", fake)
+    monkeypatch.setattr(subagents, "ask_llm", fake)
     return seen
 
 
-def test_contract_is_injected_into_the_system_prompt(mp):
-    seen = _script([json.dumps({"type": "final_answer", "content": {"n": 1}})], mp)
+def test_contract_is_injected_into_the_system_prompt(monkeypatch):
+    seen = _script([json.dumps({"type": "final_answer", "content": {"n": 1}})], monkeypatch)
     subagents.run_subagent(_agent(), "task", schema=SCHEMA)
     system = seen["messages"][0][0]["content"]
     assert "STRUCTURED OUTPUT REQUIRED" in system
     assert '"n"' in system
 
 
-def test_valid_structured_answer_is_returned_as_a_dict(mp):
-    _script([json.dumps({"type": "final_answer", "content": {"n": 7}})], mp)
+def test_valid_structured_answer_is_returned_as_a_dict(monkeypatch):
+    _script([json.dumps({"type": "final_answer", "content": {"n": 7}})], monkeypatch)
     res = subagents.run_subagent(_agent(), "task", schema=SCHEMA)
     assert res["ok"] is True
     assert res["schema_ok"] is True
     assert res["raw_report"] == {"n": 7}
 
 
-def test_bad_shape_gets_a_repair_message_naming_the_violation(mp):
+def test_bad_shape_gets_a_repair_message_naming_the_violation(monkeypatch):
     seen = _script([
         json.dumps({"type": "final_answer", "content": {"n": "not-an-int"}}),
         json.dumps({"type": "final_answer", "content": {"n": 3}}),
-    ], mp)
+    ], monkeypatch)
     res = subagents.run_subagent(_agent(), "task", schema=SCHEMA)
     assert res["ok"] is True and res["raw_report"] == {"n": 3}
     # The second call must have carried a repair message describing the error.
@@ -1036,23 +1039,23 @@ def test_bad_shape_gets_a_repair_message_naming_the_violation(mp):
     assert "expected integer" in repair and "$.n" in repair
 
 
-def test_three_strikes_fails_the_call(mp):
-    _script([json.dumps({"type": "final_answer", "content": {"n": "bad"}})], mp)
+def test_three_strikes_fails_the_call(monkeypatch):
+    _script([json.dumps({"type": "final_answer", "content": {"n": "bad"}})], monkeypatch)
     res = subagents.run_subagent(_agent(), "task", schema=SCHEMA)
     assert res["ok"] is False
     assert res["schema_ok"] is False
     assert "schema" in (res.get("note") or "").lower()
 
 
-def test_json_string_content_is_parsed_before_validation(mp):
+def test_json_string_content_is_parsed_before_validation(monkeypatch):
     # Models routinely return the JSON as a STRING rather than a nested object.
-    _script([json.dumps({"type": "final_answer", "content": '{"n": 5}'})], mp)
+    _script([json.dumps({"type": "final_answer", "content": '{"n": 5}'})], monkeypatch)
     res = subagents.run_subagent(_agent(), "task", schema=SCHEMA)
     assert res["ok"] is True and res["raw_report"] == {"n": 5}
 
 
-def test_no_schema_keeps_the_legacy_text_behaviour(mp):
-    _script([json.dumps({"type": "final_answer", "content": "just prose"})], mp)
+def test_no_schema_keeps_the_legacy_text_behaviour(monkeypatch):
+    _script([json.dumps({"type": "final_answer", "content": "just prose"})], monkeypatch)
     res = subagents.run_subagent(_agent(), "task")
     assert res["ok"] is True and res["report"] == "just prose"
     assert res.get("schema_ok") is None
@@ -1060,7 +1063,7 @@ def test_no_schema_keeps_the_legacy_text_behaviour(mp):
 
 if __name__ == "__main__":
     import types
-    mp = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
+    monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     tests = [test_contract_is_injected_into_the_system_prompt,
              test_valid_structured_answer_is_returned_as_a_dict,
              test_bad_shape_gets_a_repair_message_naming_the_violation,
@@ -1071,7 +1074,7 @@ if __name__ == "__main__":
     _orig = subagents.ask_llm
     for t in tests:
         try:
-            t(mp); print(f"PASS {t.__name__}")
+            t(monkeypatch); print(f"PASS {t.__name__}")
         except Exception as e:
             failed += 1
             import traceback; traceback.print_exc()
@@ -1206,8 +1209,8 @@ Expected: 6 × `PASS`, then `OK`, exit 0
 
 Then confirm nothing regressed in the existing suite:
 
-Run: `python tests/test_delegation.py && python tests/test_subagent_routing.py && python tests/test_llm_subagent_context.py && python tests/test_model_ladder.py`
-Expected: `OK` from each, exit 0
+Run: `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`
+Expected: **3 failed, 253 passed, 1 skipped** plus your new tests in the passed count. Those same 3 pre-existing environmental failures and NO others (see Global Constraints).
 
 - [ ] **Step 5: Commit**
 
@@ -1256,10 +1259,10 @@ class FakeAgentDef:
         self.mode = "write" if is_write else "read"
 
 
-def _install(mp, handler, agents=("researcher", "implementer")):
+def _install(monkeypatch, handler, agents=("researcher", "implementer")):
     """Point the runtime at a fake subagent engine and a fake persona registry."""
-    mp.setattr(R, "run_subagent", handler)
-    mp.setattr(R, "get_agent",
+    monkeypatch.setattr(R, "run_subagent", handler)
+    monkeypatch.setattr(R, "get_agent",
                lambda n: FakeAgentDef(n, is_write=(n == "implementer"))
                if n in agents else None)
 
@@ -1270,29 +1273,29 @@ def _rt(dry_run=False, concurrency=None):
     return R.WorkflowRuntime(j, run_dir=d, dry_run=dry_run, concurrency=concurrency)
 
 
-def test_agent_returns_the_report_text(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "hello", "raw_report": "hello",
+def test_agent_returns_the_report_text(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "hello", "raw_report": "hello",
                                   "tokens": 5, "model": "m"})
     rt = _rt()
     assert rt.agent("do a thing") == "hello"
 
 
-def test_agent_returns_the_validated_dict_when_a_schema_is_given(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "{}", "raw_report": {"n": 1},
+def test_agent_returns_the_validated_dict_when_a_schema_is_given(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "{}", "raw_report": {"n": 1},
                                   "schema_ok": True, "tokens": 5})
     rt = _rt()
     out = rt.agent("p", schema={"type": "object", "properties": {"n": {"type": "integer"}}})
     assert out == {"n": 1}
 
 
-def test_failed_agent_returns_none_rather_than_raising(mp):
-    _install(mp, lambda *a, **k: {"ok": False, "report": "boom", "raw_report": None})
+def test_failed_agent_returns_none_rather_than_raising(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": False, "report": "boom", "raw_report": None})
     rt = _rt()
     assert rt.agent("p") is None
 
 
-def test_unknown_agent_type_raises(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "x"})
+def test_unknown_agent_type_raises(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x"})
     rt = _rt()
     try:
         rt.agent("p", agent_type="nope")
@@ -1301,8 +1304,8 @@ def test_unknown_agent_type_raises(mp):
         assert "nope" in str(e)
 
 
-def test_write_agent_without_scope_is_rejected(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "x"})
+def test_write_agent_without_scope_is_rejected(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x"})
     rt = _rt()
     try:
         rt.agent("edit it", agent_type="implementer")
@@ -1311,33 +1314,33 @@ def test_write_agent_without_scope_is_rejected(mp):
         assert "scope" in str(e).lower()
 
 
-def test_write_agent_with_scope_is_allowed(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "done", "raw_report": "done"})
+def test_write_agent_with_scope_is_allowed(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "done", "raw_report": "done"})
     rt = _rt()
     assert rt.agent("edit it", agent_type="implementer", scope=["src/"]) == "done"
 
 
-def test_dry_run_never_calls_the_engine_and_returns_schema_stubs(mp):
+def test_dry_run_never_calls_the_engine_and_returns_schema_stubs(monkeypatch):
     called = {"n": 0}
 
     def boom(*a, **k):
         called["n"] += 1
         raise AssertionError("dry-run must not reach the engine")
 
-    _install(mp, boom)
+    _install(monkeypatch, boom)
     rt = _rt(dry_run=True)
     sch = {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}
     out = rt.agent("p", schema=sch)
     assert out == {"n": 1} and called["n"] == 0
 
 
-def test_dry_run_without_schema_returns_a_string(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "x"})
+def test_dry_run_without_schema_returns_a_string(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x"})
     rt = _rt(dry_run=True)
     assert isinstance(rt.agent("p"), str)
 
 
-def test_cached_result_is_replayed_without_calling_the_engine(mp):
+def test_cached_result_is_replayed_without_calling_the_engine(monkeypatch):
     d = tempfile.mkdtemp(prefix="wfrt-")
     path = _os.path.join(d, "journal.jsonl")
     j = J.Journal(path)
@@ -1351,14 +1354,14 @@ def test_cached_result_is_replayed_without_calling_the_engine(mp):
         called["n"] += 1
         return {"ok": True, "report": "fresh", "raw_report": "fresh"}
 
-    _install(mp, counter)
+    _install(monkeypatch, counter)
     j2 = J.Journal(_os.path.join(d, "second.jsonl"), replay_from=path)
     rt = R.WorkflowRuntime(j2, run_dir=d)
     assert rt.agent("p") == "from-cache"
     assert called["n"] == 0
 
 
-def test_concurrency_never_exceeds_the_semaphore(mp):
+def test_concurrency_never_exceeds_the_semaphore(monkeypatch):
     live = {"now": 0, "peak": 0}
     lock = threading.Lock()
 
@@ -1373,7 +1376,7 @@ def test_concurrency_never_exceeds_the_semaphore(mp):
             live["now"] -= 1
         return {"ok": True, "report": "x", "raw_report": "x"}
 
-    _install(mp, slow)
+    _install(monkeypatch, slow)
     rt = _rt(concurrency=2)
     threads = [threading.Thread(target=lambda i=i: rt.agent(f"p{i}")) for i in range(8)]
     for t in threads:
@@ -1383,8 +1386,8 @@ def test_concurrency_never_exceeds_the_semaphore(mp):
     assert live["peak"] <= 2
 
 
-def test_abort_stops_further_agent_calls(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
+def test_abort_stops_further_agent_calls(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
     rt = _rt()
     rt.agent("first")
     rt.abort()
@@ -1395,8 +1398,8 @@ def test_abort_stops_further_agent_calls(mp):
         pass
 
 
-def test_phase_from_a_branch_thread_raises_with_the_fix_named(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "x"})
+def test_phase_from_a_branch_thread_raises_with_the_fix_named(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x"})
     rt = _rt()
     err = {}
 
@@ -1411,8 +1414,8 @@ def test_phase_from_a_branch_thread_raises_with_the_fix_named(mp):
     assert "phase=" in str(err.get("e", ""))
 
 
-def test_events_are_emitted_for_started_and_done(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x",
+def test_events_are_emitted_for_started_and_done(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x",
                                   "tokens": 3})
     events = []
     d = tempfile.mkdtemp(prefix="wfrt-")
@@ -1427,8 +1430,8 @@ def test_events_are_emitted_for_started_and_done(mp):
     assert started["label"] == "my-label" and started["phase"] == "Scan"
 
 
-def test_label_defaults_to_a_trimmed_prompt(mp):
-    _install(mp, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
+def test_label_defaults_to_a_trimmed_prompt(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
     events = []
     d = tempfile.mkdtemp(prefix="wfrt-")
     j = J.Journal(_os.path.join(d, "journal.jsonl"))
@@ -1440,7 +1443,7 @@ def test_label_defaults_to_a_trimmed_prompt(mp):
 
 if __name__ == "__main__":
     import types
-    mp = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
+    monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     tests = [test_agent_returns_the_report_text,
              test_agent_returns_the_validated_dict_when_a_schema_is_given,
              test_failed_agent_returns_none_rather_than_raising,
@@ -1459,7 +1462,7 @@ if __name__ == "__main__":
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:
         try:
-            t(mp); print(f"PASS {t.__name__}")
+            t(monkeypatch); print(f"PASS {t.__name__}")
         except Exception as e:
             failed += 1
             import traceback; traceback.print_exc()
@@ -1704,15 +1707,15 @@ git commit -m "feat(workflows): runtime agent() with semaphore-capped concurrenc
 Append to `tests/test_workflow_runtime.py` (before the `__main__` block):
 
 ```python
-def test_parallel_returns_results_in_input_order(mp):
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+def test_parallel_returns_results_in_input_order(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
     rt = _rt()
     out = rt.parallel([lambda i=i: rt.agent(f"p{i}") for i in range(5)])
     assert out == ["p0", "p1", "p2", "p3", "p4"]
 
 
-def test_parallel_isolates_a_raising_thunk_as_none(mp):
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+def test_parallel_isolates_a_raising_thunk_as_none(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
     rt = _rt()
 
     def boom():
@@ -1722,21 +1725,21 @@ def test_parallel_isolates_a_raising_thunk_as_none(mp):
     assert out[0] == "ok" and out[1] is None
 
 
-def test_parallel_actually_runs_concurrently(mp):
+def test_parallel_actually_runs_concurrently(monkeypatch):
     gate = threading.Barrier(3, timeout=5)
 
     def waits(ad, p, **k):
         gate.wait()          # deadlocks and raises BrokenBarrier if serialized
         return {"ok": True, "report": p, "raw_report": p}
 
-    _install(mp, waits)
+    _install(monkeypatch, waits)
     rt = _rt(concurrency=3)
     out = rt.parallel([lambda i=i: rt.agent(f"p{i}") for i in range(3)])
     assert out == ["p0", "p1", "p2"]
 
 
-def test_pipeline_threads_each_item_through_every_stage(mp):
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+def test_pipeline_threads_each_item_through_every_stage(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
     rt = _rt()
     out = rt.pipeline(
         ["a", "b"],
@@ -1746,8 +1749,8 @@ def test_pipeline_threads_each_item_through_every_stage(mp):
     assert out == ["one:a|two:a:0", "one:b|two:b:1"]
 
 
-def test_pipeline_stage_receives_original_item_and_index(mp):
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+def test_pipeline_stage_receives_original_item_and_index(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
     rt = _rt()
     seen = []
     rt.pipeline(["x", "y"],
@@ -1756,8 +1759,8 @@ def test_pipeline_stage_receives_original_item_and_index(mp):
     assert ("x", "x", 0) in seen and ("s1", "y", 1) in seen
 
 
-def test_pipeline_drops_a_failing_item_to_none_and_skips_its_rest(mp):
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+def test_pipeline_drops_a_failing_item_to_none_and_skips_its_rest(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
     rt = _rt()
     reached = []
 
@@ -1775,11 +1778,11 @@ def test_pipeline_drops_a_failing_item_to_none_and_skips_its_rest(mp):
     assert reached == ["good"]      # the failed item never reached stage 2
 
 
-def test_pipeline_has_no_barrier_between_stages(mp):
+def test_pipeline_has_no_barrier_between_stages(monkeypatch):
     # Item A must be able to reach stage 2 while item B is still in stage 1.
     # If a barrier existed, A would wait for B and this barrier would break.
     cross = threading.Barrier(2, timeout=5)
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
     rt = _rt(concurrency=4)
 
     def stage1(item, orig, i):
@@ -1796,8 +1799,8 @@ def test_pipeline_has_no_barrier_between_stages(mp):
     assert sorted(x for x in out if x) == ["fast", "slow"]
 
 
-def test_item_cap_is_an_explicit_error_not_a_silent_truncation(mp):
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+def test_item_cap_is_an_explicit_error_not_a_silent_truncation(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
     rt = _rt()
     try:
         rt.parallel([lambda: None] * (R.MAX_ITEMS + 1))
@@ -1806,14 +1809,14 @@ def test_item_cap_is_an_explicit_error_not_a_silent_truncation(mp):
         assert str(R.MAX_ITEMS) in str(e)
 
 
-def test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one(mp):
+def test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one(monkeypatch):
     """THE deadlock regression guard.
 
     A shared ThreadPoolExecutor design fails here: pipeline items take every
     worker slot, then each calls parallel() whose branches call agent() and wait
     for a slot only the blocked items could free. Threads-plus-a-semaphore does
     not, because threads are unbounded and only the semaphore is contended."""
-    _install(mp, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
     rt = _rt(concurrency=1)
     out = rt.pipeline(
         ["a", "b", "c"],
@@ -1962,11 +1965,11 @@ class FakeAgentDef:
         self.mode = "write" if is_write else "read"
 
 
-def _install(mp, handler=None):
+def _install(monkeypatch, handler=None):
     handler = handler or (lambda ad, p, **k: {"ok": True, "report": p,
                                               "raw_report": p, "tokens": 1})
-    mp.setattr(R, "run_subagent", handler)
-    mp.setattr(R, "get_agent",
+    monkeypatch.setattr(R, "run_subagent", handler)
+    monkeypatch.setattr(R, "get_agent",
                lambda n: FakeAgentDef(n, is_write=(n == "implementer"))
                if n in ("researcher", "implementer") else None)
 
@@ -1983,16 +1986,16 @@ def _root():
     return tempfile.mkdtemp(prefix="wfrun-")
 
 
-def test_run_executes_and_returns_the_scripts_value(mp):
-    _install(mp)
+def test_run_executes_and_returns_the_scripts_value(monkeypatch):
+    _install(monkeypatch)
     res = workflows.run(src=GOOD, run_root=_root())
     assert res["ok"] is True
     assert res["result"]["seen"] == ["look at 0", "look at 1", "look at 2"]
     assert res["agent_count"] == 3
 
 
-def test_run_writes_the_run_directory(mp):
-    _install(mp)
+def test_run_writes_the_run_directory(monkeypatch):
+    _install(monkeypatch)
     root = _root()
     res = workflows.run(src=GOOD, run_root=root)
     d = _os.path.join(root, "workflows", res["run_id"])
@@ -2002,28 +2005,28 @@ def test_run_writes_the_run_directory(mp):
     assert _os.path.exists(_os.path.join(d, "result.json"))
 
 
-def test_a_syntax_error_never_reaches_the_engine(mp):
+def test_a_syntax_error_never_reaches_the_engine(monkeypatch):
     called = {"n": 0}
 
     def counter(*a, **k):
         called["n"] += 1
         return {"ok": True, "report": "x"}
 
-    _install(mp, counter)
+    _install(monkeypatch, counter)
     res = workflows.run(src='meta = {"name":"a","description":"b"}\nif True\n  pass\n',
                         run_root=_root())
     assert res["ok"] is False and "syntax" in res["error"].lower()
     assert called["n"] == 0
 
 
-def test_a_runtime_shape_bug_is_caught_by_dry_run_before_any_token(mp):
+def test_a_runtime_shape_bug_is_caught_by_dry_run_before_any_token(monkeypatch):
     called = {"n": 0}
 
     def counter(*a, **k):
         called["n"] += 1
         return {"ok": True, "report": "x", "raw_report": {"findings": []}}
 
-    _install(mp, counter)
+    _install(monkeypatch, counter)
     bad = ('meta = {"name": "a", "description": "b"}\n'
            'r = agent("p", schema={"type": "object", '
            '"properties": {"findings": {"type": "array"}}, "required": ["findings"]})\n'
@@ -2033,28 +2036,28 @@ def test_a_runtime_shape_bug_is_caught_by_dry_run_before_any_token(mp):
     assert called["n"] == 0
 
 
-def test_unscoped_write_agent_is_rejected_at_dry_run(mp):
-    _install(mp)
+def test_unscoped_write_agent_is_rejected_at_dry_run(monkeypatch):
+    _install(monkeypatch)
     bad = ('meta = {"name": "a", "description": "b"}\n'
            'return agent("edit", agent_type="implementer")\n')
     res = workflows.run(src=bad, run_root=_root())
     assert res["ok"] is False and "scope" in res["error"].lower()
 
 
-def test_dry_run_flag_returns_without_spending_tokens(mp):
+def test_dry_run_flag_returns_without_spending_tokens(monkeypatch):
     called = {"n": 0}
 
     def counter(*a, **k):
         called["n"] += 1
         return {"ok": True, "report": "x"}
 
-    _install(mp, counter)
+    _install(monkeypatch, counter)
     res = workflows.run(src=GOOD, run_root=_root(), dry_run=True)
     assert res["ok"] is True and called["n"] == 0
 
 
-def test_events_carry_start_and_done_with_the_run_id(mp):
-    _install(mp)
+def test_events_carry_start_and_done_with_the_run_id(monkeypatch):
+    _install(monkeypatch)
     events = []
     res = workflows.run(src=GOOD, run_root=_root(), on_event=events.append)
     kinds = [e["type"] for e in events]
@@ -2062,14 +2065,14 @@ def test_events_carry_start_and_done_with_the_run_id(mp):
     assert all(e.get("run_id") == res["run_id"] for e in events)
 
 
-def test_resume_replays_and_makes_no_new_calls(mp):
+def test_resume_replays_and_makes_no_new_calls(monkeypatch):
     calls = {"n": 0}
 
     def counter(ad, p, **k):
         calls["n"] += 1
         return {"ok": True, "report": p, "raw_report": p, "tokens": 1}
 
-    _install(mp, counter)
+    _install(monkeypatch, counter)
     root = _root()
     first = workflows.run(src=GOOD, run_root=root)
     assert calls["n"] == 3
@@ -2079,8 +2082,8 @@ def test_resume_replays_and_makes_no_new_calls(mp):
     assert calls["n"] == 3      # nothing re-ran
 
 
-def test_resume_warns_when_the_prior_run_had_write_agents(mp):
-    _install(mp)
+def test_resume_warns_when_the_prior_run_had_write_agents(monkeypatch):
+    _install(monkeypatch)
     root = _root()
     src = ('meta = {"name": "w", "description": "d"}\n'
            'return agent("edit", agent_type="implementer", scope=["src/"])\n')
@@ -2090,23 +2093,23 @@ def test_resume_warns_when_the_prior_run_had_write_agents(mp):
                for w in second["warnings"])
 
 
-def test_args_reach_the_script(mp):
-    _install(mp)
+def test_args_reach_the_script(monkeypatch):
+    _install(monkeypatch)
     src = ('meta = {"name": "a", "description": "b"}\n'
            'return agent(f"do {args[\'thing\']}")\n')
     res = workflows.run(src=src, run_root=_root(), args={"thing": "X"})
     assert res["result"] == "do X"
 
 
-def test_validate_reports_meta_without_running(mp):
-    _install(mp)
+def test_validate_reports_meta_without_running(monkeypatch):
+    _install(monkeypatch)
     out = workflows.validate(GOOD)
     assert out["ok"] is True and out["meta"]["name"] == "demo"
 
 
 if __name__ == "__main__":
     import types
-    mp = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
+    monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     tests = [test_run_executes_and_returns_the_scripts_value,
              test_run_writes_the_run_directory,
              test_a_syntax_error_never_reaches_the_engine,
@@ -2121,7 +2124,7 @@ if __name__ == "__main__":
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:
         try:
-            t(mp); print(f"PASS {t.__name__}")
+            t(monkeypatch); print(f"PASS {t.__name__}")
         except Exception as e:
             failed += 1
             import traceback; traceback.print_exc()
@@ -2407,10 +2410,10 @@ class FakeAgentDef:
         self.mode = "write" if is_write else "read"
 
 
-def _install(mp):
-    mp.setattr(R, "get_agent", lambda n: FakeAgentDef(
+def _install(monkeypatch):
+    monkeypatch.setattr(R, "get_agent", lambda n: FakeAgentDef(
         n, is_write=n in ("implementer", "engineer")))
-    mp.setattr(R, "run_subagent",
+    monkeypatch.setattr(R, "run_subagent",
                lambda *a, **k: (_ for _ in ()).throw(
                    AssertionError("dry-run must not reach the engine")))
 
@@ -2426,15 +2429,15 @@ def test_every_workflow_has_a_description_and_when_to_use():
         assert w["when_to_use"], f"{w['name']} has no when_to_use"
 
 
-def test_every_workflow_dry_runs_clean(mp):
-    _install(mp)
+def test_every_workflow_dry_runs_clean(monkeypatch):
+    _install(monkeypatch)
     for w in library.list_workflows():
         src = library.load_source(w["name"])
         out = workflows.validate(src, args=ARGS.get(w["name"], {}))
         assert out["ok"], f"{w['name']} failed dry-run: {out['error']}"
 
 
-def test_migrate_declares_scope_on_its_writers(mp):
+def test_migrate_declares_scope_on_its_writers(monkeypatch):
     # A write agent without scope would be rejected by the runtime; this asserts
     # the library entry does it right rather than relying on the error path.
     src = library.load_source("migrate")
@@ -2451,7 +2454,7 @@ def test_unknown_name_is_a_clear_error():
 
 if __name__ == "__main__":
     import types
-    mp = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
+    monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     failed = 0
     for t, needs_mp in [(test_every_expected_workflow_is_listed, False),
@@ -2460,7 +2463,7 @@ if __name__ == "__main__":
                         (test_migrate_declares_scope_on_its_writers, True),
                         (test_unknown_name_is_a_clear_error, False)]:
         try:
-            t(mp) if needs_mp else t()
+            t(monkeypatch) if needs_mp else t()
             print(f"PASS {t.__name__}")
         except Exception as e:
             failed += 1
@@ -3009,7 +3012,7 @@ def test_description_lists_the_library():
     assert "review-changes" in text and "migrate" in text
 
 
-def test_name_is_forwarded_to_workflows_run(mp):
+def test_name_is_forwarded_to_workflows_run(monkeypatch):
     seen = {}
 
     def fake_run(**kw):
@@ -3018,14 +3021,14 @@ def test_name_is_forwarded_to_workflows_run(mp):
                 "agent_count": 3, "aborted": False, "elapsed_s": 1.0,
                 "warnings": [], "error": ""}
 
-    mp.setattr(workflow_tools, "_run", fake_run)
+    monkeypatch.setattr(workflow_tools, "_run", fake_run)
     out = run_workflow(name="review-changes", args={"target": "HEAD"})
     assert seen["name"] == "review-changes" and seen["args"] == {"target": "HEAD"}
     assert out["ok"] is True and out["run_id"] == "abc"
 
 
-def test_failure_returns_the_error_for_self_correction(mp):
-    mp.setattr(workflow_tools, "_run",
+def test_failure_returns_the_error_for_self_correction(monkeypatch):
+    monkeypatch.setattr(workflow_tools, "_run",
                lambda **kw: {"ok": False, "error": "dry-run failed: KeyError: 'x'",
                              "run_id": "", "name": "", "result": None,
                              "agent_count": 0, "aborted": False, "elapsed_s": 0.1,
@@ -3034,7 +3037,7 @@ def test_failure_returns_the_error_for_self_correction(mp):
     assert "error" in out and "KeyError" in out["error"]
 
 
-def test_string_args_json_is_decoded(mp):
+def test_string_args_json_is_decoded(monkeypatch):
     # Models routinely pass a JSON-ENCODED string instead of an object.
     seen = {}
 
@@ -3044,13 +3047,13 @@ def test_string_args_json_is_decoded(mp):
                 "agent_count": 0, "aborted": False, "elapsed_s": 0.0,
                 "warnings": [], "error": ""}
 
-    mp.setattr(workflow_tools, "_run", fake_run)
+    monkeypatch.setattr(workflow_tools, "_run", fake_run)
     run_workflow(name="review-changes", args='{"target": "HEAD"}')
     assert seen["args"] == {"target": "HEAD"}
 
 
-def test_warnings_are_surfaced(mp):
-    mp.setattr(workflow_tools, "_run",
+def test_warnings_are_surfaced(monkeypatch):
+    monkeypatch.setattr(workflow_tools, "_run",
                lambda **kw: {"ok": True, "error": "", "run_id": "r", "name": "n",
                              "result": None, "agent_count": 0, "aborted": False,
                              "elapsed_s": 0.0, "warnings": ["write side effects"]})
@@ -3060,7 +3063,7 @@ def test_warnings_are_surfaced(mp):
 
 if __name__ == "__main__":
     import types
-    mp = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
+    monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     _orig = workflow_tools._run
     failed = 0
     for t, needs_mp in [(test_requires_name_or_script, False),
@@ -3071,7 +3074,7 @@ if __name__ == "__main__":
                         (test_string_args_json_is_decoded, True),
                         (test_warnings_are_surfaced, True)]:
         try:
-            t(mp) if needs_mp else t()
+            t(monkeypatch) if needs_mp else t()
             print(f"PASS {t.__name__}")
         except Exception as e:
             failed += 1
@@ -3244,8 +3247,8 @@ Confirm `tools/__init__.py` imports the new module the way it imports the others
 Run: `python tests/test_workflow_tool.py`
 Expected: 7 × `PASS`, then `OK`, exit 0
 
-Run: `python tests/test_tool_meta_coverage.py`
-Expected: `OK` — this suite asserts every registered tool has complete metadata, so it is the guard that `run_workflow` was registered properly.
+Run: `.venv/Scripts/python.exe -m pytest tests/test_tool_meta_coverage.py -q`
+Expected: all pass — this suite asserts every registered tool has complete metadata, so it is the guard that `run_workflow` was registered properly.
 
 - [ ] **Step 5: Commit**
 
@@ -3318,7 +3321,7 @@ def test_keyword_in_a_user_message_turns_it_on():
     assert agent_mod._ultra_keyword_requested("just a normal question") is False
 
 
-def test_stopping_aborts_every_active_workflow(mp):
+def test_stopping_aborts_every_active_workflow(monkeypatch):
     """Without this wiring, Stop cancels the shell command in flight but a
     running workflow keeps spawning agents."""
     import workflows
@@ -3328,28 +3331,28 @@ def test_stopping_aborts_every_active_workflow(mp):
         called["n"] += 1
         return 2
 
-    mp.setattr(workflows, "abort", fake_abort)
+    monkeypatch.setattr(workflows, "abort", fake_abort)
     api = _api()
     api._abort_active_workflows()
     assert called["n"] == 1
     assert any("2" in str(e.get("content", "")) for e in api.emits)
 
 
-def test_aborting_workflows_never_raises(mp):
+def test_aborting_workflows_never_raises(monkeypatch):
     # Stop must not be able to fail, whatever the engine is doing.
     import workflows
 
     def boom(run_id=None):
         raise RuntimeError("engine on fire")
 
-    mp.setattr(workflows, "abort", boom)
+    monkeypatch.setattr(workflows, "abort", boom)
     _api()._abort_active_workflows()      # must not raise
 
 
 if __name__ == "__main__":
     import types
     import workflows as _wf
-    mp = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
+    monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     _orig_abort = _wf.abort
     failed = 0
     for t, needs_mp in [(test_default_is_off, False),
@@ -3360,7 +3363,7 @@ if __name__ == "__main__":
                         (test_stopping_aborts_every_active_workflow, True),
                         (test_aborting_workflows_never_raises, True)]:
         try:
-            t(mp) if needs_mp else t()
+            t(monkeypatch) if needs_mp else t()
             print(f"PASS {t.__name__}")
         except Exception as e:
             failed += 1
@@ -3466,8 +3469,8 @@ Expected: 7 × `PASS`, then `OK`, exit 0
 
 Run the agent-touching suites to confirm nothing regressed:
 
-Run: `python tests/test_delegation.py && python tests/test_agent_delegation_wave.py && python tests/test_conversation_tokens.py && python tests/test_fs_api.py`
-Expected: `OK` from each
+Run: `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`
+Expected: **3 failed, 253 passed, 1 skipped** plus your new tests in the passed count. Those same 3 pre-existing environmental failures and NO others (see Global Constraints).
 
 - [ ] **Step 5: Commit**
 
@@ -3912,26 +3915,26 @@ return {"inner": inner}
 '''
 
 
-def test_a_workflow_can_call_a_library_workflow(mp):
-    _install(mp)
+def test_a_workflow_can_call_a_library_workflow(monkeypatch):
+    _install(monkeypatch)
     res = workflows.run(src=CHILD_CALLER, run_root=_root())
     assert res["ok"] is True, res["error"]
     assert res["result"]["inner"] is not None
 
 
-def test_child_agents_count_toward_the_parent(mp):
-    _install(mp)
+def test_child_agents_count_toward_the_parent(monkeypatch):
+    _install(monkeypatch)
     res = workflows.run(src=CHILD_CALLER, run_root=_root())
     # one child read + one child synthesize, at minimum
     assert res["agent_count"] >= 2
 
 
-def test_nesting_two_levels_deep_is_refused(mp):
+def test_nesting_two_levels_deep_is_refused(monkeypatch):
     """A child runtime must refuse to nest further. Asserted against the depth
     guard directly — driving it through two library workflows would depend on a
     library entry that itself nests, and would pass for the wrong reason if the
     inner name simply failed to resolve."""
-    _install(mp)
+    _install(monkeypatch)
     import tempfile
     from workflows import journal as _J
     d = tempfile.mkdtemp(prefix="wfnest-")
@@ -3946,8 +3949,8 @@ def test_nesting_two_levels_deep_is_refused(mp):
         assert "one level" in str(e).lower() or "nested" in str(e).lower()
 
 
-def test_child_events_carry_a_group_label(mp):
-    _install(mp)
+def test_child_events_carry_a_group_label(monkeypatch):
+    _install(monkeypatch)
     events = []
     workflows.run(src=CHILD_CALLER, run_root=_root(), on_event=events.append)
     grouped = [e for e in events if e.get("group")]
@@ -4062,8 +4065,8 @@ Expected: `OK` from each, exit 0
 
 Run the pre-existing suite to confirm no regression:
 
-Run: `python tests/test_delegation.py && python tests/test_delegation_nudges.py && python tests/test_agent_delegation_wave.py && python tests/test_subagent_routing.py && python tests/test_model_ladder.py && python tests/test_model_effort.py && python tests/test_llm_subagent_context.py && python tests/test_conversation_tokens.py && python tests/test_tool_meta_coverage.py && python tests/test_fs_api.py && python tests/test_host_exec.py && python tests/test_frontend_js.py`
-Expected: `OK` from each
+Run: `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`
+Expected: **3 failed, 253 passed, 1 skipped** plus your new tests in the passed count. Those same 3 pre-existing environmental failures and NO others (see Global Constraints).
 
 - [ ] **Step 5: Commit**
 
@@ -4157,7 +4160,7 @@ After Task 13, the whole thing should be green from a cold shell:
 
 ```bash
 cd omni-agent
-for t in schema sandbox journal runtime run library tool; do python tests/test_workflow_$t.py || echo "FAILED: $t"; done
+for t in schema sandbox journal runtime run library tool; do .venv/Scripts/python.exe tests/test_workflow_$t.py || echo "FAILED: $t"; done
 python tests/test_subagent_schema.py
 python tests/test_ultra_mode.py
 node tests/frontend/test_workflow_view.mjs
@@ -4166,18 +4169,10 @@ node tests/frontend/test_workflow_view.mjs
 And the pre-existing suite must still pass — the only files this plan modifies that other tests cover are `subagents.py`, `tool_registry.py`, `agent.py`, `frontend/app.js` and `frontend/index.html`:
 
 ```bash
-python tests/test_delegation.py
-python tests/test_delegation_nudges.py
-python tests/test_agent_delegation_wave.py
-python tests/test_subagent_routing.py
-python tests/test_model_ladder.py
-python tests/test_model_effort.py
-python tests/test_llm_subagent_context.py
-python tests/test_conversation_tokens.py
-python tests/test_tool_meta_coverage.py
-python tests/test_fs_api.py
-python tests/test_host_exec.py
-python tests/test_frontend_js.py
+# Whole pre-existing suite. Green == 3 failed / 253 passed / 1 skipped + our new tests.
+# The 3 failures are pre-existing and environmental; see Global Constraints.
+.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend
+
 node tests/frontend/test_boot.mjs
 node tests/frontend/test_element_ids.mjs
 node tests/frontend/test_tailwind_classes.mjs
