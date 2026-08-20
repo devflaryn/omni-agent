@@ -29,6 +29,10 @@ const FRONTEND = path.join(here, '..', '..', 'frontend');
 const tw = fs.readFileSync(path.join(FRONTEND, 'tailwind.css'), 'utf8');
 const html = fs.readFileSync(path.join(FRONTEND, 'index.html'), 'utf8');
 const appJs = fs.readFileSync(path.join(FRONTEND, 'app.js'), 'utf8');
+// workflow_view.js is a separate UI file (kept out of app.js on purpose) and
+// gets the same class protection as everything else.
+const workflowViewJs = fs.readFileSync(path.join(FRONTEND, 'workflow_view.js'), 'utf8');
+const jsSources = appJs + '\n' + workflowViewJs;
 
 // Classes defined by the project itself, in index.html's <style> block.
 const styleBlock = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
@@ -52,13 +56,13 @@ function classesIn(source) {
     for (const c of m[1].split(/\s+/)) if (c) out.add(c);
   }
   // classList.add('foo') / classList.toggle('foo', x) / className = 'a b'
-  for (const m of appJs.matchAll(/classList\.(?:add|remove|toggle|contains)\('([^']+)'/g)) {
+  for (const m of jsSources.matchAll(/classList\.(?:add|remove|toggle|contains)\('([^']+)'/g)) {
     out.add(m[1]);
   }
   return out;
 }
 
-const used = new Set([...classesIn(html), ...classesIn(appJs)]);
+const used = new Set([...classesIn(html), ...classesIn(jsSources)]);
 
 // Only judge classes that LOOK like Tailwind utilities we can verify. Skip
 // project classes and bare words that are clearly component names.
@@ -129,9 +133,15 @@ for (const bad of ['t-xs', 'flex', 'text-term-cyan']) {
 assert.ok(VARIANT_ARBITRARY.test('md:w-[10px]'),
   'VARIANT_ARBITRARY regex no longer matches md:w-[10px]');
 
-// The escaping this test relies on must keep working: these two are the most
-// heavily escaped selectors in the sheet (comma -> \2c, parens, %, /).
-for (const cls of ['mx-[max(20px,calc((100%-64rem)/2))]', 'text-[10.5px]']) {
+// The escaping this test relies on must keep working: these two exercise the
+// heaviest escapes in the sheet (comma -> \2c, parens, %, / and the decimal
+// point). `text-[10.5px]` used to be the decimal-point fixture here, but it
+// is no longer referenced anywhere in index.html or app.js (the .t-* type
+// ramp replaced it) — a freshly rebuilt tailwind.css correctly no longer
+// contains it, so pinning to it was asserting stale build output rather than
+// the escaping behavior. `gap-1.5` is a live, currently-used class that hits
+// the same dot-escape path (`.gap-1\.5`).
+for (const cls of ['mx-[max(20px,calc((100%-64rem)/2))]', 'gap-1.5']) {
   assert.ok(unescaped.includes('.' + cls),
     `un-escaping is broken: could not find .${cls} after normalising tailwind.css`);
 }

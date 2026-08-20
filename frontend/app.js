@@ -2383,6 +2383,12 @@ window.__agent = {
       case 'subagent_progress': subagentProgress(ev); break;
       case 'subagent_done': subagentDone(ev); break;
       case 'wave_done': waveDone(ev); break;
+      case 'workflow_started': workflowStarted(ev); break;
+      case 'wf_phase': workflowPhase(ev); break;
+      case 'wf_agent_started': workflowAgentStarted(ev); break;
+      case 'wf_agent_done': workflowAgentDone(ev); break;
+      case 'wf_log': workflowLog(ev); break;
+      case 'workflow_done': workflowDone(ev); break;
       case 'done': onDone(); break;
     }
     // No scrollDown() here: every renderer that appends to the chat already
@@ -3603,10 +3609,10 @@ function resetGraph() {
 
 function switchTab(tab) {
   activeTab = tab;
-  const chatTab = $('chatTab'), graphTab = $('graphTab'), planTab = $('planTab');
-  const tabChat = $('tabChat'), tabGraph = $('tabGraph'), tabPlan = $('tabPlan');
-  const allTabs = [chatTab, graphTab, planTab];
-  const allBtns = [tabChat, tabGraph, tabPlan];
+  const chatTab = $('chatTab'), graphTab = $('graphTab'), planTab = $('planTab'), workflowTab = $('workflowTab');
+  const tabChat = $('tabChat'), tabGraph = $('tabGraph'), tabPlan = $('tabPlan'), tabWorkflow = $('tabWorkflow');
+  const allTabs = [chatTab, graphTab, planTab, workflowTab];
+  const allBtns = [tabChat, tabGraph, tabPlan, tabWorkflow];
 
   allTabs.forEach(el => el.classList.add('hidden'));
   graphTab.classList.remove('flex');
@@ -3618,7 +3624,7 @@ function switchTab(tab) {
     btn.classList.remove('active');
     btn.setAttribute('aria-selected', 'false');
   });
-  const activeBtn = tab === 'graph' ? tabGraph : tab === 'plan' ? tabPlan : tabChat;
+  const activeBtn = tab === 'graph' ? tabGraph : tab === 'plan' ? tabPlan : tab === 'workflow' ? tabWorkflow : tabChat;
   activeBtn.classList.add('active');
   activeBtn.setAttribute('aria-selected', 'true');
 
@@ -3639,6 +3645,8 @@ function switchTab(tab) {
     planTab.classList.remove('hidden');
     planTab.classList.add('flex');
     renderPlanTab(currentPlan);
+  } else if (tab === 'workflow') {
+    workflowTab.classList.remove('hidden');
   } else {
     chatTab.classList.remove('hidden');
   }
@@ -4330,6 +4338,7 @@ async function init() {
   $('tabChat').addEventListener('click', () => switchTab('chat'));
   $('tabPlan').addEventListener('click', () => switchTab('plan'));
   $('tabGraph').addEventListener('click', () => switchTab('graph'));
+  $('tabWorkflow').addEventListener('click', () => switchTab('workflow'));
   $('planBadge').addEventListener('click', () => switchTab('plan'));
   $('graphModeToggle').addEventListener('click', toggleGraphMode);
   // Manual build controls (fixes the "no graph yet" dead-end + enables one graph

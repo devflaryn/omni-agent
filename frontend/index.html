@@ -975,6 +975,57 @@
          flat wash still reads as "pending". */
       .skeleton { animation: none; background-image: none; background-color: rgb(var(--shimmer-base) / .22); }
     }
+
+    /* ---- workflow progress: phase tree (Workflow tab) + inline run card ----
+       Status dots follow the same raw --term-* fill convention as the other
+       small status indicators in this file (e.g. the online dot at ~1094);
+       only TEXT is repointed to the -fg variants, per the contrast policy
+       above. */
+    .wf-dot {
+      display: inline-block; flex-shrink: 0;
+      width: 8px; height: 8px; border-radius: var(--radius-full);
+      background: rgb(var(--term-muted));
+    }
+    .wf-dot-run { background: rgb(var(--term-cyan)); animation: wf-pulse 1.4s ease-in-out infinite; }
+    .wf-dot-ok { background: rgb(var(--term-green)); }
+    .wf-dot-fail { background: rgb(var(--term-red)); }
+    .wf-dot-warn { background: rgb(var(--term-orange)); }
+    @keyframes wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+
+    .wf-badge {
+      display: inline-flex; align-items: center; justify-content: center;
+      min-width: 16px; height: 16px; margin-left: var(--space-1);
+      padding: 0 5px; border-radius: var(--radius-full);
+      border: 1px solid rgb(var(--term-cyan) / .4);
+      background: rgb(var(--term-cyan) / .15);
+      color: rgb(var(--term-cyan-fg));
+      font-size: var(--text-2xs); line-height: 14px;
+    }
+    .wf-badge.hidden { display: none; }
+
+    .wf-card-head, .wf-run-head {
+      display: flex; align-items: center; gap: var(--space-2);
+    }
+    .wf-card-name, .wf-run-name { font-size: var(--text-sm); font-weight: 500; color: rgb(var(--term-text)); }
+    .wf-card-meta, .wf-run-desc {
+      font-size: var(--text-xs); color: rgb(var(--term-muted));
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+
+    .wf-phase { margin-top: var(--space-3); }
+    .wf-phase-title {
+      font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: .08em;
+      color: rgb(var(--term-muted)); margin-bottom: var(--space-1);
+    }
+    .wf-agent {
+      display: flex; align-items: center; gap: var(--space-2);
+      padding: var(--space-1) 0;
+    }
+    .wf-agent-label { font-size: var(--text-sm); color: rgb(var(--term-text)); }
+    .wf-agent-meta { font-size: var(--text-2xs); color: rgb(var(--term-muted)); margin-left: auto; }
+
+    .wf-logs { margin-top: var(--space-3); border-top: 1px solid rgb(var(--term-line)); padding-top: var(--space-2); }
+    .wf-log { font-size: var(--text-xs); color: rgb(var(--term-muted)); padding: 2px 0; }
   </style>
 </head>
 <body class="h-full font-sans t-base text-term-text antialiased">
@@ -1114,6 +1165,7 @@
           <button id="tabChat" class="llm-tab" role="tab" aria-selected="true" aria-controls="chatTab">Chat</button>
           <button id="tabPlan" class="llm-tab" role="tab" aria-selected="false" aria-controls="planTab">Plan</button>
           <button id="tabGraph" class="llm-tab" role="tab" aria-selected="false" aria-controls="graphTab">Knowledge Graph</button>
+          <button id="tabWorkflow" class="llm-tab" role="tab" aria-selected="false" aria-controls="workflowTab">Workflow<span id="workflowTabBadge" class="wf-badge hidden"></span></button>
         </div>
       </div>
 
@@ -1121,6 +1173,9 @@
       <div id="chatTab" class="flex-1 flex flex-col min-h-0">
         <!-- transcript (padding centers a readable column, like claude.ai) -->
         <div id="chat" class="selectable flex-1 overflow-y-auto py-4 space-y-1 px-[max(20px,calc((100%-64rem)/2))]"></div>
+
+        <!-- compact inline card for the currently running workflow -->
+        <div id="workflowCard" class="hidden mx-[max(20px,calc((100%-64rem)/2))] mb-2 rounded-xl border border-term-line bg-term-panel px-3 py-2"></div>
 
         <!-- memory summary banner -->
         <div id="memoryBanner" class="hidden mb-2 rounded-xl border border-term-orange/40 bg-term-orange/10 px-3 py-2 t-xs text-term-orange mx-[max(20px,calc((100%-64rem)/2))]">
@@ -1213,6 +1268,12 @@
           <div id="graphLegend" class="flex-1 overflow-y-auto px-2 py-1"></div>
           <div id="graphStats" class="px-3 py-2 border-t border-term-line t-2xs text-term-muted"></div>
         </div>
+      </div>
+
+      <!-- WORKFLOW TAB -->
+      <div id="workflowTab" class="scroll-y hidden flex-1 px-3 py-2" role="tabpanel">
+        <div id="workflowEmpty" class="text-term-muted t-xs">No workflow has run yet.</div>
+        <div id="workflowTree"></div>
       </div>
     </main>
   </div>
@@ -1411,6 +1472,7 @@
   <div id="toasts" aria-live="polite"></div>
 
   <script defer src="wave_stats.js"></script>
+  <script defer src="workflow_view.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
