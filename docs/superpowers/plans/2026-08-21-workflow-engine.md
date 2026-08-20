@@ -2158,8 +2158,11 @@ import uuid
 
 from . import journal as _journal
 from . import sandbox as _sandbox
-from .runtime import WorkflowRuntime, WorkflowAborted
 from .sandbox import WorkflowScriptError
+# NOTE: `.runtime` is imported INSIDE the functions below, never here. It pulls in
+# `subagents`, which imports `workflows.schema`, which executes this __init__ —
+# a module-level import creates a real cycle that breaks `import subagents`
+# app-wide. See the mandatory note in the task text.
 
 _ACTIVE = {}        # run_id -> WorkflowRuntime
 
@@ -2181,6 +2184,7 @@ def _resolve_source(src, name):
 def _dry_run(code, meta, args, concurrency):
     """Execute the whole script with agent() stubbed. Catches shape bugs, unknown
     personas, and unscoped writers for free."""
+    from .runtime import WorkflowRuntime      # function-level: breaks the cycle
     import tempfile
     tmp = os.path.join(tempfile.mkdtemp(prefix="wfdry-"), "journal.jsonl")
     j = _journal.Journal(tmp)
@@ -2257,6 +2261,7 @@ def run(src=None, name=None, args=None, run_root=".", on_event=None,
             "RESULTS, not workspace side effects — files those agents already "
             "changed stay changed, and their work will not be re-applied.")
 
+    from .runtime import WorkflowRuntime       # function-level: breaks the cycle
     rt = WorkflowRuntime(j, on_event=on_event, run_dir=run_dir,
                          concurrency=concurrency, run_id=run_id)
     _ACTIVE[run_id] = rt
@@ -2270,6 +2275,7 @@ def run(src=None, name=None, args=None, run_root=".", on_event=None,
 
     ok, error, value = True, "", None
     try:
+        from .runtime import WorkflowAborted   # function-level: breaks the cycle
         code = _sandbox.compile_workflow(src)
         ns = _sandbox.make_namespace(rt.primitives(), args)
         exec(code, ns)
@@ -2313,7 +2319,25 @@ def active_runs():
     return list(_ACTIVE.keys())
 ```
 
-Note the import ordering trap: `workflows/runtime.py` imports `subagents`, and Task 4 made `subagents` import `workflows.schema`. That is fine — `workflows/__init__.py` must NOT import `runtime` at module scope before `schema` is importable. It doesn't: `schema` has no intra-package imports, so `subagents` → `workflows.schema` resolves without touching `runtime`. If a circular-import error appears, move `from .runtime import ...` inside the functions.
+**MANDATORY — the circular import.** `workflows/runtime.py` imports `subagents`, and Task 4 made `subagents` import `workflows.schema`. Importing *any* submodule executes the package `__init__` first, so a module-level `from .runtime import ...` here creates a genuine cycle:
+
+```
+import subagents
+  → from workflows import schema          # runs workflows/__init__.py
+    → from .runtime import WorkflowRuntime
+      → from subagents import run_subagent  # subagents is partially initialized
+        → ImportError: cannot import name 'run_subagent'
+```
+
+This breaks `agent.py`'s import of `subagents` — the whole app, not just workflows. It has been reproduced; do not treat it as hypothetical.
+
+**Therefore `workflows/__init__.py` must NOT import `.runtime` at module level.** Put `from .runtime import WorkflowRuntime, WorkflowAborted` *inside* `_dry_run()` and `run()` (both need it). `from . import journal` and `from . import sandbox` stay at module level — neither touches `subagents`. Function-level imports to break cycles are already this repo's idiom; see `tools/delegation_tools.py`.
+
+Verify with:
+
+```bash
+python -c "import subagents; import workflows; print('no cycle')"
+```
 
 - [ ] **Step 4: Run test to verify it passes**
 
