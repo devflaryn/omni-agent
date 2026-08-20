@@ -200,7 +200,73 @@ class WorkflowRuntime:
                     "elapsed_s": elapsed})
         return value
 
+    def _spawn(self, fns):
+        """Run each zero-arg fn on its own thread; return results in input order.
+
+        A raising fn resolves to None rather than propagating: one bad branch
+        must not take down the wave. Threads are deliberately unbounded here —
+        the semaphore inside agent() is what caps real work. See the module
+        docstring for why a pool would deadlock."""
+        if len(fns) > MAX_ITEMS:
+            raise WorkflowScriptError(
+                f"too many items: {len(fns)} exceeds the per-call cap of "
+                f"{MAX_ITEMS}. Batch the work or narrow the input; the cap is an "
+                f"explicit error rather than a silent truncation."
+            )
+        results = [None] * len(fns)
+        threads = []
+
+        def runner(i, fn):
+            try:
+                results[i] = fn()
+            except WorkflowAborted:
+                results[i] = None
+            except Exception as e:      # noqa: BLE001 — isolated per branch
+                results[i] = None
+                self.log(f"branch {i} failed: {type(e).__name__}: {e}")
+
+        for i, fn in enumerate(fns):
+            t = threading.Thread(target=runner, args=(i, fn), daemon=True)
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+        return results
+
+    def parallel(self, thunks):
+        """Run every thunk concurrently and WAIT for all of them — a barrier.
+
+        Use only when a later stage genuinely needs all results together (dedup
+        across the full set, an early exit on a zero count). Otherwise prefer
+        pipeline(), which has no barrier."""
+        self._check_abort()
+        return self._spawn(list(thunks))
+
+    def pipeline(self, items, *stages):
+        """Run each item through every stage independently — NO barrier between
+        stages. Item A can be in stage 3 while item B is still in stage 1, so
+        wall-clock is the slowest single chain rather than the sum of the
+        slowest-per-stage.
+
+        Every stage is called as stage(prev_result, original_item, index); the
+        first stage receives the item itself as prev_result. A stage that raises
+        drops that item to None and skips its remaining stages."""
+        self._check_abort()
+        items = list(items)
+
+        def chain(item, index):
+            def run():
+                value = item
+                for stage in stages:
+                    self._check_abort()
+                    value = stage(value, item, index)
+                return value
+            return run
+
+        return self._spawn([chain(item, i) for i, item in enumerate(items)])
+
     def primitives(self):
-        """The names injected into a script's namespace. parallel/pipeline are
-        added in Task 6, workflow() in Task 14."""
-        return {"agent": self.agent, "phase": self.phase, "log": self.log}
+        """The names injected into a script's namespace. workflow() is added in
+        Task 14."""
+        return {"agent": self.agent, "phase": self.phase, "log": self.log,
+                "parallel": self.parallel, "pipeline": self.pipeline}

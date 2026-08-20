@@ -200,6 +200,127 @@ def test_label_defaults_to_a_trimmed_prompt(monkeypatch):
     assert 0 < len(label) <= 48
 
 
+def test_parallel_returns_results_in_input_order(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+    rt = _rt()
+    out = rt.parallel([lambda i=i: rt.agent(f"p{i}") for i in range(5)])
+    assert out == ["p0", "p1", "p2", "p3", "p4"]
+
+
+def test_parallel_isolates_a_raising_thunk_as_none(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+    rt = _rt()
+
+    def boom():
+        raise ValueError("nope")
+
+    out = rt.parallel([lambda: rt.agent("ok"), boom])
+    assert out[0] == "ok" and out[1] is None
+
+
+def test_parallel_actually_runs_concurrently(monkeypatch):
+    gate = threading.Barrier(3, timeout=5)
+
+    def waits(ad, p, **k):
+        gate.wait()          # deadlocks and raises BrokenBarrier if serialized
+        return {"ok": True, "report": p, "raw_report": p}
+
+    _install(monkeypatch, waits)
+    rt = _rt(concurrency=3)
+    out = rt.parallel([lambda i=i: rt.agent(f"p{i}") for i in range(3)])
+    assert out == ["p0", "p1", "p2"]
+
+
+def test_pipeline_threads_each_item_through_every_stage(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+    rt = _rt()
+    out = rt.pipeline(
+        ["a", "b"],
+        lambda item, orig, i: rt.agent(f"one:{item}"),
+        lambda prev, orig, i: f"{prev}|two:{orig}:{i}",
+    )
+    assert out == ["one:a|two:a:0", "one:b|two:b:1"]
+
+
+def test_pipeline_stage_receives_original_item_and_index(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+    rt = _rt()
+    seen = []
+    rt.pipeline(["x", "y"],
+                lambda item, orig, i: seen.append((item, orig, i)) or "s1",
+                lambda prev, orig, i: seen.append((prev, orig, i)) or "s2")
+    assert ("x", "x", 0) in seen and ("s1", "y", 1) in seen
+
+
+def test_pipeline_drops_a_failing_item_to_none_and_skips_its_rest(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+    rt = _rt()
+    reached = []
+
+    def stage1(item, orig, i):
+        if item == "bad":
+            raise ValueError("nope")
+        return item
+
+    def stage2(prev, orig, i):
+        reached.append(orig)
+        return prev
+
+    out = rt.pipeline(["good", "bad"], stage1, stage2)
+    assert out[0] == "good" and out[1] is None
+    assert reached == ["good"]      # the failed item never reached stage 2
+
+
+def test_pipeline_has_no_barrier_between_stages(monkeypatch):
+    # Item A must be able to reach stage 2 while item B is still in stage 1.
+    # If a barrier existed, A would wait for B and this barrier would break.
+    cross = threading.Barrier(2, timeout=5)
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+    rt = _rt(concurrency=4)
+
+    def stage1(item, orig, i):
+        if orig == "slow":
+            cross.wait()        # released only by 'fast' arriving in stage 2
+        return orig
+
+    def stage2(prev, orig, i):
+        if orig == "fast":
+            cross.wait()
+        return prev
+
+    out = rt.pipeline(["slow", "fast"], stage1, stage2)
+    assert sorted(x for x in out if x) == ["fast", "slow"]
+
+
+def test_item_cap_is_an_explicit_error_not_a_silent_truncation(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "r", "raw_report": "r"})
+    rt = _rt()
+    try:
+        rt.parallel([lambda: None] * (R.MAX_ITEMS + 1))
+        raise AssertionError("expected an error")
+    except Exception as e:
+        assert str(R.MAX_ITEMS) in str(e)
+
+
+def test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one(monkeypatch):
+    """THE deadlock regression guard.
+
+    A shared ThreadPoolExecutor design fails here: pipeline items take every
+    worker slot, then each calls parallel() whose branches call agent() and wait
+    for a slot only the blocked items could free. Threads-plus-a-semaphore does
+    not, because threads are unbounded and only the semaphore is contended."""
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+    rt = _rt(concurrency=1)
+    out = rt.pipeline(
+        ["a", "b", "c"],
+        lambda item, orig, i: rt.parallel([lambda o=orig: rt.agent(f"x:{o}"),
+                                           lambda o=orig: rt.agent(f"y:{o}")]),
+        lambda prev, orig, i: rt.parallel([lambda p=prev: rt.agent(f"z:{p[0]}")]),
+    )
+    assert len(out) == 3
+    assert out[0] == ["z:x:a"]
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -216,7 +337,16 @@ if __name__ == "__main__":
              test_abort_stops_further_agent_calls,
              test_phase_from_a_branch_thread_raises_with_the_fix_named,
              test_events_are_emitted_for_started_and_done,
-             test_label_defaults_to_a_trimmed_prompt]
+             test_label_defaults_to_a_trimmed_prompt,
+             test_parallel_returns_results_in_input_order,
+             test_parallel_isolates_a_raising_thunk_as_none,
+             test_parallel_actually_runs_concurrently,
+             test_pipeline_threads_each_item_through_every_stage,
+             test_pipeline_stage_receives_original_item_and_index,
+             test_pipeline_drops_a_failing_item_to_none_and_skips_its_rest,
+             test_pipeline_has_no_barrier_between_stages,
+             test_item_cap_is_an_explicit_error_not_a_silent_truncation,
+             test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one]
     failed = 0
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:
