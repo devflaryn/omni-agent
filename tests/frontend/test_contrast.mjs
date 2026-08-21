@@ -46,7 +46,7 @@ const light = { ...dark, ...vars('html.light') }; // light overrides a subset
 
 let checked = 0;
 for (const [themeName, theme] of [['dark', dark], ['light', light]]) {
-  for (const surface of ['term-bg', 'term-panel']) {
+  for (const surface of ['term-bg', 'term-panel', 'term-raised']) {
     assert.ok(theme[surface], `${themeName}: missing --${surface}`);
 
     // muted is body-adjacent text and must also clear AA.
@@ -69,7 +69,7 @@ for (const [themeName, theme] of [['dark', dark], ['light', light]]) {
     `${themeName}: --term-text should clear AAA (7:1) on --term-bg`);
 }
 
-assert.equal(checked, 28, `expected 28 contrast checks, ran ${checked}`);
+assert.equal(checked, 42, `expected 42 contrast checks, ran ${checked}`);
 
 // The whole point of the -fg split: the plain accents stay vivid for fills, so
 // at least one of them is ALLOWED to fail as text. If every -fg equalled its

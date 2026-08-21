@@ -23,6 +23,7 @@ module.exports = {
         term: {
           bg: 'rgb(var(--term-bg) / <alpha-value>)',
           panel: 'rgb(var(--term-panel) / <alpha-value>)',
+          raised: 'rgb(var(--term-raised) / <alpha-value>)',
           line: 'rgb(var(--term-line) / <alpha-value>)',
           muted: 'rgb(var(--term-muted) / <alpha-value>)',
           green: 'rgb(var(--term-green) / <alpha-value>)',

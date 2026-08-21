@@ -39,35 +39,35 @@
 
     :root {
       color-scheme: dark;
-      /* Claude dark: warm charcoal surfaces, cream text, terracotta accent */
-      --term-bg: 38 38 36;        /* #262624 */
-      --term-panel: 48 48 46;     /* #30302E */
-      --term-line: 64 62 58;      /* #403E3A */
-      --term-muted: 157 154 145;  /* #9D9A91 */
-      --term-text: 237 235 227;   /* #EDEBE3 */
-      --term-green: 133 165 113;
-      --term-magenta: 140 169 198;
-      --term-orange: 217 164 91;
-      --term-cyan: 217 119 87;    /* accent — Claude terracotta #D97757 */
-      --term-red: 229 117 106;
-      --term-gray: 138 135 127;
-      --shimmer-base: 146 143 135;
-      --shimmer-hi: 253 252 248;
-      --shimmer-glow: rgba(255, 255, 255, .16);
+      /* "Instrument": cool machined graphite, one warm signal.
+         Surfaces separate by TONE — bg / panel / raised — and --term-line is
+         reserved for real edges (inputs, focus, the run rail), never for
+         outlining a panel. Every value below is contrast-verified; see
+         docs/superpowers/specs/2026-08-21-ui-restyle-design.md. */
+      --term-bg: 19 21 24;         /* #131518 */
+      --term-panel: 23 25 28;      /* #17191C */
+      --term-raised: 31 34 38;     /* #1F2226 — selected tab, hovered row, chip */
+      --term-line: 42 46 51;       /* #2A2E33 */
+      --term-muted: 154 160 166;   /* #9AA0A6 — 6.93 bg / 6.67 panel */
+      --term-text: 232 234 236;    /* #E8EAEC — 15.16 on bg */
+      --term-cyan: 230 164 74;     /* #E6A44A — the accent */
+      --term-green: 127 159 122;   /* #7F9F7A */
+      --term-magenta: 138 155 176; /* #8A9BB0 */
+      --term-orange: 194 154 94;   /* #C29A5E — duller than the accent on purpose */
+      --term-red: 196 115 107;     /* #C4736B */
+      --term-gray: 95 106 114;     /* #5F6A72 */
 
-      /* TEXT variants of the accents. The values above are tuned for fills,
-         borders and dots; as small text on --term-panel several of them fell
-         under the WCAG AA 4.5:1 floor (cyan 4.24, red 4.46, gray 3.69). These
-         hold hue and saturation and move only lightness until they clear 4.5
-         against BOTH --term-panel and --term-bg. Use -fg for any text; use the
-         plain variable for everything else.
-         Asserted by tests/frontend/test_contrast.mjs. */
-      --term-cyan-fg: 219 128 98;     /* #DB8062 — panel 4.58, bg 5.25 */
-      --term-red-fg: 230 120 109;     /* #E6786D — panel 4.58, bg 5.25 */
-      --term-gray-fg: 154 152 145;    /* #9A9891 — panel 4.58, bg 5.25 */
-      --term-green-fg: 133 165 113;   /* already 4.80 / 5.50 */
-      --term-magenta-fg: 140 169 198; /* already 5.42 / 6.21 */
-      --term-orange-fg: 217 164 91;   /* already 5.93 / 6.79 */
+      /* Five of six -fg variants equal their base: the desaturated status
+         palette already clears AA. Only gray needed lifting (base is 3.30). */
+      --term-cyan-fg: 230 164 74;     /* 8.51 / 8.20 */
+      --term-green-fg: 127 159 122;   /* 6.22 / 5.99 */
+      --term-red-fg: 196 115 107;     /* 5.24 / 5.04 */
+      --term-magenta-fg: 138 155 176; /* 6.44 / 6.20 */
+      --term-orange-fg: 194 154 94;   /* 7.04 / 6.78 */
+      --term-gray-fg: 138 147 153;    /* #8A9399 — 5.85 bg / 5.63 panel / 5.11 raised */
+      --shimmer-base: 122 130 137;
+      --shimmer-hi: 232 234 236;
+      --shimmer-glow: rgba(255, 255, 255, .12);
 
       /* ---- spacing: 4px grid ---- */
       --space-1: 4px;  --space-2: 8px;  --space-3: 12px;
@@ -106,30 +106,22 @@
     }
     html.light {
       color-scheme: light;
-      /* Claude light: ivory / pampas surfaces, near-black text */
-      --term-bg: 250 249 245;     /* #FAF9F5 */
-      --term-panel: 240 238 229;  /* #F0EEE5 */
-      --term-line: 223 220 209;   /* #DFDCD1 */
-      --term-muted: 110 107 99;   /* #6E6B63 */
-      --term-text: 20 20 19;      /* #141413 */
-      --term-green: 92 130 74;
-      --term-magenta: 90 122 156;
-      --term-orange: 158 108 33;
-      --term-cyan: 192 91 57;     /* accent — terracotta, darkened for contrast */
-      --term-red: 193 65 54;
-      --term-gray: 131 128 120;
-      --shimmer-base: 168 165 155;
-      --shimmer-hi: 66 63 55;
-      --shimmer-glow: rgba(0, 0, 0, .05);
-
-      /* Light theme failed AA on panel across the board (every accent landed
-         between 3.4 and 4.4). Darkened to clear 4.5 on both surfaces. */
-      --term-cyan-fg: 171 81 51;      /* #AB5133 — panel 4.57, bg 5.04 */
-      --term-red-fg: 189 64 53;       /* #BD4035 — panel 4.58, bg 5.05 */
-      --term-green-fg: 82 116 66;     /* #527442 — panel 4.59, bg 5.06 */
-      --term-magenta-fg: 81 110 141;  /* #516E8D — panel 4.56, bg 5.03 */
-      --term-orange-fg: 144 98 30;    /* #90621E — panel 4.57, bg 5.04 */
-      --term-gray-fg: 110 107 101;    /* #6E6B65 — panel 4.57, bg 5.04 */
+      /* Instrument light: a neutral base with the same warm signal accent. */
+      --term-bg: 250 250 250;      /* #FAFAFA */
+      --term-panel: 255 255 255;   /* #FFFFFF */
+      --term-raised: 241 242 244;  /* #F1F2F4 */
+      --term-line: 227 229 232;    /* #E3E5E8 */
+      --term-muted: 90 97 103;     /* #5A6167 — 6.02 / 6.29 */
+      --term-text: 26 28 31;       /* #1A1C1F — 16.36 on bg */
+      --term-cyan-fg: 138 98 44;      /* #8A622C — 5.21 / 5.43 / 4.85 raised */
+      --term-green-fg: 90 113 87;     /* #5A7157 — 5.11 / 5.34 / 4.76 */
+      --term-red-fg: 153 90 83;       /* #995A53 — 5.10 / 5.33 / 4.76 */
+      --term-magenta-fg: 97 108 123;  /* #616C7B — 5.11 / 5.33 / 4.76 */
+      --term-orange-fg: 128 102 62;   /* #80663E — 5.17 / 5.40 / 4.82 */
+      --term-gray-fg: 95 106 114;     /* #5F6A72 — 5.31 / 5.54 */
+      --shimmer-base: 150 155 160;
+      --shimmer-hi: 26 28 31;
+      --shimmer-glow: rgba(0, 0, 0, .08);
     }
     html, body { background: rgb(var(--term-bg)); }
     /* Smooth hovers on interactive elements only. (This used to be a universal
