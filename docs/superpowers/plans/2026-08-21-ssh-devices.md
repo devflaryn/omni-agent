@@ -658,7 +658,7 @@ git commit -m "feat(devices): ssh discovery preferring MSYS, multiplexed argv, t
 
 **Interfaces:**
 - Consumes: `devices.active()`, `devices.run_argv`, `devices.reap_argv`, `devices.find_ssh`, `devices.NO_SSH_MSG`.
-- Produces: `host_exec.run_cmd` routes remote; `host_exec.workspace_root()` returns `None` when a device is active; `host_exec._SSH_ERROR_SIGNATURES`.
+- Produces: `host_exec.run_cmd` routes remote; `host_exec.run_on(device, command, timeout=DEFAULT_TIMEOUT)`; `host_exec.workspace_root()` returns `None` when a device is active; `host_exec._SSH_ERROR_SIGNATURES`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -742,6 +742,19 @@ def test_missing_ssh_never_falls_back_to_local(monkeypatch):
     assert res["returncode"] != 0 and "error" in res
 
 
+def test_run_on_targets_an_explicit_device_without_touching_global_state(monkeypatch):
+    # Probing an unselected device must not swap the global active device: the
+    # picker thread and the agent loop run concurrently, so that would route a
+    # live tool call to the machine being TESTED.
+    monkeypatch.setattr(devices, "_active", None)
+    monkeypatch.setattr(devices, "find_ssh", lambda: "/usr/bin/ssh")
+    seen = _capture(monkeypatch)
+    other = devices.Device("other", "other-box", "root@other", "/srv/app")
+    host_exec.run_on(other, "uname -a")
+    assert "root@other" in seen["cmd"]
+    assert devices.active() is None, "run_on must not mutate the active device"
+
+
 def test_workspace_root_is_none_when_remote(monkeypatch):
     # Its callers do LOCAL file I/O on the returned path; None turns "operates on
     # a path that does not exist here" into a clean refusal.
@@ -809,6 +822,7 @@ if __name__ == "__main__":
              test_remote_builds_an_ssh_argv, test_remote_display_is_the_original_command,
              test_remote_does_not_require_a_local_workspace,
              test_missing_ssh_never_falls_back_to_local,
+             test_run_on_targets_an_explicit_device_without_touching_global_state,
              test_workspace_root_is_none_when_remote,
              test_ssh_transport_failure_is_reported_as_a_device_error,
              test_a_genuine_255_exit_is_passed_through,
@@ -938,10 +952,28 @@ def run_cmd(command, timeout=DEFAULT_TIMEOUT):
         ...   # unchanged from here down
 ```
 
+**Also export an explicit-device entry point.** `devices.probe()` (Task 4) must be
+able to run a command on a device that is NOT the active one — the picker's "Test
+connection" tests an unselected device. It must NOT do that by temporarily
+swapping the global active device: the picker runs on the pywebview API thread
+while the agent loop runs on its own, so a concurrent tool call would be routed to
+the machine being TESTED rather than the one selected. That is the exact
+wrong-machine failure the spec forbids. Give it an honest parameter instead:
+
+```python
+def run_on(device, command, timeout=DEFAULT_TIMEOUT):
+    """Run a command on an EXPLICIT device, regardless of which one is active.
+
+    Exists so probing an unselected device cannot race the agent loop: the
+    alternative — mutating the global active device around the call — would let a
+    concurrent tool call land on the wrong machine."""
+    return _run_remote(command, timeout, device)
+```
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `.venv/Scripts/python.exe tests/test_host_exec_remote.py`
-Expected: 11 × `PASS`, then `OK`, exit 0
+Expected: 12 × `PASS`, then `OK`, exit 0
 
 Run: `.venv/Scripts/python.exe -m pytest tests/ -q --ignore=tests/frontend`
 Expected: exactly the 3 pre-existing environmental failures from Global Constraints and NO others.
@@ -983,8 +1015,8 @@ def test_probe_parses_root_uname_and_missing_tools(monkeypatch):
         "OMNI_MISS=curl",
     ])
     import host_exec
-    monkeypatch.setattr(host_exec, "run_cmd",
-                        lambda cmd, timeout=None: {"stdout": out, "stderr": "", "returncode": 0})
+    monkeypatch.setattr(host_exec, "run_on",
+                        lambda dev, cmd, timeout=None: {"stdout": out, "stderr": "", "returncode": 0})
     res = devices.probe(devices.Device("i", "n", "h", "/home/berat/proj"))
     assert res["ok"] is True
     assert res["root"] == "/home/berat/proj"
@@ -994,10 +1026,10 @@ def test_probe_parses_root_uname_and_missing_tools(monkeypatch):
 
 def test_probe_reports_failure_without_raising(monkeypatch):
     import host_exec
-    monkeypatch.setattr(host_exec, "run_cmd",
-                        lambda cmd, timeout=None: {"stdout": "", "stderr": "boom",
-                                                   "returncode": 255,
-                                                   "error": "could not reach device"})
+    monkeypatch.setattr(host_exec, "run_on",
+                        lambda dev, cmd, timeout=None: {"stdout": "", "stderr": "boom",
+                                                        "returncode": 255,
+                                                        "error": "could not reach device"})
     res = devices.probe(devices.Device("i", "n", "h", "/r"))
     assert res["ok"] is False and "could not reach" in res["error"]
 
@@ -1030,7 +1062,7 @@ def probe(device):
 
     One round trip on purpose — each extra connection is a handshake unless
     multiplexing is up, and at probe time it is not yet."""
-    from host_exec import run_cmd   # imported here: host_exec imports THIS module
+    from host_exec import run_on   # imported here: host_exec imports THIS module
 
     checks = "; ".join(
         f'command -v {t} >/dev/null 2>&1 && echo OMNI_HAVE={t} || echo OMNI_MISS={t}'
@@ -1042,14 +1074,12 @@ def probe(device):
         'echo "OMNI_UNAME=$(uname -a 2>/dev/null || echo unknown)"; '
         + checks
     )
-    prev = _active
-    try:
-        # Probe the device being tested, which is not necessarily the active one
-        # (the picker's "Test connection" runs against an unselected device).
-        globals()["_active"] = device
-        res = run_cmd(script, timeout=30)
-    finally:
-        globals()["_active"] = prev
+    # run_on takes the device EXPLICITLY. Do not swap the global active device
+    # around this call: the picker runs on the pywebview thread while the agent
+    # loop runs on its own, so a concurrent tool call would be routed to the
+    # device being tested instead of the one selected — the wrong-machine failure
+    # the whole design exists to prevent.
+    res = run_on(device, script, timeout=30)
 
     if res.get("error") or res.get("returncode"):
         return {"ok": False, "root": "", "uname": "", "missing": [],
