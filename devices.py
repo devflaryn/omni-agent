@@ -125,3 +125,135 @@ def active_root():
     host_exec.workspace_root(), which is the LOCAL folder and returns None when
     a device is active."""
     return _active.remote_root if _active is not None else None
+
+
+import shlex
+import shutil
+
+IS_WINDOWS = os.name == "nt"
+
+# Multiplexing keeps one master connection alive so subsequent tool calls skip
+# the TCP+auth handshake. Without it a workflow's hundreds of calls each pay it.
+CONTROL_DIR = os.path.join(os.path.expanduser("~"), ".omni-agent", "ssh")
+CONTROL_PERSIST = "600"
+CONNECT_TIMEOUT = "10"
+
+NO_SSH_MSG = (
+    "No ssh client was found, so no command could run on the selected device.\n"
+    "Install Git for Windows (which ships ssh) or OpenSSH, then reselect the device."
+)
+
+_ssh_path = None
+
+
+def control_path():
+    """ControlPath template. MUST resolve to under 108 bytes — the Unix-socket
+    limit — or ssh refuses with 'ControlPath too long' and multiplexing silently
+    never happens. `%C` is a 64-char hash of (local host, remote host, port,
+    user), so the directory has to stay short."""
+    return os.path.join(CONTROL_DIR, "%C")
+
+
+def supports_multiplexing(ssh_path):
+    """Windows OpenSSH cannot multiplex — it fails with 'getsockname failed: Not
+    a socket'. It lives in System32, which is the same tell _find_posix_shell()
+    uses to skip the WSL bash stub."""
+    return "System32" not in (ssh_path or "").replace("/", "\\")
+
+
+def find_ssh():
+    """Absolute path of an ssh client, preferring the Git/MSYS one on Windows.
+
+    Mirrors host_exec._find_posix_shell(): `git.exe` is the reliable anchor
+    because its install carries usr/bin/ssh.exe, and Git is on virtually every
+    Windows dev box. The System32 copy is a last resort — it works, but without
+    connection multiplexing."""
+    global _ssh_path
+    if _ssh_path:
+        return _ssh_path
+
+    if not IS_WINDOWS:
+        _ssh_path = shutil.which("ssh")
+        return _ssh_path
+
+    git = shutil.which("git")
+    if git:
+        root = os.path.dirname(os.path.dirname(git))
+        for rel in (os.path.join("usr", "bin", "ssh.exe"), os.path.join("bin", "ssh.exe")):
+            cand = os.path.join(root, rel)
+            if os.path.isfile(cand):
+                _ssh_path = cand
+                return _ssh_path
+    for cand in (r"C:\Program Files\Git\usr\bin\ssh.exe",
+                 r"C:\msys64\usr\bin\ssh.exe"):
+        if os.path.isfile(cand):
+            _ssh_path = cand
+            return _ssh_path
+    _ssh_path = shutil.which("ssh")     # System32 fallback: no multiplexing
+    return _ssh_path
+
+
+def ssh_opts(ssh_path):
+    opts = ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={CONNECT_TIMEOUT}"]
+    if supports_multiplexing(ssh_path):
+        try:
+            os.makedirs(CONTROL_DIR, exist_ok=True)
+        except OSError:
+            return opts
+        opts += ["-o", "ControlMaster=auto",
+                 "-o", f"ControlPath={control_path()}",
+                 "-o", f"ControlPersist={CONTROL_PERSIST}"]
+    return opts
+
+
+def _pgid_file(tag):
+    # Quoted for the REMOTE shell; ${TMPDIR:-/tmp} keeps it working on hosts
+    # where /tmp is not the temp directory.
+    return f'"${{TMPDIR:-/tmp}}/.omni-{tag}.pgid"'
+
+
+def _wrapper(device, command, tag):
+    """The script the remote bash runs. Order matters: record the pgid first so
+    a reap can find us even if the command dies instantly."""
+    f = _pgid_file(tag)
+    lines = [
+        f"echo $$ > {f}",
+        f"trap 'rm -f {f}' EXIT",
+        'export PATH="$HOME/.omni-agent/bin:$PATH"',
+    ]
+    prelude = (device.env_prelude or "").strip()
+    if prelude:
+        lines.append(prelude)
+    # `|| exit 1` matters: without it a failed cd runs the command in the remote
+    # HOME directory — the wrong folder, with no error.
+    lines.append(f"cd {shlex.quote(device.remote_root)} || exit 1")
+    lines.append(command)
+    return "\n".join(lines)
+
+
+def _one_remote_arg(script):
+    """ssh joins every argument after the target with spaces and hands the result
+    to the remote LOGIN shell, so the whole thing must be ONE already-quoted
+    argument or it gets re-split on the far side."""
+    return "bash -c " + shlex.quote(script)
+
+
+def run_argv(device, command, tag, ssh_path=None):
+    ssh = ssh_path or find_ssh()
+    return [ssh, *ssh_opts(ssh), device.target, _one_remote_arg(_wrapper(device, command, tag))]
+
+
+def reap_argv(device, tag, ssh_path=None):
+    """Kill a still-running remote command by the process-group id its wrapper
+    recorded. `kill -TERM -PID` signals the whole GROUP so children die too; the
+    bare-PID fallback covers hosts where the remote bash is not a group leader."""
+    ssh = ssh_path or find_ssh()
+    f = _pgid_file(tag)
+    script = (
+        f'P=$(cat {f} 2>/dev/null); '
+        f'if [ -n "$P" ]; then kill -TERM -"$P" 2>/dev/null || kill -TERM "$P" 2>/dev/null; fi; '
+        f'sleep 1; '
+        f'if [ -n "$P" ]; then kill -KILL -"$P" 2>/dev/null || kill -KILL "$P" 2>/dev/null; fi; '
+        f'rm -f {f}; exit 0'
+    )
+    return [ssh, *ssh_opts(ssh), device.target, _one_remote_arg(script)]

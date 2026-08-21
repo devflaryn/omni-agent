@@ -108,20 +108,145 @@ def test_corrupt_registry_degrades_to_empty(monkeypatch):
     assert devices.load_devices() == []
 
 
+import shlex
+
+
+def _dev():
+    return devices.Device("id1", "box", "berat@10.0.0.5", "/home/berat/my proj")
+
+
+def test_control_path_is_under_the_108_byte_socket_limit():
+    # MSYS ssh rejects a longer ControlPath outright ("ControlPath too long"),
+    # which silently disables multiplexing and makes every tool call pay a full
+    # handshake.
+    cp = devices.control_path()
+    resolved = cp.replace("%C", "c" * 64)   # %C expands to a 64-char hash
+    assert len(resolved) < 108, f"{len(resolved)} bytes: {resolved}"
+
+
+def test_multiplexing_is_disabled_for_windows_openssh():
+    # Windows OpenSSH fails multiplexing with "getsockname failed: Not a socket".
+    assert devices.supports_multiplexing(r"C:\Windows\System32\OpenSSH\ssh.exe") is False
+    assert devices.supports_multiplexing("/usr/bin/ssh") is True
+
+
+def test_opts_include_batchmode_so_a_missing_key_fails_fast():
+    opts = devices.ssh_opts("/usr/bin/ssh")
+    assert "BatchMode=yes" in opts
+
+
+def test_opts_include_multiplexing_when_supported():
+    opts = devices.ssh_opts("/usr/bin/ssh")
+    joined = " ".join(opts)
+    assert "ControlMaster=auto" in joined and "ControlPersist=" in joined
+
+
+def test_opts_omit_multiplexing_on_windows_openssh():
+    opts = devices.ssh_opts(r"C:\Windows\System32\OpenSSH\ssh.exe")
+    joined = " ".join(opts)
+    assert "ControlMaster" not in joined and "ControlPath" not in joined
+
+
+def test_run_argv_shape():
+    argv = devices.run_argv(_dev(), "ls -la", "tag123", ssh_path="/usr/bin/ssh")
+    assert argv[0] == "/usr/bin/ssh"
+    assert "berat@10.0.0.5" in argv
+    # Everything after the target is ONE argument: ssh joins extra args with
+    # spaces and hands them to the remote login shell, so a multi-arg command
+    # would be re-split and break on any space.
+    assert argv[-1].startswith("bash -c ")
+    assert len(argv) == argv.index("berat@10.0.0.5") + 2
+
+
+def test_remote_root_with_spaces_is_quoted():
+    argv = devices.run_argv(_dev(), "ls", "t", ssh_path="/usr/bin/ssh")
+    inner = shlex.split(argv[-1])[-1]     # the wrapper script
+    assert "cd '/home/berat/my proj'" in inner
+
+
+def test_command_with_quotes_and_dollars_survives():
+    cmd = """grep -r "it's $HOME" . | head -5"""
+    argv = devices.run_argv(_dev(), cmd, "t", ssh_path="/usr/bin/ssh")
+    inner = shlex.split(argv[-1])[-1]
+    assert cmd in inner, "the command must reach the remote shell unmodified"
+
+
+def test_wrapper_records_its_pgid_and_traps_exit():
+    argv = devices.run_argv(_dev(), "ls", "tag123", ssh_path="/usr/bin/ssh")
+    inner = shlex.split(argv[-1])[-1]
+    assert "tag123" in inner
+    assert "trap" in inner and "EXIT" in inner
+
+
+def test_wrapper_prepends_the_remote_tool_bin():
+    argv = devices.run_argv(_dev(), "ls", "t", ssh_path="/usr/bin/ssh")
+    inner = shlex.split(argv[-1])[-1]
+    assert '$HOME/.omni-agent/bin' in inner
+
+
+def test_wrapper_runs_env_prelude_when_set():
+    d = devices.Device("i", "n", "h", "/r", env_prelude="source ~/.nvm/nvm.sh")
+    inner = shlex.split(devices.run_argv(d, "ls", "t", ssh_path="/usr/bin/ssh")[-1])[-1]
+    assert "source ~/.nvm/nvm.sh" in inner
+
+
+def test_wrapper_aborts_when_cd_fails():
+    # Without this the command would run in the remote HOME directory — the
+    # wrong folder, silently.
+    inner = shlex.split(devices.run_argv(_dev(), "rm -rf build", "t",
+                                         ssh_path="/usr/bin/ssh")[-1])[-1]
+    assert "|| exit 1" in inner
+
+
+def test_reap_argv_targets_the_recorded_pgid():
+    argv = devices.reap_argv(_dev(), "tag123", ssh_path="/usr/bin/ssh")
+    inner = shlex.split(argv[-1])[-1]
+    assert "tag123" in inner
+    assert "kill -TERM" in inner and "kill -KILL" in inner
+
+
+def test_reap_kills_the_group_then_falls_back_to_the_pid():
+    # `kill -TERM -PID` signals the process GROUP, so children die too; but the
+    # remote bash is only a group leader when sshd gave it its own session, so
+    # the bare-PID fallback matters.
+    inner = shlex.split(devices.reap_argv(_dev(), "t", ssh_path="/usr/bin/ssh")[-1])[-1]
+    assert '-"$P"' in inner and '"$P"' in inner
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     _orig = devices.DEVICES_PATH
-    tests = [test_registry_is_empty_when_no_file_exists, test_added_device_round_trips,
-             test_ids_are_unique, test_remove_device, test_no_secret_fields_are_persisted,
-             test_active_defaults_to_none_meaning_local, test_set_active_selects_a_device,
-             test_set_active_none_returns_to_local, test_set_active_unknown_id_raises,
-             test_removing_the_active_device_returns_to_local,
-             test_corrupt_registry_degrades_to_empty]
+    tests = [(test_registry_is_empty_when_no_file_exists, True),
+             (test_added_device_round_trips, True),
+             (test_ids_are_unique, True),
+             (test_remove_device, True),
+             (test_no_secret_fields_are_persisted, True),
+             (test_active_defaults_to_none_meaning_local, True),
+             (test_set_active_selects_a_device, True),
+             (test_set_active_none_returns_to_local, True),
+             (test_set_active_unknown_id_raises, True),
+             (test_removing_the_active_device_returns_to_local, True),
+             (test_corrupt_registry_degrades_to_empty, True),
+             (test_control_path_is_under_the_108_byte_socket_limit, False),
+             (test_multiplexing_is_disabled_for_windows_openssh, False),
+             (test_opts_include_batchmode_so_a_missing_key_fails_fast, False),
+             (test_opts_include_multiplexing_when_supported, False),
+             (test_opts_omit_multiplexing_on_windows_openssh, False),
+             (test_run_argv_shape, False),
+             (test_remote_root_with_spaces_is_quoted, False),
+             (test_command_with_quotes_and_dollars_survives, False),
+             (test_wrapper_records_its_pgid_and_traps_exit, False),
+             (test_wrapper_prepends_the_remote_tool_bin, False),
+             (test_wrapper_runs_env_prelude_when_set, False),
+             (test_wrapper_aborts_when_cd_fails, False),
+             (test_reap_argv_targets_the_recorded_pgid, False),
+             (test_reap_kills_the_group_then_falls_back_to_the_pid, False)]
     failed = 0
-    for t in tests:
+    for t, needs_mp in tests:
         try:
-            t(monkeypatch); print(f"PASS {t.__name__}")
+            t(monkeypatch) if needs_mp else t()
+            print(f"PASS {t.__name__}")
         except Exception as e:
             failed += 1
             import traceback; traceback.print_exc()
