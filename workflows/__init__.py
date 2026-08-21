@@ -17,6 +17,7 @@ import uuid
 from . import journal as _journal
 from . import sandbox as _sandbox
 from .sandbox import WorkflowScriptError
+from .runs import list_runs, load_run   # noqa: F401
 # NOTE: `.runtime` is imported INSIDE the functions below, never here. It pulls in
 # `subagents`, which imports `workflows.schema`, which executes this __init__ —
 # a module-level import creates a real cycle that breaks `import subagents`
