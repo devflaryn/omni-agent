@@ -1164,6 +1164,14 @@
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .device-row-actions { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; }
+
+    .ico { width: 16px; height: 16px; display: inline-block; vertical-align: -3px;
+           fill: none; stroke: currentColor; stroke-width: 1.75;
+           stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+    .ico-lg { width: 20px; height: 20px; vertical-align: -4px; }
+    .ico-spin { animation: ico-spin 900ms linear infinite; }
+    @keyframes ico-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .ico-spin { animation: none; } }
   </style>
 </head>
 <body class="h-full font-sans t-base text-term-text antialiased">
@@ -1702,6 +1710,7 @@
   <script defer src="workflow_view.js"></script>
   <script defer src="workflow_library.js"></script>
   <script defer src="device_view.js"></script>
+  <script defer src="icons.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

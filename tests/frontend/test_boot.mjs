@@ -64,7 +64,7 @@ sb.requestAnimationFrame=()=>0; sb.addEventListener=(t,f)=>{ sb._onload = t==='l
 sb.Event=class{constructor(t){this.type=t;}}; sb.pywebview={api}; sb.navigator={clipboard:{writeText(){}}};
 sb.prompt=()=>null; sb.confirm=()=>false; sb.alert=()=>{};
 vm.createContext(sb);
-for (const f of ['wave_stats.js','app.js'])
+for (const f of ['wave_stats.js','icons.js','app.js'])
   vm.runInContext(fs.readFileSync(path.join(FRONTEND,f),'utf8'), sb, {filename:f});
 
 let err = null;

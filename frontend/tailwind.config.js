@@ -7,7 +7,7 @@
  *   npx tailwindcss@3 -c tailwind.config.js -i tailwind.input.css -o tailwind.css --minify
  */
 module.exports = {
-  content: ['./index.html', './app.js', './workflow_view.js', './workflow_library.js', './device_view.js'],
+  content: ['./index.html', './app.js', './workflow_view.js', './workflow_library.js', './device_view.js', './icons.js'],
   theme: {
     extend: {
       fontFamily: {

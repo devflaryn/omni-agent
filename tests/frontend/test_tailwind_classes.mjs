@@ -35,7 +35,8 @@ const appJs = fs.readFileSync(path.join(FRONTEND, 'app.js'), 'utf8');
 const workflowViewJs = fs.readFileSync(path.join(FRONTEND, 'workflow_view.js'), 'utf8');
 const workflowLibraryJs = fs.readFileSync(path.join(FRONTEND, 'workflow_library.js'), 'utf8');
 const deviceViewJs = fs.readFileSync(path.join(FRONTEND, 'device_view.js'), 'utf8');
-const jsSources = appJs + '\n' + workflowViewJs + '\n' + workflowLibraryJs + '\n' + deviceViewJs;
+const iconsJs = fs.readFileSync(path.join(FRONTEND, 'icons.js'), 'utf8');
+const jsSources = appJs + '\n' + workflowViewJs + '\n' + workflowLibraryJs + '\n' + deviceViewJs + '\n' + iconsJs;
 
 // Classes defined by the project itself, in index.html's <style> block.
 const styleBlock = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
