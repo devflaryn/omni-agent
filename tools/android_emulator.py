@@ -4,10 +4,19 @@ ARCHITECTURE NOTE: these tools bypass host_exec.run_cmd and shell out
 directly via subprocess (resolving OS-appropriate names, e.g. `adb` vs
 `adb.exe`), reading and writing files with tools.common.resolve_workspace_path
 rather than through the shell. That is a deliberate
-directness, not a different machine: every tool in this project now runs on this
-same host, so a screenshot saved here is immediately reachable by
+directness, not a different machine: they drive the LOCAL Android SDK and the
+LOCAL omnidroid engine, so a screenshot saved here is immediately reachable by
 read_file_chunk, and an APK built by recompile_apk/sign_apk is immediately
 reachable here for install_apk_on_emulator.
+
+LOCAL ONLY — every registered tool in this module opens with
+`devices.require_local(...)` and REFUSES while an ssh device is active. Bypassing
+run_cmd is exactly why: with a device selected, run_cmd goes to the other
+machine while this module's subprocess calls stay here, so `adb_shell("pm
+uninstall com.x")` would silently drive THIS box's emulator, and
+run_apk_test_session would build remotely and install locally — one task, two
+machines. There is no remote emulator path in v1; refusing out loud is the
+behaviour, and it is what AGENTS.md promises.
 
 ONE BACKEND: omnidroid (QEMU). Every "run the app on a VM" flow goes through the
 self-contained headless **omnidroid** engine — a QEMU/Bliss-OS (Android 13,
@@ -65,6 +74,7 @@ import sys
 import threading
 import time
 
+import devices
 from tool_registry import registry
 from tools.common import resolve_workspace_path, find_android_sdk_tools
 from tools._emulator_frame_capture import capture_keyframes
@@ -715,6 +725,9 @@ def _resolve_serial(backend, device_name=None):
 def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_image=_DEFAULT_SYSTEM_IMAGE,
                              device_profile="pixel_5", reset=True, boot_timeout=300, headless=False,
                              ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, debug=None):
+    _err = devices.require_local("ensure_emulator_running")
+    if _err:
+        return _err
     backend = _coerce_backend(backend)   # omnidroid (qemu) only — never an AVD
     device_name = device_name or _default_device_name()
     reset = _truthy(reset)
@@ -752,6 +765,9 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     when_to_use="Use this for interactive device control (tap/swipe/back/home) or ad-hoc inspection not covered by install_apk_on_emulator/launch_app_on_emulator/get_logcat/take_emulator_screenshot."
 )
 def adb_shell(command, backend=_DEFAULT_BACKEND, device_name=None, timeout_seconds=30):
+    _err = devices.require_local("adb_shell")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -829,6 +845,9 @@ def _input_failure(res):
     when_to_use="Use to peek at or manage root via the Magisk app during a dev test, then switch back to 'kiosk' so the game/kiosk is visible again for screenshots."
 )
 def set_emulator_ui(view="kiosk", device_name=None):
+    _err = devices.require_local("set_emulator_ui")
+    if _err:
+        return _err
     view = (view or "kiosk").strip().lower()
     if view not in ("kiosk", "magisk"):
         return {"error": "view must be 'kiosk' or 'magisk'."}
@@ -865,6 +884,9 @@ def set_emulator_ui(view="kiosk", device_name=None):
     when_to_use="Use to click a button/menu/field whose on-screen position you read from a screenshot. Pair with take_emulator_screenshot to get coordinates first."
 )
 def tap_screen(x, y, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("tap_screen")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -899,6 +921,9 @@ def tap_screen(x, y, backend=_DEFAULT_BACKEND, device_name=None):
     when_to_use="Use after tapping a text field to enter a value (search terms, a Luau script name, credentials). Pair with tap_screen for focus."
 )
 def type_text(text, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("type_text")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -934,6 +959,9 @@ def type_text(text, backend=_DEFAULT_BACKEND, device_name=None):
     when_to_use="Use to scroll a list, drag a slider, or long-press (same start/end with a large duration). Read start/end pixels from a screenshot."
 )
 def swipe_screen(x1, y1, x2, y2, duration_ms=300, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("swipe_screen")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -975,6 +1003,9 @@ def swipe_screen(x1, y1, x2, y2, duration_ms=300, backend=_DEFAULT_BACKEND, devi
     when_to_use="Use for Back/Home/Enter/App-switch and other hardware keys — e.g. Enter to submit after type_text, or Back to dismiss a dialog."
 )
 def press_key(key, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("press_key")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -1016,6 +1047,9 @@ def press_key(key, backend=_DEFAULT_BACKEND, device_name=None):
 )
 def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None, replace=True,
                             grant_permissions=True, abi=None, require_translation=True):
+    _err = devices.require_local("install_apk_on_emulator")
+    if _err:
+        return _err
     backend = _coerce_backend(backend)
     try:
         host_apk_path = resolve_workspace_path(apk_path)
@@ -1116,6 +1150,9 @@ def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None
     when_to_use="Call this after install_apk_on_emulator, right before record_and_capture_keyframes so the capture window covers the app's actual startup."
 )
 def launch_app_on_emulator(package_name, activity=None, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("launch_app_on_emulator")
+    if _err:
+        return _err
     backend = _coerce_backend(backend)
     if backend == "qemu":
         name = device_name or _default_device_name("qemu")
@@ -1163,6 +1200,9 @@ def launch_app_on_emulator(package_name, activity=None, backend=_DEFAULT_BACKEND
     when_to_use="Use this to inspect crashes/errors after a test, or to get a clean log window bracketing a specific manual action (adb_shell input tap, etc.)."
 )
 def get_logcat(filter_pattern=None, max_lines=300, clear_first=False, priority=None, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("get_logcat")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -1227,6 +1267,9 @@ def get_logcat(filter_pattern=None, max_lines=300, clear_first=False, priority=N
 )
 def monitor_logcat(duration_seconds=15, max_traces=5, package_name=None, extra_pattern=None,
                    clear_first=True, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("monitor_logcat")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -1301,6 +1344,9 @@ def monitor_logcat(duration_seconds=15, max_traces=5, package_name=None, extra_p
     when_to_use="Use this for a single targeted screenshot at a moment you choose. To DRIVE the screen (find something and tap it) use observe_screen instead — it adds the element list and coordinates. For an unattended test window where you want the interesting frames found automatically, use record_and_capture_keyframes."
 )
 def take_emulator_screenshot(label=None, grid=0, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("take_emulator_screenshot")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -1537,6 +1583,9 @@ def record_and_capture_keyframes(session_name, package_name=None, duration_secon
                                   change_threshold=4, black_threshold=10, sample_scale_w=160, capture_logcat=True,
                                   auto_analyze=True, vision_max_frames=16,
                                   backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("record_and_capture_keyframes")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -1687,6 +1736,9 @@ def _autocap_session_dir(session_name):
     when_to_use="Call after install_apk_on_emulator (which starts the auto feed for that build) to see the screens captured so far. For a package-scoped crash/exit VERDICT over a bounded window, use record_and_capture_keyframes; for one frame right now, take_emulator_screenshot."
 )
 def read_auto_screenshots(session_name=None, since_index=0):
+    _err = devices.require_local("read_auto_screenshots")
+    if _err:
+        return _err
     # Default to the LIVE current session (resolved at call time, not import time).
     session_name = session_name or _AUTOCAP_SESSION
     if not session_name:
@@ -1782,6 +1834,9 @@ def _vision_analyze_session(session_dir, backend="auto", ollama_model="llava", p
     when_to_use="Call this after record_and_capture_keyframes, before generate_test_report, so the report includes descriptions instead of just raw image links."
 )
 def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt=None, max_frames=40):
+    _err = devices.require_local("analyze_keyframes")
+    if _err:
+        return _err
     try:
         session_dir = resolve_workspace_path(f"screenshots/{session_name}")
     except RuntimeError as e:
@@ -1815,6 +1870,9 @@ def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt
     when_to_use="Call this last, after record_and_capture_keyframes (and ideally analyze_keyframes). Then read_file_chunk the resulting .md to see what the test found and decide on fixes."
 )
 def generate_test_report(session_name, package_name=None, apk_path=None):
+    _err = devices.require_local("generate_test_report")
+    if _err:
+        return _err
     try:
         session_dir = resolve_workspace_path(f"screenshots/{session_name}")
         report_dir = resolve_workspace_path("test_reports")
@@ -2007,6 +2065,9 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
                           duration_seconds=20, vision_backend="auto", ollama_model="llava",
                           reset=True, boot_timeout=300, ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE,
                           abi=None, require_translation=True, debug=None):
+    _err = devices.require_local("run_apk_test_session")
+    if _err:
+        return _err
     session_name = f"{package_name.replace('.', '_')}_{int(time.time())}"
     log = []
 
@@ -2095,6 +2156,9 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     when_to_use="Call when finished testing to release the emulator, or before a fresh run if you want an explicit teardown. Not required between run_apk_test_session calls — reset=true already builds a fresh account each time."
 )
 def stop_emulator(backend=_DEFAULT_BACKEND, device_name=None, purge=False):
+    _err = devices.require_local("stop_emulator")
+    if _err:
+        return _err
     backend = _coerce_backend(backend)   # omnidroid (qemu) only
     device_name = device_name or _default_device_name()
 
@@ -2272,6 +2336,9 @@ def _not_dev_base_error(adb, serial, tool):
     when_to_use="Call after ensure_emulator_running(debug=true) + BOOT_OK, before attaching frida/objection to hook the app under test. Pair with hide_root_from_app to also hide root/frida from the target's detection."
 )
 def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
+    _err = devices.require_local("ensure_frida_server")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -2321,6 +2388,9 @@ def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
     when_to_use="Use when the APK under test has root/frida detection: call ensure_emulator_running(debug=true) -> ensure_frida_server -> hide_root_from_app('<pkg>') -> install/launch, then hook with frida."
 )
 def hide_root_from_app(package_name=None, device_name=None, backend=_DEFAULT_BACKEND):
+    _err = devices.require_local("hide_root_from_app")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err

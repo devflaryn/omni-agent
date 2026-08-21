@@ -32,6 +32,9 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+
+import devices
 
 IS_WINDOWS = os.name == "nt"
 
@@ -119,7 +122,15 @@ _workspace_root = None
 
 
 def workspace_root():
-    """Absolute path of the active project folder."""
+    """Absolute path of the active project folder, or None when a remote device
+    is active.
+
+    None is deliberate: there is no host-side folder then, and this function's
+    callers (tools/common.resolve_workspace_path, code_graph, web_tools) do
+    in-process LOCAL file I/O on the returned path. None turns "silently operates
+    on a path that does not exist here" into a refusal."""
+    if devices.is_remote():
+        return None
     if _workspace_root is None:
         raise RuntimeError("No active project folder — set_workspace() hasn't been called yet.")
     return _workspace_root
@@ -351,6 +362,72 @@ _WORKSPACE_GONE_MSG = (
 ).format
 
 
+# ssh's own failure modes, used to tell a transport error from a command that
+# legitimately exited 255. The residual ambiguity — a command that exits 255 AND
+# prints one of these — is accepted knowingly; there is no in-band way to
+# separate them without polluting stdout.
+_SSH_ERROR_SIGNATURES = (
+    "ssh: connect to host",
+    "Permission denied",
+    "Connection closed by",
+    "Connection timed out",
+    "kex_exchange_identification",
+    "Host key verification failed",
+    "Could not resolve hostname",
+)
+
+
+def _spawn_reap(device, tag):
+    """Kill the remote command in the background. Never blocks the Stop path —
+    the user's Stop must feel instant even if the reap connection hangs."""
+    def work():
+        try:
+            subprocess.run(devices.reap_argv(device, tag), timeout=20,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+
+
+def _run_remote(command, timeout, device):
+    ssh = devices.find_ssh()
+    if not ssh:
+        # NEVER fall back to local: that would run the command on the wrong
+        # machine, which is the one catastrophic failure this feature can cause.
+        return {"stdout": "", "stderr": "no ssh client", "returncode": 127,
+                "error": devices.NO_SSH_MSG}
+
+    tag = uuid.uuid4().hex[:12]
+    argv = devices.run_argv(device, command, tag, ssh_path=ssh)
+    timeout_msg = ("Command timed out after {elapsed}s on device '" + device.name +
+                   "'. Try a lighter command or break the task into smaller steps.")
+    res = _run_polling(argv, timeout, display=command,
+                       timeout_msg=timeout_msg, cwd=None)
+
+    if res.get("stopped") or res.get("error"):
+        _spawn_reap(device, tag)
+
+    if res.get("returncode") == 255:
+        err = res.get("stderr") or ""
+        if any(sig in err for sig in _SSH_ERROR_SIGNATURES):
+            res["error"] = (
+                f"Could not reach device '{device.name}' ({device.target}):\n"
+                f"  {err.strip().splitlines()[0] if err.strip() else 'connection failed'}\n"
+                "No command ran. Check the host is up and your ssh key works "
+                f"(`ssh {device.target} true`), then retry."
+            )
+    return res
+
+
+def run_on(device, command, timeout=DEFAULT_TIMEOUT):
+    """Run a command on an EXPLICIT device, regardless of which one is active.
+
+    Exists so probing an unselected device cannot race the agent loop: the
+    alternative — mutating the global active device around the call — would let a
+    concurrent tool call land on the wrong machine."""
+    return _run_remote(command, timeout, device)
+
+
 def run_cmd(command, timeout=DEFAULT_TIMEOUT):
     """
     Execute a shell command in the active project folder. Returns a dict with
@@ -370,6 +447,9 @@ def run_cmd(command, timeout=DEFAULT_TIMEOUT):
     still-running process or give it more time. Only when it decides to kill (or
     no decider is registered) does the process get terminated.
     """
+    device = devices.active()
+    if device is not None:
+        return _run_remote(command, timeout, device)
     if _workspace_root is None:
         return {"stdout": "", "stderr": "no active project folder", "returncode": 1,
                 "error": _NO_WORKSPACE_MSG}

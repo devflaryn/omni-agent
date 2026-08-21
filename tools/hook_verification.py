@@ -26,6 +26,7 @@ coupling — offline-testable with tiny fixtures, exactly like `constraints.py`
 and `learned_technique.py`."""
 import os
 
+import devices
 from tool_registry import registry
 from tools import learned_technique as _lt
 
@@ -233,6 +234,9 @@ def all_hooks_applied(results):
         "recorded hook actually landed, not just that no forbidden file appeared."),
 )
 def verify_hooks_applied_tool(base_dir=None, output_dir=None, hook_points=None):
+    _err = devices.require_local("verify_hooks_applied")
+    if _err:
+        return _err
     from tools.common import resolve_workspace_path
     if not base_dir or not output_dir:
         return {"error": ("verify_hooks_applied needs both 'base_dir' (the "

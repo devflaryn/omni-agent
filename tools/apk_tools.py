@@ -510,7 +510,7 @@ def _apply_constraint_gate(res, constraints_list, original_apk, output_apk):
             checks,
             _constraints.apk_members(resolve_workspace_path(original_apk)),
             _constraints.apk_members(resolve_workspace_path(output_apk)))
-    except (OSError, zipfile.BadZipFile) as e:
+    except (OSError, RuntimeError, zipfile.BadZipFile) as e:
         res["constraint_results"] = []
         res["constraints_ok"] = False
         res["stdout"] = (res.get("stdout", "")

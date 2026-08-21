@@ -24,6 +24,7 @@ import re
 import subprocess
 import time
 
+import devices
 from tool_registry import registry
 from tools.common import resolve_workspace_path
 from tools._emulator_screen_read import (
@@ -268,6 +269,9 @@ def _capture(adb, serial, grid, label=None, box=None, scale=1):
 )
 def observe_screen(region=None, target=None, grid=100, describe=None, question=None, settle_ms=0,
                    max_elements=40, label=None, backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("observe_screen")
+    if _err:
+        return _err
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -412,6 +416,9 @@ def observe_screen(region=None, target=None, grid=100, describe=None, question=N
 )
 def tap_element(text=None, desc=None, element_id=None, index=0,
                 backend=_DEFAULT_BACKEND, device_name=None):
+    _err = devices.require_local("tap_element")
+    if _err:
+        return _err
     selectors = [s for s in (text, desc, element_id) if s not in (None, "")]
     if len(selectors) != 1:
         return {"error": "Give exactly ONE selector: text=, desc=, or element_id=."}

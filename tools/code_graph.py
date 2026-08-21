@@ -29,6 +29,7 @@ import os
 import re
 import json
 
+import devices
 from tool_registry import registry
 from tools.common import normalize_path, run_python_script
 
@@ -185,6 +186,9 @@ def _shell_build(root_dir, inc, frc, gid):
     when_to_use="Call this ONCE per codebase/project/version to map a big tree. To compare two versions, build each into its OWN graph (different root_dir or explicit graph_id) then call diff_code_graphs. For a single project, query_code_graph/ask_codebase auto-build over the workspace, so prefer those unless you need a specific sub-dir or a named version."
 )
 def build_code_graph(root_dir, include_so=True, force=False, graph_id=None):
+    _err = devices.require_local("build_code_graph")
+    if _err:
+        return _err
     root_dir = normalize_path(root_dir)
     inc = "1" if include_so in (True, "true", "True", 1, "1") else "0"
     frc = "1" if force in (True, "true", "True", 1, "1") else "0"
@@ -248,6 +252,9 @@ def build_code_graph(root_dir, include_so=True, force=False, graph_id=None):
     summary="search a big codebase's graph by any identifier/string -> file:line hits (auto-builds; no query_type needed)",
 )
 def query_code_graph(name="", query_type="search", limit=40, graph_id=None):
+    _err = devices.require_local("query_code_graph")
+    if _err:
+        return _err
     try:
         limit = int(limit)
     except Exception:
@@ -291,6 +298,9 @@ def query_code_graph(name="", query_type="search", limit=40, graph_id=None):
     when_to_use="Call this to discover which graph_ids exist (e.g. before diff_code_graphs) or to confirm a build landed in its own namespace."
 )
 def list_code_graphs():
+    _err = devices.require_local("list_code_graphs")
+    if _err:
+        return _err
     res = _run_python_script(_QUERY_PATH, ["graphs", "", "40", "", ""], timeout=60)
     if res.get("returncode") == 0 and res.get("stdout"):
         return {"stdout": res["stdout"]}
@@ -317,6 +327,9 @@ def list_code_graphs():
     when_to_use="Use this when asked to compare two versions of an app ('what changed between v1 and v2'). It keeps the two codebases in separate graphs so they never mix, and surfaces the real differences (including obfuscation-resistant string/symbol changes) cheaply."
 )
 def diff_code_graphs(graph_a, graph_b, limit=40):
+    _err = devices.require_local("diff_code_graphs")
+    if _err:
+        return _err
     try:
         limit = int(limit)
     except Exception:

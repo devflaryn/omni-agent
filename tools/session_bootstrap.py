@@ -28,6 +28,7 @@ import shlex
 import shutil
 import xml.etree.ElementTree as ET
 
+import devices
 from tool_registry import registry
 from tools.android_emulator import _find_qemu_manager
 from tools.common import resolve_workspace_path
@@ -304,6 +305,9 @@ def _insert_into_on_create(smali_text):
     ),
 )
 def inject_session_bootstrap(decompiled_dir):
+    _err = devices.require_local("inject_session_bootstrap")
+    if _err:
+        return _err
     if not decompiled_dir:
         return {"error": "decompiled_dir not found: (empty)"}
     # Every other apk_tools function (decode_apk, recompile_apk, sign_apk, ...)

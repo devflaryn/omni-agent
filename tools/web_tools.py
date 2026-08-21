@@ -31,15 +31,17 @@ model a challenge page as if it were the answer.
 """
 import os
 import re
+import shlex
 import time
 import html
 import urllib.parse
 
 import requests
 
+import devices
 from tool_registry import registry
 from tools.common import normalize_path, wpath
-from host_exec import workspace_root
+from host_exec import workspace_root, run_cmd
 
 # A realistic desktop browser UA for the direct-fetch fallbacks; some origins
 # 403 the default python-requests UA.
@@ -413,6 +415,26 @@ def download_file(url, dest=None, max_mb=_DEFAULT_MAX_MB):
         max_bytes = max(1, int(max_mb)) * 1024 * 1024
     except (TypeError, ValueError):
         max_bytes = _DEFAULT_MAX_MB * 1024 * 1024
+
+    if devices.is_remote():
+        # Fetch ON the device: an in-process download would put the file on this
+        # machine, which is not where the agent is working.
+        rel = normalize_path(dest) if dest else os.path.basename(url) or "download"
+        cmd = (f"mkdir -p \"$(dirname {wpath(rel)})\" && "
+               f"curl -fL --max-filesize {max_bytes} "
+               f"-o {wpath(rel)} {shlex.quote(url)}")
+        res = run_cmd(cmd, timeout=600)
+        if res.get("error") or res.get("returncode"):
+            return {"error": (f"download_file failed on the device: "
+                              f"{res.get('error') or res.get('stderr') or 'curl failed'}")}
+        # Re-read active() rather than assuming it: the picker runs on the
+        # pywebview thread, so the user can deselect the device while a 10-minute
+        # curl is in flight, and `.name` on None would turn a SUCCESSFUL download
+        # into an AttributeError.
+        _d = devices.active()
+        return {"ok": True, "path": rel,
+                "device": (_d.name if _d else "the device it was selected on"),
+                "note": "downloaded on the active device, not this computer"}
 
     try:
         workspace_root()

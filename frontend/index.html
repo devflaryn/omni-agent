@@ -1036,6 +1036,43 @@
 
     .wf-logs { margin-top: var(--space-3); border-top: 1px solid rgb(var(--term-line)); padding-top: var(--space-2); }
     .wf-log { font-size: var(--text-xs); color: rgb(var(--term-muted)); padding: 2px 0; }
+
+    /* Device chip + picker (2026-08 SSH devices). Red, not cyan: this is a
+       warning about which machine commands are about to run on, not a
+       positive toggle like ultra mode — the ultra-chip color is deliberately
+       NOT reused here. device-chip-remote is the load-bearing class: it is
+       the only thing standing between a user and running a destructive
+       command against the wrong computer while believing they are local. */
+    .device-chip { cursor: pointer; gap: var(--space-2); }
+    .device-chip:hover { background: rgb(var(--term-line) / .6); }
+    .device-chip-dot {
+      display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+      background: rgb(var(--term-green)); flex-shrink: 0;
+    }
+    .device-chip-remote {
+      border-color: rgb(var(--term-red) / .5);
+      background: rgb(var(--term-red) / .15);
+      color: rgb(var(--term-red-fg));
+    }
+    .device-chip-remote .device-chip-dot { background: rgb(var(--term-red)); }
+
+    .device-row {
+      display: flex; align-items: center; gap: var(--space-2);
+      padding: var(--space-2) var(--space-3);
+      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-md);
+      margin-bottom: var(--space-1);
+    }
+    .device-row-active {
+      border-color: rgb(var(--term-cyan) / .5);
+      background: rgb(var(--term-cyan) / .08);
+    }
+    .device-row-main { min-width: 0; flex: 1 1 auto; }
+    .device-row-name { font-size: var(--text-sm); color: rgb(var(--term-text)); font-weight: 500; }
+    .device-row-target {
+      font-size: var(--text-2xs); color: rgb(var(--term-muted));
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .device-row-actions { display: flex; align-items: center; gap: var(--space-1); flex-shrink: 0; }
   </style>
 </head>
 <body class="h-full font-sans t-base text-term-text antialiased">
@@ -1156,6 +1193,14 @@
           <span id="projectBadge" class="truncate font-serif text-term-text t-lg" >project</span>
         </div>
         <div class="ml-auto flex items-center gap-1 text-term-muted t-xs" >
+          <!-- Which machine tools run on. A safety control, not decoration —
+               device-chip-remote is the visual cue that stops a destructive
+               command being run against the wrong computer. Always first so
+               it cannot be missed. -->
+          <button id="deviceChip" type="button" title="Tools run on this computer — click to switch" class="chip device-chip">
+            <span id="deviceChipDot" class="device-chip-dot"></span>
+            <span id="deviceChipName">this computer</span>
+          </button>
           <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="chip text-term-cyan hover:bg-term-line/60" style="height:var(--control-h-sm)">plan —</button>
           <button id="ultraToggle" type="button" role="switch" aria-checked="false"
             title="Ultra mode — let the agent start multi-agent workflows on its own judgement"
@@ -1481,11 +1526,64 @@
     </div>
   </div>
 
+  <!-- ============ DEVICE PICKER ============
+       Choose which machine the toolset runs on. "This computer" is always the
+       first row; no credentials are stored here — auth is whatever the
+       user's own ssh already does. -->
+  <div id="devicePicker" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="devicePickerTitle">
+    <div class="modal-shell" style="width:560px;max-width:96vw;height:640px">
+      <div class="modal-head">
+        <div class="min-w-0 flex-1">
+          <div class="eyebrow">execution target</div>
+          <div id="devicePickerTitle" class="modal-title">Devices</div>
+        </div>
+        <button id="devicePickerClose" title="Close" class="icon-btn">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div id="deviceList" class="mb-4"></div>
+
+        <div id="devicePickerResult" class="mb-3 t-xs text-term-muted" role="status"></div>
+
+        <section class="llm-section llm-section-last">
+          <h3 class="llm-section-title">Add a device</h3>
+          <div class="llm-field">
+            <label class="eyebrow" for="deviceFormName">name</label>
+            <input id="deviceFormName" type="text" autocomplete="off" spellcheck="false"
+              placeholder="e.g. build box" class="field" />
+          </div>
+          <div class="llm-field">
+            <label class="eyebrow" for="deviceFormTarget">ssh target</label>
+            <input id="deviceFormTarget" type="text" autocomplete="off" spellcheck="false"
+              placeholder="user@host" class="field font-mono" />
+          </div>
+          <div class="llm-field">
+            <label class="eyebrow" for="deviceFormRoot">remote project folder</label>
+            <input id="deviceFormRoot" type="text" autocomplete="off" spellcheck="false"
+              placeholder="/home/user/project" class="field font-mono" />
+          </div>
+          <div class="llm-field">
+            <label class="eyebrow" for="deviceFormPrelude">env prelude (optional)</label>
+            <input id="deviceFormPrelude" type="text" autocomplete="off" spellcheck="false"
+              placeholder="e.g. source ~/.profile" class="field font-mono" />
+          </div>
+          <button id="deviceAddBtn" type="button" class="btn btn-sm">+ add device</button>
+        </section>
+      </div>
+
+      <div class="modal-foot">
+        <span id="devicePickerError" class="min-w-0 flex-1 truncate text-term-red t-xs" ></span>
+        <button id="devicePickerDoneBtn" class="btn btn-primary shrink-0">done</button>
+      </div>
+    </div>
+  </div>
+
   <!-- system message toasts (bottom-right, auto-dismiss) -->
   <div id="toasts" aria-live="polite"></div>
 
   <script defer src="wave_stats.js"></script>
   <script defer src="workflow_view.js"></script>
+  <script defer src="device_view.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
