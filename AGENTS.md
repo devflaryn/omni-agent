@@ -251,10 +251,13 @@ Three things are load-bearing:
   ("getsockname failed: Not a socket"), and without multiplexing every tool call
   pays a fresh TCP+auth handshake. `ControlPath` must also stay under 108
   bytes — the Unix-socket limit — or ssh refuses with "ControlPath too long"
-  and multiplexing silently never happens; `%C` itself is a fixed-length hash,
-  so the risk is entirely the directory prefix (`~/.omni-agent/ssh/%C` is 33
-  bytes for a short home directory on this box — comfortably under the limit,
-  but a deep profile path could get closer).
+  and multiplexing silently never happens. `%C` itself is a fixed-length hash,
+  so the risk is entirely the directory prefix. Precisely: the template
+  `<home>/.omni-agent/ssh/%C` is **33 bytes** as written on this box, and `%C`
+  expands to a 64-character hash in place of those 2 characters, so the socket
+  path resolves to **95 bytes** — **13 bytes** under the 108-byte limit. A home
+  directory 14 or more characters longer than this one exhausts that margin, and
+  multiplexing stops (loudly, in ssh's stderr).
 - **Never fall back to local.** If a device is unreachable the command fails
   loudly. A fallback would run it on the wrong machine, which is the one
   catastrophic failure this feature can cause.
@@ -263,13 +266,25 @@ Paths need no translation: `normalize_path` already returns project-relative
 paths and commands run with cwd set to the project folder, so the command string
 is valid on either machine.
 
-**Not everything goes remote.** Tools that bypass `run_cmd` — emulator, screen
-capture, vision, Frida, Roblox session, hook verification (they drive the LOCAL
-Android SDK), APK session-bootstrap injection (it edits decoded smali files
-directly with Python, not through `run_cmd`) and code-graph building (a local
-index of a remote project is meaningless) — call `devices.require_local()` and
-REFUSE while a device is active. `download_file` fetches with `curl` on the
-device instead. APK work is largely unaffected: `apk_tools` is almost entirely
+**Not everything goes remote.** Tools that bypass `run_cmd` — emulator (all 20
+tools in `tools/android_emulator.py`, which shell out via `subprocess` rather
+than `run_cmd`), screen capture, vision, Frida, Roblox session, hook
+verification (they drive the LOCAL Android SDK), APK session-bootstrap injection
+(it edits decoded smali files directly with Python, not through `run_cmd`) and
+code-graph building (a local index of a remote project is meaningless) — call
+`devices.require_local()` and REFUSE while a device is active. `download_file`
+fetches with `curl` on the device instead.
+
+The GUI's own file operations stay local too, and refuse the same way. The file
+tree and viewer FOLLOW the device (`build_file_tree` / `read_project_file` shell
+out over ssh), but every mutation — `fs_move`, `fs_delete`, `fs_trash_empty`,
+`fs_mkdir`, `fs_new_file`, `fs_rename`, `fs_duplicate`, `fs_write_upload`,
+`upload_files` — plus `read_archive_member` resolves through `_safe_abs` against
+the LOCAL picked folder. Unguarded, deleting a file from the (remote) tree would
+trash the LOCAL project's copy and then repaint the remote tree, hiding the
+damage completely. So `_safe_abs` and each of those entry points call
+`devices.require_local()` first. `select_device` also refuses while the agent is
+busy, so one turn's commands can never split across two machines. APK work is largely unaffected: `apk_tools` is almost entirely
 `run_cmd` calls: only `recompile_apk`'s constraint check touches the local
 filesystem directly (via `resolve_workspace_path`, to diff the original and
 rebuilt APKs), and that one path already catches the `RuntimeError` it raises

@@ -77,17 +77,50 @@ def test_remote_tree_shells_out_and_does_not_touch_local_disk(monkeypatch):
     assert [c["name"] for c in tree["children"]] == ["src", "README.md"]
 
 
-def test_remote_tree_survives_a_failed_command(monkeypatch):
+def test_an_unreachable_host_does_not_look_like_an_empty_project(monkeypatch):
+    # It used to swallow the error and return a bare empty tree, which is exactly
+    # what a genuinely empty project folder looks like -- so a dead connection
+    # read as "nothing here yet" and the user carried on working.
     monkeypatch.setattr(devices, "_active", devices.Device("i", "box", "h", "/r"))
     monkeypatch.setattr(agent, "run_cmd",
                         lambda cmd, timeout=None: {"stdout": "", "stderr": "boom",
                                                    "returncode": 1,
                                                    "error": "could not reach device"})
     tree = agent.build_file_tree("proj")
-    assert tree["type"] == "dir" and tree["children"] == []
+    # The shape the UI walks must still be intact, or the sidebar throws.
+    assert tree["type"] == "dir" and isinstance(tree["children"], list)
+    assert "error" in tree and "box" in tree["error"]
+    assert "could not reach device" in tree["error"]
+    # ...and it has to be visible in the sidebar, not only in a key no UI reads.
+    assert len(tree["children"]) == 1
+    node = tree["children"][0]
+    assert node["path"] == agent.REMOTE_TREE_ERROR_PATH
+    assert "box" in node["name"] and node["type"] == "dir"
+
+
+def test_a_reachable_but_empty_project_is_still_reported_as_empty(monkeypatch):
+    monkeypatch.setattr(devices, "_active", devices.Device("i", "box", "h", "/r"))
+    monkeypatch.setattr(agent, "run_cmd",
+                        lambda cmd, timeout=None: {"stdout": "d\t.\n", "stderr": "",
+                                                   "returncode": 0})
+    tree = agent.build_file_tree("proj")
+    assert tree["children"] == [] and "error" not in tree
 
 
 import base64
+
+
+def _only_the_probe_ran(seen):
+    """No file CONTENT command was issued.
+
+    The probe itself now names `base64` -- it carries the binary sniff's first
+    block back so the sniff costs no extra round trip -- so "base64 never appears"
+    is no longer the right assertion. The real guarantee is stronger and is what
+    is checked here: the path-resolving probe is the ONLY command that ran, so
+    nothing cat'd or base64'd the whole file.
+    """
+    assert len(seen["cmds"]) == 1, f"a second command ran: {seen['cmds'][1:]}"
+    assert "pwd -P" in seen["cmds"][0], "the one command must be the probe"
 
 
 def _remote(monkeypatch, stdout, returncode=0):
@@ -133,9 +166,7 @@ def test_remote_leaf_symlink_escape_is_rejected_without_transfer(monkeypatch):
     seen = _remote(monkeypatch, "OUTSIDE\n")
     res = agent.read_project_file("proj", "leak.txt")
     assert res["ok"] is False and "outside" in res["error"].lower()
-    assert len(seen["cmds"]) == 1, "must not issue a second command after OUTSIDE"
-    assert not any("base64" in c for c in seen["cmds"])
-    assert not any(c.strip().startswith("cat ") for c in seen["cmds"])
+    _only_the_probe_ran(seen)
 
 
 def test_remote_unresolved_dotdot_in_resolved_path_is_rejected(monkeypatch):
@@ -148,8 +179,7 @@ def test_remote_unresolved_dotdot_in_resolved_path_is_rejected(monkeypatch):
     seen = _remote(monkeypatch, "OUTSIDE\n")
     res = agent.read_project_file("proj", "leak.txt")
     assert res["ok"] is False and "outside" in res["error"].lower()
-    assert not any("base64" in c for c in seen["cmds"])
-    assert not any(c.strip().startswith("cat ") for c in seen["cmds"])
+    _only_the_probe_ran(seen)
 
 
 def test_probe_script_rejects_dotdot_before_the_root_comparison(monkeypatch):
@@ -190,13 +220,179 @@ def test_a_file_over_the_cap_is_refused_not_transferred(monkeypatch):
     seen = _remote(monkeypatch, f"SIZE={agent.REMOTE_PREVIEW_MAX_BYTES + 1}\n")
     res = agent.read_project_file("proj", "big.apk")
     assert res["ok"] is False and "too large" in res["error"].lower()
-    assert not any("base64" in c for c in seen["cmds"]), "must not transfer it"
+    _only_the_probe_ran(seen)
+    # ...and the probe must not have read the file either: the sniff block is
+    # skipped above the cap, so nothing at all is transferred.
+    assert f'-le {agent.REMOTE_PREVIEW_MAX_BYTES}' in seen["cmds"][0]
 
 
 def test_a_missing_remote_file_reports_cleanly(monkeypatch):
     _remote(monkeypatch, "MISSING\n")
     res = agent.read_project_file("proj", "nope.txt")
     assert res["ok"] is False and "error" in res
+
+
+# --- the remote viewer must decline binaries, not mojibake them ---------------
+
+def _head_b64(raw):
+    return base64.b64encode(raw).decode("ascii")
+
+
+def test_a_remote_binary_is_declined_not_catted_as_text(monkeypatch):
+    # Under the 8 MB cap the old code `cat`'d an .so straight into the viewer as
+    # garbage, while the LOCAL viewer returns a clean "unsupported" card for the
+    # same file.
+    seen = _remote(monkeypatch, lambda cmd: (
+        "SIZE=2048\nHEAD=" + _head_b64(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64) + "\n"
+        if "pwd -P" in cmd else "garbage"))
+    res = agent.read_project_file("proj", "libfoo.so")
+    assert res["ok"] is True and res["kind"] == "unsupported"
+    # Exactly the LOCAL payload's key names -- the frontend is not being changed.
+    for key in ("kind", "path", "size", "label", "reason", "can_force_text"):
+        assert key in res, key
+    assert res["label"] == "ELF binary"
+    assert "box" in res["reason"] and "remote" in res["reason"].lower()
+    assert not any(c.strip().startswith("cat ") for c in seen["cmds"]), "must not transfer it"
+
+
+def test_the_unsupported_payload_matches_the_local_viewers(monkeypatch):
+    # Same keys AND same values-by-shape as _viewer_unsupported(), because
+    # frontend/app.js reads one set of key names for both.
+    _remote(monkeypatch, lambda cmd: (
+        "SIZE=2048\nHEAD=" + _head_b64(b"\x7fELF\x02\x01\x01\x00") + "\n"
+        if "pwd -P" in cmd else "garbage"))
+    remote = agent.read_project_file("proj", "libfoo.so")
+    local = agent._viewer_unsupported("libfoo.so", 2048, "ELF binary")
+    assert set(remote) == set(local), (sorted(remote), sorted(local))
+    assert remote["can_force_text"] is True and remote["ok"] is True
+
+
+def test_a_remote_archive_is_declined_by_extension(monkeypatch):
+    # Remote archive LISTING is a subsystem (one ssh round trip per member), not
+    # a preview -- so an .apk gets the same unsupported card, never mojibake.
+    _remote(monkeypatch, lambda cmd: (
+        "SIZE=4096\nHEAD=" + _head_b64(b"PK\x03\x04" + b"junk" * 8) + "\n"
+        if "pwd -P" in cmd else "garbage"))
+    res = agent.read_project_file("proj", "app.apk")
+    assert res["ok"] is True and res["kind"] == "unsupported"
+    assert res["kind"] != "archive", "no remote archive listing in v1"
+    assert "APK" in res["label"]
+
+
+def test_the_sniff_rides_on_the_existing_probe(monkeypatch):
+    # One round trip, not two: the head comes back from the same probe that
+    # already resolves the path and reads the size.
+    seen = _remote(monkeypatch,
+                   lambda cmd: "SIZE=5\nHEAD=\n" if "pwd -P" in cmd else "hello")
+    agent.read_project_file("proj", "a.txt")
+    probes = [c for c in seen["cmds"] if "pwd -P" in c]
+    assert len(probes) == 1
+    assert "HEAD=" in probes[0] and "base64" in probes[0]
+
+
+def test_force_text_still_shows_a_remote_binary_as_text(monkeypatch):
+    # The "view as text anyway" escape hatch behaves like the local viewer's.
+    _remote(monkeypatch, lambda cmd: (
+        "SIZE=8\nHEAD=" + _head_b64(b"\x7fELF\x00\x00") + "\n"
+        if "pwd -P" in cmd else "raw bytes"))
+    res = agent.read_project_file("proj", "libfoo.so", force_text=True)
+    assert res["kind"] == "text" and "raw bytes" in res["content"]
+
+
+def test_a_remote_text_file_with_no_head_line_still_opens(monkeypatch):
+    # A host whose head/dd both failed yields an empty HEAD; an empty head is a
+    # perfectly fine empty text file, so the viewer must not start refusing.
+    _remote(monkeypatch,
+            lambda cmd: "SIZE=5\nHEAD=\n" if "pwd -P" in cmd else "hello")
+    res = agent.read_project_file("proj", "a.txt")
+    assert res["kind"] == "text" and "hello" in res["content"]
+
+
+# --- CRITICAL 1: the fs_* family mutates the LOCAL disk -----------------------
+# The tree shows the REMOTE box while _safe_abs resolves against the LOCAL picked
+# folder, so an unguarded fs_delete of `config.json` trashes the LOCAL project's
+# copy and then repaints the remote tree -- the destruction is invisible.
+
+def _fs_api(tmp_root):
+    from agent import AgentApi
+    api = AgentApi.__new__(AgentApi)
+    api.session = {"project": "proj", "root": tmp_root}
+    api._window = None
+    api._emit = lambda e: None
+    api._refresh_tree = lambda force=False: None
+    return api
+
+
+# (method name, args) for every entry point that resolves through _safe_abs.
+FS_CALLS = [
+    ("fs_move", (["a.txt"], "sub")),
+    ("fs_delete", (["a.txt"],)),
+    ("fs_trash_empty", ()),
+    ("fs_mkdir", ("newdir",)),
+    ("fs_new_file", ("new.txt",)),
+    ("fs_rename", ("a.txt", "b.txt")),
+    ("fs_duplicate", ("a.txt",)),
+    ("fs_write_upload", ("", "a.txt", "aGk=")),
+    ("upload_files", ("",)),
+    ("read_archive_member", ("app.apk", "AndroidManifest.xml")),
+]
+
+
+def _local_workspace():
+    import tempfile
+    root = tempfile.mkdtemp(prefix="fsguard-")
+    with open(_os.path.join(root, "a.txt"), "w", encoding="utf-8") as f:
+        f.write("local content")
+    _os.makedirs(_os.path.join(root, "sub"), exist_ok=True)
+    return root
+
+
+def test_every_fs_mutation_refuses_when_a_device_is_active(monkeypatch):
+    monkeypatch.setattr(devices, "_active",
+                        devices.Device("i", "build-box", "berat@h", "/r"))
+    root = _local_workspace()
+    api = _fs_api(root)
+    before = sorted(_os.listdir(root))
+    bad = []
+    for name, args in FS_CALLS:
+        res = getattr(api, name)(*args)
+        if not (isinstance(res, dict) and res.get("ok") is False
+                and "build-box" in str(res.get("error", ""))
+                and "This computer" in str(res.get("error", ""))):
+            bad.append((name, res))
+    assert not bad, f"these did not refuse (or did not name the device): {bad}"
+    assert sorted(_os.listdir(root)) == before, "the LOCAL workspace was modified"
+    with open(_os.path.join(root, "a.txt"), encoding="utf-8") as f:
+        assert f.read() == "local content"
+
+
+def test_safe_abs_itself_refuses_so_a_future_caller_inherits_the_guard(monkeypatch):
+    monkeypatch.setattr(devices, "_active",
+                        devices.Device("i", "build-box", "berat@h", "/r"))
+    api = _fs_api(_local_workspace())
+    try:
+        api._safe_abs("a.txt")
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "build-box" in str(e)
+    # reveal_in_finder takes relative paths through _safe_abs; it must degrade to
+    # a clean error rather than opening the LOCAL folder.
+    res = api.reveal_in_finder("a.txt")
+    assert res["ok"] is False and "build-box" in res["error"]
+
+
+def test_the_fs_family_still_works_locally(monkeypatch):
+    # The guard must refuse REMOTE only -- a local session keeps every operation.
+    monkeypatch.setattr(devices, "_active", None)
+    root = _local_workspace()
+    api = _fs_api(root)
+    monkeypatch.setattr(agent, "build_file_tree",
+                        lambda p: {"name": p, "path": "", "type": "dir", "children": []})
+    assert api.fs_mkdir("made")["ok"] is True
+    assert _os.path.isdir(_os.path.join(root, "made"))
+    assert api.fs_delete(["a.txt"])["ok"] is True
+    assert not _os.path.exists(_os.path.join(root, "a.txt"))
+
 
 
 if __name__ == "__main__":
@@ -210,7 +406,8 @@ if __name__ == "__main__":
              (test_empty_output_yields_an_empty_root, False),
              (test_file_nodes_carry_their_size, False),
              (test_remote_tree_shells_out_and_does_not_touch_local_disk, True),
-             (test_remote_tree_survives_a_failed_command, True),
+             (test_an_unreachable_host_does_not_look_like_an_empty_project, True),
+             (test_a_reachable_but_empty_project_is_still_reported_as_empty, True),
              (test_remote_text_file_is_returned_as_text, True),
              (test_remote_escape_outside_the_project_is_rejected, True),
              (test_remote_leaf_symlink_escape_is_rejected_without_transfer, True),
@@ -218,7 +415,16 @@ if __name__ == "__main__":
              (test_probe_script_rejects_dotdot_before_the_root_comparison, True),
              (test_remote_image_comes_back_base64, True),
              (test_a_file_over_the_cap_is_refused_not_transferred, True),
-             (test_a_missing_remote_file_reports_cleanly, True)]
+             (test_a_missing_remote_file_reports_cleanly, True),
+             (test_a_remote_binary_is_declined_not_catted_as_text, True),
+             (test_the_unsupported_payload_matches_the_local_viewers, True),
+             (test_a_remote_archive_is_declined_by_extension, True),
+             (test_the_sniff_rides_on_the_existing_probe, True),
+             (test_force_text_still_shows_a_remote_binary_as_text, True),
+             (test_a_remote_text_file_with_no_head_line_still_opens, True),
+             (test_every_fs_mutation_refuses_when_a_device_is_active, True),
+             (test_safe_abs_itself_refuses_so_a_future_caller_inherits_the_guard, True),
+             (test_the_fs_family_still_works_locally, True)]
     failed = 0
     for t, needs in tests:
         try:

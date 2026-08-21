@@ -10,6 +10,7 @@ that argv construction stays testable without touching process machinery.
 """
 import json
 import os
+import re
 import threading
 import uuid
 
@@ -67,7 +68,25 @@ def save_devices(devices):
     os.replace(tmp, DEVICES_PATH)
 
 
+def validate_target(target):
+    """Raise ValueError if ssh would read `target` as an option rather than a
+    host. A leading '-' is the whole attack: `-oProxyCommand=...` is a valid ssh
+    option that runs an arbitrary LOCAL command, so a device whose target starts
+    with '-' would execute on THIS machine — the exact wrong-machine failure the
+    feature exists to prevent."""
+    t = (target or "").strip()
+    if not t:
+        raise ValueError("A device needs an ssh target (user@host or a ~/.ssh/config alias).")
+    if t.startswith("-"):
+        raise ValueError(
+            "An ssh target cannot start with '-' — ssh would read it as an option "
+            "(e.g. -oProxyCommand=...) and run it on this computer instead of "
+            "connecting. Use user@host or a ~/.ssh/config alias.")
+    return t
+
+
 def add_device(name, target, remote_root, env_prelude="", notes=""):
+    target = validate_target(target)
     d = Device(uuid.uuid4().hex[:12], name, target, remote_root, env_prelude, notes)
     all_ = load_devices()
     all_.append(d)
@@ -206,18 +225,46 @@ def ssh_opts(ssh_path):
     return opts
 
 
+# Anything outside this set is replaced before `tag` reaches the remote shell.
+# The tag is interpolated inside a double-quoted shell word, where $, `, \ and "
+# are all still live; today's only caller passes a hex uuid, but a filename
+# built from caller-supplied text must not be one refactor away from command
+# injection on another machine.
+_TAG_UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
 def _pgid_file(tag):
     # Quoted for the REMOTE shell; ${TMPDIR:-/tmp} keeps it working on hosts
-    # where /tmp is not the temp directory.
-    return f'"${{TMPDIR:-/tmp}}/.omni-{tag}.pgid"'
+    # where /tmp is not the temp directory. The tag is sanitized (not shlex-
+    # quoted) because the surrounding word must stay double-quoted for ${TMPDIR}
+    # to expand at all.
+    safe = _TAG_UNSAFE.sub("_", str(tag or "x"))
+    return '"${TMPDIR:-/tmp}/.omni-' + safe + '.pgid"'
 
 
 def _wrapper(device, command, tag):
     """The script the remote bash runs. Order matters: record the pgid first so
-    a reap can find us even if the command dies instantly."""
+    a reap can find us even if the command dies instantly.
+
+    `echo $$` is NOT the pgid. ssh hands `bash -c ...` to the remote LOGIN shell,
+    so this bash is a CHILD of that shell and inherits its process group — it is
+    not a group leader, and `kill -TERM -$$` therefore fails with "no such
+    process". The reap would then fall back to the bare pid and kill only bash,
+    leaving java/apktool/gradle children running after Stop or a timeout, which
+    breaks the promise that a reap takes the whole tree down.
+
+    So ask the kernel for the real group id via `ps -o pgid=`, which is POSIX and
+    present on Linux, macOS and the BSDs. The fallback is `$$`: on a host with no
+    usable ps the reap degrades to exactly today's behaviour rather than writing
+    a garbage id that would make `kill` target an unrelated group."""
     f = _pgid_file(tag)
     lines = [
-        f"echo $$ > {f}",
+        # `tr -dc 0-9` rather than trimming spaces: ps pads its output differently
+        # on Linux vs the BSDs, and a pgid is digits and nothing else.
+        'P=$(ps -o pgid= -p $$ 2>/dev/null | tr -dc 0-9)',
+        # Non-numeric or empty output means ps is missing/odd — degrade to $$.
+        'case "$P" in ""|*[!0-9]*) P=$$;; esac',
+        f'echo "$P" > {f}',
         f"trap 'rm -f {f}' EXIT",
         'export PATH="$HOME/.omni-agent/bin:$PATH"',
     ]
@@ -245,8 +292,10 @@ def run_argv(device, command, tag, ssh_path=None):
 
 def reap_argv(device, tag, ssh_path=None):
     """Kill a still-running remote command by the process-group id its wrapper
-    recorded. `kill -TERM -PID` signals the whole GROUP so children die too; the
-    bare-PID fallback covers hosts where the remote bash is not a group leader."""
+    recorded. `kill -TERM -P` signals the whole GROUP so children (java, apktool,
+    gradle) die too, which is what the wrapper's `ps -o pgid=` lookup exists to
+    make possible. The bare-`P` fallback covers the wrapper's own fallback — a
+    host with no usable `ps`, where the recorded number is a bare pid."""
     ssh = ssh_path or find_ssh()
     f = _pgid_file(tag)
     script = (

@@ -427,7 +427,13 @@ def download_file(url, dest=None, max_mb=_DEFAULT_MAX_MB):
         if res.get("error") or res.get("returncode"):
             return {"error": (f"download_file failed on the device: "
                               f"{res.get('error') or res.get('stderr') or 'curl failed'}")}
-        return {"ok": True, "path": rel, "device": devices.active().name,
+        # Re-read active() rather than assuming it: the picker runs on the
+        # pywebview thread, so the user can deselect the device while a 10-minute
+        # curl is in flight, and `.name` on None would turn a SUCCESSFUL download
+        # into an AttributeError.
+        _d = devices.active()
+        return {"ok": True, "path": rel,
+                "device": (_d.name if _d else "the device it was selected on"),
                 "note": "downloaded on the active device, not this computer"}
 
     try:

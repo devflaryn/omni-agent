@@ -178,6 +178,60 @@ def test_wrapper_records_its_pgid_and_traps_exit():
     assert "trap" in inner and "EXIT" in inner
 
 
+def test_wrapper_records_the_process_GROUP_not_the_bare_pid():
+    # `echo $$` records a PID. ssh hands `bash -c ...` to the remote LOGIN shell,
+    # so this bash inherits that shell's pgid and is NOT a group leader —
+    # `kill -TERM -$$` then fails and the reap falls back to killing bash alone,
+    # leaving java/apktool/gradle children alive after Stop or a timeout.
+    inner = shlex.split(devices.run_argv(_dev(), "ls", "t", ssh_path="/usr/bin/ssh")[-1])[-1]
+    assert "pgid" in inner, "the wrapper must ask for the process-GROUP id"
+    assert "ps -o pgid= -p $$" in inner
+    first = [ln for ln in inner.splitlines() if ln.strip()][0]
+    assert first.startswith("P=$("), "the pgid must be recorded before anything else runs"
+    assert "echo $$ >" not in inner, "recording the bare pid is the bug"
+
+
+def test_wrapper_falls_back_to_dollar_dollar_when_ps_is_unusable():
+    # A host with no usable `ps` must degrade to the old bare-pid behaviour, not
+    # write an empty/garbage id that `kill` would aim at an unrelated group.
+    inner = shlex.split(devices.run_argv(_dev(), "ls", "t", ssh_path="/usr/bin/ssh")[-1])[-1]
+    assert 'case "$P" in' in inner and "P=$$" in inner
+
+
+def test_pgid_filename_cannot_carry_shell_syntax():
+    # The tag is interpolated into a DOUBLE-quoted remote filename, where $ and `
+    # are still live. Today's caller passes a hex uuid; the quoting must not
+    # depend on that staying true.
+    evil = 'a"; rm -rf ~; echo "$(id)`id`'
+    name = devices._pgid_file(evil)
+    assert name.startswith('"${TMPDIR:-/tmp}/.omni-') and name.endswith('.pgid"')
+    body = name[len('"${TMPDIR:-/tmp}/.omni-'):-len('.pgid"')]
+    assert all(c.isalnum() or c in "._-" for c in body), body
+    # ...and the same tag must still produce the same name for run and reap, or
+    # the reap looks for a file that was never written.
+    assert devices._pgid_file(evil) == name
+
+
+def test_ssh_target_starting_with_a_dash_is_rejected(monkeypatch):
+    # `-oProxyCommand=...` is a valid ssh OPTION that runs an arbitrary command on
+    # THIS machine. A device whose target ssh parses as an option never connects
+    # anywhere — it executes locally, the exact wrong-machine failure.
+    _isolate(monkeypatch)
+    try:
+        devices.add_device("evil", "-oProxyCommand=calc.exe", "/r")
+        raise AssertionError("expected ValueError")
+    except ValueError as e:
+        assert "-" in str(e) and "option" in str(e).lower()
+    assert devices.load_devices() == [] or all(
+        not d.target.startswith("-") for d in devices.load_devices())
+
+
+def test_an_ordinary_target_still_registers(monkeypatch):
+    _isolate(monkeypatch)
+    d = devices.add_device("box", "  berat@10.0.0.5 ", "/r")
+    assert d.target == "berat@10.0.0.5", "the target is trimmed, not mangled"
+
+
 def test_wrapper_prepends_the_remote_tool_bin():
     argv = devices.run_argv(_dev(), "ls", "t", ssh_path="/usr/bin/ssh")
     inner = shlex.split(argv[-1])[-1]
@@ -270,6 +324,11 @@ if __name__ == "__main__":
              (test_remote_root_with_spaces_is_quoted, False),
              (test_command_with_quotes_and_dollars_survives, False),
              (test_wrapper_records_its_pgid_and_traps_exit, False),
+             (test_wrapper_records_the_process_GROUP_not_the_bare_pid, False),
+             (test_wrapper_falls_back_to_dollar_dollar_when_ps_is_unusable, False),
+             (test_pgid_filename_cannot_carry_shell_syntax, False),
+             (test_ssh_target_starting_with_a_dash_is_rejected, True),
+             (test_an_ordinary_target_still_registers, True),
              (test_wrapper_prepends_the_remote_tool_bin, False),
              (test_wrapper_runs_env_prelude_when_set, False),
              (test_wrapper_aborts_when_cd_fails, False),

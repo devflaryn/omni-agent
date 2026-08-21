@@ -14,10 +14,27 @@ from tool_registry import registry
 # and tap_element. tap_element also drives the LOCAL adb/view-hierarchy channel
 # (_resolve_serial / _read_ui), so it belongs in this list on the merits, not
 # just to make the count work. Corrected here; see task-4-report.md Deviations.
+# tools/android_emulator.py was omitted from the plan by mistake and so was never
+# pointed at by a per-task review. It bypasses host_exec.run_cmd BY DESIGN
+# (subprocess straight to the local adb / omnidroid engine), which is exactly why
+# it needs the guard: with a device active, run_cmd goes to the other machine
+# while these stay here, so adb_shell("pm uninstall com.x") silently drives the
+# LOCAL emulator and run_apk_test_session builds remotely then installs locally —
+# one task, two machines. All 20 registered tools in that module are listed.
+EMULATOR_TOOLS = [
+    "ensure_emulator_running", "adb_shell", "set_emulator_ui", "tap_screen",
+    "type_text", "swipe_screen", "press_key", "install_apk_on_emulator",
+    "launch_app_on_emulator", "get_logcat", "monitor_logcat",
+    "take_emulator_screenshot", "record_and_capture_keyframes",
+    "read_auto_screenshots", "analyze_keyframes", "generate_test_report",
+    "run_apk_test_session", "stop_emulator", "ensure_frida_server",
+    "hide_root_from_app",
+]
+
 LOCAL_ONLY = [
     "build_code_graph", "query_code_graph", "diff_code_graphs", "list_code_graphs",
     "observe_screen", "tap_element",
-]
+] + EMULATOR_TOOLS
 
 
 def _go_remote(monkeypatch):
@@ -90,6 +107,39 @@ def test_apk_constraint_check_catches_it(monkeypatch):
         "the constraint check must degrade, not crash, when there is no local path"
 
 
+def test_every_registered_emulator_tool_is_covered():
+    # The list above must be the WHOLE module, not the part someone remembered.
+    # A tool added to android_emulator.py later fails here until it is guarded.
+    import inspect
+    from tools import android_emulator
+    registered = {name for name, _ in registry.list_tools()
+                  if getattr(registry._tools[name].get("func"), "__module__", "")
+                  .split(".")[-1] == "android_emulator"}
+    assert registered == set(EMULATOR_TOOLS), (
+        f"unlisted: {sorted(registered - set(EMULATOR_TOOLS))}, "
+        f"stale: {sorted(set(EMULATOR_TOOLS) - registered)}")
+    assert len(registered) == 20, f"expected 20 emulator tools, found {len(registered)}"
+    for name in sorted(registered):
+        src = inspect.getsource(registry._tools[name]["func"])
+        assert "require_local" in src, f"{name} would run on the LOCAL emulator"
+    # The module header claims this; AGENTS.md promises it to the user.
+    assert "LOCAL ONLY" in (android_emulator.__doc__ or "")
+
+
+def test_an_emulator_tool_refuses_before_touching_adb(monkeypatch):
+    # The guard must come before _resolve_serial, or a remote session still
+    # spawns a local adb and blocks on it.
+    _go_remote(monkeypatch)
+    from tools import android_emulator
+    monkeypatch.setattr(android_emulator, "_resolve_serial",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("adb was reached on a remote session")))
+    res = android_emulator.adb_shell("pm uninstall com.x")
+    assert "error" in res and "build-box" in res["error"]
+    res = android_emulator.run_apk_test_session("app.apk", "com.x")
+    assert "error" in res and "build-box" in res["error"]
+
+
 def test_local_only_list_matches_reality():
     # If a tool is renamed or added, this test is where you find out.
     for name in LOCAL_ONLY:
@@ -145,6 +195,8 @@ if __name__ == "__main__":
              (test_guarded_tools_check_the_guard_before_touching_anything, True),
              (test_resolve_workspace_path_raises_a_catchable_error_when_remote, True),
              (test_apk_constraint_check_catches_it, True),
+             (test_every_registered_emulator_tool_is_covered, False),
+             (test_an_emulator_tool_refuses_before_touching_adb, True),
              (test_local_only_list_matches_reality, False),
              (test_download_file_uses_curl_on_the_device, True),
              (test_download_file_still_uses_requests_when_local, True)]

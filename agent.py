@@ -1120,11 +1120,27 @@ def _parse_find_output(text, project_name):
     return root
 
 
+# The tree node a failed remote listing puts in the sidebar. A path no real file
+# can have, so a stray click/drag on it resolves to nothing.
+REMOTE_TREE_ERROR_PATH = ".omni-device-unreachable"
+
+
 def _remote_file_tree(project_name):
     res = run_cmd(_remote_find_command(), timeout=60)
     if res.get("error") or res.get("returncode"):
+        # Returning a bare empty tree here made an unreachable host look exactly
+        # like an empty project folder — the user sees nothing wrong and starts
+        # working. Keep the payload shape (the UI walks .children and would break
+        # on anything else) but say so, both in a machine-readable `error` key and
+        # as a node the user actually SEES in the sidebar.
+        d = devices.active()
+        detail = (res.get("error") or res.get("stderr") or "").strip()             or f"the listing command exited {res.get('returncode')}"
+        where = f"'{d.name}' ({d.target})" if d else "the active device"
+        msg = f"Could not list the project folder on {where}: {detail}"
         return {"name": project_name or "workspace", "path": "", "type": "dir",
-                "children": []}
+                "error": msg,
+                "children": [{"name": f"⚠ {msg}", "path": REMOTE_TREE_ERROR_PATH,
+                              "type": "dir", "children": []}]}
     return _parse_find_output(res.get("stdout") or "", project_name)
 
 
@@ -1351,7 +1367,21 @@ def _remote_read_project_file(project_name, rel_path, force_text=False):
         f'case "$F" in *"/../"*|*"/..") echo OUTSIDE; exit 0;; esac; '
         f'case "$F" in "$R"/*|"$R") ;; *) echo OUTSIDE; exit 0;; esac; '
         f'if [ ! -f {t} ]; then echo MISSING; exit 0; fi; '
-        f'echo "SIZE=$(wc -c < {t} | tr -d " ")"'
+        f'S=$(wc -c < {t} | tr -d " "); echo "SIZE=$S"; '
+        # The binary sniff needs BYTES, and it rides along on this same probe
+        # rather than costing a second round trip. base64 so the bytes survive
+        # the pipe intact, one line so the parse below stays line-oriented, and
+        # `dd` behind `head -c` for the rare host whose head lacks -c. If both
+        # fail the line is empty and the sniff simply sees an empty head — the
+        # pre-existing text path, not a crash. Skipped entirely above the preview
+        # cap, where the answer is "too large" and no bytes should be read at all.
+        f'if [ "$S" -le {REMOTE_PREVIEW_MAX_BYTES} ]; then '
+        f'echo "HEAD=$( (head -c {_VIEWER_SNIFF_BYTES} {t} 2>/dev/null '
+        f'|| dd if={t} bs=1 count={_VIEWER_SNIFF_BYTES} 2>/dev/null) '
+        # tr -dc (keep only the base64 alphabet) rather than tr -d of a newline:
+        # it strips the line wrapping without an escaped newline in the middle of
+        # a shell string, and drops anything a chattier base64 might add.
+        f"| base64 | tr -dc 'A-Za-z0-9+/=' )\"; fi"
     )
     probe = run_cmd(probe_script, timeout=30)
     out = (probe.get("stdout") or "").strip()
@@ -1362,13 +1392,18 @@ def _remote_read_project_file(project_name, rel_path, force_text=False):
     if out.startswith("MISSING"):
         return {"ok": False, "error": f"No such file on device: {rel_path}"}
 
-    size = 0
+    size, head = 0, b""
     for line in out.splitlines():
         if line.startswith("SIZE="):
             try:
                 size = int(line[5:])
             except ValueError:
                 size = 0
+        elif line.startswith("HEAD="):
+            try:
+                head = base64.b64decode(line[5:] or "")
+            except (binascii.Error, ValueError):
+                head = b""
     if size > REMOTE_PREVIEW_MAX_BYTES:
         mb = REMOTE_PREVIEW_MAX_BYTES // (1024 * 1024)
         return {"ok": False,
@@ -1382,6 +1417,25 @@ def _remote_read_project_file(project_name, rel_path, force_text=False):
             return {"ok": False, "error": res.get("error") or "could not read the image"}
         return {"ok": True, "kind": "image", "mime": _REMOTE_IMAGE_MIME[ext],
                 "data": (res.get("stdout") or "").strip(), "path": rel, "size": size}
+
+    # Everything the local viewer would render as an archive listing or decline as
+    # binary must be declined here too. Without this an .apk or .so under the 8 MB
+    # cap was `cat`'d straight into the viewer as mojibake — worse than the local
+    # behaviour on the same file. The payload is _viewer_unsupported()'s exact
+    # shape (kind/path/size/label/reason/can_force_text) because the frontend is
+    # not being changed; only the wording says the limitation is the device.
+    # Archive extensions are declined by NAME rather than sniffed, deliberately:
+    # listing a remote zip's entries is a subsystem (every member read would be
+    # its own ssh round trip), not a preview.
+    if not force_text and (ext in _VIEWER_ARCHIVE_EXTS or _viewer_looks_binary(head)):
+        label = _viewer_describe_binary(head, ext)
+        d = devices.active()
+        where = f"'{d.name}'" if d else "the active device"
+        return _viewer_unsupported(
+            rel, size, label,
+            detail=(f"This looks like a {label}. Preview isn't available for this "
+                    f"type on a remote device ({where}) — read it with tools that "
+                    f"run there instead."))
 
     res = run_cmd(f"cat {t}", timeout=120)
     if res.get("error") or res.get("returncode"):
@@ -3268,6 +3322,16 @@ class AgentApi:
             "transcript": s.get("transcript", []),
             "busy": self._busy,
         })
+        # The chip is painted once at init() and then only by `device_changed`.
+        # _load_persisted() reinstates (or clears) devices._active for the project
+        # being opened, so WITHOUT this emit a change-session into a project with a
+        # different saved device leaves the chip reading the PREVIOUS project's
+        # machine — routing remote while the chip says "this computer", or the
+        # reverse. Emitted unconditionally, local included: the chip has to be
+        # repainted to "this computer" just as urgently as to a device name.
+        _dev = devices.active()
+        self._emit({"type": "device_changed",
+                    "device": (_dev.to_dict() if _dev else None)})
         # Restore the header stats (steps / tools used / context / resets) after the
         # chat is rebuilt, so a reopened project shows its last counts instead of 0.
         last_status = s.get("last_status")
@@ -3477,7 +3541,10 @@ class AgentApi:
                 "devices": [x.to_dict() for x in devices.load_devices()]}
 
     def add_device(self, name, target, remote_root, env_prelude="", notes=""):
-        d = devices.add_device(name, target, remote_root, env_prelude, notes)
+        try:
+            d = devices.add_device(name, target, remote_root, env_prelude, notes)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
         return {"ok": True, "device": d.to_dict()}
 
     def remove_device(self, device_id):
@@ -3492,6 +3559,14 @@ class AgentApi:
     def select_device(self, device_id):
         """Switch the machine work happens on. Recorded in the transcript so a
         later reader is never left guessing which computer a command ran on."""
+        # Routing is read per tool call from a process-wide global, so switching
+        # mid-turn would split ONE task across TWO machines: the build lands on
+        # the device, the install on this computer. Refuse instead.
+        if getattr(self, "_busy", False):
+            return {"ok": False, "error": (
+                "The agent is working right now — switching machines mid-task "
+                "would run part of it here and part of it there. Let the current "
+                "task finish, or press Stop, then switch.")}
         try:
             d = devices.set_active(device_id)
         except KeyError:
@@ -3537,6 +3612,12 @@ class AgentApi:
         return read_project_file(self.session["project"], rel_path, force_text=bool(force_text))
 
     def read_archive_member(self, rel_path, member, force_text=False):
+        # Reading an archive member unzips a LOCAL file. With a device active the
+        # tree shows the REMOTE box, so the path in hand names a remote file and
+        # the same path here would open an unrelated local one.
+        _err = devices.require_local("Browsing inside an archive")
+        if _err:
+            return {"ok": False, **_err}
         if not self.session:
             return {"ok": False, "error": "No active session."}
         return read_project_archive_member(
@@ -3547,12 +3628,25 @@ class AgentApi:
     # between a frontend-supplied relative path and arbitrary host filesystem
     # access. It resolves symlinks before comparing, so a symlink inside the
     # workspace cannot be used to escape it.
+    #
+    # ALL OF IT IS LOCAL-ONLY. _safe_abs resolves against session["root"] — the
+    # LOCAL picked folder — while build_file_tree() shows the REMOTE folder when a
+    # device is active. Without a guard, deleting `config.json` from the (remote)
+    # tree trashes the LOCAL project's file and then repaints the remote tree, so
+    # the destruction is invisible. Every entry point below therefore refuses out
+    # loud when a device is active; _safe_abs itself refuses too, so a future
+    # caller inherits the guard instead of having to remember it. There is no
+    # remote implementation on purpose — refusing is v1, exactly like the other
+    # local-only tools.
 
     TRASH_DIRNAME = ".omni-trash"
 
     def _safe_abs(self, rel, *, must_exist=False):
         """Resolve a workspace-relative path to an absolute one, or raise
         ValueError if it would land outside the workspace root."""
+        _err = devices.require_local("Editing files from the file tree")
+        if _err:
+            raise ValueError(_err["error"])
         if not self.session:
             raise ValueError("No active session.")
         root = os.path.realpath(self.session.get("root") or _project_root())
@@ -3587,6 +3681,9 @@ class AgentApi:
 
     def fs_move(self, rel_paths, dest_dir_rel):
         """Move files/folders into dest_dir_rel (drag and drop in the tree)."""
+        _err = devices.require_local("Moving files in the file tree")
+        if _err:
+            return {"ok": False, **_err}
         try:
             dest = self._safe_abs(dest_dir_rel, must_exist=True)
             if not os.path.isdir(dest):
@@ -3621,6 +3718,9 @@ class AgentApi:
         undoable, and the agent's own tools already treat the workspace as the
         unit of state.
         """
+        _err = devices.require_local("Deleting files from the file tree")
+        if _err:
+            return {"ok": False, **_err}
         try:
             root = self._safe_abs("")
             trash = os.path.join(root, self.TRASH_DIRNAME)
@@ -3649,6 +3749,9 @@ class AgentApi:
 
     def fs_trash_empty(self):
         """Permanently delete everything in the workspace trash."""
+        _err = devices.require_local("Emptying the trash")
+        if _err:
+            return {"ok": False, **_err}
         try:
             trash = self._safe_abs(self.TRASH_DIRNAME)
             if not os.path.isdir(trash):
@@ -3667,6 +3770,9 @@ class AgentApi:
 
     def fs_mkdir(self, rel):
         """Create a new folder."""
+        _err = devices.require_local("Creating a folder")
+        if _err:
+            return {"ok": False, **_err}
         try:
             target = self._safe_abs(rel)
             if os.path.exists(target):
@@ -3678,6 +3784,9 @@ class AgentApi:
 
     def fs_new_file(self, rel):
         """Create an empty file."""
+        _err = devices.require_local("Creating a file")
+        if _err:
+            return {"ok": False, **_err}
         try:
             target = self._safe_abs(rel)
             if os.path.exists(target):
@@ -3692,6 +3801,9 @@ class AgentApi:
     def fs_rename(self, rel, new_name):
         """Rename in place. new_name is a bare name, never a path — accepting a
         path here would let a rename act as a move outside the workspace."""
+        _err = devices.require_local("Renaming a file")
+        if _err:
+            return {"ok": False, **_err}
         try:
             src = self._safe_abs(rel, must_exist=True)
             name = (new_name or "").strip()
@@ -3707,6 +3819,9 @@ class AgentApi:
 
     def fs_duplicate(self, rel):
         """Copy a file or folder beside itself."""
+        _err = devices.require_local("Duplicating a file")
+        if _err:
+            return {"ok": False, **_err}
         try:
             src = self._safe_abs(rel, must_exist=True)
             dest = self._unique_path(src)
@@ -3727,6 +3842,9 @@ class AgentApi:
         `name` may contain forward slashes so a dropped FOLDER can recreate its
         structure; each segment is still resolved through _safe_abs.
         """
+        _err = devices.require_local("Uploading into the file tree")
+        if _err:
+            return {"ok": False, **_err}
         try:
             rel_name = (name or "").strip().replace("\\", "/").strip("/")
             if not rel_name or ".." in rel_name.split("/"):
@@ -3750,6 +3868,9 @@ class AgentApi:
         dest_dir, relative to the project root). Returns the refreshed file tree
         so the frontend updates immediately. Existing files of the same name are
         overwritten (an upload of a newer copy)."""
+        _err = devices.require_local("Uploading files")
+        if _err:
+            return {"ok": False, **_err}
         if not self.session:
             return {"ok": False, "error": "No active session."}
         if self._window is None:
