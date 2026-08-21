@@ -1,5 +1,6 @@
 import os
 import re
+import shlex
 import sys
 import base64
 import binascii
@@ -57,7 +58,9 @@ from host_exec import (
     set_workspace,
     set_timeout_decider,
     set_stop_check as set_exec_stop_check,
+    run_cmd,
 )
+import devices
 from tool_registry import registry, CORE_GROUP
 import planning
 import investigation
@@ -1027,9 +1030,79 @@ def _tree_signature(tree):
         return None
 
 
+# Depth and ignore list mirror the local walker, so switching machines does not
+# silently change what the tree shows.
+_REMOTE_TREE_DEPTH = 6
+_REMOTE_TREE_IGNORE = (".git", "node_modules", "__pycache__", ".venv", "dist", "build")
+
+
+def _remote_find_command():
+    """Two `find` passes, one per type, each tagged with a leading d/f.
+
+    Deliberately avoids `find -printf`, which is GNU-only. The local box assumes
+    a GNU userland, but a remote host may be macOS or BSD, and a tree that fails
+    on half the machines you connect to is not a tree."""
+    prune = " -o ".join(f"-name {shlex.quote(n)}" for n in _REMOTE_TREE_IGNORE)
+    base = f"find . -maxdepth {_REMOTE_TREE_DEPTH} \\( {prune} \\) -prune -o "
+    d = base + r"-type d -print | sed 's|^|d\t|'"
+    f = base + r"-type f -print | sed 's|^|f\t|'"
+    return d + "; " + f
+
+
+def _parse_find_output(text, project_name):
+    """Turn the tagged find output into the SAME nested dict the local walker
+    produces, so the frontend needs no changes."""
+    root = {"name": project_name or "workspace", "path": "", "type": "dir", "children": []}
+    dirs = {"": root}
+
+    rows = []
+    for line in (text or "").splitlines():
+        if "\t" not in line:
+            continue
+        kind, _, raw = line.partition("\t")
+        rel = raw[2:] if raw.startswith("./") else raw
+        if rel in ("", "."):
+            continue
+        rows.append((kind, rel))
+
+    # Directories first and shallowest-first, so a parent always exists before
+    # its child is attached.
+    rows.sort(key=lambda r: (0 if r[0] == "d" else 1, r[1].count("/"), r[1]))
+
+    for kind, rel in rows:
+        parent_rel, _, name = rel.rpartition("/")
+        parent = dirs.get(parent_rel)
+        if parent is None:
+            continue          # its parent was pruned; skip rather than orphan it
+        node = {"name": name, "path": rel, "type": "dir" if kind == "d" else "file"}
+        if kind == "d":
+            node["children"] = []
+            dirs[rel] = node
+        parent["children"].append(node)
+
+    def sort_tree(node):
+        node["children"].sort(key=lambda c: (0 if c["type"] == "dir" else 1, c["name"].lower()))
+        for c in node["children"]:
+            if c["type"] == "dir":
+                sort_tree(c)
+
+    sort_tree(root)
+    return root
+
+
+def _remote_file_tree(project_name):
+    res = run_cmd(_remote_find_command(), timeout=60)
+    if res.get("error") or res.get("returncode"):
+        return {"name": project_name or "workspace", "path": "", "type": "dir",
+                "children": []}
+    return _parse_find_output(res.get("stdout") or "", project_name)
+
+
 def build_file_tree(project_name):
     """Builds a nested file-tree dict of the active workspace (host side).
     The picked folder is the root (no project-subfolder layer)."""
+    if devices.is_remote():
+        return _remote_file_tree(project_name)
     try:
         root = _project_root(project_name)
     except RuntimeError:
