@@ -285,7 +285,7 @@ lower-risk than its blast radius suggests.
 | `tests/frontend/test_contrast.mjs` (existing) | Re-derives every ratio from the CSS. The new palette must clear AA in BOTH themes. The `-fg` values are tuned against this, not by eye. |
 | `tests/frontend/test_tailwind_classes.mjs` (existing) | Every class used still resolves after the rebuild. |
 | `tests/frontend/test_element_ids.mjs` (existing) | No id lost while editing markup. |
-| `tests/frontend/test_icons.mjs` (new) | Every `icon('name')` used in any frontend JS exists in the sprite; the sprite has no unused symbols; every symbol has a 24×24 viewBox. |
+| `tests/frontend/test_icons.mjs` (new) | Every `icon('name')` used in any frontend JS exists in the sprite, and every symbol has a 24×24 viewBox. It does NOT reject unused symbols: the sprite carries a few (chevrons, search, plus, refresh) that the folded-in inline SVGs and near-term UI need. |
 | `tests/frontend/test_no_emoji.mjs` (new) | No emoji or pictographic glyph remains in `index.html`, `app.js`, `workflow_view.js`, `workflow_library.js`, `device_view.js`, `wave_stats.js`. |
 | `tests/frontend/test_font.mjs` (new) | The bundled font file exists, `@font-face` points at it, the licence ships beside it, and a fallback stack is declared. |
 | `tests/frontend/test_boot.mjs` (existing) | The app still boots with the sprite injected. |
