@@ -179,6 +179,16 @@ TOOL_RESULT_KEEP_RECENT = 14        # most-recent tool results kept in full
 TOOL_RESULT_STUB_OVER = 1200        # only elide results longer than this
 TOOL_RESULT_STUB_HEAD = 220         # chars of the original kept in the stub
 
+# --- Workflow launch (UI-initiated) -------------------------------------------
+# A user-launched workflow's result goes back into the conversation so the model
+# can act on it. This follows the existing TOOL RESULT convention (user-role
+# messages carrying tool output), rather than inventing a new channel.
+WORKFLOW_RESULT_PREFIX = "WORKFLOW RESULT"
+# An exhaustive-audit result can be enormous. Capping it protects exactly the
+# context budget the workflow engine exists to protect; the run id is the
+# pointer to the full record.
+WORKFLOW_RESULT_CAP = 4000
+
 # --- Tool budget / loop protection -------------------------------------------
 # No soft "you've run too many tools" nudge: multi-day runs make hundreds of
 # back-to-back tool calls normal. MAX_CONSECUTIVE_TOOLS only triggers silent
@@ -3579,6 +3589,85 @@ class AgentApi:
                     "device": (d.to_dict() if d else None)})
         self._refresh_system_prompt()
         return {"ok": True, "device": (d.to_dict() if d else None)}
+
+    def list_workflows(self):
+        import workflows
+        return {"ok": True, "workflows": workflows.list_library()}
+
+    def list_runs(self, limit=50):
+        import workflows
+        return {"ok": True, "runs": workflows.list_runs(limit=limit)}
+
+    def load_run(self, run_id):
+        import workflows
+        return workflows.load_run(run_id)
+
+    def _workflow_result_into_conversation(self, res):
+        """Append a finished run's result as a user-role message.
+
+        User-role because this codebase already feeds tool output back that way
+        ('TOOL RESULT:'), so the model reads it with machinery it already has."""
+        import json as _json
+        name = res.get("name") or "workflow"
+        run_id = res.get("run_id") or "(no run id)"
+        head = f"{WORKFLOW_RESULT_PREFIX} ({name}, run {run_id}):\n"
+        if not res.get("ok"):
+            body = f"The run FAILED: {res.get('error') or 'unknown error'}"
+        else:
+            try:
+                body = _json.dumps(res.get("result"), indent=2, default=str)
+            except (TypeError, ValueError):
+                body = str(res.get("result"))
+            if len(body) > WORKFLOW_RESULT_CAP:
+                body = (body[:WORKFLOW_RESULT_CAP]
+                        + f"\n… truncated. Open run {run_id} in the Workflow tab "
+                          f"for the full result.")
+        stats = (f"\n({res.get('agent_count', 0)} agents, "
+                 f"{res.get('elapsed_s', 0)}s)")
+        warn = ""
+        for w in (res.get("warnings") or []):
+            warn += f"\nWARNING: {w}"
+        self.session["messages"].append(
+            {"role": "user", "content": head + body + stats + warn})
+
+    def launch_workflow(self, name, args=None, dry_run=False):
+        """Run a workflow from the UI, then hand its result to the model."""
+        import threading
+        import workflows
+        if not self.session:
+            return {"ok": False, "error": "No active session. Start a project first."}
+        known = [w["name"] for w in workflows.list_library()]
+        if name not in known:
+            return {"ok": False,
+                    "error": f"no workflow named '{name}'. Available: {', '.join(known)}"}
+        with self._lock:
+            if self._busy:
+                # Two things driving the conversation at once is incoherent.
+                return {"ok": False,
+                        "error": "The agent is busy. Finish or stop the current task first."}
+            self._busy = True
+            self._stop = False
+
+        def work():
+            try:
+                res = workflows.run(name=name, args=args, on_event=self._emit,
+                                    dry_run=bool(dry_run))
+                if not dry_run:
+                    self._workflow_result_into_conversation(res)
+                    self._run_agent_loop()
+                    return
+                self._emit({"type": "system",
+                            "content": f"Dry run of '{name}': "
+                                       + ("passed" if res.get("ok")
+                                          else res.get("error", "failed"))})
+            except Exception as e:  # noqa: BLE001
+                self._emit({"type": "error", "content": f"workflow launch failed: {e}"})
+            finally:
+                with self._lock:
+                    self._busy = False
+
+        threading.Thread(target=work, daemon=True).start()
+        return {"ok": True, "started": True}
 
     def _abort_active_workflows(self):
         """Cancel every running workflow. Called from the same place that sets
