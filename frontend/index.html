@@ -129,7 +129,7 @@
     body { font-family: var(--font-ui); font-feature-settings: 'cv05' 1; }
     /* Every count, token total, elapsed time and id sits in a column. Tabular
        figures stop them jittering as values change. */
-    .t-2xs, .t-xs, .wf-agent-meta, [class*="tabular"] { font-variant-numeric: tabular-nums; }
+    .t-2xs, .t-xs, .wf-agent-meta, .font-mono, [class*="tabular"] { font-variant-numeric: tabular-nums; }
     /* Smooth hovers on interactive elements only. (This used to be a universal
        `*` rule, which made every style/class change in a 1000+ row chat DOM a
        transition candidate and dominated style-recalc time.) */
