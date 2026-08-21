@@ -3,6 +3,8 @@ meta = {
     "description": "Read several parts of the codebase in parallel and return one structured map.",
     "when_to_use": "Getting oriented in unfamiliar code. args: {\"paths\": [\"src/a\", \"src/b\"]}",
     "phases": [{"title": "Read"}, {"title": "Synthesize"}],
+    "args_schema": {"paths": {"label": "Paths to read (JSON list)",
+                              "required": True, "placeholder": '["src/a", "src/b"]'}},
 }
 
 PATHS = (args or {}).get("paths") or ["."]

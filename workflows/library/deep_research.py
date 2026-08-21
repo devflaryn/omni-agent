@@ -3,6 +3,8 @@ meta = {
     "description": "Sweep a question from several angles, read the best leads deeply, synthesize, then ask what is missing.",
     "when_to_use": "An open question needing broad coverage. args: {\"question\": \"...\"}",
     "phases": [{"title": "Sweep"}, {"title": "Read"}, {"title": "Synthesize"}, {"title": "Critique"}],
+    "args_schema": {"question": {"label": "Question to research",
+                                 "required": True, "placeholder": "how does X work"}},
 }
 
 QUESTION = (args or {}).get("question") or "the current task"

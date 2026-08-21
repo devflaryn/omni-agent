@@ -3,6 +3,8 @@ meta = {
     "description": "Keep hunting for problems until two consecutive rounds find nothing new, judging each by several distinct lenses.",
     "when_to_use": "A thorough audit where the number of issues is unknown. args: {\"target\": \"src/\"}",
     "phases": [{"title": "Find"}, {"title": "Judge"}],
+    "args_schema": {"target": {"label": "Path to audit",
+                               "required": False, "placeholder": "src/"}},
 }
 
 TARGET = (args or {}).get("target") or "."
