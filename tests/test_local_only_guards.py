@@ -96,6 +96,45 @@ def test_local_only_list_matches_reality():
         assert name in registry._tools, f"{name} is no longer a registered tool"
 
 
+def test_download_file_uses_curl_on_the_device(monkeypatch):
+    # Fetching with in-process requests would land the file on THIS machine —
+    # the wrong one.
+    _go_remote(monkeypatch)
+    from tools import web_tools
+    import host_exec
+    seen = {}
+
+    # NOTE: the brief's own mock was `seen.setdefault("cmd", cmd) or {...}` —
+    # setdefault returns the (truthy, non-empty) command string it just
+    # inserted, so `or` short-circuits and the mock returns that STRING instead
+    # of the result dict, regardless of what download_file does. A plan defect,
+    # not an implementation bug; see task-4-report.md Deviations. Fixed here
+    # while preserving the same intent: record cmd, return a success dict.
+    def _mock_run_cmd(cmd, timeout=None):
+        seen["cmd"] = cmd
+        return {"stdout": "", "stderr": "", "returncode": 0}
+
+    monkeypatch.setattr(host_exec, "run_cmd", _mock_run_cmd)
+    monkeypatch.setattr(web_tools, "run_cmd", _mock_run_cmd)
+    web_tools.download_file("https://example.com/a.apk", dest="downloads/a.apk")
+    assert "curl" in seen["cmd"]
+    assert "https://example.com/a.apk" in seen["cmd"]
+    assert "downloads/a.apk" in seen["cmd"]
+
+
+def test_download_file_still_uses_requests_when_local(monkeypatch):
+    monkeypatch.setattr(devices, "_active", None)
+    from tools import web_tools
+    called = {"curl": 0}
+    monkeypatch.setattr(web_tools, "run_cmd",
+                        lambda *a, **k: called.__setitem__("curl", 1) or {})
+    try:
+        web_tools.download_file("https://example.invalid/x", dest="x")
+    except Exception:
+        pass
+    assert called["curl"] == 0, "the local path must not shell out to curl"
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -106,7 +145,9 @@ if __name__ == "__main__":
              (test_guarded_tools_check_the_guard_before_touching_anything, True),
              (test_resolve_workspace_path_raises_a_catchable_error_when_remote, True),
              (test_apk_constraint_check_catches_it, True),
-             (test_local_only_list_matches_reality, False)]
+             (test_local_only_list_matches_reality, False),
+             (test_download_file_uses_curl_on_the_device, True),
+             (test_download_file_still_uses_requests_when_local, True)]
     failed = 0
     for t, needs in tests:
         try:
