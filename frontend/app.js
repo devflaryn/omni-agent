@@ -3887,10 +3887,30 @@ async function launchSelectedWorkflow(dryRun) {
     const res = await pywebview.api.launch_workflow(st.selected, out.args, !!dryRun);
     if (!res || !res.ok) {
       if (errEl) errEl.textContent = (res && res.error) || 'Could not launch workflow.';
+      return;
     }
+    // The backend has taken self._busy for the whole run — minutes and many
+    // LLM calls. Without this the UI still believed it was idle: Stop stayed
+    // hidden, #input stayed enabled, and every send_message was refused with
+    // "Agent is already working." The `done` event clears it again (onDone),
+    // and the launch thread emits `done` on every exit path including a dry
+    // run, so this can never latch on.
+    setBusy(true);
   } catch (e) {
     if (errEl) errEl.textContent = String(e);
   }
+}
+
+// The rail's two sections collapse (spec: "two collapsible sections"). The
+// header owns the state via .wf-collapsed; the bodies just follow it.
+function wireWorkflowSection(headId, bodyIds) {
+  const head = $(headId);
+  if (!head) return;
+  const apply = () => {
+    const collapsed = head.classList.contains('wf-collapsed');
+    bodyIds.forEach((id) => { const el = $(id); if (el) el.classList.toggle('hidden', collapsed); });
+  };
+  head.addEventListener('click', () => { head.classList.toggle('wf-collapsed'); apply(); });
 }
 
 // ---------- knowledge graph visualization (2D vis-network / 3D force-graph) ----------
@@ -4605,6 +4625,8 @@ async function init() {
   $('tabWorkflow').addEventListener('click', () => switchTab('workflow'));
   $('workflowDryRunBtn').addEventListener('click', () => launchSelectedWorkflow(true));
   $('workflowLaunchBtn').addEventListener('click', () => launchSelectedWorkflow(false));
+  wireWorkflowSection('workflowLibraryToggle', ['workflowLibraryList', 'workflowLaunchPanel']);
+  wireWorkflowSection('workflowRunsToggle', ['workflowRunList', 'workflowRunError']);
   $('planBadge').addEventListener('click', () => switchTab('plan'));
   $('ultraToggle').addEventListener('click', toggleUltra);
   $('graphModeToggle').addEventListener('click', toggleGraphMode);

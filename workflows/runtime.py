@@ -15,6 +15,7 @@ A branch parked on the semaphore costs a few KB of committed stack, so hundreds
 are fine. tests/test_workflow_runtime.py pins this with a deadlock regression
 test that runs nested parallel/pipeline with the semaphore set to 1.
 """
+import json
 import os
 import threading
 import time
@@ -31,6 +32,38 @@ MAX_ITEMS = 256          # per parallel()/pipeline() call
 # each parallel(256) is ~65k threads, which MAX_ITEMS alone permits.
 MAX_LIVE_BRANCHES = 1024
 LABEL_CHARS = 48
+# An agent result rides on every wf_agent_done event, and that event crosses the
+# JS bridge. An exhaustive-audit finding can be tens of kilobytes, so the event
+# carries a CAPPED copy — the full value is always on disk in the journal and
+# comes back whole from load_run(), which is what the click-through panel falls
+# back to for a historical run.
+MAX_EVENT_RESULT_CHARS = 4000
+
+
+def _event_result(value):
+    """The agent's result, capped for the UI event bus.
+
+    A short structured result crosses intact so the frontend can pretty-print
+    it; anything longer is rendered to text and truncated with a marker naming
+    how much was dropped. Never raises: a result that will not serialize still
+    has to reach the UI as *something*."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, indent=2, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+        if len(text) <= MAX_EVENT_RESULT_CHARS:
+            return value
+    if len(text) <= MAX_EVENT_RESULT_CHARS:
+        return text
+    dropped = len(text) - MAX_EVENT_RESULT_CHARS
+    marker = (chr(10) + "… [truncated " + str(dropped)
+              + " chars — open this run in Recent runs for the full result]")
+    return text[:MAX_EVENT_RESULT_CHARS] + marker
 
 
 class WorkflowAborted(Exception):
@@ -209,8 +242,12 @@ class WorkflowRuntime:
                 "group": self.emit_prefix or None,
             })
             self._note_partial(phase, label, agent_type, cached, True)
+            # The result rides along so a click on this row renders the same
+            # body a historical (load_run) row would. Both paths are journal
+            # rows; the click-through must not be able to tell them apart.
             self._emit({"type": "wf_agent_done", "sub_id": sub_id, "ok": True,
-                        "cached": True, "tokens": 0, "elapsed_s": 0.0})
+                        "cached": True, "tokens": 0, "elapsed_s": 0.0,
+                        "result": _event_result(cached)})
             return cached
 
         if self.dry_run:
@@ -260,7 +297,7 @@ class WorkflowRuntime:
             self._note_partial(phase, label, agent_type, value, False)
         self._emit({"type": "wf_agent_done", "sub_id": sub_id, "ok": ok,
                     "cached": False, "tokens": res.get("tokens", 0),
-                    "elapsed_s": elapsed})
+                    "elapsed_s": elapsed, "result": _event_result(value)})
         return value
 
     def _spawn(self, fns):

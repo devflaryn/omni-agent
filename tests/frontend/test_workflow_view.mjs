@@ -9,6 +9,34 @@ import { El } from './_harness.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FRONTEND = path.join(here, '..', '..', 'frontend');
+const ROOT = path.join(here, '..', '..');
+
+// The keys the PYTHON engine actually puts on a wf_agent_done event. Read from
+// workflows/runtime.py rather than invented here: the whole reason live
+// click-through shipped broken is that this test fabricated a `result` field
+// the engine never sent, and then asserted on other fields entirely. Every
+// wf_agent_done emit site must agree.
+function agentDoneKeys() {
+  const py = fs.readFileSync(path.join(ROOT, 'workflows', 'runtime.py'), 'utf8');
+  const sites = [];
+  let from = 0;
+  for (;;) {
+    const i = py.indexOf('"wf_agent_done"', from);
+    if (i < 0) break;
+    const end = py.indexOf('})', i);
+    sites.push(py.slice(i, end < 0 ? i + 400 : end));
+    from = i + 1;
+  }
+  assert.ok(sites.length >= 2,
+    `expected both wf_agent_done emit sites in runtime.py, found ${sites.length}`);
+  const perSite = sites.map(
+    (block) => new Set([...block.matchAll(/"(\w+)":/g)].map((m) => m[1])));
+  // Intersection: a key only counts if EVERY emit site sends it. The cache-hit
+  // path and the executed path must not disagree about the click-through
+  // contract.
+  return [...perSite[0]].filter((k) => perSite.every((s) => s.has(k)));
+}
+const AGENT_DONE_KEYS = agentDoneKeys();
 
 function load() {
   const root = new El('div');
@@ -198,16 +226,57 @@ function started(ctx) {
 }
 
 {
-  const { ctx } = load();
+  // Click-through on a LIVE run. This used to hand workflowAgentDone a
+  // `result` field the Python engine never emitted, then assert only sub_id
+  // and tokens — so it passed while every live click rendered an EMPTY body.
+  // The event below is now built from AGENT_DONE_KEYS, which is read out of
+  // workflows/runtime.py itself, and the assertion is on the rendered panel.
+  const { ctx, byId } = load();
   ctx.workflowStarted({ run_id: 'r1', name: 'p', description: '', phases: [] });
   ctx.workflowAgentStarted({ run_id: 'r1', sub_id: 'a', phase: 'Work', label: 'x' });
-  ctx.workflowAgentDone({ run_id: 'r1', sub_id: 'a', ok: true, cached: false,
-                          tokens: 42, elapsed_s: 1.5, result: 'the answer' });
+  assert.ok(AGENT_DONE_KEYS.includes('result'),
+    'workflows/runtime.py must put `result` on wf_agent_done — without it a '
+    + 'live click-through renders label and meta over an empty <pre>, while '
+    + 'the SAME run reopened from history renders fine');
+  const ev = { run_id: 'r1', sub_id: 'a' };
+  const values = { ok: true, cached: false, tokens: 42, elapsed_s: 1.5,
+                   result: 'the answer' };
+  for (const k of AGENT_DONE_KEYS) if (k in values) ev[k] = values[k];
+  ctx.workflowAgentDone(ev);
   ctx.workflowSelectAgent('r1', 'a');
   const sel = ctx.workflowState().selectedAgent;
   assert.equal(sel.sub_id, 'a');
   assert.equal(sel.tokens, 42);
-  console.log('PASS an agent row can be selected');
+  const detail = byId.get('workflowAgentDetail')._html || '';
+  assert.ok(/the answer/.test(detail),
+    'the click-through panel must show the result the live event carried');
+  console.log('PASS an agent row can be selected and shows its live result');
+}
+
+{
+  // A run that is still LIVE is already in list_runs (meta.json is written at
+  // run START), so it can be opened from history while its events keep
+  // arriving. Rendering it under the live key merged flat journal rows into
+  // the live sub_id-keyed agents: every agent twice, and status forced to
+  // 'done' mid-run.
+  const { ctx } = load();
+  ctx.workflowStarted({ run_id: 'live1', name: 'p', description: '', phases: [] });
+  ctx.workflowAgentStarted({ run_id: 'live1', sub_id: 'a', phase: 'Work', label: 'x' });
+  ctx.workflowRenderRecord({
+    ok: true, run_id: 'live1',
+    meta: { name: 'p', description: '' },
+    summary: { ok: true },
+    rows: [{ phase: 'Work', label: 'x', ok: true, result: 'r' }],
+  });
+  const st = ctx.workflowState();
+  assert.equal(st.runs.live1.status, 'running',
+    'opening a live run from history must not force its status to done');
+  assert.deepEqual(Object.keys(st.runs.live1.phases.Work.agents), ['a'],
+    'the live run must keep exactly its live agents — no duplicated journal rows');
+  assert.ok(st.runs['hist:live1'],
+    'a historical record renders under its own key, never the live one');
+  assert.equal(st.runs['hist:live1'].status, 'done');
+  console.log('PASS opening a still-live run does not corrupt its live tree');
 }
 
 {

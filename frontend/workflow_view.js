@@ -6,6 +6,8 @@
 // second run started after a refresh, cannot scribble on the first one's tree.
 (function () {
   const runs = Object.create(null);
+  // Namespace for a run loaded from load_run. See workflowRenderRecord.
+  const HISTORICAL_PREFIX = 'hist:';
   // The agent currently shown in #workflowAgentDetail — set by clicking a row
   // in either a live or a historical tree, both of which share this state.
   let selectedAgent = null;
@@ -118,9 +120,13 @@
     return '<span class="wf-dot wf-dot-ok"></span>';
   }
 
+  // Quotes matter as much as angle brackets here: every one of these values is
+  // also interpolated into an ATTRIBUTE (data-run-id=, data-sub-id=), where a
+  // bare " ends the attribute and everything after it becomes markup.
   function esc(s) {
     return String(s == null ? '' : s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   // The inline card ships hidden in index.html and only earns its space while a
@@ -255,7 +261,12 @@
   // must draw through the SAME renderer as a live run, or the two views drift.
   function workflowRenderRecord(record) {
     if (!record || !record.ok) return;
-    const id = record.run_id || 'historical';
+    // A HISTORICAL record must never share a key with the live event path.
+    // meta.json is written at run START, so list_runs happily lists a run that
+    // is still going; opening it merged flat journal rows (keyed "0","1",…)
+    // into the very object holding that run's live sub_id-keyed agents —
+    // every agent appeared twice and run.status was forced to 'done' mid-run.
+    const id = HISTORICAL_PREFIX + (record.run_id || 'historical');
     const run = ensureRun(id);
     run.name = (record.meta && record.meta.name) || '';
     run.description = (record.meta && record.meta.description) || '';

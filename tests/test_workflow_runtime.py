@@ -190,6 +190,80 @@ def test_events_are_emitted_for_started_and_done(monkeypatch):
     assert started["label"] == "my-label" and started["phase"] == "Scan"
 
 
+# --- the result rides on wf_agent_done (click-through, live AND historical) ---
+def test_wf_agent_done_carries_the_agents_result(monkeypatch):
+    """Click-through is specified as "identical for live and historical runs,
+    because both are journal rows". The frontend stores ev.result on the row so
+    a later click can render it; this event never carried one, so clicking an
+    agent during or after a LIVE run rendered an EMPTY body while the very same
+    run reopened from history rendered it fine."""
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "the answer",
+                                           "raw_report": "the answer", "tokens": 3})
+    events = []
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    j = J.Journal(_os.path.join(d, "journal.jsonl"))
+    rt = R.WorkflowRuntime(j, run_dir=d, on_event=events.append)
+    rt.agent("p", label="my-label")
+    done = [e for e in events if e["type"] == "wf_agent_done"][0]
+    assert "result" in done, "wf_agent_done must carry the agent's result"
+    assert done["result"] == "the answer"
+
+
+def test_a_cache_hit_also_carries_its_replayed_result(monkeypatch):
+    """The replay path emits its own wf_agent_done. A resumed run's rows must
+    click through to the same body a cold run's rows do."""
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    old = _os.path.join(d, "old.jsonl")
+    j = J.Journal(old)
+    k = J.call_key("researcher", "p", {})
+    j.record(k, 0, {"ok": True, "result": "from-cache"})
+    j.close()
+
+    events = []
+    j2 = J.Journal(_os.path.join(d, "new.jsonl"), replay_from=old)
+    rt = R.WorkflowRuntime(j2, run_dir=d, on_event=events.append)
+    assert rt.agent("p") == "from-cache"
+    done = [e for e in events if e["type"] == "wf_agent_done"][0]
+    assert done["cached"] is True
+    assert "result" in done, "a replayed wf_agent_done must carry its result too"
+    assert done["result"] == "from-cache"
+
+
+def test_a_huge_result_is_truncated_on_the_event_but_not_in_the_journal(monkeypatch):
+    """Every wf_agent_done crosses the JS bridge. An audit finding can be tens
+    of KB, so the EVENT carries a capped copy — the journal (and therefore
+    load_run) keeps the whole thing."""
+    big = "y" * 50000
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": big, "raw_report": big})
+    events = []
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    path = _os.path.join(d, "journal.jsonl")
+    j = J.Journal(path)
+    rt = R.WorkflowRuntime(j, run_dir=d, on_event=events.append)
+    rt.agent("p")
+    j.close()
+    done = [e for e in events if e["type"] == "wf_agent_done"][0]
+    assert len(done["result"]) < len(big), "a huge result must not cross the bridge whole"
+    assert len(done["result"]) <= R.MAX_EVENT_RESULT_CHARS + 200
+    assert "truncated" in done["result"], "truncation must be marked, not silent"
+
+    rows = [_json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    assert rows[0]["result"] == big, "the journal keeps the FULL result"
+
+
+def test_a_structured_result_small_enough_crosses_intact(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x",
+                                           "raw_report": {"confirmed": ["a bug"]}})
+    events = []
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    j = J.Journal(_os.path.join(d, "journal.jsonl"))
+    rt = R.WorkflowRuntime(j, run_dir=d, on_event=events.append)
+    rt.agent("p", schema={"confirmed": "list"})
+    done = [e for e in events if e["type"] == "wf_agent_done"][0]
+    assert done["result"] == {"confirmed": ["a bug"]}
+
+
 def test_label_defaults_to_a_trimmed_prompt(monkeypatch):
     _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
     events = []
@@ -459,11 +533,38 @@ def test_nested_fan_out_cannot_exceed_the_live_branch_cap(monkeypatch):
     j = J.Journal(_os.path.join(d, "journal.jsonl"))
     rt = R.WorkflowRuntime(j, run_dir=d, on_event=events.append)
     monkeypatch.setattr(R, "MAX_LIVE_BRANCHES", 8)
+
     # 4 pipeline branches reserve 4 slots; only 1 of the 4 nested parallel(4)
-    # calls can fit in the remaining 4, so the other 3 are deterministically
-    # capped regardless of thread scheduling.
-    out = rt.pipeline(list(range(4)),
-                       lambda item, orig, i: rt.parallel([lambda: 1] * 4))
+    # calls fits in the remaining 4, so the other 3 must be capped.
+    #
+    # "must" needs a gate to be true. The winner releases its 4 slots as soon
+    # as its thunks return, so with instant thunks a loser could arrive AFTER
+    # that release, find 4 free slots and succeed — count(None) would be 2.
+    # The gate makes the ordering explicit instead of hoping for it: every
+    # thunk parks until all four branches have finished their cap check, so
+    # the winner provably still holds its slots while the losers check.
+    gate = threading.Event()
+    arrived = set()
+    arrived_lock = threading.Lock()
+
+    def arrive(i):
+        with arrived_lock:
+            arrived.add(i)
+            if len(arrived) == 4:
+                gate.set()          # all four checks are done; let the winner finish
+
+    def stage(value, orig, i):
+        def thunk():
+            arrive(i)               # reached only by the branch that RESERVED
+            assert gate.wait(30), "the four branches never all reached the cap check"
+            return 1
+        try:
+            return rt.parallel([thunk] * 4)
+        except R.WorkflowScriptError:
+            arrive(i)               # this branch checked, and lost
+            raise
+
+    out = rt.pipeline(list(range(4)), stage)
     assert out.count(None) == 3, "exactly 3 of 4 nested fan-outs must be capped"
     logs = [e["message"] for e in events if e.get("type") == "wf_log"]
     assert any("too many concurrent branches" in m and "8" in m for m in logs), (
@@ -520,6 +621,10 @@ if __name__ == "__main__":
              test_abort_stops_further_agent_calls,
              test_phase_from_a_branch_thread_raises_with_the_fix_named,
              test_events_are_emitted_for_started_and_done,
+             test_wf_agent_done_carries_the_agents_result,
+             test_a_cache_hit_also_carries_its_replayed_result,
+             test_a_huge_result_is_truncated_on_the_event_but_not_in_the_journal,
+             test_a_structured_result_small_enough_crosses_intact,
              test_label_defaults_to_a_trimmed_prompt,
              test_parallel_returns_results_in_input_order,
              test_parallel_isolates_a_raising_thunk_as_none,
@@ -542,6 +647,7 @@ if __name__ == "__main__":
              test_a_child_workflow_counts_against_the_same_budget]
     failed = 0
     _orig_run, _orig_get = R.run_subagent, R.get_agent
+    _orig_cap = R.MAX_LIVE_BRANCHES
     for t in tests:
         try:
             t(monkeypatch); print(f"PASS {t.__name__}")
@@ -550,6 +656,10 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
             print(f"FAIL {t.__name__}: {e}")
         finally:
+            # MAX_LIVE_BRANCHES too: the cap test lowers it to 8 and this
+            # runner's monkeypatch has no undo, so without this every LATER
+            # test in the list would run against the lowered cap.
             R.run_subagent, R.get_agent = _orig_run, _orig_get
+            R.MAX_LIVE_BRANCHES = _orig_cap
     print("OK" if not failed else f"{failed} FAILED")
     _sys.exit(1 if failed else 0)

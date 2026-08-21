@@ -200,9 +200,14 @@ def run(src=None, name=None, args=None, run_root=None, on_event=None,
                     "started": started_wall,
                     "finished": time.time(),
                 }, f, indent=2, default=str)
-        except OSError:
+        # A non-serialisable result (a cycle, or an object default=str cannot
+        # reach) raises ValueError/TypeError, not OSError. Left narrow, that
+        # escaped this finally, masked whatever the run actually failed with,
+        # and — worse — skipped j.close(), leaking the journal's file handle.
+        except (OSError, TypeError, ValueError):
             pass
-        j.close()
+        finally:
+            j.close()
 
     out = {"ok": ok, "error": error, "run_id": run_id,
            "name": meta.get("name", ""), "result": value,

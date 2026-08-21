@@ -1118,6 +1118,14 @@
       font-size: var(--text-2xs); color: rgb(var(--term-muted)); flex-shrink: 0;
       font-variant-numeric: tabular-nums;
     }
+    #workflowRunError:empty { display: none; }
+
+    /* Collapsible rail sections. The caret is content on the header, so the
+       open/closed state has exactly one source of truth: .wf-collapsed. */
+    .wf-sec-head { cursor: pointer; user-select: none; display: flex; align-items: center; gap: var(--space-2); }
+    .wf-sec-head::before { content: 'BE'; font-size: var(--text-2xs); line-height: 1; }
+    .wf-sec-head.wf-collapsed::before { content: 'B8'; }
+    .wf-sec-head:hover { color: rgb(var(--term-text)); }
 
     /* Device chip + picker (2026-08 SSH devices). Red, not cyan: this is a
        warning about which machine commands are about to run on, not a
@@ -1417,9 +1425,12 @@
            run picked in #workflowRunList. -->
       <div id="workflowTab" class="hidden flex-1 flex min-h-0" role="tabpanel">
         <div class="w-72 shrink-0 border-r border-term-line bg-term-panel flex flex-col overflow-hidden">
-          <div class="eyebrow px-3 py-2 border-b border-term-line">workflows</div>
+          <!-- Both rail sections are collapsible (spec: "Left rail, two
+               collapsible sections"). The header carries .wf-collapsed while
+               its body is hidden; the caret is drawn from that class. -->
+          <div id="workflowLibraryToggle" class="eyebrow wf-sec-head px-3 py-2 border-b border-term-line" role="button" tabindex="0">workflows</div>
           <div id="workflowLibraryList" class="scroll-y flex-1 min-h-0 px-2 py-1"></div>
-          <div class="border-t border-term-line px-3 py-2">
+          <div id="workflowLaunchPanel" class="border-t border-term-line px-3 py-2">
             <div id="workflowLaunchName" class="wf-launch-name t-sm"></div>
             <div id="workflowArgsForm" class="wf-args-form"></div>
             <div id="workflowLaunchError" class="t-2xs text-term-red"></div>
@@ -1428,8 +1439,9 @@
               <button id="workflowLaunchBtn" class="btn btn-sm btn-accent flex-1">Launch</button>
             </div>
           </div>
-          <div class="eyebrow px-3 py-2 border-t border-b border-term-line">recent runs</div>
+          <div id="workflowRunsToggle" class="eyebrow wf-sec-head px-3 py-2 border-t border-b border-term-line" role="button" tabindex="0">recent runs</div>
           <div id="workflowRunList" class="scroll-y flex-1 min-h-0 px-2 py-1"></div>
+          <div id="workflowRunError" class="t-2xs text-term-red px-3 pb-2"></div>
         </div>
         <div class="scroll-y flex-1 min-h-0 px-3 py-2">
           <div id="workflowEmpty" class="text-term-muted t-xs">No workflow has run yet.</div>

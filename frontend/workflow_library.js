@@ -12,13 +12,22 @@
   // workflow declares no args_schema, which switches the form to a raw JSON
   // textarea instead of one input per field.
   const current = { name: '', schema: null };
+  // The catalog most recently rendered. The click listener is bound ONCE (it
+  // is delegated), so it must read this rather than close over the array it
+  // happened to be created with — a second renderLibrary() used to leave the
+  // handler resolving names against the FIRST payload forever.
+  let catalog = [];
 
   // Same idiom as workflow_view.js's esc() and device_view.js's esc(): every
   // value here (workflow names/descriptions come from files on disk, run
   // names and labels come from a journal) goes through this before innerHTML.
+  // Quotes matter as much as angle brackets here: these values also land in
+  // ATTRIBUTE position (data-name=, data-arg=, placeholder=, data-run-id=),
+  // where a bare " closes the attribute and turns the rest into markup.
   function esc(s) {
     return String(s == null ? '' : s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
   // --- the catalog ------------------------------------------------------
@@ -26,7 +35,8 @@
   function renderLibrary(payload) {
     const el = document.getElementById('workflowLibraryList');
     if (!el) return;
-    const workflows = (payload && payload.ok && payload.workflows) || [];
+    catalog = (payload && payload.ok && payload.workflows) || [];
+    const workflows = catalog;
     if (!workflows.length) {
       el.innerHTML = '<div class="wf-lib-empty t-xs text-term-muted">No workflows found.</div>';
       return;
@@ -45,7 +55,7 @@
         const row = e.target && e.target.closest ? e.target.closest('.wf-lib-row') : null;
         if (!row) return;
         const name = row.getAttribute ? row.getAttribute('data-name') : row['data-name'];
-        const w = workflows.find((x) => x.name === name);
+        const w = catalog.find((x) => x.name === name);
         if (!w) return;
         selectWorkflow(w);
       });
@@ -129,9 +139,32 @@
     return `${v}${suffix || ''}`;
   }
 
+  // Relative time, per spec ("name, relative time, a status dot, agent count
+  // and elapsed"). `started` is wall-clock SECONDS (time.time() on the Python
+  // side), not milliseconds. A run written before the summary fields existed
+  // has no `started` at all, which renders blank rather than "56 years ago".
+  function relTime(started) {
+    const t = Number(started);
+    if (!started || !isFinite(t) || t <= 0) return '';
+    const secs = Math.round(Date.now() / 1000 - t);
+    if (secs < 0) return 'just now';          // clock skew, not the future
+    if (secs < 60) return 'just now';
+    if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+    if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+    if (secs < 86400 * 30) return `${Math.floor(secs / 86400)}d ago`;
+    return `${Math.floor(secs / (86400 * 30))}mo ago`;
+  }
+
+  function showHistoryError(message) {
+    const el = document.getElementById('workflowRunError');
+    if (!el) return;
+    el.textContent = message || '';
+  }
+
   function renderRunHistory(payload) {
     const el = document.getElementById('workflowRunList');
     if (!el) return;
+    showHistoryError('');       // a fresh list clears the previous failure
     const runs = (payload && payload.ok && payload.runs) || [];
     if (!runs.length) {
       el.innerHTML = '<div class="wf-lib-empty t-xs text-term-muted">No runs yet.</div>';
@@ -139,7 +172,8 @@
     }
     const sorted = [...runs].sort((a, b) => (b.started || 0) - (a.started || 0));
     el.innerHTML = sorted.map((r) => {
-      const meta = [blankIfNull(r.agent_count) !== '' ? `${r.agent_count} agents` : '',
+      const meta = [relTime(r.started),
+                    blankIfNull(r.agent_count) !== '' ? `${r.agent_count} agents` : '',
                     blankIfNull(r.elapsed_s, 's')]
         .filter(Boolean).join(' · ');
       return `<div class="wf-run-row" data-run-id="${esc(r.run_id)}">${statusDot(r)}` +
@@ -153,9 +187,18 @@
         if (!row) return;
         const runId = row.getAttribute ? row.getAttribute('data-run-id') : row['data-run-id'];
         if (!runId) return;
+        showHistoryError('');
+        // load_run answers {ok:false, error} for a run whose directory was
+        // deleted or whose meta.json is unreadable. Dropping that made the
+        // click do NOTHING — the spec promises a clear error and a rail that
+        // stays usable.
         Promise.resolve(pywebview.api.load_run(runId)).then((record) => {
+          if (!record || !record.ok) {
+            showHistoryError((record && record.error) || `Could not open run ${runId}.`);
+            return;
+          }
           if (typeof workflowRenderRecord === 'function') workflowRenderRecord(record);
-        }).catch(() => {});
+        }).catch((e) => showHistoryError(String(e)));
       });
     }
   }
@@ -164,6 +207,7 @@
     return { selected: current.name, args_schema: current.schema, collectArgs };
   }
 
-  const api = { renderLibrary, buildArgsForm, renderRunHistory, libraryState };
+  const api = { renderLibrary, buildArgsForm, renderRunHistory, libraryState,
+                relTime };
   Object.assign(typeof window !== 'undefined' ? window : globalThis, api);
 })();

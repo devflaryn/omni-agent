@@ -1,7 +1,7 @@
 meta = {
     "name": "design-panel",
     "description": "Generate several independent approaches, score them with independent judges, synthesize the winner.",
-    "when_to_use": "An open design question with a wide solution space. args: {\"problem\": \"...\"}",
+    "when_to_use": "An open design question with a wide solution space.",
     "phases": [{"title": "Propose"}, {"title": "Judge"}, {"title": "Synthesize"}],
     "args_schema": {"problem": {"label": "Design question", "required": True,
                                 "placeholder": "how should we cache"}},
