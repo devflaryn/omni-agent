@@ -243,6 +243,14 @@ def test_every_builtin_declares_a_valid_args_schema():
         assert SB.validate_args_schema(schema) == []
 
 
+def test_list_workflows_surfaces_args_schema():
+    # Declared in the source but dropped by discovery would leave the launch
+    # form and the tool description with nothing to read.
+    for w in library.list_workflows():
+        assert "args_schema" in w, f"{w['name']}: discovery dropped args_schema"
+        assert w["args_schema"], f"{w['name']}: args_schema came through empty"
+
+
 def test_declared_args_match_the_args_each_workflow_actually_reads():
     # A schema advertising an arg the script ignores sends the user to fill in a
     # field that does nothing; the reverse hides a required input.
@@ -266,7 +274,19 @@ Expected: FAIL — `review-changes has no args_schema`
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add an `args_schema` to each `meta`. The arg names must match what each script already reads — check each source rather than trusting this list:
+**First, surface the field.** `workflows/library/__init__.py`'s `list_workflows()` builds its dict from only `{name, description, when_to_use, file}`, so `args_schema` would be declared in the sources and then dropped on the way out — the UI would always fall back to the raw JSON box, and Task 9's test would fail against Task 9's own implementation. Add it:
+
+```python
+        out.append({"name": meta.get("name", ""),
+                    "description": meta.get("description", ""),
+                    "when_to_use": meta.get("when_to_use", ""),
+                    # Surfaced so the launch form and the tool description can
+                    # read declared arg names instead of parsing prose.
+                    "args_schema": meta.get("args_schema") or {},
+                    "file": path})
+```
+
+**Then add an `args_schema` to each `meta`.** The arg names must match what each script already reads — check each source rather than trusting this list:
 
 `review_changes.py`:
 ```python
