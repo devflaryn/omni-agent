@@ -3843,9 +3843,79 @@ function switchTab(tab) {
     renderPlanTab(currentPlan);
   } else if (tab === 'workflow') {
     workflowTab.classList.remove('hidden');
+    loadWorkflowLibrary();
   } else {
     chatTab.classList.remove('hidden');
   }
+}
+
+// ---------- workflow library rail (Workflow tab) ----------
+// The rail itself (renderLibrary/renderRunHistory/buildArgsForm/libraryState)
+// lives in workflow_library.js — it knows WHICH run to draw. This is just the
+// request/response glue into pywebview.api, the same split device_view.js and
+// its picker wiring below use.
+
+async function loadWorkflowLibrary() {
+  try {
+    const [libRes, runsRes] = await Promise.all([
+      pywebview.api.list_workflows(), pywebview.api.list_runs(50),
+    ]);
+    if (typeof renderLibrary === 'function') renderLibrary(libRes);
+    if (typeof renderRunHistory === 'function') renderRunHistory(runsRes);
+  } catch (e) {
+    // The rail just stays empty; the tab is still usable for a live run.
+  }
+}
+
+async function launchSelectedWorkflow(dryRun) {
+  const errEl = $('workflowLaunchError');
+  if (errEl) errEl.textContent = '';
+  if (typeof libraryState !== 'function') return;
+  const st = libraryState();
+  if (!st.selected) {
+    if (errEl) errEl.textContent = 'Pick a workflow first.';
+    return;
+  }
+  // Validated IN THE FORM — the alternative is spending a dry-run round trip
+  // to be told a field was blank.
+  const out = st.collectArgs();
+  if (!out.ok) {
+    if (errEl) errEl.textContent = out.error;
+    return;
+  }
+  // The backend takes self._busy for the whole run — minutes and many LLM
+  // calls — so the UI must believe it's busy from the moment the launch is
+  // sent, not after the await resolves. A dry run can finish (and emit its
+  // `done` event) before this promise even resolves; setting it afterward
+  // would clobber that `done`'s setBusy(false) and latch the UI busy with
+  // nothing running. The `done` event clears it again (onDone), and the
+  // launch thread emits `done` on every exit path including a dry run, so
+  // this can never latch on — except on a refusal, which never reaches the
+  // backend, so it's cleared explicitly below.
+  setBusy(true);
+  try {
+    const res = await pywebview.api.launch_workflow(st.selected, out.args, !!dryRun);
+    if (!res || !res.ok) {
+      if (errEl) errEl.textContent = (res && res.error) || 'Could not launch workflow.';
+      setBusy(false);
+      return;
+    }
+  } catch (e) {
+    if (errEl) errEl.textContent = String(e);
+    setBusy(false);
+  }
+}
+
+// The rail's two sections collapse (spec: "two collapsible sections"). The
+// header owns the state via .wf-collapsed; the bodies just follow it.
+function wireWorkflowSection(headId, bodyIds) {
+  const head = $(headId);
+  if (!head) return;
+  const apply = () => {
+    const collapsed = head.classList.contains('wf-collapsed');
+    bodyIds.forEach((id) => { const el = $(id); if (el) el.classList.toggle('hidden', collapsed); });
+  };
+  head.addEventListener('click', () => { head.classList.toggle('wf-collapsed'); apply(); });
 }
 
 // ---------- knowledge graph visualization (2D vis-network / 3D force-graph) ----------
@@ -4558,6 +4628,10 @@ async function init() {
   $('tabPlan').addEventListener('click', () => switchTab('plan'));
   $('tabGraph').addEventListener('click', () => switchTab('graph'));
   $('tabWorkflow').addEventListener('click', () => switchTab('workflow'));
+  $('workflowDryRunBtn').addEventListener('click', () => launchSelectedWorkflow(true));
+  $('workflowLaunchBtn').addEventListener('click', () => launchSelectedWorkflow(false));
+  wireWorkflowSection('workflowLibraryToggle', ['workflowLibraryList', 'workflowLaunchPanel']);
+  wireWorkflowSection('workflowRunsToggle', ['workflowRunList', 'workflowRunError']);
   $('planBadge').addEventListener('click', () => switchTab('plan'));
   $('ultraToggle').addEventListener('click', toggleUltra);
   $('graphModeToggle').addEventListener('click', toggleGraphMode);

@@ -29,11 +29,13 @@ const FRONTEND = path.join(here, '..', '..', 'frontend');
 const tw = fs.readFileSync(path.join(FRONTEND, 'tailwind.css'), 'utf8');
 const html = fs.readFileSync(path.join(FRONTEND, 'index.html'), 'utf8');
 const appJs = fs.readFileSync(path.join(FRONTEND, 'app.js'), 'utf8');
-// workflow_view.js and device_view.js are separate UI files (kept out of
-// app.js on purpose) and get the same class protection as everything else.
+// workflow_view.js, workflow_library.js and device_view.js are separate UI
+// files (kept out of app.js on purpose) and get the same class protection as
+// everything else.
 const workflowViewJs = fs.readFileSync(path.join(FRONTEND, 'workflow_view.js'), 'utf8');
+const workflowLibraryJs = fs.readFileSync(path.join(FRONTEND, 'workflow_library.js'), 'utf8');
 const deviceViewJs = fs.readFileSync(path.join(FRONTEND, 'device_view.js'), 'utf8');
-const jsSources = appJs + '\n' + workflowViewJs + '\n' + deviceViewJs;
+const jsSources = appJs + '\n' + workflowViewJs + '\n' + workflowLibraryJs + '\n' + deviceViewJs;
 
 // Classes defined by the project itself, in index.html's <style> block.
 const styleBlock = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));

@@ -15,17 +15,21 @@ const FRONTEND = path.join(here, '..', '..', 'frontend');
 
 const html = fs.readFileSync(path.join(FRONTEND, 'index.html'), 'utf8');
 const app = fs.readFileSync(path.join(FRONTEND, 'app.js'), 'utf8');
-// workflow_view.js and device_view.js are separate UI files (kept out of
-// app.js on purpose — see their header comments) and get the same id
-// protection as everything else.
+// workflow_view.js, workflow_library.js and device_view.js are separate UI
+// files (kept out of app.js on purpose — see their header comments) and get
+// the same id protection as everything else.
 const workflowView = fs.readFileSync(path.join(FRONTEND, 'workflow_view.js'), 'utf8');
+const workflowLibrary = fs.readFileSync(path.join(FRONTEND, 'workflow_library.js'), 'utf8');
 const deviceView = fs.readFileSync(path.join(FRONTEND, 'device_view.js'), 'utf8');
-const sources = app + '\n' + workflowView + '\n' + deviceView;
+const sources = app + '\n' + workflowView + '\n' + workflowLibrary + '\n' + deviceView;
 
 const declared = new Set([...html.matchAll(/\bid="([\w-]+)"/g)].map(m => m[1]));
 
 // Ids app.js creates at runtime rather than finding in the markup.
-const CREATED_AT_RUNTIME = new Set(['concurrency-dock', 'subagents-fab']);
+// workflowArgsJson: the raw-JSON textarea buildArgsForm() writes into
+// #workflowArgsForm only when the selected workflow has no args_schema — it
+// never exists in the static markup, only in the HTML that function emits.
+const CREATED_AT_RUNTIME = new Set(['concurrency-dock', 'subagents-fab', 'workflowArgsJson']);
 
 const looked_up = new Set(
   [...sources.matchAll(/\$\('([\w-]+)'\)/g)].map(m => m[1]));

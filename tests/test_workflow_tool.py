@@ -121,6 +121,13 @@ def test_the_session_points_the_run_root_at_memory_dir():
     assert "set_run_root(memory_dir)" in src,         "start_session no longer points workflow run dirs at the session memory_dir"
 
 
+def test_description_advertises_declared_arg_names():
+    # The model guesses arg names from prose today. Declared names are exact.
+    text = workflow_tools._run_workflow_description()
+    assert "target" in text, "review-changes' declared arg should appear"
+    assert "question" in text, "deep-research' declared arg should appear"
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -135,7 +142,8 @@ if __name__ == "__main__":
                         (test_warnings_are_surfaced, True),
                         (test_the_configured_run_root_is_forwarded_not_the_cwd, True),
                         (test_an_aborted_run_still_reports_what_it_did, True),
-                        (test_the_session_points_the_run_root_at_memory_dir, False)]:
+                        (test_the_session_points_the_run_root_at_memory_dir, False),
+                        (test_description_advertises_declared_arg_names, False)]:
         try:
             t(monkeypatch) if needs_mp else t()
             print(f"PASS {t.__name__}")

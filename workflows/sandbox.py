@@ -72,6 +72,24 @@ def _parse(src):
         ) from e
 
 
+def validate_args_schema(schema):
+    """Error strings for a meta['args_schema']; empty when valid.
+
+    Returns ALL problems rather than raising on the first: an author fixing a
+    schema wants the whole list, not one round trip per typo."""
+    errors = []
+    if not isinstance(schema, dict):
+        return ["`args_schema` must be a dict of {arg_name: {…}}"]
+    for key, entry in schema.items():
+        if not isinstance(key, str):
+            errors.append(f"`args_schema` key {key!r} must be a string")
+            continue
+        if not isinstance(entry, dict):
+            errors.append(f"`args_schema['{key}']` must be a dict "
+                          f"(e.g. {{'label': 'Git ref', 'required': True}})")
+    return errors
+
+
 def extract_meta(src):
     """Read the module-level `meta = {...}` literal WITHOUT running the script.
 
@@ -100,6 +118,11 @@ def extract_meta(src):
                 f"`meta` is missing required field(s): {', '.join(missing)}. "
                 f"Required: {', '.join(_META_REQUIRED)}."
             )
+        if "args_schema" in meta:
+            problems = validate_args_schema(meta["args_schema"])
+            if problems:
+                raise WorkflowScriptError(
+                    "`meta['args_schema']` is malformed: " + "; ".join(problems))
         return meta
     raise WorkflowScriptError(
         "workflow script must start with a `meta = {...}` literal containing at "

@@ -27,6 +27,9 @@ def list_workflows():
         out.append({"name": meta.get("name", ""),
                     "description": meta.get("description", ""),
                     "when_to_use": meta.get("when_to_use", ""),
+                    # Surfaced so the launch form and the tool description can
+                    # read declared arg names instead of parsing prose.
+                    "args_schema": meta.get("args_schema") or {},
                     "file": path})
     return out
 

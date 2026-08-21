@@ -1,8 +1,10 @@
 meta = {
     "name": "review-changes",
     "description": "Review a diff across independent dimensions, then adversarially verify every finding.",
-    "when_to_use": "Reviewing a change set for bugs. args: {\"target\": \"<git ref or path>\"}",
+    "when_to_use": "Reviewing a change set for bugs.",
     "phases": [{"title": "Review"}, {"title": "Verify"}],
+    "args_schema": {"target": {"label": "Git ref or path to review",
+                               "required": False, "placeholder": "HEAD"}},
 }
 
 TARGET = (args or {}).get("target", "the current working-tree changes")

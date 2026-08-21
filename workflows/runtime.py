@@ -15,6 +15,7 @@ A branch parked on the semaphore costs a few KB of committed stack, so hundreds
 are fine. tests/test_workflow_runtime.py pins this with a deadlock regression
 test that runs nested parallel/pipeline with the semaphore set to 1.
 """
+import json
 import os
 import threading
 import time
@@ -27,7 +28,45 @@ from . import schema as _schema
 from .sandbox import WorkflowScriptError
 
 MAX_ITEMS = 256          # per parallel()/pipeline() call
+# MAX_ITEMS bounds ONE call; this bounds the PRODUCT. pipeline(256) whose stages
+# each parallel(256) is ~65k threads, which MAX_ITEMS alone permits.
+MAX_LIVE_BRANCHES = 1024
 LABEL_CHARS = 48
+# An agent result rides on every wf_agent_done event, and that event crosses the
+# JS bridge. An exhaustive-audit finding can be tens of kilobytes, so the event
+# carries a CAPPED copy — the full value is always on disk in the journal and
+# comes back whole from load_run(), which is what the click-through panel falls
+# back to for a historical run.
+MAX_EVENT_RESULT_CHARS = 4000
+
+
+def _event_result(value):
+    """The agent's result, capped for the UI event bus.
+
+    A short structured result crosses intact so the frontend can pretty-print
+    it; anything longer is rendered to text and truncated with a marker naming
+    how much was dropped. Never raises: a result that will not serialize still
+    has to reach the UI as *something*."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, indent=2, default=str)
+        except (TypeError, ValueError):
+            text = str(value)
+            if len(text) <= MAX_EVENT_RESULT_CHARS:
+                return text
+        else:
+            if len(text) <= MAX_EVENT_RESULT_CHARS:
+                return value
+    if len(text) <= MAX_EVENT_RESULT_CHARS:
+        return text
+    dropped = len(text) - MAX_EVENT_RESULT_CHARS
+    marker = (chr(10) + "… [truncated " + str(dropped)
+              + " chars — open this run in Recent runs for the full result]")
+    return text[:MAX_EVENT_RESULT_CHARS] + marker
 
 
 class WorkflowAborted(Exception):
@@ -74,6 +113,11 @@ class WorkflowRuntime:
         self.depth = 0          # bumped for a child runtime
         self._source_loader = None   # set by workflows.run
         self._key_prefix = ""   # set on a child so its journal keys can't collide with the parent's
+        self._live_branches = 0
+        # A nested workflow shares its parent's budget — see workflow() below,
+        # which already shares _count_lock. Without this, nesting reopens the
+        # hole the cap exists to close.
+        self._branch_owner = self
 
     # --- lifecycle --------------------------------------------------------
     @property
@@ -195,10 +239,18 @@ class WorkflowRuntime:
                 "ok": True, "result": cached, "phase": phase, "label": label,
                 "agent_type": agent_type, "tokens": 0, "elapsed_s": 0.0,
                 "model": model, "is_write": is_write, "cached": True,
+                # Same value _emit puts on ev["group"] for a live nested-workflow
+                # event — a replayed row must keep the grouping the UI already
+                # showed, or reopening a resumed run renders it flat.
+                "group": self.emit_prefix or None,
             })
             self._note_partial(phase, label, agent_type, cached, True)
+            # The result rides along so a click on this row renders the same
+            # body a historical (load_run) row would. Both paths are journal
+            # rows; the click-through must not be able to tell them apart.
             self._emit({"type": "wf_agent_done", "sub_id": sub_id, "ok": True,
-                        "cached": True, "tokens": 0, "elapsed_s": 0.0})
+                        "cached": True, "tokens": 0, "elapsed_s": 0.0,
+                        "result": _event_result(cached)})
             return cached
 
         if self.dry_run:
@@ -239,12 +291,16 @@ class WorkflowRuntime:
             "agent_type": agent_type, "tokens": res.get("tokens", 0),
             "elapsed_s": elapsed, "model": res.get("model"),
             "is_write": is_write, "cached": False,
+            # Read from the SAME attribute _emit reads for ev["group"] — no
+            # second source of truth for whether this call belongs to a
+            # nested workflow.
+            "group": self.emit_prefix or None,
         })
         if ok:
             self._note_partial(phase, label, agent_type, value, False)
         self._emit({"type": "wf_agent_done", "sub_id": sub_id, "ok": ok,
                     "cached": False, "tokens": res.get("tokens", 0),
-                    "elapsed_s": elapsed})
+                    "elapsed_s": elapsed, "result": _event_result(value)})
         return value
 
     def _spawn(self, fns):
@@ -260,25 +316,41 @@ class WorkflowRuntime:
                 f"{MAX_ITEMS}. Batch the work or narrow the input; the cap is an "
                 f"explicit error rather than a silent truncation."
             )
-        results = [None] * len(fns)
-        threads = []
 
-        def runner(i, fn):
-            try:
-                results[i] = fn()
-            except WorkflowAborted:
-                results[i] = None
-            except Exception as e:      # noqa: BLE001 — isolated per branch
-                results[i] = None
-                self.log(f"branch {i} failed: {type(e).__name__}: {e}")
+        owner = self._branch_owner
+        with self._count_lock:
+            if owner._live_branches + len(fns) > MAX_LIVE_BRANCHES:
+                raise WorkflowScriptError(
+                    f"too many concurrent branches: {owner._live_branches} already "
+                    f"in flight plus {len(fns)} more exceeds the cap of "
+                    f"{MAX_LIVE_BRANCHES}. Nested fan-out multiplies — a pipeline "
+                    f"whose stages each call parallel() opens items x items "
+                    f"branches. Reduce one of the two levels."
+                )
+            owner._live_branches += len(fns)
+        try:
+            results = [None] * len(fns)
+            threads = []
 
-        for i, fn in enumerate(fns):
-            t = threading.Thread(target=runner, args=(i, fn), daemon=True)
-            threads.append(t)
-            t.start()
-        for t in threads:
-            t.join()
-        return results
+            def runner(i, fn):
+                try:
+                    results[i] = fn()
+                except WorkflowAborted:
+                    results[i] = None
+                except Exception as e:      # noqa: BLE001 — isolated per branch
+                    results[i] = None
+                    self.log(f"branch {i} failed: {type(e).__name__}: {e}")
+
+            for i, fn in enumerate(fns):
+                t = threading.Thread(target=runner, args=(i, fn), daemon=True)
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join()
+            return results
+        finally:
+            with self._count_lock:
+                owner._live_branches -= len(fns)
 
     def parallel(self, thunks):
         """Run every thunk concurrently and WAIT for all of them — a barrier.
@@ -343,6 +415,7 @@ class WorkflowRuntime:
         child._sem = self._sem
         child._abort = self._abort
         child._count_lock = self._count_lock
+        child._branch_owner = self._branch_owner
         # One partial list under the shared lock, so an abort inside a nested
         # workflow still reports through the parent's result.
         child._partial = self._partial

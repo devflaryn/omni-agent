@@ -179,6 +179,16 @@ TOOL_RESULT_KEEP_RECENT = 14        # most-recent tool results kept in full
 TOOL_RESULT_STUB_OVER = 1200        # only elide results longer than this
 TOOL_RESULT_STUB_HEAD = 220         # chars of the original kept in the stub
 
+# --- Workflow launch (UI-initiated) -------------------------------------------
+# A user-launched workflow's result goes back into the conversation so the model
+# can act on it. This follows the existing TOOL RESULT convention (user-role
+# messages carrying tool output), rather than inventing a new channel.
+WORKFLOW_RESULT_PREFIX = "WORKFLOW RESULT"
+# An exhaustive-audit result can be enormous. Capping it protects exactly the
+# context budget the workflow engine exists to protect; the run id is the
+# pointer to the full record.
+WORKFLOW_RESULT_CAP = 4000
+
 # --- Tool budget / loop protection -------------------------------------------
 # No soft "you've run too many tools" nudge: multi-day runs make hundreds of
 # back-to-back tool calls normal. MAX_CONSECUTIVE_TOOLS only triggers silent
@@ -3452,60 +3462,10 @@ class AgentApi:
         self.session["inline_only"] = (
             bool(self.session.get("superpowers_enabled"))
             and superpowers.detect_inline_only(text))
-        # Fresh user turn -> reset per-task loop/budget state.
-        self.session["last_tool_call"] = None
-        self.session["consecutive_tools"] = 0
-        self.session["summary_resets"] = 0
-        self.session["reads_since_nav"] = 0
-        self.session["graph_nudges_sent"] = 0
-        # Fresh task -> re-arm the skill guard so this task gets its own skill check.
-        self.session["domain_tools_since_skill"] = 0
-        self.session["skill_nudges_sent"] = 0
-        self.session["skill_loaded"] = False
-        # Fresh task -> reset the review/evidence guards for this task.
-        self.session["review_rounds"] = 0
-        self.session["strategy_review_rounds"] = 0
-        self.session["findings_since_brief_sync"] = 0
-        self.session["unverified_change"] = None
-        self.session["failed_sigs"] = {}
-        self.session["failed_sig_warned"] = set()
-        self.session["_validation_nudged_for"] = None
-        self.session["build_observed"] = False
-        self.session["assumption_nudges_sent"] = 0
-        self.session["solo_read_streak"] = 0
-        self.session["solo_read_nudges_sent"] = 0
-        self.session["_delegation_phase_nudged"] = set()
-        # New task -> the next tool call is the "first", so guarantee it opens with
-        # an explanation (see the emit block in _run_agent_loop).
-        self.session["narrated_this_task"] = False
-        self.session["tools_since_explanation"] = 0
-        self.session["tools_since_narration"] = 0
-
-        # Plan-and-execute: a genuinely NEW task (no active plan, or the
-        # previous one is fully done) must be planned before any tool runs.
-        # A follow-up message that continues an in-progress plan does NOT
-        # force a re-plan — the model can just keep working the existing one
-        # (or call plan_add_task/plan_update_task itself if the follow-up
-        # changes scope).
-        active_plan = planning.get_active_plan()
-        if active_plan is None or active_plan.is_complete():
-            self.session["needs_plan"] = True
-            self.session["mutating_gate_nudged"] = False  # re-arm the one-time unplanned-mutation nudge
-            self.session["dispatched_steps"] = set()      # new plan -> fresh delegation tracking
-            self.session["steps_since_reground"] = 0
-            # Superpowers: a genuinely NEW, non-trivial task earns an autonomous
-            # brainstorm before planning. Trivial one-liners skip straight to work.
-            self.session["needs_brainstorm"] = (
-                bool(self.session.get("superpowers_enabled"))
-                and not superpowers.is_trivial_task(text))
-            # …and the architect designs the plan itself, right after the brainstorm.
-            self.session["needs_architect"] = self.session["needs_brainstorm"]
-        else:
-            # A follow-up continuing an in-progress plan does not re-brainstorm.
-            self.session["needs_brainstorm"] = False
-            self.session["needs_architect"] = False
-        self.session["tools_since_plan_touch"] = 0
-        self.session["_plan_touch_nudge_sent"] = False
+        # Fresh user turn -> reset per-task loop/budget state. Shared with the
+        # workflow-launch path (see _reset_per_task_state) so a counter added
+        # here can never drift out of the other one.
+        self._reset_per_task_state(text)
 
         self._emit({"type": "user_message", "content": text})
         # Persist immediately so the user's message survives even if the app is
@@ -3579,6 +3539,220 @@ class AgentApi:
                     "device": (d.to_dict() if d else None)})
         self._refresh_system_prompt()
         return {"ok": True, "device": (d.to_dict() if d else None)}
+
+    def list_workflows(self):
+        import workflows
+        return {"ok": True, "workflows": workflows.list_library()}
+
+    def list_runs(self, limit=50):
+        import workflows
+        return {"ok": True, "runs": workflows.list_runs(limit=limit)}
+
+    def load_run(self, run_id):
+        import workflows
+        return workflows.load_run(run_id)
+
+    def _workflow_result_into_conversation(self, res):
+        """Append a finished run's result as a user-role message.
+
+        User-role because this codebase already feeds tool output back that way
+        ('TOOL RESULT:'), so the model reads it with machinery it already has."""
+        import json as _json
+        name = res.get("name") or "workflow"
+        run_id = res.get("run_id") or "(no run id)"
+        head = f"{WORKFLOW_RESULT_PREFIX} ({name}, run {run_id}):\n"
+        if not res.get("ok"):
+            body = f"The run FAILED: {res.get('error') or 'unknown error'}"
+        else:
+            try:
+                body = _json.dumps(res.get("result"), indent=2, default=str)
+            except (TypeError, ValueError):
+                body = str(res.get("result"))
+            if len(body) > WORKFLOW_RESULT_CAP:
+                body = (body[:WORKFLOW_RESULT_CAP]
+                        + f"\n… truncated. Open run {run_id} in the Workflow tab "
+                          f"for the full result.")
+        stats = (f"\n({res.get('agent_count', 0)} agents, "
+                 f"{res.get('elapsed_s', 0)}s)")
+        warn = ""
+        for w in (res.get("warnings") or []):
+            warn += f"\nWARNING: {w}"
+        self.session["messages"].append(
+            {"role": "user", "content": head + body + stats + warn})
+
+    def _run_workflow_with_ui_drain(self, name, args, dry_run):
+        """Run workflows.run() on a background thread and drain its events HERE,
+        on the calling thread, one at a time.
+
+        parallel()/pipeline() spawn one thread PER BRANCH (WorkflowRuntime._spawn
+        in workflows/runtime.py), and each branch fires wf_agent_started /
+        wf_agent_done through on_event from that branch's own thread. self._emit
+        appends to and trims session["transcript"], mutates session["dock"]
+        across several statements, and calls self._window.evaluate_js — none of
+        it synchronized, and _emit swallows exceptions so a race there would be
+        silent. Funneling every event through one queue and draining it from a
+        single thread is the same pattern as _run_delegated_wave (agent.py) and
+        tools/workflow_tools.py's _drain_to_ui — never pass self._emit as
+        on_event to something that can fan out across threads."""
+        import queue as _queue
+        import workflows
+        q = _queue.Queue()
+        _SENTINEL = object()
+        holder = {}
+
+        def runner():
+            try:
+                holder["result"] = workflows.run(name=name, args=args, on_event=q.put,
+                                                  dry_run=bool(dry_run))
+            except Exception as e:  # noqa: BLE001
+                holder["error"] = e
+            finally:
+                q.put(_SENTINEL)
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        while True:
+            ev = q.get()
+            if ev is _SENTINEL:
+                break
+            self._emit(ev)
+        t.join()
+        if holder.get("error") is not None:
+            raise holder["error"]
+        return holder.get("result")
+
+    def _reset_per_task_state(self, text=None):
+        """Reset the per-task loop/budget/guard counters before a fresh turn.
+
+        ONE definition, called by both paths that start a turn: send_message
+        (with the text the user typed) and launch_workflow's follow-up turn
+        (with None). It used to be copy-pasted between the two, field for
+        field — faithful on the day it was written and one new counter away
+        from silently drifting.
+
+        `text` is the only difference between the two callers. There is no
+        typed text on the launch path, so there is nothing to run the
+        triviality check against, and a workflow result is a finding to act on
+        rather than a fresh task to brainstorm — so that path never arms the
+        auto-brainstorm/architect."""
+        s = self.session
+        s["last_tool_call"] = None
+        s["consecutive_tools"] = 0
+        s["summary_resets"] = 0
+        s["reads_since_nav"] = 0
+        s["graph_nudges_sent"] = 0
+        # Fresh task -> re-arm the skill guard so this task gets its own skill check.
+        s["domain_tools_since_skill"] = 0
+        s["skill_nudges_sent"] = 0
+        s["skill_loaded"] = False
+        # Fresh task -> reset the review/evidence guards for this task.
+        s["review_rounds"] = 0
+        s["strategy_review_rounds"] = 0
+        s["findings_since_brief_sync"] = 0
+        s["unverified_change"] = None
+        s["failed_sigs"] = {}
+        s["failed_sig_warned"] = set()
+        s["_validation_nudged_for"] = None
+        s["build_observed"] = False
+        s["assumption_nudges_sent"] = 0
+        s["solo_read_streak"] = 0
+        s["solo_read_nudges_sent"] = 0
+        s["_delegation_phase_nudged"] = set()
+        # New task -> the next tool call is the "first", so guarantee it opens with
+        # an explanation (see the emit block in _run_agent_loop).
+        s["narrated_this_task"] = False
+        s["tools_since_explanation"] = 0
+        s["tools_since_narration"] = 0
+
+        # Plan-and-execute: a genuinely NEW task (no active plan, or the
+        # previous one is fully done) must be planned before any tool runs.
+        # A follow-up message that continues an in-progress plan does NOT
+        # force a re-plan — the model can just keep working the existing one
+        # (or call plan_add_task/plan_update_task itself if the follow-up
+        # changes scope).
+        active_plan = planning.get_active_plan()
+        if active_plan is None or active_plan.is_complete():
+            s["needs_plan"] = True
+            s["mutating_gate_nudged"] = False  # re-arm the one-time unplanned-mutation nudge
+            s["dispatched_steps"] = set()      # new plan -> fresh delegation tracking
+            s["steps_since_reground"] = 0
+            # Superpowers: a genuinely NEW, non-trivial task earns an autonomous
+            # brainstorm before planning. Trivial one-liners skip straight to work.
+            s["needs_brainstorm"] = (
+                text is not None
+                and bool(s.get("superpowers_enabled"))
+                and not superpowers.is_trivial_task(text))
+            # …and the architect designs the plan itself, right after the brainstorm.
+            s["needs_architect"] = s["needs_brainstorm"]
+        else:
+            # A follow-up continuing an in-progress plan does not re-brainstorm.
+            s["needs_brainstorm"] = False
+            s["needs_architect"] = False
+        s["tools_since_plan_touch"] = 0
+        s["_plan_touch_nudge_sent"] = False
+
+    def launch_workflow(self, name, args=None, dry_run=False):
+        """Run a workflow from the UI, then hand its result to the model."""
+        import threading
+        import workflows
+        if not self.session:
+            return {"ok": False, "error": "No active session. Start a project first."}
+        known = [w["name"] for w in workflows.list_library()]
+        if name not in known:
+            return {"ok": False,
+                    "error": f"no workflow named '{name}'. Available: {', '.join(known)}"}
+        with self._lock:
+            if self._busy:
+                # Two things driving the conversation at once is incoherent.
+                return {"ok": False,
+                        "error": "The agent is busy. Finish or stop the current task first."}
+            self._busy = True
+            self._stop = False
+
+        def work():
+            # _busy has exactly ONE owner at a time. This thread takes it from
+            # launch_workflow above and holds it until either it clears the flag
+            # itself or it hands ownership to _run_agent_loop, whose own finally
+            # clears the flag AND emits `done`.
+            #
+            # The handoff has to happen BEFORE the call: _run_agent_loop's
+            # `done` re-enables the UI input, so a send_message can legitimately
+            # set _busy = True and start a second loop the instant that event
+            # lands — while this frame is still sitting in _run_agent_loop's
+            # return path. A finally here that cleared _busy unconditionally
+            # would un-flag THAT loop, letting a third send_message start a
+            # third one, with two agent loops interleaving on
+            # session["messages"] and session["transcript"].
+            owns_busy = True
+            try:
+                res = self._run_workflow_with_ui_drain(name, args, dry_run)
+                if not dry_run:
+                    self._workflow_result_into_conversation(res)
+                    self._reset_per_task_state()
+                    self._persist_session()
+                    owns_busy = False       # handed to _run_agent_loop
+                    self._run_agent_loop()
+                    return
+                self._emit({"type": "system",
+                            "content": f"Dry run of '{name}': "
+                                       + ("passed" if res.get("ok")
+                                          else res.get("error", "failed"))})
+            except Exception as e:  # noqa: BLE001
+                self._emit({"type": "error", "content": f"workflow launch failed: {e}"})
+            finally:
+                if owns_busy:
+                    with self._lock:
+                        self._busy = False
+                    # The frontend sets busy on an ok launch response and clears
+                    # it on `done`. Every exit from this thread that does NOT go
+                    # through _run_agent_loop (a dry run, a launch that threw)
+                    # must emit it too, or Stop stays on screen forever and the
+                    # input stays disabled.
+                    self._emit({"type": "done"})
+
+        # Named so a test — and a thread dump — can tell this thread apart.
+        threading.Thread(target=work, name="workflow-launch", daemon=True).start()
+        return {"ok": True, "started": True}
 
     def _abort_active_workflows(self):
         """Cancel every running workflow. Called from the same place that sets

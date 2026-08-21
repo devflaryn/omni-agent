@@ -9,11 +9,40 @@ import { El } from './_harness.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FRONTEND = path.join(here, '..', '..', 'frontend');
+const ROOT = path.join(here, '..', '..');
+
+// The keys the PYTHON engine actually puts on a wf_agent_done event. Read from
+// workflows/runtime.py rather than invented here: the whole reason live
+// click-through shipped broken is that this test fabricated a `result` field
+// the engine never sent, and then asserted on other fields entirely. Every
+// wf_agent_done emit site must agree.
+function agentDoneKeys() {
+  const py = fs.readFileSync(path.join(ROOT, 'workflows', 'runtime.py'), 'utf8');
+  const sites = [];
+  let from = 0;
+  for (;;) {
+    const i = py.indexOf('"wf_agent_done"', from);
+    if (i < 0) break;
+    const end = py.indexOf('})', i);
+    sites.push(py.slice(i, end < 0 ? i + 400 : end));
+    from = i + 1;
+  }
+  assert.ok(sites.length >= 2,
+    `expected both wf_agent_done emit sites in runtime.py, found ${sites.length}`);
+  const perSite = sites.map(
+    (block) => new Set([...block.matchAll(/"(\w+)":/g)].map((m) => m[1])));
+  // Intersection: a key only counts if EVERY emit site sends it. The cache-hit
+  // path and the executed path must not disagree about the click-through
+  // contract.
+  return [...perSite[0]].filter((k) => perSite.every((s) => s.has(k)));
+}
+const AGENT_DONE_KEYS = agentDoneKeys();
 
 function load() {
   const root = new El('div');
   const byId = new Map();
-  for (const id of ['workflowTree', 'workflowEmpty', 'workflowCard', 'workflowTabBadge']) {
+  for (const id of ['workflowTree', 'workflowEmpty', 'workflowCard', 'workflowTabBadge',
+                    'workflowAgentDetail']) {
     const el = new El('div');
     el.id = id;
     byId.set(id, el);
@@ -175,6 +204,130 @@ function started(ctx) {
   assert.equal(st.counts.running, 1);
   assert.equal(st.phases.Review.agents[KEY + ':1'].status, 'running', 'the sibling row is untouched');
   console.log('PASS keeps colliding prompts as separate rows');
+}
+
+{
+  // The runtime already emits `group` for a nested workflow; the tree rendered
+  // it flat, silently lying about structure.
+  const { ctx } = load();
+  ctx.workflowStarted({ run_id: 'r1', name: 'parent', description: '', phases: [] });
+  ctx.workflowAgentStarted({ run_id: 'r1', sub_id: 'a', phase: 'Work', label: 'outer' });
+  ctx.workflowAgentStarted({ run_id: 'r1', sub_id: 'b', phase: 'Work', label: 'inner',
+                             group: 'understand-subsystem' });
+  const st = ctx.workflowState();
+  const phase = st.runs.r1.phases.Work;
+  assert.equal(phase.agents.a.group, undefined, 'a top-level agent has no group');
+  assert.equal(phase.agents.b.group, 'understand-subsystem');
+  assert.ok(st.runs.r1.groups.has
+    ? st.runs.r1.groups.has('understand-subsystem')
+    : Object.keys(st.runs.r1.groups).includes('understand-subsystem'),
+    'the run tracks its nested groups');
+  console.log('PASS nested agents carry their group');
+}
+
+{
+  // Click-through on a LIVE run. This used to hand workflowAgentDone a
+  // `result` field the Python engine never emitted, then assert only sub_id
+  // and tokens — so it passed while every live click rendered an EMPTY body.
+  // The event below is now built from AGENT_DONE_KEYS, which is read out of
+  // workflows/runtime.py itself, and the assertion is on the rendered panel.
+  const { ctx, byId } = load();
+  ctx.workflowStarted({ run_id: 'r1', name: 'p', description: '', phases: [] });
+  ctx.workflowAgentStarted({ run_id: 'r1', sub_id: 'a', phase: 'Work', label: 'x' });
+  assert.ok(AGENT_DONE_KEYS.includes('result'),
+    'workflows/runtime.py must put `result` on wf_agent_done — without it a '
+    + 'live click-through renders label and meta over an empty <pre>, while '
+    + 'the SAME run reopened from history renders fine');
+  const ev = { run_id: 'r1', sub_id: 'a' };
+  const values = { ok: true, cached: false, tokens: 42, elapsed_s: 1.5,
+                   result: 'the answer' };
+  for (const k of AGENT_DONE_KEYS) if (k in values) ev[k] = values[k];
+  ctx.workflowAgentDone(ev);
+  ctx.workflowSelectAgent('r1', 'a');
+  const sel = ctx.workflowState().selectedAgent;
+  assert.equal(sel.sub_id, 'a');
+  assert.equal(sel.tokens, 42);
+  const detail = byId.get('workflowAgentDetail')._html || '';
+  assert.ok(/the answer/.test(detail),
+    'the click-through panel must show the result the live event carried');
+  console.log('PASS an agent row can be selected and shows its live result');
+}
+
+{
+  // A run that is still LIVE is already in list_runs (meta.json is written at
+  // run START), so it can be opened from history while its events keep
+  // arriving. Rendering it under the live key merged flat journal rows into
+  // the live sub_id-keyed agents: every agent twice, and status forced to
+  // 'done' mid-run.
+  const { ctx } = load();
+  ctx.workflowStarted({ run_id: 'live1', name: 'p', description: '', phases: [] });
+  ctx.workflowAgentStarted({ run_id: 'live1', sub_id: 'a', phase: 'Work', label: 'x' });
+  ctx.workflowRenderRecord({
+    ok: true, run_id: 'live1',
+    meta: { name: 'p', description: '' },
+    summary: { ok: true },
+    rows: [{ phase: 'Work', label: 'x', ok: true, result: 'r' }],
+  });
+  const st = ctx.workflowState();
+  assert.equal(st.runs.live1.status, 'running',
+    'opening a live run from history must not force its status to done');
+  assert.deepEqual(Object.keys(st.runs.live1.phases.Work.agents), ['a'],
+    'the live run must keep exactly its live agents — no duplicated journal rows');
+  assert.ok(st.runs['hist:live1'],
+    'a historical record renders under its own key, never the live one');
+  assert.equal(st.runs['hist:live1'].status, 'done');
+  console.log('PASS opening a still-live run does not corrupt its live tree');
+}
+
+{
+  // A historical run comes from load_run, not from events, but must draw
+  // through the SAME renderer.
+  const { ctx, byId } = load();
+  ctx.workflowRenderRecord({
+    ok: true, run_id: 'old1',
+    meta: { name: 'review-changes', description: 'd' },
+    summary: { agent_count: 2, elapsed_s: 3.5, ok: true },
+    rows: [
+      { phase: 'Review', label: 'review:bugs', agent_type: 'researcher',
+        tokens: 10, elapsed_s: 1.0, model: 'm', ok: true, cached: false,
+        result: 'found one' },
+      { phase: 'Verify', label: 'verify:a.py', agent_type: 'researcher',
+        tokens: 5, elapsed_s: 0.5, model: 'm', ok: true, cached: true,
+        result: 'confirmed' },
+      // A nested workflow's journal row now carries `group` too (fix round 1:
+      // workflows/runtime.py used to emit it live but never persist it, so a
+      // reopened historical run rendered a nested run flat). A fixture with
+      // no group at all could not have caught that regression.
+      { phase: 'Review', label: 'nested:call', agent_type: 'researcher',
+        tokens: 3, elapsed_s: 0.2, model: 'm', ok: true, cached: false,
+        result: 'nested result', group: 'understand-subsystem' },
+    ],
+    result: { confirmed: ['one'] },
+  });
+  const html = byId.get('workflowTree')._html || '';
+  assert.ok(/review:bugs/.test(html), 'historical rows render in the tree');
+  assert.ok(/Verify/.test(html), 'historical phases render');
+  assert.ok(/wf-group-title/.test(html) && /understand-subsystem/.test(html),
+    'a historical row carrying group renders under the nested group node');
+  assert.ok(/nested:call/.test(html), 'the grouped row itself still renders');
+  console.log('PASS a historical run renders through the same tree');
+}
+
+{
+  // Stored results are MODEL-AUTHORED text — the most attacker-adjacent string
+  // in this feature.
+  const { ctx, byId } = load();
+  ctx.workflowRenderRecord({
+    ok: true, run_id: 'x1', meta: { name: 'n', description: '' },
+    summary: {}, result: null,
+    rows: [{ phase: 'P', label: 'l', agent_type: 'researcher', tokens: 0,
+             elapsed_s: 0, model: '', ok: true, cached: false,
+             result: '<img src=x onerror=alert(1)>' }],
+  });
+  ctx.workflowSelectAgent('x1', 0);
+  const detail = byId.get('workflowAgentDetail')._html || '';
+  assert.ok(!detail.includes('<img'), 'a stored result is escaped before innerHTML');
+  console.log('PASS stored results are escaped');
 }
 
 console.log('OK');

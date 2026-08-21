@@ -235,6 +235,30 @@ Ultra mode (`session["ultra"]`) gates autonomous orchestration: off, the agent
 must be asked; on, it defaults to a workflow for substantive tasks. The keyword
 `ultra` in a user message turns it on.
 
+**Launching by hand.** The Workflow tab lists the library and past runs. A
+workflow's `meta` may declare an optional `args_schema` — `{arg: {label,
+required, placeholder}}` — which drives both the launch form and the arg names
+advertised in `run_workflow`'s description. A UI-launched run (`AgentApi.
+launch_workflow`) posts its result back into the conversation as a user-role
+`WORKFLOW RESULT (...)` message (`agent.WORKFLOW_RESULT_PREFIX`), capped at
+`agent.WORKFLOW_RESULT_CAP` (4000) characters with the run id as the pointer to
+the full record, so the model can act on findings without the context cost of a
+large result. A run launched by the model through the `run_workflow` tool
+instead gets its result directly as the tool's return value — this message
+path is for the human-triggered one.
+
+**Two caps, and they bound different things.** `workflows.runtime.MAX_ITEMS`
+(256) bounds ONE `parallel()`/`pipeline()` call. `workflows.runtime.
+MAX_LIVE_BRANCHES` (1024) bounds the PRODUCT across nesting — a pipeline whose
+stages each call `parallel()` opens items × items branches, which `MAX_ITEMS`
+alone permits. A nested workflow shares its parent's branch budget via
+`_branch_owner`, set on the child in `WorkflowRuntime.workflow()`.
+
+Past runs are read by `workflows.list_runs()` / `workflows.load_run()` from the
+artifacts `run()` already writes. There is no separate transcript format: the
+journal row IS the per-agent record, carrying each agent's result, model,
+tokens and elapsed time.
+
 ## SSH devices (2026-08 upgrade)
 
 `devices.py` lets the agent run its toolset on another machine. A device is a

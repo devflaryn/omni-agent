@@ -17,6 +17,7 @@ import uuid
 from . import journal as _journal
 from . import sandbox as _sandbox
 from .sandbox import WorkflowScriptError
+from .runs import list_runs, load_run   # noqa: F401
 # NOTE: `.runtime` is imported INSIDE the functions below, never here. It pulls in
 # `subagents`, which imports `workflows.schema`, which executes this __init__ —
 # a module-level import creates a real cycle that breaks `import subagents`
@@ -105,6 +106,7 @@ def validate(src, args=None, concurrency=None):
 def run(src=None, name=None, args=None, run_root=None, on_event=None,
         resume_from=None, dry_run=False, concurrency=None):
     started = time.monotonic()
+    started_wall = time.time()
     run_root = run_root if run_root is not None else get_run_root()
     warnings = []
     try:
@@ -187,11 +189,25 @@ def run(src=None, name=None, args=None, run_root=None, on_event=None,
         _ACTIVE.pop(run_id, None)
         try:
             with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as f:
-                json.dump({"ok": ok, "error": error, "result": value},
-                          f, indent=2, default=str)
-        except OSError:
+                json.dump({
+                    "ok": ok, "error": error, "result": value,
+                    # Summary fields: run() computes these anyway, and a history
+                    # list cannot report what was never written to disk.
+                    "name": meta.get("name", ""),
+                    "aborted": rt.aborted,
+                    "agent_count": rt.agent_count,
+                    "elapsed_s": round(time.monotonic() - started, 2),
+                    "started": started_wall,
+                    "finished": time.time(),
+                }, f, indent=2, default=str)
+        # A non-serialisable result (a cycle, or an object default=str cannot
+        # reach) raises ValueError/TypeError, not OSError. Left narrow, that
+        # escaped this finally, masked whatever the run actually failed with,
+        # and — worse — skipped j.close(), leaking the journal's file handle.
+        except (OSError, TypeError, ValueError):
             pass
-        j.close()
+        finally:
+            j.close()
 
     out = {"ok": ok, "error": error, "run_id": run_id,
            "name": meta.get("name", ""), "result": value,

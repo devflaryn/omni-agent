@@ -362,6 +362,45 @@ def test_an_aborted_run_returns_partial_results_not_none(monkeypatch):
     assert done == ["first call"]
 
 
+def test_result_json_carries_the_run_summary(monkeypatch):
+    # A history list cannot report what was never persisted: agent_count, aborted
+    # and elapsed are computed by run() and were previously thrown away.
+    _install(monkeypatch)
+    import json as _json
+    root = _root()
+    res = workflows.run(src=GOOD, run_root=root)
+    path = _os.path.join(root, "workflows", res["run_id"], "result.json")
+    saved = _json.load(open(path, encoding="utf-8"))
+    assert saved["name"] == "demo"
+    assert saved["agent_count"] == 3
+    assert saved["aborted"] is False
+    assert isinstance(saved["elapsed_s"], (int, float))
+    assert saved["started"] > 0 and saved["finished"] >= saved["started"]
+
+
+def test_the_summary_is_written_even_when_the_script_raises(monkeypatch):
+    # The write lives in a finally; a crashed run must still be listable.
+    _install(monkeypatch)
+    import json as _json
+    root = _root()
+    # validate() dry-runs the WHOLE script (deterministically) before a single
+    # token is spent, so an unconditional raise would be caught there instead —
+    # never reaching run_id creation. dry-run stubs agent() as "[dry-run:...]",
+    # while the mocked real run echoes the prompt back, so gating on the
+    # returned value is what makes this crash only the real run.
+    bad = ('meta = {"name": "boom", "description": "d"}\n'
+           'r = agent("one")\n'
+           'if r == "one":\n'
+           '    raise ValueError("nope")\n')
+    res = workflows.run(src=bad, run_root=root)
+    assert res["ok"] is False
+    path = _os.path.join(root, "workflows", res["run_id"], "result.json")
+    saved = _json.load(open(path, encoding="utf-8"))
+    assert saved["ok"] is False
+    assert saved["agent_count"] == 1, "the agents that DID run must still be counted"
+    assert saved["name"] == "boom"
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -387,7 +426,9 @@ if __name__ == "__main__":
              test_validate_leaves_no_temp_directory_behind,
              test_a_failing_dry_run_also_cleans_up,
              test_a_malformed_resume_id_is_treated_as_no_journal,
-             test_an_aborted_run_returns_partial_results_not_none]
+             test_an_aborted_run_returns_partial_results_not_none,
+             test_result_json_carries_the_run_summary,
+             test_the_summary_is_written_even_when_the_script_raises]
     failed = 0
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:

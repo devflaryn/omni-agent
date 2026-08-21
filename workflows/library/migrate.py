@@ -1,8 +1,14 @@
 meta = {
     "name": "migrate",
     "description": "Find every site needing a change, edit each one in its own scope, then verify.",
-    "when_to_use": "A mechanical change across many files. args: {\"description\": \"...\", \"sites\": [\"path\", ...] (optional)}",
+    "when_to_use": "A mechanical change across many files.",
     "phases": [{"title": "Discover"}, {"title": "Edit"}, {"title": "Verify"}],
+    "args_schema": {
+        "description": {"label": "The change to apply", "required": True,
+                        "placeholder": "rename foo to bar"},
+        "sites": {"label": "Files to change (JSON list, optional)",
+                  "required": False, "placeholder": '["src/a.py"]'},
+    },
 }
 
 CHANGE = (args or {}).get("description") or "the requested change"
