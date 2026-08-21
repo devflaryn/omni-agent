@@ -3559,7 +3559,7 @@ function selectLlmProvider(id, existing) {
   for (const b of $('llmProviderTabs').children) {
     const active = b.dataset.pid === p.id;
     b.className = 'rounded-full px-3 py-1 t-sm ' + (active
-      ? 'bg-term-cyan text-white'
+      ? 'bg-term-cyan text-term-bg'
       : 'bg-term-raised text-term-muted hover:bg-term-line/60 hover:text-term-text');
   }
 

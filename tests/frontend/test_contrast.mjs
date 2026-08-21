@@ -69,7 +69,39 @@ for (const [themeName, theme] of [['dark', dark], ['light', light]]) {
     `${themeName}: --term-text should clear AAA (7:1) on --term-bg`);
 }
 
-assert.equal(checked, 42, `expected 42 contrast checks, ran ${checked}`);
+// --- accent fills: the labels painted ON TOP of a solid accent fill (e.g. the
+// Send button) must clear text AA against that fill, using --term-bg as the
+// label color (see index.html .composer-send / .btn-primary). ---
+const FILL_LABEL_ACCENTS = ['cyan', 'red'];
+for (const [themeName, theme] of [['dark', dark], ['light', light]]) {
+  for (const a of FILL_LABEL_ACCENTS) {
+    const fill = theme[`term-${a}`];
+    assert.ok(fill, `${themeName}: missing --term-${a}`);
+    const r = ratio(theme['term-bg'], fill);
+    assert.ok(r >= AA,
+      `${themeName}: --term-bg label on --term-${a} fill is ${r.toFixed(2)}, needs ${AA}`);
+    checked++;
+  }
+}
+
+// --- non-text UI contrast: focus rings and status dots are graphical objects,
+// not text, so WCAG 2.1 SC 1.4.11 sets their floor at 3.0, not 4.5. ---
+const UI_NONTEXT = 3.0;
+const NONTEXT_ACCENTS = ['cyan', 'green', 'red'];
+for (const [themeName, theme] of [['dark', dark], ['light', light]]) {
+  for (const surface of ['term-bg', 'term-panel', 'term-raised']) {
+    for (const a of NONTEXT_ACCENTS) {
+      const fill = theme[`term-${a}`];
+      assert.ok(fill, `${themeName}: missing --term-${a}`);
+      const r = ratio(fill, theme[surface]);
+      assert.ok(r >= UI_NONTEXT,
+        `${themeName}: --term-${a} on --${surface} is ${r.toFixed(2)}, needs ${UI_NONTEXT}`);
+      checked++;
+    }
+  }
+}
+
+assert.equal(checked, 64, `expected 64 contrast checks, ran ${checked}`);
 
 // The whole point of the -fg split: the plain accents stay vivid for fills, so
 // at least one of them is ALLOWED to fail as text. If every -fg equalled its

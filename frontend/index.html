@@ -41,7 +41,7 @@
       color-scheme: dark;
       /* "Instrument": cool machined graphite, one warm signal.
          Surfaces separate by TONE — bg / panel / raised — and --term-line is
-         reserved for real edges (inputs, focus, the run rail), never for
+         reserved for real edges (inputs, the run rail), never for
          outlining a panel. Every value below is contrast-verified; see
          docs/superpowers/specs/2026-08-21-ui-restyle-design.md. */
       --term-bg: 19 21 24;         /* #131518 */
@@ -113,6 +113,12 @@
       --term-line: 227 229 232;    /* #E3E5E8 */
       --term-muted: 90 97 103;     /* #5A6167 — 6.02 / 6.29 */
       --term-text: 26 28 31;       /* #1A1C1F — 16.36 on bg */
+      --term-cyan: 170 121 55;        /* #AA7937 — 3.66/3.82/3.41 */
+      --term-green: 110 138 106;      /* #6E8A6A — 3.65/3.81/3.40 */
+      --term-red: 188 110 103;        /* #BC6E67 — 3.62/3.77/3.37 */
+      --term-orange: 159 126 77;      /* #9F7E4D — 3.61/3.77/3.37 */
+      --term-magenta: 119 133 151;    /* #778597 — 3.60/3.76/3.36 */
+      --term-gray: 95 106 114;        /* #5F6A72 — 5.31/5.54/4.94 */
       --term-cyan-fg: 138 98 44;      /* #8A622C — 5.21 / 5.43 / 4.85 raised */
       --term-green-fg: 90 113 87;     /* #5A7157 — 5.11 / 5.34 / 4.76 */
       --term-red-fg: 153 90 83;       /* #995A53 — 5.10 / 5.33 / 4.76 */
@@ -419,7 +425,7 @@
        busy-toggle of `hidden` wins deterministically regardless of CSS order */
     .composer-btn {
       display: grid; place-items: center; width: 32px; height: 32px;
-      flex-shrink: 0; border-radius: 10px; color: #fff;
+      flex-shrink: 0; border-radius: 10px; color: rgb(var(--term-bg));
       box-shadow: 0 1px 2px rgb(0 0 0 / .18);
     }
     .composer-btn.hidden { display: none; }
@@ -581,7 +587,7 @@
     .btn:focus-visible { outline: 2px solid rgb(var(--term-cyan)); outline-offset: 2px; }
 
     .btn-primary {
-      background: rgb(var(--term-cyan)); border-color: transparent; color: #fff; font-weight: 600;
+      background: rgb(var(--term-cyan)); border-color: transparent; color: rgb(var(--term-bg)); font-weight: 600;
     }
     .btn-primary:hover:not(:disabled) { background: rgb(var(--term-cyan)); opacity: .9; }
     .btn-ghost { border-color: transparent; color: rgb(var(--term-muted)); }
@@ -982,6 +988,11 @@
       /* A looping placeholder sweep is the same problem as the shimmer; the
          flat wash still reads as "pending". */
       .skeleton { animation: none; background-image: none; background-color: rgb(var(--shimmer-base) / .22); }
+      /* The blanket rule above already collapses this to a single frame; state
+         it explicitly (as .ico-spin does below) so a reduced-motion user never
+         sees the run-head dot pulse. */
+      .wf-card-head .wf-dot-run,
+      .wf-run-head .wf-dot-run { animation: none; }
     }
 
     /* ---- workflow progress: phase tree (Workflow tab) + inline run card ----
@@ -1005,6 +1016,11 @@
     .wf-dot-warn { background: rgb(var(--term-orange)); }
     .wf-dot-run  { background: transparent; border: 1.5px solid rgb(var(--term-cyan)); }
     .wf-dot-cached { background: rgb(var(--term-gray)); opacity: .55; }
+    /* The head dot is the one summary indicator a user watches during a live
+       run, so only it pulses; the per-agent rail marks stay quiet. */
+    .wf-card-head .wf-dot-run,
+    .wf-run-head .wf-dot-run { animation: wf-pulse 1.4s ease-in-out infinite; }
+    @keyframes wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 
     /* Header ultra-mode toggle. A .chip with an explicit ON state, so the
        control reads as on/off rather than as another static label. */
@@ -1195,7 +1211,7 @@
     <!-- LEFT RAIL: identity + the two ways in -->
     <div class="flex shrink-0 flex-col bg-term-panel p-6 hide-narrow" style="width:300px">
       <div class="mb-8 flex items-center gap-3">
-        <div class="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-term-cyan font-serif italic text-white t-lg" >O</div>
+        <div class="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-term-cyan font-serif italic text-term-bg t-lg" >O</div>
         <div class="min-w-0">
           <h1 class="font-serif text-term-text t-xl" >Omni Agent</h1>
           <p class="text-term-muted t-xs" >Open a workspace to begin</p>
