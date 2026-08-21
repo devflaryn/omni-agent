@@ -1270,6 +1270,62 @@ def _resolve_project_file(project_name, rel_path):
     return full, rel, None
 
 
+# base64 over ssh is fine for a screenshot and absurd for an APK. Anything above
+# this is refused rather than transferred for a preview nobody can use.
+REMOTE_PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+
+_REMOTE_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                      ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+
+
+def _remote_read_project_file(project_name, rel_path, force_text=False):
+    from tools.common import normalize_path, wpath
+    rel = normalize_path(rel_path)
+
+    # Same guard as the local viewer: resolve on the far side and confirm the
+    # result is still inside the project root.
+    probe = run_cmd(
+        f'R=$(pwd -P); F=$(cd "$(dirname {wpath(rel)})" 2>/dev/null && pwd -P)/'
+        f'"$(basename {wpath(rel)})"; '
+        f'case "$F" in "$R"/*|"$R") ;; *) echo OUTSIDE; exit 0;; esac; '
+        f'if [ ! -f {wpath(rel)} ]; then echo MISSING; exit 0; fi; '
+        f'echo "SIZE=$(wc -c < {wpath(rel)} | tr -d " ")"',
+        timeout=30)
+    out = (probe.get("stdout") or "").strip()
+    if probe.get("error"):
+        return {"ok": False, "error": probe["error"]}
+    if out.startswith("OUTSIDE"):
+        return {"ok": False, "error": f"{rel_path} resolves outside the project folder."}
+    if out.startswith("MISSING"):
+        return {"ok": False, "error": f"No such file on device: {rel_path}"}
+
+    size = 0
+    for line in out.splitlines():
+        if line.startswith("SIZE="):
+            try:
+                size = int(line[5:])
+            except ValueError:
+                size = 0
+    if size > REMOTE_PREVIEW_MAX_BYTES:
+        mb = REMOTE_PREVIEW_MAX_BYTES // (1024 * 1024)
+        return {"ok": False,
+                "error": f"{rel_path} is {size} bytes — too large to preview from a "
+                         f"remote device (limit {mb} MB). Work with it through tools instead."}
+
+    ext = os.path.splitext(rel)[1].lower()
+    if ext in _REMOTE_IMAGE_MIME and not force_text:
+        res = run_cmd(f"base64 {wpath(rel)} | tr -d '\\n'", timeout=120)
+        if res.get("error") or res.get("returncode"):
+            return {"ok": False, "error": res.get("error") or "could not read the image"}
+        return {"ok": True, "kind": "image", "mime": _REMOTE_IMAGE_MIME[ext],
+                "data": (res.get("stdout") or "").strip(), "path": rel}
+
+    res = run_cmd(f"cat {wpath(rel)}", timeout=120)
+    if res.get("error") or res.get("returncode"):
+        return {"ok": False, "error": res.get("error") or "could not read the file"}
+    return {"ok": True, "kind": "text", "content": res.get("stdout") or "", "path": rel}
+
+
 def read_project_file(project_name, rel_path, force_text=False):
     """Reads a file from the project workspace (host side) for the frontend
     viewer. Returns a typed payload: kind="image" (base64 + mime),
@@ -1278,6 +1334,8 @@ def read_project_file(project_name, rel_path, force_text=False):
 
     force_text=True is the frontend's "view as text anyway" escape hatch: it
     skips the binary sniff and decodes with errors="replace"."""
+    if devices.is_remote():
+        return _remote_read_project_file(project_name, rel_path, force_text)
     full, rel, err = _resolve_project_file(project_name, rel_path)
     if err:
         return {"ok": False, "error": err}

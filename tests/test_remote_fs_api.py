@@ -78,6 +78,59 @@ def test_remote_tree_survives_a_failed_command(monkeypatch):
     assert tree["type"] == "dir" and tree["children"] == []
 
 
+import base64
+
+
+def _remote(monkeypatch, stdout, returncode=0):
+    monkeypatch.setattr(devices, "_active", devices.Device("i", "box", "h", "/r"))
+    seen = {}
+
+    def fake(cmd, timeout=None):
+        seen.setdefault("cmds", []).append(cmd)
+        out = stdout(cmd) if callable(stdout) else stdout
+        return {"stdout": out, "stderr": "", "returncode": returncode}
+
+    monkeypatch.setattr(agent, "run_cmd", fake)
+    return seen
+
+
+def test_remote_text_file_is_returned_as_text(monkeypatch):
+    _remote(monkeypatch, lambda cmd: "SIZE=12\n" if "stat" in cmd else "hello world\n")
+    res = agent.read_project_file("proj", "README.md")
+    assert res["ok"] is True and res["kind"] == "text"
+    assert "hello world" in res["content"]
+
+
+def test_remote_escape_outside_the_project_is_rejected(monkeypatch):
+    # The local viewer has this guard; the remote one needs its own or the
+    # viewer can be walked out of the project root.
+    _remote(monkeypatch, "OUTSIDE\n")
+    res = agent.read_project_file("proj", "../../etc/passwd")
+    assert res["ok"] is False and "outside" in res["error"].lower()
+
+
+def test_remote_image_comes_back_base64(monkeypatch):
+    payload = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
+    _remote(monkeypatch, lambda cmd: "SIZE=15\n" if "stat" in cmd else payload)
+    res = agent.read_project_file("proj", "shot.png")
+    assert res["ok"] is True and res["kind"] == "image"
+    assert res["mime"] == "image/png" and res["data"] == payload
+
+
+def test_a_file_over_the_cap_is_refused_not_transferred(monkeypatch):
+    # base64 of a 50MB APK over ssh for a PREVIEW is not a reasonable thing to do.
+    seen = _remote(monkeypatch, f"SIZE={agent.REMOTE_PREVIEW_MAX_BYTES + 1}\n")
+    res = agent.read_project_file("proj", "big.apk")
+    assert res["ok"] is False and "too large" in res["error"].lower()
+    assert not any("base64" in c for c in seen["cmds"]), "must not transfer it"
+
+
+def test_a_missing_remote_file_reports_cleanly(monkeypatch):
+    _remote(monkeypatch, "MISSING\n")
+    res = agent.read_project_file("proj", "nope.txt")
+    assert res["ok"] is False and "error" in res
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -88,7 +141,12 @@ if __name__ == "__main__":
              (test_directories_sort_before_files, False),
              (test_empty_output_yields_an_empty_root, False),
              (test_remote_tree_shells_out_and_does_not_touch_local_disk, True),
-             (test_remote_tree_survives_a_failed_command, True)]
+             (test_remote_tree_survives_a_failed_command, True),
+             (test_remote_text_file_is_returned_as_text, True),
+             (test_remote_escape_outside_the_project_is_rejected, True),
+             (test_remote_image_comes_back_base64, True),
+             (test_a_file_over_the_cap_is_refused_not_transferred, True),
+             (test_a_missing_remote_file_reports_cleanly, True)]
     failed = 0
     for t, needs in tests:
         try:
