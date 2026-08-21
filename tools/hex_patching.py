@@ -11,8 +11,8 @@ tooling lives in one focused, readable module.
 """
 
 from tool_registry import registry
-from tools.common import normalize_path
-from docker_sandbox import run_cmd
+from tools.common import normalize_path, wpath
+from host_exec import run_cmd
 
 
 def _format_hex_bytes(new_hex_bytes):
@@ -43,7 +43,7 @@ def _format_hex_bytes(new_hex_bytes):
         "binary_patch, which locates the bytes by content and disambiguates multiple matches."
     ),
     params_schema={
-        "so_path": "string (path to the binary inside /workspace, e.g. 'lib/arm64-v8a/libfoo.so')",
+        "so_path": "string (path to the binary inside the project, e.g. 'lib/arm64-v8a/libfoo.so')",
         "file_offset": "string (hex file offset where the patch starts, e.g. '0x1234')",
         "new_hex_bytes": "string (even-length hex string of replacement bytes, e.g. 'd503201f' for an ARM64 NOP)"
     },
@@ -61,8 +61,8 @@ def patch_bytes_at_offset(so_path, file_offset, new_hex_bytes):
 
     cmd = (
         f'echo -n -e "{formatted_bytes}" | '
-        f'dd of=/workspace/{so_path} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
+        f'dd of={wpath(so_path)} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
         # Read back the patched bytes to verify the write succeeded
-        f'dd if=/workspace/{so_path} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p'
+        f'dd if={wpath(so_path)} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p'
     )
     return run_cmd(cmd, timeout=60)

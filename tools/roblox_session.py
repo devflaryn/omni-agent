@@ -6,10 +6,10 @@ rather than reimplementing them, so the agent exercises the exact path a custome
 gets. That is the point: a test that logs in by tapping through Roblox's UI would
 not be testing the product.
 
-What these deliberately do NOT include: any control over auto-screenshots. On the
-dev base the recorder starts with QEMU and runs for the instance's lifetime — it
-is not a tool, not a toggle, and not something the agent can turn off. Read the
-frames with read_auto_screenshots.
+What these deliberately do NOT include: any control over auto-screenshots. On a
+debug boot the recorder starts with QEMU and runs for the instance's lifetime —
+it is not a tool, not a toggle, and not something the agent can turn off. Read
+the frames with read_auto_screenshots.
 """
 import os
 import tempfile
@@ -99,7 +99,7 @@ def _summarize(parsed, res, action):
         "job_id": "string (optional — gameInstanceId/JobId to join a SPECIFIC running server instead of matchmaking)",
         "launch_data": "string (optional — <=200 bytes, readable in-game via Player:GetJoinData())",
         "user_id": "integer (optional — informational: which Roblox user the token belongs to)",
-        "dev": "boolean (optional — boot the instance on the DEV base (frida+Magisk+root) to test a new Roblox build. For the standard 'does this build work' check on production, leave false)",
+        "debug": "boolean (optional — DEBUG boot: attach the devkit (frida + omni-* tools) to the same dual-use image, for runtime-hooking a Roblox build under test. For the standard 'does this build work' check, leave false. Note: apk_path installs on ANY base and does NOT require this.)",
         "timeout": "integer (optional — seconds to wait for boot; the engine picks a first-boot-aware default)",
     },
     output=("JSON: {ok, place_id, deeplink, booted, launched, session:{...token redacted...}, "
@@ -114,7 +114,7 @@ def _summarize(parsed, res, action):
     ),
 )
 def play_roblox(place_id, account=None, token=None, session_name=None,
-                job_id=None, launch_data=None, user_id=None, dev=False,
+                job_id=None, launch_data=None, user_id=None, debug=False,
                 timeout=None, apk_path=None):
     # Modern model: the account username IS the instance name, so the engine
     # resolves its saved cookie automatically. `account` therefore takes
@@ -138,18 +138,16 @@ def play_roblox(place_id, account=None, token=None, session_name=None,
     # see set_roblox_account); `start` refuses if the instance is up.
     argv = ["start", session_name, "--place", str(place_id), "--json"]
     if apk_path:
-        # One-shot: omnidroid installs this APK on the dev base after boot and
-        # BEFORE delivering the session, then checks the guest actually logged
-        # in. `--apk` is dev-gated engine-side (apk_dev_only), so dev is forced
-        # rather than left to the caller to get right.
-        dev = True
+        # One-shot: omnidroid installs this APK after boot and BEFORE delivering
+        # the session, then checks the guest actually logged in. `--apk` works on
+        # EVERY base now (no dev gate) and does NOT force a debug boot — frida is
+        # a separate, explicit opt-in.
         argv += ["--apk", str(apk_path)]
-    if _truthy(dev):
-        # Create the instance on the DEV base (frida+Magisk) for testing a new
-        # Roblox build. Only affects a NEW instance; the engine gates --dev by
-        # OMNI_DEV_MODE, which the agent's env sets. Ignored if the instance
-        # already exists (its base is fixed at create).
-        argv += ["--dev"]
+    if _truthy(debug):
+        # DEBUG boot: attach the devkit (frida + omni-* tools) to the same
+        # dual-use image, for runtime-hooking the build under test. Per-boot, so
+        # it applies to THIS boot only.
+        argv += ["--debug"]
     if job_id:
         argv += ["--job", str(job_id)]
     if launch_data:
@@ -242,7 +240,7 @@ def set_roblox_account(token=None, place_id=None, session_name=None, play=None,
         "token": "string (optional — the raw .ROBLOSECURITY cookie. Prefer token_file: this puts the "
                  "cookie directly in your tool call, which is logged in the transcript)",
         "token_file": "string (optional — path to a file containing the cookie, e.g. 'cookie.txt' in "
-                     "/workspace. Preferred over token)",
+                     "the project root. Preferred over token)",
     },
     output=("JSON: {ok, username, user_id}. `username` is what to pass to play_roblox(account=...) next "
             "— it also names the instance. On failure {error} — almost always 'bad_token' (the cookie is "
@@ -343,12 +341,12 @@ def _rm_workspace_artifact(rel_path):
         "account": "string (optional — a saved Roblox USERNAME from `omni login` / list_roblox_accounts. Its cookie is resolved automatically and it names the instance. PREFER this over token/token_file when the account is already saved; give ONE of account / token / token_file)",
         "token": "string (optional — raw .ROBLOSECURITY cookie; give this OR token_file OR account)",
         "token_file": "string (optional — path to a file with the cookie, e.g. 'cookie.txt')",
-        "apk_path": "string (optional — a Roblox APK to test, relative to /workspace. Omit this to just "
+        "apk_path": "string (optional — a Roblox APK to test, relative to the project root. Omit this to just "
                     "log in and play whatever Roblox build is ALREADY installed on the instance; pass it "
                     "when you have a NEW build to test)",
-        "dev": "boolean (optional — defaults to true when apk_path is given (testing a swappable build "
-              "needs the dev base's install/frida/root capability), false otherwise (play a production "
-              "instance with its already-baked build). Override either way.)",
+        "debug": "boolean (optional, default false — DEBUG boot: attach the devkit (frida + omni-* tools) "
+              "for runtime-hooking the build under test. Installing a custom apk_path does NOT require this "
+              "(APK swap works on every base); pass debug=true only when you need frida/root hooking.)",
         "timeout": "integer (optional — boot timeout in seconds; the engine picks a first-boot-aware "
                   "default)",
     },
@@ -368,7 +366,7 @@ def _rm_workspace_artifact(rel_path):
     ),
 )
 def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk_path=None,
-                        dev=None, timeout=None):
+                        debug=None, timeout=None):
     err = _place_error(place_id)
     if err:
         return {"error": err, "stage": "validate"}
@@ -393,10 +391,12 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
         if not username:
             return {"error": "login succeeded but returned no username", "stage": "login"}
 
-    use_dev = bool(apk_path) if dev is None else _truthy(dev)
+    # Debug (frida) is an explicit opt-in, NOT implied by apk_path — the APK
+    # swap works on every base without it.
+    use_debug = _truthy(debug) if debug is not None else False
 
     if apk_path:
-        # NO throwaway boot here any more. omnidroid's `start --dev --apk` does
+        # NO throwaway boot here any more. omnidroid's `start --apk` does
         # boot -> install -> deliver session -> verify login in ONE call, so the
         # old "boot, install, boot again" dance is not just wasteful — the second
         # boot would now hard-fail, because `start` refuses an instance that is
@@ -431,7 +431,7 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
         # lifecycle — clear any stale instance so the one-shot below can boot.
         _run_qemu(["stop", username, "--json"], timeout=300)
 
-    play_res = play_roblox(place_id=place_id, account=username, dev=use_dev,
+    play_res = play_roblox(place_id=place_id, account=username, debug=use_debug,
                            timeout=timeout,
                            apk_path=(built_apk if apk_path else None))
     if play_res.get("error"):

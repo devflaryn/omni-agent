@@ -2,7 +2,7 @@
 name: learn-and-apply-modification
 description: Learn a modification technique from a WORKING modified APK plus its plain base, then reconstruct it on a target APK — understanding the technique, not copying files. Records what it learned as a checkpoint that also arms the build-constraint gate.
 when_to_use: Use when the user gives a working modified APK and its base and asks to learn the change/bypass and apply it to the base or a new target (e.g. "learn the bypass on this APK and add it to the base"). NOT for a from-scratch mod (use apk-modding) or a whole-file swap (use apk-toolchain's unzip path).
-allowed-tools: decode_apk, compare_directories, diff_code_graphs, build_code_graph, query_code_graph, jadx_decompile, search_smali, record_learned_technique, clear_technique_constraints, patch_smali_method, insert_smali_code, recompile_apk, sign_apk, verify_apk, write_file
+allowed-tools: decode_apk, compare_directories, diff_code_graphs, build_code_graph, query_code_graph, jadx_decompile, search_smali, record_learned_technique, clear_technique_constraints, verify_hooks_applied, patch_smali_method, insert_smali_code, recompile_apk, sign_apk, verify_apk, write_file
 ---
 
 # Learn-and-apply modification
@@ -66,13 +66,23 @@ the same way.
 
 ## Phase 5 — Verify and hand off
 
-`recompile_apk` the target **with `original_apk` set to the target's base** so
-the constraint gate runs (constraints omitted with a base = unverified = the
+**First, prove the hooks actually landed.** Call **`verify_hooks_applied`** with
+`base_dir` = the target's *unedited* decode dir and `output_dir` = the decode dir
+you just edited. It walks every hook point you recorded and checks — by
+class+method NAME — that the method is present in the target AND its body changed
+versus the base (or is a freshly injected method). A hook reported `missing-*` or
+`unchanged` means you skipped or mis-applied it: fix that hook and re-check before
+going further. This is the check the constraint gate cannot do — the gate only
+sees files, so a build where you applied *zero* hooks still passes it. Do not
+proceed to recompile until every recorded hook reads PASS.
+
+Then `recompile_apk` the target **with `original_apk` set to the target's base**
+so the constraint gate runs (constraints omitted with a base = unverified = the
 tool refuses). The gate checks your reconstruction against what you recorded:
 if you said "no new .so" and a `.so` slipped in, the build fails with the
-delta — fix and rebuild (bounded retries). Once it passes, `sign_apk` +
-`verify_apk`, then hand the signed APK to the normal on-device test flow to
-confirm the technique works at runtime.
+delta — fix and rebuild (bounded retries). Once BOTH `verify_hooks_applied` and
+the constraint gate pass, `sign_apk` + `verify_apk`, then hand the signed APK to
+the normal on-device test flow to confirm the technique works at runtime.
 
 Finally, call **`clear_technique_constraints`** so the constraints this
 technique auto-armed do not leak into a later, unrelated task in the same

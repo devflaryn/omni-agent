@@ -23,8 +23,8 @@ address 0.
 import base64
 
 from tool_registry import registry
-from tools.common import normalize_path, detect_elf_arch, TOOLCHAINS
-from docker_sandbox import run_cmd
+from tools.common import normalize_path, detect_elf_arch, TOOLCHAINS, encode_script, wpath
+from host_exec import run_cmd
 
 
 def _extract_and_check(objdump_bin, objcopy_bin, timeout):
@@ -76,8 +76,8 @@ def _maybe_patch(so_path, file_offset, hex_bytes, max_bytes):
     formatted = "\\x" + "\\x".join(hex_bytes[i:i + 2] for i in range(0, len(hex_bytes), 2))
     cmd = (
         f'echo -n -e "{formatted}" | '
-        f'dd of=/workspace/{so_path} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
-        f'dd if=/workspace/{so_path} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p | tr -d "\\n"'
+        f'dd of={wpath(so_path)} bs=1 seek=$((16#{clean_offset})) conv=notrunc && '
+        f'dd if={wpath(so_path)} bs=1 skip=$((16#{clean_offset})) count={byte_count} 2>/dev/null | xxd -p | tr -d "\\n"'
     )
     res = run_cmd(cmd, timeout=60)
     readback = res.get("stdout", "").strip()
@@ -113,7 +113,7 @@ def _resolve_toolchain(so_path, arch):
         "is unresolved instead."
     ),
     params_schema={
-        "so_path": "string (path to the .so file, relative to /workspace)",
+        "so_path": "string (path to the .so file, relative to the project root)",
         "assembly_code": "string (raw assembly, GNU 'as' syntax, for the target arch — e.g. 'mov w0, #1\\nret' for ARM64)",
         "arch": "string (optional: 'aarch64', 'arm', 'x86_64', or 'x86'; auto-detected from so_path via readelf if omitted)",
         "file_offset": "string (optional hex file offset to patch at, e.g. '0x1234'; if omitted, this is a dry run that only returns the assembled bytes)",
@@ -158,7 +158,7 @@ def assemble_and_patch(so_path, assembly_code, arch=None, file_offset=None, max_
         "explains exactly which symbol is unresolved instead."
     ),
     params_schema={
-        "so_path": "string (path to the .so file, relative to /workspace)",
+        "so_path": "string (path to the .so file, relative to the project root)",
         "c_code": "string (C source defining exactly one self-contained function, e.g. 'int check(int x) { return (x * 7 + 3) % 5 == 0; }')",
         "arch": "string (optional: 'aarch64', 'arm', 'x86_64', or 'x86'; auto-detected from so_path via readelf if omitted)",
         "file_offset": "string (optional hex file offset to patch at, e.g. '0x1234'; if omitted, this is a dry run that only returns the compiled bytes)",
@@ -199,7 +199,7 @@ def compile_c_and_patch(so_path, c_code, arch=None, file_offset=None, max_bytes=
         "of each run found."
     ),
     params_schema={
-        "binary_path": "string (path to the file to scan, relative to /workspace)",
+        "binary_path": "string (path to the file to scan, relative to the project root)",
         "min_size": "integer (minimum consecutive filler bytes required, e.g. 32)",
         "fill_byte": "string (optional, 2-hex-char byte to look for runs of, default '00')",
         "max_results": "integer (optional, max candidate offsets to return, default 10)"
@@ -219,7 +219,7 @@ def find_code_cave(binary_path, min_size, fill_byte="00", max_results=10):
         return {"error": "fill_byte must be a single hex byte, e.g. '00' or 'ff'."}
 
     script = f"""
-path = '/workspace/{binary_path}'
+path = '{binary_path}'
 fill = bytes.fromhex('{fill_byte}')[0]
 min_size = {min_size}
 max_results = {max_results}
@@ -244,7 +244,7 @@ else:
     for start, run_len in results:
         print('offset=0x' + format(start, 'x') + ' length=' + str(run_len) + ' bytes')
 """
-    b64_script = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    b64_script = encode_script(script)
     cmd = f"echo '{b64_script}' | base64 -d | python3 -"
     res = run_cmd(cmd, timeout=60)
     if res.get("stdout"):

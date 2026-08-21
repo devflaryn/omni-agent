@@ -6,7 +6,7 @@ BEFORE it touches the target. This is the echo-back checkpoint and the plan the
 apply phase follows. Constraint derivation (auto-arming the Component 2 gate) is
 added in the neighbouring function `_derive_constraints` / the record path.
 
-Pure module: no agent.py coupling, no sandbox I/O. Durable per-project
+Pure module: no agent.py coupling, no shell I/O. Durable per-project
 persistence of the artifact (write_file learned_technique.json) is done by the
 skill, keeping this tool offline-testable."""
 import copy

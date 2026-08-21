@@ -1,17 +1,13 @@
 """Android emulator control + on-device testing tools.
 
-IMPORTANT ARCHITECTURE NOTE: unlike every other tool in this project, these
-do NOT go through docker_sandbox.run_cmd / the Linux sandbox. The emulator
-runs NATIVELY on the host machine (macOS / Linux / Windows), so these tools
-shell out directly to host executables via subprocess (resolved with
-OS-appropriate names, e.g. `adb` vs `adb.exe`), and read/write files directly
-on the host
-filesystem via tools.common.resolve_workspace_path (which maps a
-'/workspace/...'-style path onto the same bind-mounted directory the Linux
-sandbox sees at /workspace — so a screenshot saved here is still reachable by
-read_file_chunk etc. inside the sandbox, and an APK built by
-recompile_apk/sign_apk in the sandbox is still reachable here for
-install_apk_on_emulator).
+ARCHITECTURE NOTE: these tools bypass host_exec.run_cmd and shell out
+directly via subprocess (resolving OS-appropriate names, e.g. `adb` vs
+`adb.exe`), reading and writing files with tools.common.resolve_workspace_path
+rather than through the shell. That is a deliberate
+directness, not a different machine: every tool in this project now runs on this
+same host, so a screenshot saved here is immediately reachable by
+read_file_chunk, and an APK built by recompile_apk/sign_apk is immediately
+reachable here for install_apk_on_emulator.
 
 ONE BACKEND: omnidroid (QEMU). Every "run the app on a VM" flow goes through the
 self-contained headless **omnidroid** engine — a QEMU/Bliss-OS (Android 13,
@@ -78,6 +74,7 @@ from tools._emulator_capture_contract import (
     normalize_capture_metadata, write_metadata_atomic,
 )
 from tools._emulator_diagnostics import analyze_logcat, merge_diagnostics, extract_crash_traces
+from tools._emulator_screen_read import parse_screen_size, in_bounds, draw_grid
 from llm import get_openai_endpoint_config, get_vision_endpoint_config, has_vision_model
 
 # omnidroid (QEMU against the base_x86/base_arm qcow2s, driven through the frozen
@@ -93,7 +90,7 @@ _DEFAULT_BACKEND = "qemu"
 # v1). The qemu backend does a `version --json` handshake and warns on mismatch.
 _EXPECTED_CONTRACT = "1.0"
 _DEFAULT_QEMU_SESSION = "omniagent"
-# The CURRENT auto-screenshot session folder under /workspace/screenshots/, or
+# The CURRENT auto-screenshot session folder in the project folder/screenshots/, or
 # None until an APK install names one (`<apk_basename>_<DDMMHHMM>`). We do NOT use
 # a generic "auto" folder: auto-capture into the workspace begins at install with
 # the rule-named folder; before that the engine records to its own account dir
@@ -279,13 +276,13 @@ def _parse_json_object(text):
 def _omni_env():
     """Environment for every omnidroid call the AGENT makes.
 
-    The engine hides its dev base (frida + Magisk root) from `bases`/`use-base`/
-    `create` unless OMNI_DEV_MODE=1, so that the shipped product cannot list or
-    switch to it — customers must not reach a rooted image. omni-agent is the
-    devtool that base exists for, so it is the one caller that opts in."""
-    env = dict(os.environ)
-    env["OMNI_DEV_MODE"] = "1"
-    return env
+    There is no dev-base gate any more: every shipped base is dual-use, so the
+    agent needs no special unlock. Debug (the frida/omni-* devkit) is a per-boot
+    option passed explicitly (ensure_emulator_running debug=true / start
+    --debug), not a session-wide env, so this is just the plain environment.
+    OMNI_DEBUG_BOOT is intentionally NOT forced here — the agent runs production
+    boots by default and opts into debug per call."""
+    return dict(os.environ)
 
 
 def _run_qemu(args, timeout=60):
@@ -417,21 +414,20 @@ def _qemu_readiness_check():
     return False, {"error": "doctor returned no JSON"}
 
 
-def _dev_base_enabled(dev=None):
-    """Whether new omnidroid accounts should be created from the DEV base
-    (base_arm + the base_arm_devkit.qcow2 extra disk: frida + Magisk + omni
-    tools). True when the caller passes dev=True OR the OMNI_USE_DEV_BASE env var
-    is truthy. omni-agent is a dev-only dependency, so it is the only thing that
-    ever selects this base; the shipped bases (base_x86/base_arm) never carry the
-    devkit disk."""
-    if dev is not None:
-        return _truthy(dev)
-    return _truthy(os.environ.get("OMNI_USE_DEV_BASE", ""))
+def _debug_boot_enabled(debug=None):
+    """Whether THIS boot should attach the devkit disk (frida + omni-* tools) as
+    vdc. A per-BOOT option, not a base or account property: every shipped base
+    is dual-use, so debug just adds the toolkit. True when the caller passes
+    debug=True OR the OMNI_DEBUG_BOOT env var is truthy. Default (production)
+    boots attach nothing extra."""
+    if debug is not None:
+        return _truthy(debug)
+    return _truthy(os.environ.get("OMNI_DEBUG_BOOT", ""))
 
 
 def _autocap_workspace_dir():
     """The workspace folder for the CURRENT auto-screenshot session
-    (/workspace/screenshots/<apk_basename>_<DDMMHHMM>/), or None when no session
+    (screenshots/<apk_basename>_<DDMMHHMM>/), or None when no session
     has been named yet (before an APK install). None means 'do not capture into
     the workspace' — the engine records to its own account dir instead, so no
     generic screenshots/auto/ folder is created."""
@@ -488,23 +484,24 @@ def _agent_ensure_autocap(name, log):
     if isinstance(parsed, dict) and parsed.get("running"):
         state = "already ON" if parsed.get("already") else "STARTED"
         log.append(f"[autocap] always-on screenshots {state} -> "
-                   f"/workspace/screenshots/{_AUTOCAP_SESSION}/ "
+                   f"screenshots/{_AUTOCAP_SESSION}/ "
                    f"(read them with read_auto_screenshots).")
     else:
         why = (parsed or {}).get("reason") or (res.get("stderr") or "")[:120]
         log.append(f"[autocap] recorder not started ({why}).")
 
 
-def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
+def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, debug=False):
     err = _validate_session_id(name)
     if err:
         return {"error": err}
     log = []
-    if dev:
-        log.append("DEV BASE selected: new accounts boot base_arm with the "
-                   "devkit disk (vdc: frida + Magisk + omni tools). Start frida "
-                   "with ensure_frida_server; hide it with hide_root_from_app. "
-                   "(Root needs a Magisk-patched boot: omni build-dev-base --patch-boot.)")
+    if debug:
+        log.append("DEBUG boot: this boot attaches the devkit disk (vdc: frida "
+                   "+ omni-* tools) to the SAME dual-use production image. Start "
+                   "frida with ensure_frida_server; hide it with "
+                   "hide_root_from_app. (Root is baked into the shipped base; "
+                   "if su is missing, root it with `omni root-base`.)")
         # Do NOT point the engine's boot-time recorder at the workspace yet: there
         # is no APK session named at boot, and we don't want a generic
         # screenshots/auto/ folder. Clear any stale value so the engine records to
@@ -588,7 +585,7 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
         adb = _qemu_adb(_find_qemu_manager()[1])
         if serial:
             _run([adb, "connect", serial], timeout=10)
-        if dev:
+        if debug:
             _agent_ensure_autocap(name, log)
         log.append(f"BOOT_OK (serial={serial or 'unknown'})")
         return {"stdout": "\n".join(log)}
@@ -603,9 +600,10 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
     # it, the instance comes up on Roblox's own login screen, which is fine for
     # install/launch/frida work. play_roblox is the tool that wants a session.
     args += ["--no-token"]
-    if dev:
-        # The base is chosen at START now (there is no create-time --base dev).
-        args += ["--dev"]
+    if debug:
+        # Debug is a per-boot option now: attach the devkit (frida + tools) to
+        # the same dual-use production image. No separate base.
+        args += ["--debug"]
     if mode:
         args += ["--mode", mode]
     if mem:
@@ -641,8 +639,8 @@ def _ensure_qemu_running(name, reset, boot_timeout, mode, mem, dev=False):
     bridge = parsed_s.get("native_bridge_ok")
     if bridge is False:
         log.append("WARNING: libndk ARM bridge did NOT verify — arm64-only APKs may fail to run.")
-    if dev:
-        # Engine already auto-starts the recorder on a dev --wait boot; this
+    if debug:
+        # Engine already auto-starts the recorder on a debug boot; this
         # idempotent ensure just confirms it and repoints to the workspace.
         _agent_ensure_autocap(name, log)
     log.append(f"BOOT_OK (serial={serial or 'unknown'})")
@@ -709,18 +707,18 @@ def _resolve_serial(backend, device_name=None):
         "ram_mb": "integer (optional — override guest RAM in MB, passed as --mem; overrides the mode's RAM. Engine defaults to the mode's tier if omitted)",
         "cpus": "integer (optional — IGNORED (vCPU count is set by 'mode'))",
         "headless": "boolean (IGNORED — omnidroid instances are always headless; view over the instance's localhost VNC port)",
-        "dev": "boolean (optional, default false — boot the DEV base: base_arm plus the extra devkit disk (vdc = base_arm_devkit.qcow2) carrying an android-arm64 frida-server + Magisk + the omni-* tools, for reverse-engineering/runtime-hooking work. The base is chosen at BOOT, so the same instance name can boot dev or production on different runs. Also enablable globally via the OMNI_USE_DEV_BASE env var; production bases are untouched. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)",
+        "debug": "boolean (optional, default false — DEBUG boot: attach the devkit disk (vdc = base_<arch>_devkit.qcow2, carrying a native frida-server + the omni-* tools) to the SAME dual-use production image for reverse-engineering/runtime-hooking work. Debug is per-BOOT, so the same instance name can boot production or debug on different runs; the base image is identical either way. Also enablable via the OMNI_DEBUG_BOOT env var. After BOOT_OK, use ensure_frida_server / hide_root_from_app.)",
     },
     output="A log of what happened (stop-for-reset if needed, boot progress) ending in 'BOOT_OK (serial=...)' or 'BOOT_TIMEOUT after Ns'.",
-    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly. Instances are diskless (the shared base booted snapshot=on), so EVERY boot is already a clean device and nothing persists between boots; reset=true just means 'stop the live instance and boot it fresh' rather than reusing it. This boot passes --no-token, so it comes up on Roblox's own login screen — use play_roblox when you want a logged-in session. Fully self-contained (no Android Studio / SDK emulator / LDPlayer). Pass dev=true (or set OMNI_USE_DEV_BASE) to boot the frida/root dev base."
+    when_to_use="Call this FIRST, before install_apk_on_emulator/launch_app_on_emulator/any adb-based tool. Safe to call repeatedly. Instances are diskless (the shared base booted snapshot=on), so EVERY boot is already a clean device and nothing persists between boots; reset=true just means 'stop the live instance and boot it fresh' rather than reusing it. This boot passes --no-token, so it comes up on Roblox's own login screen — use play_roblox when you want a logged-in session. Fully self-contained (no Android Studio / SDK emulator / LDPlayer). Pass debug=true (or set OMNI_DEBUG_BOOT) to attach the frida/omni-* devkit."
 )
 def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_image=_DEFAULT_SYSTEM_IMAGE,
                              device_profile="pixel_5", reset=True, boot_timeout=300, headless=False,
-                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, dev=None):
+                             ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE, debug=None):
     backend = _coerce_backend(backend)   # omnidroid (qemu) only — never an AVD
     device_name = device_name or _default_device_name()
     reset = _truthy(reset)
-    dev = _dev_base_enabled(dev)
+    debug = _debug_boot_enabled(debug)
     try:
         boot_timeout = int(boot_timeout)
     except (TypeError, ValueError):
@@ -731,7 +729,8 @@ def ensure_emulator_running(backend=_DEFAULT_BACKEND, device_name=None, system_i
     # ALWAYS omnidroid: create/start an account on the base (base_x86 on x86,
     # base_arm on an arm64 host) via the frozen contract. system_image/
     # device_profile/headless are ignored (they were AVD-only).
-    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb, dev=dev)
+    return _ensure_qemu_running(device_name, reset, boot_timeout, mode, ram_mb,
+                                debug=debug)
 
 
 @registry.register(
@@ -770,6 +769,37 @@ def _int_arg(value, name):
         return int(value)
     except (TypeError, ValueError):
         return {"error": f"{name} must be an integer (got {value!r})."}
+
+
+# Screen size per adb serial. The resolution cannot change under a running
+# instance, and a `wm size` round trip on every tap would double the cost of a
+# drive loop — so read it once and remember it.
+_SCREEN_SIZE_CACHE = {}
+
+
+def _screen_size(adb, serial):
+    """(width, height) of the device screen, or (None, None) if unreadable."""
+    if serial not in _SCREEN_SIZE_CACHE:
+        res = _run([adb, "-s", serial, "shell", "wm", "size"], timeout=20)
+        _SCREEN_SIZE_CACHE[serial] = parse_screen_size(res.get("stdout") or "")
+    return _SCREEN_SIZE_CACHE[serial]
+
+
+def _bounds_failure(adb, serial, points):
+    """An {'error': ...} dict when any (x, y) is off-screen, else None.
+
+    An off-screen `input tap` is accepted by adb and does NOTHING — the most
+    expensive failure mode in a drive loop, because it looks like success and
+    the agent concludes the button doesn't work. Fails OPEN when the size can't
+    be read, so an unreadable `wm size` never blocks a tap that would work.
+    """
+    width, height = _screen_size(adb, serial)
+    bad = [p for p in points if not in_bounds(p[0], p[1], width, height)]
+    if not bad:
+        return None
+    return {"error": (f"Coordinate {bad[0][0]},{bad[0][1]} is outside the {width}x{height} "
+                      f"screen — adb would accept this and do nothing. Call observe_screen "
+                      f"to get real coordinates for this device.")}
 
 
 def _input_failure(res):
@@ -843,6 +873,9 @@ def tap_screen(x, y, backend=_DEFAULT_BACKEND, device_name=None):
         return xi
     if isinstance(yi, dict):
         return yi
+    oob = _bounds_failure(adb, serial_or_err, [(xi, yi)])
+    if oob:
+        return oob
     res = _run([adb, "-s", serial_or_err, "shell", "input", "tap", str(xi), str(yi)], timeout=30)
     fail = _input_failure(res)
     if fail:
@@ -914,6 +947,9 @@ def swipe_screen(x1, y1, x2, y2, duration_ms=300, backend=_DEFAULT_BACKEND, devi
     if isinstance(dur, dict):
         dur = 300
     dur = max(50, min(dur, 10000))
+    oob = _bounds_failure(adb, serial_or_err, [tuple(coords[:2]), tuple(coords[2:])])
+    if oob:
+        return oob
     res = _run([adb, "-s", serial_or_err, "shell", "input", "swipe",
                 *[str(c) for c in coords], str(dur)], timeout=30)
     fail = _input_failure(res)
@@ -967,7 +1003,7 @@ def press_key(key, backend=_DEFAULT_BACKEND, device_name=None):
         "passing silently."
     ),
     params_schema={
-        "apk_path": "string (path to the .apk, relative to /workspace, e.g. 'modified.apk')",
+        "apk_path": "string (path to the .apk, relative to the project root, e.g. 'modified.apk')",
         "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)",
         "replace": "boolean (optional, default true — adb backends only: adds -r to allow reinstalling over an existing install)",
@@ -1040,7 +1076,7 @@ def install_apk_on_emulator(apk_path, backend=_DEFAULT_BACKEND, device_name=None
         # folder instead of piling into a single shared 'auto/'. Dev-base only.
         cap_log = []
         session = _begin_install_autocap_session(apk_path, name, cap_log)
-        cap_note = f" Auto-screenshots -> /workspace/screenshots/{session}/ (read_auto_screenshots)."
+        cap_note = f" Auto-screenshots -> screenshots/{session}/ (read_auto_screenshots)."
         return {"stdout": (
             f"Installed {parsed.get('package')} on {arch} account '{name}': abi={abi_installed}, "
             f"native_bridge_used={nbu} — intended path exercised "
@@ -1257,13 +1293,14 @@ def monitor_logcat(duration_seconds=15, max_traces=5, package_name=None, extra_p
     ),
     params_schema={
         "label": "string (optional, a short label prefixed to the saved filename, e.g. 'after_login_tap')",
+        "grid": "integer (optional, default 0 — also save a copy with a labelled coordinate grid every N pixels, for reading tap coordinates off the image; 100 is a good value)",
         "backend": "string (optional, default 'qemu' — must match whichever backend ensure_emulator_running booted)",
         "device_name": "string (optional — must match the device_name ensure_emulator_running used, if you overrode it)"
     },
-    output="The saved file's /workspace-relative path and size in bytes.",
-    when_to_use="Use this for a single targeted screenshot at a moment you choose. For an unattended test window where you want the interesting frames found automatically, use record_and_capture_keyframes instead."
+    output="The saved file's project-relative path and size in bytes (plus the grid copy's path when grid is set).",
+    when_to_use="Use this for a single targeted screenshot at a moment you choose. To DRIVE the screen (find something and tap it) use observe_screen instead — it adds the element list and coordinates. For an unattended test window where you want the interesting frames found automatically, use record_and_capture_keyframes."
 )
-def take_emulator_screenshot(label=None, backend=_DEFAULT_BACKEND, device_name=None):
+def take_emulator_screenshot(label=None, grid=0, backend=_DEFAULT_BACKEND, device_name=None):
     adb, serial_or_err = _resolve_serial(backend, device_name)
     if adb is None:
         return serial_or_err
@@ -1284,7 +1321,20 @@ def take_emulator_screenshot(label=None, backend=_DEFAULT_BACKEND, device_name=N
         return {"error": f"screencap failed: {proc.stderr.decode('utf-8', 'replace')}"}
     with open(fpath, "wb") as f:
         f.write(proc.stdout)
-    return {"stdout": f"Saved: /workspace/screenshots/manual/{fname} ({len(proc.stdout)} bytes)"}
+    rels = [f"screenshots/manual/{fname}"]
+    out = f"Saved: {rels[0]} ({len(proc.stdout)} bytes)"
+    try:
+        grid = max(0, int(grid))
+    except (TypeError, ValueError):
+        grid = 0
+    if grid:
+        try:
+            grid_rel = "screenshots/manual/" + os.path.basename(draw_grid(fpath, step=grid))
+            rels.append(grid_rel)
+            out += f"\nGrid-annotated copy (read tap coordinates off this one): {grid_rel}"
+        except Exception as e:
+            out += f"\n(grid overlay failed: {e})"
+    return {"stdout": out, "files": rels}
 
 
 # --------------------------------------------------------------------------
@@ -1463,7 +1513,7 @@ def _capture_via_engine(name, session_dir, duration_seconds, package_name,
         "'adb exec-out screencap -p' polling on an engine too old to support capture. Logcat is captured "
         "as '-b all -v epoch' (all buffers, epoch timestamps) and clears right before the window so the "
         "screenshots and logs cover the exact same interval. "
-        "Writes /workspace/screenshots/<session_name>/ (keyframe PNGs + metadata.json + logcat.txt) — "
+        "Writes screenshots/<session_name>/ (keyframe PNGs + metadata.json + logcat.txt) — "
         "call analyze_keyframes next for descriptions, then generate_test_report to assemble the report."
     ),
     params_schema={
@@ -1602,7 +1652,7 @@ def record_and_capture_keyframes(session_name, package_name=None, duration_secon
 # The recorder is NOT toggled by the agent: the omnidroid engine auto-starts a
 # continuous `capture --auto` the moment a dev instance finishes booting (see
 # _agent_ensure_autocap / OMNI_AUTOCAP_DIR), so screenshots are ALWAYS being
-# captured to /workspace/screenshots/auto/ whenever a dev emulator is up. It
+# captured to screenshots/auto/ whenever a dev emulator is up. It
 # drops a keyframe on EVERY big on-screen change (a spinner stays below
 # threshold; a black->loading flip is always caught), flushes metadata.json
 # live, and names files frame_<idx>_t<elapsed>ms_+<gap>ms_w<HHMMSS_mmm>.png so an
@@ -1620,8 +1670,8 @@ def _autocap_session_dir(session_name):
     name="read_auto_screenshots",
     description=(
         "Reads the ALWAYS-ON auto-screenshot feed for the running dev emulator. You do NOT start or stop "
-        "anything — whenever a dev instance is up (ensure_emulator_running(dev=True)), omnidroid is already "
-        "capturing a full-resolution PNG on every big on-screen change into /workspace/screenshots/auto/. "
+        "anything — whenever a dev instance is up (ensure_emulator_running(debug=True)), omnidroid is already "
+        "capturing a full-resolution PNG on every big on-screen change into screenshots/auto/. "
         "This returns whether the recorder is currently running plus a per-keyframe list (index, elapsed "
         "t_ms, gap +delta_ms since the previous kept frame, changed%, black-screen flag, reason, saved "
         "filename), so you can see what has rendered so far while frames keep accumulating. A spinner stays "
@@ -1650,8 +1700,8 @@ def read_auto_screenshots(session_name=None, since_index=0):
         return {"error": str(e)}
     meta_path = os.path.join(session_dir, "metadata.json")
     if not os.path.isfile(meta_path):
-        return {"error": (f"No auto-screenshot feed at /workspace/screenshots/{session_name}/ yet. "
-                          f"Make sure a DEV emulator is running (ensure_emulator_running(dev=True)); "
+        return {"error": (f"No auto-screenshot feed at screenshots/{session_name}/ yet. "
+                          f"Make sure a DEV emulator is running (ensure_emulator_running(debug=True)); "
                           f"the recorder auto-starts on a dev boot.")}
     try:
         with open(meta_path, encoding="utf-8") as f:
@@ -1751,7 +1801,7 @@ def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt
         "Assembles a Markdown test report from a recorded session: every keyframe (with its image "
         "link, timestamp, diff score, black-screen flag, and vision description if analyze_keyframes "
         "was run) plus the last 400 lines of logcat captured during that same session window. Written "
-        "to /workspace/test_reports/<session_name>.md — this is the file the TEXT-ONLY primary agent "
+        "to test_reports/<session_name>.md — this is the file the TEXT-ONLY primary agent "
         "loop reads (via read_file_chunk) to decide what to fix, since it can't view the images "
         "itself; the vision descriptions inside the report are its window into what actually happened "
         "on screen."
@@ -1761,7 +1811,7 @@ def analyze_keyframes(session_name, backend="auto", ollama_model="llava", prompt
         "package_name": "string (optional, included in the report header for context)",
         "apk_path": "string (optional, included in the report header for context)"
     },
-    output="Confirmation of the report path written, e.g. 'Report written to /workspace/test_reports/<session_name>.md'.",
+    output="Confirmation of the report path written, e.g. 'Report written to test_reports/<session_name>.md'.",
     when_to_use="Call this last, after record_and_capture_keyframes (and ideally analyze_keyframes). Then read_file_chunk the resulting .md to see what the test found and decide on fixes."
 )
 def generate_test_report(session_name, package_name=None, apk_path=None):
@@ -1859,7 +1909,7 @@ def generate_test_report(session_name, package_name=None, apk_path=None):
     report_path = os.path.join(report_dir, f"{session_name}.md")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
-    return {"stdout": f"Report written to /workspace/test_reports/{session_name}.md"}
+    return {"stdout": f"Report written to test_reports/{session_name}.md"}
 
 
 # Packages allowed to exist on a "fresh" instance. The omnidroid kiosk is a
@@ -1931,7 +1981,7 @@ def _verify_fresh_instance(backend=_DEFAULT_BACKEND, device_name=None):
         "login_roblox_account + play_roblox) instead — never this."
     ),
     params_schema={
-        "apk_path": "string (path to the .apk to test, relative to /workspace)",
+        "apk_path": "string (path to the .apk to test, relative to the project root)",
         "package_name": "string (the app's package name, needed to launch it and label the report)",
         "activity": "string (optional, specific activity to launch; omit to use the default launcher activity)",
         "backend": "string (optional — omnidroid is the ONLY backend; any other value is coerced to it. No SDK emulator / AVD / LDPlayer)",
@@ -1947,7 +1997,7 @@ def _verify_fresh_instance(backend=_DEFAULT_BACKEND, device_name=None):
         "reset": "boolean (IGNORED — always coerced to true: a test session ALWAYS starts from a freshly recreated instance and verifies nothing is installed on it. Use the individual tools (ensure_emulator_running reset=false + install/launch) when you deliberately want to reuse a provisioned instance for fast iteration)",
         "boot_timeout": "integer (optional, default 300 seconds)",
         "abi": "string (optional, qemu backend — force the install ABI. Default exercises the intended path per account arch (x86 -> arm64-v8a translation, arm -> native). 'x86_64' on an x86 account deliberately trips the ABI-contract guard and FAILS the session.)",
-        "dev": "boolean (optional, default false — run the session on the DEV base (base_arm + the vdc devkit disk: android-arm64 frida-server + Magisk + omni tools) instead of a production base. Also enablable via OMNI_USE_DEV_BASE. Use when the APK under test has frida/root detection and you need runtime hooking; call ensure_frida_server + hide_root_from_app between steps via the individual tools for full control.)"
+        "debug": "boolean (optional, default false — DEBUG boot: attach the devkit disk (vdc: native frida-server + omni-* tools) to the same dual-use production image. Also enablable via OMNI_DEBUG_BOOT. Use when the APK under test has frida/root detection and you need runtime hooking; call ensure_frida_server + hide_root_from_app between steps via the individual tools for full control.)"
     },
     output="A summary of each pipeline stage plus the path to the generated Markdown report — read that report with read_file_chunk for the full picture (keyframe descriptions + logcat). If the ABI-safe install fails/violates the contract, or the fresh-instance guarantee cannot be verified after boot, the session ABORTS with a FAILED summary and no pass is emitted.",
     when_to_use="Use this as the default way to test a freshly built/signed APK end-to-end. Fall back to the individual tools (ensure_emulator_running, install_apk_on_emulator, etc.) if you need to interleave manual adb_shell actions between steps, or re-run just one stage."
@@ -1956,7 +2006,7 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
                           system_image=_DEFAULT_SYSTEM_IMAGE, device_profile="pixel_5",
                           duration_seconds=20, vision_backend="auto", ollama_model="llava",
                           reset=True, boot_timeout=300, ram_mb=None, cpus=None, mode=_DEFAULT_QEMU_MODE,
-                          abi=None, require_translation=True, dev=None):
+                          abi=None, require_translation=True, debug=None):
     session_name = f"{package_name.replace('.', '_')}_{int(time.time())}"
     log = []
 
@@ -1972,7 +2022,7 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     boot_res = ensure_emulator_running(
         backend=backend, device_name=device_name, system_image=system_image,
         device_profile=device_profile, reset=reset, boot_timeout=boot_timeout,
-        ram_mb=ram_mb, cpus=cpus, mode=mode, dev=dev,
+        ram_mb=ram_mb, cpus=cpus, mode=mode, debug=debug,
     )
     log.append("[ensure_emulator_running]\n" + (boot_res.get("stdout") or boot_res.get("error") or ""))
     if "BOOT_OK" not in (boot_res.get("stdout") or ""):
@@ -2012,7 +2062,7 @@ def run_apk_test_session(apk_path, package_name, activity=None, backend=_DEFAULT
     report_res = generate_test_report(session_name, package_name=package_name, apk_path=apk_path)
     log.append("[generate_test_report]\n" + (report_res.get("stdout") or report_res.get("error") or ""))
 
-    report_path = f"/workspace/test_reports/{session_name}.md"
+    report_path = f"test_reports/{session_name}.md"
     # Surface the capture VERDICT in the one-shot summary too, so the model sees
     # crash/exit/black up front without having to open the report first.
     verdict_line = ""
@@ -2074,7 +2124,7 @@ def stop_emulator(backend=_DEFAULT_BACKEND, device_name=None, purge=False):
 # DEV BASE runtime helpers: frida + root/frida/Magisk hiding. The dev base is
 # base_arm + the vdc devkit disk (base_arm_devkit.qcow2); root is Magisk (`su`)
 # from a patched boot. These only work on an account booted from the dev base
-# (ensure_emulator_running dev=true / OMNI_USE_DEV_BASE) whose boot is rooted. On
+# (ensure_emulator_running debug=true / OMNI_DEBUG_BOOT) whose boot is rooted. On
 # a production or un-rooted account they return a clear, specific error.
 # --------------------------------------------------------------------------
 
@@ -2182,24 +2232,23 @@ def _adb_root(adb, serial):
     under this name for the frida_tools import."""
     if not _su_available(adb, serial):
         return ("no Magisk root (su unavailable) — the dev boot is not patched; "
-                "run `omni build-dev-base --patch-boot`")
+                "run `omni root-base`")
     _ensure_devkit_activated(adb, serial)
     return "Magisk root OK; devkit activated"
 
 
 def _not_dev_base_error(adb, serial, tool):
-    """Precise error for a frida/hide call on a non-usable account: distinguish
-    'not a dev account' from 'dev account but not rooted (boot not patched)'."""
+    """Precise error for a frida/hide call that can't run: distinguish 'not a
+    debug boot' (no devkit disk) from 'devkit attached but not rooted'."""
     if _is_dev_account(adb, serial):
         return {"error": (
-            f"This is a DEV account (the vdc devkit disk is attached) but it is "
-            f"NOT ROOTED — Magisk `su` is unavailable, so {tool} cannot run. The "
-            f"dev system boot is not Magisk-patched. Root it once with: "
-            f"`omni build-dev-base --patch-boot` (then recreate the account).")}
+            f"The devkit disk (vdc) is attached but the base is NOT ROOTED — "
+            f"Magisk `su` is unavailable, so {tool} cannot run. Root the shipped "
+            f"base once with: `omni root-base` (then reboot the instance).")}
     return {"error": (
-        f"This account is not a DEV base (no devkit disk / manifest). Boot it with "
-        f"ensure_emulator_running(dev=true) (or set OMNI_USE_DEV_BASE=1), and make "
-        f"sure `omni build-dev-base` has produced base_arm_devkit.qcow2.")}
+        f"This is not a DEBUG boot (no devkit disk / manifest). Reboot with "
+        f"ensure_emulator_running(debug=true) (or set OMNI_DEBUG_BOOT=1); if the "
+        f"devkit disk is missing, build it with `omni build-devkit`.")}
 
 
 @registry.register(
@@ -2207,7 +2256,7 @@ def _not_dev_base_error(adb, serial, tool):
     description=(
         "Starts the frida-server from the DEV-BASE devkit disk and sets up a host->guest port forward so "
         "you can attach with the host frida tools. Only works on an account booted from the dev base "
-        "(ensure_emulator_running dev=true, or OMNI_USE_DEV_BASE=1) whose boot is Magisk-rooted. It uses "
+        "(ensure_emulator_running debug=true, or OMNI_DEBUG_BOOT=1) whose boot is Magisk-rooted. It uses "
         "Magisk `su` (the arm base is a 'user' build — `adb root` is unavailable), launches the hidden "
         "launcher `omni-fridad` (android-arm64 frida-server on a CUSTOM loopback port with a randomized "
         "process name — not the well-known 27042/'frida-server', so a naive port/name scan misses it), "
@@ -2216,11 +2265,11 @@ def _not_dev_base_error(adb, serial, tool):
         "required). Idempotent: re-running reuses the running server."
     ),
     params_schema={
-        "device_name": "string (optional — the omnidroid dev account name; must match the one ensure_emulator_running(dev=true) created, default 'omniagent')",
+        "device_name": "string (optional — the omnidroid dev account name; must match the one ensure_emulator_running(debug=true) created, default 'omniagent')",
         "backend": "string (optional, default 'qemu' — omnidroid only)"
     },
-    output="The host frida endpoint ('127.0.0.1:<host_port>') plus the guest port and server status, or an error if the account isn't a dev base / isn't rooted (build the dev base + `--patch-boot` with `omni build-dev-base`).",
-    when_to_use="Call after ensure_emulator_running(dev=true) + BOOT_OK, before attaching frida/objection to hook the app under test. Pair with hide_root_from_app to also hide root/frida from the target's detection."
+    output="The host frida endpoint ('127.0.0.1:<host_port>') plus the guest port and server status, or an error if the account is not a debug boot / is not rooted (attach it with debug=true; root the base with `omni root-base`).",
+    when_to_use="Call after ensure_emulator_running(debug=true) + BOOT_OK, before attaching frida/objection to hook the app under test. Pair with hide_root_from_app to also hide root/frida from the target's detection."
 )
 def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
     adb, serial_or_err = _resolve_serial(backend, device_name)
@@ -2269,7 +2318,7 @@ def ensure_frida_server(device_name=None, backend=_DEFAULT_BACKEND):
         "backend": "string (optional, default 'qemu' — omnidroid only)"
     },
     output="What omni-hide actually applied (resetprop keys set, Magisk DenyList result, frida sanity), or an error if the account isn't a dev base / isn't rooted.",
-    when_to_use="Use when the APK under test has root/frida detection: call ensure_emulator_running(dev=true) -> ensure_frida_server -> hide_root_from_app('<pkg>') -> install/launch, then hook with frida."
+    when_to_use="Use when the APK under test has root/frida detection: call ensure_emulator_running(debug=true) -> ensure_frida_server -> hide_root_from_app('<pkg>') -> install/launch, then hook with frida."
 )
 def hide_root_from_app(package_name=None, device_name=None, backend=_DEFAULT_BACKEND):
     adb, serial_or_err = _resolve_serial(backend, device_name)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Code knowledge-graph indexer (runs INSIDE the Docker sandbox).
+"""Code knowledge-graph indexer (runs as a standalone script on the host).
 
 Usage:
     python3 _kg_indexer.py <root_dir> <include_so:0|1> <force:0|1> [graph_id]
@@ -14,11 +14,11 @@ Walks <root_dir> for *.smali files and builds a compact, queryable graph:
 
 NAMED GRAPHS
 ------------
-Every build lands in its own namespace under /workspace/.codegraph/<graph_id>/,
+Every build lands in its own namespace in the project folder/.codegraph/<graph_id>/,
 so several graphs can coexist without mixing — e.g. two versions of the same app
 indexed separately for a diff. `graph_id` defaults (in the host wrapper) to a slug
 of <root_dir>, so indexing `roblox_v1` and `roblox_v2` naturally yields two graphs.
-A tiny /workspace/.codegraph/graphs.json index lists every built graph.
+A tiny .codegraph/graphs.json index lists every built graph.
 
 Each namespace holds SMALL CHUNKED JSON files (no single 100MB monolith):
 
@@ -40,10 +40,10 @@ import json
 import time
 import subprocess
 
-# Base workspace path. Overridable via env ONLY so the indexer/query pair can be
-# unit-tested against a temp dir on the host; inside the sandbox it stays
-# /workspace (the env var is never set there).
-WORKSPACE = os.environ.get("CODEGRAPH_WORKSPACE", "/workspace")
+# Base project path. Commands run with the project folder as their working
+# directory, so cwd is the right default; the env var is for the in-process
+# build, which runs from somewhere else, and for unit tests against a temp dir.
+WORKSPACE = os.path.abspath(os.environ.get("CODEGRAPH_WORKSPACE") or os.getcwd())
 GRAPH_ROOT = os.path.join(WORKSPACE, ".codegraph")
 GRAPH_INDEX_PATH = os.path.join(GRAPH_ROOT, "graphs.json")
 
@@ -69,8 +69,8 @@ def _fs_path(path):
     com/google/... packages) routinely blow past MAX_PATH; unless the host has
     long-path support turned on, os.walk/open then fail and the whole build
     dies. Prefixing an absolute path with the extended-length marker (\\?\)
-    lifts that limit regardless of the OS setting. No-op on POSIX (the Docker
-    sandbox) and for paths that are already prefixed."""
+    lifts that limit regardless of the OS setting. No-op on POSIX and for paths
+    that are already prefixed."""
     if os.name != "nt" or not path:
         return path
     if path.startswith("\\\\?\\"):
@@ -94,7 +94,7 @@ def _strip_ext_prefix(p):
 
 def strip_workspace(path):
     # Normalize to forward slashes so descriptors/shard keys are separator-stable
-    # regardless of host OS (the sandbox is Linux; host unit tests run on Windows).
+    # regardless of host OS.
     # Also drop any extended-length prefix so a \\?\-walked path still matches
     # the (unprefixed) WORKSPACE root.
     path = _strip_ext_prefix(path.replace("\\", "/"))
@@ -106,7 +106,10 @@ def strip_workspace(path):
         return "."
     prefix = base + "/"
     if path.startswith(prefix):
-        return path[len(prefix):]
+        # lstrip: the workspace root reaches us as an absolute path that may
+        # carry a redundant separator (root + "/" + "/app"), and a
+        # leading slash on a stored descriptor would make it read as absolute.
+        return path[len(prefix):].lstrip("/")
     return path
 
 

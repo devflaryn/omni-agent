@@ -3,9 +3,9 @@
 Every other tool wraps a specific command. `run_command` is the catch-all for
 the cases none of them cover: running a build (gradle, npm, make), a package
 manager, a one-off python/awk/sed pipeline, a custom analysis script, or any CLI
-that happens to be installed in the sandbox image. It runs INSIDE the same Linux
-Docker sandbox as the rest of the tools, with the working directory at
-`/workspace`, so relative paths line up with what the file tools see.
+that happens to be installed on the machine. It runs on the host, the same place
+as the rest of the tools, with the project folder as the working directory, so
+relative paths line up with what the file tools see.
 
 Prefer a purpose-built tool when one exists (they give cleaner, paginated,
 context-friendly output and steer you correctly) — reach for this only when
@@ -13,7 +13,7 @@ nothing else fits.
 """
 import re as _re
 from tool_registry import registry
-from docker_sandbox import run_cmd
+from host_exec import run_cmd
 
 
 # The agent bypassed the decode tools by shelling out — this is how the four
@@ -40,12 +40,14 @@ def _decode_bypass(command):
 @registry.register(
     name="run_command",
     description=(
-        "Runs an ARBITRARY shell command inside the Linux Docker sandbox and returns its stdout/stderr and "
+        "Runs an ARBITRARY shell command ON THE HOST MACHINE and returns its stdout/stderr and "
         "exit code. This is the general-purpose escape hatch for anything the specific tools don't cover: "
         "running a build (gradle/npm/make/python), a package manager, chained pipelines, or a custom analysis "
-        "script. The command runs with `sh -c`; the working directory is `/workspace`, so relative paths match "
-        "the other tools (write files under /workspace to keep them). It is non-interactive — commands that "
-        "wait for input will hang until the timeout. "
+        "script. The command runs in a POSIX shell with the PROJECT FOLDER as the working directory, so relative "
+        "paths match the other tools. It is non-interactive — commands that wait for input will hang until the "
+        "timeout. The GNU userland (coreutils/sed/grep/findutils/gawk) is first on PATH, so GNU-style flags "
+        "work. This is a REAL machine, not a disposable container — changes outside the project folder affect "
+        "the user's actual system, so stay inside it. "
         "IMPORTANT: prefer a purpose-built tool when one exists (grep_directory, read_file_chunk, recompile_apk, "
         "extract_strings, etc.) — they return cleaner, paginated, context-friendly output and guide you toward "
         "the right workflow. Use run_command only when nothing else fits."
@@ -68,5 +70,6 @@ def run_command(command, timeout_seconds=120):
         timeout_seconds = max(1, min(int(timeout_seconds), 600))
     except (TypeError, ValueError):
         timeout_seconds = 120
-    # Run from /workspace so relative paths line up with every other tool.
-    return run_cmd(f"cd /workspace && {command}", timeout=timeout_seconds)
+    # run_cmd already starts in the project folder, so the command needs no
+    # prologue — relative paths line up with every other tool by construction.
+    return run_cmd(command, timeout=timeout_seconds)

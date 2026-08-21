@@ -8,6 +8,7 @@ const chat = $('chat');
 let session = null;        // {project}
 let autoScroll = true;
 let replaying = false;     // true while a saved transcript is being replayed
+let replayTs = null;       // wall-clock ms of the event being replayed (for real elapsed)
 
 // ---------- small utilities ----------
 function escapeHtml(s) {
@@ -34,13 +35,28 @@ function nearBottom() {
 // Coalesce scroll requests to one real scroll per animation frame. Events can
 // arrive far faster than the display refreshes, and every `scrollTop =
 // scrollHeight` forces a synchronous layout of the whole transcript.
+// True while the user has an active (non-collapsed) text selection inside the
+// transcript. Streaming auto-scroll must stand down for the duration, or a
+// drag-select gets yanked out from under the cursor on the next event. Written
+// defensively: the test DOM shim has neither getSelection nor Node.contains.
+function hasChatSelection() {
+  try {
+    const sel = typeof window.getSelection === 'function' ? window.getSelection() : null;
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    if (typeof chat.contains !== 'function') return false;
+    return chat.contains(sel.getRangeAt(0).commonAncestorContainer);
+  } catch {
+    return false;
+  }
+}
+
 let scrollQueued = false;
 function scrollDown() {
-  if (!autoScroll || replaying || scrollQueued) return;
+  if (!autoScroll || replaying || scrollQueued || hasChatSelection()) return;
   scrollQueued = true;
   requestAnimationFrame(() => {
     scrollQueued = false;
-    if (autoScroll) chat.scrollTop = chat.scrollHeight;
+    if (autoScroll && !hasChatSelection()) chat.scrollTop = chat.scrollHeight;
   });
 }
 
@@ -94,6 +110,27 @@ const INPUT_MAX_H = 260;
 // to dark) in sync with the <html class="light"> flag.
 const _THEME_SUN = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>';
 const _THEME_MOON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+// ---------- sidebar collapse ----------
+// The file tree is a fixed --sidebar-w column. On a narrow window that column is
+// most of the usable width, so it can be folded away entirely; the chat reclaims
+// the space and a matching expand button appears in the header. Persisted so the
+// choice survives a reload.
+const SIDEBAR_KEY = 'omni-sidebar-collapsed';
+
+function setSidebarCollapsed(collapsed) {
+  $('app').classList.toggle('sidebar-collapsed', collapsed);
+  try { localStorage.setItem(SIDEBAR_KEY, collapsed ? '1' : '0'); } catch (e) { /* private mode */ }
+  // The graph canvases size themselves to their container, so a width change
+  // has to be announced or the 3D view keeps rendering at the old width.
+  resizeGraph3D();
+}
+
+function applySidebarState() {
+  let collapsed = false;
+  try { collapsed = localStorage.getItem(SIDEBAR_KEY) === '1'; } catch (e) { /* private mode */ }
+  $('app').classList.toggle('sidebar-collapsed', collapsed);
+}
+
 function applyThemeIcons() {
   const light = document.documentElement.classList.contains('light');
   const icon = light ? _THEME_MOON : _THEME_SUN;
@@ -116,6 +153,77 @@ function autoGrowInput() {
 function resetInputHeight() {
   const ta = $('input');
   if (ta) { ta.style.height = 'auto'; ta.style.overflowY = 'hidden'; }
+}
+
+// ---------- loading states ----------
+// Every async surface in this app used to jump straight from empty to
+// populated, so a slow bridge call was indistinguishable from an empty result.
+// These fill the gap. aria-busy is set alongside the visual state so the
+// condition is announced rather than only drawn.
+function showSkeleton(el, rows = 5) {
+  if (!el) return;
+  el.setAttribute('aria-busy', 'true');
+  el.innerHTML = Array.from({ length: rows },
+    () => '<div class="skeleton skeleton-row"></div>').join('');
+}
+
+// Paired with showSkeleton. Renderers overwrite the placeholder markup on their
+// own, so this only has to clear the flag — but it must ALWAYS run, including
+// on the error path, or the surface stays marked busy forever.
+function clearSkeleton(el) {
+  if (el) el.removeAttribute('aria-busy');
+}
+
+function setBusy(btn, busy) {
+  if (!btn) return;
+  btn.classList.toggle('is-busy', !!busy);
+  if (busy) btn.setAttribute('aria-busy', 'true');
+  else btn.removeAttribute('aria-busy');
+}
+
+// ---------- modal shell ----------
+// Both modals used to be opened by toggling a class alone. Consequences:
+// keyboard focus stayed on the page underneath, Tab walked straight out of the
+// dialog into the app behind it, Esc closed only the file viewer, and on close
+// focus was dropped to <body> instead of returning to whatever opened it.
+let _modalOpener = null;
+
+function _focusables(el) {
+  return Array.from(el.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  )).filter(n => !n.disabled && !n.closest('.hidden'));
+}
+
+function _trapKeydown(e) {
+  const el = e.currentTarget;
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(el); return; }
+  if (e.key !== 'Tab') return;
+  const f = _focusables(el);
+  if (!f.length) return;
+  const first = f[0], last = f[f.length - 1];
+  // Wrap at both ends so Tab cycles inside the dialog instead of escaping it.
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+function openModal(el) {
+  if (!el) return;
+  // Only record the opener on a genuine open — openFileViewer can be called
+  // again while the viewer is already up (drilling into an archive), and
+  // re-recording would trap the restore target inside the dialog itself.
+  if (el.classList.contains('hidden')) _modalOpener = document.activeElement || null;
+  el.classList.remove('hidden');
+  el.addEventListener('keydown', _trapKeydown);
+  const f = _focusables(el);
+  if (f.length && f[0].focus) f[0].focus();
+}
+
+function closeModal(el) {
+  if (!el) return;
+  el.classList.add('hidden');
+  el.removeEventListener('keydown', _trapKeydown);
+  if (_modalOpener && _modalOpener.focus) _modalOpener.focus();
+  _modalOpener = null;
 }
 
 // ---------- markdown ----------
@@ -171,11 +279,13 @@ function renderUserMessage(content) {
   currentGroup = null; // a new user turn starts a fresh set of action groups
   // A genuine new user turn starts the run clock for the Thinking… elapsed readout.
   // (Skip during transcript replay on reopen — those aren't a live run.)
-  if (!replaying) { runStartTs = performance.now(); sessionTokens = 0; }
+  // Only the clock restarts per turn — convoTokens is the size of the WHOLE
+  // conversation and must keep climbing across turns.
+  if (!replaying) runStartTs = performance.now();
   const el = document.createElement('div');
   el.className = 'py-1 user-row';
   el.innerHTML = `
-    <div class="msg-meta mb-0.5 text-[10px] text-term-muted"><span class="text-term-green">user</span> <span>${nowTime()}</span></div>
+    <div class="msg-meta mb-0.5 t-2xs text-term-muted"><span class="text-term-green">user</span> <span>${nowTime()}</span></div>
     <div class="user-bubble msg-fmt whitespace-pre-wrap text-term-text">${formatInline(content)}</div>`;
   appendRow(el);
 }
@@ -220,10 +330,13 @@ function spinTick() {
 let thinkingEl = null;     // the live "Thinking…" shimmer line, if any
 let currentGroup = null;   // the action group following the most recent thought
 
-// Live run telemetry surfaced on the Thinking… line: "Thinking… 214k tokens 31m 5s".
-// sessionTokens = current context size in tokens (from 'status' events); runStartTs
-// = wall-clock origin of the current run (set on each user message).
-let sessionTokens = 0;
+// Live run telemetry surfaced on the Thinking… line: "Thinking… (31m 5s · 214k tokens)".
+// convoTokens = total size of the MAIN conversation in real provider-reported
+// tokens (from the 'status' event's convo_tokens). It counts every main-thread
+// message ever sent — including ones auto-summarization later discarded — so it
+// only ever climbs. Subagent spend is deliberately excluded. runStartTs = the
+// wall-clock origin of the current run, reset on each user message.
+let convoTokens = 0;
 let runStartTs = null;
 let _thinkTicker = null;
 
@@ -232,26 +345,31 @@ function resetActivityState() {
   if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
   thinkingEl = null;
   currentGroup = null;
-  sessionTokens = 0;
+  convoTokens = 0;
   runStartTs = null;
   resetConcurrencyDock();
 }
 
-// Fill the tokens/elapsed suffix on the live Thinking… line.
+// Fill the elapsed/tokens suffix on the live Thinking… line, rendered as
+// "(1h 55m 4s · 56k tokens)" — elapsed first, joined by a deliberately small
+// middot. With only one value available the parens hold just that value; with
+// neither, nothing is rendered (no empty parens).
 function _updateThinkingMeta() {
   if (!thinkingEl) return;
   const meta = thinkingEl.querySelector('.think-meta');
   if (!meta) return;
   const parts = [];
-  if (sessionTokens > 0) parts.push(`${window.formatTokens(sessionTokens)} tokens`);
-  if (runStartTs != null) parts.push(window.formatClock(performance.now() - runStartTs));
-  meta.textContent = parts.length ? '  ' + parts.join('  ') : '';
+  if (runStartTs != null) parts.push(escapeHtml(window.formatClock(performance.now() - runStartTs)));
+  if (convoTokens > 0) parts.push(escapeHtml(`${window.formatTokens(convoTokens)} tokens`));
+  meta.innerHTML = parts.length
+    ? ` (${parts.join('<span class="think-dot">·</span>')})`
+    : '';
 }
 
 function startThinking() {
   if (thinkingEl) { _updateThinkingMeta(); return; } // JSON-retry leg: reuse the existing line
   const el = document.createElement('div');
-  el.className = 'py-0.5 font-mono text-[12px] leading-5';
+  el.className = 'py-0.5 font-mono t-sm leading-5';
   el.innerHTML = `<span class="braille-spin text-term-cyan">${SPIN_FRAMES[spinFrame]}</span> ` +
     `<span class="shimmer">Thinking…</span><span class="think-meta text-term-muted"></span>`;
   appendRow(el);
@@ -284,39 +402,285 @@ function finishThinking(ev) {
   scrollDown();
 }
 
-// Which tools count as "reading a file" vs "changing a file" for the group's
-// summary title ("Ran N tools · read N files · changed N files"). Files are
-// deduped by path, so touching the same file twice still counts once.
-const READ_FILE_TOOLS = new Set([
-  'read_file_chunk', 'read_binary_range', 'tail_file', 'grep_file', 'read_archive_member',
-]);
-const CHANGE_FILE_TOOLS = new Set([
-  'write_file', 'replace_in_file', 'delete_path', 'move_file', 'duplicate_file',
-  'patch_smali_method', 'insert_smali_code', 'assemble_dex',
-  'patch_binary_string', 'binary_patch', 'nop_function', 'patch_function_return',
-  'patch_at_offset_with_bytes', 'patch_bytes_at_offset',
-  'replace_file_in_apk', 'recompile_apk', 'sign_apk',
-  'assemble_and_patch', 'compile_c_and_patch',
+// ---------- tool metadata: display names + summary categories ----------
+// One entry per registered tool: the human-facing name shown on an action row,
+// and which of the six summary buckets it counts toward. Kept in sync with the
+// Python registry by tests/test_tool_meta_coverage.py, which fails if a
+// registered tool has no entry here.
+const TOOL_META = {
+  // read: reads content out of the workspace — counted by distinct path
+  read_file_chunk:         { name: 'Read File', cat: 'read' },
+  read_binary_range:       { name: 'Read Binary Range', cat: 'read' },
+  tail_file:               { name: 'Tail File', cat: 'read' },
+  read_skill_resource:     { name: 'Read Skill Resource', cat: 'read' },
+  read_auto_screenshots:   { name: 'Read Screenshots', cat: 'read' },
+  use_skill:               { name: 'Use Skill', cat: 'read' },
+  extract_manifest_info:   { name: 'Read Manifest', cat: 'read' },
+  extract_strings:         { name: 'Extract Strings', cat: 'read' },
+  analyze_image:           { name: 'Analyze Image', cat: 'read' },
+  analyze_keyframes:       { name: 'Analyze Keyframes', cat: 'read' },
+  ghidra_decompile:        { name: 'Decompile (Ghidra)', cat: 'read' },
+  jadx_decompile:          { name: 'Decompile (JADX)', cat: 'read' },
+  decode_apk:              { name: 'Decode APK', cat: 'read' },
+  unzip_apk:               { name: 'Unzip APK', cat: 'read' },
+  disassemble_dex:         { name: 'Disassemble DEX', cat: 'read' },
+  disassemble_range:       { name: 'Disassemble Range', cat: 'read' },
+  llvm_objdump_disasm:     { name: 'Disassemble (objdump)', cat: 'read' },
+  readelf_info:            { name: 'Read ELF Info', cat: 'read' },
+  nm_symbols:              { name: 'Read Symbol Table', cat: 'read' },
+  rabin2_info:             { name: 'Read Binary Info', cat: 'read' },
+  inspect_apk:             { name: 'Inspect APK', cat: 'read' },
+  list_dex_classes:        { name: 'List DEX Classes', cat: 'read' },
+  analyze_function_calls:  { name: 'Analyze Function Calls', cat: 'read' },
+  get_apk_signature_hash:  { name: 'Read APK Signature', cat: 'read' },
+  verify_apk:              { name: 'Verify APK', cat: 'read' },
+  verify_hooks_applied:    { name: 'Verify Hooks Applied', cat: 'read' },
+  compute_sha256:          { name: 'Compute SHA-256', cat: 'read' },
+  compare_files_sha256:    { name: 'Compare File Hashes', cat: 'read' },
+  diff_binary_files:       { name: 'Diff Binaries', cat: 'read' },
+  compare_directories:     { name: 'Compare Directories', cat: 'read' },
+  generate_test_report:    { name: 'Generate Test Report', cat: 'read' },
+  get_logcat:              { name: 'Read Logcat', cat: 'run' },
+  monitor_logcat:          { name: 'Monitor Logcat', cat: 'run' },
+  read_archive_member:     { name: 'Read Archive Member', cat: 'read' },
+
+  // change: writes or mutates files — counted by distinct path
+  write_file:                  { name: 'Write File', cat: 'change' },
+  append_to_file:              { name: 'Append To File', cat: 'change' },
+  replace_in_file:             { name: 'Edit File', cat: 'change' },
+  delete_path:                 { name: 'Delete Path', cat: 'change' },
+  move_file:                   { name: 'Move File', cat: 'change' },
+  duplicate_file:              { name: 'Duplicate File', cat: 'change' },
+  patch_smali_method:          { name: 'Patch Smali Method', cat: 'change' },
+  insert_smali_code:           { name: 'Insert Smali Code', cat: 'change' },
+  assemble_dex:                { name: 'Assemble DEX', cat: 'change' },
+  patch_binary_string:         { name: 'Patch Binary String', cat: 'change' },
+  binary_patch:                { name: 'Patch Binary', cat: 'change' },
+  nop_function:                { name: 'NOP Function', cat: 'change' },
+  patch_function_return:       { name: 'Patch Function Return', cat: 'change' },
+  patch_at_offset_with_bytes:  { name: 'Patch At Offset', cat: 'change' },
+  patch_bytes_at_offset:       { name: 'Patch Bytes At Offset', cat: 'change' },
+  replace_file_in_apk:         { name: 'Replace File In APK', cat: 'change' },
+  recompile_apk:               { name: 'Recompile APK', cat: 'change' },
+  sign_apk:                    { name: 'Sign APK', cat: 'change' },
+  assemble_and_patch:          { name: 'Assemble & Patch', cat: 'change' },
+  compile_c_and_patch:         { name: 'Compile C & Patch', cat: 'change' },
+  inject_session_bootstrap:    { name: 'Inject Session Bootstrap', cat: 'change' },
+  hide_root_from_app:          { name: 'Hide Root From App', cat: 'run' },
+  find_code_cave:              { name: 'Find Code Cave', cat: 'change' },
+
+  // search: locating / querying — counted by call
+  list_directory:            { name: 'List Directory', cat: 'search' },
+  find_files:                { name: 'Find Files', cat: 'search' },
+  grep_file:                 { name: 'Search In File', cat: 'search' },
+  grep_directory:            { name: 'Search In Directory', cat: 'search' },
+  search_java:               { name: 'Search Java', cat: 'search' },
+  search_smali:              { name: 'Search Smali', cat: 'search' },
+  query_code_graph:          { name: 'Query Code Graph', cat: 'search' },
+  ask_codebase:              { name: 'Ask The Codebase', cat: 'search' },
+  build_code_graph:          { name: 'Build Code Graph', cat: 'search' },
+  diff_code_graphs:          { name: 'Diff Code Graphs', cat: 'search' },
+  list_code_graphs:          { name: 'List Code Graphs', cat: 'search' },
+  list_skills:               { name: 'List Skills', cat: 'search' },
+  list_commands:             { name: 'List Commands', cat: 'search' },
+  web_search:                { name: 'Search The Web', cat: 'search' },
+  read_webpage:              { name: 'Read Webpage', cat: 'search' },
+  download_file:             { name: 'Download File', cat: 'search' },
+  find_byte_sequence_in_so:  { name: 'Find Byte Sequence', cat: 'search' },
+  frida_list_processes:      { name: 'List Processes', cat: 'search' },
+  list_roblox_accounts:      { name: 'List Roblox Accounts', cat: 'search' },
+  expand_tools:              { name: 'Expand Tools', cat: 'search' },
+
+  // run: executes something — counted by call
+  run_command:                   { name: 'Run Command', cat: 'run' },
+  use_command:                   { name: 'Use Command', cat: 'run' },
+  adb_shell:                     { name: 'ADB Shell', cat: 'run' },
+  radare2_cmd:                   { name: 'Radare2 Command', cat: 'run' },
+  frida_run_script:              { name: 'Run Frida Script', cat: 'run' },
+  frida_trace:                   { name: 'Frida Trace', cat: 'run' },
+  frida_bypass_ssl_pinning:      { name: 'Bypass SSL Pinning', cat: 'run' },
+  ensure_frida_server:           { name: 'Start Frida Server', cat: 'run' },
+  ensure_emulator_running:       { name: 'Start Emulator', cat: 'run' },
+  install_apk_on_emulator:       { name: 'Install APK', cat: 'run' },
+  launch_app_on_emulator:        { name: 'Launch App', cat: 'run' },
+  stop_emulator:                 { name: 'Stop Emulator', cat: 'run' },
+  run_apk_test_session:          { name: 'Run APK Test Session', cat: 'run' },
+  record_and_capture_keyframes:  { name: 'Record Keyframes', cat: 'run' },
+  take_emulator_screenshot:      { name: 'Take Screenshot', cat: 'run' },
+  observe_screen:                { name: 'Observe Screen', cat: 'run' },
+  tap_element:                   { name: 'Tap Element', cat: 'run' },
+  tap_screen:                    { name: 'Tap Screen', cat: 'run' },
+  swipe_screen:                  { name: 'Swipe Screen', cat: 'run' },
+  press_key:                     { name: 'Press Key', cat: 'run' },
+  type_text:                     { name: 'Type Text', cat: 'run' },
+  set_emulator_ui:               { name: 'Set Emulator UI', cat: 'run' },
+  launch_roblox_build:           { name: 'Launch Roblox Build', cat: 'run' },
+  login_roblox_account:          { name: 'Log In Roblox Account', cat: 'run' },
+  set_roblox_account:            { name: 'Set Roblox Account', cat: 'run' },
+  play_roblox:                   { name: 'Play Roblox', cat: 'run' },
+
+  // delegate: fans work out to subagents
+  dispatch_agents:  { name: 'Dispatch Subagents', cat: 'delegate' },
+  run_workflow:     { name: 'Run Workflow', cat: 'delegate' },
+
+  // plan: plan / investigation / strategy bookkeeping — counted by call
+  plan_create:                  { name: 'Create Plan', cat: 'plan' },
+  plan_add_task:                { name: 'Add Plan Step', cat: 'plan' },
+  plan_add_tasks:               { name: 'Add Plan Steps', cat: 'plan' },
+  plan_update_task:             { name: 'Update Plan Step', cat: 'plan' },
+  plan_advance_phase:           { name: 'Advance Phase', cat: 'plan' },
+  plan_reorder:                 { name: 'Reorder Plan', cat: 'plan' },
+  plan_replan:                  { name: 'Replan', cat: 'plan' },
+  plan_set_next_action:         { name: 'Set Next Action', cat: 'plan' },
+  plan_set_outcome:             { name: 'Set Step Outcome', cat: 'plan' },
+  plan_view:                    { name: 'View Plan', cat: 'plan' },
+  investigation_view:           { name: 'View Investigation', cat: 'plan' },
+  record_assumption:            { name: 'Record Assumption', cat: 'plan' },
+  record_decision:              { name: 'Record Decision', cat: 'plan' },
+  record_failed_attempt:        { name: 'Record Failed Attempt', cat: 'plan' },
+  record_finding:               { name: 'Record Finding', cat: 'plan' },
+  record_hypothesis:            { name: 'Record Hypothesis', cat: 'plan' },
+  record_learned_technique:     { name: 'Record Learned Technique', cat: 'plan' },
+  record_open_question:         { name: 'Record Open Question', cat: 'plan' },
+  record_test_result:           { name: 'Record Test Result', cat: 'plan' },
+  update_assumption:            { name: 'Update Assumption', cat: 'plan' },
+  update_hypothesis:            { name: 'Update Hypothesis', cat: 'plan' },
+  declare_constraints:          { name: 'Declare Constraints', cat: 'plan' },
+  clear_technique_constraints:  { name: 'Clear Constraints', cat: 'plan' },
+  set_next_steps:               { name: 'Set Next Steps', cat: 'plan' },
+  ledger_add_component:         { name: 'Ledger: Add Component', cat: 'plan' },
+  ledger_set_component_status:  { name: 'Ledger: Set Component Status', cat: 'plan' },
+  ledger_record_artifact:       { name: 'Ledger: Record Artifact', cat: 'plan' },
+  ledger_record_patch:          { name: 'Ledger: Record Patch', cat: 'plan' },
+  ledger_record_verification:   { name: 'Ledger: Record Verification', cat: 'plan' },
+  ledger_status:                { name: 'Ledger: Status', cat: 'plan' },
+  strategy_set:                 { name: 'Set Strategy', cat: 'plan' },
+  strategy_update:              { name: 'Update Strategy', cat: 'plan' },
+  review_conclusion:            { name: 'Review Conclusion', cat: 'plan' },
+};
+
+// Acronyms that must stay upper-case when a tool falls through to the mechanical
+// fallback below (i.e. a tool added after this table was last regenerated).
+const _TOOL_ACRONYMS = new Set([
+  'apk', 'dex', 'elf', 'so', 'adb', 'url', 'id', 'ui', 'kg', 'js', 'nm', 'plt',
+  'ssl', 'os', 'io', 'api', 'cli', 'sdk', 'jvm', 'xml', 'json',
 ]);
 
-// The workspace path a tool operates on, used to dedupe file counts. Mirrors the
-// arg keys the backend tools actually use (filepath / file_path / so_path / …).
+// Human-facing name for a tool. Curated entries win; anything unmapped is
+// Title-Cased mechanically, so a newly added tool degrades to "Some New Tool"
+// instead of leaking `some_new_tool` into the transcript.
+function toolDisplayName(tool) {
+  const meta = TOOL_META[tool];
+  if (meta) return meta.name;
+  const raw = String(tool || '');
+  const words = raw.split('_').filter(Boolean).map(w =>
+    _TOOL_ACRONYMS.has(w.toLowerCase())
+      ? w.toUpperCase()
+      : w.charAt(0).toUpperCase() + w.slice(1));
+  return words.join(' ') || raw;
+}
+
+// Which of the six summary buckets a tool belongs to. Unmapped tools land in
+// 'other', which renders as a trailing "Ran N tools" so they never disappear
+// from the count.
+function toolCategory(tool) {
+  const meta = TOOL_META[tool];
+  return meta ? meta.cat : 'other';
+}
+
+// Derived views, kept because other call sites still read them.
+const READ_FILE_TOOLS = new Set(
+  Object.keys(TOOL_META).filter(t => TOOL_META[t].cat === 'read'));
+const CHANGE_FILE_TOOLS = new Set(
+  Object.keys(TOOL_META).filter(t => TOOL_META[t].cat === 'change'));
+
+// The identity a tool operates on, used to dedupe read/changed counts so that
+// touching the same target twice still counts once. Mirrors the arg names the
+// backend tools actually declare — kept honest by
+// tests/test_tool_meta_coverage.py, which fails if a read/change tool takes none
+// of these. Not every key is a filesystem path: a skill name or capture-session
+// name identifies the thing just as well for counting purposes.
+const _TOOL_PATH_ARGS = [
+  // workspace files
+  'filepath', 'file_path', 'path', 'destination', 'source', 'output', 'out_path', 'target',
+  // binaries / native
+  'binary_path', 'so_path', 'so_filename',
+  // dex / smali
+  'smali_file', 'smali_dir', 'dex_path', 'output_dex', 'decompiled_dir',
+  // apk
+  'apk_filename', 'apk_path', 'output_apk', 'manifest_path',
+  // media
+  'image_path', 'image_paths',
+  // comparisons name two operands; the first is a stable enough identity
+  'dir_a', 'file_a', 'file1', 'base_dir', 'output_dir',
+  // non-filesystem identities
+  'skill_name', 'resource_path', 'session_name',
+];
+
 function toolPathKey(args) {
   if (!args || typeof args !== 'object') return null;
-  return args.filepath || args.file_path || args.path || args.so_path || args.smali_file
-    || args.dex_path || args.apk_filename || args.apk_path || args.output_apk
-    || args.destination || args.source || args.output || args.out_path || args.target || null;
+  for (const k of _TOOL_PATH_ARGS) {
+    const v = args[k];
+    if (Array.isArray(v)) { if (v.length) return v.join(','); continue; }
+    if (v) return v;
+  }
+  return null;
 }
 
-// The count summary shown as the group's title. Pluralized, tools first.
+// Fresh per-group counters. read/change dedupe by workspace path, so touching
+// the same file twice still counts once; every other bucket counts calls.
+function newGroupCounts() {
+  return { read: new Set(), change: new Set(), run: 0, search: 0, delegate: 0, plan: 0, other: 0 };
+}
+
+// How many subagents one dispatch_agents call fanned out to. The arg is a list
+// of specs; anything unreadable counts as a single delegation.
+function dispatchedAgentCount(args) {
+  const specs = args && (args.agents || args.specs || args.tasks);
+  return (Array.isArray(specs) && specs.length) ? specs.length : 1;
+}
+
+// Record one tool call into a group's counters. `seq` disambiguates calls that
+// carry no path, so two pathless reads don't collapse into one.
+function countToolCall(counts, ev, seq) {
+  const cat = toolCategory(ev.tool);
+  if (cat === 'read' || cat === 'change') {
+    counts[cat].add(toolPathKey(ev.args) || `${ev.tool}#${seq}`);
+  } else if (cat === 'delegate') {
+    counts.delegate += dispatchedAgentCount(ev.args);
+  } else {
+    counts[cat] += 1;
+  }
+}
+
+// The group's summary title: categorized counts in a fixed order, joined by "·",
+// zero segments omitted. Replaces the old undifferentiated "Ran N tools".
+const _GROUP_SEGMENTS = [
+  ['read',     (n) => `Read ${n} ${n === 1 ? 'file' : 'files'}`],
+  ['change',   (n) => `Changed ${n} ${n === 1 ? 'file' : 'files'}`],
+  ['run',      (n) => `Ran ${n} ${n === 1 ? 'command' : 'commands'}`],
+  ['search',   (n) => `Searched ${n === 1 ? 'once' : n + ' times'}`],
+  ['delegate', (n) => `Delegated to ${n} ${n === 1 ? 'subagent' : 'subagents'}`],
+  ['plan',     (n) => `Planned ${n} ${n === 1 ? 'step' : 'steps'}`],
+  ['other',    (n) => `Ran ${n} ${n === 1 ? 'tool' : 'tools'}`],
+];
+
 function groupTitleText(g) {
-  const plur = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
-  const parts = [`Ran ${plur(g.n, 'tool')}`];
-  if (g.readFiles.size) parts.push(`read ${plur(g.readFiles.size, 'file')}`);
-  if (g.changedFiles.size) parts.push(`changed ${plur(g.changedFiles.size, 'file')}`);
+  const c = g.counts;
+  const parts = [];
+  for (const [key, fmt] of _GROUP_SEGMENTS) {
+    const n = (key === 'read' || key === 'change') ? c[key].size : c[key];
+    if (n > 0) parts.push(fmt(n));
+  }
+  if (!parts.length) return `Ran ${g.n} ${g.n === 1 ? 'tool' : 'tools'}`;
   return parts.join(' · ');
 }
-function updateGroupTitle(g) { g.titleEl.textContent = groupTitleText(g); }
+
+function updateGroupTitle(g) {
+  g.titleEl.textContent = groupTitleText(g);
+  // The raw total stays reachable without cluttering the line.
+  g.titleEl.title = `${g.n} ${g.n === 1 ? 'tool call' : 'tool calls'}`;
+}
 
 // Keep the newest tool calls visible: pin the group's scroll region to the
 // bottom (rows are appended there). rAF-batched so a burst of calls costs one
@@ -352,7 +716,11 @@ function completeGroup(g) {
     g.titleEl.addEventListener('animationend',
       () => g.titleEl.classList.remove('group-title-wave'), { once: true });
   }
-  g.metaEl.textContent = fmtElapsed(Date.now() - g.startTs);
+  // On replay the wall clock is meaningless (everything happens "now"); use the
+  // timestamp of the event that closed the group so the shown elapsed is the real
+  // historical duration, not ~0s.
+  const nowTs = (replaying && replayTs != null) ? replayTs : Date.now();
+  g.metaEl.textContent = fmtElapsed(nowTs - g.startTs);
   setGroupOpen(g, false);
 }
 
@@ -363,13 +731,13 @@ function startActionGroup() {
   // active); the body is a short, self-scrolling container so a long burst of
   // tool calls never fills the whole chat — newest calls sit at the bottom.
   el.innerHTML = `
-    <button type="button" class="group-head flex w-full items-center gap-2 rounded-lg px-1.5 py-0.5 text-left font-mono text-[12px] leading-5 hover:bg-term-line/30">
-      <span class="group-caret caret shrink-0 select-none text-[9px] leading-none text-term-muted">▶</span>
+    <button type="button" class="group-head flex w-full items-center gap-2 rounded-lg px-1.5 py-0.5 text-left font-mono t-sm leading-5 hover:bg-term-line/30">
+      <span class="group-caret caret shrink-0 select-none t-2xs leading-none text-term-muted">▶</span>
       <span class="group-title min-w-0 flex-1 truncate text-term-text"></span>
-      <span class="group-meta ml-auto shrink-0 text-[10.5px] tabular-nums text-term-muted"></span>
+      <span class="group-meta ml-auto shrink-0 t-2xs tabular-nums text-term-muted"></span>
     </button>
     <div class="group-body"><div class="group-body-clip"><div class="group-scroll">
-      <div class="group-list space-y-px py-0.5 pl-5 font-mono text-[12px] text-term-muted"></div>
+      <div class="group-list space-y-px py-0.5 pl-5 font-mono t-sm text-term-muted"></div>
     </div></div></div>`;
   const g = {
     el,
@@ -380,12 +748,20 @@ function startActionGroup() {
     scrollEl: el.querySelector('.group-scroll'),
     listEl: el.querySelector('.group-list'),
     caret: el.querySelector('.group-caret'),
-    n: 0, readFiles: new Set(), changedFiles: new Set(),
+    n: 0, counts: newGroupCounts(),
     liveId: null, liveEv: null, liveRow: null,
-    startTs: Date.now(), completed: false, open: true,
+    // On replay, anchor the group's clock to the event's real timestamp so its
+    // completed elapsed reflects history, not the instant of the rebuild.
+    startTs: (replaying && replayTs != null) ? replayTs : Date.now(),
+    completed: false, open: true,
   };
   g.titleEl.classList.add('shimmer'); // active → silver sweep until completed
-  g.head.addEventListener('click', () => setGroupOpen(g, !g.open));
+  // Finishing a drag-select over the summary line still fires a click; toggling
+  // the group there would collapse the very text the user just highlighted.
+  g.head.addEventListener('click', () => {
+    if (hasChatSelection()) return;
+    setGroupOpen(g, !g.open);
+  });
   currentGroup = g;
   updateGroupTitle(g);
   setGroupOpen(g, true); // auto-expanded while the group is the live one
@@ -401,7 +777,7 @@ function actionInner(ev, state) {
     interrupted: '<span class="text-term-muted">○</span>',
   }[state];
   const nameCls = state === 'warn' ? 'text-term-red' : 'text-term-text';
-  return `${icon} <span class="${nameCls}">${escapeHtml(ev.tool)}</span>` +
+  return `${icon} <span class="${nameCls}">${escapeHtml(toolDisplayName(ev.tool))}</span>` +
     ` <span class="text-term-muted">${escapeHtml(argSummary(ev.args))}</span>` +
     (state === 'warn' ? ' <span class="text-term-red">loop warning</span>' : '');
 }
@@ -418,9 +794,7 @@ function pushAction(ev, state) {
   g.listEl.appendChild(row);
   if (state === 'live') { registerSpinners(row); g.liveId = ev.id; g.liveEv = ev; g.liveRow = row; }
   g.n += 1;
-  const key = toolPathKey(ev.args) || `${ev.tool}#${g.n}`;
-  if (READ_FILE_TOOLS.has(ev.tool)) g.readFiles.add(key);
-  else if (CHANGE_FILE_TOOLS.has(ev.tool)) g.changedFiles.add(key);
+  countToolCall(g.counts, ev, g.n);
   updateGroupTitle(g);
   if (g.open) scrollGroupToBottom(g);
   return row;
@@ -483,21 +857,25 @@ function renderFinalAnswer(ev) {
   const el = document.createElement('div');
   el.className = 'py-1';
   el.innerHTML = `
-    <div class="mb-0.5 text-[10px] text-term-muted"><span class="text-term-magenta">answer</span> <span>${ev.time}</span> <span>${ev.steps} steps</span></div>
-    <div class="markdown text-term-text text-[13px] leading-6">${renderMarkdown(ev.content)}</div>`;
+    <div class="mb-0.5 t-2xs text-term-muted"><span class="text-term-magenta">answer</span> <span>${ev.time}</span> <span>${ev.steps} steps</span></div>
+    <div class="markdown text-term-text t-base leading-6">${renderMarkdown(ev.content)}</div>`;
   appendRow(el);
 }
 
 // System messages surface as auto-dismissing toasts in the bottom-right
 // corner instead of cluttering the transcript. Each hides itself after 10s.
-function renderSystem(content) {
+// One toast. `kind` sets the label and colour: 'sys' for agent system messages,
+// 'error' / 'warn' / 'info' for the file-tree operations, which need to report
+// failures somewhere the user will actually see them in a packaged desktop app.
+function toast(kind, content) {
   const host = document.getElementById('toasts');
   if (!host) return; // fall back to nothing if the container isn't present
 
+  const label = { error: 'error', warn: 'warn', info: 'ok', sys: 'sys' }[kind] || 'sys';
   const el = document.createElement('div');
-  el.className = 'toast';
+  el.className = 'toast toast-' + (kind === 'sys' ? 'sys' : kind);
   el.innerHTML = `
-    <span class="toast-label">sys</span>
+    <span class="toast-label">${label}</span>
     <span class="toast-msg">${escapeHtml(content)}</span>
     <button class="toast-close" title="Dismiss" aria-label="Dismiss">×</button>`;
 
@@ -515,9 +893,11 @@ function renderSystem(content) {
   host.appendChild(el);
 }
 
+function renderSystem(content) { toast('sys', content); }
+
 function renderLog(content) {
   const el = document.createElement('div');
-  el.className = 'px-2 py-0.5 text-[10px] text-term-muted';
+  el.className = 'px-2 py-0.5 t-2xs text-term-muted';
   el.textContent = content;
   chat.appendChild(el);
   scrollDown();
@@ -533,8 +913,13 @@ function renderError(content) {
 function renderStatus(ev) {
   // The steps / tools / ctx / resets header counters were removed; the only status
   // field still surfaced is the token count, which rides on the live Thinking… line.
-  if (ev.ctx_tokens !== undefined && ev.ctx_tokens !== null) {
-    sessionTokens = ev.ctx_tokens;
+  // Prefer convo_tokens (real provider counts, monotonic). Transcripts recorded
+  // before that field existed still replay, falling back to the old ctx_tokens
+  // estimate rather than showing zero.
+  const tokens = (ev.convo_tokens !== undefined && ev.convo_tokens !== null)
+    ? ev.convo_tokens : ev.ctx_tokens;
+  if (tokens !== undefined && tokens !== null) {
+    convoTokens = tokens;
     _updateThinkingMeta();
   }
 }
@@ -700,7 +1085,9 @@ function _startWave() {
   if (_freezeTimer) { clearTimeout(_freezeTimer); _freezeTimer = null; }
   _wave = { originTs: performance.now(), bars: new Map(), done: false };
   const el = _dock();
-  el.querySelector('.cdock-body').innerHTML = '';
+  // Running bars live in .cdock-active; finished ones are moved into a lazily
+  // created .cdock-completed group below them (see subagentDone).
+  el.querySelector('.cdock-body').innerHTML = '<div class="cdock-active"></div>';
   el.querySelector('.cdock-summary').style.display = 'none';
   _openSubagents(); // auto-reveal the sidebar when a wave starts so the work is visible
   _waveTicker = setInterval(_renderWave, 200);
@@ -708,6 +1095,45 @@ function _startWave() {
 }
 
 function _ensureWave() { if (!_wave || _wave.done) _startWave(); }
+
+// Rebuild the Subagents dock from a persisted snapshot after a refresh / reopen,
+// so the menu doesn't vanish. This is a STATIC restore — no live timeline or
+// ticker (the run that produced these subagents is over from the dock's view);
+// every row renders in its final label-only form. A subsequent live wave_started
+// clears this and takes over.
+function waveRestore(ev) {
+  const dock = ev && ev.dock;
+  const rows = dock && Array.isArray(dock.rows) ? dock.rows : [];
+  if (!rows.length) return;
+  _hudEnsure();
+  const el = _dock();
+  const body = el.querySelector('.cdock-body');
+  body.innerHTML = '<div class="cdock-active"></div>';
+  el.querySelector('.cdock-summary').style.display = 'none';
+  _wave = null; // static — not a live wave
+  let doneCount = 0;
+  rows.forEach(r => {
+    const row = document.createElement('div');
+    row.className = 'cbar cbar-done ' + (r.running ? '' : (r.ok ? 'cbar-ok' : 'cbar-failed'));
+    row.innerHTML =
+      '<div class="cbar-label"><span class="cbar-name"></span><span class="cbar-task"></span>' +
+      '<span class="cbar-model"></span><span class="cbar-key"></span><span class="cbar-stat"></span></div>';
+    row.querySelector('.cbar-name').textContent = r.agent || '';
+    row.querySelector('.cbar-task').textContent = r.task || '';
+    row.querySelector('.cbar-model').textContent =
+      _modelTierLabel(r.tier, r.model) + (r.escalated ? ' ⇡' : '');
+    row.querySelector('.cbar-key').textContent = r.key_label || '';
+    row.querySelector('.cbar-stat').textContent = r.running
+      ? `⋯ interrupted · ${r.tokens || 0} tok · step ${r.steps || 0}`
+      : `${r.ok ? '✓' : '✗'} ${r.elapsed_s || 0}s · ${r.tokens || 0} tok · ${r.steps || 0} steps`;
+    _completedSection().appendChild(row);
+    if (!r.running) doneCount++;
+  });
+  const cnt = _completedSection().querySelector('.cdock-done-count');
+  if (cnt) cnt.textContent = String(rows.length);
+  el.querySelector('.cdock-count').textContent = '';
+  _updateFab(0, doneCount > 0); // surface the FAB so the menu is reachable; don't auto-open
+}
 
 function waveStarted(ev) { _hudEnsure(); _startWave(); }
 
@@ -733,11 +1159,26 @@ function subagentStarted(ev) {
   row.querySelector('.cbar-task').textContent = ev.task || '';
   row.querySelector('.cbar-model').textContent = _modelTierLabel(ev.tier, ev.model);
   row.querySelector('.cbar-key').textContent = ev.key_label || '';
-  _dock().querySelector('.cdock-body').appendChild(row);
+  const active = _dock().querySelector('.cdock-active') || _dock().querySelector('.cdock-body');
+  active.appendChild(row);
   _wave.bars.set(key, { row, startOffsetMs: now - _wave.originTs, endOffsetMs: null,
                         ok: null, steps: 0, tokens: 0, name: ev.agent, running: true,
                         tier: ev.tier });
   _renderWave();
+}
+
+// Lazily create (once per wave) the "Completed" group that finished subagent
+// rows are moved into, appended below the live .cdock-active bars in the body.
+function _completedSection() {
+  const body = _dock().querySelector('.cdock-body');
+  let sec = body.querySelector('.cdock-completed');
+  if (!sec) {
+    sec = document.createElement('div');
+    sec.className = 'cdock-completed';
+    sec.innerHTML = '<div class="cdock-done-title">Completed <span class="cdock-done-count">0</span></div>';
+    body.appendChild(sec);
+  }
+  return sec;
 }
 
 function subagentProgress(ev) {
@@ -766,6 +1207,17 @@ function subagentDone(ev) {
     modelEl.textContent = _modelTierLabel(bar.tier, ev.model) + (ev.escalated ? ' ⇡' : '');
     if (ev.escalated) modelEl.title = 'escalated to a stronger model after repeated protocol errors';
   }
+  // Retire the finished row: its timeline bar only ever spanned its slice of the
+  // shared wall-clock axis (green but never "full", which misreads as still
+  // running), so drop the track entirely and file the row under a "Completed"
+  // title. The ✓/✗ stat line now carries the outcome.
+  const track = bar.row.querySelector('.cbar-track');
+  if (track) track.remove();
+  bar.row.classList.add('cbar-done', ev.ok ? 'cbar-ok' : 'cbar-failed');
+  const sec = _completedSection();
+  sec.appendChild(bar.row);
+  const cnt = sec.querySelector('.cdock-done-count');
+  if (cnt) cnt.textContent = String(sec.querySelectorAll('.cbar-done').length);
   _hudOnDone(ev);
   _renderWave();
   // Singleton (write) waves have no wave_done: freeze when nothing is running.
@@ -813,8 +1265,9 @@ function _renderWave() {
   el.querySelector('.cdock-count').textContent = _wave.done ? '' : `${runningCount} running`;
   _updateFab(runningCount, _wave.done);
   bars.forEach(b => {
-    const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs;
     const fill = b.row.querySelector('.cbar-fill');
+    if (!fill) return;   // a completed row: its timeline track was removed on done
+    const end = b.endOffsetMs == null ? now - _wave.originTs : b.endOffsetMs;
     fill.style.left = `${(b.startOffsetMs / span) * 100}%`;
     fill.style.width = `${Math.max(1, ((end - b.startOffsetMs) / span) * 100)}%`;
   });
@@ -889,7 +1342,7 @@ function planOutcomeChip(outcome) {
     blocked: 'text-term-red border-term-red/40',
     needs_different_approach: 'text-term-red border-term-red/40',
   }[outcome] || 'text-term-muted border-term-line';
-  return `<span class="ml-2 rounded-full border px-2 py-0.5 text-[10px] ${color}">${escapeHtml(outcome.replace(/_/g, ' '))}</span>`;
+  return `<span class="ml-2 rounded-full border px-2 py-0.5 t-2xs ${color}">${escapeHtml(outcome.replace(/_/g, ' '))}</span>`;
 }
 
 // ---------- composer model selector + fallback indicator ----------
@@ -933,6 +1386,21 @@ function _syncModelTrigger() {
   label.textContent = opt ? opt.textContent : (sel.value || '—');
   btn.disabled = sel.disabled;
   btn.title = (opt && opt.title) || '';
+
+  // Surface the active effort on the trigger, so the current level is visible
+  // without opening the menu. Hidden when the model has nothing to configure.
+  const suffix = btn.querySelector('.composer-model-effort');
+  if (suffix) {
+    const meta = _modelOptions.find(m => m.model === sel.value);
+    const fam = meta && (meta.reasoning_style || detectReasoningFamily(sel.value));
+    const def = fam && _REASONING_FAMILIES[fam];
+    const eff = meta && _coerceEffort(fam, meta.reasoning_effort || '');
+    const known = def && def.options && def.options.find(([v]) => v === eff);
+    // "Default" carries no information on the trigger — only show a real level.
+    const show = known && eff ? known[1] : '';
+    suffix.textContent = show;
+    suffix.classList.toggle('hidden', !show);
+  }
 }
 
 function _closeModelMenu() {
@@ -964,10 +1432,70 @@ function _openModelMenu() {
     });
     menu.appendChild(it);
   });
+  _appendEffortSection(menu, sel.value);
   menu.classList.remove('hidden');
   $('modelSelectBtn').setAttribute('aria-expanded', 'true');
   const act = menu.querySelector('.active');
   if (act) act.scrollIntoView({ block: 'nearest' });
+}
+
+// The effort control that lives at the FOOT of the model menu. Which levels are
+// offered depends on the selected model's reasoning family — a GLM model gets a
+// thinking on/off toggle, an OpenAI-style model gets Off..Max, and a model that
+// always reasons (DeepSeek R1) gets no control at all. Families and their option
+// lists are the same _REASONING_FAMILIES table the LLM settings panel uses, so
+// the two surfaces can never disagree about what a model supports.
+function _appendEffortSection(menu, model) {
+  const opt = _modelOptions.find(m => m.model === model);
+  if (!opt) return;
+  const fam = opt.reasoning_style || detectReasoningFamily(model);
+  const def = _REASONING_FAMILIES[fam];
+  if (!def || !def.options) return;   // family reasons unconditionally
+
+  const current = _coerceEffort(fam, opt.reasoning_effort || '');
+
+  const sec = document.createElement('div');
+  sec.className = 'composer-effort';
+
+  const head = document.createElement('div');
+  head.className = 'composer-effort-head';
+  head.textContent = 'Effort';
+  head.title = def.label;
+  sec.appendChild(head);
+
+  const row = document.createElement('div');
+  row.className = 'composer-effort-row';
+  def.options.forEach(([value, label]) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'composer-effort-btn' + (value === current ? ' active' : '');
+    b.textContent = label;
+    b.title = def.label;
+    b.addEventListener('click', (e) => {
+      // Keep the menu open: changing effort is a setting, not a selection, and
+      // closing here would make comparing levels needlessly fiddly.
+      e.stopPropagation();
+      setModelEffort(opt.config_id || '', model, value);
+    });
+    row.appendChild(b);
+  });
+  sec.appendChild(row);
+  menu.appendChild(sec);
+}
+
+async function setModelEffort(configId, model, effort) {
+  const target = _modelOptions.find(m => m.model === model);
+  if (target) target.reasoning_effort = effort;   // optimistic, for instant feedback
+  _syncModelTrigger();
+  if (!$('modelMenu').classList.contains('hidden')) _openModelMenu();  // re-render the row
+  try {
+    const res = await pywebview.api.set_model_effort(configId, model, effort);
+    if (res && res.ok && res.options) {
+      _modelOptions = res.options;
+      _syncModelTrigger();
+      if (!$('modelMenu').classList.contains('hidden')) _openModelMenu();
+    }
+  } catch (e) { /* non-fatal: the optimistic value stands until the next refresh */ }
 }
 
 function _renderModelSelect() {
@@ -1038,18 +1566,18 @@ function _planStepRow(it, plan) {
     it.fallback ? ['fallback', it.fallback] : null,
   ].filter(Boolean);
   const detailHtml = detail.length ? `
-    <div class="text-[11px] text-term-muted mt-1 space-y-0.5">
+    <div class="t-xs text-term-muted mt-1 space-y-0.5">
       ${detail.map(([k, v]) => `<div><span class="text-term-muted/70">${k}:</span> ${escapeHtml(v)}</div>`).join('')}
     </div>` : '';
   return `
     <div class="flex items-start gap-2 rounded-lg px-2 py-1.5 ${active ? 'bg-term-cyan/10 border border-term-cyan/30' : 'border border-transparent'}">
-      <span class="${planStatusColor(it.status)} shrink-0 mt-0.5 text-[13px]">${planStatusIcon(it.status)}</span>
+      <span class="${planStatusColor(it.status)} shrink-0 mt-0.5 t-base">${planStatusIcon(it.status)}</span>
       <div class="min-w-0 flex-1">
-        <div class="${contentClass} text-[13px] leading-5">${escapeHtml(it.content)}</div>
-        ${it.notes ? `<div class="text-[11px] text-term-muted mt-0.5">${escapeHtml(it.notes)}</div>` : ''}
+        <div class="${contentClass} t-base leading-5">${escapeHtml(it.content)}</div>
+        ${it.notes ? `<div class="t-xs text-term-muted mt-0.5">${escapeHtml(it.notes)}</div>` : ''}
         ${detailHtml}
       </div>
-      <span class="text-[10px] text-term-muted shrink-0 mt-0.5">${escapeHtml(it.status.replace('_', ' '))}</span>
+      <span class="t-2xs text-term-muted shrink-0 mt-0.5">${escapeHtml(it.status.replace('_', ' '))}</span>
     </div>`;
 }
 
@@ -1057,8 +1585,8 @@ function _planBullets(label, values) {
   if (!values || !values.length) return '';
   return `
     <div class="mt-2">
-      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">${label}</div>
-      <ul class="text-[12px] text-term-text/90 space-y-0.5">
+      <div class="t-2xs uppercase tracking-wider text-term-muted mb-0.5">${label}</div>
+      <ul class="t-sm text-term-text/90 space-y-0.5">
         ${values.map(v => `<li class="flex gap-1.5"><span class="text-term-muted">•</span><span>${escapeHtml(v)}</span></li>`).join('')}
       </ul>
     </div>`;
@@ -1084,26 +1612,26 @@ function renderPlanTab(plan) {
 
   const phasesHtml = hasPhases ? `
     <div class="mt-2">
-      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">phases</div>
+      <div class="t-2xs uppercase tracking-wider text-term-muted mb-0.5">phases</div>
       <div class="space-y-0.5">
         ${plan.phases.map(p => {
           const cur = p.id === plan.current_phase_id;
-          return `<div class="flex items-start gap-2 text-[12px] ${cur ? 'text-term-cyan' : ''}">
-            <span class="${planStatusColor(p.status)} shrink-0 text-[12px]">${planStatusIcon(p.status)}</span>
+          return `<div class="flex items-start gap-2 t-sm ${cur ? 'text-term-cyan' : ''}">
+            <span class="${planStatusColor(p.status)} shrink-0 t-sm">${planStatusIcon(p.status)}</span>
             <span class="min-w-0 flex-1 ${p.status === 'completed' ? 'text-term-muted' : ''}">${escapeHtml(p.title)}${p.note ? ` <span class="text-term-muted">— ${escapeHtml(p.note)}</span>` : ''}</span>
-            ${cur ? '<span class="text-[9px] uppercase tracking-wider text-term-cyan shrink-0">current</span>' : ''}
+            ${cur ? '<span class="t-2xs uppercase tracking-wider text-term-cyan shrink-0">current</span>' : ''}
           </div>`;
         }).join('')}
       </div>
     </div>` : '';
 
   const rows = hasItems ? plan.items.map(it => _planStepRow(it, plan)).join('') :
-    `<div class="text-[12px] text-term-muted italic px-2 py-3">No steps in the current phase yet.</div>`;
+    `<div class="t-sm text-term-muted italic px-2 py-3">No steps in the current phase yet.</div>`;
 
   const nextHtml = plan.next_action ? `
     <div class="px-4 py-2.5 border-t border-term-line shrink-0 bg-term-cyan/5">
-      <div class="text-[10px] uppercase tracking-wider text-term-muted mb-0.5">next action</div>
-      <div class="text-[13px] text-term-text">${escapeHtml(plan.next_action)}</div>
+      <div class="t-2xs uppercase tracking-wider text-term-muted mb-0.5">next action</div>
+      <div class="t-base text-term-text">${escapeHtml(plan.next_action)}</div>
     </div>` : '';
 
   // Header + steps share one scroll region: with long criteria/phases the
@@ -1111,12 +1639,12 @@ function renderPlanTab(plan) {
   root.innerHTML = `
     <div class="flex-1 min-h-0 overflow-y-auto">
       <div class="px-4 py-3 border-b border-term-line">
-        <div class="text-[10px] uppercase tracking-wider text-term-muted mb-1">current task ${planOutcomeChip(plan.outcome)}</div>
-        <div class="text-term-text text-[13px] mb-2">${escapeHtml(plan.task)}${plan.outcome_note ? ` <span class="text-term-muted">— ${escapeHtml(plan.outcome_note)}</span>` : ''}</div>
+        <div class="t-2xs uppercase tracking-wider text-term-muted mb-1">current task ${planOutcomeChip(plan.outcome)}</div>
+        <div class="text-term-text t-base mb-2">${escapeHtml(plan.task)}${plan.outcome_note ? ` <span class="text-term-muted">— ${escapeHtml(plan.outcome_note)}</span>` : ''}</div>
         <div class="h-1.5 rounded-full bg-term-line overflow-hidden">
           <div class="h-full bg-term-cyan transition-all" style="width:${pct}%"></div>
         </div>
-        <div class="text-[10px] text-term-muted mt-1">${done}/${total} steps complete (${pct}%)${plan.replans && plan.replans.length ? ` · replanned ${plan.replans.length}×` : ''}</div>
+        <div class="t-2xs text-term-muted mt-1">${done}/${total} steps complete (${pct}%)${plan.replans && plan.replans.length ? ` · replanned ${plan.replans.length}×` : ''}</div>
         ${_planBullets('success criteria', plan.success_criteria)}
         ${_planBullets('constraints', plan.constraints)}
         ${_planBullets('unknowns', plan.unknowns)}
@@ -1166,17 +1694,246 @@ function countTreeFiles(node) {
 // created only the first time the folder is expanded. This bounds the live DOM
 // to what the user has actually opened, instead of eagerly materializing every
 // file in a huge (decompiled-APK) workspace, which is what OOM'd the renderer.
+// ---------- file tree: selection, drag/drop, context menu ----------
+// Behaviour follows the VS Code explorer: click selects, ctrl/cmd-click and
+// shift-click extend, drag moves onto a folder or the trash, right-click opens
+// a menu. Every mutation goes through the path-scoped fs_* APIs, which return the
+// refreshed tree so the view re-renders from truth.
+
+const TRASH_DIR = '.omni-trash';
+
+let _treeSelection = new Set();   // selected workspace paths
+let _treeOrder = [];              // visible rows in order, for shift-range select
+let _treeAnchor = null;           // where a shift-range starts
+let _treeDragPaths = [];          // paths being dragged right now
+
+function _isInTrash(p) { return p === TRASH_DIR || p.startsWith(TRASH_DIR + '/'); }
+
+function _applyTreeSelection() {
+  $('fileTree').querySelectorAll('.tree-row').forEach(r => {
+    r.classList.toggle('sel', _treeSelection.has(r.dataset.path));
+  });
+}
+
+function _selectTreeRow(path, ev) {
+  const multi = ev && (ev.metaKey || ev.ctrlKey);
+  const range = ev && ev.shiftKey;
+  if (range && _treeAnchor) {
+    const a = _treeOrder.indexOf(_treeAnchor);
+    const b = _treeOrder.indexOf(path);
+    if (a >= 0 && b >= 0) {
+      _treeSelection = new Set(_treeOrder.slice(Math.min(a, b), Math.max(a, b) + 1));
+    }
+  } else if (multi) {
+    if (_treeSelection.has(path)) _treeSelection.delete(path); else _treeSelection.add(path);
+    _treeAnchor = path;
+  } else {
+    _treeSelection = new Set([path]);
+    _treeAnchor = path;
+  }
+  _applyTreeSelection();
+}
+
+// A drag carries the whole selection when the dragged row is part of it, so
+// dragging one of five selected files moves all five (as VS Code does).
+function _dragPathsFor(path) {
+  return _treeSelection.has(path) ? [..._treeSelection] : [path];
+}
+
+// Refuse a drop that would put a folder inside itself — the backend refuses it
+// too, but the cursor should say no before the drop happens.
+function _dropAllowed(destPath) {
+  return !_treeDragPaths.some(p => destPath === p || destPath.startsWith(p + '/'));
+}
+
+async function _fsCall(fn, ...args) {
+  try {
+    const res = await pywebview.api[fn](...args);
+    if (!res || !res.ok) { toast('error', (res && res.error) || `${fn} failed.`); return null; }
+    if (res.tree) renderFileTree(res.tree);
+    const skipped = res.skipped || [];
+    if (skipped.length) toast('warn', skipped.map(s => `${s.path}: ${s.reason}`).join(' · '));
+    return res;
+  } catch (e) {
+    toast('error', '' + e);
+    return null;
+  }
+}
+
+function moveTreePaths(paths, destDir) {
+  if (!paths.length) return;
+  _treeSelection.clear();
+  return _fsCall('fs_move', paths, destDir);
+}
+
+function deleteTreePaths(paths) {
+  if (!paths.length) return;
+  _treeSelection.clear();
+  return _fsCall('fs_delete', paths);
+}
+
+// ---------- context menu ----------
+let _ctxMenu = null;
+
+function closeContextMenu() {
+  if (_ctxMenu) { _ctxMenu.remove(); _ctxMenu = null; }
+}
+
+function openContextMenu(x, y, items) {
+  closeContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'ctx-menu';
+  items.forEach(item => {
+    if (item === '-') {
+      const sep = document.createElement('div');
+      sep.className = 'ctx-sep';
+      menu.appendChild(sep);
+      return;
+    }
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ctx-item' + (item.danger ? ' danger' : '');
+    b.textContent = item.label;
+    b.addEventListener('click', () => { closeContextMenu(); item.run(); });
+    menu.appendChild(b);
+  });
+  document.body.appendChild(menu);
+  // Flip the menu back inside the window when it would overflow the edge.
+  const w = menu.offsetWidth, h = menu.offsetHeight;
+  menu.style.left = Math.min(x, window.innerWidth - w - 8) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - h - 8) + 'px';
+  _ctxMenu = menu;
+}
+
+function _promptName(title, initial) {
+  const v = prompt(title, initial || '');
+  return v == null ? null : v.trim();
+}
+
+function treeContextItems(node) {
+  const path = node.path;
+  const isDir = node.type === 'dir';
+  const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+  const selected = _treeSelection.has(path) ? [..._treeSelection] : [path];
+
+  if (_isInTrash(path)) {
+    return [
+      { label: 'Restore to workspace', run: () => moveTreePaths([path], '') },
+      '-',
+      { label: 'Empty Trash', danger: true, run: () => {
+        if (confirm('Permanently delete everything in the trash? This cannot be undone.')) {
+          _fsCall('fs_trash_empty');
+        }
+      } },
+    ];
+  }
+
+  const items = [];
+  if (!isDir) items.push({ label: 'Open', run: () => openFileViewer(path) });
+  if (isDir) {
+    items.push({ label: 'New File…', run: () => {
+      const n = _promptName('New file name');
+      if (n) _fsCall('fs_new_file', `${path}/${n}`);
+    } });
+    items.push({ label: 'New Folder…', run: () => {
+      const n = _promptName('New folder name');
+      if (n) _fsCall('fs_mkdir', `${path}/${n}`);
+    } });
+  }
+  items.push('-');
+  items.push({ label: 'Rename…', run: () => {
+    const n = _promptName('Rename to', node.name);
+    if (n && n !== node.name) _fsCall('fs_rename', path, n);
+  } });
+  items.push({ label: 'Duplicate', run: () => _fsCall('fs_duplicate', path) });
+  items.push({ label: 'Copy Path', run: () => {
+    try { navigator.clipboard.writeText(path); toast('info', 'Path copied'); }
+    catch (e) { toast('error', 'Could not copy'); }
+  } });
+  items.push({ label: 'Reveal in File Manager', run: () => revealTreePath(path) });
+  items.push('-');
+  items.push({
+    label: selected.length > 1 ? `Delete ${selected.length} items` : 'Delete',
+    danger: true,
+    run: () => deleteTreePaths(selected),
+  });
+  return items;
+}
+
+async function revealTreePath(rel) {
+  try {
+    const res = await pywebview.api.reveal_in_finder(rel);
+    if (res && !res.ok) toast('error', res.error || 'Could not reveal that path.');
+  } catch (e) { toast('error', '' + e); }
+}
+
 function buildTreeNode(node, depth) {
   const row = document.createElement('div');
   row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
   row.style.paddingLeft = (depth * 12 + 4) + 'px';
+  row.dataset.path = node.path;
+  row.draggable = true;
+  _treeOrder.push(node.path);
+  if (_treeSelection.has(node.path)) row.classList.add('sel');
+
+  // --- drag source: a drag carries the whole selection when the row is in it ---
+  row.addEventListener('dragstart', (e) => {
+    _treeDragPaths = _dragPathsFor(node.path);
+    e.dataTransfer.effectAllowed = 'move';
+    // Some payload is required for the drag to start at all in WebKit.
+    try { e.dataTransfer.setData('text/plain', _treeDragPaths.join('\n')); } catch (_) {}
+    row.classList.add('dragging');
+  });
+  row.addEventListener('dragend', () => {
+    _treeDragPaths = [];
+    row.classList.remove('dragging');
+    $('fileTree').querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+  });
+
+  row.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    // Right-clicking outside the current selection moves the selection there
+    // first, so the menu always acts on what the user is pointing at.
+    if (!_treeSelection.has(node.path)) _selectTreeRow(node.path, null);
+    openContextMenu(e.clientX, e.clientY, treeContextItems(node));
+  });
 
   if (node.type === 'dir') {
     const caret = document.createElement('span');
-    caret.className = 'caret text-term-muted w-3 inline-block text-[10px]'; caret.textContent = '▶';
-    const icon = document.createElement('span'); icon.textContent = '📁'; icon.className = 'text-[12px]';
-    const name = document.createElement('span'); name.textContent = node.name; name.className = 'text-term-text truncate';
+    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.textContent = '▶';
+    const isTrash = node.path === TRASH_DIR;
+    const icon = document.createElement('span');
+    icon.textContent = isTrash ? '🗑' : '📁';
+    icon.className = 't-sm';
+    const name = document.createElement('span');
+    name.textContent = isTrash ? 'Trash' : node.name;
+    name.className = 'text-term-text truncate';
     row.append(caret, icon, name);
+    if (isTrash) row.classList.add('tree-trash');
+
+    // --- drop target: folders (and the trash) accept a dragged selection ---
+    row.addEventListener('dragover', (e) => {
+      if (!_treeDragPaths.length) return;
+      if (!isTrash && !_dropAllowed(node.path)) { e.dataTransfer.dropEffect = 'none'; return; }
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      row.classList.add('drop-target');
+    });
+    row.addEventListener('dragleave', () => row.classList.remove('drop-target'));
+    row.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      row.classList.remove('drop-target');
+      // A drop from OUTSIDE the app carries files; a drop from inside carries paths.
+      if (e.dataTransfer.items && e.dataTransfer.items.length && !_treeDragPaths.length) {
+        uploadDroppedItems(e.dataTransfer, isTrash ? '' : node.path);
+        return;
+      }
+      const paths = _treeDragPaths.slice();
+      if (!paths.length) return;
+      if (isTrash) deleteTreePaths(paths);
+      else if (_dropAllowed(node.path)) moveTreePaths(paths, node.path);
+    });
 
     const childWrap = document.createElement('div');
     childWrap.className = 'hidden';
@@ -1192,11 +1949,14 @@ function buildTreeNode(node, depth) {
     const setOpen = (open) => {
       childWrap.classList.toggle('hidden', !open);
       caret.classList.toggle('open', open);
-      icon.textContent = open ? '📂' : '📁';
+      if (!isTrash) icon.textContent = open ? '📂' : '📁';
       if (open) { buildChildren(); expandedDirs.add(node.path); }
       else expandedDirs.delete(node.path);
     };
-    row.addEventListener('click', () => setOpen(childWrap.classList.contains('hidden')));
+    row.addEventListener('click', (e) => {
+      _selectTreeRow(node.path, e);
+      setOpen(childWrap.classList.contains('hidden'));
+    });
     // Re-expand a folder that was open before this re-render (recurses into its
     // children, which restore their own state — only the previously-open subtree).
     if (expandedDirs.has(node.path)) setOpen(true);
@@ -1207,14 +1967,16 @@ function buildTreeNode(node, depth) {
     return wrap;
   } else {
     const spacer = document.createElement('span'); spacer.className = 'w-3 inline-block';
-    const icon = document.createElement('span'); icon.textContent = fileIcon(node.name); icon.className = 'text-[12px]';
+    const icon = document.createElement('span'); icon.textContent = fileIcon(node.name); icon.className = 't-sm';
     const name = document.createElement('span'); name.textContent = node.name; name.className = 'text-term-text truncate flex-1';
-    const size = document.createElement('span'); size.textContent = humanSize(node.size); size.className = 'text-[10px] text-term-muted';
+    const size = document.createElement('span'); size.textContent = humanSize(node.size); size.className = 't-2xs text-term-muted';
     row.append(spacer, icon, name, size);
-    row.addEventListener('click', () => {
+    row.addEventListener('click', (e) => {
+      _selectTreeRow(node.path, e);
       $('fileTree').querySelectorAll('.tree-row.active').forEach(r => r.classList.remove('active'));
       row.classList.add('active');
-      openFileViewer(node.path);
+      // A modifier click is a selection gesture, not a request to open the file.
+      if (!(e.metaKey || e.ctrlKey || e.shiftKey)) openFileViewer(node.path);
     });
     return row;
   }
@@ -1223,16 +1985,170 @@ function buildTreeNode(node, depth) {
 function renderFileTree(tree) {
   const root = $('fileTree');
   root.innerHTML = '';
+  _treeOrder = [];
   let count = 0;
   if (tree && tree.children) {
+    // The trash sorts to the bottom regardless of alphabetical position, the way
+    // a real explorer pins it.
+    const children = tree.children.filter(c => c.path !== TRASH_DIR);
+    const trash = tree.children.find(c => c.path === TRASH_DIR);
     const frag = document.createDocumentFragment();
-    for (const c of tree.children) {
+    for (const c of children) {
       frag.appendChild(buildTreeNode(c, 0)); // only the top level is built up front
       count += countTreeFiles(c);
     }
+    if (trash) frag.appendChild(buildTreeNode(trash, 0));
     root.appendChild(frag);
   }
+  // Selections referring to rows that no longer exist would otherwise linger and
+  // be sent to fs_move/fs_delete on the next gesture.
+  _treeSelection = new Set([..._treeSelection].filter(p => _treeOrder.includes(p)));
   setStatus('treeFileCount', count);
+}
+
+// ---------- drag-and-drop upload from the host ----------
+// pywebview 6.2.1 exposes no native file-drop event, so a host->app drop has to
+// go through the HTML5 DataTransfer API and be streamed over the JS bridge.
+// webkitGetAsEntry() is what makes dropped FOLDERS possible: it distinguishes a
+// file from a directory and lets us walk the directory recursively.
+//
+// Chunked because the bridge serializes arguments as JSON — one large file in a
+// single call is a memory spike on both sides. 256 KB of raw bytes becomes ~344 KB
+// of base64, which the bridge handles comfortably.
+const UPLOAD_CHUNK_BYTES = 256 * 1024;
+const UPLOAD_MAX_BYTES = 100 * 1024 * 1024;   // per file
+
+// Walk a dropped DataTransfer into a flat [{file, relPath}] list. Directory
+// entries recurse; readEntries() must be called repeatedly because it returns
+// at most 100 entries per call, which is a classic source of silent truncation.
+async function _collectDropEntries(dataTransfer) {
+  const roots = [];
+  for (const item of dataTransfer.items) {
+    if (item.kind !== 'file') continue;
+    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+    if (entry) roots.push(entry);
+    else {
+      const f = item.getAsFile();
+      if (f) roots.push({ isFile: true, name: f.name, _file: f });
+    }
+  }
+
+  const out = [];
+  const readAll = (reader) => new Promise((resolve, reject) => {
+    const acc = [];
+    const step = () => reader.readEntries(batch => {
+      if (!batch.length) { resolve(acc); return; }
+      acc.push(...batch);
+      step();
+    }, reject);
+    step();
+  });
+
+  const walk = async (entry, prefix) => {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isFile) {
+      const file = entry._file
+        ? entry._file
+        : await new Promise((res, rej) => entry.file(res, rej));
+      out.push({ file, relPath: rel });
+      return;
+    }
+    if (entry.isDirectory) {
+      const children = await readAll(entry.createReader());
+      for (const c of children) await walk(c, rel);
+    }
+  };
+
+  for (const r of roots) await walk(r, '');
+  return out;
+}
+
+function _readSliceAsBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onerror = () => reject(fr.error || new Error('read failed'));
+    fr.onload = () => {
+      // readAsDataURL gives "data:<mime>;base64,<payload>" — take the payload.
+      const s = String(fr.result);
+      resolve(s.slice(s.indexOf(',') + 1));
+    };
+    fr.readAsDataURL(blob);
+  });
+}
+
+async function _uploadOneFile(file, relPath, destDir) {
+  if (file.size > UPLOAD_MAX_BYTES) {
+    return { ok: false, error: `${relPath} is ${humanSize(file.size)} — over the ${humanSize(UPLOAD_MAX_BYTES)} limit` };
+  }
+  // A zero-byte file still needs one call, or it would never be created.
+  const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
+  for (let i = 0; i < total; i++) {
+    const slice = file.slice(i * UPLOAD_CHUNK_BYTES, (i + 1) * UPLOAD_CHUNK_BYTES);
+    const b64 = await _readSliceAsBase64(slice);
+    const res = await pywebview.api.fs_write_upload(
+      destDir, relPath, b64, i === 0, i === total - 1);
+    if (!res || !res.ok) return { ok: false, error: (res && res.error) || `${relPath} failed` };
+    if (res.tree) renderFileTree(res.tree);
+  }
+  return { ok: true };
+}
+
+let _uploadBusy = false;
+
+async function uploadDroppedItems(dataTransfer, destDir) {
+  if (_uploadBusy) { toast('warn', 'An upload is already running.'); return; }
+  let entries;
+  try {
+    entries = await _collectDropEntries(dataTransfer);
+  } catch (e) {
+    toast('error', 'Could not read the dropped items: ' + e);
+    return;
+  }
+  if (!entries.length) return;
+
+  _uploadBusy = true;
+  const where = destDir || 'the workspace root';
+  toast('info', `Uploading ${entries.length} file${entries.length === 1 ? '' : 's'} to ${where}…`);
+  const failures = [];
+  try {
+    for (const { file, relPath } of entries) {
+      const res = await _uploadOneFile(file, relPath, destDir);
+      if (!res.ok) failures.push(res.error);
+    }
+  } finally {
+    _uploadBusy = false;
+  }
+  if (failures.length) toast('error', failures.join(' · '));
+  else toast('info', `Uploaded ${entries.length} file${entries.length === 1 ? '' : 's'}.`);
+}
+
+// Drop anywhere on the tree that isn't a folder row lands in the workspace root.
+function wireTreeDropZone() {
+  const zone = $('fileTree');
+  const isExternal = (e) => !_treeDragPaths.length;
+
+  zone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    if (isExternal(e)) { e.dataTransfer.dropEffect = 'copy'; zone.classList.add('drop-zone'); }
+  });
+  zone.addEventListener('dragleave', (e) => {
+    if (e.target === zone) zone.classList.remove('drop-zone');
+  });
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    zone.classList.remove('drop-zone');
+    if (isExternal(e) && e.dataTransfer.items && e.dataTransfer.items.length) {
+      uploadDroppedItems(e.dataTransfer, '');
+    } else if (_treeDragPaths.length) {
+      // Dropping on empty space moves to the workspace root.
+      moveTreePaths(_treeDragPaths.slice(), '');
+    }
+  });
+
+  // The window must swallow stray drops, or WebKit NAVIGATES to the dropped
+  // file and the whole app is replaced by a file view.
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => e.preventDefault());
 }
 
 // ---------- file viewer ----------
@@ -1241,25 +2157,53 @@ function renderFileTree(tree) {
 // re-reading the zip. null whenever the viewer shows a plain workspace file.
 let archiveViewer = null;
 
-// Switches which pane of the viewer body is visible ('text' | 'image' | 'archive').
+// What "View as text" should re-request when the backend declined to preview a
+// file: {path} for a workspace file, {path, entry} for an archive member.
+// Cleared whenever the viewer successfully renders something.
+let viewerForceTarget = null;
+
+// Switches which pane of the viewer body is visible
+// ('text' | 'image' | 'archive' | 'unsupported').
 // The back button shows only while previewing an entry *inside* an open archive.
 function viewerShowPane(mode) {
   $('viewerContent').classList.toggle('hidden', mode !== 'text');
   $('viewerImage').classList.toggle('hidden', mode !== 'image');
   $('viewerImage').classList.toggle('flex', mode === 'image');
   $('viewerArchive').classList.toggle('hidden', mode !== 'archive');
+  $('viewerUnsupported').classList.toggle('hidden', mode !== 'unsupported');
+  $('viewerUnsupported').classList.toggle('flex', mode === 'unsupported');
   $('viewerBack').classList.toggle('hidden', !(archiveViewer && mode !== 'archive'));
 }
 
 function viewerShowError(msg) {
   $('viewerSize').textContent = '';
+  viewerForceTarget = null;
   $('viewerContent').textContent = 'Error: ' + msg;
   viewerShowPane('text');
 }
 
+// Renders the backend's "I won't guess at this" payload: what the file appears
+// to be, plus the escape hatch that re-reads it with force_text.
+function renderViewerUnsupported(res, target) {
+  viewerForceTarget = target;
+  const label = res.label || 'This file';
+  $('viewerUnsupportedTitle').textContent = `${label} — preview not supported`;
+  $('viewerUnsupportedReason').textContent =
+    res.reason || `This looks like a ${label}, which the viewer can't render.`;
+  $('viewerForceText').classList.toggle('hidden', res.can_force_text === false);
+  viewerShowPane('unsupported');
+}
+
 // Renders a typed read_file / read_archive_member payload into the viewer body.
-function renderViewerResult(res) {
+// `target` is what a later "View as text" would re-request; pass null when the
+// payload is already a forced text read (there is nothing left to escalate to).
+function renderViewerResult(res, target) {
   $('viewerSize').textContent = humanSize(res.size) + (res.truncated ? ' (truncated)' : '');
+  if (res.kind === 'unsupported') {
+    renderViewerUnsupported(res, target || null);
+    return;
+  }
+  viewerForceTarget = null;
   if (res.kind === 'image') {
     $('viewerImage').querySelector('img').src = `data:${res.mime};base64,${res.data}`;
     viewerShowPane('image');
@@ -1275,20 +2219,47 @@ function renderViewerResult(res) {
 async function openFileViewer(path) {
   if (!session) return;
   archiveViewer = null;
+  viewerForceTarget = null;
   $('viewerPath').textContent = path;
   $('viewerSize').textContent = 'loading…';
-  $('viewerContent').textContent = '';
   $('viewerImage').querySelector('img').removeAttribute('src');
   viewerShowPane('text');
-  $('fileViewer').classList.remove('hidden');
+  // Placeholder lines rather than a blank pane — reading a large file over the
+  // bridge is slow enough that empty read as "this file is empty".
+  showSkeleton($('viewerContent'), 6);
+  openModal($('fileViewer'));
   try {
     const res = await pywebview.api.read_file(path);
     if (!res.ok) { viewerShowError(res.error); return; }
     if (res.kind === 'archive') archiveViewer = { path };
-    renderViewerResult(res);
+    renderViewerResult(res, { path });
     if (archiveViewer) archiveViewer.sizeLabel = $('viewerSize').textContent;
   } catch (e) {
     viewerShowError(e);
+  } finally {
+    clearSkeleton($('viewerContent'));
+  }
+}
+
+// "View as text": re-read the file the viewer just declined, with the binary
+// sniff bypassed. The result is always kind="text" (mojibake included), so the
+// panel can't bounce the user straight back to itself.
+async function viewerForceAsText() {
+  const target = viewerForceTarget;
+  if (!target || !session) return;
+  const btn = $('viewerForceText');
+  btn.disabled = true;
+  $('viewerSize').textContent = 'loading…';
+  try {
+    const res = target.entry
+      ? await pywebview.api.read_archive_member(target.path, target.entry, true)
+      : await pywebview.api.read_file(target.path, true);
+    if (!res.ok) { viewerShowError(res.error); return; }
+    renderViewerResult(res, null);
+  } catch (e) {
+    viewerShowError(e);
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -1321,8 +2292,8 @@ function appendArchiveLevel(container, node, depth) {
     row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
     row.style.paddingLeft = (depth * 12 + 4) + 'px';
     const caret = document.createElement('span');
-    caret.className = 'caret text-term-muted w-3 inline-block text-[10px]'; caret.textContent = '▶';
-    const icon = document.createElement('span'); icon.textContent = '📁'; icon.className = 'text-[12px]';
+    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.textContent = '▶';
+    const icon = document.createElement('span'); icon.textContent = '📁'; icon.className = 't-sm';
     const name = document.createElement('span'); name.textContent = dirName; name.className = 'text-term-text truncate';
     row.append(caret, icon, name);
     const childWrap = document.createElement('div');
@@ -1342,9 +2313,9 @@ function appendArchiveLevel(container, node, depth) {
     row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
     row.style.paddingLeft = (depth * 12 + 4) + 'px';
     const spacer = document.createElement('span'); spacer.className = 'w-3 inline-block';
-    const icon = document.createElement('span'); icon.textContent = fileIcon(f.name); icon.className = 'text-[12px]';
+    const icon = document.createElement('span'); icon.textContent = fileIcon(f.name); icon.className = 't-sm';
     const name = document.createElement('span'); name.textContent = f.name; name.className = 'text-term-text truncate flex-1';
-    const size = document.createElement('span'); size.textContent = humanSize(f.size); size.className = 'text-[10px] text-term-muted';
+    const size = document.createElement('span'); size.textContent = humanSize(f.size); size.className = 't-2xs text-term-muted';
     row.append(spacer, icon, name, size);
     row.addEventListener('click', () => openArchiveMember(f.full));
     container.appendChild(row);
@@ -1357,7 +2328,7 @@ function renderArchiveListing(res) {
   appendArchiveLevel(root, buildArchiveTree(res.entries), 0);
   if (res.truncated) {
     const note = document.createElement('div');
-    note.className = 'text-[10px] text-term-muted mt-2 px-1';
+    note.className = 't-2xs text-term-muted mt-2 px-1';
     note.textContent = `Showing ${res.entries.length.toLocaleString()} of ${res.entry_count.toLocaleString()} entries.`;
     root.appendChild(note);
   }
@@ -1371,7 +2342,7 @@ async function openArchiveMember(entry) {
   try {
     const res = await pywebview.api.read_archive_member(archiveViewer.path, entry);
     if (!res.ok) { viewerShowError(res.error); return; }
-    renderViewerResult(res);
+    renderViewerResult(res, { path: archiveViewer.path, entry });
   } catch (e) {
     viewerShowError(e);
   }
@@ -1380,6 +2351,7 @@ async function openArchiveMember(entry) {
 // "← archive": return from an entry preview to the still-rendered listing.
 function backToArchiveListing() {
   if (!archiveViewer) return;
+  viewerForceTarget = null;
   $('viewerPath').textContent = archiveViewer.path;
   $('viewerSize').textContent = archiveViewer.sizeLabel || '';
   viewerShowPane('archive');
@@ -1405,17 +2377,59 @@ window.__agent = {
       case 'status': renderStatus(ev); break;
       case 'file_tree': renderFileTree(ev.tree); break;
       case 'plan_update': renderPlan(ev.plan); break;
+      case 'wave_restore': waveRestore(ev); break;
       case 'wave_started': waveStarted(ev); break;
       case 'subagent_started': subagentStarted(ev); break;
       case 'subagent_progress': subagentProgress(ev); break;
       case 'subagent_done': subagentDone(ev); break;
       case 'wave_done': waveDone(ev); break;
+      case 'workflow_started': workflowStarted(ev); break;
+      case 'wf_phase': workflowPhase(ev); break;
+      case 'wf_agent_started': workflowAgentStarted(ev); break;
+      case 'wf_agent_done': workflowAgentDone(ev); break;
+      case 'wf_log': workflowLog(ev); break;
+      case 'workflow_done': workflowDone(ev); break;
+      case 'ultra_mode': renderUltra(ev.ultra); break;
       case 'done': onDone(); break;
     }
     // No scrollDown() here: every renderer that appends to the chat already
     // requests one, and non-chat events (status/file_tree/plan) don't need it.
   }
 };
+
+// ---------- ultra mode ----------
+// A per-project flag the backend owns (agent.set_ultra / get_ultra). The header
+// chip only REFLECTS it: every path that changes it — this toggle, the `ultra`
+// keyword in a message, the end of a keyword-armed turn — comes back as an
+// `ultra_mode` event, so there is one source of truth rather than two.
+let _ultra = false;
+
+function renderUltra(on) {
+  _ultra = !!on;
+  const btn = $('ultraToggle');
+  if (!btn) return;
+  btn.classList.toggle('is-on', _ultra);
+  btn.textContent = _ultra ? 'ultra on' : 'ultra off';
+  btn.setAttribute('aria-checked', _ultra ? 'true' : 'false');
+}
+
+async function toggleUltra() {
+  const next = !_ultra;
+  renderUltra(next);                     // optimistic; the event confirms it
+  try {
+    const res = await pywebview.api.set_ultra(next);
+    if (res && typeof res.ultra === 'boolean') renderUltra(res.ultra);
+  } catch (_) {
+    renderUltra(!next);                  // the backend never took it
+  }
+}
+
+async function refreshUltra() {
+  try {
+    const res = await pywebview.api.get_ultra();
+    if (res && typeof res.ultra === 'boolean') renderUltra(res.ultra);
+  } catch (_) { /* no session yet */ }
+}
 
 // ---------- session lifecycle ----------
 function setBusy(busy) {
@@ -1489,15 +2503,23 @@ function onSessionStarted(ev) {
     // scroll/layout — one scroll to the bottom once the DOM is rebuilt.
     replaying = true;
     try {
-      for (const e of transcript) { try { window.__agent.onEvent(e); } catch (_) {} }
+      for (const e of transcript) {
+        replayTs = (typeof e.ts === 'number') ? e.ts : null;
+        try { window.__agent.onEvent(e); } catch (_) {}
+      }
+      // If the run isn't still live, settle the last open action group using the
+      // final event's timestamp so it shows its real elapsed and collapses.
+      if (!ev.busy) finalizeLiveLines();
     } finally {
       replaying = false;
+      replayTs = null;
     }
     chat.scrollTop = chat.scrollHeight;
   } else {
     renderSystem(`Workspace: ${ev.project}`);
   }
   renderPlan(null); // cleared until the backend's follow-up plan_update event (fires right after session_started) arrives
+  refreshUltra();   // ultra is per-project and persisted, so read it per session
   if (ev.memory_summary) {
     const banner = $('memoryBanner');
     banner.classList.remove('hidden');
@@ -1534,44 +2556,184 @@ function onSessionEnded() {
 }
 
 // ---------- start screen ----------
+// ---------- workspace picker (start screen) ----------
+// A VS Code-style recent list, not a <select>: each row shows the folder name,
+// its full path, when it was last opened and how big its saved chat is, with
+// per-row actions revealed on hover.
+let _recent = [];            // [{label, path, opened_at, message_count}]
+let _selectedWs = null;      // path of the highlighted row
+
+// "3 minutes ago" / "2 days ago". Entries saved before opened_at existed have
+// no timestamp and render as an em dash rather than a fabricated "just now".
+function relativeTime(epochSeconds) {
+  if (!epochSeconds) return '—';
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - epochSeconds));
+  if (s < 60) return 'just now';
+  const units = [['minute', 60], ['hour', 3600], ['day', 86400], ['month', 2592000], ['year', 31536000]];
+  let label = 'just now';
+  for (const [name, secs] of units) {
+    if (s < secs) break;
+    const n = Math.floor(s / secs);
+    label = `${n} ${name}${n === 1 ? '' : 's'} ago`;
+  }
+  return label;
+}
+
+function _wsIconBtn(title, svg, onClick) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'icon-btn';
+  b.title = title;
+  b.innerHTML = svg;
+  b.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+  return b;
+}
+
+const _WS_REVEAL_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/></svg>';
+const _WS_FORGET_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>';
+
+function _wsRow(entry) {
+  const row = document.createElement('div');
+  row.className = 'ws-row' + (entry.path === _selectedWs ? ' selected' : '');
+  row.tabIndex = 0;
+  row.setAttribute('role', 'option');
+  row.setAttribute('aria-selected', entry.path === _selectedWs ? 'true' : 'false');
+  row.dataset.path = entry.path;
+
+  const main = document.createElement('div');
+  main.className = 'ws-main';
+  const name = document.createElement('div');
+  name.className = 'ws-name';
+  name.textContent = entry.label;
+  const path = document.createElement('div');
+  path.className = 'ws-path';
+  path.title = entry.path;
+  // The RTL trick clips the front of the path; bidi marks keep the text itself
+  // reading left-to-right so separators don't get reordered.
+  path.textContent = '‪' + entry.path + '‬';
+  main.appendChild(name);
+  main.appendChild(path);
+
+  const meta = document.createElement('div');
+  meta.className = 'ws-meta';
+  const when = document.createElement('span');
+  when.textContent = relativeTime(entry.opened_at);
+  meta.appendChild(when);
+  if (entry.message_count > 0) {
+    const chat = document.createElement('span');
+    chat.className = 'chip';
+    chat.textContent = `${entry.message_count} msg`;
+    chat.title = 'This folder has a saved chat that will be restored';
+    meta.appendChild(chat);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'ws-actions';
+  actions.appendChild(_wsIconBtn('Reveal in file manager', _WS_REVEAL_SVG,
+    () => pywebview.api.reveal_in_finder(entry.path)));
+  actions.appendChild(_wsIconBtn(
+    'Forget this folder (removes it from the list and its saved chat; does NOT delete the folder)',
+    _WS_FORGET_SVG, () => forgetWorkspace(entry.path)));
+
+  row.appendChild(main);
+  row.appendChild(meta);
+  row.appendChild(actions);
+
+  row.addEventListener('click', () => selectWorkspace(entry.path));
+  row.addEventListener('dblclick', () => { selectWorkspace(entry.path); startSession(); });
+  row.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); selectWorkspace(entry.path); startSession(); }
+  });
+  return row;
+}
+
+function selectWorkspace(path) {
+  _selectedWs = path;
+  $('startSessionBtn').disabled = !path;
+  [...$('recentList').children].forEach(el => {
+    const on = el.dataset.path === path;
+    el.classList.toggle('selected', on);
+    el.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
+}
+
+function renderRecent() {
+  const q = $('recentFilter').value.trim().toLowerCase();
+  const shown = q
+    ? _recent.filter(r => r.label.toLowerCase().includes(q) || r.path.toLowerCase().includes(q))
+    : _recent;
+
+  const list = $('recentList');
+  list.innerHTML = '';
+  shown.forEach(r => list.appendChild(_wsRow(r)));
+
+  // The empty state distinguishes "nothing yet" from "nothing matched", which a
+  // single blank pane would not.
+  const noneAtAll = _recent.length === 0;
+  $('recentEmpty').classList.toggle('hidden', !noneAtAll);
+  $('recentEmpty').classList.toggle('flex', noneAtAll);
+  list.classList.toggle('hidden', noneAtAll);
+  $('recentCount').textContent = noneAtAll
+    ? 'no folders yet'
+    : (q ? `${shown.length} of ${_recent.length} folders` : `${_recent.length} folder${_recent.length === 1 ? '' : 's'}`);
+
+  // Keep a valid selection: if the highlighted row got filtered away, move to
+  // the first visible one so Enter/Open always does something sensible.
+  if (!shown.some(r => r.path === _selectedWs)) {
+    selectWorkspace(shown.length ? shown[0].path : null);
+  }
+}
+
 async function loadStartScreen() {
+  showSkeleton($('recentList'), 4);
   try {
-    // A "project" is now a host folder you picked. get_projects returns the
-    // recently-used folders {label, path} + the last-used default.
     const res = await pywebview.api.get_projects();
-    const recent = (res && res.recent) || [];
-    const projSel = $('projectSelect');
-    projSel.innerHTML = '';
-    recent.forEach(r => {
-      const o = document.createElement('option');
-      o.value = r.path; o.textContent = r.label + '  —  ' + r.path; o.title = r.path;
-      projSel.appendChild(o);
-    });
-    if (!recent.length) {
-      const o = document.createElement('option'); o.value = '';
-      o.textContent = '(no folders yet — click “Select folder”)'; projSel.appendChild(o);
-    } else if (res.last) {
-      projSel.value = res.last;
-    }
+    _recent = (res && res.recent) || [];
+    _selectedWs = (res && res.last && _recent.some(r => r.path === res.last))
+      ? res.last
+      : (_recent[0] ? _recent[0].path : null);
+    renderRecent();
+    selectWorkspace(_selectedWs);
   } catch (e) {
     $('startError').textContent = 'Failed to load: ' + e;
+    $('recentList').innerHTML = '';
+  } finally {
+    clearSkeleton($('recentList'));
+  }
+}
+
+// Move the highlight by `delta` rows within the currently filtered list.
+function moveWsSelection(delta) {
+  const rows = [...$('recentList').children];
+  if (!rows.length) return;
+  const i = rows.findIndex(el => el.dataset.path === _selectedWs);
+  const next = Math.min(rows.length - 1, Math.max(0, (i < 0 ? 0 : i + delta)));
+  selectWorkspace(rows[next].dataset.path);
+  rows[next].scrollIntoView({ block: 'nearest' });
+}
+
+async function forgetWorkspace(path) {
+  $('startError').textContent = '';
+  try {
+    const res = await pywebview.api.delete_workspace(path);
+    if (res && !res.ok) { $('startError').textContent = res.error || 'Could not forget that folder.'; return; }
+    await loadStartScreen();
+  } catch (e) {
+    $('startError').textContent = '' + e;
   }
 }
 
 async function startSession() {
   $('startError').textContent = '';
-  const path = $('projectSelect').value;   // value is now an absolute folder path
-  if (!path || path.startsWith('(')) {
-    $('startError').textContent = 'Select a workspace folder first.'; return;
-  }
-  const btn = $('startSessionBtn'); btn.disabled = true; btn.textContent = 'Starting sandbox…';
+  if (!_selectedWs) { $('startError').textContent = 'Select a workspace folder first.'; return; }
+  const btn = $('startSessionBtn'); btn.disabled = true; btn.textContent = 'Starting session…';
   try {
-    const res = await pywebview.api.start_session(path);
+    const res = await pywebview.api.start_session(_selectedWs);
     if (!res.ok) $('startError').textContent = res.error || 'Failed to start session.';
   } catch (e) {
     $('startError').textContent = '' + e;
   } finally {
-    btn.disabled = false; btn.textContent = 'Start session';
+    btn.disabled = false; btn.textContent = 'Open';
   }
 }
 
@@ -1579,7 +2741,7 @@ async function startSession() {
 // container, then start the session on it. The picked folder is the project root.
 async function pickWorkspaceAndStart() {
   $('startError').textContent = '';
-  const btn = $('newProjectBtn');
+  const btn = $('openFolderBtn');
   const prev = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = 'Selecting + mounting…'; }
   try {
@@ -1587,7 +2749,7 @@ async function pickWorkspaceAndStart() {
     if (res && res.cancelled) return;
     if (!res || !res.ok) { $('startError').textContent = (res && res.error) || 'Could not select folder.'; return; }
     await loadStartScreen();
-    $('projectSelect').value = res.path;
+    selectWorkspace(res.path);
     await startSession();
   } catch (e) {
     $('startError').textContent = '' + e;
@@ -1597,6 +2759,13 @@ async function pickWorkspaceAndStart() {
 }
 
 // ---------- import from folder ----------
+function toggleImportBox() {
+  const box = $('importFolderBox');
+  const showing = box.classList.contains('hidden');
+  box.classList.toggle('hidden', !showing);
+  box.classList.toggle('flex', showing);
+}
+
 async function browseImportFolder() {
   try {
     const res = await pywebview.api.pick_folder();
@@ -1627,8 +2796,7 @@ async function confirmImport() {
       return;
     }
     await loadStartScreen();
-    $('projectSelect').value = name;
-    $('importFolderBox').classList.add('hidden'); $('importFolderBox').classList.remove('flex');
+    toggleImportBox();
     $('importSourcePath').value = '';
     $('importProjectNameInput').value = '';
   } catch (e) {
@@ -1638,151 +2806,94 @@ async function confirmImport() {
   }
 }
 
-// ---------- export workspace ----------
-function renderExportDiff(diff) {
-  const listEl = $('exportDiffList');
-  const summaryEl = $('exportDiffSummary');
-  const groups = [
-    ['added', 'text-term-green', '+'],
-    ['modified', 'text-term-orange', '~'],
-    ['deleted', 'text-term-red', '-'],
-  ];
-  const total = diff.added.length + diff.modified.length + diff.deleted.length;
-  summaryEl.textContent = total === 0
-    ? 'No changes since import — exporting will not modify the target folder.'
-    : `${diff.added.length} added, ${diff.modified.length} modified, ${diff.deleted.length} deleted.`;
-  listEl.innerHTML = '';
-  for (const [key, color, sign] of groups) {
-    const files = diff[key];
-    if (!files.length) continue;
-    const section = document.createElement('div');
-    const label = document.createElement('div');
-    label.className = `text-[10px] uppercase tracking-wider ${color} mb-1`;
-    label.textContent = `${key} (${files.length})`;
-    section.appendChild(label);
-    const list = document.createElement('div');
-    list.className = 'space-y-0.5 max-h-40 overflow-y-auto rounded-lg border border-term-line bg-term-bg p-2';
-    files.forEach(f => {
-      const row = document.createElement('div');
-      row.className = `${color} text-[11px] font-mono`;
-      row.textContent = `${sign} ${f}`;
-      list.appendChild(row);
-    });
-    section.appendChild(list);
-    listEl.appendChild(section);
-  }
-}
-
-let _exportDiffCache = null;
-
-async function openExportModal() {
-  if (!session) return;
-  $('exportError').textContent = '';
-  $('exportTargetPath').textContent = '—';
-  $('exportDiffSummary').textContent = 'Pick a target folder…';
-  $('exportDiffList').innerHTML = '';
-  $('exportApproveBtn').disabled = true;
-  _exportDiffCache = null;
-
-  let targetPath;
-  try {
-    const pick = await pywebview.api.pick_folder();
-    if (!pick || !pick.ok || !pick.path) return; // cancelled
-    targetPath = pick.path;
-  } catch (e) {
-    $('exportError').textContent = '' + e;
-    return;
-  }
-
-  $('exportModal').classList.remove('hidden');
-  $('exportTargetPath').textContent = targetPath;
-  $('exportDiffSummary').textContent = 'Computing changes…';
-
-  try {
-    const res = await pywebview.api.compute_export_diff(session.project);
-    if (!res.ok) {
-      $('exportDiffSummary').textContent = '';
-      $('exportError').textContent = res.error || 'Failed to compute diff.';
-      return;
-    }
-    _exportDiffCache = { targetPath, diff: res.diff };
-    renderExportDiff(res.diff);
-    $('exportApproveBtn').disabled = false;
-  } catch (e) {
-    $('exportError').textContent = '' + e;
-  }
-}
-
-function closeExportModal() {
-  $('exportModal').classList.add('hidden');
-  _exportDiffCache = null;
-}
-
-async function approveExport() {
-  if (!session || !_exportDiffCache) return;
-  $('exportError').textContent = '';
-  const btn = $('exportApproveBtn'); btn.disabled = true; btn.textContent = 'exporting…';
-  try {
-    const res = await pywebview.api.export_workspace(session.project, _exportDiffCache.targetPath);
-    if (!res.ok) {
-      $('exportError').textContent = res.error || 'Export failed.';
-      return;
-    }
-    const a = res.applied;
-    $('exportDiffSummary').textContent = `Done: ${a.copied.length} file(s) copied, ${a.deleted.length} deleted` +
-      (a.errors.length ? `, ${a.errors.length} error(s)` : '') + '.';
-    if (a.errors.length) $('exportError').textContent = a.errors.join(' | ');
-    $('exportDiffList').innerHTML = '';
-    _exportDiffCache = null;
-  } catch (e) {
-    $('exportError').textContent = '' + e;
-  } finally {
-    btn.disabled = false; btn.textContent = 'approve & export';
-  }
-}
-
 // ---------- LLM provider settings (multiple providers + fallback order) ----------
 let _llmProviders = [];        // preset metadata from the backend
 let _llmConfigs = [];          // ordered list of saved providers (order = fallback priority)
 let _llmActiveProvider = null; // provider selected in the edit form
 let _llmEditingId = null;      // id being edited in the form, or null when adding
 let _llmDragId = null;         // id of the row currently being dragged
+let _llmSelectedId = null;     // id highlighted in the master column
 
 function _llmProvider(id) { return _llmProviders.find(p => p.id === id) || null; }
 
 async function openLlmModal() {
   $('llmError').textContent = '';
   $('llmListStatus').textContent = '';
-  $('llmModal').classList.remove('hidden');
+  openModal($('llmModal'));
   llmShowList();
+  showSkeleton($('llmList'), 4);
   try {
     const res = await pywebview.api.get_llm_configs();
     if (!res || !res.ok) {
-      $('llmListStatus').className = 'text-[11px] text-term-red';
+      _llmStatusKind('error');
       $('llmListStatus').textContent = (res && res.error) || 'Failed to load LLM configs.';
+      $('llmList').innerHTML = '';
       return;
     }
     _llmProviders = res.providers || [];
     _llmConfigs = (res.configs || []).map(c => ({ ...c }));
     renderLlmList();
   } catch (e) {
-    $('llmListStatus').className = 'text-[11px] text-term-red';
+    _llmStatusKind('error');
     $('llmListStatus').textContent = '' + e;
+    $('llmList').innerHTML = '';
+  } finally {
+    // Both failure paths return before renderLlmList, so without this the
+    // placeholder rows would sit there looking like they are still loading.
+    clearSkeleton($('llmList'));
   }
 }
 
-function closeLlmModal() { $('llmModal').classList.add('hidden'); }
+// The status line now lives in the SHARED modal footer, so replacing its
+// className (as this used to) also stripped its layout classes. Set only the
+// colour and leave the rest of the class list alone.
+function _llmStatusKind(kind) {
+  const el = $('llmListStatus');
+  el.classList.remove('text-term-red', 'text-term-green', 'text-term-muted');
+  el.classList.add(kind === 'error' ? 'text-term-red'
+    : kind === 'ok' ? 'text-term-green' : 'text-term-muted');
+}
+
+function closeLlmModal() { closeModal($('llmModal')); }
 
 // ----- switch between the list view and the add/edit form -----
+// The panel is master-detail now: the provider list is ALWAYS visible on the
+// left, and the right column shows either the edit form or a placeholder. These
+// two functions therefore toggle the DETAIL column (and which footer buttons
+// apply), not two mutually exclusive full-panel views.
 function llmShowList() {
   $('llmModalTitle').textContent = 'LLM Providers';
-  $('llmListView').style.display = 'flex';
   $('llmEditView').style.display = 'none';
+  $('llmEmptyDetail').style.display = 'flex';
+  $('llmEditFoot').style.display = 'none';
+  $('llmDoneBtn').style.display = '';
+  $('llmError').textContent = '';
+  _llmSelectedId = null;
+  _markSelectedProvider();
 }
 function llmShowEdit() {
   $('llmModalTitle').textContent = _llmEditingId ? 'Edit provider' : 'Add provider';
-  $('llmListView').style.display = 'none';
-  $('llmEditView').style.display = 'flex';
+  $('llmEditView').style.display = 'block';
+  $('llmEmptyDetail').style.display = 'none';
+  $('llmEditFoot').style.display = 'flex';
+  $('llmDoneBtn').style.display = 'none';
+  llmShowModelPane('text');
+  _llmSelectedId = _llmEditingId;
+  _markSelectedProvider();
+}
+
+// Text / Vision tabs inside the Models section.
+function llmShowModelPane(which) {
+  const text = which !== 'vision';
+  $('llmTextPane').style.display = text ? '' : 'none';
+  $('llmVisionPane').style.display = text ? 'none' : '';
+  $('llmTabText').classList.toggle('active', text);
+  $('llmTabVision').classList.toggle('active', !text);
+}
+
+function _markSelectedProvider() {
+  [...$('llmList').children].forEach(el =>
+    el.classList.toggle('selected', el.dataset.id === _llmSelectedId));
 }
 
 // ----- list of saved providers (drag to reorder = change fallback priority) -----
@@ -1797,61 +2908,76 @@ function _llmRow(c, idx) {
   const prov = _llmProvider(c.provider);
   const label = (prov && prov.label) || c.label || c.provider;
   const row = document.createElement('div');
-  row.className = 'flex items-center gap-2 rounded-xl border border-term-line bg-term-bg px-3 py-2';
+  // Narrow master column: rank + name on one line, a compact summary beneath,
+  // actions revealed on hover. The old row put edit/remove buttons inline and
+  // spelled every model out, which no longer fits.
+  row.className = 'llm-prow' + (c.id === _llmSelectedId ? ' selected' : '');
   row.dataset.id = c.id;
   row.draggable = true;
+  row.title = 'Click to edit · drag ⠿ to change fallback priority';
 
   const handle = document.createElement('span');
   handle.textContent = '⠿';
   handle.title = 'drag to reorder';
-  handle.className = 'text-term-muted';
+  handle.className = 'text-term-muted shrink-0';
   handle.style.cursor = 'grab';
   row.appendChild(handle);
+
+  // Explicit priority number: "top is primary" is much easier to read when the
+  // position is stated rather than inferred from the order.
+  const rank = document.createElement('span');
+  rank.className = 'llm-prow-rank';
+  rank.textContent = String(idx + 1);
+  row.appendChild(rank);
 
   const mid = document.createElement('div');
   mid.className = 'min-w-0';
   mid.style.flex = '1 1 auto';
+
   const title = document.createElement('div');
-  title.className = 'text-term-text';
+  title.className = 'truncate text-term-text';
   title.textContent = c.name || label;
   if (idx === 0) {
     const badge = document.createElement('span');
     badge.textContent = 'primary';
-    badge.className = 'ml-2 rounded-full border border-term-line text-[10px] text-term-muted';
-    badge.style.padding = '1px 6px';
+    badge.className = 'chip ml-2';
     title.appendChild(badge);
   }
-  const sub = document.createElement('div');
-  sub.className = 'text-[11px] text-term-muted';
-  sub.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
-  // Decoupled view: a shared key POOL + a separate model LADDER.
+
   const keys = Array.isArray(c.api_keys) && c.api_keys.length ? c.api_keys : (c.api_key ? [c.api_key] : []);
   const models = Array.isArray(c.models) && c.models.length ? c.models : (c.model ? [c.model] : []);
-  const nKeys = keys.length;
-  const keyPart = (prov && prov.requires_key)
-    ? (nKeys ? ` · ${nKeys} key${nKeys === 1 ? '' : 's'}` : ' · ⚠ no key')
-    : '';
-  const modelPart = models.length
-    ? (models.length === 1 ? ` · ${models[0]}` : ` · ${models.length} models: ${models.join(', ')}`)
-    : ' · default model';
   const vision = Array.isArray(c.vision_models) ? c.vision_models : (c.vision_model ? [c.vision_model] : []);
-  const visionPart = vision.length ? ` · ${vision.length} vision` : '';
-  sub.textContent = `${label}${modelPart}${visionPart}${keyPart}`;
-  mid.appendChild(title); mid.appendChild(sub);
+
+  const sub = document.createElement('div');
+  sub.className = 'truncate text-term-muted';
+  sub.style.fontSize = 'var(--text-2xs)';
+  // Counts, not a full model list: the detail pane shows the ladder itself.
+  const parts = [label];
+  parts.push(models.length ? `${models.length} model${models.length === 1 ? '' : 's'}` : 'default model');
+  if (vision.length) parts.push(`${vision.length} vision`);
+  if (prov && prov.requires_key) {
+    parts.push(keys.length ? `${keys.length} key${keys.length === 1 ? '' : 's'}` : '⚠ no key');
+  }
+  sub.textContent = parts.join(' · ');
+  sub.title = models.join(', ');
+
+  mid.appendChild(title);
+  mid.appendChild(sub);
   row.appendChild(mid);
 
-  const editBtn = document.createElement('button');
-  editBtn.textContent = 'edit';
-  editBtn.className = 'rounded-full border border-term-line px-3 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text';
-  editBtn.addEventListener('click', () => llmEditEntry(c.id));
-  row.appendChild(editBtn);
-
+  const actions = document.createElement('div');
+  actions.className = 'ws-actions';
   const delBtn = document.createElement('button');
+  delBtn.type = 'button';
   delBtn.textContent = '✕';
-  delBtn.title = 'remove';
-  delBtn.className = 'rounded-full border border-term-line px-2 py-1 text-[11px] text-term-muted hover:bg-term-line/60 hover:text-term-text';
-  delBtn.addEventListener('click', () => llmDeleteEntry(c.id));
-  row.appendChild(delBtn);
+  delBtn.title = 'Remove this provider';
+  delBtn.className = 'icon-btn';
+  delBtn.addEventListener('click', (e) => { e.stopPropagation(); llmDeleteEntry(c.id); });
+  actions.appendChild(delBtn);
+  row.appendChild(actions);
+
+  // The whole row is the edit affordance now — there is no separate edit button.
+  row.addEventListener('click', () => llmEditEntry(c.id));
 
   // HTML5 drag-and-drop reorder. Order in _llmConfigs IS the fallback priority.
   row.addEventListener('dragstart', () => { _llmDragId = c.id; row.style.opacity = '0.4'; });
@@ -1874,6 +3000,9 @@ function llmReorder(srcId, dstId) {
 
 function llmDeleteEntry(id) {
   _llmConfigs = _llmConfigs.filter(c => c.id !== id);
+  // If the detail pane was editing the row just removed, fall back to the
+  // placeholder rather than leaving a form bound to a deleted provider.
+  if (_llmEditingId === id) { _llmEditingId = null; llmShowList(); }
   renderLlmList();
   persistLlmConfigs('provider removed');
 }
@@ -1887,7 +3016,7 @@ function renderLlmTabs() {
     b.type = 'button';
     b.dataset.pid = p.id;
     b.textContent = p.label;
-    b.className = 'rounded-full border px-3 py-1 text-[12px] border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
+    b.className = 'rounded-full border px-3 py-1 t-sm border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
     b.addEventListener('click', () => selectLlmProvider(p.id, null));
     wrap.appendChild(b);
   });
@@ -1911,7 +3040,7 @@ function _miniBtn(label, title, onClick) {
   b.type = 'button';
   b.textContent = label;
   b.title = title || '';
-  b.className = 'shrink-0 rounded-lg border border-term-line px-2 py-1 text-[11px] leading-none text-term-muted hover:bg-term-line/60 hover:text-term-text';
+  b.className = 'shrink-0 rounded-lg border border-term-line px-2 py-1 t-xs leading-none text-term-muted hover:bg-term-line/60 hover:text-term-text';
   b.addEventListener('click', onClick);
   return b;
 }
@@ -1927,7 +3056,7 @@ function _renderListEditor(containerId, values, opts) {
     const inp = document.createElement('input');
     inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
     inp.placeholder = opts.placeholder || '';
-    inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
+    inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono t-xs outline-none focus:border-term-cyan';
     row.appendChild(inp);
     if (opts.ordered) {
       const up = _miniBtn('↑', 'move up (higher priority)', () => _moveListItem(containerId, i, -1, opts));
@@ -1943,7 +3072,7 @@ function _renderListEditor(containerId, values, opts) {
   });
   if (!values || !values.length) {
     const empty = document.createElement('div');
-    empty.className = 'text-[11px] italic text-term-muted';
+    empty.className = 't-xs italic text-term-muted';
     empty.textContent = opts.emptyText || '(none)';
     host.appendChild(empty);
   }
@@ -2066,7 +3195,7 @@ function _coerceEffort(fam, eff) {
 
 function _miniSelect(extraCls, options, value) {
   const sel = document.createElement('select');
-  sel.className = extraCls + ' flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2 py-1 text-[10px] text-term-muted outline-none focus:border-term-cyan';
+  sel.className = extraCls + ' flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2 py-1 t-2xs text-term-muted outline-none focus:border-term-cyan';
   options.forEach(([v, label]) => {
     const o = document.createElement('option');
     o.value = v; o.textContent = label;
@@ -2137,7 +3266,7 @@ function _modelRow(containerId, val, i, s, openPanel) {
   const inp = document.createElement('input');
   inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
   inp.placeholder = _LLM_MODEL_OPTS.placeholder;
-  inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono text-[11px] outline-none focus:border-term-cyan';
+  inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono t-xs outline-none focus:border-term-cyan';
   // A rename can change the model family — rebuild so the ⚙ panel shows the
   // right reasoning control for the new name.
   inp.addEventListener('change', () => {
@@ -2166,14 +3295,14 @@ function _modelRow(containerId, val, i, s, openPanel) {
   const fam = detectReasoningFamily(val);
   const famDef = _REASONING_FAMILIES[fam] || _REASONING_FAMILIES.openai;
   const famLine = document.createElement('div');
-  famLine.className = 'text-[10px] text-term-muted';
+  famLine.className = 't-2xs text-term-muted';
   famLine.textContent = 'detected: ' + famDef.label;
   panel.appendChild(famLine);
   if (famDef.options) {
     const rowEl = document.createElement('div');
     rowEl.className = 'flex items-center gap-1.5';
     const lab = document.createElement('span');
-    lab.className = 'shrink-0 text-[10px] uppercase tracking-wider text-term-muted';
+    lab.className = 'shrink-0 t-2xs uppercase tracking-wider text-term-muted';
     lab.textContent = 'reasoning';
     rowEl.append(lab, _miniSelect('llm-model-effort', famDef.options, _coerceEffort(fam, s.reasoning_effort)));
     panel.appendChild(rowEl);
@@ -2181,7 +3310,7 @@ function _modelRow(containerId, val, i, s, openPanel) {
   const tierRow = document.createElement('div');
   tierRow.className = 'flex items-center gap-1.5';
   const tierLab = document.createElement('span');
-  tierLab.className = 'shrink-0 text-[10px] uppercase tracking-wider text-term-muted';
+  tierLab.className = 'shrink-0 t-2xs uppercase tracking-wider text-term-muted';
   tierLab.textContent = 'cost tier';
   tierRow.append(tierLab, _miniSelect('llm-model-tier', _tierOptions(s.tier), s.tier || ''));
   panel.appendChild(tierRow);
@@ -2189,7 +3318,7 @@ function _modelRow(containerId, val, i, s, openPanel) {
   testRow.className = 'flex min-w-0 items-center gap-2';
   testRow.appendChild(_miniBtn('test this model', 'send a tiny probe using this key pool + model + reasoning', () => _testModelRow(card)));
   const result = document.createElement('span');
-  result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-muted';
+  result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-muted';
   testRow.appendChild(result);
   panel.appendChild(testRow);
   card.appendChild(panel);
@@ -2208,7 +3337,7 @@ function _renderModelLadder(containerId, models, modelSettings, openSet) {
   });
   if (!list.length) {
     const empty = document.createElement('div');
-    empty.className = 'text-[11px] italic text-term-muted';
+    empty.className = 't-xs italic text-term-muted';
     empty.textContent = _LLM_MODEL_OPTS.emptyText;
     host.appendChild(empty);
   }
@@ -2227,7 +3356,7 @@ async function _testModelRow(card) {
   const result = card.querySelector('.llm-model-test-result');
   const model = card.querySelector('input.llm-list-input').value.trim();
   if (!model) {
-    result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+    result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
     result.textContent = 'enter a model id first';
     return;
   }
@@ -2247,21 +3376,21 @@ async function _testModelRow(card) {
   if (mt) payload.max_tokens = parseInt(mt, 10);
   const temp = $('llmTemperature').value.trim();
   if (temp !== '') payload.temperature = parseFloat(temp);
-  result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-muted';
+  result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-muted';
   result.textContent = 'testing…';
   result.title = '';
   try {
     const res = await pywebview.api.test_llm_config(payload);
     if (res && res.ok) {
-      result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-green';
+      result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-green';
       result.textContent = `✓ ${res.model}` + (res.reply ? ` — “${res.reply}”` : ' — reachable');
     } else {
-      result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+      result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
       result.textContent = '✕ ' + ((res && res.error) || 'connection failed');
       result.title = (res && res.error) || '';
     }
   } catch (e) {
-    result.className = 'llm-model-test-result min-w-0 truncate text-[10.5px] text-term-red';
+    result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
     result.textContent = '✕ ' + e;
   }
 }
@@ -2276,7 +3405,7 @@ function selectLlmProvider(id, existing) {
 
   for (const b of $('llmProviderTabs').children) {
     const active = b.dataset.pid === p.id;
-    b.className = 'rounded-full border px-3 py-1 text-[12px] ' + (active
+    b.className = 'rounded-full border px-3 py-1 t-sm ' + (active
       ? 'bg-term-cyan text-white border-term-cyan'
       : 'border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text');
   }
@@ -2403,7 +3532,7 @@ async function persistLlmConfigs(statusMsg) {
     }));
     const res = await pywebview.api.save_llm_configs(payload);
     if (!res || !res.ok) {
-      $('llmListStatus').className = 'text-[11px] text-term-red';
+      _llmStatusKind('error');
       $('llmListStatus').textContent = (res && res.error) || 'Save failed.';
       return false;
     }
@@ -2413,7 +3542,7 @@ async function persistLlmConfigs(statusMsg) {
       _llmProviders = fresh.providers || _llmProviders;
       renderLlmList();
     }
-    $('llmListStatus').className = 'text-[11px] text-term-green';
+    _llmStatusKind('ok');
     $('llmListStatus').textContent = '✓ ' + (statusMsg || 'saved') + (res.primary
       ? ` — primary: ${res.primary.name} (${res.primary.label} · ${res.primary.model})`
       : ' — no providers left');
@@ -2423,7 +3552,7 @@ async function persistLlmConfigs(statusMsg) {
     }
     return true;
   } catch (e) {
-    $('llmListStatus').className = 'text-[11px] text-term-red';
+    _llmStatusKind('error');
     $('llmListStatus').textContent = '' + e;
     return false;
   }
@@ -2516,24 +3645,28 @@ function resetGraph() {
 
 function switchTab(tab) {
   activeTab = tab;
-  const chatTab = $('chatTab'), graphTab = $('graphTab'), planTab = $('planTab');
-  const tabChat = $('tabChat'), tabGraph = $('tabGraph'), tabPlan = $('tabPlan');
-  const allTabs = [chatTab, graphTab, planTab];
-  const allBtns = [tabChat, tabGraph, tabPlan];
+  const chatTab = $('chatTab'), graphTab = $('graphTab'), planTab = $('planTab'), workflowTab = $('workflowTab');
+  const tabChat = $('tabChat'), tabGraph = $('tabGraph'), tabPlan = $('tabPlan'), tabWorkflow = $('tabWorkflow');
+  const allTabs = [chatTab, graphTab, planTab, workflowTab];
+  const allBtns = [tabChat, tabGraph, tabPlan, tabWorkflow];
 
   allTabs.forEach(el => el.classList.add('hidden'));
   graphTab.classList.remove('flex');
   planTab.classList.remove('flex');
+  // The tab strip is the shared .llm-tabs segmented control. This used to
+  // toggle border-term-cyan / border-transparent, which rendered nothing: the
+  // buttons carry no border width, so only the text colour ever changed.
   allBtns.forEach(btn => {
-    btn.classList.remove('border-term-cyan', 'text-term-cyan');
-    btn.classList.add('border-transparent', 'text-term-muted');
+    btn.classList.remove('active');
+    btn.setAttribute('aria-selected', 'false');
   });
+  const activeBtn = tab === 'graph' ? tabGraph : tab === 'plan' ? tabPlan : tab === 'workflow' ? tabWorkflow : tabChat;
+  activeBtn.classList.add('active');
+  activeBtn.setAttribute('aria-selected', 'true');
 
   if (tab === 'graph') {
     graphTab.classList.remove('hidden');
     graphTab.classList.add('flex');
-    tabGraph.classList.add('border-term-cyan', 'text-term-cyan');
-    tabGraph.classList.remove('border-transparent', 'text-term-muted');
     // Rebuilding the graph (fetch + layout) on every tab visit is expensive;
     // reuse it until a finished run invalidates it. The tab was hidden (and so
     // zero-size) while off-screen, so nudge the active engine to re-fit.
@@ -2547,13 +3680,11 @@ function switchTab(tab) {
   } else if (tab === 'plan') {
     planTab.classList.remove('hidden');
     planTab.classList.add('flex');
-    tabPlan.classList.add('border-term-cyan', 'text-term-cyan');
-    tabPlan.classList.remove('border-transparent', 'text-term-muted');
     renderPlanTab(currentPlan);
+  } else if (tab === 'workflow') {
+    workflowTab.classList.remove('hidden');
   } else {
     chatTab.classList.remove('hidden');
-    tabChat.classList.add('border-term-cyan', 'text-term-cyan');
-    tabChat.classList.remove('border-transparent', 'text-term-muted');
   }
 }
 
@@ -2644,7 +3775,7 @@ async function loadGraph(graphId) {
 // ---------- manual graph build (Build button on the Graph tab) ----------
 // Building on demand fixes the "No knowledge graph found" dead-end: the user no
 // longer has to ask the agent to run build_code_graph. The backend indexes on
-// the host (no Docker round-trip) straight into <workspace>/.codegraph/<id>/,
+// the host in-process straight into <workspace>/.codegraph/<id>/,
 // which is exactly where this tab reads — so the folder always appears.
 let buildFormOpen = false;
 
@@ -2685,12 +3816,13 @@ async function runManualBuild() {
   const status = $('graphBuildStatus');
   const btn = $('graphBuildRun');
   btn.disabled = true;
-  status.className = 'text-[11px] text-term-muted';
+  setBusy(btn, true);
+  status.className = 't-xs text-term-muted';
   status.textContent = 'Building… indexing files (this can take a moment).';
   try {
     const res = await pywebview.api.build_code_graph_ui(target, name, so, true);
     if (!res || !res.ok) {
-      status.className = 'text-[11px] text-term-red';
+      status.className = 't-xs text-term-red';
       status.textContent = 'Build failed: ' + escapeHtml((res && res.error) || 'unknown error');
       return;
     }
@@ -2698,11 +3830,11 @@ async function runManualBuild() {
     currentGraphId = res.graph_id;
     graphLoaded = false;
     if (res.empty) {
-      status.className = 'text-[11px] text-term-orange';
+      status.className = 't-xs text-term-orange';
       status.textContent = 'Built "' + escapeHtml(res.graph_id) + '" but it has no indexable code — pick a folder that contains source.';
       return;
     }
-    status.className = 'text-[11px] text-term-green';
+    status.className = 't-xs text-term-green';
     // Report HOW MUCH was indexed + WHERE the cache landed, so it's clear the
     // (whole-workspace) build actually covered the tree and wrote .codegraph.
     const c = res.counts || {};
@@ -2716,10 +3848,11 @@ async function runManualBuild() {
     else loadGraph(res.graph_id);
     setTimeout(() => { if (buildFormOpen) setBuildFormOpen(false); }, 1400);
   } catch (e) {
-    status.className = 'text-[11px] text-term-red';
+    status.className = 't-xs text-term-red';
     status.textContent = 'Build error: ' + escapeHtml('' + e);
   } finally {
     btn.disabled = false;
+    setBusy(btn, false);
   }
 }
 
@@ -2818,7 +3951,7 @@ function makeComparePane(graphs, chosenId, withDivider) {
   const head = document.createElement('div');
   head.className = 'flex items-center gap-2 px-2 py-1 border-b border-term-line bg-term-panel';
   const sel = document.createElement('select');
-  sel.className = 'min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-1.5 py-0.5 text-[11px] outline-none focus:border-term-cyan';
+  sel.className = 'min-w-0 flex-1 rounded-lg border border-term-line bg-term-bg px-1.5 py-0.5 t-xs outline-none focus:border-term-cyan';
   for (const g of graphs) {
     const o = document.createElement('option');
     o.value = g.id;
@@ -2827,7 +3960,7 @@ function makeComparePane(graphs, chosenId, withDivider) {
     sel.appendChild(o);
   }
   const stat = document.createElement('div');
-  stat.className = 'text-[10px] text-term-muted shrink-0';
+  stat.className = 't-2xs text-term-muted shrink-0';
   head.append(sel, stat);
   const canvas = document.createElement('div');
   canvas.className = 'flex-1 relative bg-term-bg';
@@ -2846,13 +3979,13 @@ async function drawComparePane(pane, graphId) {
     if (!res || !res.ok || !res.graph || !res.graph.nodes || !res.graph.nodes.length) {
       pane.canvas.innerHTML =
         '<div class="absolute inset-0 flex items-center justify-center p-4 text-center">' +
-        '<span class="text-term-muted text-[12px]">' +
+        '<span class="text-term-muted t-sm">' +
         escapeHtml((res && res.error) || 'This graph has no nodes.') + '</span></div>';
       pane.stat.textContent = '';
       return;
     }
     if (typeof vis === 'undefined') {
-      pane.canvas.innerHTML = '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-muted text-[12px]">2D graph library unavailable.</span></div>';
+      pane.canvas.innerHTML = '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-muted t-sm">2D graph library unavailable.</span></div>';
       return;
     }
     pane.net = buildStandaloneNetwork(pane.canvas, res.graph);
@@ -2860,7 +3993,7 @@ async function drawComparePane(pane, graphId) {
     pane.stat.textContent = s.total_nodes + 'n · ' + s.total_edges + 'e';
   } catch (e) {
     pane.canvas.innerHTML =
-      '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-red text-[12px]">' +
+      '<div class="absolute inset-0 flex items-center justify-center p-4"><span class="text-term-red t-sm">' +
       escapeHtml('' + e) + '</span></div>';
   }
 }
@@ -2966,7 +4099,7 @@ function renderGraph(data) {
 function showGraphError(container, msg) {
   container.innerHTML =
     '<div class="absolute inset-0 flex items-center justify-center p-6 text-center">' +
-    '<span class="text-term-muted text-[13px] max-w-sm leading-relaxed">' + escapeHtml(msg) + '</span></div>';
+    '<span class="text-term-muted t-base max-w-sm leading-relaxed">' + escapeHtml(msg) + '</span></div>';
   $('graphStats').textContent = '';
 }
 
@@ -2992,14 +4125,14 @@ function renderNodeInfo(nodeId) {
   const items = neighbors.map(nid => {
     const nb = _nodesById.get(nid);
     const color = (nb && nb.color && nb.color.background) || '#555';
-    return `<span class="block rounded-md px-1.5 py-0.5 text-[11px] cursor-pointer hover:bg-term-line" style="border-left:3px solid ${color}" onclick="focusGraphNode(${JSON.stringify(nid)})">${escapeHtml(nb ? nb.label : nid)}</span>`;
+    return `<span class="block rounded-md px-1.5 py-0.5 t-xs cursor-pointer hover:bg-term-line" style="border-left:3px solid ${color}" onclick="focusGraphNode(${JSON.stringify(nid)})">${escapeHtml(nb ? nb.label : nid)}</span>`;
   }).join('');
   $('graphInfo').innerHTML = `
     <div class="font-semibold text-term-text mb-1">${escapeHtml(n.label)}</div>
-    <div class="text-[11px] text-term-muted mb-0.5">community: ${escapeHtml(n.community_name)}</div>
-    <div class="text-[11px] text-term-muted mb-0.5">source: ${escapeHtml(n.source_file || '-')}</div>
-    <div class="text-[11px] text-term-muted mb-1">degree: ${n.degree}</div>
-    ${neighbors.length ? `<div class="text-[10px] text-term-muted mb-1">neighbors (${neighbors.length})</div><div class="space-y-0.5 max-h-32 overflow-y-auto">${items}</div>` : ''}`;
+    <div class="t-xs text-term-muted mb-0.5">community: ${escapeHtml(n.community_name)}</div>
+    <div class="t-xs text-term-muted mb-0.5">source: ${escapeHtml(n.source_file || '-')}</div>
+    <div class="t-xs text-term-muted mb-1">degree: ${n.degree}</div>
+    ${neighbors.length ? `<div class="t-2xs text-term-muted mb-1">neighbors (${neighbors.length})</div><div class="space-y-0.5 max-h-32 overflow-y-auto">${items}</div>` : ''}`;
 }
 
 // Center/select a node in whichever engine is active, then show its info.
@@ -3016,7 +4149,7 @@ function renderGraphLegend(data) {
   legendEl.innerHTML = '';
   data.legend.forEach(c => {
     const item = document.createElement('label');
-    item.className = 'flex items-center gap-1.5 py-0.5 cursor-pointer text-[11px] hover:text-term-text';
+    item.className = 'flex items-center gap-1.5 py-0.5 cursor-pointer t-xs hover:text-term-text';
     const cb = document.createElement('input');
     cb.type = 'checkbox'; cb.checked = true; cb.className = 'accent-term-cyan';
     cb.onchange = () => {
@@ -3025,7 +4158,7 @@ function renderGraphLegend(data) {
     };
     const dot = document.createElement('span'); dot.className = 'w-2.5 h-2.5 rounded-full inline-block'; dot.style.background = c.color;
     const label = document.createElement('span'); label.className = 'flex-1 truncate text-term-muted'; label.textContent = c.label;
-    const count = document.createElement('span'); count.className = 'text-[10px] text-term-muted'; count.textContent = c.count;
+    const count = document.createElement('span'); count.className = 't-2xs text-term-muted'; count.textContent = c.count;
     item.append(cb, dot, label, count);
     legendEl.appendChild(item);
   });
@@ -3172,44 +4305,28 @@ async function init() {
     if (st && st.active) await pywebview.api.restore_session();
   } catch (e) { /* stay on the start screen */ }
 
-  // "Select folder": pick a host folder at runtime, mount it, and start on it.
-  // No fixed workspace, no copy-in. (Import-from-folder button was removed.)
-  $('newProjectBtn').addEventListener('click', pickWorkspaceAndStart);
-  $('createProjectConfirm').addEventListener('click', async () => {
-    const name = $('newProjectInput').value.trim();
-    if (!name) return;
-    const res = await pywebview.api.create_project(name);
-    if (res.ok) {
-      await loadStartScreen();
-      $('projectSelect').value = name;
-      $('newProjectInput').value = '';
-      $('newProjectBox').classList.add('hidden'); $('newProjectBox').classList.remove('flex');
-    } else { $('startError').textContent = res.error; }
-  });
-
-  $('deleteProjectBtn').addEventListener('click', async () => {
-    $('startError').textContent = '';
-    const path = $('projectSelect').value;
-    if (!path || path.startsWith('(')) {
-      $('startError').textContent = 'Select a workspace folder to forget.'; return;
-    }
-    if (!confirm(`Forget workspace "${path}"?\n\nThis removes it from the recent list and deletes its saved chat. Your folder on disk is NOT touched.`)) return;
-    const btn = $('deleteProjectBtn'); btn.disabled = true;
-    try {
-      const res = await pywebview.api.delete_workspace(path);
-      if (res.ok) await loadStartScreen();
-      else $('startError').textContent = res.error || 'Failed to forget workspace.';
-    } catch (e) {
-      $('startError').textContent = '' + e;
-    } finally {
-      btn.disabled = false;
-    }
-  });
-
-  // Import-from-folder is gone (the picked folder is mounted + edited in place,
-  // no copy). The "Select folder" button above is the single entry point.
-
+  // "Open Folder…": pick a host folder at runtime, mount it, and start on it.
+  $('openFolderBtn').addEventListener('click', pickWorkspaceAndStart);
+  $('importFolderBtn').addEventListener('click', toggleImportBox);
+  $('importBrowseBtn').addEventListener('click', browseImportFolder);
+  $('importConfirmBtn').addEventListener('click', confirmImport);
   $('startSessionBtn').addEventListener('click', startSession);
+
+  $('recentFilter').addEventListener('input', renderRecent);
+  // Keyboard navigation over the recent list. Only while the picker is up, so it
+  // can never swallow keys meant for the chat composer.
+  document.addEventListener('keydown', (e) => {
+    if ($('startScreen').classList.contains('hidden')) return;
+    const typing = e.target === $('recentFilter');
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveWsSelection(1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); moveWsSelection(-1); }
+    else if (e.key === 'Enter' && !typing) { e.preventDefault(); startSession(); }
+    else if (e.key === 'Enter' && typing) { e.preventDefault(); startSession(); }
+    else if (e.key === '/' && !typing) { e.preventDefault(); $('recentFilter').focus(); }
+    else if (e.key === 'Escape' && typing && $('recentFilter').value) {
+      e.preventDefault(); $('recentFilter').value = ''; renderRecent();
+    }
+  });
 
   $('themeToggle').addEventListener('click', toggleTheme);
   $('themeToggleStart').addEventListener('click', toggleTheme);
@@ -3232,18 +4349,34 @@ async function init() {
 
   $('refreshTreeBtn').addEventListener('click', async () => {
     if (!session) return;
-    const r = await pywebview.api.get_file_tree();
-    if (r && r.ok) renderFileTree(r.tree);
+    showSkeleton($('fileTree'), 7);
+    try {
+      const r = await pywebview.api.get_file_tree();
+      if (r && r.ok) renderFileTree(r.tree);
+      else $('fileTree').innerHTML = '';
+    } finally {
+      clearSkeleton($('fileTree'));
+    }
   });
   $('uploadFilesBtn').addEventListener('click', uploadFiles);
   $('composerUploadBtn').addEventListener('click', uploadFiles);
+  wireTreeDropZone();
+  // The context menu closes on any outside click, Escape, or scroll — leaving it
+  // pinned over a re-rendered tree would let it act on a stale path.
+  document.addEventListener('click', () => closeContextMenu());
+  document.addEventListener('scroll', () => closeContextMenu(), true);
+  $('sidebarCollapseBtn').addEventListener('click', () => setSidebarCollapsed(true));
+  $('sidebarExpandBtn').addEventListener('click', () => setSidebarCollapsed(false));
+  applySidebarState();
   $('changeSessionBtn').addEventListener('click', async () => {
     await pywebview.api.end_session();
   });
   $('tabChat').addEventListener('click', () => switchTab('chat'));
   $('tabPlan').addEventListener('click', () => switchTab('plan'));
   $('tabGraph').addEventListener('click', () => switchTab('graph'));
+  $('tabWorkflow').addEventListener('click', () => switchTab('workflow'));
   $('planBadge').addEventListener('click', () => switchTab('plan'));
+  $('ultraToggle').addEventListener('click', toggleUltra);
   $('graphModeToggle').addEventListener('click', toggleGraphMode);
   // Manual build controls (fixes the "no graph yet" dead-end + enables one graph
   // per project for multi-project compare).
@@ -3262,15 +4395,17 @@ async function init() {
   if (window.ResizeObserver) {
     new ResizeObserver(() => { if (activeTab === 'graph') resizeGraph3D(); }).observe($('graphContainer'));
   }
-  $('viewerClose').addEventListener('click', () => $('fileViewer').classList.add('hidden'));
+  $('viewerClose').addEventListener('click', () => closeModal($('fileViewer')));
   $('viewerBack').addEventListener('click', backToArchiveListing);
-  $('fileViewer').addEventListener('click', (e) => { if (e.target.id === 'fileViewer') $('fileViewer').classList.add('hidden'); });
+  $('viewerForceText').addEventListener('click', viewerForceAsText);
+  // Inside an open archive, "Close" on the unsupported panel means "back to the
+  // listing" — dumping the user out of the whole archive would lose their place.
+  $('viewerUnsupportedClose').addEventListener('click', () => {
+    if (archiveViewer) backToArchiveListing();
+    else closeModal($('fileViewer'));
+  });
+  $('fileViewer').addEventListener('click', (e) => { if (e.target.id === 'fileViewer') closeModal($('fileViewer')); });
 
-  $('exportWorkspaceBtn').addEventListener('click', openExportModal);
-  $('exportModalClose').addEventListener('click', closeExportModal);
-  $('exportCancelBtn').addEventListener('click', closeExportModal);
-  $('exportApproveBtn').addEventListener('click', approveExport);
-  $('exportModal').addEventListener('click', (e) => { if (e.target.id === 'exportModal') closeExportModal(); });
 
   $('modelSelect').addEventListener('change', onModelSelected);
   $('llmSettingsBtn').addEventListener('click', openLlmModal);
@@ -3278,6 +4413,8 @@ async function init() {
   $('llmModalClose').addEventListener('click', closeLlmModal);
   $('llmDoneBtn').addEventListener('click', closeLlmModal);
   $('llmAddBtn').addEventListener('click', llmAddEntry);
+  $('llmTabText').addEventListener('click', () => llmShowModelPane('text'));
+  $('llmTabVision').addEventListener('click', () => llmShowModelPane('vision'));
   $('llmBackBtn').addEventListener('click', () => { $('llmError').textContent = ''; llmShowList(); });
   $('llmSaveBtn').addEventListener('click', saveLlmEntry);
   $('llmKeysAdd').addEventListener('click', () => _addListItem('llmKeysList', _LLM_KEY_OPTS));
@@ -3287,8 +4424,8 @@ async function init() {
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
-      $('fileViewer').classList.add('hidden');
-      closeExportModal();
+      closeContextMenu();
+      closeModal($('fileViewer'));
       closeLlmModal();
       _closeModelMenu();
     }

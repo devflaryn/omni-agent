@@ -63,8 +63,11 @@ def reset_salvage_stats():
 #   2. `from llm import CLINE_API_URL, API_KEY, MODEL_NAME` still resolves for the
 #      emulator vision tool (which now prefers get_openai_endpoint_config()).
 # Everything routes through the live config via get_effective_config().
+# API_KEY is sourced from the environment, not hardcoded, so no real credential
+# ships in source/history; without it set, first run seeds an empty/unconfigured
+# entry instead of a live key.
 CLINE_API_URL = "https://api.cline.bot/api/v1/chat/completions"
-API_KEY = "REDACTED_API_KEY"
+API_KEY = os.environ.get("OMNI_AGENT_SEED_API_KEY", "")
 MODEL_NAME = "cline-pass/glm-5.2"
 
 # Two request "protocols" cover every provider:
@@ -165,9 +168,45 @@ code, debug and fix bugs, reverse-engineer software and Android apps, patch and 
 native binaries, test apps on an emulator, and whatever else the task needs within your tools. You are not limited \
 to one domain — pick the tools and skills that fit the task in front of you.
 
-You run in a Linux Docker sandbox with the active project mounted at `/workspace`; all project files live there and \
-`/workspace/notes.md` is your scratchpad for persistent notes. Most tools run in the sandbox; the Android emulator \
-tools run on the host machine instead (their descriptions say so)."""
+You run DIRECTLY ON THE USER'S MACHINE ({os_name}) — there is no container and no virtual filesystem. \
+Every command runs with the user's PROJECT FOLDER as the working directory, so paths are ordinary relative \
+paths: `src/main.py`, `app_decompiled/smali`, `notes.md`. Write them the way you would in a terminal opened \
+in that folder. `notes.md` is your scratchpad for persistent notes. Every tool, including the Android \
+emulator tools, runs on this same machine and sees the same filesystem, so a file you write with one tool is \
+immediately visible to all the others.
+
+Your commands run in a POSIX shell with the GNU userland first on PATH (coreutils, sed, grep, findutils, \
+gawk) alongside the RE toolchain — apktool, jadx, baksmali/smali, radare2, Ghidra, apksigner, llvm/binutils \
+— so GNU-style commands and flags work as written. Install packages with {pkg_manager}.
+
+Because it is a real machine and not a disposable container, treat it with care: keep your work inside the \
+project folder, and do not modify files elsewhere on the system or install/uninstall software unless the \
+user asked you to."""
+
+
+def describe_host():
+    """(os_name, pkg_manager) for the system prompt.
+
+    The agent installs packages and writes shell commands against a REAL
+    machine, so telling it "macOS, use brew" on a Linux box is not a cosmetic
+    inaccuracy — it produces commands that cannot work. Detected once here
+    rather than hardcoded."""
+    import platform
+    import sys as _sys
+    if _sys.platform == "darwin":
+        return "macOS %s" % (platform.mac_ver()[0] or "").strip() or "macOS", "`brew`, never `apt-get`"
+    if os.name == "nt":
+        return "Windows (commands run in a POSIX shell — Git Bash / MSYS2 / WSL)", "`winget` or `choco`"
+    distro = ""
+    try:  # /etc/os-release is the portable way to name a Linux distribution
+        with open("/etc/os-release", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("PRETTY_NAME="):
+                    distro = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except OSError:
+        pass
+    return (distro or "Linux"), "the system package manager (`apt`, `dnf`, or `pacman`)"
 
 
 def get_static_system_prompt(native_tools=False):
@@ -180,7 +219,8 @@ def get_static_system_prompt(native_tools=False):
     OpenAI function-calling interface: they must NOT be told to emit the JSON
     envelope (that contradicts tool_choice=required and confuses the model), so
     the block points at the native interface and the final_answer tool instead."""
-    base_prompt = DEFAULT_SYSTEM_PROMPT
+    _os_name, _pkg_manager = describe_host()
+    base_prompt = DEFAULT_SYSTEM_PROMPT.format(os_name=_os_name, pkg_manager=_pkg_manager)
 
     if native_tools:
         base_prompt += """
@@ -250,12 +290,20 @@ PLAN & EXECUTE (adaptive, layered — the runtime expects it):
 - STEPS ARE SMALL AND VERIFIABLE: give an important step a clear "done when…" check plus action / purpose / expected /
   verification / fallback (fields on plan_add_task/plan_update_task). Mark a step in_progress when you start it,
   completed ONLY once done AND its verification passed, skipped (with a note) if moot.
-- PARALLELISM: steps in the SAME phase run CONCURRENTLY by default — starting one delegated step fans out every
-  independent delegated step in that phase at once. So GROUP independent research/probes into one phase, TAG each
-  with delegate="<agent>@<tier>", and they all run in parallel; when a step truly needs another's result, either
-  set its `depends_on` to that step's id (same phase) or put it in a LATER phase. Writes to the shared workspace
-  are always serialized for you. Prefer the smallest action that reduces uncertainty; avoid over-planning and
-  inventing unconfirmed details.
+- PARALLELISM — PLAN WIDE, NOT LONG: steps in the SAME phase run CONCURRENTLY by default — starting one delegated
+  step fans out every independent delegated step in that phase at once. So GROUP independent research/probes into
+  one phase, TAG each with delegate="<agent>@<tier>", and they all run in parallel; when a step truly needs
+  another's result, set its `depends_on` to that step's id (or put it in a LATER phase). Phases are DEPENDENCY
+  STAGES, not a to-do list: a phase of 12 independent steps costs about as much wall-clock as a phase of 1, so a
+  plan that reads as a chain is wasting most of the machine. `plan_add_tasks` adds a whole wave in ONE call — use
+  it instead of repeated plan_add_task. The plan render lists what is "Ready NOW"; if it says several steps have
+  no delegate, tag them.
+- CONCURRENT WRITES ARE SCOPED, NOT FORBIDDEN: give a change step a `scope` naming the workspace paths it owns
+  (e.g. scope=["smali/com/foo/**"]). Write steps with DISJOINT scopes execute at the SAME TIME; overlapping ones
+  queue automatically, and a write step with NO scope claims the whole workspace and blocks every other writer.
+  For a large multi-package/multi-library change, cut the work by OWNERSHIP (one step per package / .so / module,
+  each scoped) so the pieces build in parallel. Prefer the smallest action that reduces uncertainty; avoid
+  over-planning and inventing unconfirmed details.
 - ADVANCE with `plan_advance_phase` at a real milestone. REPLAN, don't drift: a SCOPED edit (add/update/reorder) for a
   course-correction; `plan_replan` (with reason) after a major failure / invalidated assumption / repeated dead ends —
   it preserves completed work. End with `plan_set_outcome` (completed / partial / blocked / needs_different_approach)
@@ -1796,7 +1844,12 @@ def _build_groups(configs):
                 mcfg["reasoning_effort"] = ""
                 mcfg["reasoning_style"] = "none"
             out.append({"id": settings.get("id"), "name": settings.get("name", ""),
-                        "model": model, "cfg": mcfg})
+                        "model": model, "cfg": mcfg,
+                        # The user's RAW per-model choice, kept beside cfg because
+                        # cfg cannot represent it: 'off' is flattened to '' above so
+                        # the request builder sends no reasoning params. The UI needs
+                        # to tell "explicitly off" from "not set", so it reads this.
+                        "effort_override": eff})
         return out
 
     for g in groups:
@@ -2096,22 +2149,89 @@ def set_preferred_model(config_id, model):
 def list_model_options():
     """Every text-model rung across all provider groups, flattened in fallback
     order, for the composer's model selector. Marks the user's preferred rung
-    (defaulting to the primary when nothing is pinned)."""
+    (defaulting to the primary when nothing is pinned).
+
+    Each rung also carries its CURRENT reasoning effort and the resolved
+    reasoning STYLE, so the composer's effort menu can render the right control
+    for that model (a thinking toggle for GLM, a level list for OpenAI-style,
+    nothing at all for a model that always reasons) without a second round trip.
+    """
     pref = get_preferred_model()
     out = []
     for g in _build_groups(get_effective_configs()):
         for m in g.get("models") or []:
+            cfg = m.get("cfg") or {}
             out.append({
                 "config_id": m.get("id"),
                 "name": m.get("name") or g.get("label") or g.get("provider"),
                 "label": g.get("label") or g.get("provider"),
                 "model": m["model"],
+                # The user's own per-model choice, not cfg's request-ready value:
+                # cfg flattens an explicit 'off' to '' (see _ladder), which would
+                # make the composer show "Default" for a model whose thinking the
+                # user had deliberately turned off. Falls back to the group-level
+                # effort when no per-model override exists.
+                "reasoning_effort": (m.get("effort_override")
+                                     or _norm_reasoning(cfg.get("reasoning_effort"))),
+                "reasoning_style": _resolve_reasoning_style(cfg) or "",
                 "preferred": bool(pref and pref["model"] == m["model"]
                                   and (not pref.get("config_id") or pref["config_id"] == m.get("id"))),
             })
     if out and not any(o["preferred"] for o in out):
         out[0]["preferred"] = True
     return out
+
+
+def set_model_effort(config_id, model, effort):
+    """Set (or clear, with a falsy effort) one model's reasoning effort.
+
+    Writes configs[i].model_settings[model].reasoning_effort — the same field the
+    LLM settings modal edits — so the composer's inline effort menu and the
+    settings panel are two views of one value rather than competing stores.
+    Returns True when the config file was written.
+    """
+    model = (model or "").strip()
+    if not model:
+        return False
+    data = _read_config_file()
+    if not isinstance(data, dict) or not isinstance(data.get("configs"), list):
+        data = {"version": 2, "configs": [_minimize_entry(c) for c in load_configs()]}
+
+    cid = (config_id or "").strip()
+    # Without a config_id, fall back to whichever entry actually lists the model.
+    target = None
+    for c in data["configs"]:
+        if not isinstance(c, dict):
+            continue
+        if cid and c.get("id") != cid:
+            continue
+        models = c.get("models") or ([c["model"]] if c.get("model") else [])
+        if model in models:
+            target = c
+            break
+    if target is None:
+        return False
+
+    ms = target.get("model_settings")
+    if not isinstance(ms, dict):
+        ms = {}
+        target["model_settings"] = ms
+    entry = ms.get(model)
+    if not isinstance(entry, dict):
+        entry = {}
+        ms[model] = entry
+
+    level = _norm_model_effort(effort)
+    if level:
+        entry["reasoning_effort"] = level
+    else:
+        entry.pop("reasoning_effort", None)
+        # Drop empties so clearing an override leaves no residue behind.
+        if not entry:
+            ms.pop(model, None)
+        if not ms:
+            target.pop("model_settings", None)
+    return _write_config_file(data)
 
 
 def _apply_preference(groups, pref):

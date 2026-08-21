@@ -7,8 +7,8 @@ diffing two builds).
 """
 
 from tool_registry import registry
-from tools.common import normalize_path
-from docker_sandbox import run_cmd
+from tools.common import normalize_path, wpath
+from host_exec import run_cmd
 
 
 @registry.register(
@@ -22,8 +22,8 @@ from docker_sandbox import run_cmd
         "digests so you can record/compare them in notes."
     ),
     params_schema={
-        "file_a": "string (path to the first file, relative to /workspace or absolute starting with /workspace)",
-        "file_b": "string (path to the second file, relative to /workspace or absolute starting with /workspace)"
+        "file_a": "string (path to the first file, relative to the project root)",
+        "file_b": "string (path to the second file, relative to the project root)"
     },
     output="Three lines: VERDICT (IDENTICAL or DIFFERENT), SHA256 A (the digest of file_a), SHA256 B (the digest of file_b). If either file is missing, an ERROR line says which file does not exist.",
     when_to_use="Use this to verify a rebuilt/signed APK matches a reference, confirm two .so libs are the same build, or check whether a patch actually changed a file."
@@ -35,20 +35,20 @@ def compare_files_sha256(file_a, file_b):
     cmd = (
         # Bail out early with a clear message if either file is missing,
         # otherwise sha256sum/cmp would just fail opaquely.
-        f"if [ ! -f /workspace/{file_a} ] || [ ! -f /workspace/{file_b} ]; then "
+        f"if [ ! -f {wpath(file_a)} ] || [ ! -f {wpath(file_b)} ]; then "
         f"  echo 'ERROR: One or both files do not exist.'; "
-        f"  test -f /workspace/{file_a} && echo 'FILE_A (/workspace/{file_a}): exists' || echo 'FILE_A (/workspace/{file_a}): MISSING'; "
-        f"  test -f /workspace/{file_b} && echo 'FILE_B (/workspace/{file_b}): exists' || echo 'FILE_B (/workspace/{file_b}): MISSING'; "
+        f"  test -f {wpath(file_a)} && echo 'FILE_A ({wpath(file_a)}): exists' || echo 'FILE_A ({wpath(file_a)}): MISSING'; "
+        f"  test -f {wpath(file_b)} && echo 'FILE_B ({wpath(file_b)}): exists' || echo 'FILE_B ({wpath(file_b)}): MISSING'; "
         f"  exit 1; "
         f"fi; "
         # cmp -s is a definitive byte-for-byte comparison (exit 0 => identical)
-        f"cmp -s /workspace/{file_a} /workspace/{file_b} && verdict='IDENTICAL' || verdict='DIFFERENT'; "
+        f"cmp -s {wpath(file_a)} {wpath(file_b)} && verdict='IDENTICAL' || verdict='DIFFERENT'; "
         # sha256sum gives a human-readable digest for each file
-        f"hash_a=$(sha256sum /workspace/{file_a} | awk '{{print $1}}'); "
-        f"hash_b=$(sha256sum /workspace/{file_b} | awk '{{print $1}}'); "
+        f"hash_a=$(sha256sum {wpath(file_a)} | awk '{{print $1}}'); "
+        f"hash_b=$(sha256sum {wpath(file_b)} | awk '{{print $1}}'); "
         f"echo \"VERDICT: $verdict\"; "
-        f"echo \"SHA256 A (/workspace/{file_a}): $hash_a\"; "
-        f"echo \"SHA256 B (/workspace/{file_b}): $hash_b\""
+        f"echo \"SHA256 A ({wpath(file_a)}): $hash_a\"; "
+        f"echo \"SHA256 B ({wpath(file_b)}): $hash_b\""
     )
     return run_cmd(cmd, timeout=60)
 
@@ -62,18 +62,18 @@ def compare_files_sha256(file_a, file_b):
         "compare_files_sha256 instead; to see WHICH bytes differ, use diff_binary_files."
     ),
     params_schema={
-        "file_path": "string (path to the file, relative to /workspace or absolute starting with /workspace)"
+        "file_path": "string (path to the file, relative to the project root)"
     },
-    output="One line: 'SHA256 (/workspace/<path>): <64-hex-digest>'. An ERROR line if the file does not exist.",
+    output="One line: 'SHA256 (<path>): <64-hex-digest>'. An ERROR line if the file does not exist.",
     when_to_use="Use this to get one file's SHA256 fingerprint to record or compare by hand. To compare two files directly use compare_files_sha256; to list byte-level differences use diff_binary_files."
 )
 def compute_sha256(file_path):
     file_path = normalize_path(file_path)
     cmd = (
-        f"if [ ! -f /workspace/{file_path} ]; then "
-        f"  echo 'ERROR: file not found: /workspace/{file_path}'; exit 1; "
+        f"if [ ! -f {wpath(file_path)} ]; then "
+        f"  echo 'ERROR: file not found: {file_path}'; exit 1; "
         f"fi; "
-        f"hash=$(sha256sum /workspace/{file_path} | cut -d' ' -f1); "
-        f"echo \"SHA256 (/workspace/{file_path}): $hash\""
+        f"hash=$(sha256sum {wpath(file_path)} | cut -d' ' -f1); "
+        f"echo \"SHA256 ({wpath(file_path)}): $hash\""
     )
     return run_cmd(cmd, timeout=60)

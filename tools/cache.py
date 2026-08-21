@@ -16,7 +16,7 @@ hash is recomputed from the ACTUAL file on every call, so:
     why directory-listing / file-reading / build / sign tools are NOT cached here:
     their output depends on mutable directory state that no single input-file hash
     captures (cache ``list_directory`` and an edit to the folder would be invisible).
-  * The cache is FAIL-OPEN. Any problem whatsoever — no workspace mounted (offline
+  * The cache is FAIL-OPEN. Any problem whatsoever — no active project (offline
     tests), an unreadable file, a corrupt/half-written archive, an extract error —
     is swallowed and reported as a miss (lookup) or a no-op (store), so the caller
     always falls back to running the real command. Caching can only make things
@@ -29,13 +29,12 @@ Two kinds of entry
 * TEXT — the tool returns a result dict derived purely from the file
   (``get_apk_signature_hash``, ``extract_manifest_info``, ``inspect_apk``). We
   store and replay that dict.
-* TREE — the tool ALSO writes an output directory into the workspace
+* TREE — the tool ALSO writes an output directory into the project folder
   (``unzip_apk``, ``decode_apk``, ``jadx_decompile``). We archive that directory
   and, on a hit, restore it into the requested output dir BEFORE replaying the
   dict, so downstream tools (recompile / search / read) see the files exactly as a
-  real run would have left them. Archiving/restoring happen host-side: the
-  workspace is bind-mounted into the sandbox, so files the sandbox wrote are
-  visible on the host and vice-versa.
+  real run would have left them. Archiving and restoring read and write the
+  project folder directly — the same files the tool commands operate on.
 
 Environment knobs
 -----------------
@@ -55,7 +54,12 @@ import tempfile
 # v2: store() now caches the FULL result dict (was: only stdout/stderr/returncode).
 # Bumping discards any v1 entries whose custom keys were dropped (e.g. broken vision
 # cache entries) so they repopulate correctly on the next run.
-_CACHE_VERSION = "v2"
+# v3: tool output now names files with project-relative paths. The cache is global
+# (~/.omni_agent_cache) and keyed on file BYTES, so entries written when tools
+# reported a `/workspace/...` root would otherwise be replayed verbatim into the
+# model's context — handing it paths that no longer resolve. A stale hit is
+# indistinguishable from a fresh one, so the entries have to be retired by key.
+_CACHE_VERSION = "v3"
 
 _READ_CHUNK = 1024 * 1024  # 1 MiB — streaming hash/copy chunk
 
@@ -81,9 +85,9 @@ def _entries_root():
 
 
 def _host_path(rel_path):
-    """Absolute HOST path for a ``/workspace``-relative path, or None when the
-    workspace isn't mounted (e.g. offline unit tests) — in which case caching is
-    simply unavailable and the caller runs the real command."""
+    """Absolute path for a project-relative path, or None when no project is
+    active (e.g. offline unit tests) — in which case caching is simply
+    unavailable and the caller runs the real command."""
     try:
         from tools.common import resolve_workspace_path
         return resolve_workspace_path(rel_path)
@@ -92,9 +96,9 @@ def _host_path(rel_path):
 
 
 def file_sha256(rel_path):
-    """SHA256 hex digest of a workspace file, computed on the host (fast, no docker
-    exec — the workspace is bind-mounted). None if the workspace isn't mounted or
-    the file can't be read; either way the caller treats it as 'cache unavailable'."""
+    """SHA256 hex digest of a workspace file, read directly rather than shelled out
+    to (fast — it is a plain local file). None if no workspace is active or the
+    file can't be read; either way the caller treats it as 'cache unavailable'."""
     host = _host_path(rel_path)
     if not host or not os.path.isfile(host):
         return None
@@ -158,11 +162,11 @@ def _read_meta(edir):
 
 
 # ---------------------------------------------------------------------------
-# Directory (TREE) archive / restore — host-side, via the bind mount
+# Directory (TREE) archive / restore
 # ---------------------------------------------------------------------------
 
 def _archive_tree(dir_rel, edir):
-    """Archive the workspace directory ``dir_rel`` into ``edir/tree.tar.gz``.
+    """Archive the project directory ``dir_rel`` into ``edir/tree.tar.gz``.
     Written atomically; returns True on success, False (and cleans up) on any error."""
     host = _host_path(dir_rel)
     if not host or not os.path.isdir(host):
@@ -238,7 +242,7 @@ def lookup(tool_name, target_rel, extra=None, restore_dir=None):
     """Return a cached result dict for (tool_name, sha256(target_rel), extra), or
     None on a miss / any problem.
 
-    For TREE tools, pass ``restore_dir`` (a ``/workspace``-relative dir): the
+    For TREE tools, pass ``restore_dir`` (a project-relative dir): the
     archived output tree is restored there as part of the hit, and the hit is only
     reported if that restore fully succeeds. The returned dict is a copy with a
     short ``[cache]`` banner appended to stdout so hits are visible in logs/UI."""
@@ -281,7 +285,7 @@ def store(tool_name, target_rel, result, extra=None, capture_dir=None):
     """Cache ``result`` under (tool_name, sha256(target_rel), extra). No-op on any
     error (fail-open). Errored results are never stored.
 
-    For TREE tools, pass ``capture_dir`` (a ``/workspace``-relative dir) to also
+    For TREE tools, pass ``capture_dir`` (a project-relative dir) to also
     archive that produced directory; if the archive fails, nothing is written (so a
     meta.json never promises a tree that isn't there)."""
     if not enabled() or not isinstance(result, dict) or result.get("error"):

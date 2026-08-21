@@ -48,7 +48,7 @@ def _run_with_ui_telemetry(run_fn):
     at once; instead we run the wave in a background thread, funnel its events
     through a thread-safe queue, and drain that queue HERE on the agent-loop
     thread — so `subagents.ui_emit` is only ever called from one thread, exactly
-    like agent.py's `_run_delegated_read_wave`. Returns whatever run_fn returns."""
+    like agent.py's `_run_delegated_wave`. Returns whatever run_fn returns."""
     q = _queue.Queue()
     _SENTINEL = object()
     holder = {}

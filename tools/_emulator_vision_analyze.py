@@ -10,9 +10,8 @@ Backend selection ("auto" by default):
      with an inline base64 image. If that request errors, times out, or the
      model's reply looks like a refusal/doesn't actually describe an image,
      fall back to local Ollama.
-  2. Local Ollama at http://localhost:11434 (both the agent and the emulator
-     run on the same Windows host now, so no host.docker.internal indirection
-     is needed) — works with any vision model the user has pulled (llava,
+  2. Local Ollama at http://localhost:11434 (the agent, the emulator and Ollama
+     all run on the same host, so plain localhost reaches it) — works with any vision model the user has pulled (llava,
      moondream, qwen2.5vl, bakllava, ...).
 If both fail, each frame is left with vision_description=None and an error
 note, so generate_test_report can still produce a report from brightness/diff

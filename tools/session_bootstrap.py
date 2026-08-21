@@ -24,6 +24,7 @@ clear of Roblox's WebView.setDataDirectorySuffix, if it makes one).
 """
 import os
 import re
+import shlex
 import shutil
 import xml.etree.ElementTree as ET
 
@@ -60,42 +61,23 @@ def _find_bootstrap_dex():
 
 
 def _baksmali(dex_path, out_dir):
-    """dex -> smali. `baksmali` only exists inside the Linux docker sandbox
-    (same place decode_apk/recompile_apk run apktool), not on the host, so
-    this shells into the container via docker_sandbox.run_cmd rather than a
-    raw host subprocess call — the two are different machines/filesystems.
-    `dex_path` is the prebuilt bootstrap dex, which lives in the omnidroid
-    checkout OUTSIDE the bind-mounted /workspace, so it is copied in under a
-    throwaway workspace-relative tmp name first; `out_dir` is already inside
-    the workspace (a subdir of decompiled_dir), so its result is copied back
-    out to the exact host path the caller asked for. Returns None on success,
-    else an error string."""
-    from docker_sandbox import run_cmd, get_workspace_host_path
-    try:
-        host_root = get_workspace_host_path()
-    except RuntimeError as e:
-        return str(e)
-    out_rel = os.path.relpath(out_dir, host_root)
-    if out_rel.startswith(".."):
-        return f"internal error: out_dir {out_dir} is not under the workspace {host_root}"
+    """dex -> smali, via the `baksmali` wrapper on PATH (the same one
+    decode_apk/recompile_apk reach for alongside apktool).
 
-    tmp_rel = ".omni-baksmali-tmp"
-    tmp_host = os.path.join(host_root, tmp_rel)
-    shutil.rmtree(tmp_host, ignore_errors=True)
-    os.makedirs(tmp_host, exist_ok=True)
-    dex_copy_host = os.path.join(tmp_host, "bootstrap.dex")
-    try:
-        shutil.copy2(dex_path, dex_copy_host)
-    except OSError as e:
-        shutil.rmtree(tmp_host, ignore_errors=True)
-        return f"could not stage bootstrap dex into the workspace: {e}"
+    `dex_path` is the prebuilt bootstrap dex from the omnidroid checkout, which
+    lives OUTSIDE the workspace. Since tools run on the host now, both it and
+    `out_dir` are addressed as plain absolute paths — no staging copy into the
+    workspace and back out. Returns None on success, else an error string."""
+    from host_exec import run_cmd
+    if not os.path.isfile(dex_path):
+        return f"bootstrap dex not found: {dex_path}"
 
-    cmd = (f"rm -rf /workspace/{out_rel} && "
-           f"baksmali d /workspace/{tmp_rel}/bootstrap.dex -o /workspace/{out_rel}")
+    dex_q = shlex.quote(os.path.abspath(dex_path))
+    out_q = shlex.quote(os.path.abspath(out_dir))
+    cmd = f"rm -rf {out_q} && baksmali d {dex_q} -o {out_q}"
     res = run_cmd(cmd, timeout=180)
-    shutil.rmtree(tmp_host, ignore_errors=True)
     if not isinstance(res, dict):
-        return "baksmali failed: no result from the sandbox"
+        return "baksmali failed: no result"
     if res.get("error"):
         return f"baksmali failed: {res['error']}"
     if res.get("returncode", 0) != 0:
@@ -325,7 +307,7 @@ def inject_session_bootstrap(decompiled_dir):
     if not decompiled_dir:
         return {"error": "decompiled_dir not found: (empty)"}
     # Every other apk_tools function (decode_apk, recompile_apk, sign_apk, ...)
-    # takes a path relative to /workspace and resolves it to the host path via
+    # takes a path relative to the project root and resolves it to the host path via
     # resolve_workspace_path. This one did raw os.path.isdir() on whatever the
     # caller passed — since the agent process's OS cwd is NOT the selected
     # project workspace, a normal call using that same convention (e.g. the

@@ -1,8 +1,8 @@
 """Adaptive, evidence-driven plan-and-execute state for the agent.
 
 A single active Plan is tracked per process — this app only ever runs one
-session at a time, the same assumption docker_sandbox.py already makes for
-the active container/workspace (module-level singleton, no session object
+session at a time, the same assumption host_exec.py already makes for
+the active workspace (module-level singleton, no session object
 threaded through). tools/plan_tools.py mutates the active plan; agent.py
 calls set_context() once per session so mutations autosave to the project's
 memory dir and push a real-time update to the GUI + the live system prompt,
@@ -29,7 +29,7 @@ evidence memory), not here — planning owns "what I intend to do and how I'll
 verify it", investigation owns "what I've established". The two are folded
 into the system prompt side by side.
 
-Kept intentionally free of any pywebview/Docker/LLM imports so it can be
+Kept intentionally free of any pywebview/shell/LLM imports so it can be
 tested and reasoned about in isolation — agent.py is the only place that
 bridges it to the rest of the app (see AgentApi._on_plan_update).
 """
@@ -91,6 +91,22 @@ def _clean_id_list(v):
     return [str(x).strip() for x in v if x and str(x).strip()]
 
 
+def _clean_scope(v):
+    """Normalize a step's `scope` to a list of workspace-relative path patterns.
+    Accepts a single string or a list; strips leading slashes so "/smali/x" and
+    "smali/x" mean the same thing to the scope comparison in subagents.py."""
+    if not v:
+        return []
+    if isinstance(v, str):
+        v = [v]
+    out = []
+    for x in v:
+        s = str(x or "").strip().replace("\\", "/").lstrip("/")
+        if s:
+            out.append(s)
+    return out
+
+
 class Plan:
     def __init__(self, task):
         self.task = task
@@ -116,7 +132,8 @@ class Plan:
     # --- steps (items) ---------------------------------------------------------
     def add_item(self, content, status="pending", after_id=None, notes=None,
                  action=None, purpose=None, expected=None, verification=None,
-                 fallback=None, phase_id=None, explanation=None, delegate=None, depends_on=None):
+                 fallback=None, phase_id=None, explanation=None, delegate=None, depends_on=None,
+                 scope=None):
         item = {
             "id": _new_id(),
             "content": content,
@@ -129,6 +146,12 @@ class Plan:
             # Steps this one waits for (same-phase ids). Empty => independent =>
             # eligible immediately, so the harness can dispatch it in parallel.
             "depends_on": _clean_id_list(depends_on),
+            # The workspace paths this step OWNS while it runs (globs/prefixes,
+            # e.g. ["smali/com/foo/**"]). Two write steps with DISJOINT scopes are
+            # safe to run at the same time, so this is what lets a big multi-file
+            # change fan out instead of serializing on one global workspace lock.
+            # Empty on a write step => exclusive (whole workspace), the safe default.
+            "scope": _clean_scope(scope),
             # Evidence-driven step fields (all optional; important steps fill them).
             "action": action or "",
             "purpose": purpose or "",
@@ -157,9 +180,61 @@ class Plan:
     def find(self, item_id):
         return next((it for it in self.items if it["id"] == item_id), None)
 
+    def add_items(self, steps, after_id=None):
+        """Add MANY steps in one shot — the batch path that makes a wide, parallel
+        phase practical to author (30 independent steps in one tool call instead of
+        30 round-trips).
+
+        Each step may be a plain string or a dict of the same fields add_item takes,
+        plus an optional local `key`. A step in the SAME batch may name another
+        step's `key` in its depends_on, and it is resolved to that step's real id
+        once every step exists — so a batch can express its own internal dependency
+        graph without the caller knowing ids in advance. Names that match no key in
+        the batch are left untouched (they may already be real ids from an earlier
+        call). Returns the created items in order."""
+        created = []
+        by_key = {}
+        for step in (steps or []):
+            if isinstance(step, dict):
+                content = (step.get("content") or step.get("step") or step.get("action") or "")
+                content = str(content).strip()
+                if not content:
+                    continue
+                item = self.add_item(
+                    content, after_id=after_id,
+                    status=step.get("status") or "pending",
+                    action=step.get("action"), purpose=step.get("purpose"),
+                    expected=step.get("expected"), verification=step.get("verification"),
+                    fallback=step.get("fallback"), notes=step.get("notes"),
+                    explanation=step.get("explanation"), delegate=step.get("delegate"),
+                    depends_on=step.get("depends_on"), scope=step.get("scope"),
+                )
+                key = str(step.get("key") or "").strip()
+                if key:
+                    by_key[key] = item["id"]
+            else:
+                content = str(step or "").strip()
+                if not content:
+                    continue
+                item = self.add_item(content, after_id=after_id)
+            if after_id:
+                # Keep a batch inserted after an anchor in its own given order
+                # rather than reversing it (each insert lands after the anchor).
+                after_id = item["id"]
+            created.append(item)
+
+        if by_key:
+            for item in created:
+                deps = item.get("depends_on") or []
+                if deps:
+                    item["depends_on"] = [by_key.get(d, d) for d in deps]
+        self._touch()
+        return created
+
     def update_item(self, item_id, status=None, content=None, notes=None,
                     action=None, purpose=None, expected=None, verification=None,
-                    fallback=None, explanation=None, delegate=None, depends_on=None):
+                    fallback=None, explanation=None, delegate=None, depends_on=None,
+                    scope=None):
         item = self.find(item_id)
         if not item:
             return None
@@ -176,7 +251,8 @@ class Plan:
         for key, val in (("action", action), ("purpose", purpose), ("expected", expected),
                          ("verification", verification), ("fallback", fallback),
                          ("explanation", explanation), ("delegate", delegate),
-                         ("depends_on", _clean_id_list(depends_on) if depends_on is not None else None)):
+                         ("depends_on", _clean_id_list(depends_on) if depends_on is not None else None),
+                         ("scope", _clean_scope(scope) if scope is not None else None)):
             if val is not None:
                 item[key] = val
         item["updated_at"] = time.time()
@@ -194,27 +270,35 @@ class Plan:
     def active_item(self):
         return next((it for it in self.items if it["status"] == "in_progress"), None)
 
-    def ready_delegatable_steps(self, dispatched_ids):
-        """Steps in the current phase that are ready to hand to a subagent right
-        now: they carry a `delegate`, aren't done or already dispatched, and every
-        same-phase id in their `depends_on` is completed/skipped. Foreign/self dep
-        ids are ignored (they never block). Returns them in plan order."""
+    def _deps_satisfied(self, item, done_ids, known_ids):
+        """Whether every dependency this step actually names is finished. A dep on
+        an id that exists ANYWHERE in the plan is honored (a cross-phase dependency
+        is real); an id that matches nothing — a typo, or a batch key that was never
+        resolved — is ignored so a bad reference can never deadlock the wave."""
+        deps = [d for d in (item.get("depends_on") or [])
+                if d in known_ids and d != item["id"]]
+        return all(d in done_ids for d in deps)
+
+    def ready_steps(self, dispatched_ids=None):
+        """Every step in the current phase that could START right now: not done,
+        not already dispatched, and all its dependencies satisfied. These are
+        mutually independent by construction, so they are exactly the batch that
+        may run AT THE SAME TIME — delegated ones fan out to subagents, the rest
+        are the orchestrator's own parallel options. Returns them in plan order."""
         dispatched_ids = dispatched_ids or set()
-        phase_ids = {it["id"] for it in self.items
-                     if it.get("phase_id") == self.current_phase_id}
+        known = {it["id"] for it in self.items}
         done = {it["id"] for it in self.items if it["status"] in DONE_STATUSES}
-        ready = []
-        for it in self.items:
-            if it.get("phase_id") != self.current_phase_id:
-                continue
-            if not (it.get("delegate") or "").strip():
-                continue
-            if it["status"] in DONE_STATUSES or it["id"] in dispatched_ids:
-                continue
-            deps = [d for d in it.get("depends_on", []) if d in phase_ids and d != it["id"]]
-            if all(d in done for d in deps):
-                ready.append(it)
-        return ready
+        return [it for it in self.items
+                if it.get("phase_id") == self.current_phase_id
+                and it["status"] not in DONE_STATUSES
+                and it["id"] not in dispatched_ids
+                and self._deps_satisfied(it, done, known)]
+
+    def ready_delegatable_steps(self, dispatched_ids):
+        """The subset of ready_steps that carries a `delegate` — i.e. the steps the
+        harness can hand to subagents right now, as one parallel wave."""
+        return [it for it in self.ready_steps(dispatched_ids)
+                if (it.get("delegate") or "").strip()]
 
     def progress(self):
         total = len(self.items)
@@ -341,10 +425,21 @@ class Plan:
         """Whether the task is finished. True when explicitly marked 'completed',
         or (for a still-active plan with steps) when every step is done. A plan
         marked partial / blocked / needs_different_approach is NOT complete, so the
-        agent resumes it to finish, replan, or change approach."""
+        agent resumes it to finish, replan, or change approach.
+
+        A PHASED plan is not complete while any phase is still pending or running,
+        even if the current phase's steps are all done — finishing phase 1 of 5 of
+        a large build is not finishing the task. Without this, a long multi-phase
+        job reads as "complete" the moment a phase empties, and the next user
+        message is treated as a brand-new task (re-brainstormed, re-planned) rather
+        than a continuation. The explicit `outcome == "completed"` check above is
+        the deliberate way out, and the final-answer gate in agent.py already
+        requires it before an answer is accepted."""
         if self.outcome == "completed":
             return True
         if self.outcome != "active":
+            return False
+        if any(p["status"] not in DONE_STATUSES for p in self.phases):
             return False
         return bool(self.items) and all(it["status"] in DONE_STATUSES for it in self.items)
 
@@ -433,6 +528,8 @@ class Plan:
                 lines.append(f"    → delegate to subagent: {it['delegate']}")
             if it.get("depends_on"):
                 lines.append(f"    ↳ waits for: {', '.join(it['depends_on'])}")
+            if it.get("scope"):
+                lines.append(f"    ⌗ owns: {', '.join(it['scope'])}")
             # Fold the evidence fields onto a compact indented line when present, so
             # an important step reads as action/why/expect/verify/fallback.
             detail = []
@@ -442,6 +539,18 @@ class Plan:
                     detail.append(f"{label}: {it[key]}")
             if detail:
                 lines.append("    " + " | ".join(detail))
+
+        # The parallel picture, stated as ids. Without this the model has to derive
+        # "what can run at the same time right now" from the dependency lines every
+        # turn — so it usually doesn't, and works the wide phase one step at a time.
+        ready = [it for it in self.ready_steps() if it["status"] == "pending"]
+        if len(ready) > 1:
+            lines.append("Ready NOW — independent, may run concurrently: "
+                         + ", ".join(f"({it['id']})" for it in ready))
+            undelegated = [it for it in ready if not (it.get("delegate") or "").strip()]
+            if len(undelegated) > 1:
+                lines.append(f"  ({len(undelegated)} of them have no delegate — tag them to fan "
+                             "them out as one wave instead of doing them serially.)")
 
         if self.next_action:
             lines.append(f"Next action: {self.next_action}")
@@ -464,6 +573,7 @@ class Plan:
                         "phase_id", "notes", "explanation", "delegate"):
                 it.setdefault(key, "")
             it.setdefault("depends_on", [])
+            it.setdefault("scope", [])
         plan.phases = data.get("phases", []) or []
         plan.current_phase_id = data.get("current_phase_id")
         plan.success_criteria = data.get("success_criteria", []) or []

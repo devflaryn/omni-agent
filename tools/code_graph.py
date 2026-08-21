@@ -2,51 +2,54 @@
 
 These let the agent analyze thousands of .smali files (and .so native symbol
 tables) WITHOUT re-reading them every turn, which saves a huge amount of
-tokens and context. The heavy lifting is done by two Python scripts that run
-INSIDE the Docker sandbox:
+tokens and context. The heavy lifting is done by two Python scripts:
 
   - _kg_indexer.py : walks a directory, parses every .smali file into a graph
                      (classes / methods / call-edges / string-xrefs / .so
-                     symbols), and caches it under /workspace/.codegraph/
+                     symbols), and caches it under <project>/.codegraph/
   - _kg_query.py   : answers compact queries against those cached graphs
 
 NAMED GRAPHS (multi-version support)
 ------------------------------------
-Each build is stored in its OWN namespace, /workspace/.codegraph/<graph_id>/, so
+Each build is stored in its OWN namespace, <project>/.codegraph/<graph_id>/, so
 several graphs can coexist instead of overwriting/mixing. `graph_id` defaults to a
 slug of `root_dir`, so indexing two versions of an app in different directories
 (e.g. `roblox_v1` and `roblox_v2`) automatically produces two independent graphs.
 `diff_code_graphs` then compares them, and `list_code_graphs` lists them.
 
-The scripts are shipped from the host to the container as base64 so there are
-no shell-escaping issues (same trick write_file uses), and they require no
-extra dependencies beyond python3 + nm (both present in the sandbox image).
+The scripts are piped into python3 as base64 so there are no shell-escaping
+issues (same trick write_file uses), and they require no extra dependencies
+beyond python3 + nm. Running them through the shell tool path (rather than
+importing them) is deliberate: a full index of a large tree can take minutes,
+and that path is the one that honors the user's Stop button and the timeout
+decider. An in-process build is kept as a backstop for when the shell run comes
+back empty.
 """
 import os
 import re
 import json
 
 from tool_registry import registry
-from tools.common import normalize_path, run_script_in_sandbox
+from tools.common import normalize_path, run_python_script
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _INDEXER_PATH = os.path.join(_HERE, "_kg_indexer.py")
 _QUERY_PATH = os.path.join(_HERE, "_kg_query.py")
 
 
-def _run_script_in_sandbox(script_path, args, timeout):
-    return run_script_in_sandbox(script_path, args, timeout)
+def _run_python_script(script_path, args, timeout):
+    return run_python_script(script_path, args, timeout)
 
 
 def _host_build_fallback(root_dir, inc, frc, gid):
-    """Build the graph directly on the HOST (no Docker) into the same
+    """Build the graph IN-PROCESS (this app's own interpreter) into the same
     <workspace>/.codegraph/<gid>/ the Graph tab reads.
 
-    Used as a fallback when the sandbox build produced nothing — e.g. the
-    container isn't running or the bind mount didn't surface the .codegraph
-    directory on the host. That failure mode is exactly what leaves the Graph
-    tab stuck on "No knowledge graph found" even though the agent "built" one,
-    so we retry natively rather than silently succeeding with no on-disk graph.
+    Used as a backstop when the shell build produced nothing — e.g. no `python3`
+    resolved on PATH, or the indexer walked the wrong root. That failure mode is
+    exactly what leaves the Graph tab stuck on "No knowledge graph found" even
+    though the agent "built" one, so we retry with the interpreter we know exists
+    rather than silently succeeding with no on-disk graph.
 
     Returns a result dict: {"stdout": ...} on success, else {"error": ...} with a
     concrete reason (so a failure is diagnosable rather than a vague error)."""
@@ -54,14 +57,17 @@ def _host_build_fallback(root_dir, inc, frc, gid):
     import subprocess
     from tools.common import resolve_workspace_path
     try:
-        from docker_sandbox import get_workspace_host_path
-        host_root = get_workspace_host_path()
+        from host_exec import workspace_root
+        host_root = workspace_root()
     except Exception as e:
         return {"error": "no host workspace is available for a host-side build (%s)" % e}
     if not host_root or not os.path.isdir(host_root):
         return {"error": "host workspace path is missing or not a directory: %r" % host_root}
     target = resolve_workspace_path(root_dir)
-    env = dict(os.environ)
+    # Inherit the tool PATH (llvm/binutils `nm` for .so symbol tables, which the
+    # app's own bare environment may not have) and then pin the workspace root.
+    from host_exec import build_env
+    env = build_env()
     env["CODEGRAPH_WORKSPACE"] = host_root  # graphs land under <host_root>/.codegraph/
     try:
         proc = subprocess.run(
@@ -81,7 +87,7 @@ def _slug(value):
     """Turn a root_dir or a user-supplied id into a safe graph-namespace slug.
 
     Mirrors _kg_*.py's _sanitize_graph_id so the id we compute on the host maps to
-    the same on-disk directory the sandbox scripts use. Path separators collapse to
+    the same on-disk directory the indexer/query scripts use. Path separators collapse to
     '__' (so 'app/smali' -> 'app__smali') rather than being stripped to the last
     segment, keeping distinct roots distinct.
     """
@@ -129,12 +135,11 @@ def _auto_build_workspace_graph():
 def _looks_empty(stdout):
     r"""True when an indexer run reported that it found NO classes/functions.
 
-    On Windows this is the tell-tale of the Docker mount's long-path problem:
-    Docker Desktop's file sharing can't serve host paths longer than 260 chars,
-    so a deeply nested smali tree is silently skipped inside the container and
-    the build comes back 'successful' but with 0 classes. We treat that as a
-    failure so the host fallback (which opens files via the extended-length
-    \\?\ API, where long paths work) gets a chance to actually index them."""
+    A build that walks the wrong root, or is stopped by a path the walker can't
+    open (on Windows, a deeply nested smali tree past the 260-char limit),
+    reports 'successful' with 0 classes. Treating that as a failure is what lets
+    the in-process backstop — which opens files via the extended-length \\?\ API
+    — get a chance to actually index them."""
     if not stdout:
         return True
     if "WARNING: 0 classes" in stdout:
@@ -143,12 +148,13 @@ def _looks_empty(stdout):
     return bool(m) and int(m.group(1)) == 0
 
 
-def _sandbox_build(sandbox_root, inc, frc, gid):
-    """Run the indexer in the Docker sandbox. Returns {"stdout": ...} only when
-    it produced a REAL (non-empty) graph; otherwise None (so the caller falls
-    back to the host build)."""
+def _shell_build(root_dir, inc, frc, gid):
+    """Run the indexer through the shell tool path (so Stop and the timeout
+    decider apply to a long index). Returns {"stdout": ...} only when it produced
+    a REAL (non-empty) graph; otherwise None, so the caller falls back to the
+    in-process build."""
     try:
-        res = _run_script_in_sandbox(_INDEXER_PATH, [sandbox_root, inc, frc, gid], timeout=900)
+        res = _run_python_script(_INDEXER_PATH, [root_dir, inc, frc, gid], timeout=900)
     except Exception:
         return None
     out = (res.get("stdout") if isinstance(res, dict) else "") or ""
@@ -165,22 +171,21 @@ def _sandbox_build(sandbox_root, inc, frc, gid):
         "Use this ONCE when you land in a big/unfamiliar tree (a decompiled APK's apktool/smali dir, OR a normal project root — pass '.' for the whole workspace) so you can query classes/functions/call-graphs/string-refs WITHOUT re-reading thousands of files (saves tokens & context). "
         "Parses each file for: classes (with super/interfaces where available), methods/functions with file:line, call-edges (caller->callee, resolved by name for general source), and string literals. Also indexes exported/imported symbols of every .so via nm. "
         "MULTI-PROJECT / MULTI-VERSION: each build is stored under its own graph_id (defaults to a slug of root_dir), so several graphs coexist without mixing — build one per project/app-version in separate directories, then compare with diff_code_graphs. Building over '.' indexes the whole workspace and separates each top-level project into its own colored community. "
-        "Cached under /workspace/.codegraph/<graph_id>/ and only rebuilt when files change (unless force=true). "
+        "Cached in the project folder/.codegraph/<graph_id>/ and only rebuilt when files change (unless force=true). "
         "NOTE: query_code_graph and ask_codebase will auto-build a workspace graph if none exists yet, so you usually don't need to call this by hand — do call it explicitly to index a SPECIFIC sub-directory or to name a version for a later diff. "
         "Returns a compact summary (counts + top classes + the graph_id used) — NOT the source code."
     ),
     params_schema={
-        "root_dir": "string (directory to index, relative to /workspace). Examples: '.' for the whole workspace, a project root like 'backend', or a decompiled dir like 'app_decompiled/smali'.",
+        "root_dir": "string (directory to index, relative to the project root). Examples: '.' for the whole workspace, a project root like 'backend', or a decompiled dir like 'app_decompiled/smali'.",
         "include_so": "boolean (optional, default true) — also index .so native symbol tables",
         "force": "boolean (optional, default false) — force a full rebuild even if cache is fresh",
         "graph_id": "string (optional) — name this graph so it doesn't collide with others. Defaults to a slug of root_dir. Use distinct ids (or distinct root_dirs) when indexing multiple projects/versions you want to keep separate or compare."
     },
-    output="A compact summary: the graph_id used, file counts (smali + source, with detected languages), classes count, methods count, call-edges count, string-refs count, and the top 10 classes/modules by method count. NOT the source code. The graph is saved as small chunked JSON files under /workspace/.codegraph/<graph_id>/.",
+    output="A compact summary: the graph_id used, file counts (smali + source, with detected languages), classes count, methods count, call-edges count, string-refs count, and the top 10 classes/modules by method count. NOT the source code. The graph is saved as small chunked JSON files in the project folder/.codegraph/<graph_id>/.",
     when_to_use="Call this ONCE per codebase/project/version to map a big tree. To compare two versions, build each into its OWN graph (different root_dir or explicit graph_id) then call diff_code_graphs. For a single project, query_code_graph/ask_codebase auto-build over the workspace, so prefer those unless you need a specific sub-dir or a named version."
 )
 def build_code_graph(root_dir, include_so=True, force=False, graph_id=None):
     root_dir = normalize_path(root_dir)
-    sandbox_root = "/workspace" if root_dir == "." else "/workspace/" + root_dir
     inc = "1" if include_so in (True, "true", "True", 1, "1") else "0"
     frc = "1" if force in (True, "true", "True", 1, "1") else "0"
     gid = _resolve_graph_id(graph_id, root_dir)
@@ -198,17 +203,12 @@ def build_code_graph(root_dir, include_so=True, force=False, graph_id=None):
             if fb and "stdout" in fb else "host build unavailable")
         return None
 
-    # The agent host is Windows, where Docker Desktop's file sharing can't serve
-    # paths >260 chars and is slow over the bind mount — so the SANDBOX build
-    # routinely times out or comes back empty on big decompiled trees (the exact
-    # failure the user hit). Index on the HOST first there (long paths via \\?\,
-    # straight off local disk, same code path as the working "Build graph"
-    # button); use the sandbox only as a backstop. On non-Windows hosts, prefer
-    # the sandbox (nm there also fills in .so symbol tables).
-    if os.name == "nt":
-        r = try_host() or _sandbox_build(sandbox_root, inc, frc, gid)
-    else:
-        r = _sandbox_build(sandbox_root, inc, frc, gid) or try_host()
+    # Prefer the shell build: indexing a large decompiled tree runs for minutes,
+    # and only that path is interruptible by the user's Stop button and eligible
+    # for the timeout decider's extensions. On Windows it can still come back
+    # empty (paths past the 260-char limit), so the in-process build — which
+    # opens files via the extended-length \\?\ API — is the backstop everywhere.
+    r = _shell_build(root_dir, inc, frc, gid) or try_host()
     if r:
         return r
 
@@ -216,8 +216,8 @@ def build_code_graph(root_dir, include_so=True, force=False, graph_id=None):
     # agent (and the user) sees WHY instead of a generic failure.
     if host_err:
         return {"error": "Could not build the code graph: %s" % host_err}
-    return {"error": "Could not build the code graph (sandbox produced no graph and no host "
-                     "workspace was available). Try the 'Build graph' button on the Graph tab."}
+    return {"error": "Could not build the code graph (the indexer produced no graph and no "
+                     "workspace was active). Try the 'Build graph' button on the Graph tab."}
 
 
 @registry.register(
@@ -255,7 +255,7 @@ def query_code_graph(name="", query_type="search", limit=40, graph_id=None):
     gid = _slug(graph_id) if (graph_id or "").strip() else ""
 
     def _run(g):
-        r = _run_script_in_sandbox(_QUERY_PATH, [query_type, name, str(limit), g, ""], timeout=120)
+        r = _run_python_script(_QUERY_PATH, [query_type, name, str(limit), g, ""], timeout=120)
         if r.get("returncode") == 0 and r.get("stdout"):
             return {"stdout": r["stdout"]}
         return r
@@ -291,7 +291,7 @@ def query_code_graph(name="", query_type="search", limit=40, graph_id=None):
     when_to_use="Call this to discover which graph_ids exist (e.g. before diff_code_graphs) or to confirm a build landed in its own namespace."
 )
 def list_code_graphs():
-    res = _run_script_in_sandbox(_QUERY_PATH, ["graphs", "", "40", "", ""], timeout=60)
+    res = _run_python_script(_QUERY_PATH, ["graphs", "", "40", "", ""], timeout=60)
     if res.get("returncode") == 0 and res.get("stdout"):
         return {"stdout": res["stdout"]}
     return res
@@ -323,7 +323,7 @@ def diff_code_graphs(graph_a, graph_b, limit=40):
         limit = 40
     a = _slug(graph_a)
     b = _slug(graph_b)
-    res = _run_script_in_sandbox(_QUERY_PATH, ["diff", "", str(limit), a, b], timeout=180)
+    res = _run_python_script(_QUERY_PATH, ["diff", "", str(limit), a, b], timeout=180)
     if res.get("returncode") == 0 and res.get("stdout"):
         return {"stdout": res["stdout"]}
     return res

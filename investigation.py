@@ -2,7 +2,7 @@
 
 A single active Investigation is tracked per process — the same singleton
 pattern planning.py uses, and for the same reason: this app runs one session at
-a time (see docker_sandbox.py's active-container assumption). It records what
+a time (see host_exec.py's single-active-workspace assumption). It records what
 the agent has actually ESTABLISHED, kept separate from the raw conversation, so
 that:
 
@@ -20,7 +20,7 @@ that:
   * the loop can detect when the model is about to repeat an approach already
     recorded as failed, and demand new evidence before letting it retry.
 
-Kept deliberately free of pywebview / Docker / LLM imports so it can be tested
+Kept deliberately free of pywebview / shell / LLM imports so it can be tested
 and reasoned about in isolation. agent.py is the only place that bridges it to
 the rest of the app (set_context + a notify callback), the same way it wires up
 planning.py.

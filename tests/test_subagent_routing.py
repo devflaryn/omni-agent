@@ -122,10 +122,15 @@ def test_notes_accumulate_across_call_and_frontmatter_unknown_ids(monkeypatch):
 
 def test_normalize_spec_shapes():
     ad = AgentDef("a", "p")
-    assert subagents._normalize_spec((ad, "t")) == (ad, "t", "", None, None)
-    assert subagents._normalize_spec((ad, "t", "c")) == (ad, "t", "c", None, None)
+    assert subagents._normalize_spec((ad, "t")) == (ad, "t", "", None, None, None)
+    assert subagents._normalize_spec((ad, "t", "c")) == (ad, "t", "c", None, None, None)
     assert subagents._normalize_spec(
-        {"agent_def": ad, "task": "t", "tier": "cheap"}) == (ad, "t", "", "cheap", None)
+        {"agent_def": ad, "task": "t", "tier": "cheap"}) == (ad, "t", "", "cheap", None, None)
+    # A spec may carry the workspace paths its step owns, so a write subagent can
+    # run concurrently with disjoint-scoped siblings.
+    assert subagents._normalize_spec(
+        {"agent_def": ad, "task": "t", "scope": ["smali/a/**"]}
+    ) == (ad, "t", "", None, None, ["smali/a/**"])
 
 
 def test_run_subagent_pins_the_resolved_ladder(monkeypatch):

@@ -38,8 +38,8 @@ import urllib.parse
 import requests
 
 from tool_registry import registry
-from tools.common import normalize_path
-from docker_sandbox import get_workspace_host_path
+from tools.common import normalize_path, wpath
+from host_exec import workspace_root
 
 # A realistic desktop browser UA for the direct-fetch fallbacks; some origins
 # 403 the default python-requests UA.
@@ -356,7 +356,7 @@ def _safe_workspace_dest(dest, fallback_name):
     """Resolve `dest` to an absolute host path INSIDE the workspace. If dest is
     empty or a directory, place `fallback_name` in it. Returns (abs_path, rel)
     or raises ValueError on traversal outside the workspace."""
-    host_root = os.path.abspath(get_workspace_host_path())
+    host_root = os.path.abspath(workspace_root())
     rel = normalize_path(dest) if dest else "."
     # Treat a trailing slash or an existing directory as a target folder.
     looks_dir = (not dest) or dest.endswith(("/", "\\")) or rel == "."
@@ -415,7 +415,7 @@ def download_file(url, dest=None, max_mb=_DEFAULT_MAX_MB):
         max_bytes = _DEFAULT_MAX_MB * 1024 * 1024
 
     try:
-        get_workspace_host_path()
+        workspace_root()
     except RuntimeError:
         return {"error": "download_file: no active workspace — start a project first."}
 
@@ -468,7 +468,7 @@ def download_file(url, dest=None, max_mb=_DEFAULT_MAX_MB):
 
     return {"stdout": (
         f"Downloaded OK.\n"
-        f"  Saved to: /workspace/{rel}\n"
+        f"  Saved to: {wpath(rel)}\n"
         f"  Size: {written:,} bytes ({written/1048576:.2f} MB)\n"
         f"  Content-Type: {ctype}\n"
         f"  Source: {url}"

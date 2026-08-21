@@ -29,11 +29,12 @@ Write your plan to `/workspace/notes.md` using `write_file`. Include:
 
 ## Step 4 — Install dependencies and build
 If the project needs dependencies installed or a build step:
-- The workspace runs inside a Linux Docker sandbox.
-- Use `write_file` to create a shell script if needed, then the sandbox tools to run it.
-- For Python: create requirements.txt and use pip install.
+- Commands run on the host machine (macOS, with the GNU userland first on PATH), rooted at the project root.
+- Use `write_file` to create a shell script if needed, then `run_command` to run it.
+- For Python: create requirements.txt and use pip install (prefer a venv inside the project).
 - For Node.js: create package.json and use npm install.
-- For C/C++: use gcc/g++/make.
+- For C/C++: use clang/gcc/make.
+- Install missing system packages with `brew`, not `apt-get` — and only when the task needs it.
 
 ## Step 5 — Test
 1. Write a test script or test file.

@@ -7,8 +7,8 @@ build logs) without dumping thousands of lines into the context window:
   - compare_directories : diff two directories to find what files differ
 """
 from tool_registry import registry
-from tools.common import normalize_path, build_paginated_command, append_page_hint
-from docker_sandbox import run_cmd
+from tools.common import normalize_path, build_paginated_command, append_page_hint, wpath
+from host_exec import run_cmd
 
 
 @registry.register(
@@ -21,7 +21,7 @@ from docker_sandbox import run_cmd
         "Example: grep_file filepath='crash.log' pattern='FATAL|Exception' to find crash lines."
     ),
     params_schema={
-        "filepath": "string (path to the file to search, relative to /workspace)",
+        "filepath": "string (path to the file to search, relative to the project root)",
         "pattern": "string (regex pattern to match, e.g. 'FATAL|Exception|Error')",
         "max_lines": "integer (optional, max matching lines to return, default 100)",
         "skip": "integer (optional, number of matches to skip for pagination, default 0)",
@@ -34,7 +34,7 @@ def grep_file(filepath, pattern, max_lines=100, skip=0, case_insensitive=True):
     filepath = normalize_path(filepath)
     ci_flag = "-i" if case_insensitive in (True, "true", "True", 1, "1") else ""
     # -E for extended regex so | works as alternation (e.g. 'FATAL|ERROR')
-    base = f"grep -nE {ci_flag} '{pattern}' /workspace/{filepath}"
+    base = f"grep -nE {ci_flag} '{pattern}' {wpath(filepath)}"
     cmd = build_paginated_command(base, max_lines=max_lines, skip=skip)
     res = run_cmd(cmd, timeout=60)
     if res["returncode"] == 0 or res.get("stdout"):
@@ -58,7 +58,7 @@ def grep_file(filepath, pattern, max_lines=100, skip=0, case_insensitive=True):
         "Much more efficient than read_file_chunk when you just need to see how a log ends."
     ),
     params_schema={
-        "filepath": "string (path to the file, relative to /workspace)",
+        "filepath": "string (path to the file, relative to the project root)",
         "num_lines": "integer (optional, number of lines from the end, default 100)"
     },
     output="A header showing total line count, followed by the last N lines of the file. Much more efficient than read_file_chunk when you only need the tail.",
@@ -70,10 +70,10 @@ def tail_file(filepath, num_lines=100):
         num_lines = int(num_lines)
     except Exception:
         num_lines = 100
-    count_cmd = f"wc -l < /workspace/{filepath}"
+    count_cmd = f"wc -l < {wpath(filepath)}"
     count_res = run_cmd(count_cmd, timeout=10)
     total = count_res["stdout"].strip() if count_res["returncode"] == 0 else "?"
-    cmd = f"tail -n {num_lines} /workspace/{filepath}"
+    cmd = f"tail -n {num_lines} {wpath(filepath)}"
     res = run_cmd(cmd, timeout=60)
     if res["returncode"] != 0:
         return res
@@ -95,7 +95,7 @@ def tail_file(filepath, num_lines=100):
         "noise (e.g. '*.png'). Results are paginated with skip/max_lines."
     ),
     params_schema={
-        "directory": "string (directory to search under, relative to /workspace, e.g. 'app_jadx/sources')",
+        "directory": "string (directory to search under, relative to the project root, e.g. 'app_jadx/sources')",
         "pattern": "string (regex pattern to match, e.g. 'https?://|api_key|Base64')",
         "include_glob": "string (optional, only search files matching this glob, e.g. '*.java' or '*.xml')",
         "exclude_glob": "string (optional, skip files matching this glob, e.g. '*.png')",
@@ -112,7 +112,7 @@ def grep_directory(directory, pattern, include_glob=None, exclude_glob=None,
     ci_flag = "-i " if case_insensitive in (True, "true", "True", 1, "1") else ""
     inc = f"--include={include_glob!r} " if include_glob else ""
     exc = f"--exclude={exclude_glob!r} " if exclude_glob else ""
-    base = f"grep -rnE {ci_flag}{inc}{exc}'{pattern}' /workspace/{directory}"
+    base = f"grep -rnE {ci_flag}{inc}{exc}'{pattern}' {wpath(directory)}"
     cmd = build_paginated_command(base, max_lines=max_lines, skip=skip)
     res = run_cmd(cmd, timeout=180)
     if res["returncode"] == 0 or res.get("stdout"):
@@ -135,8 +135,8 @@ def grep_directory(directory, pattern, include_glob=None, exclude_glob=None,
         "Returns a compact summary (file paths + status) — not file contents."
     ),
     params_schema={
-        "dir_a": "string (first directory, relative to /workspace)",
-        "dir_b": "string (second directory, relative to /workspace)",
+        "dir_a": "string (first directory, relative to the project root)",
+        "dir_b": "string (second directory, relative to the project root)",
         "max_results": "integer (optional, max differences to report, default 200)"
     },
     output="A header with file counts for each directory, then a list of differences: 'Files dir_a/file and dir_b/file differ', 'Only in dir_a: file', etc. If identical, says 'Directories are identical.'",
@@ -149,10 +149,10 @@ def compare_directories(dir_a, dir_b, max_results=200):
         max_results = int(max_results)
     except Exception:
         max_results = 200
-    cmd = f"diff -rq /workspace/{dir_a} /workspace/{dir_b} | head -n {max_results}"
+    cmd = f"diff -rq {wpath(dir_a)} {wpath(dir_b)} | head -n {max_results}"
     res = run_cmd(cmd, timeout=120)
-    count_a = run_cmd(f"find /workspace/{dir_a} -type f | wc -l", timeout=30)
-    count_b = run_cmd(f"find /workspace/{dir_b} -type f | wc -l", timeout=30)
+    count_a = run_cmd(f"find {wpath(dir_a)} -type f | wc -l", timeout=30)
+    count_b = run_cmd(f"find {wpath(dir_b)} -type f | wc -l", timeout=30)
     n_a = count_a["stdout"].strip() if count_a["returncode"] == 0 else "?"
     n_b = count_b["stdout"].strip() if count_b["returncode"] == 0 else "?"
     if res["returncode"] == 0 and not res.get("stdout"):

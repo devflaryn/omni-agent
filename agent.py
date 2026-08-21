@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import base64
+import binascii
 import datetime
 import json
 import glob
@@ -23,6 +24,7 @@ if sys.platform == "win32":
             _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+import llm
 from llm import (
     ask_llm,
     get_full_system_prompt,
@@ -40,24 +42,28 @@ from llm import (
     native_tools_payload_chars,
     get_preferred_model,
     set_preferred_model,
+    set_model_effort,
     list_model_options,
     set_stop_check,
     test_connection,
     extract_json_action,
     strip_reasoning,
     get_context_window,
+    take_last_usage,
     reset_salvage_stats,
     SALVAGE_STATS,
 )
-from docker_sandbox import (
-    setup_sandbox,
+from host_exec import (
+    set_workspace,
     set_timeout_decider,
-    set_stop_check as set_sandbox_stop_check,
+    set_stop_check as set_exec_stop_check,
 )
 from tool_registry import registry, CORE_GROUP
 import planning
 import investigation
+import ledger
 import strategy
+import superpowers
 import tools  # Triggers the __init__.py which loads all tool categories
 from tools.reviewer import run_review, run_strategy_review
 from tools import mission_constraints
@@ -70,8 +76,7 @@ MEMORY_DIR = "./memory"
 # --- Workspace selection (Part 2 redesign) -----------------------------------
 # There is NO fixed workspace folder any more. The user PICKS a host folder at
 # runtime (native folder dialog); that folder IS the project root (no
-# project-subfolder layer) and is bind-mounted straight into the Docker
-# sandbox. The last-used pick is persisted so it's the default next launch, but
+# project-subfolder layer) and is the working directory every tool command runs in. The last-used pick is persisted so it's the default next launch, but
 # the user can always re-pick. Conversation/memory is kept OUTSIDE the picked
 # folder, under MEMORY_DIR keyed by the folder's absolute path.
 _WS_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -110,7 +115,10 @@ def set_active_workspace(path):
     s["last"] = ap
     recent = [r for r in s.get("recent", [])
               if isinstance(r, dict) and r.get("path") != ap]
-    recent.insert(0, {"label": _ws_label(ap), "path": ap})
+    # opened_at drives the "2 hours ago" column in the workspace picker. Entries
+    # written before this field existed simply have no timestamp; the picker
+    # renders those as "—" rather than pretending they were opened just now.
+    recent.insert(0, {"label": _ws_label(ap), "path": ap, "opened_at": time.time()})
     s["recent"] = recent[:12]
     _save_ws_settings(s)
     return ap
@@ -189,7 +197,7 @@ PERSIST_MIN_INTERVAL_S = 15
 # switch strategy instead of blindly retrying the same failing command.
 WATCHDOG_FAIL_THRESHOLD = 5
 # --- Long-running command timeout decisions ----------------------------------
-# When a sandbox command outruns its timeout we don't kill it outright — the LLM
+# When a tool command outruns its timeout we don't kill it outright — the LLM
 # is asked whether it's stuck (kill) or a slow-but-progressing job (keep going).
 # See AgentApi._decide_on_timeout.
 TIMEOUT_EXTEND_CAP = 3600            # max seconds granted per "continue" decision
@@ -240,6 +248,14 @@ UI_TEXT_CAP = 40000          # max chars of any other renderable field (answer, 
 TRANSCRIPT_MAX_EVENTS = 500
 # Event types that make up the visible chat and are persisted for replay.
 RENDERABLE_EVENT_TYPES = {"user_message", "thought", "tool_result", "final_answer", "system", "error"}
+
+# Subagent-dock lifecycle events. These are NOT chat transcript events (they drive
+# the Subagents sidebar, not the message list), so they're captured into a separate
+# compact snapshot (session["dock"]) that is persisted and replayed on reopen — so
+# the Subagents menu doesn't vanish on a refresh.
+DOCK_EVENT_TYPES = {"wave_started", "subagent_started", "subagent_progress",
+                    "subagent_done", "wave_done"}
+DOCK_MAX_ROWS = 24           # cap restored rows so a long multi-wave run stays bounded
 
 
 def _ui_trunc(text, cap):
@@ -387,10 +403,20 @@ EXPLANATION_CADENCE_NUDGE = 6
 # Read-only tool calls the ORCHESTRATOR may run inline before it's reminded that
 # those are exactly what a parallel subagent wave does for ~0 context. Bounded and
 # self-re-arming (see _maybe_nudge_delegation); 0 disables the nudge entirely.
+# Default matches EXPLANATION_CADENCE_NUDGE (6) — a sub-process is ~2-6 calls, so a
+# streak past that many pure look-ups is a fan-out the model has clearly not taken.
+# Was 8; lowered to catch chronic solo-reading a step sooner.
 try:
-    SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "8")))
+    SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "6")))
 except ValueError:
-    SOLO_READ_NUDGE = 8
+    SOLO_READ_NUDGE = 6
+
+# Soft per-session ceiling on PREMIUM subagent dispatches. Advisory: over-budget
+# @premium requests degrade to standard rather than being blocked. 0 = unlimited.
+try:
+    PREMIUM_BUDGET = max(0, int(os.environ.get("OMNI_PREMIUM_BUDGET", "5")))
+except ValueError:
+    PREMIUM_BUDGET = 5
 
 # Tools that MEAN the model delegated — they reset the solo-read streak.
 DELEGATION_TOOLS = {"dispatch_agents", "ask_codebase"}
@@ -445,6 +471,17 @@ REVIEW_MAX_STEPS = 8           # verification tool calls the reviewer may make
 STRATEGY_BRIEF_DEFAULT = True
 MAX_STRATEGY_REVIEW_ROUNDS = 2   # revise rounds before the gate forces a mutation through
 STRATEGY_RESYNC_FINDINGS = 5     # new findings before nudging a brief reconcile
+
+# Superpowers Mode: on a NON-TRIVIAL new task, auto-brainstorm the goal into a
+# chosen approach (autonomously — never asks the user) BEFORE planning, then make
+# subagent-driven execution the DEFAULT (unless the user clearly asked for inline).
+# Behind superpowers_enabled; OFF (OMNI_SUPERPOWERS=0) is byte-identical to today.
+SUPERPOWERS_DEFAULT = (os.environ.get("OMNI_SUPERPOWERS", "1").strip().lower()
+                       not in ("0", "false", "no", "off"))
+# The persona the auto-brainstorm dispatches (must exist on disk / in a plugin).
+SUPERPOWERS_BRAINSTORMER = "brainstormer"
+SUPERPOWERS_ARCHITECT = "architect"
+SUPERPOWERS_BRAINSTORM_MAX_STEPS = 12
 
 # The workspace-mutation classification (MUTATING_TOOLS / VALIDATION_TOOLS) now
 # lives in tool_policy.py — the single source of truth shared with subagents.py
@@ -1044,10 +1081,105 @@ _VIEWER_ARCHIVE_EXTS = {".zip", ".apk", ".jar", ".aar", ".xapk", ".apks"}
 _VIEWER_TEXT_CAP = 2_000_000       # 2MB text cap for the viewer
 _VIEWER_IMAGE_CAP = 20_000_000     # refuse to inline images bigger than this
 _VIEWER_MAX_ARCHIVE_ENTRIES = 20_000
+_VIEWER_SNIFF_BYTES = 8192         # how much of a file the binary sniff looks at
+
+# Magic-number → human label, so "this isn't previewable" can say WHAT the file
+# actually is instead of just "binary". Matching one of these is on its own proof
+# the file is not text, so every entry must be a signature no plausible text file
+# could open with — that rules out short/printable prefixes like "MZ" (a CSV
+# could start "MZ,…") and "BZh". Those formats are still caught, just by the byte
+# sniff below rather than by name. Longer prefixes come first where they overlap.
+_VIEWER_MAGIC = (
+    (b"%PDF-", "PDF document"),
+    (b"\x7fELF", "ELF binary"),
+    (b"\xca\xfe\xba\xbe", "Mach-O universal binary"),
+    (b"\xcf\xfa\xed\xfe", "Mach-O binary"),
+    (b"\xce\xfa\xed\xfe", "Mach-O binary (32-bit)"),
+    (b"dex\n", "Android DEX bytecode"),
+    (b"\x00\x61\x73\x6d", "WebAssembly module"),
+    (b"\x1f\x8b", "gzip archive"),
+    (b"7z\xbc\xaf\x27\x1c", "7-Zip archive"),
+    (b"Rar!\x1a\x07", "RAR archive"),
+    (b"\xfd7zXZ\x00", "XZ archive"),
+    (b"SQLite format 3\x00", "SQLite database"),
+    (b"OggS", "Ogg media"),
+    (b"fLaC", "FLAC audio"),
+    (b"\xff\xd8\xff", "JPEG image"),
+    (b"wOFF", "WOFF font"),
+    (b"wOF2", "WOFF2 font"),
+    (b"\x00\x01\x00\x00\x00", "TrueType font"),
+)
+# Offset-4 magics (media containers put the brand after a size field).
+_VIEWER_MAGIC_AT_4 = ((b"ftyp", "video/audio container"),)
+
+
+def _viewer_known_binary(head):
+    """The format's own signature, or None if we don't recognize it. A hit is
+    conclusive — no byte sniffing needed, and no threshold to get wrong on a
+    small file (a short PDF stub is mostly printable ASCII, but it is still a
+    PDF and rendering it as text helps nobody)."""
+    for magic, label in _VIEWER_MAGIC:
+        if head.startswith(magic):
+            return label
+    for magic, label in _VIEWER_MAGIC_AT_4:
+        if head[4:4 + len(magic)] == magic:
+            return label
+    return None
+
+
+def _viewer_describe_binary(head, ext):
+    """Best-effort human label for an unpreviewable file, from magic bytes and
+    then the extension. Never raises — worst case it says 'binary file'."""
+    known = _viewer_known_binary(head)
+    if known:
+        return known
+    if ext:
+        return f"{ext.lstrip('.').upper()} file"
+    return "binary file"
+
+
+def _viewer_looks_binary(head):
+    """True when `head` (the first few KB of a file) is not plausibly text.
+
+    Three signals, cheapest-first: a recognized binary signature, a NUL byte
+    (which almost never appears in real text), and a low share of printable
+    bytes. UTF-16 text trips the NUL check on purpose — the viewer decodes
+    UTF-8, so showing it is exactly the mojibake this guard exists to prevent."""
+    if not head:
+        return False  # an empty file is a perfectly fine empty text file
+    if _viewer_known_binary(head):
+        return True
+    if b"\x00" in head:
+        return True
+    try:
+        head.decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        pass
+    # Not valid UTF-8: fall back to a printable-ratio test so latin-1/cp1252 text
+    # still opens while real binaries don't. The two populations sit far apart —
+    # accented characters are a few percent of Western European prose, whereas
+    # NUL-free binary (compressed/encrypted payloads) is near-uniform random and
+    # lands around 39% printable. 0.80 is the gap between them.
+    printable = sum(1 for b in head if 32 <= b < 127 or b in (9, 10, 13, 12))
+    return printable / len(head) < 0.80
+
+
+def _viewer_unsupported(rel, size, label, *, detail=None):
+    """The payload the frontend turns into the 'not supported / view as text
+    anyway' panel. kind='unsupported' is always ok=True: nothing failed, we're
+    just declining to guess at a rendering."""
+    # Phrased around the label rather than pluralizing it: labels range from
+    # "PDF document" to "ELF binary" to "XYZ file", and "ELF binarys" is not a
+    # word.
+    return {"ok": True, "kind": "unsupported", "path": rel, "size": size,
+            "label": label,
+            "reason": detail or f"This looks like a {label}, which the viewer can't render.",
+            "can_force_text": True}
 
 
 def _resolve_project_file(project_name, rel_path):
-    """Normalizes rel_path and sandboxes it inside the project root.
+    """Normalizes rel_path and confines it to the project root.
     Returns (full_path, rel, None) or (None, None, error)."""
     if not rel_path:
         return None, None, "No path provided."
@@ -1065,24 +1197,29 @@ def _resolve_project_file(project_name, rel_path):
     return full, rel, None
 
 
-def read_project_file(project_name, rel_path):
+def read_project_file(project_name, rel_path, force_text=False):
     """Reads a file from the project workspace (host side) for the frontend
     viewer. Returns a typed payload: kind="image" (base64 + mime),
-    kind="archive" (zip/apk entry listing), or kind="text" (the default)."""
+    kind="archive" (zip/apk entry listing), kind="unsupported" (binary we
+    decline to render), or kind="text" (the default).
+
+    force_text=True is the frontend's "view as text anyway" escape hatch: it
+    skips the binary sniff and decodes with errors="replace"."""
     full, rel, err = _resolve_project_file(project_name, rel_path)
     if err:
         return {"ok": False, "error": err}
     ext = os.path.splitext(full)[1].lower()
     try:
         size = os.path.getsize(full)
-        if ext in _VIEWER_IMAGE_MIME:
+        if ext in _VIEWER_IMAGE_MIME and not force_text:
             if size > _VIEWER_IMAGE_CAP:
-                return {"ok": False, "error": f"Image too large to preview ({size:,} bytes)."}
+                return _viewer_unsupported(
+                    rel, size, "Image", detail=f"Image too large to preview ({size:,} bytes).")
             with open(full, "rb") as f:
                 data = base64.b64encode(f.read()).decode("ascii")
             return {"ok": True, "kind": "image", "path": rel, "size": size,
                     "mime": _VIEWER_IMAGE_MIME[ext], "data": data}
-        if ext in _VIEWER_ARCHIVE_EXTS and zipfile.is_zipfile(full):
+        if ext in _VIEWER_ARCHIVE_EXTS and not force_text and zipfile.is_zipfile(full):
             with zipfile.ZipFile(full) as zf:
                 infos = zf.infolist()
             entries = [{"name": i.filename, "size": i.file_size, "dir": i.is_dir()}
@@ -1090,6 +1227,11 @@ def read_project_file(project_name, rel_path):
             return {"ok": True, "kind": "archive", "path": rel, "size": size,
                     "entries": entries, "entry_count": len(infos),
                     "truncated": len(infos) > _VIEWER_MAX_ARCHIVE_ENTRIES}
+        if not force_text:
+            with open(full, "rb") as f:
+                head = f.read(_VIEWER_SNIFF_BYTES)
+            if _viewer_looks_binary(head):
+                return _viewer_unsupported(rel, size, _viewer_describe_binary(head, ext))
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(_VIEWER_TEXT_CAP)
         return {"ok": True, "kind": "text", "path": rel, "size": size, "content": content,
@@ -1098,10 +1240,11 @@ def read_project_file(project_name, rel_path):
         return {"ok": False, "error": str(e)}
 
 
-def read_project_archive_member(project_name, rel_path, member):
+def read_project_archive_member(project_name, rel_path, member, force_text=False):
     """Reads a single entry out of a zip-based archive (zip/apk/jar/…) in the
     workspace, for previewing inside the frontend's archive explorer. Entries
-    get the same typed treatment as read_project_file (image or text)."""
+    get the same typed treatment as read_project_file (image, text, or the
+    'unsupported' decline), including the force_text escape hatch."""
     full, rel, err = _resolve_project_file(project_name, rel_path)
     if err:
         return {"ok": False, "error": err}
@@ -1115,17 +1258,24 @@ def read_project_archive_member(project_name, rel_path, member):
                 return {"ok": False, "error": "Entry not found in archive."}
             if info.is_dir():
                 return {"ok": False, "error": "Entry is a directory."}
+            entry_path = f"{rel} › {member}"
             ext = os.path.splitext(member)[1].lower()
-            if ext in _VIEWER_IMAGE_MIME:
+            if ext in _VIEWER_IMAGE_MIME and not force_text:
                 if info.file_size > _VIEWER_IMAGE_CAP:
-                    return {"ok": False, "error": f"Image too large to preview ({info.file_size:,} bytes)."}
+                    return _viewer_unsupported(
+                        entry_path, info.file_size, "Image",
+                        detail=f"Image too large to preview ({info.file_size:,} bytes).")
                 with zf.open(info) as f:
                     data = base64.b64encode(f.read()).decode("ascii")
-                return {"ok": True, "kind": "image", "path": f"{rel} › {member}",
+                return {"ok": True, "kind": "image", "path": entry_path,
                         "size": info.file_size, "mime": _VIEWER_IMAGE_MIME[ext], "data": data}
             with zf.open(info) as f:
                 raw = f.read(_VIEWER_TEXT_CAP)
-            return {"ok": True, "kind": "text", "path": f"{rel} › {member}",
+            if not force_text and _viewer_looks_binary(raw[:_VIEWER_SNIFF_BYTES]):
+                return _viewer_unsupported(
+                    entry_path, info.file_size,
+                    _viewer_describe_binary(raw[:_VIEWER_SNIFF_BYTES], ext))
+            return {"ok": True, "kind": "text", "path": entry_path,
                     "size": info.file_size, "content": raw.decode("utf-8", errors="replace"),
                     "truncated": info.file_size > _VIEWER_TEXT_CAP}
     except (OSError, zipfile.BadZipFile) as e:
@@ -1200,6 +1350,31 @@ def _read_import_meta(project_dir):
         return None
 
 
+_ULTRA_ON = (
+    "ULTRA MODE: ON. For any substantive task — a review, an audit, a migration, "
+    "a research question, a design decision — reach for `run_workflow` BEFORE "
+    "working through it turn by turn. Prefer a library workflow by name. Trivial "
+    "or conversational turns still get a direct answer."
+)
+_ULTRA_OFF = (
+    "ULTRA MODE: OFF. Do not start a workflow on your own judgement — a fan-out "
+    "spends real money. Answer directly, or use dispatch_agents for a single "
+    "parallel wave. If a task genuinely warrants multi-stage orchestration, say so "
+    "and let the user turn ultra mode on. `run_workflow` still runs if they name one."
+)
+
+# Word-boundary match so 'ultrasound' / 'ultrasonic' do not trip it.
+_ULTRA_RE = re.compile(r"\bultra\b", re.IGNORECASE)
+
+
+def _ultra_prompt_segment(session):
+    return _ULTRA_ON if (session or {}).get("ultra") else _ULTRA_OFF
+
+
+def _ultra_keyword_requested(text):
+    return bool(_ULTRA_RE.search(text or ""))
+
+
 class AgentApi:
     """Bridge exposed to the webview frontend as `pywebview.api.*`."""
 
@@ -1213,7 +1388,7 @@ class AgentApi:
         # Counts consecutive ambiguous timeout-decision replies for the command
         # currently running, so a confused model can't pin a process open forever.
         self._timeout_ambiguous_streak = 0
-        # Route sandbox command timeouts through the LLM instead of a hard kill.
+        # Route command timeouts through the LLM instead of a hard kill.
         set_timeout_decider(self._decide_on_timeout)
         # Surface LLM fallbacks (primary provider failed -> using the next one) as
         # system lines in the chat so the user can see which provider is in play.
@@ -1224,9 +1399,9 @@ class AgentApi:
         # Let ask_llm's never-give-up retry/backoff loop see the Stop button, so a
         # long backoff wait (up to 10 min) can still be interrupted by the user.
         set_stop_check(lambda: self._stop)
-        # Same predicate for the sandbox, so a running tool subprocess is killed the
+        # Same predicate for the executor, so a running tool subprocess is killed the
         # instant Stop is pressed instead of blocking for its whole timeout window.
-        set_sandbox_stop_check(lambda: self._stop)
+        set_exec_stop_check(lambda: self._stop)
         # Bridge subagent telemetry emitted OUTSIDE the planner's read-wave (e.g.
         # the dispatch_agents tool) to the browser, so the Subagents HUD lights up
         # for deliberate delegation too, not only auto read-waves.
@@ -1263,10 +1438,18 @@ class AgentApi:
                 stored["text"] = _ui_trunc(stored["text"], UI_THOUGHT_CAP)
             if "content" in stored:
                 stored["content"] = _ui_trunc(stored["content"], UI_TEXT_CAP)
+            # Wall-clock stamp so a REPLAYED transcript can show the real elapsed
+            # per action group instead of ~0s (the frontend has no live clock on
+            # reopen — it derives group durations from these stamps).
+            stored.setdefault("ts", int(time.time() * 1000))
             tr = self.session.setdefault("transcript", [])
             tr.append(stored)
             if len(tr) > TRANSCRIPT_MAX_EVENTS:
                 del tr[:len(tr) - TRANSCRIPT_MAX_EVENTS]
+        # Keep a compact snapshot of the subagent dock so the Subagents menu
+        # survives a refresh / reopen (the wave/subagent events are NOT part of
+        # the chat transcript).
+        self._track_dock(event)
         if self._window is None:
             return
         try:
@@ -1275,9 +1458,68 @@ class AgentApi:
         except Exception:
             pass
 
+    def _track_dock(self, event):
+        """Fold a subagent/wave event into session['dock'] — a compact, JSON-safe
+        snapshot of the Subagents dock (one row per subagent, plus a wave-done
+        flag) so the menu can be rebuilt after a refresh / reopen. Best-effort:
+        never raises into the emit path."""
+        s = self.session
+        if s is None:
+            return
+        et = event.get("type")
+        if et not in DOCK_EVENT_TYPES:
+            return
+        try:
+            dock = s.setdefault("dock", {"rows": [], "index": {}, "done": False, "wave_id": None})
+
+            def _key(ev):
+                return ev.get("sub_id") or f"{ev.get('agent') or ''}::{ev.get('key_label') or ''}"
+
+            if et == "wave_started":
+                # A fresh parallel wave replaces the previous snapshot.
+                dock["rows"] = []
+                dock["index"] = {}
+                dock["done"] = False
+                dock["wave_id"] = event.get("wave_id")
+            elif et == "subagent_started":
+                k = _key(event)
+                row = {"sub_id": event.get("sub_id"), "agent": event.get("agent"),
+                       "task": event.get("task"), "tier": event.get("tier"),
+                       "model": event.get("model"), "key_label": event.get("key_label"),
+                       "running": True, "ok": None, "steps": 0, "tokens": 0,
+                       "elapsed_s": 0, "escalated": False}
+                if k in dock["index"]:
+                    dock["rows"][dock["index"][k]].update(row)
+                else:
+                    # Bound the snapshot: drop the oldest rows and reindex.
+                    dock["rows"].append(row)
+                    if len(dock["rows"]) > DOCK_MAX_ROWS:
+                        dock["rows"] = dock["rows"][-DOCK_MAX_ROWS:]
+                    dock["index"] = {(_key(r)): i for i, r in enumerate(dock["rows"])}
+            elif et in ("subagent_progress", "subagent_done"):
+                idx = dock["index"].get(_key(event))
+                if idx is not None:
+                    row = dock["rows"][idx]
+                    for f in ("tokens", "elapsed_s", "model", "escalated"):
+                        if event.get(f) is not None:
+                            row[f] = event.get(f)
+                    # progress emits `step` (singular); done emits `steps` (plural).
+                    step = event.get("steps", event.get("step"))
+                    if step is not None:
+                        row["steps"] = step
+                    if et == "subagent_done":
+                        row["running"] = False
+                        row["ok"] = bool(event.get("ok"))
+            elif et == "wave_done":
+                dock["done"] = True
+                for row in dock["rows"]:
+                    row["running"] = False
+        except Exception:
+            pass  # a dock-snapshot hiccup must never break the emit path
+
     # --- long-running command supervision ------------------------------------
     def _decide_on_timeout(self, display, elapsed_s, base_timeout, rounds):
-        """Called by the sandbox when a command outruns its timeout instead of
+        """Called by the executor when a command outruns its timeout instead of
         killing it. Asks the LLM whether the process looks stuck (kill it) or is
         a slow-but-progressing job (keep waiting). Returns ("kill", None) or
         ("extend", seconds). Never raises — any failure falls back to extending
@@ -1371,6 +1613,12 @@ class AgentApi:
             # reopened long run keeps their full schemas instead of dropping back
             # to catalog-only until the next domain call re-arms them.
             "active_toolsets": sorted(s.get("active_toolsets") or []),
+            # Subagents-dock snapshot so the menu survives a reopen (see _track_dock).
+            "dock": s.get("dock"),
+            # Ultra mode, so a project the user switched ON stays on across
+            # restarts. A keyword-armed turn is deliberately NOT persisted — it
+            # is scoped to that one turn (see send_message / _run_agent_loop).
+            "ultra": bool(s.get("ultra")) and not s.get("ultra_turn_only"),
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         })
         _write_json_atomic(os.path.join(mem, TRANSCRIPT_FILENAME), _cap_transcript(s.get("transcript", [])))
@@ -1396,9 +1644,12 @@ class AgentApi:
         conv_path = os.path.join(memory_dir, CONVERSATION_FILENAME)
         tr_path = os.path.join(memory_dir, TRANSCRIPT_FILENAME)
         messages, transcript, original_task, stats = None, [], None, None
-        # Restored progressive-disclosure toolsets are stashed on self (rather than
-        # widening this method's return tuple) and read back in start_session.
+        # Restored progressive-disclosure toolsets + dock snapshot are stashed on
+        # self (rather than widening this method's return tuple) and read back in
+        # start_session.
         self._restored_active_toolsets = set()
+        self._restored_dock = None
+        self._restored_ultra = False
         try:
             if os.path.isfile(conv_path):
                 with open(conv_path, "r", encoding="utf-8") as f:
@@ -1413,6 +1664,10 @@ class AgentApi:
                 ts = data.get("active_toolsets")
                 if isinstance(ts, list):
                     self._restored_active_toolsets = set(ts)
+                dk = data.get("dock")
+                if isinstance(dk, dict) and isinstance(dk.get("rows"), list) and dk["rows"]:
+                    self._restored_dock = dk
+                self._restored_ultra = bool(data.get("ultra"))
         except (OSError, json.JSONDecodeError, AttributeError):
             messages, original_task, stats = None, None, None
         try:
@@ -1485,6 +1740,17 @@ class AgentApi:
                     "strategy_update; a complete brief must pass an independent strategy review before you "
                     "may change the workspace):\n" + brief.to_markdown()
                 )
+        # Design Brief pins just below the Strategic Brief: the autonomously-chosen
+        # approach from the auto-brainstorm, so the plan is built against it. Only
+        # rendered when Superpowers is on AND a brief exists — otherwise byte-identical.
+        if self.session.get("superpowers_enabled"):
+            design = superpowers.get_active()
+            if design is not None and not design.is_empty():
+                section += (
+                    "\n\nDESIGN BRIEF (auto-brainstormed approach chosen for this task — plan and execute "
+                    "against it; the assumptions were resolved without asking, so proceed on them unless "
+                    "the user corrects one):\n" + design.to_markdown()
+                )
         if plan is not None:
             section += (
                 "\n\nCURRENT PLAN (auto-synchronized — this reflects your own plan_* tool calls in "
@@ -1501,6 +1767,25 @@ class AgentApi:
                 "current with record_finding / record_hypothesis / update_hypothesis / record_failed_attempt "
                 "/ record_decision / record_test_result / set_next_steps):\n" + inv.to_markdown()
             )
+        # Fold the BUILD LEDGER in too — the physical manifest of a large,
+        # multi-artifact modification (components done vs planned, files produced,
+        # offsets patched, verifications). Aggregate-first and bounded, it rides in
+        # the prompt and SURVIVES a summarization/reset just like investigation
+        # memory, so a many-hour / many-subagent build never loses track of how
+        # much is done or what's left.
+        lg = ledger.get_active()
+        if lg is not None and not lg.is_empty():
+            section += (
+                "\n\nBUILD LEDGER (physical build accounting; survives context resets — keep it current with "
+                "ledger_add_component / ledger_set_component_status / ledger_record_artifact / "
+                "ledger_record_patch / ledger_record_verification; treat THIS, not the transcript, as the "
+                "source of truth for what's built and what remains):\n" + lg.to_markdown()
+            )
+        if PREMIUM_BUDGET:
+            used = self.session.get("premium_dispatches", 0)
+            section += (f"\n\n[premium budget: {used}/{PREMIUM_BUDGET} premium "
+                         "subagent dispatches used this session]")
+        section += "\n\n" + _ultra_prompt_segment(self.session)
         self.session["messages"][0]["content"] = (
             self.session["base_system_prompt"] + "\n" + tools_section + section
         )
@@ -1519,11 +1804,25 @@ class AgentApi:
         self._refresh_system_prompt()
         self._emit({"type": "investigation_update", "investigation": inv_dict})
 
+    def _on_ledger_update(self, ledger_dict):
+        """Bridge from ledger.py's notify callback to the live prompt + event
+        stream (mirrors _on_investigation_update). Keeps the physical build
+        manifest visible in the prompt in real time."""
+        self._refresh_system_prompt()
+        self._emit({"type": "ledger_update", "ledger": ledger_dict})
+
     def _on_strategy_update(self, brief_dict):
         """Bridge from strategy.py's notify callback to the live prompt + event
         stream (mirrors _on_plan_update / _on_investigation_update)."""
         self._refresh_system_prompt()
         self._emit({"type": "strategy_update", "strategy": brief_dict})
+
+    def _on_design_brief_update(self, brief_dict):
+        """Bridge from superpowers.py's notify callback to the live prompt + event
+        stream (mirrors _on_strategy_update). Keeps the auto-brainstorm's Design
+        Brief pinned in the prompt in real time."""
+        self._refresh_system_prompt()
+        self._emit({"type": "design_brief_update", "design_brief": brief_dict})
 
     # --- plan-driven delegation ------------------------------------------------
     def _auto_delegate_untagged_steps(self, plan):
@@ -1548,6 +1847,11 @@ class AgentApi:
         OMNI_AUTO_DELEGATE=0 disables this entirely."""
         s = self.session
         if not AUTO_DELEGATE or not s.get("delegation_enabled", True):
+            return
+        # Superpowers inline-only: the user asked to keep execution in this context,
+        # so the harness never auto-tags steps for subagents (explicit delegate= tags
+        # the model sets itself are still honored downstream).
+        if s.get("superpowers_enabled") and s.get("inline_only"):
             return
         if not getattr(plan, "current_phase_id", None):
             return
@@ -1579,7 +1883,11 @@ class AgentApi:
         picks = []
         read_tag = _live(AUTO_DELEGATE_READ_TAG)
         reads = [it for it in pool if _looks_like_research(it)]
-        if read_tag and len(reads) >= AUTO_DELEGATE_READ_MIN:
+        # Superpowers makes subagent-driven execution the DEFAULT: a single independent
+        # research step is enough to fan out (floor 1), vs the conservative 2+ otherwise.
+        read_min = (1 if (s.get("superpowers_enabled") and not s.get("inline_only"))
+                    else AUTO_DELEGATE_READ_MIN)
+        if read_tag and len(reads) >= read_min:
             picks += [(it, read_tag) for it in reads]
         write_tag = _live(AUTO_DELEGATE_WRITE_TAG)
         if write_tag:
@@ -1618,6 +1926,23 @@ class AgentApi:
             "was a bad fit, retag it (plan_update_task delegate=\"<agent>@<tier>\") or clear the "
             "delegate to take it back."
         )})
+
+    def _premium_budget_gate(self, tier):
+        """Ration premium. Returns (effective_tier, note). A premium request over
+        the soft cap degrades to 'standard' (never blocked); an allowed premium
+        request increments the session counter. Non-premium tiers pass untouched.
+        PREMIUM_BUDGET == 0 disables the cap entirely. (Rate-limit degradation is
+        already handled by models_for_tier's failover body — this only rations.)"""
+        if llm._norm_tier(tier) != "premium":
+            return tier, ""
+        if not PREMIUM_BUDGET:
+            return "premium", ""
+        used = self.session.get("premium_dispatches", 0)
+        if used >= PREMIUM_BUDGET:
+            return "standard", (f"premium budget exhausted ({used}/{PREMIUM_BUDGET}) "
+                                "— ran standard")
+        self.session["premium_dispatches"] = used + 1
+        return "premium", ""
 
     def _maybe_dispatch_delegated_steps(self):
         """Dispatch delegated plan steps of the ACTIVE phase. Parallel-by-default:
@@ -1671,24 +1996,37 @@ class AgentApi:
             if not candidates:
                 return
 
-            reads, writes = [], []
+            wave, writes = [], []
             for step in candidates:
                 ad, tier = _resolve(step)
                 if ad is None:
                     continue
+                tier, budget_note = self._premium_budget_gate(tier)
+                if budget_note:
+                    self._emit({"type": "delegate_note", "agent": ad.name,
+                                "content": budget_note})
                 dispatched.add(step["id"])
                 if parallel and step.get("status") != "in_progress":
                     # Harness-initiated start of a pulled-forward step: mark it live so
                     # the plan/UI reflect it, exactly like a model-started step.
                     plan.update_item(step["id"], status="in_progress")
-                (writes if ad.is_write else reads).append((step, ad.name, ad, tier))
+                # Reads always fan out. A WRITE step joins the same wave as soon as it
+                # declares the paths it owns (`scope`): subagents.ScopedWorkspaceLock
+                # lets disjoint owners run at once and makes overlapping ones queue, so
+                # a many-package change progresses in parallel while staying safe. A
+                # write step with no scope claims the whole workspace, so it stays on
+                # the serial path below.
+                if not ad.is_write or step.get("scope"):
+                    wave.append((step, ad.name, ad, tier))
+                else:
+                    writes.append((step, ad.name, ad, tier))
             planning.notify_updated()
 
-            if reads:
+            if wave:
                 try:
-                    self._run_delegated_read_wave(plan, reads)
+                    self._run_delegated_wave(plan, wave)
                 except Exception as e:
-                    for step, _name, _ad, _tier in reads:
+                    for step, _name, _ad, _tier in wave:
                         s["messages"].append({"role": "user", "content": (
                             f"[SYSTEM] Delegation of step ({step['id']}) failed to start ({e}). "
                             "Handle this step yourself.")})
@@ -1699,9 +2037,13 @@ class AgentApi:
                     context = self._compose_delegate_context(plan)
                     self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
                                 "content": f"Delegating step ({step['id']}) to subagent '{name}' ({ad.mode})…"})
+                    # Only pass `scope` when the step actually declares one, keeping
+                    # the historical call shape for unscoped writes (which is all
+                    # that reaches this serial path) intact.
+                    _extra = {"scope": step["scope"]} if step.get("scope") else {}
                     result = subagents.run_subagent(ad, task, context=context,
                                                     run_dir=getattr(self, "_delegate_run_dir", None),
-                                                    tier=tier)
+                                                    tier=tier, **_extra)
                     self._fold_delegate_result(plan, step, name, ad, result)
                 except Exception as e:
                     s["messages"].append({"role": "user", "content": (
@@ -1712,13 +2054,17 @@ class AgentApi:
                 # Legacy path handled the started step(s) once; don't loop-pull more.
                 return
 
-    def _run_delegated_read_wave(self, plan, reads):
-        """Run a batch of independent READ-delegated steps as ONE parallel wave
+    def _run_delegated_wave(self, plan, reads):
+        """Run a batch of independent delegated steps as ONE parallel wave
         (subagents.run_subagents_parallel), streaming each worker's live telemetry
         to self._emit as it arrives instead of buffering it until the whole wave
         finishes. Runs the wave in a background thread and drains a thread-safe
         queue on the calling (main) thread — self._emit is only ever called from
         the main thread this way, same as the rest of the event stream.
+
+        The wave carries every READ step plus every SCOPED write step; each spec
+        passes its step's `scope` down so writers that own disjoint paths execute
+        concurrently and overlapping ones serialize inside the subagent layer.
 
         NOTE: run_dir is intentionally NOT threaded into run_subagents_parallel
         here (unlike the serial write path below) — _delegate_run_dir is not
@@ -1726,11 +2072,14 @@ class AgentApi:
         import queue as _queue
         evq = _queue.Queue()
         specs = [{"agent_def": ad, "task": self._compose_delegate_task(step),
-                  "context": self._compose_delegate_context(plan), "tier": tier}
+                  "context": self._compose_delegate_context(plan), "tier": tier,
+                  "scope": step.get("scope")}
                  for (step, _name, ad, tier) in reads]
         for step, name, ad, _tier in reads:
+            _how = ("read" if not ad.is_write
+                    else "write, owns " + ", ".join(step.get("scope") or []))
             self._emit({"type": "delegate_running", "agent": name, "mode": ad.mode,
-                        "content": f"Delegating step ({step['id']}) to subagent '{name}' (read) in a parallel wave…"})
+                        "content": f"Delegating step ({step['id']}) to subagent '{name}' ({_how}) in a parallel wave…"})
         holder = {}
         _SENTINEL = {"type": "__wave_done__"}
 
@@ -1804,7 +2153,7 @@ class AgentApi:
         """Post-`run_subagent` fold-back: distill the subagent's report into the
         MAIN context, persist it into durable investigation memory, and update the
         plan step's status — shared by both the serial dispatch path above and the
-        parallel read-wave path (_run_delegated_read_wave)."""
+        parallel wave path (_run_delegated_wave)."""
         self.session["solo_read_streak"] = 0
         s = self.session
         report = (result.get("report") or "").strip()
@@ -1954,20 +2303,79 @@ class AgentApi:
 
     # --- public API (called from JS) ----------------------------------------
     def get_projects(self):
-        """Recently-used workspace folders (label + abspath), most-recent first,
-        plus the persisted last-used default. A 'project' is now just a host
-        folder you picked (no fixed workspace dir)."""
+        """Recently-used workspace folders, most-recent first, plus the persisted
+        last-used default. A 'project' is just a host folder you picked.
+
+        Each entry carries what the picker shows in its list: label, absolute
+        path, when it was last opened, and how many messages its saved chat holds
+        (0 when there is no saved chat). Folders that no longer exist are dropped.
+        """
         s = _load_ws_settings()
-        recent = [r for r in s.get("recent", [])
-                  if isinstance(r, dict) and r.get("path") and os.path.isdir(r["path"])]
+        recent = []
+        for r in s.get("recent", []):
+            if not isinstance(r, dict):
+                continue
+            path = r.get("path")
+            if not path or not os.path.isdir(path):
+                continue
+            recent.append({
+                "label": r.get("label") or _ws_label(path),
+                "path": path,
+                "opened_at": r.get("opened_at"),
+                "message_count": self._saved_message_count(path),
+            })
         return {"ok": True, "recent": recent, "last": s.get("last")}
+
+    @staticmethod
+    def _saved_message_count(root):
+        """How many turns the saved chat for this folder holds, for the picker's
+        list. Counts the UI transcript rather than the LLM message list, since
+        that is what the user would actually see on reopening. Best-effort: any
+        unreadable or absent file simply reports 0."""
+        try:
+            path = os.path.join(_memory_dir_for(root), TRANSCRIPT_FILENAME)
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            return len(data) if isinstance(data, list) else 0
+        except (OSError, ValueError):
+            return 0
+
+    def reveal_in_finder(self, path):
+        """Open a path in the host file manager.
+
+        Accepts either an absolute host path (the workspace picker passes one,
+        and has no session yet) or a workspace-relative path (the file tree's
+        context menu). Relative paths go through _safe_abs, so the tree can never
+        use this to reveal something outside the workspace.
+        """
+        raw = (path or "").strip()
+        if os.path.isabs(raw):
+            target = os.path.abspath(raw)
+        else:
+            try:
+                target = self._safe_abs(raw, must_exist=True)
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+        if not os.path.exists(target):
+            return {"ok": False, "error": f"Not found: {target}"}
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["open", "-R", target], check=False)
+            elif sys.platform.startswith("win"):
+                os.startfile(os.path.dirname(target) if os.path.isfile(target) else target)  # noqa: S606
+            else:
+                subprocess.run(["xdg-open", target if os.path.isdir(target)
+                                else os.path.dirname(target)], check=False)
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True}
 
     def select_workspace(self, path=None):
         """Pick (or accept) a host folder to use as the workspace ROOT: validate
-        it, persist it as last-used, and bind-mount it into the Docker sandbox
-        (the mount step also runs the Docker-shareable preflight). Selecting a
-        new folder re-runs the container against the new mount. Pass an explicit
-        `path` to skip the dialog (recent list / automation)."""
+        it, persist it as last-used, and make it the folder every tool command
+        runs in (set_workspace also reports any missing tools). Selecting a new
+        folder just re-points it. Pass an explicit `path` to skip the dialog
+        (recent list / automation)."""
         if not path:
             picked = self.pick_folder()
             if not picked.get("ok"):
@@ -1978,9 +2386,9 @@ class AgentApi:
         if not os.path.isdir(path):
             return {"ok": False, "error": f"Not a folder: {path}"}
         root = set_active_workspace(path)
-        self._emit({"type": "log", "content": f"[Sandbox] Mounting {root} into the container..."})
+        self._emit({"type": "log", "content": f"[Workspace] Activating {root}..."})
         try:
-            setup_sandbox(root)   # bind-mount + Docker-shareable preflight
+            set_workspace(root)   # make it the command cwd + tool preflight
         except Exception as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "path": root, "label": _ws_label(root)}
@@ -2032,12 +2440,12 @@ class AgentApi:
 
     def import_workspace(self, project_name=None, source_path=None):
         """Deprecated: the agent no longer copies an external folder into a fixed
-        workspace. Pick the folder directly with select_workspace — it is
-        mounted into the container and edited in place, so there is nothing to
-        copy in or export back out."""
+        workspace. Pick the folder directly with select_workspace — it is used
+        and edited in place on this machine, so there is nothing to copy in or
+        export back out."""
         return {"ok": False,
                 "error": "Import/copy is gone — pick the folder itself with "
-                         "'Select workspace folder'; it is mounted and edited in place."}
+                         "'Select workspace folder'; it is edited in place."}
 
     def get_import_status(self, project_name=None):
         try:
@@ -2324,6 +2732,18 @@ class AgentApi:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def set_model_effort(self, config_id, model, effort):
+        """Set one model's reasoning effort from the composer's inline menu.
+        Writes the same model_settings field the LLM settings panel edits, and
+        returns the refreshed option list so the composer re-renders from truth
+        rather than assuming the write landed."""
+        try:
+            if not set_model_effort(config_id, model, effort):
+                return {"ok": False, "error": "Could not save the effort setting."}
+            return {"ok": True, "options": list_model_options()}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def start_session(self, project=None):
         # `project` may be an absolute folder path (recent list / just-picked
         # folder) or None (use the active/last-used workspace).
@@ -2337,21 +2757,20 @@ class AgentApi:
         memory_dir = _memory_dir_for(root)
         os.makedirs(memory_dir, exist_ok=True)
 
-        # Ensure the picked folder is mounted. Skip if select_workspace already
-        # mounted this exact root (avoids rebuilding/re-running the container
-        # twice for the same folder).
+        # Ensure the picked folder is the active workspace. Skip if
+        # select_workspace already activated this exact root.
         try:
-            from docker_sandbox import get_workspace_host_path
-            already_mounted = (get_workspace_host_path() == root)
+            from host_exec import workspace_root
+            already_active = (workspace_root() == root)
         except Exception:
-            already_mounted = False
-        if not already_mounted:
-            self._emit({"type": "log", "content": f"[Sandbox] Mounting {root} into the container..."})
+            already_active = False
+        if not already_active:
+            self._emit({"type": "log", "content": f"[Workspace] Activating {root}..."})
             try:
-                setup_sandbox(root)
+                set_workspace(root)
             except Exception as e:
-                return {"ok": False, "error": f"Docker sandbox failed to start: {e}"}
-        self._emit({"type": "log", "content": "[Sandbox] Container is ready."})
+                return {"ok": False, "error": f"Workspace could not be activated: {e}"}
+        self._emit({"type": "log", "content": "[Workspace] Ready."})
 
         # Build the static base to MATCH how requests are sent: native-aware when
         # the active model uses the function-calling interface. _refresh_system_prompt
@@ -2412,11 +2831,30 @@ class AgentApi:
             # to full schemas. Starts from whatever a reopened run had active;
             # grows as the model uses/expands domain tools (see the loop).
             "active_toolsets": set(getattr(self, "_restored_active_toolsets", set()) or set()),
+            # Subagents-dock snapshot restored from disk, so the menu reappears on
+            # reopen (see _track_dock / _emit_session_started).
+            "dock": getattr(self, "_restored_dock", None),
             # Long-run context editing: stub out stale tool results (keep recent).
             "context_editing": True,
+            # Ultra mode: whether the model may start workflows on its own
+            # judgement (see _ultra_prompt_segment / set_ultra / get_ultra).
+            # Restored from disk so the header toggle survives a restart.
+            "ultra": bool(getattr(self, "_restored_ultra", False)),
+            # True only while the `ultra` KEYWORD armed this turn; cleared when
+            # the turn ends, and never persisted.
+            "ultra_turn_only": False,
             "max_consecutive_tools": MAX_CONSECUTIVE_TOOLS,
             "loop_repeat_threshold": LOOP_REPEAT_THRESHOLD,
             "summary_resets": 0,
+            # Size of the main conversation in real provider-reported tokens, and
+            # the previous call's usage the per-turn delta is measured against.
+            # All three are restored together: the first call after a reopen
+            # re-sends the whole restored history, so without its matching prompt
+            # baseline the delta would count that entire history a second time.
+            # See _count_conversation_usage.
+            "convo_tokens": (saved_stats or {}).get("convo_tokens", 0),
+            "usage_prev_prompt": (saved_stats or {}).get("usage_prev_prompt", 0),
+            "usage_prev_completion": (saved_stats or {}).get("usage_prev_completion", 0),
             "needs_plan": saved_task is None,
             "tools_since_plan_touch": 0,
             "_plan_touch_nudge_sent": False,
@@ -2441,6 +2879,11 @@ class AgentApi:
             # --- Strategic Brief workflow state ---
             "strategy_brief_enabled": STRATEGY_BRIEF_DEFAULT,
             "strategy_review_rounds": 0,        # strategy-review revise rounds this task
+            # --- Superpowers Mode state ---
+            "superpowers_enabled": SUPERPOWERS_DEFAULT,
+            "needs_brainstorm": False,          # set per-task in send_message for non-trivial new tasks
+            "needs_architect": False,           # ditto — the architect designs the plan after the brainstorm
+            "inline_only": False,               # user clearly asked for inline (no subagent) execution
             "findings_since_brief_sync": 0,     # new findings since the last brief reconcile
             "evidence_guards": True,                    # repeat-failure guard + validation nudge + file tracking
             "unverified_change": None,                  # a mutating tool ran but wasn't validated yet
@@ -2456,6 +2899,8 @@ class AgentApi:
             # --- delegation nudges (bounded; see _maybe_nudge_delegation) ---
             "solo_read_streak": 0,              # consecutive inline read-only calls
             "solo_read_nudges_sent": 0,         # streak nudges fired this task (escalates wording)
+            "premium_dispatches": 0,            # premium subagent dispatches this session
+            "premium_budget_nudged": 0,         # escalating near-cap nudges sent (Task 6)
             "_delegation_phase_nudged": set(),  # (phase_id, candidate-set) sigs already nudged
             # --- adaptive planning loop policy ---
             "adaptive_planning": ADAPTIVE_PLANNING_DEFAULT,
@@ -2490,6 +2935,17 @@ class AgentApi:
         # project (if any), otherwise start clean. notify=False here since
         # self.session isn't fully wired to _on_plan_update semantics
         # (base_system_prompt refresh) until after session_started fires.
+        # Workflow run directories live under <memory_dir>/workflows/<run_id>/.
+        # Set here because this is the only place memory_dir is known — the same
+        # module-level-setter pattern as subagents.set_ui_sink and
+        # host_exec.set_stop_check. Without it every run wrote into the process
+        # CWD and a resume_from run_id was unfindable after a relaunch.
+        try:
+            import workflows as _workflows
+            _workflows.set_run_root(memory_dir)
+        except Exception:
+            pass    # a missing engine must not break session start
+
         planning.set_context(memory_dir, notify_callback=self._on_plan_update)
         resumed_plan = planning.load_plan(memory_dir)
         if resumed_plan and not resumed_plan.is_complete():
@@ -2507,10 +2963,27 @@ class AgentApi:
         else:
             investigation.clear_active(notify=False)
 
+        # Build ledger (physical manifest of a large modification): wire autosave/
+        # notify and resume any prior ledger for this project, mirroring the plan
+        # and investigation memory so a big build survives reopen + summarization.
+        ledger.set_context(memory_dir, notify_callback=self._on_ledger_update)
+        resumed_ledger = ledger.load(memory_dir)
+        if resumed_ledger is not None:
+            ledger.set_active(resumed_ledger, notify=False)
+        else:
+            ledger.clear_active(notify=False)
+
         strategy.set_context(memory_dir, notify_callback=self._on_strategy_update)
         _restored_brief = strategy.load_brief(memory_dir)
         if _restored_brief is not None:
             strategy.set_active_brief(_restored_brief, notify=False)
+
+        superpowers.set_context(memory_dir, notify_callback=self._on_design_brief_update)
+        _restored_design = superpowers.load_brief(memory_dir)
+        if _restored_design is not None:
+            superpowers.set_active_brief(_restored_design, notify=False)
+        else:
+            superpowers.clear_active_brief(notify=False)
 
         # Per-session ephemeral state (no resume, unlike plan/investigation):
         # mission build-constraints + retry budget, and the tool-call salvage
@@ -2552,10 +3025,17 @@ class AgentApi:
         last_status = s.get("last_status")
         if isinstance(last_status, dict):
             self._emit(last_status)
+        # Rebuild the Subagents dock from its snapshot so the menu doesn't vanish on
+        # a refresh / reopen. Purely a UI restore — emitted after the chat is built.
+        dock = s.get("dock")
+        if isinstance(dock, dict) and dock.get("rows"):
+            self._emit({"type": "wave_restore", "dock": dock})
         active_plan = planning.get_active_plan()
         self._on_plan_update(active_plan.to_dict() if active_plan else None)
         active_inv = investigation.get_active()
         self._on_investigation_update(active_inv.to_dict() if active_inv else None)
+        active_ledger = ledger.get_active()
+        self._on_ledger_update(active_ledger.to_dict() if active_ledger else None)
 
     def restore_session(self):
         """Re-attach the frontend to a still-live backend session after a webview
@@ -2583,6 +3063,10 @@ class AgentApi:
         s["step_count"] = 0
         s["consecutive_tools"] = 0
         s["summary_resets"] = 0
+        # A cleared chat IS a new conversation, so its token size starts over.
+        s["convo_tokens"] = 0
+        s["usage_prev_prompt"] = 0
+        s["usage_prev_completion"] = 0
         s["tools_since_plan_touch"] = 0
         s["_plan_touch_nudge_sent"] = False
         s["reads_since_nav"] = 0
@@ -2613,12 +3097,14 @@ class AgentApi:
         s["active_toolsets"] = set()
         self._emit({"type": "status", "step_count": 0, "consecutive_tools": 0,
                     "tools_used": 0, "ctx_chars": 0, "ctx_tokens": 0,
+                    "convo_tokens": 0,
                     "ctx_budget": context_token_budget(), "summary_resets": 0})
         # A fresh chat only needs a new plan if there isn't an in-progress one.
         active_plan = planning.get_active_plan()
         s["needs_plan"] = active_plan is None or active_plan.is_complete()
         s["mutating_gate_nudged"] = False  # re-arm the one-time unplanned-mutation nudge
         s["dispatched_steps"] = set()      # fresh chat -> nothing delegated yet
+        s["dock"] = None                   # fresh chat -> drop the subagents snapshot
         s["steps_since_reground"] = 0
         # Fold the (unchanged) live plan back into the fresh system prompt.
         self._refresh_system_prompt()
@@ -2634,9 +3120,26 @@ class AgentApi:
             self._busy = True
             self._stop = False
 
+        if _ultra_keyword_requested(text) and not self.session.get("ultra"):
+            # The spec: the keyword arms ultra mode for THAT TURN. It used to
+            # latch on forever, so one message mentioning "ultra" left every
+            # later turn free to fan out. _run_agent_loop's finally clears it.
+            self.session["ultra"] = True
+            self.session["ultra_turn_only"] = True
+            # Without this the very turn that asked for ultra still runs against
+            # the OFF prompt — the flag is only read when the prompt is rebuilt.
+            self._refresh_system_prompt()
+            self._emit({"type": "ultra_mode", "ultra": True})
+
         self.session["messages"].append({"role": "user", "content": text})
         if self.session["original_task"] is None:
             self.session["original_task"] = text
+        # Superpowers: read this turn's execution-mode intent. Inline-only is honored
+        # only on a CLEAR request; it disables subagent-driven execution for the task
+        # (the auto-brainstorm then runs inline instead of dispatching a subagent).
+        self.session["inline_only"] = (
+            bool(self.session.get("superpowers_enabled"))
+            and superpowers.detect_inline_only(text))
         # Fresh user turn -> reset per-task loop/budget state.
         self.session["last_tool_call"] = None
         self.session["consecutive_tools"] = 0
@@ -2678,6 +3181,17 @@ class AgentApi:
             self.session["mutating_gate_nudged"] = False  # re-arm the one-time unplanned-mutation nudge
             self.session["dispatched_steps"] = set()      # new plan -> fresh delegation tracking
             self.session["steps_since_reground"] = 0
+            # Superpowers: a genuinely NEW, non-trivial task earns an autonomous
+            # brainstorm before planning. Trivial one-liners skip straight to work.
+            self.session["needs_brainstorm"] = (
+                bool(self.session.get("superpowers_enabled"))
+                and not superpowers.is_trivial_task(text))
+            # …and the architect designs the plan itself, right after the brainstorm.
+            self.session["needs_architect"] = self.session["needs_brainstorm"]
+        else:
+            # A follow-up continuing an in-progress plan does not re-brainstorm.
+            self.session["needs_brainstorm"] = False
+            self.session["needs_architect"] = False
         self.session["tools_since_plan_touch"] = 0
         self.session["_plan_touch_nudge_sent"] = False
 
@@ -2689,10 +3203,40 @@ class AgentApi:
         self._thread.start()
         return {"ok": True}
 
+    def set_ultra(self, on):
+        """Toggle ultra mode. Exposed to the webview as pywebview.api.set_ultra.
+
+        An explicit toggle is STICKY: it clears the keyword's turn scoping, so
+        the state the user picked survives the end of the turn and is persisted."""
+        if not self.session:
+            return {"ok": False, "error": "No active session.", "ultra": False}
+        self.session["ultra"] = bool(on)
+        self.session["ultra_turn_only"] = False
+        self._refresh_system_prompt()
+        self._emit({"type": "ultra_mode", "ultra": self.session["ultra"]})
+        return {"ultra": self.session["ultra"]}
+
+    def get_ultra(self):
+        return {"ultra": bool((self.session or {}).get("ultra"))}
+
+    def _abort_active_workflows(self):
+        """Cancel every running workflow. Called from the same place that sets
+        self._stop, so Stop remains the single cancellation path rather than the
+        engine growing a second one."""
+        try:
+            import workflows
+            n = workflows.abort()
+            if n:
+                self._emit({"type": "log",
+                            "content": f"stopping {n} running workflow(s)…"})
+        except Exception:
+            pass    # stopping must never itself fail
+
     def stop(self):
         if not self._busy:
             return {"ok": False, "error": "Nothing to stop."}
         self._stop = True
+        self._abort_active_workflows()
         self._emit({"type": "system", "content": "Stopping now — aborting the current step (in-flight LLM call / running tool)."})
         return {"ok": True}
 
@@ -2701,15 +3245,218 @@ class AgentApi:
             return {"ok": False, "error": "No active session."}
         return {"ok": True, "tree": build_file_tree(self.session["project"])}
 
-    def read_file(self, rel_path):
+    def read_file(self, rel_path, force_text=False):
         if not self.session:
             return {"ok": False, "error": "No active session."}
-        return read_project_file(self.session["project"], rel_path)
+        return read_project_file(self.session["project"], rel_path, force_text=bool(force_text))
 
-    def read_archive_member(self, rel_path, member):
+    def read_archive_member(self, rel_path, member, force_text=False):
         if not self.session:
             return {"ok": False, "error": "No active session."}
-        return read_project_archive_member(self.session["project"], rel_path, member)
+        return read_project_archive_member(
+            self.session["project"], rel_path, member, force_text=bool(force_text))
+
+    # --- workspace file operations (file-tree drag/drop + context menu) -------
+    # Everything here funnels through _safe_abs, which is the ONLY thing standing
+    # between a frontend-supplied relative path and arbitrary host filesystem
+    # access. It resolves symlinks before comparing, so a symlink inside the
+    # workspace cannot be used to escape it.
+
+    TRASH_DIRNAME = ".omni-trash"
+
+    def _safe_abs(self, rel, *, must_exist=False):
+        """Resolve a workspace-relative path to an absolute one, or raise
+        ValueError if it would land outside the workspace root."""
+        if not self.session:
+            raise ValueError("No active session.")
+        root = os.path.realpath(self.session.get("root") or _project_root())
+        cleaned = (rel or "").strip().replace("\\", "/").strip("/")
+        target = os.path.realpath(os.path.join(root, *[p for p in cleaned.split("/") if p]))
+        if target != root and not target.startswith(root + os.sep):
+            raise ValueError("Path is outside the workspace.")
+        if must_exist and not os.path.exists(target):
+            raise ValueError(f"Not found: {cleaned or '/'}")
+        return target
+
+    def _tree_result(self, **extra):
+        """Standard success shape: every mutation returns the refreshed tree so
+        the frontend re-renders from truth instead of patching its own state."""
+        self._refresh_tree(force=True)
+        out = {"ok": True, "tree": build_file_tree(self.session["project"])}
+        out.update(extra)
+        return out
+
+    @staticmethod
+    def _unique_path(path):
+        """A non-colliding variant of `path` ('a.txt' -> 'a (2).txt'). Used so a
+        move or restore never silently overwrites an existing file."""
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        for n in range(2, 1000):
+            candidate = f"{base} ({n}){ext}"
+            if not os.path.exists(candidate):
+                return candidate
+        raise ValueError("Could not find a free filename.")
+
+    def fs_move(self, rel_paths, dest_dir_rel):
+        """Move files/folders into dest_dir_rel (drag and drop in the tree)."""
+        try:
+            dest = self._safe_abs(dest_dir_rel, must_exist=True)
+            if not os.path.isdir(dest):
+                return {"ok": False, "error": "Destination is not a folder."}
+            moved, skipped = [], []
+            for rel in (rel_paths or []):
+                try:
+                    src = self._safe_abs(rel, must_exist=True)
+                except ValueError as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+                    continue
+                # Moving a folder into itself or its own descendant would destroy
+                # it; the frontend guards this too, but never trust the caller.
+                if os.path.isdir(src) and (dest == src or dest.startswith(src + os.sep)):
+                    skipped.append({"path": rel, "reason": "cannot move a folder into itself"})
+                    continue
+                if os.path.dirname(src) == dest:
+                    continue  # already there — a no-op drop, not an error
+                try:
+                    shutil.move(src, self._unique_path(os.path.join(dest, os.path.basename(src))))
+                    moved.append(rel)
+                except (OSError, ValueError) as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+            return self._tree_result(moved=moved, skipped=skipped)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_delete(self, rel_paths):
+        """Move files/folders to the workspace's .omni-trash (recoverable).
+
+        Deliberately not an unlink: a mis-drop on the trash node has to be
+        undoable, and the agent's own tools already treat the workspace as the
+        unit of state.
+        """
+        try:
+            root = self._safe_abs("")
+            trash = os.path.join(root, self.TRASH_DIRNAME)
+            os.makedirs(trash, exist_ok=True)
+            trashed, skipped = [], []
+            for rel in (rel_paths or []):
+                try:
+                    src = self._safe_abs(rel, must_exist=True)
+                except ValueError as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+                    continue
+                if src == root:
+                    skipped.append({"path": rel, "reason": "cannot delete the workspace root"})
+                    continue
+                if src == trash or src.startswith(trash + os.sep):
+                    skipped.append({"path": rel, "reason": "already in the trash"})
+                    continue
+                try:
+                    shutil.move(src, self._unique_path(os.path.join(trash, os.path.basename(src))))
+                    trashed.append(rel)
+                except (OSError, ValueError) as e:
+                    skipped.append({"path": rel, "reason": str(e)})
+            return self._tree_result(trashed=trashed, skipped=skipped)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_trash_empty(self):
+        """Permanently delete everything in the workspace trash."""
+        try:
+            trash = self._safe_abs(self.TRASH_DIRNAME)
+            if not os.path.isdir(trash):
+                return self._tree_result(removed=0)
+            removed = 0
+            for name in os.listdir(trash):
+                path = os.path.join(trash, name)
+                try:
+                    shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
+                    removed += 1
+                except OSError:
+                    pass
+            return self._tree_result(removed=removed)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_mkdir(self, rel):
+        """Create a new folder."""
+        try:
+            target = self._safe_abs(rel)
+            if os.path.exists(target):
+                return {"ok": False, "error": "That name is already taken."}
+            os.makedirs(target)
+            return self._tree_result(path=rel)
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_new_file(self, rel):
+        """Create an empty file."""
+        try:
+            target = self._safe_abs(rel)
+            if os.path.exists(target):
+                return {"ok": False, "error": "That name is already taken."}
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "x", encoding="utf-8"):
+                pass
+            return self._tree_result(path=rel)
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_rename(self, rel, new_name):
+        """Rename in place. new_name is a bare name, never a path — accepting a
+        path here would let a rename act as a move outside the workspace."""
+        try:
+            src = self._safe_abs(rel, must_exist=True)
+            name = (new_name or "").strip()
+            if not name or "/" in name or "\\" in name or name in (".", ".."):
+                return {"ok": False, "error": "Enter a valid file name."}
+            dest = os.path.join(os.path.dirname(src), name)
+            if os.path.exists(dest):
+                return {"ok": False, "error": "That name is already taken."}
+            os.rename(src, dest)
+            return self._tree_result()
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_duplicate(self, rel):
+        """Copy a file or folder beside itself."""
+        try:
+            src = self._safe_abs(rel, must_exist=True)
+            dest = self._unique_path(src)
+            if os.path.isdir(src):
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
+            return self._tree_result()
+        except (ValueError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+
+    def fs_write_upload(self, dest_dir_rel, name, b64_chunk, first=True, last=True):
+        """Append one base64 chunk of a dropped file.
+
+        Chunked because the pywebview JS bridge serializes arguments as JSON —
+        handing it a whole large file in one call is a memory spike on both
+        sides. `first` truncates (starting a new file), `last` finalizes.
+        `name` may contain forward slashes so a dropped FOLDER can recreate its
+        structure; each segment is still resolved through _safe_abs.
+        """
+        try:
+            rel_name = (name or "").strip().replace("\\", "/").strip("/")
+            if not rel_name or ".." in rel_name.split("/"):
+                return {"ok": False, "error": "Invalid file name."}
+            base = (dest_dir_rel or "").strip().strip("/")
+            target = self._safe_abs(f"{base}/{rel_name}" if base else rel_name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb" if first else "ab") as f:
+                f.write(base64.b64decode(b64_chunk or ""))
+            # Only refresh the tree when the file is complete; doing it per chunk
+            # would rebuild the whole tree hundreds of times for one large file.
+            if last:
+                return self._tree_result(path=rel_name)
+            return {"ok": True}
+        except (ValueError, OSError, binascii.Error) as e:
+            return {"ok": False, "error": str(e)}
 
     def upload_files(self, dest_dir=""):
         """Opens a native multi-select file picker and copies the chosen host
@@ -2722,7 +3469,7 @@ class AgentApi:
         if self._window is None:
             return {"ok": False, "error": "Window not ready."}
 
-        # Resolve + sandbox the destination to inside the PICKED project root.
+        # Resolve + confine the destination to inside the PICKED project root.
         root = os.path.abspath(self.session.get("root") or _project_root())
         rel = (dest_dir or "").strip().lstrip("/").lstrip("\\").replace("\\", "/")
         dest_abs = os.path.abspath(os.path.join(root, *rel.split("/"))) if rel else root
@@ -2755,8 +3502,12 @@ class AgentApi:
                 skipped.append({"name": name, "reason": str(e)})
 
         self._refresh_tree(force=True)
+        # `project` was undefined here — every successful upload raised NameError
+        # on its way out, so the caller saw a failure after the copy had already
+        # happened. The session's project name is what build_file_tree wants.
         return {"ok": True, "cancelled": False, "copied": copied, "skipped": skipped,
-                "dest": rel or "(workspace root)", "tree": build_file_tree(project)}
+                "dest": rel or "(workspace root)",
+                "tree": build_file_tree(self.session["project"])}
 
     def get_code_graph(self, graph_id=None):
         """Reads a chunked code knowledge graph from the project workspace and
@@ -2973,10 +3724,9 @@ class AgentApi:
     def build_code_graph_ui(self, root_dir="", graph_id="", include_so=False, force=True):
         """Manual 'Build graph' action from the Graph tab.
 
-        Runs the code-graph indexer directly on the HOST against the picked
-        workspace (no Docker round-trip), so the .codegraph/<id>/ folder is
-        created exactly where the Graph tab reads it — even if the sandbox
-        container isn't running. Indexing a specific subdirectory gives it its
+        Runs the code-graph indexer in-process against the picked workspace, so
+        the .codegraph/<id>/ folder is created exactly where the Graph tab reads
+        it. Indexing a specific subdirectory gives it its
         OWN graph instance (multi-project): comparing two directories builds two
         separate graphs that stay independent and can be rendered side by side.
         Returns a short summary plus the refreshed graph list for the selector."""
@@ -2987,8 +3737,8 @@ class AgentApi:
 
         root = os.path.abspath(self.session.get("root") or _project_root())
 
-        # Sandbox the target INSIDE the picked workspace.
-        rel = normalize_path(root_dir)  # '', '.', '/workspace' all collapse to '.'
+        # Confine the target INSIDE the picked project folder.
+        rel = normalize_path(root_dir)  # '', '.', legacy '/workspace' -> '.'
         if rel in ("", "."):
             target_abs = root
             rel_disp = "."
@@ -3091,6 +3841,7 @@ class AgentApi:
         planning.clear_active_plan(notify=False)
         planning.set_context(None, notify_callback=None)
         strategy.set_context(None, notify_callback=None)
+        superpowers.set_context(None, notify_callback=None)
         self.session = None
         self._emit({"type": "session_ended"})
         return {"ok": True}
@@ -3113,7 +3864,12 @@ class AgentApi:
         alongside the messages so the guard reflects the true request size (the tool
         schemas never appear in s["messages"])."""
         ctx_overhead = native_tools_payload_chars(s.get("active_toolsets"))
-        if s["step_count"] >= MAX_STEPS_BEFORE_SUMMARY or context_pressure(s["messages"], ctx_overhead):
+        # A large build can carry its durable state in the plan + investigation +
+        # BUILD LEDGER (all folded into the prompt and surviving a reset), so it may
+        # opt to run more steps between summaries via a per-session override. The
+        # token/char pressure guard below is unchanged and still the hard ceiling.
+        step_ceiling = s.get("max_steps_before_summary") or MAX_STEPS_BEFORE_SUMMARY
+        if s["step_count"] >= step_ceiling or context_pressure(s["messages"], ctx_overhead):
             used = estimate_tokens(s["messages"]) + ctx_overhead // CHARS_PER_TOKEN
             self._emit({"type": "system", "content": (
                 f"Context at ~{used} tokens (>= {int(CONTEXT_WINDOW_FRACTION*100)}% of the "
@@ -3126,6 +3882,38 @@ class AgentApi:
             s["consecutive_tools"] = 0
             s["summary_resets"] += 1
 
+    def _count_conversation_usage(self, s):
+        """Fold the just-completed main-loop call into the running size of the
+        MAIN conversation, in real provider-reported tokens.
+
+        Must be called IMMEDIATELY after the conversation's own ask_llm. The
+        review gate, strategy review and summarizer also call ask_llm on this
+        thread, and their spend is not part of the conversation — reading the
+        usage right here means theirs is never attributed to the counter.
+        Subagents are excluded for free: take_last_usage is thread-local.
+
+        Each turn contributes only what is genuinely NEW — the growth in the
+        prompt since the last call (i.e. the tool results that were appended)
+        plus the reply itself. Without the delta, re-sending the whole history
+        every turn would count the same messages over and over.
+
+        The max(0, ...) clamp is what makes the number monotonic. It also means
+        that on the turn where _maybe_summarize_context fires, the prompt
+        collapses, the delta floors at zero, and that one turn's tool-result
+        tokens go uncounted. That undercounts by a few thousand tokens once per
+        summarization, which is preferred over filling the gap with a chars/4
+        estimate — the fake number this counter exists to replace.
+        """
+        usage = take_last_usage() or {}
+        prompt = int(usage.get("prompt") or 0)
+        completion = int(usage.get("completion") or 0)
+        if not prompt and not completion:
+            return  # provider reported no usage — leave the counter untouched
+        prev = s.get("usage_prev_prompt", 0) + s.get("usage_prev_completion", 0)
+        s["convo_tokens"] = s.get("convo_tokens", 0) + max(0, prompt - prev) + completion
+        s["usage_prev_prompt"] = prompt
+        s["usage_prev_completion"] = completion
+
     def _emit_status(self, s):
         """Emit the per-iteration telemetry status event and remember it so the
         stats can be persisted and restored into the header when the project is
@@ -3136,6 +3924,12 @@ class AgentApi:
                      "tools_used": s.get("tools_used", 0),
                      "ctx_chars": session_context_chars(s),
                      "ctx_tokens": session_context_tokens(s),
+                     "convo_tokens": s.get("convo_tokens", 0),
+                     # Carried so the delta baseline survives a reopen — this event
+                     # doubles as the persisted stats snapshot (see _persist_session).
+                     # The frontend ignores both.
+                     "usage_prev_prompt": s.get("usage_prev_prompt", 0),
+                     "usage_prev_completion": s.get("usage_prev_completion", 0),
                      "ctx_budget": context_token_budget(),
                      "summary_resets": s["summary_resets"]}
         s["last_status"] = status_ev
@@ -3378,6 +4172,22 @@ class AgentApi:
             "the corresponding plan steps delegate=\"researcher@cheap\". Keep only the work that "
             "genuinely needs your own judgment inline."
         )})
+        # TEETH: an advisory line alone is easy to read past — that was the ORIGINAL
+        # failure (two subagents in a 300-step run). Dispatch is otherwise only
+        # triggered by a plan_* tool call (_plan_bookkeeping_after_tool), so a long
+        # inline-read streak that never touches the plan leaves any already-delegatable
+        # steps sitting undispatched while the model reads on. When the streak trips,
+        # proactively run the auto-tag + fan-out pass: if a plan with ready research/
+        # change steps exists, they go out as a real wave NOW instead of only being
+        # talked about. Idempotent (dispatched steps are tracked) and a no-op when no
+        # plan/step qualifies — so pure free-exploration (no plan yet) still degrades
+        # to advisory-only, where the harness genuinely can't author the sub-tasks.
+        disp = getattr(self, "_maybe_dispatch_delegated_steps", None)
+        if callable(disp):
+            try:
+                disp()
+            except Exception:
+                pass  # a dispatch hiccup must never break the main tool loop
 
     def _maybe_nudge_plan_delegation(self, s):
         """Delegation nudge #2 — PLAN SHAPE.
@@ -3418,6 +4228,32 @@ class AgentApi:
             "workspace, so you get the isolated context and the cheaper model, not extra speed). "
             "Leave untagged only the steps that genuinely need your own judgment."
         )})
+
+    def _maybe_nudge_premium_budget(self, s):
+        """Advisory, escalating, fire-once-per-threshold: warn when premium is
+        nearly (1 left) then fully spent, so the orchestrator reserves it for the
+        highest-value remaining step. `premium_budget_nudged` is the level already
+        announced (0 none / 1 nearly / 2 spent) so neither message repeats every
+        turn. Silent when PREMIUM_BUDGET is disabled or there is >1 headroom."""
+        if not PREMIUM_BUDGET:
+            return None
+        used = s.get("premium_dispatches", 0)
+        remaining = PREMIUM_BUDGET - used
+        sent = s.get("premium_budget_nudged", 0)
+        if remaining <= 0:
+            if sent >= 2:
+                return None
+            s["premium_budget_nudged"] = 2
+            return ("[SYSTEM] Premium budget is spent for this session — further "
+                    "@premium delegations will run on the standard model. Reserve any "
+                    "remaining hard problem for where standard is genuinely insufficient.")
+        if remaining == 1:
+            if sent >= 1:
+                return None
+            s["premium_budget_nudged"] = 1
+            return ("[SYSTEM] Premium budget nearly spent (1 premium dispatch left). "
+                    "Reserve it for the single highest-value remaining step.")
+        return None
 
     def _code_graph_guard(self, s, tool_name):
         """Catch the "sweeping files one by one" anti-pattern. Any navigation tool
@@ -3501,6 +4337,21 @@ class AgentApi:
         soft nudge on the first un-planned mutation; legacy non-adaptive keeps the old
         "plan before any tool" behavior), and the repeat-failure guard (an EXACT call
         that already failed earlier is nudged once before it's allowed through)."""
+        # Superpowers auto-brainstorm gate: FIRST thing on a new non-trivial task —
+        # turn the goal into a chosen approach (autonomously) before anything else,
+        # so the plan is built against it. Fires at most once per task (clears its own
+        # flag), never blocks reads afterward, and never raises.
+        if self._maybe_run_brainstorm_gate(s, tool_name) == "continue":
+            return "continue"
+
+        # Superpowers architect gate: with the approach chosen, have the architect
+        # design the actual plan (in its own context, on a stronger model) and install
+        # it — so execution starts from a wide, delegated, dependency-shaped plan
+        # instead of whatever serial list the orchestrator would have typed. Fires at
+        # most once per task and degrades to self-planning on any shortfall.
+        if self._maybe_run_architect_gate(s, tool_name) == "continue":
+            return "continue"
+
         # Replan gate: once the watchdog trips (a core approach failed repeatedly),
         # MUTATIONS stay paused until a DELIBERATE plan_replan, so the agent revises
         # the plan instead of grinding a dead end. Read-only inspection stays FREE
@@ -3730,6 +4581,13 @@ class AgentApi:
         s["_delegation_nudge_fired_this_turn"] = False
         self._maybe_nudge_delegation(s, tool_name)
 
+        # Premium budget nudge: re-arming advisory when the premium dispatch cap
+        # is within 1 (or already spent), so the orchestrator reserves whatever's
+        # left for the highest-value remaining step (see _maybe_nudge_premium_budget).
+        pn = self._maybe_nudge_premium_budget(s)
+        if pn:
+            s["messages"].append({"role": "user", "content": pn})
+
         # Plan bookkeeping: gate-clear on a real plan, delegation dispatch,
         # phase-change re-grounding, and the plan-touch nudge. Nudge #2 inside it
         # is suppressed below when nudge #1 already fired this turn, so the model
@@ -3856,6 +4714,7 @@ class AgentApi:
         start_time = time.time()
         raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
                                active_groups=s.get("active_toolsets"))
+        self._count_conversation_usage(s)
         elapsed_ms = int((time.time() - start_time) * 1000)
         self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
 
@@ -3872,6 +4731,7 @@ class AgentApi:
             start_time = time.time()
             raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
                                active_groups=s.get("active_toolsets"))
+            self._count_conversation_usage(s)
             elapsed_ms += int((time.time() - start_time) * 1000)
             self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
             response_type, payload = parse_response(raw_response)
@@ -4010,6 +4870,256 @@ class AgentApi:
                 "[SYSTEM] Several new findings since your last strategy sync — reconcile the STRATEGIC "
                 "BRIEF (strategy_update): confirm the diagnosis and top hypothesis still hold, and adjust "
                 "the strategy if the evidence has moved.")})
+
+    # --- Superpowers auto-brainstorm gate --------------------------------------
+    _BRAINSTORM_AUTONOMY = (
+        "AUTONOMOUS MODE: do NOT defer to the user and do NOT return OPEN QUESTIONS. "
+        "This runs unattended — no one will answer questions. Resolve every open "
+        "question yourself with your best-judgment ASSUMPTION and label it. Return "
+        "the brief with an ASSUMPTIONS section (each a decision you made) instead of "
+        "a QUESTIONS section. Be decisive: pick ONE recommended approach."
+    )
+
+    def _brainstorm_context(self):
+        """Light grounding for the brainstormer: workspace root + any existing plan /
+        investigation memory. Kept short — the subagent inspects the workspace itself."""
+        s = self.session
+        bits = []
+        root = s.get("root") or s.get("project")
+        if root:
+            bits.append(f"Workspace root: {root}")
+        _plan = planning.get_active_plan()
+        if _plan is not None and not _plan.is_complete():
+            bits.append("An in-progress plan already exists:\n" + _plan.to_markdown())
+        _inv = investigation.get_active()
+        if _inv is not None and not _inv.is_empty():
+            bits.append("Investigation memory so far:\n" + _inv.to_markdown())
+        return "\n\n".join(bits)
+
+    def _brainstorm_inline_fallback(self, s, note=None):
+        """Inline self-brainstorm: no subagent is dispatched (used for inline-only
+        mode and whenever the brainstormer persona is unavailable or fails). The
+        model does the design thinking itself, in-context, before planning."""
+        if note:
+            self._emit({"type": "system", "content": note})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] Before planning, BRAINSTORM this task inline and DECIDE — do not ask the user "
+            "anything. In a few tight lines: (1) restate the goal crisply; (2) give 2–3 candidate "
+            "approaches with honest trade-offs; (3) pick ONE and say why; (4) list the assumptions "
+            "you're resolving on your own (label them ASSUMPTION); (5) note the key risks. Then plan "
+            "against your chosen approach."
+        )})
+
+    _ARCHITECT_CONTRACT = (
+        "Return your PLAN PROPOSAL as a single JSON object in a ```json fenced block, shaped "
+        "EXACTLY like this (no other text is needed):\n"
+        '{"task": "<one sentence>", "success_criteria": ["<objective, checkable>"], '
+        '"constraints": ["<hard boundary>"], "phases": ["<milestone 1>", "<milestone 2>"], '
+        '"components": ["<named build unit, for a large multi-artifact change>"], '
+        '"risks": ["<risk/unknown>"], "next_action": "<the single next move>", '
+        '"steps": [{"content": "<small verifiable step>", "key": "<short local name>", '
+        '"delegate": "<subagent, optionally agent@tier>", "depends_on": ["<key of a step this '
+        'one truly needs>"], "scope": ["<workspace paths this step owns, e.g. smali/com/x/**>"], '
+        '"purpose": "...", "expected": "...", "verification": "<how it is objectively checked>", '
+        '"fallback": "..."}]}\n'
+        "PLAN FOR PARALLEL EXECUTION — this is the point of the proposal:\n"
+        "- Steps with NO depends_on are dispatched CONCURRENTLY, so put every genuinely "
+        "independent piece of the FIRST phase in `steps` and give depends_on ONLY where one "
+        "step truly consumes another's result. A chain of steps that could have been a wave is "
+        "the single most costly mistake you can make here.\n"
+        "- Decompose by OWNERSHIP for a large change: one step per package / library / module, "
+        "each with a `scope` naming the paths it owns. Disjoint scopes run at the same time; an "
+        "unscoped change step takes the whole workspace and blocks everything else.\n"
+        "- Tag every self-contained step with a `delegate` and match the tier to the job "
+        "(a lookup is cheap, a design decision is not).\n"
+        "- List each build unit of a large modification in `components` so progress is counted "
+        "in artifacts, not in prose."
+    )
+
+    def _maybe_run_architect_gate(self, s, tool_name):
+        """After the brainstorm and BEFORE any planning, have the `architect` persona
+        inspect the workspace and hand back a structured, parallel-shaped plan, which
+        is installed as the active plan directly.
+
+        Why a subagent writes the plan: the orchestrator plans from whatever it has
+        already read, under its own context pressure, and reliably produces a SERIAL
+        list — which then executes serially no matter how much parallel machinery
+        sits underneath. The architect inspects freely in its own context, on a
+        stronger model, and answers in the plan's own vocabulary (delegate /
+        depends_on / scope), so the parallel shape survives into execution instead of
+        being flattened by re-transcription.
+
+        Fires ONCE per new non-trivial task, never in inline-only mode, and degrades
+        safely at every step: no persona, a failed run, or an unparseable answer all
+        fall back to the orchestrator planning for itself (its proposal, if any, is
+        still handed over as text). Never raises."""
+        if not (s.get("superpowers_enabled") and s.get("needs_architect")):
+            return None
+        s["needs_architect"] = False        # spent, whatever happens below
+        if s.get("inline_only") or not s.get("needs_plan"):
+            return None
+        task = (s.get("original_task") or "").strip()
+        if not task:
+            return None
+        agent_def = plugins.get_agent(SUPERPOWERS_ARCHITECT)
+        if agent_def is None:
+            return None
+
+        tier, budget_note = self._premium_budget_gate(getattr(agent_def, "tier", None) or "premium")
+        if budget_note:
+            self._emit({"type": "delegate_note", "agent": agent_def.name, "content": budget_note})
+        self._emit({"type": "system", "content": (
+            "Superpowers: the architect is inspecting the workspace and designing a "
+            "parallel-shaped plan…")})
+
+        context = self._brainstorm_context()
+        brief = superpowers.get_active()
+        if brief is not None and not brief.is_empty():
+            context = ("DESIGN BRIEF (the approach already chosen — plan against it):\n"
+                       + brief.to_markdown() + ("\n\n" + context if context else ""))
+        try:
+            result = subagents.run_subagent(agent_def, task + "\n\n" + self._ARCHITECT_CONTRACT,
+                                            context=context, on_event=self._emit, tier=tier)
+        except Exception as e:
+            self._emit({"type": "system", "content": (
+                f"Superpowers: architect run failed ({e}) — planning inline instead.")})
+            return None
+
+        report = (result or {}).get("report") or ""
+        proposal = superpowers.parse_plan_proposal(report) if report.strip() else None
+        if proposal is None:
+            if report.strip():
+                # Not machine-readable, but the thinking is still worth having.
+                s["messages"].append({"role": "user", "content": (
+                    "[SYSTEM] The architect subagent inspected the workspace and proposed this "
+                    "plan. Turn it into plan_create yourself — and keep its parallel shape: "
+                    "independent steps in the same phase with delegate + scope set, depends_on "
+                    "only where a step truly needs another's result.\n\n" + report)})
+                self._emit({"type": "system", "content": (
+                    "Superpowers: architect returned a prose plan — handing it to the planner.")})
+                return "continue"
+            return None
+
+        try:
+            plan = self._install_proposed_plan(proposal, task, brief)
+        except Exception as e:
+            self._emit({"type": "system", "content": (
+                f"Superpowers: could not install the architect's plan ({e}) — planning inline.")})
+            return None
+
+        s["needs_plan"] = False
+        s["mutating_gate_nudged"] = True     # the plan exists; no un-planned-mutation nudge
+        ready = [it for it in plan.ready_steps() if it["status"] == "pending"]
+        self._emit({"type": "system", "content": (
+            f"Plan installed from the architect: {len(plan.phases)} phase(s), "
+            f"{len(plan.items)} step(s) in the current phase, {len(ready)} runnable right now.")})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] The architect inspected the workspace and its PLAN IS NOW ACTIVE — you did "
+            "not have to write it and you should NOT call plan_create. Read it (it is pinned in "
+            f"your context), then EXECUTE it: {len(ready)} step(s) are independent and ready right "
+            "now, and delegated ones dispatch as a concurrent wave the moment you start them. "
+            "Adjust it as evidence arrives (plan_add_tasks / plan_update_task / plan_replan) — "
+            "but do not quietly re-do the design work, and do not turn its parallel steps into a "
+            "serial march."
+        )})
+        return "continue"
+
+    def _install_proposed_plan(self, proposal, task, brief=None):
+        """Build and activate a Plan from parsed architect proposal args. Also seeds
+        the build ledger with the proposal's components, so a large multi-artifact
+        change starts with a countable worklist instead of prose."""
+        plan = planning.Plan(proposal.get("task") or task)
+        plan.set_mission(success_criteria=proposal.get("success_criteria"),
+                         constraints=proposal.get("constraints"))
+        plan.set_orientation(
+            unknowns=proposal.get("risks"),
+            assumptions=(brief.assumptions if brief is not None else None))
+        if proposal.get("phases"):
+            plan.set_phases(proposal["phases"])
+        plan.add_items(proposal.get("steps") or [])
+        if proposal.get("next_action"):
+            plan.set_next_action(proposal["next_action"])
+        planning.set_active_plan(plan)
+
+        components = proposal.get("components") or []
+        if components:
+            try:
+                lg = ledger.ensure_active(plan.task)
+                for name in components:
+                    lg.add_component(name)
+                ledger.notify_updated()
+            except Exception:
+                pass      # the ledger is an accelerator, never a hard dependency
+        return plan
+
+    def _maybe_run_brainstorm_gate(self, s, tool_name):
+        """On the first tool call of a NEW non-trivial task, brainstorm the goal into
+        a chosen approach BEFORE anything else — autonomously, never asking the user.
+        Default path dispatches the `brainstormer` persona (isolated context, distilled
+        report) and pins the result as a Design Brief; inline-only mode brainstorms
+        in-context instead. Fires ONCE (clears needs_brainstorm up front, so it can
+        never loop), never blocks reads afterward, and never raises."""
+        if not (s.get("superpowers_enabled") and s.get("needs_brainstorm")):
+            return None
+        # Clear immediately: whatever happens below, this task's brainstorm is spent.
+        s["needs_brainstorm"] = False
+
+        task = (s.get("original_task") or "").strip()
+        if not task:
+            return None
+
+        # Inline-only: honor "no subagents" — brainstorm in-context, don't dispatch.
+        if s.get("inline_only"):
+            self._brainstorm_inline_fallback(
+                s, note="Superpowers: brainstorming inline (you asked for inline execution)…")
+            return "continue"
+
+        agent_def = plugins.get_agent(SUPERPOWERS_BRAINSTORMER)
+        if agent_def is None:
+            self._brainstorm_inline_fallback(
+                s, note=("Superpowers: brainstormer persona unavailable — brainstorming inline instead."))
+            return "continue"
+
+        tier, budget_note = self._premium_budget_gate(getattr(agent_def, "tier", None) or "premium")
+        if budget_note:
+            self._emit({"type": "delegate_note", "agent": agent_def.name, "content": budget_note})
+        self._emit({"type": "system", "content": (
+            "Superpowers: auto-brainstorming the goal into a chosen approach before planning "
+            "(autonomous — deciding, not asking)…")})
+
+        sub_task = task + "\n\n" + self._BRAINSTORM_AUTONOMY
+        try:
+            result = subagents.run_subagent(agent_def, sub_task,
+                                            context=self._brainstorm_context(),
+                                            on_event=self._emit, tier=tier)
+        except Exception as e:
+            self._brainstorm_inline_fallback(
+                s, note=f"Superpowers: brainstorm subagent errored ({e}) — brainstorming inline instead.")
+            return "continue"
+
+        report = (result or {}).get("report") or ""
+        if not (result or {}).get("ok") or not report.strip():
+            self._brainstorm_inline_fallback(
+                s, note="Superpowers: brainstorm subagent returned nothing usable — brainstorming inline.")
+            return "continue"
+
+        brief = superpowers.parse_brief_report(report, source="subagent")
+        if brief is None or brief.is_empty():
+            self._brainstorm_inline_fallback(
+                s, note="Superpowers: could not parse a design brief — brainstorming inline.")
+            return "continue"
+
+        superpowers.set_active_brief(brief)  # notifies -> pins into the prompt
+        self._emit({"type": "system", "content": (
+            f"Design brief ready — approach: {brief.one_line()[:160]}")})
+        s["messages"].append({"role": "user", "content": (
+            "[SYSTEM] A DESIGN BRIEF for this task has been prepared by the brainstormer and pinned "
+            "in your context (see 'DESIGN BRIEF'). It chose an approach and resolved the open "
+            "questions as ASSUMPTIONS — do NOT ask the user about them. Now create the plan against "
+            "that chosen approach (plan_create), then execute. If you genuinely disagree with the "
+            "brief, say why and adjust — but do not re-brainstorm from scratch."
+        )})
+        return "continue"
 
     def _run_strategy_review_gate(self, s, brief):
         """Independently review the Strategic Brief before the first mutation. On
@@ -4184,6 +5294,13 @@ class AgentApi:
         finally:
             with self._lock:
                 self._busy = False
+            # A keyword-armed ultra mode covers exactly the turn that asked for
+            # it. The header toggle is unaffected (it never sets ultra_turn_only).
+            if s.get("ultra_turn_only"):
+                s["ultra_turn_only"] = False
+                s["ultra"] = False
+                self._refresh_system_prompt()
+                self._emit({"type": "ultra_mode", "ultra": False})
             self._refresh_tree(force=True)  # push the final tree state once, at the end
             # Save the conversation + transcript so a refresh / restart can
             # restore this chat and continue from here.
@@ -4204,6 +5321,12 @@ def main():
         width=1320,
         height=840,
         min_size=(980, 600),
+        # pywebview defaults this to False, which injects
+        # `body { -webkit-user-select: none }` into the whole webview — that is
+        # what made chat messages impossible to drag-select or copy. Selection
+        # policy now lives in frontend/index.html instead (chrome stays
+        # unselectable, transcript/output/file text is selectable).
+        text_select=True,
     )
     api.set_window(window)
 
@@ -4223,7 +5346,10 @@ def main():
         except Exception as e:
             print(f"[api-server] failed to start: {e}")
 
-    webview.start(debug=True)
+    # DevTools (Web Inspector) no longer auto-opens on launch. Opt back in with
+    # OMNI_DEVTOOLS=1 when you actually need to debug the renderer.
+    _devtools = os.environ.get("OMNI_DEVTOOLS", "0").strip().lower() in ("1", "true", "yes", "on")
+    webview.start(debug=_devtools)
 
 
 if __name__ == "__main__":

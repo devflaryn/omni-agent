@@ -125,7 +125,7 @@ def test_delegate_tier_reaches_read_wave_spec(monkeypatch):
     """End-to-end: a READ step tagged delegate="researcher@cheap" must produce a
     wave spec carrying tier="cheap" and agent_def named "researcher" — not just
     split correctly in isolation. Would catch: forgetting to thread tier into
-    the dict spec built for run_subagents_parallel in _run_delegated_read_wave."""
+    the dict spec built for run_subagents_parallel in _run_delegated_wave."""
     captured = {}
 
     def fake_parallel(specs, on_event=None):

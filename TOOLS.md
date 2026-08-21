@@ -38,7 +38,7 @@ system prompt from ~39k to ~17k tokens.
 - **duplicate_file** — copy a file/directory to a new location (keeps the original).
 
 ## General-purpose shell — `tools/shell.py`
-- **run_command** — run an arbitrary shell command in the Docker sandbox (cwd `/workspace`, timeout-bounded).
+- **run_command** — run an arbitrary shell command on the host machine (cwd is the project folder, timeout-bounded).
 
 ## APK lifecycle: unpack / build / sign / inspect — `tools/apk_tools.py`
 - **unzip_apk** — extract raw APK contents (ONLY for whole-file swaps: `.so`, assets, arch folders). Not the decompile path — use `decode_apk`/`jadx_decompile` for code.
@@ -107,24 +107,43 @@ system prompt from ~39k to ~17k tokens.
 - **diff_code_graphs** — compare two graphs (e.g. two app versions).
 
 ## Codebase Q&A — `tools/codebase_qa.py`
-- **ask_codebase** — ask a natural-language question about `/workspace`; an isolated read-only sub-agent investigates and returns one answer.
+- **ask_codebase** — ask a natural-language question about the active project; an isolated read-only sub-agent investigates and returns one answer.
 
 ## Android emulator / device — `tools/android_emulator.py`
-- **ensure_emulator_running** — boot the project's Android VM (omnidroid backend). Pass `dev=true` (or set `OMNI_USE_DEV_BASE=1`) to boot the **dev base** (`base_arm` + the extra **vdc devkit disk** `base_arm_devkit.qcow2`: android-arm64 frida-server + Magisk + `omni-*` tools) instead of a shipped production base.
+- **ensure_emulator_running** — boot the project's Android VM (omnidroid backend). Pass `debug=true` (or set `OMNI_DEBUG_BOOT=1`) for a **debug boot**: the same dual-use production image, plus the **vdc devkit disk** `base_<arch>_devkit.qcow2` (native frida-server + `omni-*` tools) attached for reverse-engineering. Debug is per-BOOT, so the same instance can boot production or debug on different runs.
 - **adb_shell** — run an arbitrary `adb shell` command against the emulator.
 - **install_apk_on_emulator** — install an APK (ABI-safe on the omnidroid/qemu path).
 - **launch_app_on_emulator** — launch an installed app.
 - **get_logcat** — dump the current logcat buffer, optionally filtered.
 - **monitor_logcat** — capture a logcat window and return only crash/ANR stack traces.
-- **take_emulator_screenshot** — one on-demand screenshot via `screencap` (works even if minimized).
+- **take_emulator_screenshot** — one on-demand screenshot via `screencap` (works even if minimized). Pass `grid=100` to also save a copy with a labelled coordinate grid for reading tap coordinates off the image.
+- **tap_screen / type_text / swipe_screen / press_key** — drive the screen: tap a pixel, type into the focused field, swipe/drag/long-press, press a hardware key. Coordinates are validated against the real screen size, so an off-screen tap errors instead of being silently swallowed by adb.
 - **record_and_capture_keyframes** — sample the screen over a FIXED window and keep only meaningful keyframes.
-- **read_auto_screenshots** — *(dev base only)* read the **ALWAYS-ON** auto-screenshot feed. There is nothing to start or stop: whenever a dev emulator is up (`ensure_emulator_running(dev=True)`), omnidroid auto-captures a full-res PNG on every big on-screen change (a spinner stays below threshold; a black↔loading flip is always caught) into `/workspace/screenshots/auto/`, flushing `metadata.json` live. This returns the running flag + per-keyframe elapsed/gap/black/reason/filename; filenames encode elapsed + gap-since-previous + wall-clock so an instant transition is distinguishable from one that took time. Call with no args for the default `auto` feed; `since_index` polls just the new frames. (The recorder is engine-owned — started on the dev boot, stopped on `stop_emulator`. For a package-scoped crash/exit VERDICT over a bounded window, use `record_and_capture_keyframes`.)
+- **read_auto_screenshots** — *(debug boot only)* read the **ALWAYS-ON** auto-screenshot feed. There is nothing to start or stop: whenever a debug boot is up (`ensure_emulator_running(debug=True)`), omnidroid auto-captures a full-res PNG on every big on-screen change (a spinner stays below threshold; a black↔loading flip is always caught) into `screenshots/auto/`, flushing `metadata.json` live. This returns the running flag + per-keyframe elapsed/gap/black/reason/filename; filenames encode elapsed + gap-since-previous + wall-clock so an instant transition is distinguishable from one that took time. Call with no args for the default `auto` feed; `since_index` polls just the new frames. (The recorder is engine-owned — started on the debug boot, stopped on `stop_emulator`. For a package-scoped crash/exit VERDICT over a bounded window, use `record_and_capture_keyframes`.)
 - **analyze_keyframes** — describe each keyframe with a vision model.
 - **generate_test_report** — assemble a Markdown test report (keyframes + logcat).
-- **run_apk_test_session** — one-shot pipeline: boot → install → launch → capture → analyze → report. Always runs on a FRESH instance: reset is forced true and the harness verifies no third-party packages exist (uninstalling leftovers) before installing the APK under test. Pass `dev=true` to run the whole session on the frida/root-hiding dev base. **Not for Roblox** — it has no concept of accounts/cookies/the session bootstrap and just does a plain install + launcher-intent open; given a Roblox cookie it silently lands on Roblox's own login screen while still reporting success. Use `launch_roblox_build` (or `login_roblox_account` + `play_roblox`) for any Roblox cookie/login/join scenario.
+- **run_apk_test_session** — one-shot pipeline: boot → install → launch → capture → analyze → report. Always runs on a FRESH instance: reset is forced true and the harness verifies no third-party packages exist (uninstalling leftovers) before installing the APK under test. Pass `debug=true` to attach the frida/omni-* devkit for the whole session (the shipped base is dual-use; APK install itself needs no debug). **Not for Roblox** — it has no concept of accounts/cookies/the session bootstrap and just does a plain install + launcher-intent open; given a Roblox cookie it silently lands on Roblox's own login screen while still reporting success. Use `launch_roblox_build` (or `login_roblox_account` + `play_roblox`) for any Roblox cookie/login/join scenario.
 - **stop_emulator** — stop the running emulator/account.
-- **ensure_frida_server** — *(dev base only)* start the devkit frida-server hidden (custom port + randomized process name) via Magisk `su` and `adb forward` a host port onto it; returns the `frida -H 127.0.0.1:<port>` endpoint to attach with. Needs a Magisk-rooted dev boot (`omni build-dev-base --patch-boot`).
-- **hide_root_from_app** — *(dev base only)* best-effort hide root+Magisk+frida from a target package via the devkit `omni-hide` (Magisk DenyList/Shamiko + `resetprop` prop-spoofs). Run after `ensure_frida_server`, before launching the target.
+- **ensure_frida_server** — *(debug boot only)* start the devkit frida-server hidden (custom port + randomized process name) via Magisk `su` and `adb forward` a host port onto it; returns the `frida -H 127.0.0.1:<port>` endpoint to attach with. Needs a Magisk-rooted base (`omni root-base`) and a debug boot (`debug=true`).
+- **hide_root_from_app** — *(debug boot only)* best-effort hide root+Magisk+frida from a target package via the devkit `omni-hide` (Magisk DenyList/Shamiko + `resetprop` prop-spoofs). Run after `ensure_frida_server`, before launching the target.
+
+## Screen driving (look → act → verify) — `tools/emulator_screen.py`
+The main model is text-only, so a screenshot alone gives it nothing to aim at. These turn the
+screen into coordinates and let the agent USE the app rather than watch it. See the
+`screen-driving` skill for the loop and its failure modes.
+- **observe_screen** — one call that answers "what is on screen and what can I tap": resolution,
+  foreground activity, Lock Task state, the saved frame + a grid-annotated copy, and a table of
+  on-screen elements with their exact tap centers (from Android's own view hierarchy). On a screen
+  that draws its own frames (a game/video SurfaceView) the hierarchy is empty — it detects that and
+  falls back to the vision model reading the GRID-annotated frame. For that fallback, `region=`
+  (a name like `bottom-right`, or `x1,y1,x2,y2`) magnifies one part and `target=` names the single
+  control you want; both are measured to matter — an open whole-screen look was ~230 px off a known
+  button, while a zoomed+named look, refined once, landed inside it. Reported coordinates are
+  always FULL-SCREEN pixels, and ones that fall off the screen/region are flagged rather than
+  passed off as fact. Call it after every action to verify the result.
+- **tap_element** — tap by label (`text=` / `desc=` / `element_id=`) instead of by pixel: looks the
+  element up in the live hierarchy and taps the exact center of its bounds. Refuses to guess when
+  several elements match, listing the candidates.
 
 ## Roblox login/join (product session path) — `tools/roblox_session.py`
 Wraps the engine's `omni play` / `omni session` / `omni login` / `omni accounts`
@@ -180,10 +199,10 @@ for a name with no saved cookie and no explicit override (`no_token` error) —
   every Roblox build omnidroid will ship or test; without it, `play_roblox`
   still joins the right place but lands on Roblox's own login screen.
 
-## Frida runtime hooking / instrumentation (dev base) — `tools/frida_tools.py`
-Run natively on the host via the `frida` Python binding against the dev base's devkit frida-server (android-arm64, hidden custom port, auto-forwarded). Dev base only (`ensure_emulator_running(dev=true)`, Magisk-rooted). The base is **arm64 native** (no libndk translation), so BOTH Java/Kotlin hooks AND native `Interceptor`/`Stalker` hooks of the app's own arm64 `.so` code work.
+## Frida runtime hooking / instrumentation (debug boot) — `tools/frida_tools.py`
+Run natively on the host via the `frida` Python binding against the devkit frida-server (native arch, hidden custom port, auto-forwarded). Debug boot only (`ensure_emulator_running(debug=true)`, base rooted via `omni root-base`). The base is **arm64 native** (no libndk translation), so BOTH Java/Kotlin hooks AND native `Interceptor`/`Stalker` hooks of the app's own arm64 `.so` code work.
 - **frida_list_processes** — enumerate processes/apps the frida-server sees (confirms connectivity; finds exact process names/pids).
-- **frida_run_script** — inject an arbitrary Frida JS agent (inline or from a `/workspace` `.js`) into an app (attach or spawn-gated), run it for a window, and return every `send()`/`console.log`/error plus whether the app stayed alive (a crash right after injection ⇒ likely detection).
+- **frida_run_script** — inject an arbitrary Frida JS agent (inline or from a `.js` file in the project) into an app (attach or spawn-gated), run it for a window, and return every `send()`/`console.log`/error plus whether the app stayed alive (a crash right after injection ⇒ likely detection).
 - **frida_trace** — auto-generate + run a tracer for named Java methods (`com.pkg.Class.method`, all overloads) and/or native functions (`lib.so!symbol`), logging args + return values.
 - **frida_bypass_ssl_pinning** — inject a ready-made Java-layer TLS-unpinning agent (X509TrustManager / OkHttp CertificatePinner / Conscrypt TrustManagerImpl / HostnameVerifier) so an intercepting proxy can read the app's HTTPS.
 
@@ -225,4 +244,5 @@ Structured, deduplicated, evidence-backed record of what's been established; sur
 
 ## Delegation & meta — `tools/delegation_tools.py`, `tools/meta_tools.py`
 - **dispatch_agents** — run a wave of read-only subagents in parallel (each in its own isolated context) and get back only their distilled reports; keeps heavy exploration off the main context. Name agents from AVAILABLE SUBAGENTS. For a tracked/self-contained step (research OR a change) prefer a plan step tagged `delegate=<agent>` instead.
+- **run_workflow** — run a deterministic, multi-stage, multi-agent WORKFLOW: fan out, pipe each result into the next stage, verify findings adversarially, loop until a search goes dry, with control flow decided by code rather than by you re-deciding every turn. Prefer a library workflow by `name` (review-changes, understand-subsystem, deep-research, exhaustive-audit, migrate, design-panel); pass a `script` only for work none of them cover. Params: `name` (string, optional), `script` (string, optional — Python; must start with a literal `meta = {"name": ..., "description": ...}` and end with `return <value>`), `args` (object, optional, passed to the script as `args`), `resume_from` (string, optional — a prior run_id; unchanged agent calls replay from its journal), `dry_run` (boolean, optional, default false — validate and exercise control flow without spending tokens). Output: `{ok, run_id, name, result, agent_count, elapsed_s, warnings}` on success; `{error}` with the traceback when validation or dry-run fails, so you can fix the script and retry. For ONE flat wave of independent read-only questions, `dispatch_agents` is cheaper; use `run_workflow` for genuinely multi-stage work.
 - **expand_tools** — reveal the full parameter schemas of an on-demand toolset (`apk`/`smali`/`native`/`emulator`/`frida`) or a single tool, before a chunk of domain work.
