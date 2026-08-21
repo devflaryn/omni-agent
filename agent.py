@@ -1033,43 +1033,71 @@ def _tree_signature(tree):
 # Depth and ignore list mirror the local walker, so switching machines does not
 # silently change what the tree shows.
 _REMOTE_TREE_DEPTH = 6
-_REMOTE_TREE_IGNORE = (".git", "node_modules", "__pycache__", ".venv", "dist", "build")
+_REMOTE_TREE_IGNORE = (".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build")
 
 
 def _remote_find_command():
-    """Two `find` passes, one per type, each tagged with a leading d/f.
+    """Two `find` passes, one per type, each tagged with a leading d/f. The file
+    pass also carries a size, so remote file nodes get "size" the same as local
+    ones (frontend's humanSize() otherwise silently shows nothing).
 
-    Deliberately avoids `find -printf`, which is GNU-only. The local box assumes
-    a GNU userland, but a remote host may be macOS or BSD, and a tree that fails
-    on half the machines you connect to is not a tree."""
+    Deliberately avoids `find -printf` and `stat -c`, which are GNU-only. The
+    local box assumes a GNU userland, but a remote host may be macOS or BSD, and
+    a tree that fails on half the machines you connect to is not a tree. `wc -c`
+    is POSIX and prints "<size> <path>"; requiring the "./" prefix in the sed
+    pattern drops wc's per-batch "total" line (it has no "./" prefix) for free."""
     prune = " -o ".join(f"-name {shlex.quote(n)}" for n in _REMOTE_TREE_IGNORE)
     base = f"find . -maxdepth {_REMOTE_TREE_DEPTH} \\( {prune} \\) -prune -o "
     d = base + r"-type d -print | sed 's|^|d\t|'"
-    f = base + r"-type f -print | sed 's|^|f\t|'"
+    f = (base + r"-type f -exec wc -c {} + | "
+                r"sed -n 's|^ *\([0-9][0-9]*\) \(\./.*\)$|f\t\1\t\2|p'")
     return d + "; " + f
 
 
 def _parse_find_output(text, project_name):
     """Turn the tagged find output into the SAME nested dict the local walker
-    produces, so the frontend needs no changes."""
+    produces, so the frontend needs no changes.
+
+    Directory lines are 2-field ("d\\t<path>"); file lines are 3-field
+    ("f\\t<size>\\t<path>") so file nodes carry "size", matching the local
+    walker. A 2-field file line (no size available) still parses, with
+    size falling back to 0, rather than being dropped."""
     root = {"name": project_name or "workspace", "path": "", "type": "dir", "children": []}
     dirs = {"": root}
 
-    rows = []
+    rows = []  # (kind, rel, size-or-None)
     for line in (text or "").splitlines():
         if "\t" not in line:
             continue
-        kind, _, raw = line.partition("\t")
+        parts = line.split("\t")
+        kind = parts[0]
+        if kind == "d":
+            if len(parts) < 2:
+                continue
+            raw, size = parts[1], None
+        elif kind == "f":
+            if len(parts) >= 3:
+                raw, size_str = parts[2], parts[1]
+                try:
+                    size = int(size_str)
+                except ValueError:
+                    size = None
+            elif len(parts) == 2:
+                raw, size = parts[1], None
+            else:
+                continue
+        else:
+            continue
         rel = raw[2:] if raw.startswith("./") else raw
         if rel in ("", "."):
             continue
-        rows.append((kind, rel))
+        rows.append((kind, rel, size))
 
     # Directories first and shallowest-first, so a parent always exists before
     # its child is attached.
     rows.sort(key=lambda r: (0 if r[0] == "d" else 1, r[1].count("/"), r[1]))
 
-    for kind, rel in rows:
+    for kind, rel, size in rows:
         parent_rel, _, name = rel.rpartition("/")
         parent = dirs.get(parent_rel)
         if parent is None:
@@ -1078,6 +1106,8 @@ def _parse_find_output(text, project_name):
         if kind == "d":
             node["children"] = []
             dirs[rel] = node
+        else:
+            node["size"] = size if size is not None else 0
         parent["children"].append(node)
 
     def sort_tree(node):
@@ -1281,16 +1311,35 @@ _REMOTE_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image
 def _remote_read_project_file(project_name, rel_path, force_text=False):
     from tools.common import normalize_path, wpath
     rel = normalize_path(rel_path)
+    t = wpath(rel)
 
-    # Same guard as the local viewer: resolve on the far side and confirm the
-    # result is still inside the project root.
-    probe = run_cmd(
-        f'R=$(pwd -P); F=$(cd "$(dirname {wpath(rel)})" 2>/dev/null && pwd -P)/'
-        f'"$(basename {wpath(rel)})"; '
+    # Same guard as the local viewer: resolve the path on the far side and
+    # confirm the result is still inside the project root. Resolving only
+    # dirname() (as an earlier version of this did) misses a LEAF symlink:
+    # `ln -s /etc/passwd leak.txt` has dirname "." — which trivially passes the
+    # root check — while the leaf itself points outside. So the leaf is
+    # resolved too: realpath if present, else `readlink -f`, else (for hosts
+    # with neither, e.g. some macOS/BSD) one manual level of `readlink` on the
+    # leaf, re-anchored against its resolved directory if the target is
+    # relative. Whichever path wins, the root comparison runs on it before any
+    # -f/wc/cat/base64 touches the file.
+    probe_script = (
+        f'T={t}; R=$(pwd -P); '
+        f'D=$(cd "$(dirname "$T")" 2>/dev/null && pwd -P); '
+        f'B=$(basename "$T"); '
+        f'if command -v realpath >/dev/null 2>&1; then F=$(realpath "$D/$B" 2>/dev/null); '
+        f'elif L=$(readlink -f "$D/$B" 2>/dev/null) && [ -n "$L" ]; then F="$L"; '
+        f'else '
+        f'LK=$(readlink "$D/$B" 2>/dev/null); '
+        f'if [ -n "$LK" ]; then case "$LK" in /*) F="$LK";; *) F="$D/$LK";; esac; '
+        f'else F="$D/$B"; fi; '
+        f'fi; '
+        f'if [ -z "$F" ]; then echo OUTSIDE; exit 0; fi; '
         f'case "$F" in "$R"/*|"$R") ;; *) echo OUTSIDE; exit 0;; esac; '
-        f'if [ ! -f {wpath(rel)} ]; then echo MISSING; exit 0; fi; '
-        f'echo "SIZE=$(wc -c < {wpath(rel)} | tr -d " ")"',
-        timeout=30)
+        f'if [ ! -f {t} ]; then echo MISSING; exit 0; fi; '
+        f'echo "SIZE=$(wc -c < {t} | tr -d " ")"'
+    )
+    probe = run_cmd(probe_script, timeout=30)
     out = (probe.get("stdout") or "").strip()
     if probe.get("error"):
         return {"ok": False, "error": probe["error"]}
@@ -1314,16 +1363,17 @@ def _remote_read_project_file(project_name, rel_path, force_text=False):
 
     ext = os.path.splitext(rel)[1].lower()
     if ext in _REMOTE_IMAGE_MIME and not force_text:
-        res = run_cmd(f"base64 {wpath(rel)} | tr -d '\\n'", timeout=120)
+        res = run_cmd(f"base64 {t} | tr -d '\\n'", timeout=120)
         if res.get("error") or res.get("returncode"):
             return {"ok": False, "error": res.get("error") or "could not read the image"}
         return {"ok": True, "kind": "image", "mime": _REMOTE_IMAGE_MIME[ext],
-                "data": (res.get("stdout") or "").strip(), "path": rel}
+                "data": (res.get("stdout") or "").strip(), "path": rel, "size": size}
 
-    res = run_cmd(f"cat {wpath(rel)}", timeout=120)
+    res = run_cmd(f"cat {t}", timeout=120)
     if res.get("error") or res.get("returncode"):
         return {"ok": False, "error": res.get("error") or "could not read the file"}
-    return {"ok": True, "kind": "text", "content": res.get("stdout") or "", "path": rel}
+    return {"ok": True, "kind": "text", "content": res.get("stdout") or "", "path": rel,
+            "size": size}
 
 
 def read_project_file(project_name, rel_path, force_text=False):

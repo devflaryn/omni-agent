@@ -10,9 +10,9 @@ FIND_OUTPUT = "\n".join([
     "d\t.",
     "d\tsrc",
     "d\tsrc/util",
-    "f\tREADME.md",
-    "f\tsrc/main.py",
-    "f\tsrc/util/helpers.py",
+    "f\t123\tREADME.md",
+    "f\t456\tsrc/main.py",
+    "f\t789\tsrc/util/helpers.py",
 ])
 
 
@@ -49,6 +49,15 @@ def test_directories_sort_before_files():
 def test_empty_output_yields_an_empty_root():
     tree = agent._parse_find_output("", "proj")
     assert tree["children"] == [] and tree["type"] == "dir"
+
+
+def test_file_nodes_carry_their_size():
+    tree = agent._parse_find_output(FIND_OUTPUT, "proj")
+    src = [c for c in tree["children"] if c["name"] == "src"][0]
+    main = [c for c in src["children"] if c["name"] == "main.py"][0]
+    assert main["size"] == 456
+    readme = [c for c in tree["children"] if c["name"] == "README.md"][0]
+    assert readme["size"] == 123
 
 
 def test_remote_tree_shells_out_and_does_not_touch_local_disk(monkeypatch):
@@ -95,10 +104,14 @@ def _remote(monkeypatch, stdout, returncode=0):
 
 
 def test_remote_text_file_is_returned_as_text(monkeypatch):
-    _remote(monkeypatch, lambda cmd: "SIZE=12\n" if "stat" in cmd else "hello world\n")
+    # "pwd -P" only appears in the probe script (the data-fetch call is a
+    # plain `cat`/`base64`), so it's what actually distinguishes the two
+    # run_cmd calls the fake needs to answer differently.
+    _remote(monkeypatch, lambda cmd: "SIZE=12\n" if "pwd -P" in cmd else "hello world\n")
     res = agent.read_project_file("proj", "README.md")
     assert res["ok"] is True and res["kind"] == "text"
     assert "hello world" in res["content"]
+    assert res["size"] == 12
 
 
 def test_remote_escape_outside_the_project_is_rejected(monkeypatch):
@@ -109,12 +122,29 @@ def test_remote_escape_outside_the_project_is_rejected(monkeypatch):
     assert res["ok"] is False and "outside" in res["error"].lower()
 
 
+def test_remote_leaf_symlink_escape_is_rejected_without_transfer(monkeypatch):
+    # A symlink whose LEAF component (not a parent directory) points outside
+    # the project root must be caught too. `ln -s /etc/passwd leak.txt` has
+    # dirname "." -- resolving only the directory part would trivially pass
+    # the root check while the leaf itself points outside. The probe script
+    # resolves the leaf (realpath/readlink -f/manual fallback) before the
+    # root comparison, so it reports OUTSIDE here exactly like any other
+    # escape, and must never get as far as cat/base64.
+    seen = _remote(monkeypatch, "OUTSIDE\n")
+    res = agent.read_project_file("proj", "leak.txt")
+    assert res["ok"] is False and "outside" in res["error"].lower()
+    assert len(seen["cmds"]) == 1, "must not issue a second command after OUTSIDE"
+    assert not any("base64" in c for c in seen["cmds"])
+    assert not any(c.strip().startswith("cat ") for c in seen["cmds"])
+
+
 def test_remote_image_comes_back_base64(monkeypatch):
     payload = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
-    _remote(monkeypatch, lambda cmd: "SIZE=15\n" if "stat" in cmd else payload)
+    _remote(monkeypatch, lambda cmd: "SIZE=15\n" if "pwd -P" in cmd else payload)
     res = agent.read_project_file("proj", "shot.png")
     assert res["ok"] is True and res["kind"] == "image"
     assert res["mime"] == "image/png" and res["data"] == payload
+    assert res["size"] == 15
 
 
 def test_a_file_over_the_cap_is_refused_not_transferred(monkeypatch):
@@ -140,10 +170,12 @@ if __name__ == "__main__":
              (test_paths_are_project_relative, False),
              (test_directories_sort_before_files, False),
              (test_empty_output_yields_an_empty_root, False),
+             (test_file_nodes_carry_their_size, False),
              (test_remote_tree_shells_out_and_does_not_touch_local_disk, True),
              (test_remote_tree_survives_a_failed_command, True),
              (test_remote_text_file_is_returned_as_text, True),
              (test_remote_escape_outside_the_project_is_rejected, True),
+             (test_remote_leaf_symlink_escape_is_rejected_without_transfer, True),
              (test_remote_image_comes_back_base64, True),
              (test_a_file_over_the_cap_is_refused_not_transferred, True),
              (test_a_missing_remote_file_reports_cleanly, True)]
