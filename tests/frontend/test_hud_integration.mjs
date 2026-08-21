@@ -35,6 +35,11 @@ class El {
   get innerHTML() { return this._html; }
   addEventListener(type, fn) { (this._listeners ||= {})[type] = fn; }
   click() { const f = this._listeners && this._listeners.click; if (f) f(); }
+  // The fab-count icon swap (done vs running count) sets/clears aria-label —
+  // a real element supports this even though this shim otherwise skips attrs.
+  setAttribute(k, v) { this[k] = v; }
+  getAttribute(k) { return this[k]; }
+  removeAttribute(k) { delete this[k]; }
   appendChild(c) { c._parent = this; this.children.push(c); if (c.id) doc._byId.set(c.id, c); return c; }
   // Detach from the parent. app.js calls this on completed subagent track rows
   // (subagentDone) and on the Thinking… line, so the shim needs it to be real —
@@ -91,6 +96,7 @@ function load(file) {
   vm.runInContext(code, sandbox, { filename: file });
 }
 load('wave_stats.js'); // must load first (app.js reads window.SessionHudModel etc.)
+load('icons.js');      // defines window.icon(), which app.js calls to render sprite icons
 load('app.js');
 
 const onEvent = sandbox.window.__agent.onEvent;

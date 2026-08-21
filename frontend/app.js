@@ -259,7 +259,7 @@ function formatInline(text) {
   // `inline code`
   s = s.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${code}</code>`));
 
-  // ***bold italic***  →  **bold**  →  *italic*  (no space just inside the markers)
+  // ***bold italic*** -> **bold** -> *italic*  (no space just inside the markers)
   s = s.replace(/\*\*\*(?=\S)([\s\S]+?)(?<=\S)\*\*\*/g, '<strong><em>$1</em></strong>');
   s = s.replace(/\*\*(?=\S)([\s\S]+?)(?<=\S)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/\*(?=\S)([^*\n]+?)(?<=\S)\*/g, '<em>$1</em>');
@@ -302,30 +302,6 @@ function renderUserMessage(content) {
 // widget collapses (still clickable to re-open); a fresh group then opens under
 // the new explanation. A tool call with no explanation just extends the current
 // group — so a run reads as: explanation, [group], next explanation, [group], …
-
-const SPIN_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-let spinFrame = 0;
-
-// One global ticker animates the live spinner glyphs (at most a couple exist
-// at a time). Live spinners register here instead of being found with a
-// document-wide querySelectorAll on every tick, and the interval only runs
-// while something is actually spinning.
-const liveSpinners = new Set();
-let spinTimer = null;
-
-function registerSpinners(scope) {
-  for (const el of scope.querySelectorAll('.braille-spin')) liveSpinners.add(el);
-  if (liveSpinners.size && !spinTimer) spinTimer = setInterval(spinTick, 90);
-}
-
-function spinTick() {
-  spinFrame = (spinFrame + 1) % SPIN_FRAMES.length;
-  for (const el of liveSpinners) {
-    if (!el.isConnected) { liveSpinners.delete(el); continue; }
-    el.textContent = SPIN_FRAMES[spinFrame];
-  }
-  if (!liveSpinners.size) { clearInterval(spinTimer); spinTimer = null; }
-}
 
 let thinkingEl = null;     // the live "Thinking…" shimmer line, if any
 let currentGroup = null;   // the action group following the most recent thought
@@ -370,10 +346,9 @@ function startThinking() {
   if (thinkingEl) { _updateThinkingMeta(); return; } // JSON-retry leg: reuse the existing line
   const el = document.createElement('div');
   el.className = 'py-0.5 font-mono t-sm leading-5';
-  el.innerHTML = `<span class="braille-spin text-term-cyan">${SPIN_FRAMES[spinFrame]}</span> ` +
+  el.innerHTML = `<span class="text-term-cyan">${icon('loader', 'ico-spin')}</span> ` +
     `<span class="shimmer">Thinking…</span><span class="think-meta text-term-muted"></span>`;
   appendRow(el);
-  registerSpinners(el);
   thinkingEl = el;
   _updateThinkingMeta();
   if (_thinkTicker) clearInterval(_thinkTicker);
@@ -732,7 +707,7 @@ function startActionGroup() {
   // tool calls never fills the whole chat — newest calls sit at the bottom.
   el.innerHTML = `
     <button type="button" class="group-head flex w-full items-center gap-2 rounded-lg px-1.5 py-0.5 text-left font-mono t-sm leading-5 hover:bg-term-line/30">
-      <span class="group-caret caret shrink-0 select-none t-2xs leading-none text-term-muted">▶</span>
+      <span class="group-caret caret shrink-0 select-none t-2xs leading-none text-term-muted">${icon('chevron-right')}</span>
       <span class="group-title min-w-0 flex-1 truncate text-term-text"></span>
       <span class="group-meta ml-auto shrink-0 t-2xs tabular-nums text-term-muted"></span>
     </button>
@@ -755,7 +730,7 @@ function startActionGroup() {
     startTs: (replaying && replayTs != null) ? replayTs : Date.now(),
     completed: false, open: true,
   };
-  g.titleEl.classList.add('shimmer'); // active → silver sweep until completed
+  g.titleEl.classList.add('shimmer'); // active -> silver sweep until completed
   // Finishing a drag-select over the summary line still fires a click; toggling
   // the group there would collapse the very text the user just highlighted.
   g.head.addEventListener('click', () => {
@@ -770,14 +745,14 @@ function startActionGroup() {
 
 // Inline HTML for one action line (icon + tool name + arg summary). No output.
 function actionInner(ev, state) {
-  const icon = {
-    live: `<span class="braille-spin text-term-cyan">${SPIN_FRAMES[spinFrame]}</span>`,
-    done: '<span class="text-term-green">●</span>',
+  const stateIcon = {
+    live: `<span class="text-term-cyan">${icon('loader', 'ico-spin')}</span>`,
+    done: `<span class="text-term-green">${icon('circle', 'ico-filled')}</span>`,
     warn: '<span class="text-term-red">!</span>',
-    interrupted: '<span class="text-term-muted">○</span>',
+    interrupted: `<span class="text-term-muted">${icon('circle')}</span>`,
   }[state];
   const nameCls = state === 'warn' ? 'text-term-red' : 'text-term-text';
-  return `${icon} <span class="${nameCls}">${escapeHtml(toolDisplayName(ev.tool))}</span>` +
+  return `${stateIcon} <span class="${nameCls}">${escapeHtml(toolDisplayName(ev.tool))}</span>` +
     ` <span class="text-term-muted">${escapeHtml(argSummary(ev.args))}</span>` +
     (state === 'warn' ? ' <span class="text-term-red">loop warning</span>' : '');
 }
@@ -792,7 +767,7 @@ function pushAction(ev, state) {
   row.className = 'group-row truncate';
   row.innerHTML = actionInner(ev, state);
   g.listEl.appendChild(row);
-  if (state === 'live') { registerSpinners(row); g.liveId = ev.id; g.liveEv = ev; g.liveRow = row; }
+  if (state === 'live') { g.liveId = ev.id; g.liveEv = ev; g.liveRow = row; }
   g.n += 1;
   countToolCall(g.counts, ev, g.n);
   updateGroupTitle(g);
@@ -848,7 +823,7 @@ function argSummary(args) {
   if (args.query) return `(${args.query})`;
   if (args.pattern) return `(${args.pattern})`;
   if (args.content) return `(content: ${String(args.content).length} chars)`;
-  if (args.source && args.destination) return `(${args.source} → ${args.destination})`;
+  if (args.source && args.destination) return `(${args.source} -> ${args.destination})`;
   return '';
 }
 
@@ -1017,16 +992,16 @@ function _dock() {
     const fab = document.createElement('button');
     fab.id = 'subagents-fab';
     fab.type = 'button';
-    fab.innerHTML = '<span>⚡</span><span class="fab-label">Subagents</span><span class="fab-count"></span>';
+    fab.innerHTML = `<span>${icon('zap')}</span><span class="fab-label">Subagents</span><span class="fab-count"></span>`;
     fab.addEventListener('click', _toggleSubagents);
     document.body.appendChild(fab);
 
     el = document.createElement('div');
     el.id = 'concurrency-dock';
     el.innerHTML =
-      '<div class="cdock-header"><span>⚡</span><span class="cdock-title">Subagents</span>' +
+      `<div class="cdock-header"><span>${icon('zap')}</span><span class="cdock-title">Subagents</span>` +
       '<span class="cdock-count"></span>' +
-      '<button class="cdock-close" type="button" title="Close">✕</button></div>' +
+      `<button class="cdock-close" type="button" title="Close">${icon('x')}</button></div>` +
       '<div class="cdock-session" style="display:none">' +
       '<div class="cdock-sess-line"><span class="cdock-sess-elapsed">00:00</span>' +
       '<span class="cdock-sess-count">0 running · 0 done</span></div>' +
@@ -1056,7 +1031,11 @@ function _updateFab(runningCount, done) {
   if (!fab) return;
   fab.classList.add('fab-visible');
   const c = fab.querySelector('.fab-count');
-  if (c) c.textContent = runningCount > 0 ? String(runningCount) : (done ? '✓' : '');
+  if (c) {
+    if (runningCount > 0) { c.textContent = String(runningCount); c.removeAttribute('aria-label'); }
+    else if (done) { c.innerHTML = icon('check'); c.setAttribute('aria-label', 'done'); }
+    else { c.textContent = ''; c.removeAttribute('aria-label'); }
+  }
   fab.classList.toggle('fab-active', runningCount > 0);
 }
 
@@ -1120,12 +1099,13 @@ function waveRestore(ev) {
       '<span class="cbar-model"></span><span class="cbar-key"></span><span class="cbar-stat"></span></div>';
     row.querySelector('.cbar-name').textContent = r.agent || '';
     row.querySelector('.cbar-task').textContent = r.task || '';
-    row.querySelector('.cbar-model').textContent =
-      _modelTierLabel(r.tier, r.model) + (r.escalated ? ' ⇡' : '');
+    row.querySelector('.cbar-model').innerHTML =
+      escapeHtml(_modelTierLabel(r.tier, r.model)) +
+      (r.escalated ? ` <span aria-label="escalated">${icon('arrow-up')}</span>` : '');
     row.querySelector('.cbar-key').textContent = r.key_label || '';
-    row.querySelector('.cbar-stat').textContent = r.running
-      ? `⋯ interrupted · ${r.tokens || 0} tok · step ${r.steps || 0}`
-      : `${r.ok ? '✓' : '✗'} ${r.elapsed_s || 0}s · ${r.tokens || 0} tok · ${r.steps || 0} steps`;
+    row.querySelector('.cbar-stat').innerHTML = r.running
+      ? `${icon('more-horizontal')} interrupted · ${r.tokens || 0} tok · step ${r.steps || 0}`
+      : `<span aria-label="${r.ok ? 'succeeded' : 'failed'}">${icon(r.ok ? 'check' : 'x-circle')}</span> ${r.elapsed_s || 0}s · ${r.tokens || 0} tok · ${r.steps || 0} steps`;
     _completedSection().appendChild(row);
     if (!r.running) doneCount++;
   });
@@ -1197,20 +1177,21 @@ function subagentDone(ev) {
   bar.endOffsetMs = performance.now() - _wave.originTs;
   bar.ok = !!ev.ok; bar.running = false; bar.steps = ev.steps; bar.tokens = ev.tokens;
   bar.row.querySelector('.cbar-fill').classList.add(ev.ok ? 'ok' : 'failed');
-  bar.row.querySelector('.cbar-stat').textContent =
-    `${ev.ok ? '✓' : '✗'} ${ev.elapsed_s}s · ${ev.tokens} tok · ${ev.steps} steps`;
+  bar.row.querySelector('.cbar-stat').innerHTML =
+    `<span aria-label="${ev.ok ? 'succeeded' : 'failed'}">${icon(ev.ok ? 'check' : 'x-circle')}</span> ${ev.elapsed_s}s · ${ev.tokens} tok · ${ev.steps} steps`;
   // The model actually served can differ from the one advertised at start
   // (mid-run fallback) and/or have escalated after repeated protocol errors —
   // refresh the label so the HUD reflects what really ran.
   if (ev.model) {
     const modelEl = bar.row.querySelector('.cbar-model');
-    modelEl.textContent = _modelTierLabel(bar.tier, ev.model) + (ev.escalated ? ' ⇡' : '');
+    modelEl.innerHTML = escapeHtml(_modelTierLabel(bar.tier, ev.model)) +
+      (ev.escalated ? ` <span aria-label="escalated">${icon('arrow-up')}</span>` : '');
     if (ev.escalated) modelEl.title = 'escalated to a stronger model after repeated protocol errors';
   }
   // Retire the finished row: its timeline bar only ever spanned its slice of the
   // shared wall-clock axis (green but never "full", which misreads as still
   // running), so drop the track entirely and file the row under a "Completed"
-  // title. The ✓/✗ stat line now carries the outcome.
+  // title. The check/x-circle stat line now carries the outcome.
   const track = bar.row.querySelector('.cbar-track');
   if (track) track.remove();
   bar.row.classList.add('cbar-done', ev.ok ? 'cbar-ok' : 'cbar-failed');
@@ -1247,8 +1228,8 @@ function waveDone(ev) {
   const el = _dock();
   const sum = el.querySelector('.cdock-summary');
   sum.style.display = '';
-  sum.innerHTML = `⚡ wave done · ${stats.n} agents · peak ${stats.peak} concurrent · ` +
-    `${stats.wallS}s wall vs ${stats.summedS}s summed → ` +
+  sum.innerHTML = `${icon('zap')} wave done · ${stats.n} agents · peak ${stats.peak} concurrent · ` +
+    `${stats.wallS}s wall vs ${stats.summedS}s summed ${icon('arrow-right')} ` +
     `<span class="cdock-speedup">${stats.speedup}× faster</span>`;
   el.querySelector('.cdock-count').textContent = '';
   _updateFab(0, true);
@@ -1303,7 +1284,12 @@ window.__demoWave = function (n = 3) {
 let currentPlan = null;
 
 function planStatusIcon(status) {
-  return { pending: '○', in_progress: '◐', completed: '✓', skipped: '⊘' }[status] || '○';
+  return {
+    pending: icon('circle'),
+    in_progress: icon('loader', 'ico-spin'),
+    completed: icon('check'),
+    skipped: icon('ban'),
+  }[status] || icon('circle');
 }
 function planStatusColor(status) {
   return {
@@ -1667,11 +1653,11 @@ function renderPlan(plan) {
 
 // ---------- file tree ----------
 function fileIcon(name) {
-  return name.endsWith('.md') ? '📘' :
-    name.endsWith('.py') ? '🐍' :
-    name.match(/\.(js|ts|jsx|tsx|html|css|json)$/) ? '🧩' :
-    name.match(/\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i) ? '🖼️' :
-    name.match(/\.(zip|apk|jar|aar|xapk|apks|so|dex|bin|dat)$/i) ? '📦' : '📄';
+  return name.endsWith('.md') ? icon('file') :
+    name.endsWith('.py') ? icon('file-code') :
+    name.match(/\.(js|ts|jsx|tsx|html|css|json)$/) ? icon('puzzle') :
+    name.match(/\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i) ? icon('image') :
+    name.match(/\.(zip|apk|jar|aar|xapk|apks|so|dex|bin|dat)$/i) ? icon('package') : icon('file');
 }
 
 // Directory paths the user currently has expanded. Preserved across tree
@@ -1900,15 +1886,15 @@ function buildTreeNode(node, depth) {
 
   if (node.type === 'dir') {
     const caret = document.createElement('span');
-    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.textContent = '▶';
+    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.innerHTML = icon('chevron-right');
     const isTrash = node.path === TRASH_DIR;
-    const icon = document.createElement('span');
-    icon.textContent = isTrash ? '🗑' : '📁';
-    icon.className = 't-sm';
+    const iconEl = document.createElement('span');
+    iconEl.innerHTML = isTrash ? icon('trash') : icon('folder');
+    iconEl.className = 't-sm';
     const name = document.createElement('span');
     name.textContent = isTrash ? 'Trash' : node.name;
     name.className = 'text-term-text truncate';
-    row.append(caret, icon, name);
+    row.append(caret, iconEl, name);
     if (isTrash) row.classList.add('tree-trash');
 
     // --- drop target: folders (and the trash) accept a dragged selection ---
@@ -1949,7 +1935,7 @@ function buildTreeNode(node, depth) {
     const setOpen = (open) => {
       childWrap.classList.toggle('hidden', !open);
       caret.classList.toggle('open', open);
-      if (!isTrash) icon.textContent = open ? '📂' : '📁';
+      if (!isTrash) iconEl.innerHTML = open ? icon('folder-open') : icon('folder');
       if (open) { buildChildren(); expandedDirs.add(node.path); }
       else expandedDirs.delete(node.path);
     };
@@ -1967,10 +1953,10 @@ function buildTreeNode(node, depth) {
     return wrap;
   } else {
     const spacer = document.createElement('span'); spacer.className = 'w-3 inline-block';
-    const icon = document.createElement('span'); icon.textContent = fileIcon(node.name); icon.className = 't-sm';
+    const iconEl = document.createElement('span'); iconEl.innerHTML = fileIcon(node.name); iconEl.className = 't-sm';
     const name = document.createElement('span'); name.textContent = node.name; name.className = 'text-term-text truncate flex-1';
     const size = document.createElement('span'); size.textContent = humanSize(node.size); size.className = 't-2xs text-term-muted';
-    row.append(spacer, icon, name, size);
+    row.append(spacer, iconEl, name, size);
     row.addEventListener('click', (e) => {
       _selectTreeRow(node.path, e);
       $('fileTree').querySelectorAll('.tree-row.active').forEach(r => r.classList.remove('active'));
@@ -2153,7 +2139,7 @@ function wireTreeDropZone() {
 
 // ---------- file viewer ----------
 // When an archive (zip/apk/…) is open, this holds its workspace path and the
-// header size label so "← archive" can return to the cached listing without
+// header size label so the back-to-archive action can return to the cached listing without
 // re-reading the zip. null whenever the viewer shows a plain workspace file.
 let archiveViewer = null;
 
@@ -2292,10 +2278,10 @@ function appendArchiveLevel(container, node, depth) {
     row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
     row.style.paddingLeft = (depth * 12 + 4) + 'px';
     const caret = document.createElement('span');
-    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.textContent = '▶';
-    const icon = document.createElement('span'); icon.textContent = '📁'; icon.className = 't-sm';
+    caret.className = 'caret text-term-muted w-3 inline-block t-2xs'; caret.innerHTML = icon('chevron-right');
+    const iconEl = document.createElement('span'); iconEl.innerHTML = icon('folder'); iconEl.className = 't-sm';
     const name = document.createElement('span'); name.textContent = dirName; name.className = 'text-term-text truncate';
-    row.append(caret, icon, name);
+    row.append(caret, iconEl, name);
     const childWrap = document.createElement('div');
     childWrap.className = 'hidden';
     let built = false;
@@ -2304,7 +2290,7 @@ function appendArchiveLevel(container, node, depth) {
       if (open && !built) { built = true; appendArchiveLevel(childWrap, child, depth + 1); }
       childWrap.classList.toggle('hidden', !open);
       caret.classList.toggle('open', open);
-      icon.textContent = open ? '📂' : '📁';
+      iconEl.innerHTML = open ? icon('folder-open') : icon('folder');
     });
     container.append(row, childWrap);
   }
@@ -2313,10 +2299,10 @@ function appendArchiveLevel(container, node, depth) {
     row.className = 'tree-row flex items-center gap-1 rounded-md px-1 py-0.5 cursor-pointer select-none';
     row.style.paddingLeft = (depth * 12 + 4) + 'px';
     const spacer = document.createElement('span'); spacer.className = 'w-3 inline-block';
-    const icon = document.createElement('span'); icon.textContent = fileIcon(f.name); icon.className = 't-sm';
+    const iconEl = document.createElement('span'); iconEl.innerHTML = fileIcon(f.name); iconEl.className = 't-sm';
     const name = document.createElement('span'); name.textContent = f.name; name.className = 'text-term-text truncate flex-1';
     const size = document.createElement('span'); size.textContent = humanSize(f.size); size.className = 't-2xs text-term-muted';
-    row.append(spacer, icon, name, size);
+    row.append(spacer, iconEl, name, size);
     row.addEventListener('click', () => openArchiveMember(f.full));
     container.appendChild(row);
   }
@@ -2348,7 +2334,7 @@ async function openArchiveMember(entry) {
   }
 }
 
-// "← archive": return from an entry preview to the still-rendered listing.
+// Back to archive: return from an entry preview to the still-rendered listing.
 function backToArchiveListing() {
   if (!archiveViewer) return;
   viewerForceTarget = null;
@@ -2474,7 +2460,7 @@ function _deviceRow(d) {
     rmBtn.type = 'button';
     rmBtn.title = 'Remove device';
     rmBtn.className = 'icon-btn';
-    rmBtn.textContent = '✕';
+    rmBtn.innerHTML = icon('x');
     rmBtn.addEventListener('click', () => removeDevice(d.id));
     actions.appendChild(rmBtn);
   }
@@ -3074,10 +3060,10 @@ function _llmRow(c, idx) {
   row.className = 'llm-prow' + (c.id === _llmSelectedId ? ' selected' : '');
   row.dataset.id = c.id;
   row.draggable = true;
-  row.title = 'Click to edit · drag ⠿ to change fallback priority';
+  row.title = 'Click to edit · drag the handle to change fallback priority';
 
   const handle = document.createElement('span');
-  handle.textContent = '⠿';
+  handle.innerHTML = icon('grip-vertical');
   handle.title = 'drag to reorder';
   handle.className = 'text-term-muted shrink-0';
   handle.style.cursor = 'grab';
@@ -3116,7 +3102,7 @@ function _llmRow(c, idx) {
   parts.push(models.length ? `${models.length} model${models.length === 1 ? '' : 's'}` : 'default model');
   if (vision.length) parts.push(`${vision.length} vision`);
   if (prov && prov.requires_key) {
-    parts.push(keys.length ? `${keys.length} key${keys.length === 1 ? '' : 's'}` : '⚠ no key');
+    parts.push(keys.length ? `${keys.length} key${keys.length === 1 ? '' : 's'}` : 'no key');
   }
   sub.textContent = parts.join(' · ');
   sub.title = models.join(', ');
@@ -3129,7 +3115,7 @@ function _llmRow(c, idx) {
   actions.className = 'ws-actions';
   const delBtn = document.createElement('button');
   delBtn.type = 'button';
-  delBtn.textContent = '✕';
+  delBtn.innerHTML = icon('x');
   delBtn.title = 'Remove this provider';
   delBtn.className = 'icon-btn';
   delBtn.addEventListener('click', (e) => { e.stopPropagation(); llmDeleteEntry(c.id); });
@@ -3176,7 +3162,7 @@ function renderLlmTabs() {
     b.type = 'button';
     b.dataset.pid = p.id;
     b.textContent = p.label;
-    b.className = 'rounded-full border px-3 py-1 t-sm border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text';
+    b.className = 'rounded-full px-3 py-1 t-sm bg-term-raised text-term-muted hover:bg-term-line/60 hover:text-term-text';
     b.addEventListener('click', () => selectLlmProvider(p.id, null));
     wrap.appendChild(b);
   });
@@ -3195,12 +3181,15 @@ function _readListEditor(containerId) {
     .map(inp => inp.value.trim()).filter(Boolean);
 }
 
+// `label` is either plain text (e.g. "test this model") or pre-rendered icon
+// markup from icon() — both are safe to set via innerHTML since callers never
+// pass unescaped user input here.
 function _miniBtn(label, title, onClick) {
   const b = document.createElement('button');
   b.type = 'button';
-  b.textContent = label;
+  b.innerHTML = label;
   b.title = title || '';
-  b.className = 'shrink-0 rounded-lg border border-term-line px-2 py-1 t-xs leading-none text-term-muted hover:bg-term-line/60 hover:text-term-text';
+  b.className = 'shrink-0 rounded-lg bg-term-raised px-2 py-1 t-xs leading-none text-term-muted hover:bg-term-line/60 hover:text-term-text';
   b.addEventListener('click', onClick);
   return b;
 }
@@ -3219,13 +3208,13 @@ function _renderListEditor(containerId, values, opts) {
     inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono t-xs outline-none focus:border-term-cyan';
     row.appendChild(inp);
     if (opts.ordered) {
-      const up = _miniBtn('↑', 'move up (higher priority)', () => _moveListItem(containerId, i, -1, opts));
-      const down = _miniBtn('↓', 'move down', () => _moveListItem(containerId, i, +1, opts));
+      const up = _miniBtn(icon('arrow-up'), 'move up (higher priority)', () => _moveListItem(containerId, i, -1, opts));
+      const down = _miniBtn(icon('arrow-down'), 'move down', () => _moveListItem(containerId, i, +1, opts));
       if (i === 0) { up.disabled = true; up.classList.add('opacity-30'); }
       if (i === (values.length - 1)) { down.disabled = true; down.classList.add('opacity-30'); }
       row.appendChild(up); row.appendChild(down);
     }
-    row.appendChild(_miniBtn('✕', 'remove', () => {
+    row.appendChild(_miniBtn(icon('x'), 'remove', () => {
       const cur = _readListEditor(containerId); cur.splice(i, 1); _renderListEditor(containerId, cur, opts);
     }));
     host.appendChild(row);
@@ -3254,12 +3243,12 @@ function _addListItem(containerId, opts) {
   if (inputs.length) inputs[inputs.length - 1].focus();
 }
 
-// ---- text-model ladder editor (drag-to-reorder + per-model ⚙ settings) ----
-// One row per model: [⠿ drag] [model id] [⚙] [✕]. The gear expands a panel with
+// ---- text-model ladder editor (drag-to-reorder + per-model gear settings) ----
+// One row per model: [grip-vertical drag] [model id] [gear] [x]. The gear expands a panel with
 // that model's REASONING control — the right control is auto-detected from the
-// model name (GLM → thinking toggle, DeepSeek V4 → none/high/max effort,
-// Nemotron 3 → off/reduced/full, o-series/GPT → an effort level, Claude → its
-// thinking effort, DeepSeek R1 → nothing to configure) — plus a per-model "test"
+// model name (GLM -> thinking toggle, DeepSeek V4 -> none/high/max effort,
+// Nemotron 3 -> off/reduced/full, o-series/GPT -> an effort level, Claude -> its
+// thinking effort, DeepSeek R1 -> nothing to configure) — plus a per-model "test"
 // button that probes exactly this key pool + model + reasoning. Only the effort
 // VALUE is stored (model_settings[model] = {reasoning_effort, tier}); how the
 // effort is encoded on the wire is derived from the model name by the backend.
@@ -3366,7 +3355,7 @@ function _miniSelect(extraCls, options, value) {
 }
 
 // Read the model ladder back as {models, settings, open}: the ordered ids, the
-// per-model {reasoning_effort, tier} overrides, and which rows have their ⚙
+// per-model {reasoning_effort, tier} overrides, and which rows have their gear
 // panel open (so a re-render doesn't slam panels shut). Blank rows are dropped.
 function _readModelLadder(containerId) {
   const models = [];
@@ -3394,13 +3383,13 @@ let _llmModelDragIndex = null;
 
 function _modelRow(containerId, val, i, s, openPanel) {
   const card = document.createElement('div');
-  card.className = 'llm-model-row rounded-lg border border-term-line/70' + (openPanel ? ' open' : '');
+  card.className = 'llm-model-row rounded-lg bg-term-raised' + (openPanel ? ' open' : '');
 
   const top = document.createElement('div');
   top.className = 'flex items-center gap-1.5 p-1.5';
 
   const handle = document.createElement('span');
-  handle.textContent = '⠿';
+  handle.innerHTML = icon('grip-vertical');
   handle.title = 'drag to reorder (top = primary)';
   handle.className = 'shrink-0 select-none px-0.5 text-term-muted';
   handle.style.cursor = 'grab';
@@ -3427,18 +3416,18 @@ function _modelRow(containerId, val, i, s, openPanel) {
   inp.type = 'text'; inp.value = val; inp.autocomplete = 'off'; inp.spellcheck = false;
   inp.placeholder = _LLM_MODEL_OPTS.placeholder;
   inp.className = 'llm-list-input flex-1 min-w-0 rounded-lg border border-term-line bg-term-bg px-2.5 py-1.5 font-mono t-xs outline-none focus:border-term-cyan';
-  // A rename can change the model family — rebuild so the ⚙ panel shows the
+  // A rename can change the model family — rebuild so the gear panel shows the
   // right reasoning control for the new name.
   inp.addEventListener('change', () => {
     const cur = _readModelLadder(containerId);
     _renderModelLadder(containerId, cur.models, cur.settings, cur.open);
   });
 
-  const gear = _miniBtn('⚙', 'reasoning & connection test for this model', () => {
+  const gear = _miniBtn(icon('settings'), 'reasoning & connection test for this model', () => {
     const isOpen = card.classList.toggle('open');
     panel.classList.toggle('hidden', !isOpen);
   });
-  const del = _miniBtn('✕', 'remove', () => {
+  const del = _miniBtn(icon('x'), 'remove', () => {
     const cur = _readModelLadder(containerId);
     const idx = cur.models.indexOf(val);
     if (idx >= 0) cur.models.splice(idx, 1);
@@ -3449,9 +3438,12 @@ function _modelRow(containerId, val, i, s, openPanel) {
   top.append(handle, inp, gear, del);
   card.appendChild(top);
 
-  // ---- ⚙ panel: auto-detected reasoning control + per-model test ----
+  // ---- gear panel: auto-detected reasoning control + per-model test ----
+  // No divider between this and the row above: both live inside the same
+  // bg-term-raised card, so a border here would just re-outline a seam that
+  // padding already reads as a section break.
   const panel = document.createElement('div');
-  panel.className = 'flex flex-col gap-1.5 border-t border-term-line/60 p-2' + (openPanel ? '' : ' hidden');
+  panel.className = 'flex flex-col gap-1.5 p-2' + (openPanel ? '' : ' hidden');
   const fam = detectReasoningFamily(val);
   const famDef = _REASONING_FAMILIES[fam] || _REASONING_FAMILIES.openai;
   const famLine = document.createElement('div');
@@ -3543,15 +3535,16 @@ async function _testModelRow(card) {
     const res = await pywebview.api.test_llm_config(payload);
     if (res && res.ok) {
       result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-green';
-      result.textContent = `✓ ${res.model}` + (res.reply ? ` — “${res.reply}”` : ' — reachable');
+      result.innerHTML = `${icon('check')} ${escapeHtml(res.model)}` +
+        (res.reply ? ` — “${escapeHtml(res.reply)}”` : ' — reachable');
     } else {
       result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
-      result.textContent = '✕ ' + ((res && res.error) || 'connection failed');
+      result.innerHTML = `${icon('x-circle')} ${escapeHtml((res && res.error) || 'connection failed')}`;
       result.title = (res && res.error) || '';
     }
   } catch (e) {
     result.className = 'llm-model-test-result min-w-0 truncate t-2xs text-term-red';
-    result.textContent = '✕ ' + e;
+    result.innerHTML = `${icon('x-circle')} ${escapeHtml(String(e))}`;
   }
 }
 
@@ -3565,9 +3558,9 @@ function selectLlmProvider(id, existing) {
 
   for (const b of $('llmProviderTabs').children) {
     const active = b.dataset.pid === p.id;
-    b.className = 'rounded-full border px-3 py-1 t-sm ' + (active
-      ? 'bg-term-cyan text-white border-term-cyan'
-      : 'border-term-line text-term-muted hover:bg-term-line/60 hover:text-term-text');
+    b.className = 'rounded-full px-3 py-1 t-sm ' + (active
+      ? 'bg-term-cyan text-white'
+      : 'bg-term-raised text-term-muted hover:bg-term-line/60 hover:text-term-text');
   }
 
   const use = (existing && existing.provider === p.id) ? existing : null;
@@ -3703,8 +3696,8 @@ async function persistLlmConfigs(statusMsg) {
       renderLlmList();
     }
     _llmStatusKind('ok');
-    $('llmListStatus').textContent = '✓ ' + (statusMsg || 'saved') + (res.primary
-      ? ` — primary: ${res.primary.name} (${res.primary.label} · ${res.primary.model})`
+    $('llmListStatus').innerHTML = `${icon('check')} ` + escapeHtml(statusMsg || 'saved') + (res.primary
+      ? ` — primary: ${escapeHtml(res.primary.name)} (${escapeHtml(res.primary.label)} · ${escapeHtml(res.primary.model)})`
       : ' — no providers left');
     refreshModelOptions();  // the composer's model list / primary may have changed
     if (session && res.primary) {
@@ -4071,7 +4064,7 @@ async function runManualBuild() {
     const detail = (c.files || c.classes)
       ? ' — ' + (c.files || 0) + ' files, ' + (c.classes || 0) + ' classes'
       : '';
-    const where = res.cache_dir ? ' → ' + res.cache_dir + '/' : '';
+    const where = res.cache_dir ? ' -> ' + res.cache_dir + '/' : '';
     status.textContent = 'Built graph "' + escapeHtml(res.graph_id) + '"' + escapeHtml(detail + where);
     // If we were comparing, refresh that view; otherwise show the new graph.
     if (compareMode) renderCompare();

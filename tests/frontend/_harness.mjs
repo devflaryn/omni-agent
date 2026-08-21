@@ -135,8 +135,8 @@ export function loadApp() {
   sandbox.Event = class Event { constructor(t) { this.type = t; } };
   vm.createContext(sandbox);
 
-  // Loaded as two separate scripts, exactly as index.html does it.
-  for (const f of ['wave_stats.js', 'app.js']) {
+  // Loaded as three separate scripts, exactly as index.html does it.
+  for (const f of ['wave_stats.js', 'icons.js', 'app.js']) {
     vm.runInContext(fs.readFileSync(path.join(FRONTEND, f), 'utf8'), sandbox, { filename: f });
   }
 
