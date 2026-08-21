@@ -124,6 +124,12 @@
       --shimmer-glow: rgba(0, 0, 0, .08);
     }
     html, body { background: rgb(var(--term-bg)); }
+    /* Plex is a touch wider than the system stack it replaces; the small sizes
+       need their tracking opened and the large ones tightened. */
+    body { font-family: var(--font-ui); font-feature-settings: 'cv05' 1; }
+    /* Every count, token total, elapsed time and id sits in a column. Tabular
+       figures stop them jittering as values change. */
+    .t-2xs, .t-xs, .wf-agent-meta, [class*="tabular"] { font-variant-numeric: tabular-nums; }
     /* Smooth hovers on interactive elements only. (This used to be a universal
        `*` rule, which made every style/class change in a 1000+ row chat DOM a
        transition candidate and dominated style-recalc time.) */
@@ -633,8 +639,8 @@
     }
 
     .eyebrow {
-      font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: .08em;
-      color: rgb(var(--term-muted));
+      font-size: var(--text-2xs); text-transform: uppercase; letter-spacing: .1em;
+      color: rgb(var(--term-muted)); font-weight: 600;
     }
 
     /* ---- type ramp as CLASSES ----
@@ -645,12 +651,12 @@
        how the old seven-size mix crept back after it was removed. These are
        declared AFTER .btn/.btn-sm so an explicit size on a control wins.
        tests/frontend/test_type_ramp.mjs asserts the markup uses nothing else. */
-    .t-2xs { font-size: var(--text-2xs); }
-    .t-xs { font-size: var(--text-xs); }
+    .t-2xs { font-size: var(--text-2xs); letter-spacing: .06em; }
+    .t-xs { font-size: var(--text-xs); letter-spacing: .01em; }
     .t-sm { font-size: var(--text-sm); }
     .t-base { font-size: var(--text-base); }
-    .t-lg { font-size: var(--text-lg); }
-    .t-xl { font-size: var(--text-xl); }
+    .t-lg { font-size: var(--text-lg); letter-spacing: -.01em; font-weight: 600; }
+    .t-xl { font-size: var(--text-xl); letter-spacing: -.015em; font-weight: 600; }
 
     /* ================= utilities missing from the precompiled sheet =========
        tailwind.css is built ahead of time and had drifted behind the markup:
