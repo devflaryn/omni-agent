@@ -23,6 +23,12 @@ def _run_workflow_description():
     lines = []
     for w in workflows.list_library():
         hint = w.get("when_to_use") or w.get("description") or ""
+        schema = w.get("args_schema") or {}
+        if schema:
+            args = ", ".join(
+                f"{k}{'' if (v or {}).get('required') else ' (optional)'}"
+                for k, v in schema.items())
+            hint = f"{hint} — args: {args}"
         lines.append(f"  - {w['name']}: {hint}")
     catalog = "\n".join(lines)
     return (
