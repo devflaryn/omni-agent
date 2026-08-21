@@ -120,6 +120,18 @@
     return '<span class="wf-dot wf-dot-ok"></span>';
   }
 
+  // The run rail's mark for one agent row: a dot on the hairline, filled for
+  // done, a hollow ring for running, dimmed on top of its status colour when
+  // the row is a cached replay. Wrapped in .wf-mark so the hairline (drawn by
+  // ::before, see index.html) has a fixed-width column to anchor to.
+  function agentMark(a) {
+    let cls = 'wf-dot-ok';
+    if (a.status === 'running') cls = 'wf-dot-run';
+    else if (a.status === 'failed') cls = 'wf-dot-fail';
+    if (a.cached) cls += ' wf-dot-cached';
+    return `<span class="wf-mark"><span class="wf-dot ${cls}"></span></span>`;
+  }
+
   // Quotes matter as much as angle brackets here: every one of these values is
   // also interpolated into an ATTRIBUTE (data-run-id=, data-sub-id=), where a
   // bare " ends the attribute and everything after it becomes markup.
@@ -169,7 +181,7 @@
                   a.cached ? 'cached' : '', a.elapsed_s ? `${a.elapsed_s}s` : '']
       .filter(Boolean).join(' · ');
     return `<div class="wf-agent" data-run-id="${esc(runId)}" data-sub-id="${esc(a.id)}">` +
-      `${statusDot(a.status)}` +
+      `${agentMark(a)}` +
       `<span class="wf-agent-label">${esc(a.label)}</span>` +
       `<span class="wf-agent-meta">${esc(meta)}</span></div>`;
   }

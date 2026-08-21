@@ -982,17 +982,23 @@
        Status dots follow the same raw --term-* fill convention as the other
        small status indicators in this file (e.g. the online dot at ~1094);
        only TEXT is repointed to the -fg variants, per the contrast policy
-       above. */
-    .wf-dot {
-      display: inline-block; flex-shrink: 0;
-      width: 8px; height: 8px; border-radius: var(--radius-full);
-      background: rgb(var(--term-muted));
-    }
-    .wf-dot-run { background: rgb(var(--term-cyan)); animation: wf-pulse 1.4s ease-in-out infinite; }
-    .wf-dot-ok { background: rgb(var(--term-green)); }
+       above.
+
+       The run rail: one hairline per phase, one mark per agent. Filled = done,
+       hollow ring = running, dimmed = a cached replay. */
+    .wf-mark { width: 15px; flex-shrink: 0; display: flex; justify-content: center;
+               position: relative; }
+    .wf-mark::before { content: ''; position: absolute; left: 7px; top: -11px; bottom: -11px;
+                       width: 1px; background: rgb(var(--term-line)); }
+    .wf-agent:first-of-type .wf-mark::before { top: 50%; }
+    .wf-agent:last-of-type  .wf-mark::before { bottom: 50%; }
+    .wf-dot { width: 7px; height: 7px; border-radius: 50%; position: relative; z-index: 1;
+              background: rgb(var(--term-gray)); }
+    .wf-dot-ok   { background: rgb(var(--term-green)); }
     .wf-dot-fail { background: rgb(var(--term-red)); }
     .wf-dot-warn { background: rgb(var(--term-orange)); }
-    @keyframes wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+    .wf-dot-run  { background: transparent; border: 1.5px solid rgb(var(--term-cyan)); }
+    .wf-dot-cached { background: rgb(var(--term-gray)); opacity: .55; }
 
     /* Header ultra-mode toggle. A .chip with an explicit ON state, so the
        control reads as on/off rather than as another static label. */
