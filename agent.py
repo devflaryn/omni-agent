@@ -1569,7 +1569,15 @@ def _ultra_prompt_segment(session):
 def _device_prompt_segment(session):
     """Tell the model which machine its commands land on. It has no tool to
     change this — the user selects the device — so the line is informational and
-    must say so, or the model will hunt for a switch that does not exist."""
+    must say so, or the model will hunt for a switch that does not exist.
+
+    `session` is accepted (symmetric with _ultra_prompt_segment) but not read:
+    this reads devices.active() directly, exactly like the execution-routing
+    call sites (host_exec.py, tools/web_tools.py) do. That means a bug that
+    lets session["active_device"] drift from devices.active() would be
+    invisible here — prompt, UI and routing all mirror the same module-level
+    global, so they'd look internally consistent while commands ran on the
+    wrong machine. _load_persisted is what has to keep them in sync."""
     d = devices.active()
     if d is None:
         return ("EXECUTION TARGET: this computer. Commands, file edits and builds "
@@ -1867,6 +1875,7 @@ class AgentApi:
         self._restored_dock = None
         self._restored_ultra = False
         self._restored_active_device = None
+        saved_device = None
         try:
             if os.path.isfile(conv_path):
                 with open(conv_path, "r", encoding="utf-8") as f:
@@ -1886,16 +1895,24 @@ class AgentApi:
                     self._restored_dock = dk
                 self._restored_ultra = bool(data.get("ultra"))
                 saved_device = data.get("active_device")
-                if saved_device is not None:
-                    try:
-                        devices.set_active(saved_device)
-                        self._restored_active_device = saved_device
-                    except KeyError:
-                        # Device deleted since last session — degrade to local
-                        # rather than crash the session.
-                        self._restored_active_device = None
         except (OSError, json.JSONDecodeError, AttributeError):
             messages, original_task, stats = None, None, None
+        # Unconditionally assert the device state for THIS project — including
+        # when it has no saved device (key absent, corrupt file, or brand new
+        # project) — so opening a project never inherits whatever the PREVIOUS
+        # project left active in devices._active (module-level, process-wide
+        # state). set_active(None) correctly means local; do not gate this call
+        # on saved_device being truthy, or a project switch can silently leave
+        # commands routed at the last project's remote host.
+        try:
+            devices.set_active(saved_device)
+            self._restored_active_device = saved_device
+        except KeyError:
+            # Device deleted since last session — degrade to local rather than
+            # crash the session, and don't leave the previous project's device
+            # active in its place.
+            devices.set_active(None)
+            self._restored_active_device = None
         try:
             if os.path.isfile(tr_path):
                 with open(tr_path, "r", encoding="utf-8") as f:
@@ -3451,6 +3468,10 @@ class AgentApi:
         return {"ultra": bool((self.session or {}).get("ultra"))}
 
     def list_devices(self):
+        # Reads devices.active() rather than self.session["active_device"] —
+        # same reasoning as _device_prompt_segment: it's the module-level
+        # global that execution routing actually uses, so this must mirror
+        # THAT, not the session's copy of it.
         d = devices.active()
         return {"ok": True, "active": (d.id if d else None),
                 "devices": [x.to_dict() for x in devices.load_devices()]}

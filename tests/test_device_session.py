@@ -63,6 +63,25 @@ def test_active_device_is_persisted(monkeypatch):
     assert saved["active_device"] == "dev123"
 
 
+def test_opening_a_project_without_a_saved_device_clears_a_stale_active_one(monkeypatch):
+    """A project switch must not inherit the PREVIOUS project's device: opening a
+    project whose saved state has no active_device (key absent) must assert the
+    module-level devices._active back to local, not leave it pointed at whatever
+    the last project selected. Regression for: gating the restore call on
+    `saved_device is not None` left a truthy previous device untouched."""
+    import json, tempfile
+    stale = devices.Device("stale", "old-box", "berat@old", "/old")
+    monkeypatch.setattr(devices, "_active", stale)
+    mem = tempfile.mkdtemp(prefix="devsess-noactive-")
+    with open(_os.path.join(mem, agent_mod.CONVERSATION_FILENAME), "w", encoding="utf-8") as f:
+        json.dump({"messages": [{"role": "user", "content": "hi"}]}, f)
+    api = AgentApi.__new__(AgentApi)
+    api._load_persisted(mem)
+    assert devices.active() is None, \
+        "opening a project without a saved device left the PREVIOUS project's device active"
+    assert api._restored_active_device is None
+
+
 def test_test_device_returns_the_probe_result(monkeypatch):
     monkeypatch.setattr(devices, "get_device",
                         lambda _id: devices.Device("i", "n", "h", "/r"))
@@ -82,6 +101,7 @@ if __name__ == "__main__":
              (test_selecting_a_device_records_it_in_the_transcript, True),
              (test_selecting_local_records_it_too, True),
              (test_active_device_is_persisted, True),
+             (test_opening_a_project_without_a_saved_device_clears_a_stale_active_one, True),
              (test_test_device_returns_the_probe_result, True)]
     failed = 0
     for t, needs in tests:
