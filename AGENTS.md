@@ -181,6 +181,60 @@ tools (they're in `tool_policy.SUBAGENT_EXCLUDED`), so parallel waves are unaffe
 Behind `strategy_brief_enabled` (default on); off is byte-identical to a pre-feature
 build. Offline tests: `tests/test_strategy_*.py`.
 
+## Workflow engine (2026-08 upgrade)
+
+`workflows/` gives the orchestrator deterministic multi-agent control flow: a
+workflow is a sandboxed Python script that fans subagents across phases, pipes
+each item through stages, and resumes from a journal. `run_workflow` is the
+model-facing entry; the six built-ins in `workflows/library/` are the common
+path, and an authored `script` is the escape hatch.
+
+Three decisions are load-bearing and will look arbitrary to a future reader:
+
+- **Threads plus a semaphore, never a thread pool.** Submitting every `agent()`
+  to one shared `ThreadPoolExecutor` DEADLOCKS: `parallel()` branches occupy
+  every slot, then each calls `agent()` and waits for a slot only those blocked
+  branches could free. So threads are unbounded (one per branch/item) and a
+  semaphore inside `agent()` caps real LLM concurrency. The guard is
+  `test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one`.
+- **Journal keys are content-addressed, not positional.** `parallel`/`pipeline`
+  have no deterministic call ORDER, so an ordinal key restores the wrong cached
+  result into the wrong branch on resume. Hashing (agent_type, prompt, opts) is
+  order-independent and cascades correctly: a changed upstream result changes the
+  downstream prompt, changes its key, and re-runs everything derived from it.
+- **Every script is dry-run before it costs anything.** `agent()` returns
+  schema-shaped stubs while the whole script executes, so `KeyError`s, late-bound
+  lambdas and unscoped write agents surface for free rather than three stages in.
+  This is what makes model-authored orchestration safe enough to allow.
+
+`time`, `random` and `datetime` are unavailable inside a script — replay
+determinism requires it; pass timestamps in via `args`. The sandbox is a
+CORRECTNESS boundary, not a security one: the agent already runs arbitrary shell
+through `host_exec`.
+
+**Resume replays agent RESULTS, not workspace side effects.** Files a write agent
+already changed stay changed and its work is not re-applied. `run_workflow` warns
+when the resumed run contained writers.
+
+Write agents are allowed inside a workflow but MUST declare `scope=[...]`;
+`ScopedWorkspaceLock` then serializes only overlapping owners, so disjoint edits
+genuinely run at once. An unscoped writer takes the whole workspace and would
+silently serialize an entire fan-out, so it is rejected at dry-run.
+
+A workflow can call another workflow inline via `workflow(name_or_path, args=)`
+(`WorkflowRuntime.workflow` in `workflows/runtime.py`) — the child shares the
+parent's semaphore, abort flag, journal and run directory rather than opening a
+second concurrency budget, so a nested call cannot double the fleet. Nesting is
+capped at exactly ONE level (a flat rule, not a depth counter to tune): a child's
+`depth` starts at 1, and `workflow()` refuses to run when `depth >= 1`. The
+child's journal keys are namespaced by its own name so an identical prompt in
+parent and child cannot collide on replay, and its `agent_count` folds back into
+the parent's in a `finally` so the total is never undercounted.
+
+Ultra mode (`session["ultra"]`) gates autonomous orchestration: off, the agent
+must be asked; on, it defaults to a workflow for substantive tasks. The keyword
+`ultra` in a user message turns it on.
+
 ## Evidence-based workflow (planner → worker → reviewer)
 
 The agent loop (`agent.AgentApi._run_agent_loop`) runs one model that plays three
