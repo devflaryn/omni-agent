@@ -3883,21 +3883,26 @@ async function launchSelectedWorkflow(dryRun) {
     if (errEl) errEl.textContent = out.error;
     return;
   }
+  // The backend takes self._busy for the whole run — minutes and many LLM
+  // calls — so the UI must believe it's busy from the moment the launch is
+  // sent, not after the await resolves. A dry run can finish (and emit its
+  // `done` event) before this promise even resolves; setting it afterward
+  // would clobber that `done`'s setBusy(false) and latch the UI busy with
+  // nothing running. The `done` event clears it again (onDone), and the
+  // launch thread emits `done` on every exit path including a dry run, so
+  // this can never latch on — except on a refusal, which never reaches the
+  // backend, so it's cleared explicitly below.
+  setBusy(true);
   try {
     const res = await pywebview.api.launch_workflow(st.selected, out.args, !!dryRun);
     if (!res || !res.ok) {
       if (errEl) errEl.textContent = (res && res.error) || 'Could not launch workflow.';
+      setBusy(false);
       return;
     }
-    // The backend has taken self._busy for the whole run — minutes and many
-    // LLM calls. Without this the UI still believed it was idle: Stop stayed
-    // hidden, #input stayed enabled, and every send_message was refused with
-    // "Agent is already working." The `done` event clears it again (onDone),
-    // and the launch thread emits `done` on every exit path including a dry
-    // run, so this can never latch on.
-    setBusy(true);
   } catch (e) {
     if (errEl) errEl.textContent = String(e);
+    setBusy(false);
   }
 }
 

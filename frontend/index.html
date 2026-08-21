@@ -1123,8 +1123,8 @@
     /* Collapsible rail sections. The caret is content on the header, so the
        open/closed state has exactly one source of truth: .wf-collapsed. */
     .wf-sec-head { cursor: pointer; user-select: none; display: flex; align-items: center; gap: var(--space-2); }
-    .wf-sec-head::before { content: 'BE'; font-size: var(--text-2xs); line-height: 1; }
-    .wf-sec-head.wf-collapsed::before { content: 'B8'; }
+    .wf-sec-head::before { content: '\25BE'; font-size: var(--text-2xs); line-height: 1; }
+    .wf-sec-head.wf-collapsed::before { content: '\25B8'; }
     .wf-sec-head:hover { color: rgb(var(--term-text)); }
 
     /* Device chip + picker (2026-08 SSH devices). Red, not cyan: this is a

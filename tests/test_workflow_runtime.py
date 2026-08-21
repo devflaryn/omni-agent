@@ -264,6 +264,21 @@ def test_a_structured_result_small_enough_crosses_intact(monkeypatch):
     assert done["result"] == {"confirmed": ["a bug"]}
 
 
+def test_an_unserialisable_value_still_produces_a_json_dumpable_event(monkeypatch):
+    """default=str still fails for values json.dumps rejects outright — a
+    circular reference. _event_result must then fall back to the STRING it
+    already computed via str(value), not the original object: agent.py's
+    _emit() calls json.dumps(event) with no default=, so handing back a
+    still-unserialisable object makes json.dumps raise, the bare `except
+    Exception: pass` around it swallows that, and the whole wf_agent_done
+    event is silently dropped — the row stays "running" forever."""
+    circular = []
+    circular.append(circular)
+    result = R._event_result(circular)
+    assert isinstance(result, str), "must fall back to the computed string, not the raw object"
+    _json.dumps({"type": "wf_agent_done", "result": result})  # must not raise
+
+
 def test_label_defaults_to_a_trimmed_prompt(monkeypatch):
     _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
     events = []
@@ -625,6 +640,7 @@ if __name__ == "__main__":
              test_a_cache_hit_also_carries_its_replayed_result,
              test_a_huge_result_is_truncated_on_the_event_but_not_in_the_journal,
              test_a_structured_result_small_enough_crosses_intact,
+             test_an_unserialisable_value_still_produces_a_json_dumpable_event,
              test_label_defaults_to_a_trimmed_prompt,
              test_parallel_returns_results_in_input_order,
              test_parallel_isolates_a_raising_thunk_as_none,

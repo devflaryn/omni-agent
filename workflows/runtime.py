@@ -56,8 +56,11 @@ def _event_result(value):
             text = json.dumps(value, indent=2, default=str)
         except (TypeError, ValueError):
             text = str(value)
-        if len(text) <= MAX_EVENT_RESULT_CHARS:
-            return value
+            if len(text) <= MAX_EVENT_RESULT_CHARS:
+                return text
+        else:
+            if len(text) <= MAX_EVENT_RESULT_CHARS:
+                return value
     if len(text) <= MAX_EVENT_RESULT_CHARS:
         return text
     dropped = len(text) - MAX_EVENT_RESULT_CHARS
