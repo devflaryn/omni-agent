@@ -1566,6 +1566,23 @@ def _ultra_prompt_segment(session):
     return _ULTRA_ON if (session or {}).get("ultra") else _ULTRA_OFF
 
 
+def _device_prompt_segment(session):
+    """Tell the model which machine its commands land on. It has no tool to
+    change this — the user selects the device — so the line is informational and
+    must say so, or the model will hunt for a switch that does not exist."""
+    d = devices.active()
+    if d is None:
+        return ("EXECUTION TARGET: this computer. Commands, file edits and builds "
+                "all run locally.")
+    return (
+        f"EXECUTION TARGET: the remote device '{d.name}' ({d.target}). Every "
+        f"command, file edit and build runs THERE, in {d.remote_root} — not on "
+        f"this computer. You cannot change the target; the user selects it. "
+        f"Emulator, screen-capture, Frida and code-graph tools are local-only and "
+        f"will refuse while a device is active."
+    )
+
+
 def _ultra_keyword_requested(text):
     return bool(_ULTRA_RE.search(text or ""))
 
@@ -1814,6 +1831,10 @@ class AgentApi:
             # restarts. A keyword-armed turn is deliberately NOT persisted — it
             # is scoped to that one turn (see send_message / _run_agent_loop).
             "ultra": bool(s.get("ultra")) and not s.get("ultra_turn_only"),
+            # Which machine work happens on, so reopening a project doesn't
+            # silently drop back to the local computer while the user believes
+            # they're still on a remote device (see _load_persisted).
+            "active_device": s.get("active_device"),
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         })
         _write_json_atomic(os.path.join(mem, TRANSCRIPT_FILENAME), _cap_transcript(s.get("transcript", [])))
@@ -1845,6 +1866,7 @@ class AgentApi:
         self._restored_active_toolsets = set()
         self._restored_dock = None
         self._restored_ultra = False
+        self._restored_active_device = None
         try:
             if os.path.isfile(conv_path):
                 with open(conv_path, "r", encoding="utf-8") as f:
@@ -1863,6 +1885,15 @@ class AgentApi:
                 if isinstance(dk, dict) and isinstance(dk.get("rows"), list) and dk["rows"]:
                     self._restored_dock = dk
                 self._restored_ultra = bool(data.get("ultra"))
+                saved_device = data.get("active_device")
+                if saved_device is not None:
+                    try:
+                        devices.set_active(saved_device)
+                        self._restored_active_device = saved_device
+                    except KeyError:
+                        # Device deleted since last session — degrade to local
+                        # rather than crash the session.
+                        self._restored_active_device = None
         except (OSError, json.JSONDecodeError, AttributeError):
             messages, original_task, stats = None, None, None
         try:
@@ -1981,6 +2012,7 @@ class AgentApi:
             section += (f"\n\n[premium budget: {used}/{PREMIUM_BUDGET} premium "
                          "subagent dispatches used this session]")
         section += "\n\n" + _ultra_prompt_segment(self.session)
+        section += "\n\n" + _device_prompt_segment(self.session)
         self.session["messages"][0]["content"] = (
             self.session["base_system_prompt"] + "\n" + tools_section + section
         )
@@ -3031,6 +3063,10 @@ class AgentApi:
             "dock": getattr(self, "_restored_dock", None),
             # Long-run context editing: stub out stale tool results (keep recent).
             "context_editing": True,
+            # Which machine work happens on: None means this computer. Restored
+            # from disk (see _load_persisted) so reopening a project doesn't
+            # silently drop back to local while the user thinks they're remote.
+            "active_device": getattr(self, "_restored_active_device", None),
             # Ultra mode: whether the model may start workflows on its own
             # judgement (see _ultra_prompt_segment / set_ultra / get_ultra).
             # Restored from disk so the header toggle survives a restart.
@@ -3413,6 +3449,40 @@ class AgentApi:
 
     def get_ultra(self):
         return {"ultra": bool((self.session or {}).get("ultra"))}
+
+    def list_devices(self):
+        d = devices.active()
+        return {"ok": True, "active": (d.id if d else None),
+                "devices": [x.to_dict() for x in devices.load_devices()]}
+
+    def add_device(self, name, target, remote_root, env_prelude="", notes=""):
+        d = devices.add_device(name, target, remote_root, env_prelude, notes)
+        return {"ok": True, "device": d.to_dict()}
+
+    def remove_device(self, device_id):
+        return {"ok": devices.remove_device(device_id)}
+
+    def test_device(self, device_id):
+        d = devices.get_device(device_id)
+        if d is None:
+            return {"ok": False, "error": "no such device"}
+        return devices.probe(d)
+
+    def select_device(self, device_id):
+        """Switch the machine work happens on. Recorded in the transcript so a
+        later reader is never left guessing which computer a command ran on."""
+        try:
+            d = devices.set_active(device_id)
+        except KeyError:
+            return {"ok": False, "error": "no such device"}
+        self.session["active_device"] = (d.id if d else None)
+        where = f"the device '{d.name}' ({d.target}), folder {d.remote_root}" if d \
+            else "this computer"
+        self._emit({"type": "system", "content": f"Execution target is now {where}."})
+        self._emit({"type": "device_changed",
+                    "device": (d.to_dict() if d else None)})
+        self._refresh_system_prompt()
+        return {"ok": True, "device": (d.to_dict() if d else None)}
 
     def _abort_active_workflows(self):
         """Cancel every running workflow. Called from the same place that sets
