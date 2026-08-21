@@ -323,6 +323,43 @@ instant; if it fails, the result says the remote command may still be running.
 callers do LOCAL file I/O, and None turns "operates on a path that does not exist
 here" into a clean refusal.
 
+## The UI design language (2026-08)
+
+"Instrument": cool machined-graphite surfaces with one warm signal accent. The
+palette lives in `frontend/index.html`'s `<style>` block as CSS custom
+properties; all 180 component classes inherit from it, which is why a restyle
+is a re-valuing rather than a rewrite.
+
+Four things a future reader needs to know:
+
+- **Token NAMES are historical; only values are current.** `--term-cyan` holds
+  the accent (amber today, Claude terracotta before that) and `--term-*` no
+  longer describes a terminal palette. Renaming would touch 76 call sites plus
+  every Tailwind class derived from them, for no visual gain.
+- **Colour tokens are space-separated RGB triples, not hex.**
+  `tests/frontend/test_contrast.mjs` parses that exact format and RE-DERIVES
+  every ratio from the CSS, so a hex value silently drops out of the check.
+  Tune a colour by running that test, never by eye.
+- **Surfaces separate by TONE, not borders** — `--term-bg` / `--term-panel` /
+  `--term-raised`. `--term-line` is for real edges only: input borders (default
+  state), the run rail, and borders in markdown content. The accent (`--term-cyan`)
+  signals focus on inputs and acts as the focus-ring outline. Outlining a panel
+  is the thing this design moved away from.
+- **Icons come from one sprite**, `frontend/icons.svg`, via `icon(name)` in
+  `frontend/icons.js`, themed by `currentColor`. `test_icons.mjs` fails on a
+  name with no symbol; `test_no_emoji.mjs` fails if a glyph is used where an
+  icon belongs. Both exist because either mistake renders as empty space with
+  no error.
+
+Status colours are deliberately desaturated so the accent is the only saturated
+warm thing on screen. That is a trade, not an oversight: a single warm accent is
+only legible on a cool console if nothing else competes with it.
+
+The typeface is IBM Plex Sans Variable (SIL OFL), bundled at `frontend/fonts/`
+and loaded from a relative `@font-face` — the app is offline and fetches nothing
+at runtime. The fallback stack matters: a webview that cannot load a `file://`
+font must still be usable.
+
 ## Evidence-based workflow (planner → worker → reviewer)
 
 The agent loop (`agent.AgentApi._run_agent_loop`) runs one model that plays three
