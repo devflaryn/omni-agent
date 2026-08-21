@@ -224,6 +224,11 @@ def resolve_workspace_path(path):
     from host_exec import workspace_root
     rel = normalize_path(path)
     host_root = workspace_root()
+    if host_root is None:
+        # A remote device is active, so there is no local path for this file.
+        raise RuntimeError(
+            "no local workspace: a remote device is active, so this file has no "
+            "path on this computer")
     if rel == ".":
         return host_root
     return os.path.normpath(os.path.join(host_root, rel))

@@ -14,6 +14,7 @@ the frames with read_auto_screenshots.
 import os
 import tempfile
 
+import devices
 from tool_registry import registry
 from tools.android_emulator import (
     _default_device_name, _parse_json_object, _run_qemu, _truthy,
@@ -116,6 +117,9 @@ def _summarize(parsed, res, action):
 def play_roblox(place_id, account=None, token=None, session_name=None,
                 job_id=None, launch_data=None, user_id=None, debug=False,
                 timeout=None, apk_path=None):
+    _err = devices.require_local("play_roblox")
+    if _err:
+        return _err
     # Modern model: the account username IS the instance name, so the engine
     # resolves its saved cookie automatically. `account` therefore takes
     # precedence over session_name for NAMING — otherwise a mismatched
@@ -192,6 +196,9 @@ def play_roblox(place_id, account=None, token=None, session_name=None,
 )
 def set_roblox_account(token=None, place_id=None, session_name=None, play=None,
                        clear=False):
+    _err = devices.require_local("set_roblox_account")
+    if _err:
+        return _err
     session_name = session_name or _default_device_name()
     err = _validate_session_id(session_name)
     if err:
@@ -257,6 +264,9 @@ def set_roblox_account(token=None, place_id=None, session_name=None, play=None,
     ),
 )
 def login_roblox_account(token=None, token_file=None):
+    _err = devices.require_local("login_roblox_account")
+    if _err:
+        return _err
     if not token and not token_file:
         return {"error": "give either token or token_file (a .ROBLOSECURITY cookie)"}
     argv = ["login", "--json"]
@@ -367,6 +377,9 @@ def _rm_workspace_artifact(rel_path):
 )
 def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk_path=None,
                         debug=None, timeout=None):
+    _err = devices.require_local("launch_roblox_build")
+    if _err:
+        return _err
     err = _place_error(place_id)
     if err:
         return {"error": err, "stage": "validate"}
@@ -481,6 +494,9 @@ def launch_roblox_build(place_id, account=None, token=None, token_file=None, apk
     ),
 )
 def list_roblox_accounts(verify=False):
+    _err = devices.require_local("list_roblox_accounts")
+    if _err:
+        return _err
     argv = ["accounts", "--json"]
     if _truthy(verify):
         argv += ["--verify"]

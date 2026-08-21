@@ -15,6 +15,7 @@ import os
 
 from PIL import Image
 
+import devices
 from tool_registry import registry
 from tools.common import resolve_workspace_path
 import llm
@@ -100,6 +101,9 @@ _DEFAULT_QUESTION = (
     when_to_use="Call this whenever you need to understand what's actually on a screenshot/image — after taking an emulator screenshot or capturing keyframes, when a test result depends on what rendered, or any time visual evidence would settle an uncertainty. Then reason over the description and continue."
 )
 def analyze_image(image_path=None, image_paths=None, question=None):
+    _err = devices.require_local("analyze_image")
+    if _err:
+        return _err
     paths = []
     if isinstance(image_paths, (list, tuple)):
         paths.extend(str(p) for p in image_paths if str(p).strip())

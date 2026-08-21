@@ -28,6 +28,7 @@ import re
 import threading
 import time
 
+import devices
 from tool_registry import registry
 from tools.common import resolve_workspace_path
 # Reuse the dev-base plumbing already in android_emulator (serial resolution,
@@ -247,6 +248,9 @@ def _format_result(info, res, header):
     when_to_use="Call after ensure_emulator_running(debug=true) to confirm frida is reachable and to find the exact process name/pid of the app under test."
 )
 def frida_list_processes(filter=None, device_name=None, backend=_DEFAULT_BACKEND):
+    _err = devices.require_local("frida_list_processes")
+    if _err:
+        return _err
     dev, cleanup, info = _connect(device_name, backend)
     if dev is None:
         return info
@@ -293,6 +297,9 @@ def frida_list_processes(filter=None, device_name=None, backend=_DEFAULT_BACKEND
 )
 def frida_run_script(package_name, script=None, script_path=None, mode="attach",
                      duration_seconds=12, device_name=None, backend=_DEFAULT_BACKEND):
+    _err = devices.require_local("frida_run_script")
+    if _err:
+        return _err
     if not script and not script_path:
         return {"error": "provide either 'script' (inline JS) or 'script_path' (a .js file in the project)."}
     js = script
@@ -394,6 +401,9 @@ specs.forEach(function (spec) {
 )
 def frida_trace(package_name, java_methods=None, native_functions=None, mode="attach",
                 duration_seconds=15, device_name=None, backend=_DEFAULT_BACKEND):
+    _err = devices.require_local("frida_trace")
+    if _err:
+        return _err
     java_methods = java_methods or []
     native_functions = native_functions or []
     if isinstance(java_methods, str):
@@ -485,6 +495,9 @@ Java.perform(function () {
 )
 def frida_bypass_ssl_pinning(package_name, mode="spawn", duration_seconds=20,
                              device_name=None, backend=_DEFAULT_BACKEND):
+    _err = devices.require_local("frida_bypass_ssl_pinning")
+    if _err:
+        return _err
     return frida_run_script(package_name, script=_SSL_UNPIN_JS, mode=mode,
                             duration_seconds=duration_seconds,
                             device_name=device_name, backend=backend)

@@ -304,3 +304,20 @@ def probe(device):
         elif line.startswith("OMNI_MISS="):
             missing.append(line[len("OMNI_MISS="):])
     return {"ok": True, "root": root, "uname": uname, "missing": missing, "error": ""}
+
+
+def require_local(feature):
+    """None when running locally; an error dict when a device is active.
+
+    Some tools drive the LOCAL Android SDK or build a LOCAL index, so they cannot
+    follow the session to another machine. Refusing out loud is the same safety
+    rule as never falling back to local: the failure a user can see beats the one
+    that quietly used the wrong computer."""
+    d = active()
+    if d is None:
+        return None
+    return {"error": (
+        f"{feature} runs on this computer only — the active device is "
+        f"'{d.name}' ({d.target}). Switch to This computer in the device picker, "
+        f"or register that machine's own host as the device."
+    )}
