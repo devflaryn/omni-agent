@@ -15,10 +15,12 @@ const FRONTEND = path.join(here, '..', '..', 'frontend');
 
 const html = fs.readFileSync(path.join(FRONTEND, 'index.html'), 'utf8');
 const app = fs.readFileSync(path.join(FRONTEND, 'app.js'), 'utf8');
-// workflow_view.js is a separate UI file (kept out of app.js on purpose — see
-// its header comment) and gets the same id protection as everything else.
+// workflow_view.js and device_view.js are separate UI files (kept out of
+// app.js on purpose — see their header comments) and get the same id
+// protection as everything else.
 const workflowView = fs.readFileSync(path.join(FRONTEND, 'workflow_view.js'), 'utf8');
-const sources = app + '\n' + workflowView;
+const deviceView = fs.readFileSync(path.join(FRONTEND, 'device_view.js'), 'utf8');
+const sources = app + '\n' + workflowView + '\n' + deviceView;
 
 const declared = new Set([...html.matchAll(/\bid="([\w-]+)"/g)].map(m => m[1]));
 

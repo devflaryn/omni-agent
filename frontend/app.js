@@ -2389,6 +2389,7 @@ window.__agent = {
       case 'wf_agent_done': workflowAgentDone(ev); break;
       case 'wf_log': workflowLog(ev); break;
       case 'workflow_done': workflowDone(ev); break;
+      case 'device_changed': deviceChanged(ev); break;
       case 'ultra_mode': renderUltra(ev.ultra); break;
       case 'done': onDone(); break;
     }
@@ -2396,6 +2397,165 @@ window.__agent = {
     // requests one, and non-chat events (status/file_tree/plan) don't need it.
   }
 };
+
+// ---------- devices (SSH) ----------
+// The picker's list rendering and add/remove/select/test wiring live here
+// rather than in device_view.js because they are mostly request/response
+// calls into pywebview.api, not state driven by the `device_changed` event.
+// device_view.js owns only the chip (deviceChanged/renderDeviceChip) — the one
+// piece that must react to the event no matter how the change happened.
+let _devices = [];          // devices.list_devices().devices
+let _activeDeviceId = null; // devices.list_devices().active
+
+async function refreshDeviceList() {
+  try {
+    const res = await pywebview.api.list_devices();
+    if (res && res.ok) {
+      _devices = res.devices || [];
+      _activeDeviceId = res.active || null;
+      renderDevicePickerList();
+    }
+  } catch (e) { /* keep the last-known list rather than blanking it */ }
+}
+
+function renderDevicePickerList() {
+  const wrap = $('deviceList');
+  wrap.innerHTML = '';
+  // "This computer" (device === null) is always the first, permanent row.
+  wrap.appendChild(_deviceRow(null));
+  _devices.forEach(d => wrap.appendChild(_deviceRow(d)));
+}
+
+// Built with createElement/textContent rather than innerHTML — device names,
+// ssh targets and remote roots are user-supplied free text, and this sidesteps
+// escaping entirely rather than relying on getting an esc() call right.
+function _deviceRow(d) {
+  const id = d ? d.id : null;
+  const active = id === _activeDeviceId;
+
+  const row = document.createElement('div');
+  row.className = 'device-row' + (active ? ' device-row-active' : '');
+  row.dataset.id = id || '';
+
+  const main = document.createElement('div');
+  main.className = 'device-row-main';
+  const name = document.createElement('div');
+  name.className = 'device-row-name';
+  name.textContent = d ? (d.name || d.target) : 'This computer';
+  main.appendChild(name);
+  if (d) {
+    const meta = document.createElement('div');
+    meta.className = 'device-row-target font-mono';
+    meta.textContent = `${d.target}  ·  ${d.remote_root || ''}`;
+    main.appendChild(meta);
+  }
+  row.appendChild(main);
+
+  const actions = document.createElement('div');
+  actions.className = 'device-row-actions';
+
+  const selectBtn = document.createElement('button');
+  selectBtn.type = 'button';
+  selectBtn.className = 'btn btn-sm';
+  selectBtn.textContent = active ? 'active' : 'use';
+  selectBtn.disabled = active;
+  selectBtn.addEventListener('click', () => selectDevice(id));
+  actions.appendChild(selectBtn);
+
+  if (d) {
+    const testBtn = document.createElement('button');
+    testBtn.type = 'button';
+    testBtn.className = 'btn btn-sm';
+    testBtn.textContent = 'test';
+    testBtn.addEventListener('click', () => testDeviceConnection(d.id));
+    actions.appendChild(testBtn);
+
+    const rmBtn = document.createElement('button');
+    rmBtn.type = 'button';
+    rmBtn.title = 'Remove device';
+    rmBtn.className = 'icon-btn';
+    rmBtn.textContent = '✕';
+    rmBtn.addEventListener('click', () => removeDevice(d.id));
+    actions.appendChild(rmBtn);
+  }
+
+  row.appendChild(actions);
+  return row;
+}
+
+// Switches the execution target. select_device() already returns the
+// selected device and the backend also emits `device_changed` — calling
+// deviceChanged() here too is redundant with that event but keeps the chip
+// correct immediately rather than waiting on the round trip, and is a no-op
+// if the event arrives right after.
+async function selectDevice(id) {
+  $('devicePickerError').textContent = '';
+  try {
+    const res = await pywebview.api.select_device(id || null);
+    if (!res || !res.ok) {
+      $('devicePickerError').textContent = (res && res.error) || 'Could not switch device.';
+      return;
+    }
+    _activeDeviceId = (res.device && res.device.id) || null;
+    deviceChanged({ device: res.device || null });
+    renderDevicePickerList();
+  } catch (e) {
+    $('devicePickerError').textContent = String(e);
+  }
+}
+
+async function removeDevice(id) {
+  $('devicePickerError').textContent = '';
+  try {
+    const res = await pywebview.api.remove_device(id);
+    if (res && res.ok) await refreshDeviceList();
+    else $('devicePickerError').textContent = (res && res.error) || 'Could not remove device.';
+  } catch (e) {
+    $('devicePickerError').textContent = String(e);
+  }
+}
+
+async function testDeviceConnection(id) {
+  const result = $('devicePickerResult');
+  result.textContent = 'Testing…';
+  try {
+    const res = await pywebview.api.test_device(id);
+    if (res && res.ok) {
+      const missing = (res.missing && res.missing.length) ? ` · missing: ${res.missing.join(', ')}` : '';
+      result.textContent = `Connected — ${res.uname || ''}${missing}`;
+    } else {
+      result.textContent = (res && res.error) || 'Connection failed.';
+    }
+  } catch (e) {
+    result.textContent = String(e);
+  }
+}
+
+async function addDevice() {
+  const name = $('deviceFormName').value.trim();
+  const target = $('deviceFormTarget').value.trim();
+  const root = $('deviceFormRoot').value.trim();
+  const prelude = $('deviceFormPrelude').value.trim();
+  $('devicePickerError').textContent = '';
+  if (!name || !target || !root) {
+    $('devicePickerError').textContent = 'Name, ssh target and remote folder are required.';
+    return;
+  }
+  try {
+    const res = await pywebview.api.add_device(name, target, root, prelude);
+    if (res && res.ok) {
+      $('deviceFormName').value = '';
+      $('deviceFormTarget').value = '';
+      $('deviceFormRoot').value = '';
+      $('deviceFormPrelude').value = '';
+      await refreshDeviceList();
+    } else {
+      $('devicePickerError').textContent = (res && res.error) || 'Could not add device.';
+    }
+  } catch (e) {
+    $('devicePickerError').textContent = String(e);
+  }
+}
 
 // ---------- ultra mode ----------
 // A per-project flag the backend owns (agent.set_ultra / get_ultra). The header
@@ -4305,6 +4465,19 @@ async function init() {
     if (st && st.active) await pywebview.api.restore_session();
   } catch (e) { /* stay on the start screen */ }
 
+  // Paint the chip's initial state before any device_changed event has had a
+  // chance to fire — otherwise a session restored while a device was already
+  // active would show "this computer" until the user opened the picker.
+  try {
+    const res = await pywebview.api.list_devices();
+    if (res && res.ok) {
+      _devices = res.devices || [];
+      _activeDeviceId = res.active || null;
+      const active = _devices.find(d => d.id === _activeDeviceId) || null;
+      deviceChanged({ device: active });
+    }
+  } catch (e) { /* chip stays at its default "this computer" state */ }
+
   // "Open Folder…": pick a host folder at runtime, mount it, and start on it.
   $('openFolderBtn').addEventListener('click', pickWorkspaceAndStart);
   $('importFolderBtn').addEventListener('click', toggleImportBox);
@@ -4331,6 +4504,16 @@ async function init() {
   $('themeToggle').addEventListener('click', toggleTheme);
   $('themeToggleStart').addEventListener('click', toggleTheme);
   applyThemeIcons();
+
+  $('deviceChip').addEventListener('click', async () => {
+    $('devicePickerError').textContent = '';
+    $('devicePickerResult').textContent = '';
+    await refreshDeviceList();
+    openModal($('devicePicker'));
+  });
+  $('devicePickerClose').addEventListener('click', () => closeModal($('devicePicker')));
+  $('devicePickerDoneBtn').addEventListener('click', () => closeModal($('devicePicker')));
+  $('deviceAddBtn').addEventListener('click', addDevice);
 
   $('modelSelectBtn').addEventListener('click', (e) => {
     e.stopPropagation();
