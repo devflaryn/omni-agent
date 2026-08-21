@@ -383,6 +383,54 @@ def test_a_replayed_result_is_recorded_into_the_new_journal(monkeypatch):
     assert rows[0]["cached"] is True and rows[0]["ok"] is True
 
 
+# --- nested-run group is persisted to the journal (fix round 1) -------------
+# runtime.py's _emit sets ev["group"] = self.emit_prefix for every event of a
+# nested workflow — Task 7's frontend grouping reads that live. The journal
+# row load_run hands back must carry the SAME value, or a historical view of
+# a nested run renders flat while the live run it came from grouped
+# correctly. Covers both journal.record() call sites in agent().
+def test_nested_workflow_group_is_persisted_to_the_journal(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x",
+                                            "tokens": 1})
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    path = _os.path.join(d, "journal.jsonl")
+    j = J.Journal(path)
+    top = R.WorkflowRuntime(j, run_dir=d)
+    top.agent("top level call")
+    child = R.WorkflowRuntime(j, run_dir=d, emit_prefix="understand-subsystem")
+    child.agent("nested call")
+    j.close()
+
+    rows = [_json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    assert len(rows) == 2
+    assert rows[0].get("group") is None,         "a top-level agent's journal row must not carry a group"
+    assert rows[1].get("group") == "understand-subsystem",         "a nested workflow's journal row must carry the same group its live event carried"
+
+
+def test_a_replayed_nested_workflow_agent_keeps_its_group(monkeypatch):
+    """The cache-hit path (a resume) re-records the replayed result into a
+    fresh journal — it must carry `group` too, or resuming a nested run loses
+    the grouping the original run had."""
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "x", "raw_report": "x"})
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    old = _os.path.join(d, "old.jsonl")
+    j = J.Journal(old)
+    k = J.call_key("researcher", "p", {})
+    j.record(k, 0, {"ok": True, "result": "from-cache"})
+    j.close()
+
+    new = _os.path.join(d, "new.jsonl")
+    j2 = J.Journal(new, replay_from=old)
+    child = R.WorkflowRuntime(j2, run_dir=d, emit_prefix="understand-subsystem")
+    assert child.agent("p") == "from-cache"
+    j2.close()
+
+    rows = [_json.loads(l) for l in open(new, encoding="utf-8") if l.strip()]
+    assert len(rows) == 1
+    assert rows[0]["cached"] is True
+    assert rows[0].get("group") == "understand-subsystem",         "a replayed nested-workflow call must keep its group in the new journal"
+
+
 # --- partial results on abort (M4) ------------------------------------------
 def test_completed_results_survive_as_partials(monkeypatch):
     _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
@@ -485,6 +533,8 @@ if __name__ == "__main__":
              test_two_concurrent_identical_prompts_get_distinct_sub_ids,
              test_sub_id_carries_the_journal_key_and_its_occurrence,
              test_a_replayed_result_is_recorded_into_the_new_journal,
+             test_nested_workflow_group_is_persisted_to_the_journal,
+             test_a_replayed_nested_workflow_agent_keeps_its_group,
              test_completed_results_survive_as_partials,
              test_nested_fan_out_cannot_exceed_the_live_branch_cap,
              test_the_live_branch_counter_returns_to_zero,

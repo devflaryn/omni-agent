@@ -203,6 +203,10 @@ class WorkflowRuntime:
                 "ok": True, "result": cached, "phase": phase, "label": label,
                 "agent_type": agent_type, "tokens": 0, "elapsed_s": 0.0,
                 "model": model, "is_write": is_write, "cached": True,
+                # Same value _emit puts on ev["group"] for a live nested-workflow
+                # event — a replayed row must keep the grouping the UI already
+                # showed, or reopening a resumed run renders it flat.
+                "group": self.emit_prefix or None,
             })
             self._note_partial(phase, label, agent_type, cached, True)
             self._emit({"type": "wf_agent_done", "sub_id": sub_id, "ok": True,
@@ -247,6 +251,10 @@ class WorkflowRuntime:
             "agent_type": agent_type, "tokens": res.get("tokens", 0),
             "elapsed_s": elapsed, "model": res.get("model"),
             "is_write": is_write, "cached": False,
+            # Read from the SAME attribute _emit reads for ev["group"] — no
+            # second source of truth for whether this call belongs to a
+            # nested workflow.
+            "group": self.emit_prefix or None,
         })
         if ok:
             self._note_partial(phase, label, agent_type, value, False)

@@ -225,12 +225,22 @@ function started(ctx) {
       { phase: 'Verify', label: 'verify:a.py', agent_type: 'researcher',
         tokens: 5, elapsed_s: 0.5, model: 'm', ok: true, cached: true,
         result: 'confirmed' },
+      // A nested workflow's journal row now carries `group` too (fix round 1:
+      // workflows/runtime.py used to emit it live but never persist it, so a
+      // reopened historical run rendered a nested run flat). A fixture with
+      // no group at all could not have caught that regression.
+      { phase: 'Review', label: 'nested:call', agent_type: 'researcher',
+        tokens: 3, elapsed_s: 0.2, model: 'm', ok: true, cached: false,
+        result: 'nested result', group: 'understand-subsystem' },
     ],
     result: { confirmed: ['one'] },
   });
   const html = byId.get('workflowTree')._html || '';
   assert.ok(/review:bugs/.test(html), 'historical rows render in the tree');
   assert.ok(/Verify/.test(html), 'historical phases render');
+  assert.ok(/wf-group-title/.test(html) && /understand-subsystem/.test(html),
+    'a historical row carrying group renders under the nested group node');
+  assert.ok(/nested:call/.test(html), 'the grouped row itself still renders');
   console.log('PASS a historical run renders through the same tree');
 }
 
