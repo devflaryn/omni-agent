@@ -1070,6 +1070,55 @@
       max-height: 320px; overflow-y: auto;
     }
 
+    /* ---- workflow library rail (Task 8): the catalog, the launch form, and
+       run history — "which run to draw", handed off to workflow_view.js's
+       tree, which is "how to draw a run". ---- */
+    .wf-lib-empty { padding: var(--space-2) var(--space-1); }
+    .wf-lib-row {
+      padding: var(--space-2); border-radius: var(--radius-md); cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .wf-lib-row:hover { background: rgb(var(--term-line) / .45); }
+    .wf-lib-row + .wf-lib-row { margin-top: 2px; }
+    .wf-lib-name { font-size: var(--text-sm); font-weight: 500; color: rgb(var(--term-text)); }
+    .wf-lib-desc { font-size: var(--text-xs); color: rgb(var(--term-muted)); margin-top: 2px; }
+    .wf-lib-when {
+      font-size: var(--text-2xs); color: rgb(var(--term-muted)); margin-top: 2px; font-style: italic;
+    }
+
+    .wf-launch-name {
+      font-weight: 500; color: rgb(var(--term-text)); min-height: 1.2em;
+      margin-bottom: var(--space-2);
+    }
+    .wf-arg-label {
+      display: block; font-size: var(--text-2xs); text-transform: uppercase;
+      letter-spacing: .08em; color: rgb(var(--term-muted)); margin-top: var(--space-2);
+      margin-bottom: var(--space-1);
+    }
+    .wf-arg-req { color: rgb(var(--term-red-fg)); }
+    .wf-arg-input {
+      width: 100%; height: var(--control-h-sm); padding: 0 var(--space-2);
+      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-sm);
+      background: rgb(var(--term-bg)); color: rgb(var(--term-text));
+      font-size: var(--text-xs); font-family: inherit;
+    }
+    .wf-arg-input:focus { border-color: rgb(var(--term-cyan)); }
+    textarea.wf-arg-input { height: auto; padding: var(--space-2); line-height: var(--leading-normal); }
+
+    .wf-run-row {
+      display: flex; align-items: center; gap: var(--space-2);
+      padding: var(--space-2); border-radius: var(--radius-md); cursor: pointer;
+    }
+    .wf-run-row:hover { background: rgb(var(--term-line) / .45); }
+    .wf-run-row-name {
+      font-size: var(--text-sm); color: rgb(var(--term-text));
+      min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .wf-run-row-meta {
+      font-size: var(--text-2xs); color: rgb(var(--term-muted)); flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+    }
+
     /* Device chip + picker (2026-08 SSH devices). Red, not cyan: this is a
        warning about which machine commands are about to run on, not a
        positive toggle like ultra mode — the ultra-chip color is deliberately
@@ -1361,11 +1410,32 @@
         </div>
       </div>
 
-      <!-- WORKFLOW TAB -->
-      <div id="workflowTab" class="scroll-y hidden flex-1 px-3 py-2" role="tabpanel">
-        <div id="workflowEmpty" class="text-term-muted t-xs">No workflow has run yet.</div>
-        <div id="workflowTree"></div>
-        <div id="workflowAgentDetail" class="wf-detail"></div>
+      <!-- WORKFLOW TAB: a master-detail rail. The rail (left) is "which run to
+           draw" — the catalog, the launch form, and run history. The detail
+           pane (right) is "how to draw a run" — workflow_view.js's tree, fed
+           either by a live event stream or by workflowRenderRecord() from a
+           run picked in #workflowRunList. -->
+      <div id="workflowTab" class="hidden flex-1 flex min-h-0" role="tabpanel">
+        <div class="w-72 shrink-0 border-r border-term-line bg-term-panel flex flex-col overflow-hidden">
+          <div class="eyebrow px-3 py-2 border-b border-term-line">workflows</div>
+          <div id="workflowLibraryList" class="scroll-y flex-1 min-h-0 px-2 py-1"></div>
+          <div class="border-t border-term-line px-3 py-2">
+            <div id="workflowLaunchName" class="wf-launch-name t-sm"></div>
+            <div id="workflowArgsForm" class="wf-args-form"></div>
+            <div id="workflowLaunchError" class="t-2xs text-term-red"></div>
+            <div class="flex items-center gap-2 mt-2">
+              <button id="workflowDryRunBtn" class="btn btn-sm flex-1">Dry run</button>
+              <button id="workflowLaunchBtn" class="btn btn-sm btn-accent flex-1">Launch</button>
+            </div>
+          </div>
+          <div class="eyebrow px-3 py-2 border-t border-b border-term-line">recent runs</div>
+          <div id="workflowRunList" class="scroll-y flex-1 min-h-0 px-2 py-1"></div>
+        </div>
+        <div class="scroll-y flex-1 min-h-0 px-3 py-2">
+          <div id="workflowEmpty" class="text-term-muted t-xs">No workflow has run yet.</div>
+          <div id="workflowTree"></div>
+          <div id="workflowAgentDetail" class="wf-detail"></div>
+        </div>
       </div>
     </main>
   </div>
@@ -1617,6 +1687,7 @@
 
   <script defer src="wave_stats.js"></script>
   <script defer src="workflow_view.js"></script>
+  <script defer src="workflow_library.js"></script>
   <script defer src="device_view.js"></script>
   <script src="app.js"></script>
 </body>

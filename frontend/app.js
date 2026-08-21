@@ -3843,8 +3843,53 @@ function switchTab(tab) {
     renderPlanTab(currentPlan);
   } else if (tab === 'workflow') {
     workflowTab.classList.remove('hidden');
+    loadWorkflowLibrary();
   } else {
     chatTab.classList.remove('hidden');
+  }
+}
+
+// ---------- workflow library rail (Workflow tab) ----------
+// The rail itself (renderLibrary/renderRunHistory/buildArgsForm/libraryState)
+// lives in workflow_library.js — it knows WHICH run to draw. This is just the
+// request/response glue into pywebview.api, the same split device_view.js and
+// its picker wiring below use.
+
+async function loadWorkflowLibrary() {
+  try {
+    const [libRes, runsRes] = await Promise.all([
+      pywebview.api.list_workflows(), pywebview.api.list_runs(50),
+    ]);
+    if (typeof renderLibrary === 'function') renderLibrary(libRes);
+    if (typeof renderRunHistory === 'function') renderRunHistory(runsRes);
+  } catch (e) {
+    // The rail just stays empty; the tab is still usable for a live run.
+  }
+}
+
+async function launchSelectedWorkflow(dryRun) {
+  const errEl = $('workflowLaunchError');
+  if (errEl) errEl.textContent = '';
+  if (typeof libraryState !== 'function') return;
+  const st = libraryState();
+  if (!st.selected) {
+    if (errEl) errEl.textContent = 'Pick a workflow first.';
+    return;
+  }
+  // Validated IN THE FORM — the alternative is spending a dry-run round trip
+  // to be told a field was blank.
+  const out = st.collectArgs();
+  if (!out.ok) {
+    if (errEl) errEl.textContent = out.error;
+    return;
+  }
+  try {
+    const res = await pywebview.api.launch_workflow(st.selected, out.args, !!dryRun);
+    if (!res || !res.ok) {
+      if (errEl) errEl.textContent = (res && res.error) || 'Could not launch workflow.';
+    }
+  } catch (e) {
+    if (errEl) errEl.textContent = String(e);
   }
 }
 
@@ -4558,6 +4603,8 @@ async function init() {
   $('tabPlan').addEventListener('click', () => switchTab('plan'));
   $('tabGraph').addEventListener('click', () => switchTab('graph'));
   $('tabWorkflow').addEventListener('click', () => switchTab('workflow'));
+  $('workflowDryRunBtn').addEventListener('click', () => launchSelectedWorkflow(true));
+  $('workflowLaunchBtn').addEventListener('click', () => launchSelectedWorkflow(false));
   $('planBadge').addEventListener('click', () => switchTab('plan'));
   $('ultraToggle').addEventListener('click', toggleUltra);
   $('graphModeToggle').addEventListener('click', toggleGraphMode);
