@@ -1323,6 +1323,19 @@ def _remote_read_project_file(project_name, rel_path, force_text=False):
     # leaf, re-anchored against its resolved directory if the target is
     # relative. Whichever path wins, the root comparison runs on it before any
     # -f/wc/cat/base64 touches the file.
+    #
+    # The manual fallback (tier 3) cannot fully canonicalize: a `..`-relative
+    # symlink target (`ln -s ../../etc/passwd leak.txt`) or a 2+-level symlink
+    # chain both evade a single `readlink` hop — the string-prefix root check
+    # would then see a literal `..` segment it never collapsed and misjudge
+    # it as inside. So the principle here is: refuse what you cannot
+    # canonicalize, not "normalize it yourself" — hand-rolled `..` collapsing
+    # in POSIX sh is exactly how this class of bug recurs. Concretely: (1) if
+    # tier 3 finds the leaf IS a symlink, it refuses outright rather than
+    # trusting one hop; (2) regardless of tier, a resolved path that still
+    # contains a `..` segment is refused too, as a second, independent net —
+    # a canonical path never has one, so its presence means resolution did
+    # not complete.
     probe_script = (
         f'T={t}; R=$(pwd -P); '
         f'D=$(cd "$(dirname "$T")" 2>/dev/null && pwd -P); '
@@ -1331,10 +1344,11 @@ def _remote_read_project_file(project_name, rel_path, force_text=False):
         f'elif L=$(readlink -f "$D/$B" 2>/dev/null) && [ -n "$L" ]; then F="$L"; '
         f'else '
         f'LK=$(readlink "$D/$B" 2>/dev/null); '
-        f'if [ -n "$LK" ]; then case "$LK" in /*) F="$LK";; *) F="$D/$LK";; esac; '
-        f'else F="$D/$B"; fi; '
+        f'if [ -n "$LK" ]; then echo OUTSIDE; exit 0; fi; '
+        f'F="$D/$B"; '
         f'fi; '
         f'if [ -z "$F" ]; then echo OUTSIDE; exit 0; fi; '
+        f'case "$F" in *"/../"*|*"/..") echo OUTSIDE; exit 0;; esac; '
         f'case "$F" in "$R"/*|"$R") ;; *) echo OUTSIDE; exit 0;; esac; '
         f'if [ ! -f {t} ]; then echo MISSING; exit 0; fi; '
         f'echo "SIZE=$(wc -c < {t} | tr -d " ")"'

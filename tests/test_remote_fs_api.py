@@ -138,6 +138,44 @@ def test_remote_leaf_symlink_escape_is_rejected_without_transfer(monkeypatch):
     assert not any(c.strip().startswith("cat ") for c in seen["cmds"])
 
 
+def test_remote_unresolved_dotdot_in_resolved_path_is_rejected(monkeypatch):
+    # A resolver that could not fully canonicalize a symlink (a "..".relative
+    # leaf target, or a 2+ level chain that only tier 3's single readlink hop
+    # can partially follow) can leave a literal ".." segment in the resolved
+    # path. The probe script refuses that outright -- a canonical path never
+    # has one -- and reports OUTSIDE exactly like any other escape, before
+    # ever issuing a transfer command.
+    seen = _remote(monkeypatch, "OUTSIDE\n")
+    res = agent.read_project_file("proj", "leak.txt")
+    assert res["ok"] is False and "outside" in res["error"].lower()
+    assert not any("base64" in c for c in seen["cmds"])
+    assert not any(c.strip().startswith("cat ") for c in seen["cmds"])
+
+
+def test_probe_script_rejects_dotdot_before_the_root_comparison(monkeypatch):
+    # Ordering regression guard: the "resolved path still contains .." refusal
+    # must run BEFORE the "$R"/* root-prefix comparison, or a path a resolver
+    # left uncanonicalized could still slip through as a string-prefix match.
+    # A mocked run_cmd can't see a reordering -- it just returns canned output
+    # regardless of what the script says -- so this asserts on the generated
+    # script text directly.
+    monkeypatch.setattr(devices, "_active", devices.Device("i", "box", "h", "/r"))
+    seen = {}
+
+    def fake(cmd, timeout=None):
+        seen["cmd"] = cmd
+        return {"stdout": "MISSING\n", "stderr": "", "returncode": 0}
+
+    monkeypatch.setattr(agent, "run_cmd", fake)
+    agent.read_project_file("proj", "leak.txt")
+
+    script = seen["cmd"]
+    dotdot_pos = script.find('/../')
+    root_check_pos = script.find('"$R"/*')
+    assert dotdot_pos != -1, "the script must reject a literal .. segment"
+    assert root_check_pos != -1, "the script must still do the root-prefix comparison"
+    assert dotdot_pos < root_check_pos, "the .. rejection must run before the root comparison"
+
 def test_remote_image_comes_back_base64(monkeypatch):
     payload = base64.b64encode(b"\x89PNG\r\n\x1a\nfake").decode()
     _remote(monkeypatch, lambda cmd: "SIZE=15\n" if "pwd -P" in cmd else payload)
@@ -176,6 +214,8 @@ if __name__ == "__main__":
              (test_remote_text_file_is_returned_as_text, True),
              (test_remote_escape_outside_the_project_is_rejected, True),
              (test_remote_leaf_symlink_escape_is_rejected_without_transfer, True),
+             (test_remote_unresolved_dotdot_in_resolved_path_is_rejected, True),
+             (test_probe_script_rejects_dotdot_before_the_root_comparison, True),
              (test_remote_image_comes_back_base64, True),
              (test_a_file_over_the_cap_is_refused_not_transferred, True),
              (test_a_missing_remote_file_reports_cleanly, True)]
