@@ -393,6 +393,69 @@ def test_completed_results_survive_as_partials(monkeypatch):
     assert got == ["one", "two"]
 
 
+def test_nested_fan_out_cannot_exceed_the_live_branch_cap(monkeypatch):
+    # MAX_ITEMS bounds ONE call. The product is what was unbounded:
+    # pipeline(256) whose stages each parallel(256) is ~65k threads.
+    #
+    # A raising branch is isolated by _spawn's runner (result -> None, logged,
+    # the rest of the wave keeps going — see its docstring: "one bad branch
+    # must not take down the wave"). That isolation is existing behavior, not
+    # part of this cap, so a WorkflowScriptError from the cap never escapes
+    # pipeline()/parallel() when it fires inside a nested branch — it surfaces
+    # as a dropped item plus a logged wf_log event instead. This asserts on
+    # that observable effect rather than a raise out of pipeline().
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "x",
+                                              "raw_report": "x"})
+    events = []
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    j = J.Journal(_os.path.join(d, "journal.jsonl"))
+    rt = R.WorkflowRuntime(j, run_dir=d, on_event=events.append)
+    monkeypatch.setattr(R, "MAX_LIVE_BRANCHES", 8)
+    # 4 pipeline branches reserve 4 slots; only 1 of the 4 nested parallel(4)
+    # calls can fit in the remaining 4, so the other 3 are deterministically
+    # capped regardless of thread scheduling.
+    out = rt.pipeline(list(range(4)),
+                       lambda item, orig, i: rt.parallel([lambda: 1] * 4))
+    assert out.count(None) == 3, "exactly 3 of 4 nested fan-outs must be capped"
+    logs = [e["message"] for e in events if e.get("type") == "wf_log"]
+    assert any("too many concurrent branches" in m and "8" in m for m in logs), (
+        "the error must name the cap")
+
+
+def test_the_live_branch_counter_returns_to_zero(monkeypatch):
+    # A leaked counter would make every later fan-out fail for no reason.
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "x",
+                                              "raw_report": "x"})
+    rt = _rt()
+    rt.parallel([lambda: 1, lambda: 2])
+    assert rt._live_branches == 0
+
+
+def test_the_counter_returns_to_zero_even_when_a_branch_raises(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "x",
+                                              "raw_report": "x"})
+    rt = _rt()
+
+    def boom():
+        raise ValueError("nope")
+
+    rt.parallel([boom, lambda: 1])
+    assert rt._live_branches == 0
+
+
+def test_a_child_workflow_counts_against_the_same_budget(monkeypatch):
+    # Child runtimes share _count_lock; they must share this budget too, or
+    # nesting reopens the hole the cap exists to close.
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": "x",
+                                              "raw_report": "x"})
+    rt = _rt()
+    child = R.WorkflowRuntime(rt.journal, run_dir=rt.run_dir)
+    child._count_lock = rt._count_lock
+    child._branch_owner = rt
+    rt._live_branches = 5
+    assert child._branch_owner._live_branches == 5
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -422,7 +485,11 @@ if __name__ == "__main__":
              test_two_concurrent_identical_prompts_get_distinct_sub_ids,
              test_sub_id_carries_the_journal_key_and_its_occurrence,
              test_a_replayed_result_is_recorded_into_the_new_journal,
-             test_completed_results_survive_as_partials]
+             test_completed_results_survive_as_partials,
+             test_nested_fan_out_cannot_exceed_the_live_branch_cap,
+             test_the_live_branch_counter_returns_to_zero,
+             test_the_counter_returns_to_zero_even_when_a_branch_raises,
+             test_a_child_workflow_counts_against_the_same_budget]
     failed = 0
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:

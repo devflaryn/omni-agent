@@ -27,6 +27,9 @@ from . import schema as _schema
 from .sandbox import WorkflowScriptError
 
 MAX_ITEMS = 256          # per parallel()/pipeline() call
+# MAX_ITEMS bounds ONE call; this bounds the PRODUCT. pipeline(256) whose stages
+# each parallel(256) is ~65k threads, which MAX_ITEMS alone permits.
+MAX_LIVE_BRANCHES = 1024
 LABEL_CHARS = 48
 
 
@@ -74,6 +77,11 @@ class WorkflowRuntime:
         self.depth = 0          # bumped for a child runtime
         self._source_loader = None   # set by workflows.run
         self._key_prefix = ""   # set on a child so its journal keys can't collide with the parent's
+        self._live_branches = 0
+        # A nested workflow shares its parent's budget — see workflow() below,
+        # which already shares _count_lock. Without this, nesting reopens the
+        # hole the cap exists to close.
+        self._branch_owner = self
 
     # --- lifecycle --------------------------------------------------------
     @property
@@ -260,25 +268,41 @@ class WorkflowRuntime:
                 f"{MAX_ITEMS}. Batch the work or narrow the input; the cap is an "
                 f"explicit error rather than a silent truncation."
             )
-        results = [None] * len(fns)
-        threads = []
 
-        def runner(i, fn):
-            try:
-                results[i] = fn()
-            except WorkflowAborted:
-                results[i] = None
-            except Exception as e:      # noqa: BLE001 — isolated per branch
-                results[i] = None
-                self.log(f"branch {i} failed: {type(e).__name__}: {e}")
+        owner = self._branch_owner
+        with self._count_lock:
+            if owner._live_branches + len(fns) > MAX_LIVE_BRANCHES:
+                raise WorkflowScriptError(
+                    f"too many concurrent branches: {owner._live_branches} already "
+                    f"in flight plus {len(fns)} more exceeds the cap of "
+                    f"{MAX_LIVE_BRANCHES}. Nested fan-out multiplies — a pipeline "
+                    f"whose stages each call parallel() opens items x items "
+                    f"branches. Reduce one of the two levels."
+                )
+            owner._live_branches += len(fns)
+        try:
+            results = [None] * len(fns)
+            threads = []
 
-        for i, fn in enumerate(fns):
-            t = threading.Thread(target=runner, args=(i, fn), daemon=True)
-            threads.append(t)
-            t.start()
-        for t in threads:
-            t.join()
-        return results
+            def runner(i, fn):
+                try:
+                    results[i] = fn()
+                except WorkflowAborted:
+                    results[i] = None
+                except Exception as e:      # noqa: BLE001 — isolated per branch
+                    results[i] = None
+                    self.log(f"branch {i} failed: {type(e).__name__}: {e}")
+
+            for i, fn in enumerate(fns):
+                t = threading.Thread(target=runner, args=(i, fn), daemon=True)
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join()
+            return results
+        finally:
+            with self._count_lock:
+                owner._live_branches -= len(fns)
 
     def parallel(self, thunks):
         """Run every thunk concurrently and WAIT for all of them — a barrier.
@@ -343,6 +367,7 @@ class WorkflowRuntime:
         child._sem = self._sem
         child._abort = self._abort
         child._count_lock = self._count_lock
+        child._branch_owner = self._branch_owner
         # One partial list under the shared lock, so an abort inside a nested
         # workflow still reports through the parent's result.
         child._partial = self._partial
