@@ -105,6 +105,7 @@ def validate(src, args=None, concurrency=None):
 def run(src=None, name=None, args=None, run_root=None, on_event=None,
         resume_from=None, dry_run=False, concurrency=None):
     started = time.monotonic()
+    started_wall = time.time()
     run_root = run_root if run_root is not None else get_run_root()
     warnings = []
     try:
@@ -187,8 +188,17 @@ def run(src=None, name=None, args=None, run_root=None, on_event=None,
         _ACTIVE.pop(run_id, None)
         try:
             with open(os.path.join(run_dir, "result.json"), "w", encoding="utf-8") as f:
-                json.dump({"ok": ok, "error": error, "result": value},
-                          f, indent=2, default=str)
+                json.dump({
+                    "ok": ok, "error": error, "result": value,
+                    # Summary fields: run() computes these anyway, and a history
+                    # list cannot report what was never written to disk.
+                    "name": meta.get("name", ""),
+                    "aborted": rt.aborted,
+                    "agent_count": rt.agent_count,
+                    "elapsed_s": round(time.monotonic() - started, 2),
+                    "started": started_wall,
+                    "finished": time.time(),
+                }, f, indent=2, default=str)
         except OSError:
             pass
         j.close()
