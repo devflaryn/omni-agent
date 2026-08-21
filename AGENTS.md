@@ -235,6 +235,55 @@ Ultra mode (`session["ultra"]`) gates autonomous orchestration: off, the agent
 must be asked; on, it defaults to a workflow for substantive tasks. The keyword
 `ultra` in a user message turns it on.
 
+## SSH devices (2026-08 upgrade)
+
+`devices.py` lets the agent run its toolset on another machine. A device is a
+host alias plus a remote project folder — no credentials are stored, because auth
+is whatever the user's ssh already does.
+
+Three things are load-bearing:
+
+- **The transport is the `ssh` BINARY, not a library.** `run_cmd` builds an ssh
+  argv and hands it to the same `_run_polling` a local command uses, so process
+  groups, Stop polling, the timeout decider and pipe draining keep working
+  verbatim. A library would mean reimplementing all of it.
+- **Prefer Git/MSYS ssh over Windows OpenSSH.** Windows OpenSSH cannot multiplex
+  ("getsockname failed: Not a socket"), and without multiplexing every tool call
+  pays a fresh TCP+auth handshake. `ControlPath` must also stay under 108
+  bytes — the Unix-socket limit — or ssh refuses with "ControlPath too long"
+  and multiplexing silently never happens; `%C` itself is a fixed-length hash,
+  so the risk is entirely the directory prefix (`~/.omni-agent/ssh/%C` is 33
+  bytes for a short home directory on this box — comfortably under the limit,
+  but a deep profile path could get closer).
+- **Never fall back to local.** If a device is unreachable the command fails
+  loudly. A fallback would run it on the wrong machine, which is the one
+  catastrophic failure this feature can cause.
+
+Paths need no translation: `normalize_path` already returns project-relative
+paths and commands run with cwd set to the project folder, so the command string
+is valid on either machine.
+
+**Not everything goes remote.** Tools that bypass `run_cmd` — emulator, screen
+capture, vision, Frida, Roblox session, hook verification (they drive the LOCAL
+Android SDK), APK session-bootstrap injection (it edits decoded smali files
+directly with Python, not through `run_cmd`) and code-graph building (a local
+index of a remote project is meaningless) — call `devices.require_local()` and
+REFUSE while a device is active. `download_file` fetches with `curl` on the
+device instead. APK work is largely unaffected: `apk_tools` is almost entirely
+`run_cmd` calls: only `recompile_apk`'s constraint check touches the local
+filesystem directly (via `resolve_workspace_path`, to diff the original and
+rebuilt APKs), and that one path already catches the `RuntimeError` it raises
+when remote, degrading to a clean error instead of crashing.
+
+Stop and timeout **reap** the remote command: each command's wrapper records its
+process-group id to a tag-named file, and a second multiplexed ssh sends TERM
+then KILL to that group. Reaping runs on a background thread so Stop stays
+instant; if it fails, the result says the remote command may still be running.
+
+`host_exec.workspace_root()` returns **None** when a device is active — its
+callers do LOCAL file I/O, and None turns "operates on a path that does not exist
+here" into a clean refusal.
+
 ## Evidence-based workflow (planner → worker → reviewer)
 
 The agent loop (`agent.AgentApi._run_agent_loop`) runs one model that plays three
