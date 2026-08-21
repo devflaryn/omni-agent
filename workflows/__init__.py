@@ -8,6 +8,8 @@ otherwise waste an entire run.
 """
 import json
 import os
+import re
+import shutil
 import time
 import traceback
 import uuid
@@ -21,6 +23,28 @@ from .sandbox import WorkflowScriptError
 # app-wide. See the mandatory note in the task text.
 
 _ACTIVE = {}        # run_id -> WorkflowRuntime
+
+# Where <run_root>/workflows/<run_id>/ is created. Set once per session by
+# agent.start_session (the only place memory_dir is known), exactly like
+# subagents.set_ui_sink / host_exec.set_stop_check. Defaults to the process CWD
+# so a bare `import workflows` in a test or a script still works.
+_RUN_ROOT = "."
+
+# A run_id is uuid4().hex[:12] — 12 lowercase hex chars and nothing else. It
+# reaches os.path.join from a model-supplied `resume_from`, so it is validated
+# rather than trusted.
+_RUN_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def set_run_root(path):
+    """Point new run directories at `path` (typically the session's memory_dir)."""
+    global _RUN_ROOT
+    _RUN_ROOT = str(path or ".")
+    return _RUN_ROOT
+
+
+def get_run_root():
+    return _RUN_ROOT
 
 
 def list_library():
@@ -47,8 +71,10 @@ def _dry_run(code, meta, args, concurrency):
     personas, and unscoped writers for free."""
     from .runtime import WorkflowRuntime      # function-level: breaks the cycle
     import tempfile
-    tmp = os.path.join(tempfile.mkdtemp(prefix="wfdry-"), "journal.jsonl")
-    j = _journal.Journal(tmp)
+    # validate() runs on EVERY run_workflow call, so this directory must not
+    # outlive the dry run — it leaked one wfdry-* per validation before.
+    tmpdir = tempfile.mkdtemp(prefix="wfdry-")
+    j = _journal.Journal(os.path.join(tmpdir, "journal.jsonl"))
     rt = WorkflowRuntime(j, run_dir=None, dry_run=True, concurrency=concurrency)
     rt._source_loader = _loader
     ns = _sandbox.make_namespace(rt.primitives(), args)
@@ -57,6 +83,7 @@ def _dry_run(code, meta, args, concurrency):
         ns["__workflow__"]()
     finally:
         j.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def validate(src, args=None, concurrency=None):
@@ -75,9 +102,10 @@ def validate(src, args=None, concurrency=None):
                 "meta": {}}
 
 
-def run(src=None, name=None, args=None, run_root=".", on_event=None,
+def run(src=None, name=None, args=None, run_root=None, on_event=None,
         resume_from=None, dry_run=False, concurrency=None):
     started = time.monotonic()
+    run_root = run_root if run_root is not None else get_run_root()
     warnings = []
     try:
         src = _resolve_source(src, name)
@@ -111,8 +139,10 @@ def run(src=None, name=None, args=None, run_root=".", on_event=None,
 
     replay = None
     if resume_from:
-        replay = os.path.join(run_root, "workflows", resume_from, "journal.jsonl")
-        if not os.path.exists(replay):
+        if _RUN_ID_RE.match(str(resume_from)):
+            replay = os.path.join(run_root, "workflows", str(resume_from),
+                                  "journal.jsonl")
+        if not replay or not os.path.exists(replay):
             replay = None
             warnings.append(f"no journal found for run {resume_from}; running cold")
 
@@ -144,7 +174,12 @@ def run(src=None, name=None, args=None, run_root=".", on_event=None,
         exec(code, ns)
         value = ns["__workflow__"]()
     except WorkflowAborted:
+        # The spec: an aborted run "returns partial results with aborted: true".
+        # The script's own return value is gone (the abort unwound it), so hand
+        # back everything that DID complete — the same rows the journal kept,
+        # which is what makes an aborted run worth resuming.
         ok, error = False, "aborted"
+        value = {"aborted": True, "partial": rt.partial_results()}
     except Exception as e:  # noqa: BLE001
         ok = False
         error = f"{type(e).__name__}: {e}\n" + traceback.format_exc(limit=6)

@@ -1364,7 +1364,7 @@ _ULTRA_OFF = (
 )
 
 # Word-boundary match so 'ultrasound' / 'ultrasonic' do not trip it.
-_ULTRA_RE = __import__("re").compile(r"\bultra\b", __import__("re").IGNORECASE)
+_ULTRA_RE = re.compile(r"\bultra\b", re.IGNORECASE)
 
 
 def _ultra_prompt_segment(session):
@@ -1615,6 +1615,10 @@ class AgentApi:
             "active_toolsets": sorted(s.get("active_toolsets") or []),
             # Subagents-dock snapshot so the menu survives a reopen (see _track_dock).
             "dock": s.get("dock"),
+            # Ultra mode, so a project the user switched ON stays on across
+            # restarts. A keyword-armed turn is deliberately NOT persisted — it
+            # is scoped to that one turn (see send_message / _run_agent_loop).
+            "ultra": bool(s.get("ultra")) and not s.get("ultra_turn_only"),
             "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         })
         _write_json_atomic(os.path.join(mem, TRANSCRIPT_FILENAME), _cap_transcript(s.get("transcript", [])))
@@ -1645,6 +1649,7 @@ class AgentApi:
         # start_session.
         self._restored_active_toolsets = set()
         self._restored_dock = None
+        self._restored_ultra = False
         try:
             if os.path.isfile(conv_path):
                 with open(conv_path, "r", encoding="utf-8") as f:
@@ -1662,6 +1667,7 @@ class AgentApi:
                 dk = data.get("dock")
                 if isinstance(dk, dict) and isinstance(dk.get("rows"), list) and dk["rows"]:
                     self._restored_dock = dk
+                self._restored_ultra = bool(data.get("ultra"))
         except (OSError, json.JSONDecodeError, AttributeError):
             messages, original_task, stats = None, None, None
         try:
@@ -2832,7 +2838,11 @@ class AgentApi:
             "context_editing": True,
             # Ultra mode: whether the model may start workflows on its own
             # judgement (see _ultra_prompt_segment / set_ultra / get_ultra).
-            "ultra": False,
+            # Restored from disk so the header toggle survives a restart.
+            "ultra": bool(getattr(self, "_restored_ultra", False)),
+            # True only while the `ultra` KEYWORD armed this turn; cleared when
+            # the turn ends, and never persisted.
+            "ultra_turn_only": False,
             "max_consecutive_tools": MAX_CONSECUTIVE_TOOLS,
             "loop_repeat_threshold": LOOP_REPEAT_THRESHOLD,
             "summary_resets": 0,
@@ -2925,6 +2935,17 @@ class AgentApi:
         # project (if any), otherwise start clean. notify=False here since
         # self.session isn't fully wired to _on_plan_update semantics
         # (base_system_prompt refresh) until after session_started fires.
+        # Workflow run directories live under <memory_dir>/workflows/<run_id>/.
+        # Set here because this is the only place memory_dir is known — the same
+        # module-level-setter pattern as subagents.set_ui_sink and
+        # host_exec.set_stop_check. Without it every run wrote into the process
+        # CWD and a resume_from run_id was unfindable after a relaunch.
+        try:
+            import workflows as _workflows
+            _workflows.set_run_root(memory_dir)
+        except Exception:
+            pass    # a missing engine must not break session start
+
         planning.set_context(memory_dir, notify_callback=self._on_plan_update)
         resumed_plan = planning.load_plan(memory_dir)
         if resumed_plan and not resumed_plan.is_complete():
@@ -3100,7 +3121,14 @@ class AgentApi:
             self._stop = False
 
         if _ultra_keyword_requested(text) and not self.session.get("ultra"):
+            # The spec: the keyword arms ultra mode for THAT TURN. It used to
+            # latch on forever, so one message mentioning "ultra" left every
+            # later turn free to fan out. _run_agent_loop's finally clears it.
             self.session["ultra"] = True
+            self.session["ultra_turn_only"] = True
+            # Without this the very turn that asked for ultra still runs against
+            # the OFF prompt — the flag is only read when the prompt is rebuilt.
+            self._refresh_system_prompt()
             self._emit({"type": "ultra_mode", "ultra": True})
 
         self.session["messages"].append({"role": "user", "content": text})
@@ -3176,14 +3204,20 @@ class AgentApi:
         return {"ok": True}
 
     def set_ultra(self, on):
-        """Toggle ultra mode. Exposed to the webview as pywebview.api.set_ultra."""
+        """Toggle ultra mode. Exposed to the webview as pywebview.api.set_ultra.
+
+        An explicit toggle is STICKY: it clears the keyword's turn scoping, so
+        the state the user picked survives the end of the turn and is persisted."""
+        if not self.session:
+            return {"ok": False, "error": "No active session.", "ultra": False}
         self.session["ultra"] = bool(on)
+        self.session["ultra_turn_only"] = False
         self._refresh_system_prompt()
         self._emit({"type": "ultra_mode", "ultra": self.session["ultra"]})
         return {"ultra": self.session["ultra"]}
 
     def get_ultra(self):
-        return {"ultra": bool(self.session.get("ultra"))}
+        return {"ultra": bool((self.session or {}).get("ultra"))}
 
     def _abort_active_workflows(self):
         """Cancel every running workflow. Called from the same place that sets
@@ -5260,6 +5294,13 @@ class AgentApi:
         finally:
             with self._lock:
                 self._busy = False
+            # A keyword-armed ultra mode covers exactly the turn that asked for
+            # it. The header toggle is unaffected (it never sets ultra_turn_only).
+            if s.get("ultra_turn_only"):
+                s["ultra_turn_only"] = False
+                s["ultra"] = False
+                self._refresh_system_prompt()
+                self._emit({"type": "ultra_mode", "ultra": False})
             self._refresh_tree(force=True)  # push the final tree state once, at the end
             # Save the conversation + transcript so a refresh / restart can
             # restore this chat and continue from here.

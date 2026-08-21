@@ -57,9 +57,15 @@ class Journal:
                     key = entry.get("key")
                     if not key:
                         continue
-                    self._replay.setdefault(key, []).append(entry.get("result"))
                     if entry.get("is_write"):
                         self.had_write_agents = True
+                    # A FAILED call is history, not a cached answer. Replaying it
+                    # would freeze a transient failure in permanently — the exact
+                    # opposite of what resume is for — so it is recorded but never
+                    # handed back; the resumed run retries it.
+                    if entry.get("ok") is False:
+                        continue
+                    self._replay.setdefault(key, []).append(entry.get("result"))
         except OSError:
             pass    # no prior journal is simply a cold run
 

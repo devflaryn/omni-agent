@@ -2389,12 +2389,47 @@ window.__agent = {
       case 'wf_agent_done': workflowAgentDone(ev); break;
       case 'wf_log': workflowLog(ev); break;
       case 'workflow_done': workflowDone(ev); break;
+      case 'ultra_mode': renderUltra(ev.ultra); break;
       case 'done': onDone(); break;
     }
     // No scrollDown() here: every renderer that appends to the chat already
     // requests one, and non-chat events (status/file_tree/plan) don't need it.
   }
 };
+
+// ---------- ultra mode ----------
+// A per-project flag the backend owns (agent.set_ultra / get_ultra). The header
+// chip only REFLECTS it: every path that changes it — this toggle, the `ultra`
+// keyword in a message, the end of a keyword-armed turn — comes back as an
+// `ultra_mode` event, so there is one source of truth rather than two.
+let _ultra = false;
+
+function renderUltra(on) {
+  _ultra = !!on;
+  const btn = $('ultraToggle');
+  if (!btn) return;
+  btn.classList.toggle('is-on', _ultra);
+  btn.textContent = _ultra ? 'ultra on' : 'ultra off';
+  btn.setAttribute('aria-checked', _ultra ? 'true' : 'false');
+}
+
+async function toggleUltra() {
+  const next = !_ultra;
+  renderUltra(next);                     // optimistic; the event confirms it
+  try {
+    const res = await pywebview.api.set_ultra(next);
+    if (res && typeof res.ultra === 'boolean') renderUltra(res.ultra);
+  } catch (_) {
+    renderUltra(!next);                  // the backend never took it
+  }
+}
+
+async function refreshUltra() {
+  try {
+    const res = await pywebview.api.get_ultra();
+    if (res && typeof res.ultra === 'boolean') renderUltra(res.ultra);
+  } catch (_) { /* no session yet */ }
+}
 
 // ---------- session lifecycle ----------
 function setBusy(busy) {
@@ -2484,6 +2519,7 @@ function onSessionStarted(ev) {
     renderSystem(`Workspace: ${ev.project}`);
   }
   renderPlan(null); // cleared until the backend's follow-up plan_update event (fires right after session_started) arrives
+  refreshUltra();   // ultra is per-project and persisted, so read it per session
   if (ev.memory_summary) {
     const banner = $('memoryBanner');
     banner.classList.remove('hidden');
@@ -4340,6 +4376,7 @@ async function init() {
   $('tabGraph').addEventListener('click', () => switchTab('graph'));
   $('tabWorkflow').addEventListener('click', () => switchTab('workflow'));
   $('planBadge').addEventListener('click', () => switchTab('plan'));
+  $('ultraToggle').addEventListener('click', toggleUltra);
   $('graphModeToggle').addEventListener('click', toggleGraphMode);
   // Manual build controls (fixes the "no graph yet" dead-end + enables one graph
   // per project for multi-project compare).

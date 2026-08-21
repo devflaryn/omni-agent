@@ -109,6 +109,47 @@ def test_write_agent_presence_is_tracked_for_the_resume_warning():
     assert j2.had_write_agents is True
 
 
+# --- failures are history, never a cached answer (I7) ------------------------
+def test_a_failed_entry_is_not_replayed_so_a_resume_retries_it():
+    """Recording ok=False and replaying its None froze a transient failure in
+    permanently: no resume could ever recover from it, which is the exact
+    opposite of what resume is for."""
+    path = _tmp("failed.jsonl")
+    j = J.Journal(path)
+    k = J.call_key("researcher", "p", {})
+    j.record(k, 0, {"ok": False, "result": None})
+    j.close()
+
+    j2 = J.Journal(_tmp("second.jsonl"), replay_from=path)
+    hit, value = j2.lookup(k)
+    assert hit is False, "a failed call was replayed instead of retried"
+    assert value is None
+
+
+def test_a_failed_write_still_raises_the_side_effect_warning():
+    """It is skipped as a REPLAY, not ignored — a write agent that failed may
+    still have touched the workspace, so the resume warning must survive."""
+    path = _tmp("failedwrite.jsonl")
+    j = J.Journal(path)
+    j.record(J.call_key("implementer", "p", {}), 0,
+             {"ok": False, "result": None, "is_write": True})
+    j.close()
+    assert J.Journal(_tmp("second2.jsonl"), replay_from=path).had_write_agents is True
+
+
+def test_a_successful_entry_beside_a_failed_one_still_replays():
+    path = _tmp("mixed.jsonl")
+    j = J.Journal(path)
+    bad = J.call_key("researcher", "bad", {})
+    good = J.call_key("researcher", "good", {})
+    j.record(bad, 0, {"ok": False, "result": None})
+    j.record(good, 0, {"ok": True, "result": "kept"})
+    j.close()
+    j2 = J.Journal(_tmp("second3.jsonl"), replay_from=path)
+    assert j2.lookup(good) == (True, "kept")
+    assert j2.lookup(bad)[0] is False
+
+
 if __name__ == "__main__":
     tests = [test_key_is_stable_for_identical_inputs, test_key_ignores_opts_ordering,
              test_key_changes_with_prompt, test_key_changes_with_agent_type,
@@ -116,7 +157,10 @@ if __name__ == "__main__":
              test_repeated_identical_calls_replay_in_order,
              test_replay_is_order_independent,
              test_journal_is_readable_after_a_crash_mid_run,
-             test_write_agent_presence_is_tracked_for_the_resume_warning]
+             test_write_agent_presence_is_tracked_for_the_resume_warning,
+             test_a_failed_entry_is_not_replayed_so_a_resume_retries_it,
+             test_a_failed_write_still_raises_the_side_effect_warning,
+             test_a_successful_entry_beside_a_failed_one_still_replays]
     failed = 0
     for t in tests:
         try:

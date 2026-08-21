@@ -111,9 +111,26 @@
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  // The inline card ships hidden in index.html and only earns its space while a
+  // run is live — same class-toggling idiom as #workflowEmpty below. Nothing
+  // used to remove that `hidden`, so this surface never appeared at all.
+  function anyRunActive() {
+    for (const id in runs) if (runs[id].status === 'running') return true;
+    return false;
+  }
+
   function renderCard(run) {
     const card = document.getElementById('workflowCard');
     if (!card) return;
+    if (run.status !== 'running') {
+      // A finished run must not scribble its final state over a sibling that is
+      // still live; it only takes the card down once nothing is running.
+      if (anyRunActive()) return;
+      card.classList.add('hidden');
+      card.innerHTML = '';
+      return;
+    }
+    card.classList.remove('hidden');
     const c = run.counts;
     const bits = [];
     if (run.currentPhase) bits.push(esc(run.currentPhase));

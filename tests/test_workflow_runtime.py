@@ -3,6 +3,7 @@ LLM everywhere, so these are pure control-flow assertions."""
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
+import json as _json
 import tempfile
 import threading
 
@@ -321,6 +322,77 @@ def test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one(mo
     assert out[0] == ["z:x:a"]
 
 
+# --- sub_id uniqueness (I3) -------------------------------------------------
+def test_two_concurrent_identical_prompts_get_distinct_sub_ids(monkeypatch):
+    """sub_id used to BE the journal key, which is content-addressed — so two
+    branches asking the identical question emitted the same id. The frontend
+    keys its agent rows by sub_id, so one row overwrote the other, running/done
+    were double-counted, and findAgent could update the wrong phase.
+    review-changes hits this whenever two dimensions report the same finding."""
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "r", "raw_report": "r",
+                                           "tokens": 1})
+    events = []
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    j = J.Journal(_os.path.join(d, "journal.jsonl"))
+    rt = R.WorkflowRuntime(j, run_dir=d, on_event=events.append)
+    rt.parallel([lambda: rt.agent("the same prompt"),
+                 lambda: rt.agent("the same prompt")])
+    ids = [e["sub_id"] for e in events if e["type"] == "wf_agent_started"]
+    assert len(ids) == 2
+    assert ids[0] != ids[1], f"identical prompts collided on sub_id: {ids}"
+    # Every done event must address a started one, or the UI row never settles.
+    done = [e["sub_id"] for e in events if e["type"] == "wf_agent_done"]
+    assert sorted(done) == sorted(ids)
+
+
+def test_sub_id_carries_the_journal_key_and_its_occurrence(monkeypatch):
+    _install(monkeypatch, lambda *a, **k: {"ok": True, "report": "r", "raw_report": "r"})
+    events = []
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    rt = R.WorkflowRuntime(J.Journal(_os.path.join(d, "journal.jsonl")),
+                           run_dir=d, on_event=events.append)
+    rt.agent("p")
+    sub_id = [e for e in events if e["type"] == "wf_agent_started"][0]["sub_id"]
+    assert sub_id == J.call_key("researcher", "p", {}) + ":0"
+
+
+# --- replay is re-recorded (C1) ---------------------------------------------
+def test_a_replayed_result_is_recorded_into_the_new_journal(monkeypatch):
+    """A resume writes a FRESH journal. If a cache hit records nothing, that
+    journal holds only the delta this run executed and the NEXT resume re-runs
+    (and re-pays for) everything the first run did."""
+    d = tempfile.mkdtemp(prefix="wfrt-")
+    old = _os.path.join(d, "old.jsonl")
+    j = J.Journal(old)
+    k = J.call_key("researcher", "p", {})
+    j.record(k, 0, {"ok": True, "result": "from-cache"})
+    j.close()
+
+    _install(monkeypatch, lambda *a, **kw: {"ok": True, "report": "fresh",
+                                            "raw_report": "fresh"})
+    new = _os.path.join(d, "new.jsonl")
+    j2 = J.Journal(new, replay_from=old)
+    rt = R.WorkflowRuntime(j2, run_dir=d)
+    assert rt.agent("p") == "from-cache"
+    j2.close()
+
+    rows = [_json.loads(l) for l in open(new, encoding="utf-8") if l.strip()]
+    assert len(rows) == 1, "the replayed call was not carried into the new journal"
+    assert rows[0]["key"] == k and rows[0]["occ"] == 0
+    assert rows[0]["result"] == "from-cache"
+    assert rows[0]["cached"] is True and rows[0]["ok"] is True
+
+
+# --- partial results on abort (M4) ------------------------------------------
+def test_completed_results_survive_as_partials(monkeypatch):
+    _install(monkeypatch, lambda ad, p, **k: {"ok": True, "report": p, "raw_report": p})
+    rt = _rt()
+    rt.agent("one")
+    rt.agent("two")
+    got = [r["result"] for r in rt.partial_results()]
+    assert got == ["one", "two"]
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -346,7 +418,11 @@ if __name__ == "__main__":
              test_pipeline_drops_a_failing_item_to_none_and_skips_its_rest,
              test_pipeline_has_no_barrier_between_stages,
              test_item_cap_is_an_explicit_error_not_a_silent_truncation,
-             test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one]
+             test_nested_parallel_inside_pipeline_does_not_deadlock_at_concurrency_one,
+             test_two_concurrent_identical_prompts_get_distinct_sub_ids,
+             test_sub_id_carries_the_journal_key_and_its_occurrence,
+             test_a_replayed_result_is_recorded_into_the_new_journal,
+             test_completed_results_survive_as_partials]
     failed = 0
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:

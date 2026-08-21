@@ -66,6 +66,11 @@ class WorkflowRuntime:
         self._main_thread = threading.get_ident()
         self._count_lock = threading.Lock()
         self.agent_count = 0
+        # Every completed agent() result, in completion order. An aborted run
+        # returns these as its partial result (the script's own return value is
+        # gone once the abort unwinds it). Guarded by _count_lock — branch
+        # threads append concurrently.
+        self._partial = []
         self.depth = 0          # bumped for a child runtime
         self._source_loader = None   # set by workflows.run
         self._key_prefix = ""   # set on a child so its journal keys can't collide with the parent's
@@ -77,6 +82,17 @@ class WorkflowRuntime:
 
     def abort(self):
         self._abort.set()
+
+    def partial_results(self):
+        """Everything that completed before the abort, oldest first."""
+        with self._count_lock:
+            return list(self._partial)
+
+    def _note_partial(self, phase, label, agent_type, value, cached):
+        with self._count_lock:
+            self._partial.append({"phase": phase, "label": label,
+                                  "agent_type": agent_type, "cached": cached,
+                                  "result": value})
 
     def _check_abort(self):
         if self._abort.is_set():
@@ -158,13 +174,30 @@ class WorkflowRuntime:
             # and child cannot collide on replay.
             key = _journal.call_key(self._key_prefix, key, {})
 
+        is_write = bool(getattr(agent_def, "is_write", False))
+
         hit, cached = self.journal.lookup(key)
         if hit:
+            # The occurrence has to be taken on the WRITE side even for a replay:
+            # it is both the sub_id disambiguator and the slot this row occupies
+            # in THIS run's journal.
+            occ = self.journal.next_occurrence(key)
+            sub_id = f"{key}:{occ}"
             with self._count_lock:
                 self.agent_count += 1
             self._emit({"type": "wf_agent_started", "phase": phase, "label": label,
-                        "agent_type": agent_type, "model": model, "sub_id": key})
-            self._emit({"type": "wf_agent_done", "sub_id": key, "ok": True,
+                        "agent_type": agent_type, "model": model, "sub_id": sub_id})
+            # A resume gets a NEW run dir with a FRESH journal. Recording the
+            # replayed result here is what carries the full history forward —
+            # without it, resume B's journal holds only the delta B executed and
+            # resume C re-runs (and re-pays for) everything A did.
+            self.journal.record(key, occ, {
+                "ok": True, "result": cached, "phase": phase, "label": label,
+                "agent_type": agent_type, "tokens": 0, "elapsed_s": 0.0,
+                "model": model, "is_write": is_write, "cached": True,
+            })
+            self._note_partial(phase, label, agent_type, cached, True)
+            self._emit({"type": "wf_agent_done", "sub_id": sub_id, "ok": True,
                         "cached": True, "tokens": 0, "elapsed_s": 0.0})
             return cached
 
@@ -172,11 +205,16 @@ class WorkflowRuntime:
             return _schema.stub(schema) if schema else f"[dry-run:{label}]"
 
         occ = self.journal.next_occurrence(key)
+        # The journal key is content-addressed, so two concurrent branches with an
+        # identical prompt share it. The occurrence is what makes the UI id unique
+        # — without it the frontend overwrites one row with the other and
+        # double-counts running/done.
+        sub_id = f"{key}:{occ}"
         started = time.monotonic()
         with self._count_lock:
             self.agent_count += 1
         self._emit({"type": "wf_agent_started", "phase": phase, "label": label,
-                    "agent_type": agent_type, "model": model, "sub_id": key})
+                    "agent_type": agent_type, "model": model, "sub_id": sub_id})
 
         with self._sem:
             self._check_abort()
@@ -200,9 +238,11 @@ class WorkflowRuntime:
             "ok": ok, "result": value, "phase": phase, "label": label,
             "agent_type": agent_type, "tokens": res.get("tokens", 0),
             "elapsed_s": elapsed, "model": res.get("model"),
-            "is_write": bool(getattr(agent_def, "is_write", False)),
+            "is_write": is_write, "cached": False,
         })
-        self._emit({"type": "wf_agent_done", "sub_id": key, "ok": ok,
+        if ok:
+            self._note_partial(phase, label, agent_type, value, False)
+        self._emit({"type": "wf_agent_done", "sub_id": sub_id, "ok": ok,
                     "cached": False, "tokens": res.get("tokens", 0),
                     "elapsed_s": elapsed})
         return value
@@ -303,6 +343,9 @@ class WorkflowRuntime:
         child._sem = self._sem
         child._abort = self._abort
         child._count_lock = self._count_lock
+        # One partial list under the shared lock, so an abort inside a nested
+        # workflow still reports through the parent's result.
+        child._partial = self._partial
         child.depth = self.depth + 1
         child._source_loader = self._source_loader
         # Namespace the child's journal keys so an identical prompt in parent and

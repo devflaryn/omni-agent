@@ -83,4 +83,20 @@ for (const expected of ['get_projects', 'get_model_options']) {
   assert.ok(calls.includes(expected), `boot never called ${expected}`);
 }
 
+// I5: ultra mode had no UI control at all — set_ultra/get_ultra had no caller,
+// so the spec's header toggle did not exist and the keyword latched it on with
+// no way back. The chip must reach the backend and mirror whatever it reports.
+const ultraBtn = doc.getElementById('ultraToggle');
+ultraBtn.click();
+assert.ok(calls.includes('set_ultra'),
+  'the ultra toggle is not wired to pywebview.api.set_ultra');
+sb.window.__agent.onEvent({ type: 'ultra_mode', ultra: true });
+assert.equal(ultraBtn.textContent, 'ultra on');
+assert.equal(ultraBtn.classList.contains('is-on'), true, 'the chip shows the ON state');
+assert.equal(ultraBtn.getAttribute('aria-checked'), 'true');
+// …and a turn-scoped keyword expiring turns it back off without a click.
+sb.window.__agent.onEvent({ type: 'ultra_mode', ultra: false });
+assert.equal(ultraBtn.textContent, 'ultra off');
+assert.equal(ultraBtn.classList.contains('is-on'), false);
+
 console.log(`boot: OK (init clean, ${new Set(calls).size} backend calls)`);

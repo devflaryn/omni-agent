@@ -992,6 +992,16 @@
     .wf-dot-warn { background: rgb(var(--term-orange)); }
     @keyframes wf-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
 
+    /* Header ultra-mode toggle. A .chip with an explicit ON state, so the
+       control reads as on/off rather than as another static label. */
+    .ultra-chip { cursor: pointer; }
+    .ultra-chip:hover { background: rgb(var(--term-line) / .6); }
+    .ultra-chip.is-on {
+      border-color: rgb(var(--term-cyan) / .5);
+      background: rgb(var(--term-cyan) / .15);
+      color: rgb(var(--term-cyan-fg));
+    }
+
     .wf-badge {
       display: inline-flex; align-items: center; justify-content: center;
       min-width: 16px; height: 16px; margin-left: var(--space-1);
@@ -1147,6 +1157,9 @@
         </div>
         <div class="ml-auto flex items-center gap-1 text-term-muted t-xs" >
           <button id="planBadge" title="Current plan progress — click to open the Plan tab" class="chip text-term-cyan hover:bg-term-line/60" style="height:var(--control-h-sm)">plan —</button>
+          <button id="ultraToggle" type="button" role="switch" aria-checked="false"
+            title="Ultra mode — let the agent start multi-agent workflows on its own judgement"
+            class="chip ultra-chip" style="height:var(--control-h-sm)">ultra off</button>
           <button id="llmSettingsBtn" title="LLM provider settings" class="icon-btn">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           </button>

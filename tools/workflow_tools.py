@@ -101,8 +101,9 @@ def _coerce_args(args):
         "dry_run": "boolean (optional, default false) — validate and exercise control flow without spending tokens.",
     },
     output=("{ok, run_id, name, result, agent_count, elapsed_s, warnings} on success; "
-            "{error} with the traceback when validation or dry-run fails, so you can fix "
-            "the script and retry."),
+            "{error, run_id, name, result, aborted, agent_count, elapsed_s} on failure — "
+            "the traceback when validation or dry-run fails (fix the script and retry), and "
+            "the counters plus any partial result when a started run failed or was aborted."),
     when_to_use=(
         "Use for multi-stage work: review-then-verify, discover-then-migrate-then-check, "
         "sweep-then-read-then-synthesize, or any hunt that should continue until it stops "
@@ -122,14 +123,25 @@ def run_workflow(name=None, script=None, args=None, resume_from=None, dry_run=Fa
     try:
         res = _drain_to_ui(lambda emit: _run(
             src=script, name=name, args=_coerce_args(args),
-            run_root=".", on_event=emit, resume_from=resume_from,
-            dry_run=bool(dry_run)))
+            # The session's memory_dir, set by agent.start_session. NOT the
+            # process CWD — that wrote run dirs into the source tree and made a
+            # resume_from run_id unfindable after a relaunch.
+            run_root=workflows.get_run_root(), on_event=emit,
+            resume_from=resume_from, dry_run=bool(dry_run)))
     except Exception as e:  # noqa: BLE001
         return {"error": f"workflow crashed: {type(e).__name__}: {e}"}
 
     if not res.get("ok"):
+        # An aborted or failed run still did work — return the same counters the
+        # success path does, so the model can tell "nothing ran" from "eleven
+        # agents finished and then I stopped it", and can resume from run_id.
         return {"error": res.get("error") or "workflow failed",
                 "run_id": res.get("run_id", ""),
+                "name": res.get("name", ""),
+                "result": res.get("result"),
+                "aborted": bool(res.get("aborted")),
+                "agent_count": res.get("agent_count", 0),
+                "elapsed_s": res.get("elapsed_s", 0.0),
                 "warnings": res.get("warnings", [])}
     return {"ok": True, "run_id": res["run_id"], "name": res["name"],
             "result": res["result"], "agent_count": res["agent_count"],

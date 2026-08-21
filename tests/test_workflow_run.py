@@ -208,6 +208,160 @@ def test_child_events_carry_a_group_label(monkeypatch):
     assert grouped and all(g["group"] == "understand-subsystem" for g in grouped)
 
 
+# --- resume must be idempotent across MANY resumes (C1) ---------------------
+def test_a_double_resume_still_re_runs_nothing(monkeypatch):
+    """A -> B -> C. B replayed A's journal but recorded nothing into its own, so
+    C resumed from a 0-byte journal and re-ran (and re-paid for) every call A
+    made. This targets hours-to-days runs, so a resume of a resume is the normal
+    case, not an edge one."""
+    calls = {"n": 0}
+
+    def counter(ad, p, **k):
+        calls["n"] += 1
+        return {"ok": True, "report": p, "raw_report": p, "tokens": 1}
+
+    _install(monkeypatch, counter)
+    root = _root()
+    a = workflows.run(src=GOOD, run_root=root)
+    assert calls["n"] == 3
+
+    b = workflows.run(src=GOOD, run_root=root, resume_from=a["run_id"])
+    assert calls["n"] == 3, "resume B re-ran work"
+    jb = _os.path.join(root, "workflows", b["run_id"], "journal.jsonl")
+    assert _os.path.getsize(jb) > 0, "resume B wrote an empty journal"
+
+    c = workflows.run(src=GOOD, run_root=root, resume_from=b["run_id"])
+    assert calls["n"] == 3, "resume C re-ran work a resume already had"
+    assert c["result"] == a["result"]
+
+    # …and a fourth, to prove the history keeps carrying rather than decaying.
+    d = workflows.run(src=GOOD, run_root=root, resume_from=c["run_id"])
+    assert calls["n"] == 3 and d["result"] == a["result"]
+
+
+def test_a_resumed_write_warning_survives_the_second_resume(monkeypatch):
+    _install(monkeypatch)
+    root = _root()
+    src = ('meta = {"name": "w", "description": "d"}\n'
+           'return agent("edit", agent_type="implementer", scope=["src/"])\n')
+    a = workflows.run(src=src, run_root=root)
+    b = workflows.run(src=src, run_root=root, resume_from=a["run_id"])
+    c = workflows.run(src=src, run_root=root, resume_from=b["run_id"])
+    assert any("write" in w.lower() for w in c["warnings"]), (
+        "the write-side-effect warning was lost on the second resume")
+
+
+def test_a_failed_call_is_retried_on_resume_not_replayed(monkeypatch):
+    """The point of a resume is to recover from a transient failure. Caching
+    ok=False made that impossible."""
+    state = {"fail": True, "n": 0}
+
+    def flaky(ad, p, **k):
+        state["n"] += 1
+        if state["fail"]:
+            return {"ok": False, "report": "", "raw_report": "", "error": "boom"}
+        return {"ok": True, "report": "recovered", "raw_report": "recovered"}
+
+    _install(monkeypatch, flaky)
+    src = ('meta = {"name": "flaky", "description": "d"}\n'
+           'return agent("do it")\n')
+    root = _root()
+    first = workflows.run(src=src, run_root=root)
+    assert first["result"] is None and state["n"] == 1
+
+    state["fail"] = False
+    second = workflows.run(src=src, run_root=root, resume_from=first["run_id"])
+    assert state["n"] == 2, "the failed call was replayed instead of retried"
+    assert second["result"] == "recovered"
+
+
+# --- the run root is configured, not the CWD (I2) ---------------------------
+def test_run_root_defaults_to_the_configured_root(monkeypatch):
+    _install(monkeypatch)
+    root = _root()
+    prev = workflows.get_run_root()
+    try:
+        workflows.set_run_root(root)
+        assert workflows.get_run_root() == root
+        res = workflows.run(src=GOOD)          # no run_root= at all
+        assert _os.path.isdir(_os.path.join(root, "workflows", res["run_id"]))
+    finally:
+        workflows.set_run_root(prev)
+
+
+def test_set_run_root_falls_back_to_cwd_when_cleared(monkeypatch=None):
+    prev = workflows.get_run_root()
+    try:
+        workflows.set_run_root(None)
+        assert workflows.get_run_root() == "."
+    finally:
+        workflows.set_run_root(prev)
+
+
+# --- validate() must not leak a temp dir (I6) -------------------------------
+def test_validate_leaves_no_temp_directory_behind(monkeypatch):
+    import glob as _glob
+    import tempfile as _tf
+    _install(monkeypatch)
+    before = set(_glob.glob(_os.path.join(_tf.gettempdir(), "wfdry-*")))
+    for _ in range(3):
+        assert workflows.validate(GOOD)["ok"] is True
+    after = set(_glob.glob(_os.path.join(_tf.gettempdir(), "wfdry-*")))
+    assert after == before, f"validate leaked: {sorted(after - before)}"
+
+
+def test_a_failing_dry_run_also_cleans_up(monkeypatch):
+    import glob as _glob
+    import tempfile as _tf
+    _install(monkeypatch)
+    bad = ('meta = {"name": "b", "description": "d"}\n'
+           'return {"x": 1}["nope"]\n')
+    before = set(_glob.glob(_os.path.join(_tf.gettempdir(), "wfdry-*")))
+    assert workflows.validate(bad)["ok"] is False
+    assert set(_glob.glob(_os.path.join(_tf.gettempdir(), "wfdry-*"))) == before
+
+
+# --- resume_from is model-supplied and reaches os.path.join (M3) ------------
+def test_a_malformed_resume_id_is_treated_as_no_journal(monkeypatch):
+    _install(monkeypatch)
+    root = _root()
+    for bad in ["../../etc", "not a run id", "ABCDEF012345", "abc", ""]:
+        res = workflows.run(src=GOOD, run_root=root, resume_from=bad)
+        assert res["ok"] is True
+        if bad:
+            assert any("no journal found" in w for w in res["warnings"]), bad
+
+
+# --- an aborted run returns partial results (M4) ----------------------------
+ABORTS = '''
+meta = {"name": "ab", "description": "d"}
+phase("One")
+first = agent("first call")
+log("stopping now")
+second = agent("second call")
+return {"first": first, "second": second}
+'''
+
+
+def test_an_aborted_run_returns_partial_results_not_none(monkeypatch):
+    """The spec: an aborted run 'returns partial results with aborted: true'."""
+    seen = {"n": 0}
+
+    def stopper(ad, p, **k):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            workflows.abort()          # the Stop button, mid-run
+        return {"ok": True, "report": p, "raw_report": p, "tokens": 1}
+
+    _install(monkeypatch, stopper)
+    res = workflows.run(src=ABORTS, run_root=_root())
+    assert res["aborted"] is True
+    assert res["result"] is not None, "an aborted run threw away everything it did"
+    assert res["result"]["aborted"] is True
+    done = [p["result"] for p in res["result"]["partial"]]
+    assert done == ["first call"]
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -224,7 +378,16 @@ if __name__ == "__main__":
              test_a_workflow_can_call_a_library_workflow,
              test_child_agents_count_toward_the_parent,
              test_nesting_two_levels_deep_is_refused,
-             test_child_events_carry_a_group_label]
+             test_child_events_carry_a_group_label,
+             test_a_double_resume_still_re_runs_nothing,
+             test_a_resumed_write_warning_survives_the_second_resume,
+             test_a_failed_call_is_retried_on_resume_not_replayed,
+             test_run_root_defaults_to_the_configured_root,
+             test_set_run_root_falls_back_to_cwd_when_cleared,
+             test_validate_leaves_no_temp_directory_behind,
+             test_a_failing_dry_run_also_cleans_up,
+             test_a_malformed_resume_id_is_treated_as_no_journal,
+             test_an_aborted_run_returns_partial_results_not_none]
     failed = 0
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:
