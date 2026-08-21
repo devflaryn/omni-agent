@@ -90,6 +90,49 @@ def test_list_runs_and_load_run_pass_through(monkeypatch):
     assert api.load_run("a")["run_id"] == "a"
 
 
+def test_events_from_many_threads_are_funneled_through_a_single_emit_thread(monkeypatch):
+    """parallel()/pipeline() spawn one thread per branch and fire on_event from
+    each of them. self._emit is not thread-safe (transcript append/trim, dock
+    mutation, evaluate_js). This must fail if the drain funnel is ever removed
+    and workflows.run is handed self._emit directly again."""
+    import threading as _threading
+    import workflows
+
+    def fake_run(name=None, args=None, on_event=None, dry_run=False, **kw):
+        def branch(i):
+            for j in range(20):
+                on_event({"type": "wf_agent_done", "branch": i, "seq": j})
+        threads = [_threading.Thread(target=branch, args=(i,)) for i in range(6)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        return {"ok": True, "run_id": "abc", "name": name, "result": {},
+                "agent_count": 6, "elapsed_s": 0.1, "warnings": []}
+
+    monkeypatch.setattr(workflows, "run", fake_run)
+
+    api = _api()
+    idents = set()
+    received = []
+    emit_lock = _threading.Lock()
+
+    def recording_emit(ev):
+        with emit_lock:
+            idents.add(_threading.get_ident())
+            received.append(ev)
+
+    api._emit = recording_emit
+
+    res = api._run_workflow_with_ui_drain("review-changes", None, False)
+
+    assert res["run_id"] == "abc"
+    assert len(received) == 6 * 20, "every fanned-out event must still reach _emit"
+    assert len(idents) == 1, (
+        f"_emit was entered from {len(idents)} thread(s); it must be entered "
+        "from exactly one, or the workflow's fan-out threads race on it")
+
+
 def test_list_workflows_exposes_args_schema(monkeypatch):
     # The form is built from this; without it the UI cannot render fields.
     import workflows
@@ -105,7 +148,7 @@ if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
     import workflows as _wf
-    _saved = (_wf.list_library, _wf.list_runs, _wf.load_run)
+    _saved = (_wf.list_library, _wf.list_runs, _wf.load_run, _wf.run)
     failed = 0
     for t, needs in [(test_launch_refuses_when_the_agent_is_busy, False),
                      (test_launch_refuses_an_unknown_workflow, True),
@@ -114,6 +157,7 @@ if __name__ == "__main__":
                      (test_a_failed_run_is_reported_not_silently_dropped, False),
                      (test_warnings_are_carried_into_the_conversation, False),
                      (test_list_runs_and_load_run_pass_through, True),
+                     (test_events_from_many_threads_are_funneled_through_a_single_emit_thread, True),
                      (test_list_workflows_exposes_args_schema, True)]:
         try:
             t(monkeypatch) if needs else t()
@@ -123,6 +167,6 @@ if __name__ == "__main__":
             import traceback; traceback.print_exc()
             print(f"FAIL {t.__name__}: {e}")
         finally:
-            _wf.list_library, _wf.list_runs, _wf.load_run = _saved
+            _wf.list_library, _wf.list_runs, _wf.load_run, _wf.run = _saved
     print("OK" if not failed else f"{failed} FAILED")
     _sys.exit(1 if failed else 0)

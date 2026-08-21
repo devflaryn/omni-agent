@@ -3630,6 +3630,96 @@ class AgentApi:
         self.session["messages"].append(
             {"role": "user", "content": head + body + stats + warn})
 
+    def _run_workflow_with_ui_drain(self, name, args, dry_run):
+        """Run workflows.run() on a background thread and drain its events HERE,
+        on the calling thread, one at a time.
+
+        parallel()/pipeline() spawn one thread PER BRANCH (WorkflowRuntime._spawn
+        in workflows/runtime.py), and each branch fires wf_agent_started /
+        wf_agent_done through on_event from that branch's own thread. self._emit
+        appends to and trims session["transcript"], mutates session["dock"]
+        across several statements, and calls self._window.evaluate_js — none of
+        it synchronized, and _emit swallows exceptions so a race there would be
+        silent. Funneling every event through one queue and draining it from a
+        single thread is the same pattern as _run_delegated_wave (agent.py) and
+        tools/workflow_tools.py's _drain_to_ui — never pass self._emit as
+        on_event to something that can fan out across threads."""
+        import queue as _queue
+        import workflows
+        q = _queue.Queue()
+        _SENTINEL = object()
+        holder = {}
+
+        def runner():
+            try:
+                holder["result"] = workflows.run(name=name, args=args, on_event=q.put,
+                                                  dry_run=bool(dry_run))
+            except Exception as e:  # noqa: BLE001
+                holder["error"] = e
+            finally:
+                q.put(_SENTINEL)
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        while True:
+            ev = q.get()
+            if ev is _SENTINEL:
+                break
+            self._emit(ev)
+        t.join()
+        if holder.get("error") is not None:
+            raise holder["error"]
+        return holder.get("result")
+
+    def _reset_turn_state_for_launch(self):
+        """The per-task loop/budget/guard resets send_message performs before a
+        typed turn (agent.py ~3455-3510), minus the text-specific bits (ultra
+        keyword arming, original_task, inline_only) that only make sense for
+        something the user typed. Without this a workflow-launched follow-up
+        turn would run the agent loop against whatever consecutive_tools /
+        needs_plan / narrated_this_task state the PREVIOUS turn left behind."""
+        s = self.session
+        s["last_tool_call"] = None
+        s["consecutive_tools"] = 0
+        s["summary_resets"] = 0
+        s["reads_since_nav"] = 0
+        s["graph_nudges_sent"] = 0
+        s["domain_tools_since_skill"] = 0
+        s["skill_nudges_sent"] = 0
+        s["skill_loaded"] = False
+        s["review_rounds"] = 0
+        s["strategy_review_rounds"] = 0
+        s["findings_since_brief_sync"] = 0
+        s["unverified_change"] = None
+        s["failed_sigs"] = {}
+        s["failed_sig_warned"] = set()
+        s["_validation_nudged_for"] = None
+        s["build_observed"] = False
+        s["assumption_nudges_sent"] = 0
+        s["solo_read_streak"] = 0
+        s["solo_read_nudges_sent"] = 0
+        s["_delegation_phase_nudged"] = set()
+        s["narrated_this_task"] = False
+        s["tools_since_explanation"] = 0
+        s["tools_since_narration"] = 0
+
+        active_plan = planning.get_active_plan()
+        if active_plan is None or active_plan.is_complete():
+            s["needs_plan"] = True
+            s["mutating_gate_nudged"] = False
+            s["dispatched_steps"] = set()
+            s["steps_since_reground"] = 0
+            # There is no typed text to run the triviality check against, and a
+            # workflow result is a finding to act on, not a fresh task to
+            # brainstorm — so this path never arms an auto-brainstorm.
+            s["needs_brainstorm"] = False
+            s["needs_architect"] = False
+        else:
+            s["needs_brainstorm"] = False
+            s["needs_architect"] = False
+        s["tools_since_plan_touch"] = 0
+        s["_plan_touch_nudge_sent"] = False
+
     def launch_workflow(self, name, args=None, dry_run=False):
         """Run a workflow from the UI, then hand its result to the model."""
         import threading
@@ -3650,10 +3740,11 @@ class AgentApi:
 
         def work():
             try:
-                res = workflows.run(name=name, args=args, on_event=self._emit,
-                                    dry_run=bool(dry_run))
+                res = self._run_workflow_with_ui_drain(name, args, dry_run)
                 if not dry_run:
                     self._workflow_result_into_conversation(res)
+                    self._reset_turn_state_for_launch()
+                    self._persist_session()
                     self._run_agent_loop()
                     return
                 self._emit({"type": "system",
