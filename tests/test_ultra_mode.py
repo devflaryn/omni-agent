@@ -1,6 +1,6 @@
 """Ultra mode: the per-session flag, its prompt segment, and the keyword that
 flips it on. Guards against a casual question fanning out fifteen agents."""
-import sys as _sys, os as _os
+import sys as _sys, os as _os, threading as _threading
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
 import agent as agent_mod
@@ -18,6 +18,21 @@ def _api(**over):
                "base_system_prompt": "", "ultra": False, "ultra_turn_only": False}
     session.update(over)
     api.session = session
+    return api
+
+
+def _full_api(**over):
+    """Like _api(), but also wired for send_message()/_run_agent_loop(): the
+    __new__-built api above skips AgentApi.__init__, so the lock/busy/stop/
+    window/thread bookkeeping those two methods touch has to be added by hand.
+    original_task defaults to None since send_message reads it unconditionally."""
+    over.setdefault("original_task", None)
+    api = _api(**over)
+    api._lock = _threading.Lock()
+    api._busy = False
+    api._stop = False
+    api._window = None
+    api._thread = None
     return api
 
 
@@ -78,35 +93,79 @@ def test_aborting_workflows_never_raises(monkeypatch):
 
 
 # --- the keyword arms ONE turn, the toggle is sticky (I5) -------------------
-def test_the_keyword_arms_only_the_turn_that_asked_for_it():
+def test_the_keyword_arms_only_the_turn_that_asked_for_it(monkeypatch):
     """It used to latch on forever with nothing to clear it, so one message
     mentioning "ultra" left every later turn free to fan out. The spec scopes
-    the keyword to THAT turn."""
-    api = _api()
-    api._refreshed = 0
-    api._refresh_system_prompt = lambda: setattr(api, "_refreshed", api._refreshed + 1)
+    the keyword to THAT turn.
 
-    # send_message's keyword block, as it runs for real.
-    if agent_mod._ultra_keyword_requested("ultra: review this") and not api.session.get("ultra"):
-        api.session["ultra"] = True
-        api.session["ultra_turn_only"] = True
-        api._refresh_system_prompt()
-        api._emit({"type": "ultra_mode", "ultra": True})
+    This drives the REAL send_message() -> _run_agent_loop() path (not a
+    re-implementation of it): only the LLM call and the end-of-run tree
+    refresh are stubbed out; the keyword block (agent.py's send_message,
+    ~3123-3133) and the ultra_turn_only clearing in _run_agent_loop's
+    `finally` (~5295-5303) both run for real."""
+    api = _full_api()
+    monkeypatch.setattr(api, "_refresh_tree", lambda force=False: None)
 
+    captured = {}
+
+    def fake_get_model_response(s):
+        # Runs in place of the real LLM call, from inside the real loop body —
+        # this is the turn itself, so whatever `ultra` is here is what the
+        # turn actually ran with.
+        captured["ultra"] = s.get("ultra")
+        captured["ultra_turn_only"] = s.get("ultra_turn_only")
+        raise RuntimeError("test stub: no real LLM call")
+
+    monkeypatch.setattr(api, "_get_model_response", fake_get_model_response)
+
+    result = api.send_message("ultra: review this")
+    assert result["ok"] is True
+    api._thread.join(timeout=5)
+    assert not api._thread.is_alive(), "the agent-loop thread never finished"
+
+    # The turn that asked for it ran on the ON prompt...
+    assert captured["ultra"] is True, "the keyword never armed this turn"
+    assert captured["ultra_turn_only"] is True
+
+    # ...and once the turn completed (via _run_agent_loop's finally), the flag
+    # is cleared back off rather than latching on for every later turn.
+    assert api.session["ultra"] is False, "the keyword latched on permanently"
+    assert api.session["ultra_turn_only"] is False
+    assert {"type": "ultra_mode", "ultra": True} in api.emits
+    assert {"type": "ultra_mode", "ultra": False} in api.emits
+    # the ON emit must precede the OFF emit (armed, then cleared — not the
+    # reverse, and not just present twice).
+    on_i = api.emits.index({"type": "ultra_mode", "ultra": True})
+    off_i = api.emits.index({"type": "ultra_mode", "ultra": False})
+    assert on_i < off_i
+
+
+def test_a_sticky_toggle_survives_the_turn_that_used_it(monkeypatch):
+    """The distinction the whole design rests on: set_ultra() (the header
+    toggle) is STICKY. Unlike the keyword, a completed turn must NOT clear it,
+    because set_ultra() never set ultra_turn_only in the first place."""
+    api = _full_api()
+    monkeypatch.setattr(api, "_refresh_tree", lambda force=False: None)
+    api.set_ultra(True)
+    assert api.session["ultra_turn_only"] is False
+
+    captured = {}
+
+    def fake_get_model_response(s):
+        captured["ultra"] = s.get("ultra")
+        raise RuntimeError("test stub: no real LLM call")
+
+    monkeypatch.setattr(api, "_get_model_response", fake_get_model_response)
+
+    result = api.send_message("do the thing")
+    assert result["ok"] is True
+    api._thread.join(timeout=5)
+    assert not api._thread.is_alive(), "the agent-loop thread never finished"
+
+    assert captured["ultra"] is True
+    # Sticky: still on after the turn that used it completes.
     assert api.session["ultra"] is True
-    # …and the very turn that asked for it must run on the ON prompt.
-    assert api._refreshed == 1, "the prompt was not rebuilt for this turn"
-
-    # _run_agent_loop's finally.
-    s = api.session
-    if s.get("ultra_turn_only"):
-        s["ultra_turn_only"] = False
-        s["ultra"] = False
-        api._refresh_system_prompt()
-        api._emit({"type": "ultra_mode", "ultra": False})
-
-    assert api.get_ultra()["ultra"] is False, "the keyword latched on permanently"
-    assert api.emits[-1] == {"type": "ultra_mode", "ultra": False}
+    assert api.session["ultra_turn_only"] is False
 
 
 def test_the_toggle_is_sticky_and_clears_the_turn_scope():
@@ -192,7 +251,8 @@ if __name__ == "__main__":
                         (test_keyword_in_a_user_message_turns_it_on, False),
                         (test_stopping_aborts_every_active_workflow, True),
                         (test_aborting_workflows_never_raises, True),
-                        (test_the_keyword_arms_only_the_turn_that_asked_for_it, False),
+                        (test_the_keyword_arms_only_the_turn_that_asked_for_it, True),
+                        (test_a_sticky_toggle_survives_the_turn_that_used_it, True),
                         (test_the_toggle_is_sticky_and_clears_the_turn_scope, False),
                         (test_the_toggle_can_turn_it_back_off, False),
                         (test_the_toggle_emits_so_the_header_chip_can_reflect_it, False),
