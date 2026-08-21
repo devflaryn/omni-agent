@@ -13,7 +13,8 @@ const FRONTEND = path.join(here, '..', '..', 'frontend');
 function load() {
   const root = new El('div');
   const byId = new Map();
-  for (const id of ['workflowTree', 'workflowEmpty', 'workflowCard', 'workflowTabBadge']) {
+  for (const id of ['workflowTree', 'workflowEmpty', 'workflowCard', 'workflowTabBadge',
+                    'workflowAgentDetail']) {
     const el = new El('div');
     el.id = id;
     byId.set(id, el);
@@ -175,6 +176,79 @@ function started(ctx) {
   assert.equal(st.counts.running, 1);
   assert.equal(st.phases.Review.agents[KEY + ':1'].status, 'running', 'the sibling row is untouched');
   console.log('PASS keeps colliding prompts as separate rows');
+}
+
+{
+  // The runtime already emits `group` for a nested workflow; the tree rendered
+  // it flat, silently lying about structure.
+  const { ctx } = load();
+  ctx.workflowStarted({ run_id: 'r1', name: 'parent', description: '', phases: [] });
+  ctx.workflowAgentStarted({ run_id: 'r1', sub_id: 'a', phase: 'Work', label: 'outer' });
+  ctx.workflowAgentStarted({ run_id: 'r1', sub_id: 'b', phase: 'Work', label: 'inner',
+                             group: 'understand-subsystem' });
+  const st = ctx.workflowState();
+  const phase = st.runs.r1.phases.Work;
+  assert.equal(phase.agents.a.group, undefined, 'a top-level agent has no group');
+  assert.equal(phase.agents.b.group, 'understand-subsystem');
+  assert.ok(st.runs.r1.groups.has
+    ? st.runs.r1.groups.has('understand-subsystem')
+    : Object.keys(st.runs.r1.groups).includes('understand-subsystem'),
+    'the run tracks its nested groups');
+  console.log('PASS nested agents carry their group');
+}
+
+{
+  const { ctx } = load();
+  ctx.workflowStarted({ run_id: 'r1', name: 'p', description: '', phases: [] });
+  ctx.workflowAgentStarted({ run_id: 'r1', sub_id: 'a', phase: 'Work', label: 'x' });
+  ctx.workflowAgentDone({ run_id: 'r1', sub_id: 'a', ok: true, cached: false,
+                          tokens: 42, elapsed_s: 1.5, result: 'the answer' });
+  ctx.workflowSelectAgent('r1', 'a');
+  const sel = ctx.workflowState().selectedAgent;
+  assert.equal(sel.sub_id, 'a');
+  assert.equal(sel.tokens, 42);
+  console.log('PASS an agent row can be selected');
+}
+
+{
+  // A historical run comes from load_run, not from events, but must draw
+  // through the SAME renderer.
+  const { ctx, byId } = load();
+  ctx.workflowRenderRecord({
+    ok: true, run_id: 'old1',
+    meta: { name: 'review-changes', description: 'd' },
+    summary: { agent_count: 2, elapsed_s: 3.5, ok: true },
+    rows: [
+      { phase: 'Review', label: 'review:bugs', agent_type: 'researcher',
+        tokens: 10, elapsed_s: 1.0, model: 'm', ok: true, cached: false,
+        result: 'found one' },
+      { phase: 'Verify', label: 'verify:a.py', agent_type: 'researcher',
+        tokens: 5, elapsed_s: 0.5, model: 'm', ok: true, cached: true,
+        result: 'confirmed' },
+    ],
+    result: { confirmed: ['one'] },
+  });
+  const html = byId.get('workflowTree')._html || '';
+  assert.ok(/review:bugs/.test(html), 'historical rows render in the tree');
+  assert.ok(/Verify/.test(html), 'historical phases render');
+  console.log('PASS a historical run renders through the same tree');
+}
+
+{
+  // Stored results are MODEL-AUTHORED text — the most attacker-adjacent string
+  // in this feature.
+  const { ctx, byId } = load();
+  ctx.workflowRenderRecord({
+    ok: true, run_id: 'x1', meta: { name: 'n', description: '' },
+    summary: {}, result: null,
+    rows: [{ phase: 'P', label: 'l', agent_type: 'researcher', tokens: 0,
+             elapsed_s: 0, model: '', ok: true, cached: false,
+             result: '<img src=x onerror=alert(1)>' }],
+  });
+  ctx.workflowSelectAgent('x1', 0);
+  const detail = byId.get('workflowAgentDetail')._html || '';
+  assert.ok(!detail.includes('<img'), 'a stored result is escaped before innerHTML');
+  console.log('PASS stored results are escaped');
 }
 
 console.log('OK');

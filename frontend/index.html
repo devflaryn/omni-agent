@@ -1037,6 +1037,39 @@
     .wf-logs { margin-top: var(--space-3); border-top: 1px solid rgb(var(--term-line)); padding-top: var(--space-2); }
     .wf-log { font-size: var(--text-xs); color: rgb(var(--term-muted)); padding: 2px 0; }
 
+    /* Nested-workflow grouping (ev.group, runtime.py:107): an indented bucket
+       inside its phase rather than a flat run of rows that silently hides
+       structure. */
+    .wf-group {
+      margin-left: var(--space-3); padding-left: var(--space-2);
+      border-left: 1px solid rgb(var(--term-line));
+    }
+    .wf-group-title {
+      font-size: var(--text-2xs); color: rgb(var(--term-muted));
+      margin: var(--space-1) 0;
+    }
+
+    /* Agent rows are click targets — they open #workflowAgentDetail. */
+    .wf-agent { cursor: pointer; border-radius: var(--radius-sm); }
+    .wf-agent:hover { background: rgb(var(--term-line) / .45); }
+
+    /* Click-through detail panel for one agent row (live or historical). Its
+       body is MODEL-AUTHORED text, always written through esc() in JS. */
+    .wf-detail {
+      margin-top: var(--space-3); padding-top: var(--space-2);
+      border-top: 1px solid rgb(var(--term-line));
+    }
+    .wf-detail:empty { display: none; }
+    .wf-detail-head { font-size: var(--text-sm); font-weight: 500; color: rgb(var(--term-text)); }
+    .wf-detail-meta { font-size: var(--text-2xs); color: rgb(var(--term-muted)); margin: var(--space-1) 0; }
+    .wf-detail-body {
+      white-space: pre-wrap; word-break: break-word;
+      font-size: var(--text-xs); color: rgb(var(--term-text));
+      background: rgb(var(--term-panel)); border: 1px solid rgb(var(--term-line));
+      border-radius: var(--radius-md); padding: var(--space-2);
+      max-height: 320px; overflow-y: auto;
+    }
+
     /* Device chip + picker (2026-08 SSH devices). Red, not cyan: this is a
        warning about which machine commands are about to run on, not a
        positive toggle like ultra mode — the ultra-chip color is deliberately
@@ -1332,6 +1365,7 @@
       <div id="workflowTab" class="scroll-y hidden flex-1 px-3 py-2" role="tabpanel">
         <div id="workflowEmpty" class="text-term-muted t-xs">No workflow has run yet.</div>
         <div id="workflowTree"></div>
+        <div id="workflowAgentDetail" class="wf-detail"></div>
       </div>
     </main>
   </div>
