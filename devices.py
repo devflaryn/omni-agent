@@ -257,3 +257,50 @@ def reap_argv(device, tag, ssh_path=None):
         f'rm -f {f}; exit 0'
     )
     return [ssh, *ssh_opts(ssh), device.target, _one_remote_arg(script)]
+
+
+# What the probe checks for on the remote host. host_exec.REQUIRED_TOOLS plus
+# curl, which remote download_file needs.
+PROBE_TOOLS = ("java", "apktool", "jadx", "r2", "apksigner", "zipalign",
+               "python3", "git", "curl")
+
+
+def probe(device):
+    """Connect once and learn everything selecting this device needs to know:
+    that the remote root exists, what the machine is, and which tools are absent.
+
+    One round trip on purpose — each extra connection is a handshake unless
+    multiplexing is up, and at probe time it is not yet."""
+    from host_exec import run_on   # imported here: host_exec imports THIS module
+
+    checks = "; ".join(
+        f'command -v {t} >/dev/null 2>&1 && echo OMNI_HAVE={t} || echo OMNI_MISS={t}'
+        for t in PROBE_TOOLS)
+    script = (
+        f"mkdir -p {shlex.quote(device.remote_root)} && "
+        f"cd {shlex.quote(device.remote_root)} && "
+        'echo "OMNI_ROOT=$(pwd)"; '
+        'echo "OMNI_UNAME=$(uname -a 2>/dev/null || echo unknown)"; '
+        + checks
+    )
+    # run_on takes the device EXPLICITLY. Do not swap the global active device
+    # around this call: the picker runs on the pywebview thread while the agent
+    # loop runs on its own, so a concurrent tool call would be routed to the
+    # device being tested instead of the one selected — the wrong-machine failure
+    # the whole design exists to prevent.
+    res = run_on(device, script, timeout=30)
+
+    if res.get("error") or res.get("returncode"):
+        return {"ok": False, "root": "", "uname": "", "missing": [],
+                "error": res.get("error") or res.get("stderr") or "probe failed"}
+
+    root, uname, missing = "", "", []
+    for line in (res.get("stdout") or "").splitlines():
+        line = line.strip()
+        if line.startswith("OMNI_ROOT="):
+            root = line[len("OMNI_ROOT="):]
+        elif line.startswith("OMNI_UNAME="):
+            uname = line[len("OMNI_UNAME="):]
+        elif line.startswith("OMNI_MISS="):
+            missing.append(line[len("OMNI_MISS="):])
+    return {"ok": True, "root": root, "uname": uname, "missing": missing, "error": ""}

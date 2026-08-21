@@ -213,6 +213,39 @@ def test_reap_kills_the_group_then_falls_back_to_the_pid():
     assert '-"$P"' in inner and '"$P"' in inner
 
 
+def test_probe_parses_root_uname_and_missing_tools(monkeypatch):
+    out = "\n".join([
+        "OMNI_ROOT=/home/berat/proj",
+        "OMNI_UNAME=Linux buildbox 6.1.0 x86_64",
+        "OMNI_HAVE=java",
+        "OMNI_MISS=apktool",
+        "OMNI_HAVE=git",
+        "OMNI_MISS=curl",
+    ])
+    import host_exec
+    monkeypatch.setattr(host_exec, "run_on",
+                        lambda dev, cmd, timeout=None: {"stdout": out, "stderr": "", "returncode": 0})
+    res = devices.probe(devices.Device("i", "n", "h", "/home/berat/proj"))
+    assert res["ok"] is True
+    assert res["root"] == "/home/berat/proj"
+    assert "Linux buildbox" in res["uname"]
+    assert set(res["missing"]) == {"apktool", "curl"}
+
+
+def test_probe_reports_failure_without_raising(monkeypatch):
+    import host_exec
+    monkeypatch.setattr(host_exec, "run_on",
+                        lambda dev, cmd, timeout=None: {"stdout": "", "stderr": "boom",
+                                                        "returncode": 255,
+                                                        "error": "could not reach device"})
+    res = devices.probe(devices.Device("i", "n", "h", "/r"))
+    assert res["ok"] is False and "could not reach" in res["error"]
+
+
+def test_probe_checks_curl_for_remote_downloads():
+    assert "curl" in devices.PROBE_TOOLS
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -241,7 +274,10 @@ if __name__ == "__main__":
              (test_wrapper_runs_env_prelude_when_set, False),
              (test_wrapper_aborts_when_cd_fails, False),
              (test_reap_argv_targets_the_recorded_pgid, False),
-             (test_reap_kills_the_group_then_falls_back_to_the_pid, False)]
+             (test_reap_kills_the_group_then_falls_back_to_the_pid, False),
+             (test_probe_parses_root_uname_and_missing_tools, True),
+             (test_probe_reports_failure_without_raising, True),
+             (test_probe_checks_curl_for_remote_downloads, False)]
     failed = 0
     for t, needs_mp in tests:
         try:
