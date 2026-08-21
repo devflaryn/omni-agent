@@ -546,7 +546,7 @@
     .cdock-done-title .cdock-done-count { opacity: .7; font-weight: 400; }
     /* A completed subagent keeps only its label line — the timeline track is removed
        (its Gantt bar only ever spanned its slice of the shared axis, reading as
-       unfinished). The ✓/✗ stat carries the outcome instead. */
+       unfinished). The check/x-circle stat carries the outcome instead. */
     .cbar-done { opacity: .8; }
     .cbar-ok .cbar-stat { color: rgb(var(--term-green)); }
     .cbar-failed .cbar-stat { color: rgb(var(--term-red)); }
@@ -591,8 +591,8 @@
     .btn-lg { height: var(--control-h-lg); padding: 0 var(--space-5); font-size: var(--text-base); }
     /* .btn sets display, and Tailwind's .hidden has the SAME specificity — this
        block comes after tailwind.css, so .btn would win and a button marked
-       hidden would still render. #viewerBack hit exactly this: "← archive"
-       showed on every plain text file. Same guard as .composer-btn.hidden and
+       hidden would still render. #viewerBack hit exactly this: the arrow-left
+       icon + "archive" showed on every plain text file. Same guard as .composer-btn.hidden and
        .modal-backdrop.hidden already carry. */
     .btn.hidden, .icon-btn.hidden { display: none; }
 
@@ -1349,7 +1349,7 @@
               </button>
               <span id="hint" class="min-w-0 truncate t-xs text-term-muted">ready</span>
               <div class="ml-auto flex min-w-0 shrink-0 items-center gap-1.5">
-                <span id="fallbackBadge" class="hidden shrink-0 cursor-default rounded-full border border-term-orange/40 bg-term-orange/10 px-1.5 py-0.5 t-2xs text-term-orange" title="">⤵ fallback</span>
+                <span id="fallbackBadge" class="hidden shrink-0 cursor-default rounded-full border border-term-orange/40 bg-term-orange/10 px-1.5 py-0.5 t-2xs text-term-orange" title=""><svg class="ico" aria-hidden="true"><use href="#i-corner-down-right"></use></svg> fallback</span>
                 <div class="composer-model" title="Model requests start at — on failure the engine falls back to the next model BELOW and returns here as soon as it recovers">
                   <select id="modelSelect"></select>
                   <button id="modelSelectBtn" type="button" aria-haspopup="listbox" aria-expanded="false" class="composer-model-btn">
@@ -1410,7 +1410,7 @@
             <select id="graphSelect" title="Which built graph to view — build each app version separately to compare"
               class="field field-sm min-w-0 flex-1"></select>
             <button id="graphDeleteBtn" title="Delete the selected graph instance (does not touch your files)"
-              class="icon-btn icon-btn-bordered">✕</button>
+              class="icon-btn icon-btn-bordered"><svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg></button>
           </div>
           <div class="flex items-center gap-2 px-3 py-2 border-b border-term-line">
             <input id="graphSearch" type="text" placeholder="Search nodes…" autocomplete="off"
@@ -1471,9 +1471,9 @@
                would override font-mono, and a file path must stay monospaced. -->
           <div id="viewerPath" class="selectable t-base truncate font-mono text-term-text">—</div>
         </div>
-        <button id="viewerBack" class="btn btn-sm btn-ghost hidden shrink-0">← archive</button>
+        <button id="viewerBack" class="btn btn-sm btn-ghost hidden shrink-0"><svg class="ico" aria-hidden="true"><use href="#i-arrow-left"></use></svg> archive</button>
         <span id="viewerSize" class="t-xs shrink-0 text-term-muted"></span>
-        <button id="viewerClose" title="Close" class="icon-btn">✕</button>
+        <button id="viewerClose" title="Close" class="icon-btn"><svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg></button>
       </div>
       <div class="modal-body scroll-both bg-term-bg">
         <pre id="viewerContent" class="selectable font-mono t-sm leading-5 text-term-text"></pre>
@@ -1486,7 +1486,7 @@
              escape hatch rather than silently dumping mojibake into the <pre>. -->
         <div id="viewerUnsupported" class="hidden h-full items-center justify-center p-6">
           <div class="max-w-sm text-center">
-            <div class="mb-3 t-xl leading-none" aria-hidden="true">🚫</div>
+            <div class="mb-3 t-xl leading-none" aria-hidden="true"><svg class="ico-lg" aria-hidden="true"><use href="#i-ban"></use></svg></div>
             <div id="viewerUnsupportedTitle" class="mb-1.5 t-base font-semibold text-term-text">
               Preview not supported
             </div>
@@ -1513,7 +1513,7 @@
           <div class="eyebrow">model providers</div>
           <div id="llmModalTitle" class="modal-title">LLM Providers</div>
         </div>
-        <button id="llmModalClose" title="Close" class="icon-btn">✕</button>
+        <button id="llmModalClose" title="Close" class="icon-btn"><svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg></button>
       </div>
 
       <div class="flex min-h-0 flex-1">
@@ -1523,7 +1523,7 @@
           <div class="border-b border-term-line px-4 py-3">
             <div class="eyebrow mb-1">fallback order</div>
             <p class="leading-4 text-term-muted t-2xs" >
-              Tried top to bottom. Drag ⠿ to reorder — the top one is primary.
+              Tried top to bottom. Drag <svg class="ico" aria-hidden="true"><use href="#i-grip-vertical"></use></svg> to reorder — the top one is primary.
             </p>
           </div>
           <div id="llmList" class="scroll-y flex flex-1 flex-col gap-1 p-2"></div>
@@ -1594,7 +1594,7 @@
                     </div>
                     <div id="llmModelsList" class="flex flex-col gap-1.5"></div>
                     <p class="text-term-muted t-2xs" >
-                      Top = primary. Drag ⠿ to reorder · ⚙ for reasoning, cost tier &amp; test.
+                      Top = primary. Drag <svg class="ico" aria-hidden="true"><use href="#i-grip-vertical"></use></svg> to reorder · <svg class="ico" aria-hidden="true"><use href="#i-settings"></use></svg> for reasoning, cost tier &amp; test.
                     </p>
                   </div>
                 </div>
@@ -1662,7 +1662,7 @@
           <div class="eyebrow">execution target</div>
           <div id="devicePickerTitle" class="modal-title">Devices</div>
         </div>
-        <button id="devicePickerClose" title="Close" class="icon-btn">✕</button>
+        <button id="devicePickerClose" title="Close" class="icon-btn"><svg class="ico" aria-hidden="true"><use href="#i-x"></use></svg></button>
       </div>
 
       <div class="modal-body">

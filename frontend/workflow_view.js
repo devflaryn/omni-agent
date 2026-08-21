@@ -208,7 +208,7 @@
       parts.push(`<div class="wf-phase"><div class="wf-phase-title">${esc(phase.title)}</div>`);
       for (const bucket of bucketPhaseAgents(phase)) {
         if (bucket.group) {
-          parts.push(`<div class="wf-group"><div class="wf-group-title">▸ ${esc(bucket.group)}</div>`);
+          parts.push(`<div class="wf-group"><div class="wf-group-title">${icon('chevron-right')} ${esc(bucket.group)}</div>`);
           for (const a of bucket.agents) parts.push(renderAgentRow(run.id, a));
           parts.push('</div>');
         } else {

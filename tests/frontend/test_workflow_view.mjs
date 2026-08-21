@@ -55,6 +55,10 @@ function load() {
   const ctx = { document, window: {}, console, setTimeout, clearTimeout };
   ctx.window = ctx;
   vm.createContext(ctx);
+  // workflow_view.js renders group headers via icon(); load the real icons.js
+  // first (same as test_boot.mjs) so that global exists. injectSprite() no-ops
+  // here since this sandbox has no `fetch`.
+  vm.runInContext(fs.readFileSync(path.join(FRONTEND, 'icons.js'), 'utf8'), ctx);
   vm.runInContext(fs.readFileSync(path.join(FRONTEND, 'workflow_view.js'), 'utf8'), ctx);
   return { ctx, byId };
 }
