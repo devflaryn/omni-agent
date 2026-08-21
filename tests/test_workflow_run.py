@@ -159,6 +159,55 @@ def test_validate_reports_meta_without_running(monkeypatch):
     assert out["ok"] is True and out["meta"]["name"] == "demo"
 
 
+CHILD_CALLER = '''
+meta = {"name": "parent", "description": "calls a child"}
+inner = workflow("understand-subsystem", {"paths": ["src/a"]})
+return {"inner": inner}
+'''
+
+
+def test_a_workflow_can_call_a_library_workflow(monkeypatch):
+    _install(monkeypatch)
+    res = workflows.run(src=CHILD_CALLER, run_root=_root())
+    assert res["ok"] is True, res["error"]
+    assert res["result"]["inner"] is not None
+
+
+def test_child_agents_count_toward_the_parent(monkeypatch):
+    _install(monkeypatch)
+    res = workflows.run(src=CHILD_CALLER, run_root=_root())
+    # one child read + one child synthesize, at minimum
+    assert res["agent_count"] >= 2
+
+
+def test_nesting_two_levels_deep_is_refused(monkeypatch):
+    """A child runtime must refuse to nest further. Asserted against the depth
+    guard directly — driving it through two library workflows would depend on a
+    library entry that itself nests, and would pass for the wrong reason if the
+    inner name simply failed to resolve."""
+    _install(monkeypatch)
+    import tempfile
+    from workflows import journal as _J
+    d = tempfile.mkdtemp(prefix="wfnest-")
+    j = _J.Journal(_os.path.join(d, "journal.jsonl"))
+    child = R.WorkflowRuntime(j, run_dir=d)
+    child.depth = 1
+    child._source_loader = lambda name: 'meta = {"name":"x","description":"d"}\nreturn 1\n'
+    try:
+        child.workflow("anything")
+        raise AssertionError("expected a nesting-depth error")
+    except Exception as e:
+        assert "one level" in str(e).lower() or "nested" in str(e).lower()
+
+
+def test_child_events_carry_a_group_label(monkeypatch):
+    _install(monkeypatch)
+    events = []
+    workflows.run(src=CHILD_CALLER, run_root=_root(), on_event=events.append)
+    grouped = [e for e in events if e.get("group")]
+    assert grouped and all(g["group"] == "understand-subsystem" for g in grouped)
+
+
 if __name__ == "__main__":
     import types
     monkeypatch = types.SimpleNamespace(setattr=lambda o, n, v: setattr(o, n, v))
@@ -171,7 +220,11 @@ if __name__ == "__main__":
              test_events_carry_start_and_done_with_the_run_id,
              test_resume_replays_and_makes_no_new_calls,
              test_resume_warns_when_the_prior_run_had_write_agents,
-             test_args_reach_the_script, test_validate_reports_meta_without_running]
+             test_args_reach_the_script, test_validate_reports_meta_without_running,
+             test_a_workflow_can_call_a_library_workflow,
+             test_child_agents_count_toward_the_parent,
+             test_nesting_two_levels_deep_is_refused,
+             test_child_events_carry_a_group_label]
     failed = 0
     _orig_run, _orig_get = R.run_subagent, R.get_agent
     for t in tests:

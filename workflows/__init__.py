@@ -28,6 +28,11 @@ def list_library():
     return list_workflows()
 
 
+def _loader(name_or_path):
+    from .library import load_source
+    return load_source(name_or_path)
+
+
 def _resolve_source(src, name):
     if src:
         return src
@@ -45,6 +50,7 @@ def _dry_run(code, meta, args, concurrency):
     tmp = os.path.join(tempfile.mkdtemp(prefix="wfdry-"), "journal.jsonl")
     j = _journal.Journal(tmp)
     rt = WorkflowRuntime(j, run_dir=None, dry_run=True, concurrency=concurrency)
+    rt._source_loader = _loader
     ns = _sandbox.make_namespace(rt.primitives(), args)
     try:
         exec(code, ns)
@@ -120,6 +126,7 @@ def run(src=None, name=None, args=None, run_root=".", on_event=None,
     from .runtime import WorkflowRuntime       # function-level: breaks the cycle
     rt = WorkflowRuntime(j, on_event=on_event, run_dir=run_dir,
                          concurrency=concurrency, run_id=run_id)
+    rt._source_loader = _loader
     _ACTIVE[run_id] = rt
 
     if on_event:

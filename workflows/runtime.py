@@ -66,6 +66,9 @@ class WorkflowRuntime:
         self._main_thread = threading.get_ident()
         self._count_lock = threading.Lock()
         self.agent_count = 0
+        self.depth = 0          # bumped for a child runtime
+        self._source_loader = None   # set by workflows.run
+        self._key_prefix = ""   # set on a child so its journal keys can't collide with the parent's
 
     # --- lifecycle --------------------------------------------------------
     @property
@@ -150,6 +153,10 @@ class WorkflowRuntime:
         if context:
             opts["context"] = context
         key = _journal.call_key(agent_type, prompt, opts)
+        if self._key_prefix:
+            # Namespace a child's journal keys so an identical prompt in parent
+            # and child cannot collide on replay.
+            key = _journal.call_key(self._key_prefix, key, {})
 
         hit, cached = self.journal.lookup(key)
         if hit:
@@ -265,8 +272,53 @@ class WorkflowRuntime:
 
         return self._spawn([chain(item, i) for i, item in enumerate(items)])
 
+    def workflow(self, name_or_path, args=None):
+        """Run another workflow inline, sharing this run's semaphore, abort flag,
+        journal and run directory.
+
+        ONE level only. Unbounded nesting would let a single script open an
+        arbitrary number of concurrent runs, and a depth counter to tune is worse
+        than a flat rule."""
+        self._check_abort()
+        if self.depth >= 1:
+            raise WorkflowScriptError(
+                "workflow() cannot be called from inside a nested workflow — "
+                "nesting is one level deep. Inline the work with agent()/"
+                "pipeline() instead."
+            )
+        if self._source_loader is None:
+            raise WorkflowScriptError("nested workflows are unavailable in this context.")
+
+        from . import sandbox as _sb
+        src = self._source_loader(name_or_path)
+        meta = _sb.extract_meta(src)
+        code = _sb.compile_workflow(src, filename=f"<workflow:{meta['name']}>")
+
+        child = WorkflowRuntime(
+            self.journal, on_event=self.on_event, run_dir=self.run_dir,
+            dry_run=self.dry_run, run_id=self.run_id,
+            emit_prefix=meta.get("name", ""))
+        # Share the parent's real concurrency budget and abort signal rather than
+        # opening a second one — a child must not double the fleet.
+        child._sem = self._sem
+        child._abort = self._abort
+        child._count_lock = self._count_lock
+        child.depth = self.depth + 1
+        child._source_loader = self._source_loader
+        # Namespace the child's journal keys so an identical prompt in parent and
+        # child cannot collide on replay.
+        child._key_prefix = meta.get("name", "")
+
+        ns = _sb.make_namespace(child.primitives(), args)
+        exec(code, ns)
+        try:
+            return ns["__workflow__"]()
+        finally:
+            with self._count_lock:
+                self.agent_count += child.agent_count
+
     def primitives(self):
-        """The names injected into a script's namespace. workflow() is added in
-        Task 14."""
+        """The names injected into a script's namespace."""
         return {"agent": self.agent, "phase": self.phase, "log": self.log,
-                "parallel": self.parallel, "pipeline": self.pipeline}
+                "parallel": self.parallel, "pipeline": self.pipeline,
+                "workflow": self.workflow}
