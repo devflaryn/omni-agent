@@ -104,6 +104,19 @@ PROVIDERS = {
         "key_hint": "AIza...",
         "notes": "Gemini via its OpenAI-compatible endpoint. Use a Google AI Studio API key.",
     },
+    "deepseek": {
+        "label": "DeepSeek",
+        "protocol": "openai",
+        "base_url": "https://api.deepseek.com/v1",
+        "default_model": "deepseek-chat",
+        "requires_key": True,
+        "key_hint": "sk-...",
+        "notes": ("DeepSeek's official OpenAI-compatible endpoint. `deepseek-chat` is the cheap, fast, "
+                  "non-reasoning model — the recommended SOURCING model for native source reconstruction "
+                  "(high-volume, faithful rewriting of decompiler output). `deepseek-reasoner` is the "
+                  "slower reasoning model. Tag deepseek-chat's tier as 'cheap' (⚙ on the model) so "
+                  "reconstruction subagents route to it."),
+    },
     "nvidia": {
         "label": "NVIDIA NIM",
         "protocol": "openai",

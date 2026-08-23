@@ -37,6 +37,7 @@ _GROUP_BY_MODULE = {
     "session_bootstrap": "apk",
     "dex_editing": "smali",
     "binary_analysis": "native",
+    "native_triage": "native",
     "binary_editing": "native",
     "hex_patching": "native",
     "native_codegen": "native",

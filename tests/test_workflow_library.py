@@ -8,7 +8,8 @@ from workflows import library
 from workflows import runtime as R
 
 EXPECTED = {"review-changes", "understand-subsystem", "deep-research",
-            "exhaustive-audit", "migrate", "design-panel"}
+            "exhaustive-audit", "migrate", "design-panel",
+            "reconstruct-native-source"}
 
 # Args each library workflow needs to dry-run meaningfully.
 ARGS = {
@@ -18,6 +19,7 @@ ARGS = {
     "exhaustive-audit": {"target": "src/"},
     "migrate": {"description": "rename foo to bar", "sites": ["src/a.py"]},
     "design-panel": {"problem": "how should we cache"},
+    "reconstruct-native-source": {"so": "lib/arm64-v8a/libfoo.so"},
 }
 
 
@@ -30,7 +32,8 @@ class FakeAgentDef:
 
 def _install(monkeypatch):
     monkeypatch.setattr(R, "get_agent", lambda n: FakeAgentDef(
-        n, is_write=n in ("implementer", "engineer")))
+        n, is_write=n in ("implementer", "engineer",
+                          "native-triage", "source-reconstructor")))
     monkeypatch.setattr(R, "run_subagent",
                lambda *a, **k: (_ for _ in ()).throw(
                    AssertionError("dry-run must not reach the engine")))

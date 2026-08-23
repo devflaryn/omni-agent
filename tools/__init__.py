@@ -4,6 +4,7 @@ import tools.filesystem
 import tools.shell
 import tools.apk_tools
 import tools.binary_analysis
+import tools.native_triage
 import tools.hex_patching
 import tools.binary_editing
 import tools.hash_tools
