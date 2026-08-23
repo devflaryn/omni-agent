@@ -404,6 +404,8 @@ const TOOL_META = {
   readelf_info:            { name: 'Read ELF Info', cat: 'read' },
   nm_symbols:              { name: 'Read Symbol Table', cat: 'read' },
   rabin2_info:             { name: 'Read Binary Info', cat: 'read' },
+  identify_native_components: { name: 'Identify Native Components', cat: 'read' },
+  partition_native_functions: { name: 'Partition Native Functions', cat: 'read' },
   inspect_apk:             { name: 'Inspect APK', cat: 'read' },
   list_dex_classes:        { name: 'List DEX Classes', cat: 'read' },
   analyze_function_calls:  { name: 'Analyze Function Calls', cat: 'read' },
@@ -3145,6 +3147,11 @@ function llmReorder(srcId, dstId) {
 }
 
 function llmDeleteEntry(id) {
+  // Removal persists immediately and takes the entry's API keys with it, so ask
+  // first — the row's X is also small and sits next to the drag handle.
+  const doomed = _llmConfigs.find(c => c.id === id);
+  const who = (doomed && (doomed.name || doomed.label || doomed.provider)) || 'this provider';
+  if (!confirm('Remove provider "' + who + '"?\n\nIts API keys and model ladder are deleted from llm_config.json. This cannot be undone.')) return;
   _llmConfigs = _llmConfigs.filter(c => c.id !== id);
   // If the detail pane was editing the row just removed, fall back to the
   // placeholder rather than leaving a form bound to a deleted provider.
