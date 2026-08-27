@@ -113,6 +113,21 @@ def patch_webview_debug(decompiled_dir):
 
     # Bump the method's local count by 2 (we use two fresh registers).
     directive = m.group(1)           # "locals" or "registers"
+
+    # FIX 1: Guard against 4-bit register-operand overflow
+    # Instructions const/4, if-eqz, and non-range invoke-static encode register in 4 bits (v0..v15 only)
+    if regcount + 1 > 15:
+        return {"patched": False, "already": False, "smali_path": path,
+                "error": "target method has too many locals for a 4-bit-register patch"}
+
+    # FIX 2: Guard against .registers methods clobbering parameters
+    # .registers R means R total registers including parameters (params occupy top registers)
+    # .locals N means N locals only (params are separate)
+    # Bumping .registers would clobber the parameter registers
+    if directive == "registers":
+        return {"patched": False, "already": False, "smali_path": path,
+                "error": "target method uses .registers; only .locals is supported"}
+
     new_count = regcount + 2
     a, b = f"v{regcount}", f"v{regcount + 1}"
 

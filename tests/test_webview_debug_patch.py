@@ -107,3 +107,59 @@ def test_anchors_to_gated_method():
         assert ":omni_wvd_skip" not in ungated_block
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+def test_rejects_too_many_locals():
+    """Method with .locals 15 has regcount=15, so regcount+1=16 which is outside 4-bit range (v0..v15).
+    Patch must reject this to avoid generating invalid smali."""
+    SMALI_MANY_LOCALS = textwrap.dedent('''\
+    .class public Lcom/roblox/client/c;
+    .super Landroidx/fragment/app/Fragment;
+    .method public setupWebView(Landroid/webkit/WebView;)V
+        .locals 15
+        .param p1
+        invoke-static {}, Lni/b;->a()Z
+        move-result v0
+        if-eqz v0, :cond_1
+        invoke-static {p1}, Landroid/webkit/WebView;->setWebContentsDebuggingEnabled(Z)V
+        :cond_1
+        return-void
+    .end method
+    ''')
+    d, fp = _tree(SMALI_MANY_LOCALS)
+    try:
+        res = patch_webview_debug(d)
+        assert res["patched"] is False and res["already"] is False
+        assert "error" in res
+        assert "locals" in res["error"].lower() or "register" in res["error"].lower()
+        # File must be unchanged
+        assert MARKER not in open(fp, encoding="utf-8").read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+def test_rejects_registers_directive():
+    """Method with .registers instead of .locals would have parameters in top registers.
+    Bumping .registers would clobber those parameters. Patch must reject."""
+    SMALI_WITH_REGISTERS = textwrap.dedent('''\
+    .class public Lcom/roblox/client/c;
+    .super Landroidx/fragment/app/Fragment;
+    .method public setupWebView(Landroid/webkit/WebView;)V
+        .registers 6
+        .param p1
+        invoke-static {}, Lni/b;->a()Z
+        move-result v0
+        if-eqz v0, :cond_1
+        invoke-static {p1}, Landroid/webkit/WebView;->setWebContentsDebuggingEnabled(Z)V
+        :cond_1
+        return-void
+    .end method
+    ''')
+    d, fp = _tree(SMALI_WITH_REGISTERS)
+    try:
+        res = patch_webview_debug(d)
+        assert res["patched"] is False and res["already"] is False
+        assert "error" in res
+        assert ".registers" in res["error"]
+        # File must be unchanged
+        assert MARKER not in open(fp, encoding="utf-8").read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
