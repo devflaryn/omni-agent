@@ -8,7 +8,7 @@ with android.os.SystemProperties.get, so the page/Arkose cannot influence it and
 nothing is injected into the WebView's JS. Default (prop unset) = OFF.
 
 We insert our block at the top of the method that already references
-setWebContentsDebuggingEnabled, using a fresh local register so we never clobber
+setWebContentsDebuggingEnabled, using two fresh local registers so we never clobber
 the method's own registers. Idempotent via MARKER.
 """
 import glob
@@ -47,7 +47,46 @@ def _method_span(text, idx):
     m = reg_re.search(text, mstart)
     if not m:
         return None
-    return m.end(), m.start(1) if False else m.start(), int(m.group(2)), m
+    return m.end(), m.start(), int(m.group(2)), m
+
+
+def _find_call_offset(text, call, gate_sig="Lni/b;->a()Z"):
+    """Find the offset of 'call' to anchor the patch.
+
+    If exactly one occurrence exists, return it.
+    If multiple exist, return the one in a method containing gate_sig.
+    If zero or multiple methods contain gate_sig, return None and set error reason.
+    """
+    occurrences = []
+    start = 0
+    while True:
+        pos = text.find(call, start)
+        if pos == -1:
+            break
+        occurrences.append(pos)
+        start = pos + 1
+
+    if len(occurrences) == 0:
+        return None, "no call found"
+    if len(occurrences) == 1:
+        return occurrences[0], None
+
+    # Multiple occurrences: filter by gate_sig in method
+    valid_occurrences = []
+    for ci in occurrences:
+        mstart = text.rfind("\n.method", 0, ci)
+        mend = text.find("\n.end method", ci)
+        if mstart != -1 and mend != -1:
+            method_body = text[mstart:mend]
+            if gate_sig in method_body:
+                valid_occurrences.append(ci)
+
+    if len(valid_occurrences) == 1:
+        return valid_occurrences[0], None
+    elif len(valid_occurrences) == 0:
+        return None, f"found {len(occurrences)} calls but none in a method with {gate_sig}"
+    else:
+        return None, f"found {len(valid_occurrences)} methods with both {call} and {gate_sig} (ambiguous)"
 
 
 def patch_webview_debug(decompiled_dir):
@@ -61,7 +100,11 @@ def patch_webview_debug(decompiled_dir):
         return {"patched": False, "already": True, "smali_path": path}
 
     call = "setWebContentsDebuggingEnabled(Z)V"
-    ci = text.find(call)
+    ci, find_error = _find_call_offset(text, call)
+    if ci is None:
+        return {"patched": False, "already": False, "smali_path": path,
+                "error": find_error}
+
     span = _method_span(text, ci)
     if not span:
         return {"patched": False, "already": False, "smali_path": path,

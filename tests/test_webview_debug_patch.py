@@ -36,6 +36,17 @@ def test_inserts_prop_gated_call():
         assert "Landroid/os/SystemProperties;->get" in out
         # our own call to enable debugging exists in addition to Roblox's gated one
         assert out.count("setWebContentsDebuggingEnabled(Z)V") >= 2
+        # ORDER: the new call must be inside the guard (if-eqz before it, :omni_wvd_skip after it)
+        marker_idx = out.find(MARKER)
+        # Find the if-eqz that comes after the marker (it's in our injected block)
+        idx_if_eqz = out.find("if-eqz", marker_idx)
+        # Find the setWebContentsDebuggingEnabled that comes after this if-eqz (must be ours)
+        idx_our_call = out.find("invoke-static {v", idx_if_eqz)
+        idx_our_call = out.find("setWebContentsDebuggingEnabled", idx_our_call)
+        # Find the skip label that comes after the call
+        idx_skip = out.find(":omni_wvd_skip", idx_our_call)
+        assert idx_if_eqz < idx_our_call < idx_skip, \
+            f"Guard order broken: if-eqz@{idx_if_eqz}, our-call@{idx_our_call}, skip@{idx_skip}"
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -46,5 +57,53 @@ def test_idempotent():
         res2 = patch_webview_debug(d)
         assert res2["already"] is True and res2["patched"] is False
         assert open(fp, encoding="utf-8").read().count(MARKER) == 1
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+def test_anchors_to_gated_method():
+    """Two methods, both with setWebContentsDebuggingEnabled; only one has Lni/b->a() gate.
+    Patch must anchor to the one with the gate, not the other."""
+    SMALI_TWO_METHODS = textwrap.dedent('''\
+    .class public Lcom/roblox/client/c;
+    .super Landroidx/fragment/app/Fragment;
+    .method public setupWebViewUngated(Landroid/webkit/WebView;)V
+        .locals 2
+        .param p1
+        invoke-static {p1}, Landroid/webkit/WebView;->setWebContentsDebuggingEnabled(Z)V
+        return-void
+    .end method
+    .method public setupWebViewGated(Landroid/webkit/WebView;)V
+        .locals 4
+        .param p1
+        invoke-static {}, Lni/b;->a()Z
+        move-result v0
+        if-eqz v0, :cond_1
+        invoke-static {p1}, Landroid/webkit/WebView;->setWebContentsDebuggingEnabled(Z)V
+        :cond_1
+        return-void
+    .end method
+    ''')
+    d, fp = _tree(SMALI_TWO_METHODS)
+    try:
+        res = patch_webview_debug(d)
+        assert res["patched"] is True and res["already"] is False
+        out = open(fp, encoding="utf-8").read()
+        # Marker and omni_wvd_skip should be in the gated method, not the ungated one
+        assert MARKER in out
+        assert ":omni_wvd_skip" in out
+
+        # Find both method blocks
+        gated_start = out.find("setupWebViewGated")
+        ungated_start = out.find("setupWebViewUngated")
+        gated_end = out.find(".end method", gated_start)
+        ungated_end = out.find(".end method", ungated_start)
+        gated_block = out[gated_start:gated_end]
+        ungated_block = out[ungated_start:ungated_end]
+
+        # Marker must be in gated, not ungated
+        assert MARKER in gated_block
+        assert MARKER not in ungated_block
+        assert ":omni_wvd_skip" in gated_block
+        assert ":omni_wvd_skip" not in ungated_block
     finally:
         shutil.rmtree(d, ignore_errors=True)
