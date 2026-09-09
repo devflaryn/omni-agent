@@ -73,4 +73,6 @@ export const CONFIG = {
   tailRecentHours: fc.tailRecentHours || 72,
   memoryBudgetTokens: fc.memoryBudgetTokens || 1200,
   graphBudgetTokens: fc.graphBudgetTokens || 900,
+  /** A non-owned session file touched within this window counts as "still open in a terminal" → fork instead of resume. */
+  liveWindowMs: fc.liveWindowMs || 30000,
 };
