@@ -135,10 +135,10 @@ export async function createApp(overrides = {}) {
   }
 
   /** Memory pack + repo-graph context. Claude gets them as system prompt text, pi inline before the message. */
-  async function composePrompt(harness, prompt, { memory, graph, dir }) {
+  async function composePrompt(harness, prompt, { memory, graph: graphFlag, dir }) {
     const parts = [];
-    if (graph) { const g = await graphContext(prompt, dir); if (g) parts.push(harness === "claude" ? `Repo knowledge graph context (graphify):\n${g}` : g); }
     if (memory) { const pack = await memoryPack(prompt); if (pack) parts.push(harness === "claude" ? `Relevant durable memory from the user's Omni vault:\n${pack}` : pack); }
+    if (graphFlag) { const g = await graphContext(prompt, dir); if (g) parts.push(harness === "claude" ? `Repo knowledge graph context (graphify):\n${g}` : g); }
     if (harness === "claude") return { text: prompt, system: parts.join("\n\n") };
     return { text: parts.length ? `${parts.join("\n\n")}\n\n${prompt}` : prompt, system: "" };
   }

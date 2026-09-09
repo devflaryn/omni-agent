@@ -147,6 +147,17 @@ test("continue: fork:true forces --fork-session and returns a pending sid", asyn
   claudeCalls.at(-1).proc.emit("exit", 0);
 });
 
+test("continue: memory pack is composed before graph context, unchanged from pre-refactor ordering", async () => {
+  const r = await post(`/api/sessions/${encodeURIComponent("claude:eb130a94-0000-4000-8000-000000000000")}/continue`, { message: "crash guard again", memory: true, graph: false });
+  assert.ok(r.sid);
+  const a = claudeCalls.at(-1).args;
+  const i = a.indexOf("--append-system-prompt");
+  assert.ok(i !== -1, "--append-system-prompt present");
+  assert.match(a[i + 1], /Relevant durable memory from the user's Omni vault/);
+  assert.match(a[i + 1], /pi-crash-fix/);
+  claudeCalls.at(-1).proc.emit("exit", 0);
+});
+
 test("static route serves ES modules from ui/", async () => {
   const r = await fetch(`http://127.0.0.1:${port}/lib.js`);
   assert.equal(r.status, 200);
