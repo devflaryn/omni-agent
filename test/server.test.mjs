@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { createApp } from "../server/index.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -27,7 +29,16 @@ writeFileSync(claudeFile, [
   "",
 ].join("\n"));
 
-const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base });
+const claudeCalls = [];
+const fakeSpawn = (bin, args, opts) => {
+  const p = new EventEmitter();
+  p.stdout = new PassThrough(); p.stderr = new PassThrough(); p.stdin = new PassThrough();
+  p.pid = 7; p.kill = () => p.emit("exit", 0);
+  claudeCalls.push({ bin, args, opts, proc: p });
+  return p;
+};
+// liveWindowMs: 0 — the fixture files were written a moment ago and would otherwise count as "open in a terminal".
+const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0 });
 await app.listen();
 const port = app.server.address().port;
 const api = async (path, opts) => {
@@ -100,4 +111,44 @@ test("file browser is rooted", async () => {
   assert.ok(l.entries.some((e) => e.name === "vault"));
   const bad = await api(`/api/fs/list?root=${encodeURIComponent(base)}&path=..`);
   assert.ok(bad.error);
+});
+
+const post = (path, body) => api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+test("continue: unknown session → 404, empty message → 400", async () => {
+  const r1 = await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent("claude:nope")}/continue`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "x" }) });
+  assert.equal(r1.status, 404);
+  const r2 = await fetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent("claude:eb130a94-0000-4000-8000-000000000000")}/continue`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ message: "  " }) });
+  assert.equal(r2.status, 400);
+});
+
+test("continue: a closed Claude session resumes in place with --resume", async () => {
+  const r = await post(`/api/sessions/${encodeURIComponent("claude:eb130a94-0000-4000-8000-000000000000")}/continue`, { message: "go on", memory: false, graph: false });
+  assert.equal(r.sid, "claude:eb130a94-0000-4000-8000-000000000000");
+  assert.equal(r.forked, false);
+  const a = claudeCalls.at(-1).args;
+  assert.equal(a[a.indexOf("--resume") + 1], "eb130a94-0000-4000-8000-000000000000");
+  assert.ok(!a.includes("--fork-session"));
+  assert.equal(claudeCalls.at(-1).opts.cwd, "C:\\Users\\berat\\Desktop\\proj");
+  claudeCalls.at(-1).proc.emit("exit", 0);
+});
+
+test("continue: fork:true forces --fork-session and returns a pending sid", async () => {
+  const r = await post(`/api/sessions/${encodeURIComponent("claude:eb130a94-0000-4000-8000-000000000000")}/continue`, { message: "branch here", fork: true, memory: false });
+  assert.equal(r.forked, true);
+  assert.equal(r.forkedFrom, "claude:eb130a94-0000-4000-8000-000000000000");
+  assert.match(r.sid, /pending/);
+  assert.ok(claudeCalls.at(-1).args.includes("--fork-session"));
+  claudeCalls.at(-1).proc.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: "forked-1", cwd: "C:\\p", model: "m" })}\n`);
+  await sleep(50);
+  const st = await api("/api/state");
+  const forked = st.sessions.find((s) => s.sid === "claude:forked-1");
+  assert.equal(forked?.forkedFrom, "claude:eb130a94-0000-4000-8000-000000000000");
+  claudeCalls.at(-1).proc.emit("exit", 0);
+});
+
+test("static route serves ES modules from ui/", async () => {
+  const r = await fetch(`http://127.0.0.1:${port}/lib.js`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type"), /javascript/);
 });

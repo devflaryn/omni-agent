@@ -12,6 +12,7 @@ import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
 import { PiRpc } from "./pi-rpc.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
+import { planContinue } from "./continue.mjs";
 import { SessionRegistry, SessionWatcher } from "./watchers.mjs";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
@@ -24,7 +25,7 @@ export async function createApp(overrides = {}) {
   const tally = createTally();
   const registry = new SessionRegistry();
   const vault = new Vault(cfg.vaultDir).ensure();
-  const claude = new ClaudeRunner({ bin: cfg.claudeBin, bus });
+  const claude = new ClaudeRunner({ bin: cfg.claudeBin, bus, spawn: cfg.claudeSpawn });
   let pi = null;
 
   const isOwned = (file) => (pi?.owns(file) ?? false) || claude.owns(file);
@@ -34,7 +35,7 @@ export async function createApp(overrides = {}) {
   bus.on("event", (ev) => {
     if (ev.kind === "log") return;
     const s = registry.upsert(ev.sid, {});
-    if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming });
+    if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom });
     if (ev.kind === "status") s.streaming = !!ev.streaming;
     if (ev.kind === "msg" && ev.live) {
       s.messages++;
@@ -99,7 +100,7 @@ export async function createApp(overrides = {}) {
   }
 
   // ------------------------------------------------------------------ http
-  const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
+  const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
   function send(res, code, body, type = "application/json") {
     res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
     res.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
@@ -133,6 +134,38 @@ export async function createApp(overrides = {}) {
     return pack;
   }
 
+  /** Memory pack + repo-graph context. Claude gets them as system prompt text, pi inline before the message. */
+  async function composePrompt(harness, prompt, { memory, graph, dir }) {
+    const parts = [];
+    if (graph) { const g = await graphContext(prompt, dir); if (g) parts.push(harness === "claude" ? `Repo knowledge graph context (graphify):\n${g}` : g); }
+    if (memory) { const pack = await memoryPack(prompt); if (pack) parts.push(harness === "claude" ? `Relevant durable memory from the user's Omni vault:\n${pack}` : pack); }
+    if (harness === "claude") return { text: prompt, system: parts.join("\n\n") };
+    return { text: parts.length ? `${parts.join("\n\n")}\n\n${prompt}` : prompt, system: "" };
+  }
+
+  async function continueSession(sid, body) {
+    const s = registry.get(sid);
+    const plan = planContinue(s, { liveWindowMs: cfg.liveWindowMs, piAlive: !!pi?.proc, piSid: pi?.sid, piStreaming: !!pi?.streaming, claudeAlive: !!claude.runs.get(sid)?.alive, forceFork: !!body.fork });
+    if (plan.action === "error") throw Object.assign(new Error(plan.error), { status: plan.status });
+    if (!body.message?.trim()) throw Object.assign(new Error("empty message"), { status: 400 });
+    const dir = s.cwd || cfg.cwd;
+    if (plan.action === "claude") {
+      const p = await composePrompt("claude", body.message, { memory: body.memory, graph: body.graph, dir });
+      const r = claude.run({ prompt: p.text, cwd: plan.cwd || cfg.cwd, resume: plan.resume, fork: plan.fork, forkedFrom: plan.fork ? sid : null, model: body.model, appendSystem: p.system, autonomous: body.autonomous !== false });
+      return { sid: r.sid, pending: r.pending, forked: plan.fork, forkedFrom: plan.fork ? sid : null };
+    }
+    const p = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir });
+    if (plan.action === "pi-prompt") { await pi.prompt(p.text, { images: body.images }); return { sid: pi.sid, pending: false, forked: false, forkedFrom: null }; }
+    if (plan.start) { startPi(plan.cwd || cfg.cwd); await pi.waitReady(); }
+    await pi.switchSession(plan.file);
+    if (plan.clone) {
+      await pi.clone();
+      bus.emit({ sid: pi.sid, harness: "pi", kind: "session", ts: Date.now(), owned: true, forkedFrom: sid, cwd: pi.cwd, file: pi.state?.sessionFile });
+    }
+    await pi.prompt(p.text, { images: body.images });
+    return { sid: pi.sid, pending: false, forked: !!plan.clone, forkedFrom: plan.clone ? sid : null };
+  }
+
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const p = url.pathname;
@@ -149,7 +182,7 @@ export async function createApp(overrides = {}) {
       }
       // static UI
       if (req.method === "GET" && (p === "/" || p === "/index.html")) return send(res, 200, await fs.readFile(join(ROOT, "ui", "index.html")), MIME[".html"]);
-      if (req.method === "GET" && /^\/(app\.js|styles\.css|[\w.-]+\.(svg|png|ico))$/.test(p)) {
+      if (req.method === "GET" && /^\/[\w.-]+\.(js|mjs|css|svg|png|ico)$/.test(p)) {
         const f = join(ROOT, "ui", p.slice(1));
         if (!existsSync(f)) return send(res, 404, { error: "not found" });
         return send(res, 200, await fs.readFile(f), MIME[extname(f)] || "application/octet-stream");
@@ -179,6 +212,15 @@ export async function createApp(overrides = {}) {
         const h = await watcher.history(sid);
         return send(res, 200, { ...h, session: registry.get(sid) || null });
       }
+      if (req.method === "POST" && (m = /^\/api\/sessions\/([^/]+)\/continue$/.exec(p))) {
+        return send(res, 200, await continueSession(decodeURIComponent(m[1]), await readBody(req)));
+      }
+      if (req.method === "POST" && p === "/api/shutdown") {
+        if (!isLocal(req)) return send(res, 403, { error: "local only" });
+        send(res, 200, { ok: true });
+        setTimeout(() => { close(); process.exit(0); }, 100);
+        return;
+      }
       // pi
       if (p.startsWith("/api/pi/")) {
         const body = req.method === "POST" ? await readBody(req) : {};
@@ -188,10 +230,8 @@ export async function createApp(overrides = {}) {
           case "/api/pi/prompt": {
             const p0 = requirePi();
             if (!body.message?.trim()) return send(res, 400, { error: "empty" });
-            let message = body.message;
-            if (body.graph) { const g = await graphContext(body.message, graphDirFor(p0.sid)); if (g) message = `${g}\n\n${message}`; }
-            if (body.memory) { const pack = await memoryPack(body.message); if (pack) message = `${pack}\n\n${message}`; }
-            return send(res, 200, await p0.prompt(message, { images: body.images }));
+            const c = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(p0.sid) });
+            return send(res, 200, await p0.prompt(c.text, { images: body.images }));
           }
           case "/api/pi/abort": return send(res, 200, await requirePi().abort());
           case "/api/pi/new": return send(res, 200, await requirePi().newSession());
@@ -209,9 +249,8 @@ export async function createApp(overrides = {}) {
       // claude
       if (req.method === "POST" && p === "/api/claude/run") {
         const body = await readBody(req);
-        let appendSystem = body.appendSystem || "";
-        if (body.memory) { const pack = await memoryPack(body.prompt); if (pack) appendSystem = `${appendSystem}\n\nRelevant durable memory from the user's Omni vault:\n${pack}`.trim(); }
-        if (body.graph) { const g = await graphContext(body.prompt, body.cwd || cfg.cwd); if (g) appendSystem = `${appendSystem}\n\nRepo knowledge graph context (graphify):\n${g}`.trim(); }
+        const c = await composePrompt("claude", body.prompt || "", { memory: body.memory, graph: body.graph, dir: body.cwd || cfg.cwd });
+        const appendSystem = [body.appendSystem || "", c.system].filter(Boolean).join("\n\n");
         const r = claude.run({ prompt: body.prompt, cwd: body.cwd || cfg.cwd, model: body.model, resume: body.resume, appendSystem, autonomous: body.autonomous !== false, maxTurns: body.maxTurns });
         return send(res, 200, r);
       }
@@ -269,7 +308,7 @@ export async function createApp(overrides = {}) {
       if (req.method === "GET" && p === "/api/fs/read") return send(res, 200, await readFileSafe(q.get("root") || cfg.cwd, q.get("path") || ""));
       return send(res, 404, { error: "not found" });
     } catch (e) {
-      return send(res, 500, { error: String(e?.message || e) });
+      return send(res, e?.status || 500, { error: String(e?.message || e) });
     }
   });
 
