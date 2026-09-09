@@ -17,7 +17,7 @@ export function createComposer(root, h) {
         </div>
       </div>
       <span class="attach-pills"></span>
-      <div class="seg" data-role="target" hidden><button class="seg-btn active" data-target="pi">pi</button><button class="seg-btn" data-target="claude">Claude Code</button></div>
+      <div class="seg" data-role="target" hidden><button class="seg-btn" data-target="pi">pi</button><button class="seg-btn" data-target="claude">Claude Code</button></div>
       <button class="cbtn access" data-role="access" hidden title="Full access runs Claude Code with --dangerously-skip-permissions; Ask makes it stop for permissions"><span class="dot"></span><span class="lbl">Full access</span></button>
       <div class="menu-wrap">
         <button class="cbtn" data-role="model"><span class="lbl">Model</span><span class="chev">▾</span></button>
@@ -40,7 +40,7 @@ export function createComposer(root, h) {
 
   function getOptions() {
     const o = { memory: q('[data-opt="memory"]').checked, graph: q('[data-opt="graph"]').checked, autonomous: st.autonomous, model: st.harness === "claude" ? st.claudeModel : "" };
-    if (h.showTarget) o.target = seg.querySelector(".seg-btn.active").dataset.target;
+    if (h.showTarget) o.target = st.harness;
     return o;
   }
   function renderPills() {
@@ -68,6 +68,7 @@ export function createComposer(root, h) {
     access.classList.toggle("ask", !st.autonomous);
     access.querySelector(".lbl").textContent = st.autonomous ? "Full access" : "Ask";
     seg.hidden = !h.showTarget;
+    seg.querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("active", x.dataset.target === st.harness));
     const lbl = modelBtn.querySelector(".lbl");
     if (claude) { const name = (CLAUDE_MODELS.find(([id]) => id === st.claudeModel) || CLAUDE_MODELS[0])[1]; lbl.innerHTML = `<b>${name}</b>`; }
     else lbl.innerHTML = `<b>${st.piModel?.id || "pi model"}</b>${st.piThinking ? ` <span>${st.piThinking}</span>` : ""}`;
@@ -81,16 +82,17 @@ export function createComposer(root, h) {
     renderModelMenu();
   }
   function submit() {
+    if (st.disabled) return;
     if (st.streaming && !ta.value.trim()) { h.onStop?.(); return; }
     const text = ta.value.trim();
-    if (!text || st.disabled) return;
+    if (!text) return;
     h.onSend?.(text, getOptions());
   }
 
   plus.onclick = (e) => { e.stopPropagation(); modelMenu.hidden = true; plusMenu.hidden = !plusMenu.hidden; };
   plusMenu.querySelector('[data-act="file"]').onclick = () => { closeMenus(); h.onPickFile?.(); };
   plusMenu.querySelectorAll("[data-opt]").forEach((i) => i.addEventListener("change", renderPills));
-  seg.addEventListener("click", (e) => { const b = e.target.closest(".seg-btn"); if (!b) return; seg.querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("active", x === b)); st.harness = b.dataset.target; render(); h.onTarget?.(st.harness); });
+  seg.addEventListener("click", (e) => { const b = e.target.closest(".seg-btn"); if (!b) return; st.harness = b.dataset.target; render(); });
   access.onclick = () => { st.autonomous = !st.autonomous; render(); };
   modelBtn.onclick = (e) => { e.stopPropagation(); plusMenu.hidden = true; modelMenu.hidden = !modelMenu.hidden; };
   send.onclick = submit;
@@ -106,6 +108,5 @@ export function createComposer(root, h) {
     focus() { ta.focus(); },
     clear() { ta.value = ""; autosize(); },
     get value() { return ta.value; },
-    get harness() { return st.harness; },
   };
 }
