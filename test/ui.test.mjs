@@ -1,0 +1,72 @@
+// test/ui.test.mjs
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel } from "../ui/lib.js";
+
+test("fmtDuration", () => {
+  assert.equal(fmtDuration(0), "0s");
+  assert.equal(fmtDuration(12_400), "12s");
+  assert.equal(fmtDuration(8 * 60_000 + 4_000), "8m 4s");
+  assert.equal(fmtDuration(62 * 60_000), "1h 02m");
+});
+
+test("tokRate", () => {
+  assert.equal(tokRate(15_000, 11 * 60_000 + 20_000), 22);
+  assert.equal(tokRate(0, 1000), 0);
+  assert.equal(tokRate(100, 0), 0);
+});
+
+test("estimateTokens", () => { assert.equal(estimateTokens("abcdefgh"), 2); assert.equal(estimateTokens(""), 0); });
+
+test("editStats counts lines for Edit, Write, MultiEdit and pi's edit/write; ignores other tools", () => {
+  assert.deepEqual(editStats("Edit", { file_path: "a.js", old_string: "x\ny", new_string: "x\ny\nz" }), { path: "a.js", added: 3, removed: 2 });
+  assert.deepEqual(editStats("Write", { file_path: "b.js", content: "1\n2\n3" }), { path: "b.js", added: 3, removed: 0 });
+  assert.deepEqual(editStats("MultiEdit", { file_path: "c.js", edits: [{ old_string: "a", new_string: "b\nc" }, { old_string: "", new_string: "d" }] }), { path: "c.js", added: 3, removed: 1 });
+  assert.deepEqual(editStats("edit", { path: "d.py", oldText: "a\nb", newText: "a" }), { path: "d.py", added: 1, removed: 2 });
+  assert.deepEqual(editStats("write", { path: "e.py", content: "q" }), { path: "e.py", added: 1, removed: 0 });
+  assert.equal(editStats("Bash", { command: "ls" }), null);
+  assert.equal(editStats("Edit", null), null);
+});
+
+test("editedFiles aggregates per path and totals", () => {
+  const r = editedFiles([
+    { name: "Edit", args: { file_path: "a.js", old_string: "1", new_string: "1\n2" } },
+    { name: "Edit", args: { file_path: "a.js", old_string: "x\ny\nz", new_string: "x" } },
+    { name: "Write", args: { file_path: "b.js", content: "n\nm" } },
+    { name: "Read", args: { file_path: "c.js" } },
+  ]);
+  assert.deepEqual(r.files, [{ path: "a.js", added: 3, removed: 4 }, { path: "b.js", added: 2, removed: 0 }]);
+  assert.equal(r.added, 5); assert.equal(r.removed, 4);
+});
+
+test("groupToolRuns folds consecutive tools into work groups and text breaks them", () => {
+  const segs = groupToolRuns([
+    { kind: "tool", startTs: 1000, endTs: 3000 },
+    { kind: "tool", startTs: 3000, endTs: 9000 },
+    { kind: "text" },
+    { kind: "tool", startTs: 10_000, endTs: null },
+  ], 15_000);
+  assert.equal(segs.length, 3);
+  assert.equal(segs[0].kind, "work"); assert.equal(segs[0].items.length, 2); assert.equal(segs[0].durationMs, 8000); assert.equal(segs[0].open, false);
+  assert.equal(segs[1].kind, "text");
+  assert.equal(segs[2].open, true); assert.equal(segs[2].durationMs, 5000);
+});
+
+test("relPath strips the cwd and normalizes slashes", () => {
+  assert.equal(relPath("C:\\Users\\b\\proj\\ui\\app.js", "C:\\Users\\b\\proj"), "ui/app.js");
+  assert.equal(relPath("C:\\other\\x.js", "C:\\Users\\b\\proj"), "C:/other/x.js");
+  assert.equal(relPath("ui/app.js", null), "ui/app.js");
+});
+
+test("md renders code, bold, lists and escapes html", () => {
+  assert.equal(md("**hi** <b>"), "<p><b>hi</b> &lt;b&gt;</p>");
+  assert.match(md("```js\nlet a = 1\n```"), /<pre><code>let a = 1<\/code><\/pre>/);
+  assert.match(md("- a\n- b"), /<ul><li>a<\/li><li>b<\/li><\/ul>/);
+});
+
+test("groupLabel", () => {
+  const now = new Date(2026, 8, 9, 12).getTime();
+  assert.equal(groupLabel(now - 3600e3, now), "Today");
+  assert.equal(groupLabel(now - 86400e3, now), "Yesterday");
+  assert.equal(groupLabel(now - 3 * 86400e3, now), "This week");
+});
