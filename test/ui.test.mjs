@@ -1,7 +1,7 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments } from "../ui/lib.js";
 
 test("fmtDuration", () => {
   assert.equal(fmtDuration(0), "0s");
@@ -62,6 +62,21 @@ test("md renders code, bold, lists and escapes html", () => {
   assert.equal(md("**hi** <b>"), "<p><b>hi</b> &lt;b&gt;</p>");
   assert.match(md("```js\nlet a = 1\n```"), /<pre><code>let a = 1<\/code><\/pre>/);
   assert.match(md("- a\n- b"), /<ul><li>a<\/li><li>b<\/li><\/ul>/);
+});
+
+test("splitAttachments strips leading omni-memory/repo-graph packs", () => {
+  assert.deepEqual(splitAttachments("<omni-memory>stuff here</omni-memory>\n\nwhat's the plan?"), { text: "what's the plan?", attachments: ["memory"] });
+  assert.deepEqual(
+    splitAttachments("<omni-memory>mem</omni-memory>\n<repo-graph node=\"x\">graph</repo-graph>\n\nhello"),
+    { text: "hello", attachments: ["memory", "repo graph"] }
+  );
+  assert.deepEqual(
+    splitAttachments("<repo-graph>graph</repo-graph>\n<omni-memory>mem</omni-memory>\n\nhello"),
+    { text: "hello", attachments: ["repo graph", "memory"] }
+  );
+  assert.deepEqual(splitAttachments("just plain text"), { text: "just plain text", attachments: [] });
+  const mid = "before <omni-memory>mem</omni-memory> after";
+  assert.deepEqual(splitAttachments(mid), { text: mid, attachments: [] });
 });
 
 test("groupLabel", () => {

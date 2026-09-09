@@ -1,5 +1,5 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
-import { el, esc, md, fmtN, fmtDuration, tokRate, editedFiles, groupToolRuns, relPath } from "./lib.js";
+import { el, esc, md, fmtN, fmtDuration, tokRate, editedFiles, groupToolRuns, relPath, splitAttachments } from "./lib.js";
 
 const active = { view: null, timer: null };
 
@@ -104,12 +104,12 @@ function updateWorkLabels(t, final) {
 }
 
 // --------------------------------------------------------------- tools
-function toolCard(view, t, { toolId, name, args }) {
+function toolCard(view, t, { toolId, name, args, ts }) {
   let c = toolId ? view.tools.get(toolId) : null;
   if (c) return c;
   const d = el("details", "tool running");
   d.innerHTML = `<summary><span class="name">${esc(name || "tool")}</span><span class="brief"></span><span class="st">running</span></summary><div class="io"><pre class="args"></pre><pre class="out" hidden></pre></div>`;
-  c = { el: d, args: d.querySelector(".args"), out: d.querySelector(".out"), st: d.querySelector(".st"), brief: d.querySelector(".brief"), argText: "", call: { name: name || "tool", args: undefined }, item: { kind: "tool", startTs: Date.now(), endTs: null } };
+  c = { el: d, args: d.querySelector(".args"), out: d.querySelector(".out"), st: d.querySelector(".st"), brief: d.querySelector(".brief"), argText: "", call: { name: name || "tool", args: undefined }, item: { kind: "tool", startTs: ts || Date.now(), endTs: null } };
   if (args !== undefined) setToolArgs(c, args);
   workGroup(t).items.appendChild(d);
   t.items.push(c.item);
@@ -123,11 +123,11 @@ function setToolArgs(c, args) {
   if (typeof args === "object" && args) { c.call.args = args; c.brief.textContent = String(args.command || args.file_path || args.path || args.pattern || args.query || args.task || args.description || "").replace(/\s+/g, " ").slice(0, 120); }
   c.args.textContent = text || "";
 }
-function setToolResult(c, text, isError) {
+function setToolResult(c, text, isError, ts) {
   c.out.hidden = false; c.out.textContent = (text || "").slice(0, 30000);
   c.el.classList.remove("running"); c.el.classList.add(isError ? "err" : "ok");
   c.st.textContent = isError ? "error" : "done";
-  if (c.item.endTs == null) c.item.endTs = Date.now();
+  if (c.item.endTs == null) c.item.endTs = ts || Date.now();
 }
 
 // -------------------------------------------------------------- blocks
@@ -139,12 +139,12 @@ function thinkEl(t) {
   t.sawThinking = true;
   return d;
 }
-function renderBlocks(view, t, blocks) {
+function renderBlocks(view, t, blocks, ts) {
   for (const b of blocks) {
     if (b.type === "text") { breakWork(t); const d = el("div", "text"); d.innerHTML = md(b.text); t.body.appendChild(d); markStarted(t); }
     else if (b.type === "thinking") { breakWork(t); thinkEl(t).querySelector(".stream").textContent = b.text; markStarted(t); }
-    else if (b.type === "tool_call") { const c = toolCard(view, t, b); if (b.args !== undefined) setToolArgs(c, b.args); }
-    else if (b.type === "tool_result") { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result" }); setToolResult(c, b.text, b.isError); }
+    else if (b.type === "tool_call") { const c = toolCard(view, t, { ...b, ts }); if (b.args !== undefined) setToolArgs(c, b.args); }
+    else if (b.type === "tool_result") { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts }); setToolResult(c, b.text, b.isError, ts); }
     else if (b.type === "image") { breakWork(t); const i = el("img"); i.src = `data:${b.mimeType};base64,${b.data}`; i.style.maxWidth = "100%"; t.body.appendChild(i); }
   }
 }
@@ -227,20 +227,28 @@ export function applyEvent(view, ev) {
           for (const b of ev.blocks) {
             const p = parts.find((x) => (b.type === "tool_call" ? x.part === "tool_call" && x.card === view.tools.get(b.toolId) : x.part === b.type));
             if (p) { finishPart(p, b.text); if (b.type === "tool_call") setToolArgs(p.card, b.args); parts.splice(parts.indexOf(p), 1); }
-            else renderBlocks(view, t, [b]);
+            else renderBlocks(view, t, [b], ev.ts);
           }
           if (view.harness === "pi") closeStream(view);
-        } else renderBlocks(view, t, ev.blocks);
+        } else renderBlocks(view, t, ev.blocks, ev.ts);
         if (!ev.live) renderMeter(t);
       } else if (ev.role === "tool") {
         const t = turnOf(view, ev.ts, ev.live);
-        for (const b of ev.blocks) { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result" }); setToolResult(c, b.text, b.isError); }
+        for (const b of ev.blocks) { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts: ev.ts }); setToolResult(c, b.text, b.isError, ev.ts); }
         t.lastMsgTs = Math.max(t.lastMsgTs, ev.ts || 0);
       } else if (ev.role === "user") {
         closeTurn(view);
         const m = el("div", `msg user${animate ? " appear" : ""}`);
-        const body = el("div", "body"); body.textContent = ev.blocks.map((b) => b.text || (b.type === "image" ? "[image]" : "")).filter(Boolean).join("\n");
-        m.appendChild(body); view.root.appendChild(m);
+        const raw = ev.blocks.map((b) => b.text || (b.type === "image" ? "[image]" : "")).filter(Boolean).join("\n");
+        const { text, attachments } = splitAttachments(raw);
+        const body = el("div", "body", text);
+        m.appendChild(body);
+        if (attachments.length) {
+          const attach = el("div", "attach");
+          for (const a of attachments) attach.appendChild(el("span", "ap", a));
+          m.appendChild(attach);
+        }
+        view.root.appendChild(m);
         openTurn(view, ev.ts, !!ev.live);
       } else {
         const m = el("div", `msg system${animate ? " appear" : ""}`);
@@ -256,7 +264,7 @@ export function applyEvent(view, ev) {
       const c = toolCard(view, t, ev);
       if (ev.phase === "start" && ev.args !== undefined) setToolArgs(c, ev.args);
       if (ev.phase === "update") { c.out.hidden = false; c.out.textContent = (ev.text || "").slice(-30000); }
-      if (ev.phase === "end") setToolResult(c, ev.text, ev.isError);
+      if (ev.phase === "end") setToolResult(c, ev.text, ev.isError, ev.ts);
       scrollBottom(view);
       break;
     }

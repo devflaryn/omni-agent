@@ -25,6 +25,23 @@ export function fmtDuration(ms) {
 export function tokRate(tokens, ms) { return !tokens || !ms || ms <= 0 ? 0 : Math.round(tokens / (ms / 1000)); }
 export function estimateTokens(text) { return Math.ceil(String(text || "").length / 4); }
 
+// -------------------------------------------------------- attachments
+const MEMORY_RE = /^\s*<omni-memory>[\s\S]*?<\/omni-memory>/;
+const GRAPH_RE = /^\s*<repo-graph[^>]*>[\s\S]*?<\/repo-graph>/;
+export function splitAttachments(text) {
+  let s = String(text ?? "");
+  const attachments = [];
+  let matched = true;
+  while (matched) {
+    matched = false;
+    const m = s.match(MEMORY_RE);
+    if (m) { attachments.push("memory"); s = s.slice(m[0].length); matched = true; continue; }
+    const g = s.match(GRAPH_RE);
+    if (g) { attachments.push("repo graph"); s = s.slice(g[0].length); matched = true; }
+  }
+  return attachments.length ? { text: s.trim(), attachments } : { text, attachments: [] };
+}
+
 export function relPath(path, cwd) {
   let p = String(path || "").replace(/\\/g, "/");
   if (cwd) { const c = String(cwd).replace(/\\/g, "/").replace(/\/+$/, ""); if (p.toLowerCase().startsWith(`${c.toLowerCase()}/`)) p = p.slice(c.length + 1); }

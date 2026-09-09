@@ -129,8 +129,9 @@ body.side-open #btnOpenSide { display: none; }
 #transcript { max-width: 760px; margin: 0 auto; padding: 22px 24px 40px; }
 #chatComposer { padding: 6px 24px 16px; }
 #chatComposer .composer { max-width: 760px; margin: 0 auto; }
-.msg.user { display: flex; justify-content: flex-end; margin: 6px 0 20px; }
+.msg.user { display: flex; flex-direction: column; align-items: flex-end; margin: 6px 0 20px; }
 .msg.user .body { background: var(--bg-3); border-radius: 18px; padding: 10px 16px; white-space: pre-wrap; max-width: 85%; word-break: break-word; }
+.msg.user .attach { display: flex; gap: 4px; justify-content: flex-end; margin-top: 4px; }
 .msg.system { color: var(--muted); font-size: 12.5px; margin: 8px 0; }
 .msg.appear, .turn.appear { animation: appear 0.22s ease-out; }
 @keyframes appear { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }

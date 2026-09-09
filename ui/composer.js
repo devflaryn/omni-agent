@@ -96,7 +96,7 @@ export function createComposer(root, h) {
   plus.onclick = (e) => { e.stopPropagation(); modelMenu.hidden = true; plusMenu.hidden = !plusMenu.hidden; };
   plusMenu.querySelector('[data-act="file"]').onclick = () => { closeMenus(); h.onPickFile?.(); };
   plusMenu.querySelectorAll("[data-opt]").forEach((i) => i.addEventListener("change", renderPills));
-  seg.addEventListener("click", (e) => { const b = e.target.closest(".seg-btn"); if (!b) return; st.harness = b.dataset.target; menuDirty = true; render(); });
+  seg.addEventListener("click", (e) => { const b = e.target.closest(".seg-btn"); if (!b) return; st.harness = b.dataset.target; menuDirty = true; closeMenus(); render(); });
   access.onclick = () => { st.autonomous = !st.autonomous; render(); };
   modelBtn.onclick = (e) => {
     e.stopPropagation();
@@ -111,7 +111,13 @@ export function createComposer(root, h) {
   render();
 
   return {
-    setState(patch) { Object.assign(st, patch); menuDirty = true; render(); },
+    setState(patch) {
+      const piModelChanged = "piModel" in patch && (patch.piModel?.provider !== st.piModel?.provider || patch.piModel?.id !== st.piModel?.id);
+      const menuRelevant = ["harness", "claudeModel", "piThinking"].some((k) => k in patch && patch[k] !== st[k]) || piModelChanged;
+      Object.assign(st, patch);
+      if (menuRelevant) menuDirty = true;
+      render();
+    },
     setPiChoices({ models, levels }) { if (models) st.models = models; if (levels) st.levels = levels; menuDirty = true; render(); },
     getOptions,
     insert(text) { ta.value += `${ta.value && !/\s$/.test(ta.value) ? " " : ""}${text}`; autosize(); ta.focus(); },
