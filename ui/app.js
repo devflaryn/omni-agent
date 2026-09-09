@@ -7,7 +7,7 @@ import { createPanel } from "./panel.js";
 
 const $ = (s) => document.querySelector(s);
 const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, memCount: 0, graphs: [], followFork: null, forceFork: false, desktop: new URLSearchParams(location.search).get("desktop") === "1" };
-const LIVE_WINDOW_MS = 30000;
+const liveWindowMs = () => S.config?.liveWindowMs || 30000;
 
 async function api(path, body, method) {
   const r = await fetch(path, body ? { method: method || "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : { method: method || "GET" });
@@ -89,8 +89,9 @@ async function homeSend(text, o) {
       S.pi = st.pi;
       if (!st.pi.sid) throw new Error("pi did not report a session");
       S.sessions.set(st.pi.sid, { ...(S.sessions.get(st.pi.sid) || {}), sid: st.pi.sid, harness: "pi", owned: true, cwd, model: st.pi.state?.model?.id, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
-      home.clear(); selectSession(st.pi.sid); showView("chat");
+      selectSession(st.pi.sid); showView("chat");
       await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph });
+      home.clear();
     } else {
       const r = await api("/api/claude/run", { prompt: text, cwd, model: o.model, memory: o.memory, graph: o.graph, autonomous: o.autonomous });
       S.sessions.set(r.sid, { sid: r.sid, harness: "claude", owned: true, cwd, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
@@ -106,7 +107,7 @@ function target() {
   if (!s) return { kind: "none" };
   if (s.harness === "pi" && s.owned && S.pi.running && S.pi.sid === s.sid) return { kind: "owned-pi", s, streaming: !!s.streaming };
   if (s.harness === "claude" && S.runs.some((r) => r.sid === s.sid && r.alive)) return { kind: "owned-claude-running", s };
-  const live = !s.owned && (s.streaming || Date.now() - Math.max(s.lastActivity || 0, s.mtime || 0) < LIVE_WINDOW_MS);
+  const live = !s.owned && (s.streaming || Date.now() - Math.max(s.lastActivity || 0, s.mtime || 0) < liveWindowMs());
   return { kind: "continue", s, live };
 }
 function updateComposer() {
@@ -125,11 +126,12 @@ function updateComposer() {
 async function chatSend(text, o) {
   const t = target();
   try {
-    if (t.kind === "owned-pi") { chat.clear(); await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph }); return; }
-    if (t.kind === "owned-claude-running" || t.kind === "none") return;
-    chat.clear();
+    if (t.kind === "owned-pi") { await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph }); chat.clear(); return; }
+    if (t.kind === "owned-claude-running") { await chatStop(); return; }
+    if (t.kind === "none") return;
     chat.setState({ disabled: true, caption: "Starting…" });
     const r = await api(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, model: o.model, autonomous: o.autonomous, fork: S.forceFork });
+    chat.clear();
     S.forceFork = false;
     if (r.pending) { S.followFork = r.forkedFrom; toast("Forking the chat… Omni will switch to the new session as soon as Claude Code reports it."); }
     else if (r.sid !== S.selected) { if (r.forked) toast("Forked into a new pi session"); selectSession(r.sid); }

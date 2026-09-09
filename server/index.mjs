@@ -199,7 +199,7 @@ export async function createApp(overrides = {}) {
       // state
       if (req.method === "GET" && p === "/api/state") {
         return send(res, 200, {
-          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/?token=${cfg.token}`) : [] },
+          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/?token=${cfg.token}`) : [] },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
           runs: claude.list(),
           sessions: registry.list().map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
