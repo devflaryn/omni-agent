@@ -33,6 +33,7 @@ export class ClaudeRunner {
   run({ prompt, cwd, model, resume, fork = false, forkedFrom = null, appendSystem, autonomous = true, maxTurns, allowedTools }) {
     if (!prompt?.trim()) throw new Error("empty prompt");
     const pending = !!(resume && fork);
+    if (fork && !forkedFrom) forkedFrom = `claude:${resume}`;
     const sessionId = pending ? null : resume || randomUUID();
     const sid = pending ? `claude:pending-${randomUUID().slice(0, 8)}` : `claude:${sessionId}`;
     if (!pending && this.runs.get(sid)?.alive) throw new Error("that Claude session is already running");
@@ -58,6 +59,7 @@ export class ClaudeRunner {
     };
     if (!pending) announce();
 
+    const attrSid = () => (run.pending ? run.forkedFrom : ctx.sid);
     let sawResult = false;
     const splitter = createLineSplitter((line) => {
       let obj;
@@ -77,8 +79,8 @@ export class ClaudeRunner {
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (c) => splitter.push(c));
     proc.stderr.setEncoding("utf8");
-    proc.stderr.on("data", (t) => this.bus.emit({ sid: run.pending ? run.forkedFrom || sid : ctx.sid, harness: "claude", kind: "log", ts: Date.now(), level: "stderr", text: t.slice(0, 4000) }));
-    const fail = (text) => this.bus.emit({ sid: run.pending ? run.forkedFrom || sid : ctx.sid, harness: "claude", kind: "msg", ts: Date.now(), id: `err-${Date.now()}`, role: "system", live: true, blocks: [{ type: "text", text }] });
+    proc.stderr.on("data", (t) => this.bus.emit({ sid: attrSid(), harness: "claude", kind: "log", ts: Date.now(), level: "stderr", text: t.slice(0, 4000) }));
+    const fail = (text) => this.bus.emit({ sid: attrSid(), harness: "claude", kind: "msg", ts: Date.now(), id: `err-${Date.now()}`, role: "system", live: true, blocks: [{ type: "text", text }] });
     proc.on("error", (e) => fail(`claude spawn failed: ${e.message}`));
     proc.on("exit", (code) => {
       splitter.flush();

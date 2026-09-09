@@ -68,3 +68,27 @@ test("owns() ignores pending runs and matches by session id", () => {
   assert.equal(r.owns("C:\\c\\DEF.jsonl"), true);
   assert.equal(r.owns("C:\\c\\zzz.jsonl"), false);
 });
+
+test("fork without forkedFrom defaults to source session and no pending sid in events", async () => {
+  const calls = [], bus = new Bus(), events = [];
+  bus.on("event", (ev) => events.push(ev));
+  const r = new ClaudeRunner({ bin: "claude", bus, spawn: fakeSpawn(calls) });
+  r.run({ prompt: "x", cwd: "C:\\p", resume: "abc", fork: true });
+  calls[0].proc.emit("exit", 1);
+  await sleep(10);
+  const err = events.find((e) => e.kind === "msg" && e.role === "system");
+  assert.equal(err.sid, "claude:abc", "error routed to source session");
+  assert.ok(events.every((e) => !String(e.sid).includes("pending")), "no event ever uses a pending sid");
+});
+
+test("stderr from pending fork is routed to source session, never pending sid", async () => {
+  const calls = [], bus = new Bus(), events = [];
+  bus.on("event", (ev) => events.push(ev));
+  const r = new ClaudeRunner({ bin: "claude", bus, spawn: fakeSpawn(calls) });
+  r.run({ prompt: "x", cwd: "C:\\p", resume: "abc", fork: true });
+  calls[0].proc.stderr.write("some error output\n");
+  await sleep(10);
+  const log = events.find((e) => e.kind === "log" && e.level === "stderr");
+  assert.equal(log.sid, "claude:abc", "stderr routed to source session");
+  assert.ok(events.every((e) => !String(e.sid).includes("pending")), "no event ever uses a pending sid");
+});
