@@ -9,6 +9,12 @@ import { createLineSplitter } from "./jsonl.mjs";
 import { normalizePiRpcEvent } from "./normalize.mjs";
 
 const normPath = (p) => (p ? resolve(String(p)).toLowerCase() : "");
+/** Throws when an RPC response failed or was cancelled, so callers can't silently proceed. */
+const ok = (r, what) => {
+  if (!r?.success) throw new Error(r?.error || `${what} failed`);
+  if (r.data?.cancelled) throw new Error(`${what} was cancelled`);
+  return r;
+};
 
 export class PiRpc extends EventEmitter {
   constructor({ cli, bin = "pi", cwd, model = "", provider = "", bus }) {
@@ -118,11 +124,11 @@ export class PiRpc extends EventEmitter {
 
   abort() { return this.send({ type: "abort" }); }
   async newSession() { const r = await this.send({ type: "new_session" }); await this.refreshState(); return r; }
-  async switchSession(sessionPath) { const r = await this.send({ type: "switch_session", sessionPath }); await this.refreshState(); return r; }
+  async switchSession(sessionPath) { const r = ok(await this.send({ type: "switch_session", sessionPath }), "switch_session"); await this.refreshState(); return r; }
   /** Resolves when the child has answered get_state (its session id is known). */
   waitReady() { return this.ready || Promise.reject(new Error("pi is not running")); }
   /** Copies the current session into a new file and switches to it (the original stays untouched). */
-  async clone() { const r = await this.send({ type: "clone" }); await this.refreshState(); return r; }
+  async clone() { const r = ok(await this.send({ type: "clone" }), "clone"); await this.refreshState(); return r; }
   stats() { return this.send({ type: "get_session_stats" }); }
   models() { return this.send({ type: "get_available_models" }); }
   async setModel(provider, modelId) { const r = await this.send({ type: "set_model", provider, modelId }); await this.refreshState(); return r; }

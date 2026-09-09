@@ -49,7 +49,7 @@ export async function createApp(overrides = {}) {
 
   function startPi(cwd = cfg.cwd) {
     if (pi) pi.stop();
-    pi = new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, bus });
+    pi = cfg.createPi ? cfg.createPi({ cwd, bus }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, bus });
     pi.start();
     return pi;
   }
@@ -78,6 +78,17 @@ export async function createApp(overrides = {}) {
     const r = relative(root, abs);
     if (r.startsWith("..") || (r.length && r.split(sep)[0] === "..")) return null;
     return abs;
+  }
+  const normRoot = (p) => String(p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  /** Loopback callers can browse anywhere; LAN callers may only browse a folder Omni already knows about. */
+  function fsRootAllowed(req, root) {
+    if (isLocal(req)) return true;
+    const r = normRoot(root);
+    if (!r) return false;
+    if (r === normRoot(cfg.cwd)) return true;
+    if (pi?.cwd && r === normRoot(pi.cwd)) return true;
+    for (const s of registry.list()) if (s.cwd && r === normRoot(s.cwd)) return true;
+    return false;
   }
   const TEXT_EXT = new Set([".txt", ".md", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".py", ".sh", ".bash", ".ps1", ".cmd", ".bat", ".html", ".css", ".xml", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log", ".java", ".kt", ".c", ".h", ".cpp", ".rs", ".go", ".rb", ".php", ".sql", ".smali", ".gradle", ".properties", ".env", ".gitignore", ".csv", ".jsonl"]);
   async function listDir(root, rel) {
@@ -145,9 +156,10 @@ export async function createApp(overrides = {}) {
 
   async function continueSession(sid, body) {
     const s = registry.get(sid);
+    if (!s) throw Object.assign(new Error("unknown session"), { status: 404 });
+    if (!body.message?.trim()) throw Object.assign(new Error("empty message"), { status: 400 });
     const plan = planContinue(s, { liveWindowMs: cfg.liveWindowMs, piAlive: !!pi?.proc, piSid: pi?.sid, piStreaming: !!pi?.streaming, claudeAlive: !!claude.runs.get(sid)?.alive, forceFork: !!body.fork });
     if (plan.action === "error") throw Object.assign(new Error(plan.error), { status: plan.status });
-    if (!body.message?.trim()) throw Object.assign(new Error("empty message"), { status: 400 });
     const dir = s.cwd || cfg.cwd;
     if (plan.action === "claude") {
       const p = await composePrompt("claude", body.message, { memory: body.memory, graph: body.graph, dir });
@@ -157,11 +169,13 @@ export async function createApp(overrides = {}) {
     const p = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir });
     if (plan.action === "pi-prompt") { await pi.prompt(p.text, { images: body.images }); return { sid: pi.sid, pending: false, forked: false, forkedFrom: null }; }
     if (plan.start) { startPi(plan.cwd || cfg.cwd); await pi.waitReady(); }
-    await pi.switchSession(plan.file);
-    if (plan.clone) {
-      await pi.clone();
-      bus.emit({ sid: pi.sid, harness: "pi", kind: "session", ts: Date.now(), owned: true, forkedFrom: sid, cwd: pi.cwd, file: pi.state?.sessionFile });
-    }
+    try {
+      await pi.switchSession(plan.file);
+      if (plan.clone) {
+        await pi.clone();
+        bus.emit({ sid: pi.sid, harness: "pi", kind: "session", ts: Date.now(), owned: true, forkedFrom: sid, cwd: pi.cwd, file: pi.state?.sessionFile });
+      }
+    } catch (e) { throw Object.assign(e, { status: e.status || 409 }); }
     await pi.prompt(p.text, { images: body.images });
     return { sid: pi.sid, pending: false, forked: !!plan.clone, forkedFrom: plan.clone ? sid : null };
   }
@@ -171,6 +185,8 @@ export async function createApp(overrides = {}) {
     const p = url.pathname;
     const q = url.searchParams;
     try {
+      const sfs = req.headers["sec-fetch-site"];
+      if (req.method !== "GET" && sfs && sfs !== "same-origin" && sfs !== "none") return send(res, 403, { error: "cross-site request refused" });
       if (cfg.token && !isLocal(req)) {
         const supplied = q.get("token") || cookieToken(req) || (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
         if (supplied !== cfg.token) return send(res, 401, TOKEN_PAGE, "text/html; charset=utf-8");
@@ -304,8 +320,16 @@ export async function createApp(overrides = {}) {
         }
       }
       // files
-      if (req.method === "GET" && p === "/api/fs/list") return send(res, 200, { entries: await listDir(q.get("root") || cfg.cwd, q.get("path") || "") });
-      if (req.method === "GET" && p === "/api/fs/read") return send(res, 200, await readFileSafe(q.get("root") || cfg.cwd, q.get("path") || ""));
+      if (req.method === "GET" && p === "/api/fs/list") {
+        const root = q.get("root") || cfg.cwd;
+        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
+        return send(res, 200, { entries: await listDir(root, q.get("path") || "") });
+      }
+      if (req.method === "GET" && p === "/api/fs/read") {
+        const root = q.get("root") || cfg.cwd;
+        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
+        return send(res, 200, await readFileSafe(root, q.get("path") || ""));
+      }
       return send(res, 404, { error: "not found" });
     } catch (e) {
       return send(res, e?.status || 500, { error: String(e?.message || e) });

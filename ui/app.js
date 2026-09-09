@@ -195,7 +195,7 @@ $("#homeCwd").addEventListener("change", () => { panel.resetFiles(); renderHome(
 function connect() {
   const es = new EventSource(`/events?since=${S.seq}`);
   es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch { return; } handle(ev); };
-  es.onerror = () => { $("#piStatus").textContent = "reconnecting"; };
+  es.onerror = () => { $("#piStatus").textContent = "reconnecting"; es.close(); setTimeout(connect, 1500); };
 }
 let railTimer = null;
 function handle(ev) {

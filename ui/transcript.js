@@ -204,7 +204,7 @@ export function applyEvent(view, ev) {
     case "block": {
       if (ev.phase === "message_start") { const t = turnOf(view, Date.now(), true); closeStream(view); openStream(view, t); markStarted(t); }
       else if (ev.phase === "start") streamPart(view, ev.index, ev.part, ev);
-      else if (ev.phase === "end") { const p = view.stream?.parts.get(ev.index); if (p) { if (p.part === "tool_call" && ev.args !== undefined) setToolArgs(p.card, ev.args); finishPart(p, ev.text); } }
+      else if (ev.phase === "end") { const p = view.stream?.parts.get(ev.index); if (p) { finishPart(p, ev.text); if (p.part === "tool_call" && ev.args !== undefined) setToolArgs(p.card, ev.args); } }
       break;
     }
     case "delta": {

@@ -163,3 +163,58 @@ test("static route serves ES modules from ui/", async () => {
   assert.equal(r.status, 200);
   assert.match(r.headers.get("content-type"), /javascript/);
 });
+
+test("cross-site POSTs are refused, same-origin/absent header POSTs are not", async () => {
+  const cross = await fetch(`http://127.0.0.1:${port}/api/memory/reindex`, { method: "POST", headers: { "content-type": "application/json", "sec-fetch-site": "cross-site" }, body: "{}" });
+  assert.equal(cross.status, 403);
+  const plain = await fetch(`http://127.0.0.1:${port}/api/memory/reindex`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+  assert.equal(plain.status, 200);
+});
+
+// -------------------------------------------------------- stubbed-pi continue
+let fakePi = null;
+function makeFakePi({ cwd }) {
+  fakePi = {
+    proc: {}, sid: "pi:fake", cwd, streaming: false, state: { sessionFile: "C:\\fake.jsonl" }, calls: [], failClone: false,
+    start() {}, stop() {}, owns() { return false; },
+    waitReady() { return Promise.resolve(this.state); },
+    async switchSession(f) { this.calls.push(["switch", f]); this.sid = "pi:01a086a6-c763-777d-8188-9a868c6a2266"; },
+    async clone() { this.calls.push(["clone"]); if (this.failClone) throw new Error("clone was cancelled"); this.sid = "pi:cloned"; },
+    async prompt(m) { this.calls.push(["prompt", m]); return { ok: true }; },
+  };
+  return fakePi;
+}
+const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi });
+await app2.listen();
+const port2 = app2.server.address().port;
+after(() => app2.close());
+const post2 = async (path, body) => { const r = await fetch(`http://127.0.0.1:${port2}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); return { status: r.status, json: await r.json().catch(() => ({})) }; };
+
+test("continue on a closed pi session (stubbed pi): switches and prompts, no clone", async () => {
+  const r = await post2(`/api/sessions/${encodeURIComponent("pi:01a086a6-c763-777d-8188-9a868c6a2266")}/continue`, { message: "hi", memory: false });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.sid, "pi:01a086a6-c763-777d-8188-9a868c6a2266");
+  assert.equal(r.json.forked, false);
+  assert.equal(fakePi.calls.length, 2);
+  assert.equal(fakePi.calls[0][0], "switch");
+  assert.equal(fakePi.calls[0][1], piFile);
+  assert.deepEqual(fakePi.calls[1], ["prompt", "hi"]);
+});
+
+test("continue with fork:true (stubbed pi): clones and forks", async () => {
+  fakePi.calls.length = 0;
+  const r = await post2(`/api/sessions/${encodeURIComponent("pi:01a086a6-c763-777d-8188-9a868c6a2266")}/continue`, { message: "branch", memory: false, fork: true });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.forked, true);
+  assert.equal(r.json.sid, "pi:cloned");
+  assert.equal(r.json.forkedFrom, "pi:01a086a6-c763-777d-8188-9a868c6a2266");
+  assert.ok(fakePi.calls.some((c) => c[0] === "clone"));
+});
+
+test("continue with fork:true and a cancelled clone (stubbed pi): 409, no prompt", async () => {
+  fakePi.calls.length = 0;
+  fakePi.failClone = true;
+  const r = await post2(`/api/sessions/${encodeURIComponent("pi:01a086a6-c763-777d-8188-9a868c6a2266")}/continue`, { message: "branch again", memory: false, fork: true });
+  assert.equal(r.status, 409);
+  assert.ok(!fakePi.calls.some((c) => c[0] === "prompt"), "prompt must not be called after a cancelled clone");
+});

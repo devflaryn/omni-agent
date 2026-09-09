@@ -104,6 +104,6 @@ export class ClaudeRunner {
   }
 
   stopAll() {
-    for (const [sid] of this.runs) this.abort(sid);
+    for (const sid of [...this.runs.keys()]) this.abort(sid);
   }
 }

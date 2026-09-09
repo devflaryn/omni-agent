@@ -117,6 +117,7 @@ def open_window(url):
 
     def sync_title():
         last = None
+        failures = 0
         while True:
             time.sleep(2)
             try:
@@ -124,7 +125,11 @@ def open_window(url):
                 if title and title != last:
                     window.set_title(title)
                     last = title
+                failures = 0
             except Exception:
+                failures += 1
+                if failures < 5:
+                    continue
                 return
 
     threading.Thread(target=sync_title, daemon=True).start()
@@ -137,10 +142,10 @@ def fallback(url):
     edge = next((c for c in candidates if c and os.path.exists(c)), None)
     if edge:
         subprocess.Popen([edge, f"--app={url}"])
-        msgbox("Omni Agent", "pywebview is not installed for this Python, so Omni opened in an Edge app window instead.\nInstall it with:  pip install pywebview")
+        msgbox("Omni Agent", "pywebview is not installed for this Python, so Omni opened in an Edge app window instead.\nInstall it with:  pip install pywebview\nThe Omni Agent server keeps running in the background; end the node.exe process to stop it.")
     else:
         webbrowser.open(url)
-        msgbox("Omni Agent", "pywebview is not installed for this Python, so Omni opened in your browser instead.\nInstall it with:  pip install pywebview")
+        msgbox("Omni Agent", "pywebview is not installed for this Python, so Omni opened in your browser instead.\nInstall it with:  pip install pywebview\nThe Omni Agent server keeps running in the background; end the node.exe process to stop it.")
     return True
 
 

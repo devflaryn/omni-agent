@@ -214,7 +214,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, insert, getPi
     const box = $("#graphNode");
     if (!n) { box.innerHTML = ""; return; }
     const links = G.data.links.filter((l) => l.source === n.id || l.target === n.id).map((l) => { const other = G.data.nodes.find((x) => x.id === (l.source === n.id ? l.target : l.source)); return `<span class="lk">${esc(l.relation || "")}</span> ${esc(other?.label || "")}`; });
-    box.innerHTML = `<b>${esc(n.label)}</b> <span class="lk">${esc(n.file || "")} ${esc(n.loc || "")}</span> · community ${n.community} · ${n.degree} links<br>${links.slice(0, 12).join("<br>")}${links.length > 12 ? `<br>… ${links.length - 12} more` : ""}`;
+    box.innerHTML = `<b>${esc(n.label)}</b> <span class="lk">${esc(n.file || "")} ${esc(n.loc || "")}</span> · community ${esc(n.community)} · ${esc(n.degree)} links<br>${links.slice(0, 12).join("<br>")}${links.length > 12 ? `<br>… ${links.length - 12} more` : ""}`;
   }
   (() => {
     const c = $("#graphCanvas");

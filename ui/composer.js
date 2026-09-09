@@ -1,5 +1,5 @@
 /* The composer card: textarea, + menu (file / memory / repo graph), access pill, model pill, send/stop. */
-import { el } from "./lib.js";
+import { el, esc } from "./lib.js";
 
 export const CLAUDE_MODELS = [["", "Default"], ["claude-opus-5", "Opus 5"], ["claude-fable-5-1", "Fable 5.1"], ["claude-sonnet-5", "Sonnet 5"], ["claude-haiku-4-5", "Haiku 4.5"]];
 
@@ -33,6 +33,7 @@ export function createComposer(root, h) {
   const seg = q('[data-role="target"]'), access = q('[data-role="access"]'), modelBtn = q('[data-role="model"]'), modelMenu = q('[data-role="modelMenu"]');
   const caption = q(".caption"), send = q('[data-role="send"]');
   const st = { harness: "claude", streaming: false, disabled: false, caption: "", autonomous: true, claudeModel: "", piModel: null, piThinking: "", models: [], levels: [] };
+  let menuDirty = true;
 
   const autosize = () => { ta.style.height = "auto"; ta.style.height = `${Math.min(ta.scrollHeight, 260)}px`; };
   const closeMenus = () => { plusMenu.hidden = true; modelMenu.hidden = true; };
@@ -71,7 +72,7 @@ export function createComposer(root, h) {
     seg.querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("active", x.dataset.target === st.harness));
     const lbl = modelBtn.querySelector(".lbl");
     if (claude) { const name = (CLAUDE_MODELS.find(([id]) => id === st.claudeModel) || CLAUDE_MODELS[0])[1]; lbl.innerHTML = `<b>${name}</b>`; }
-    else lbl.innerHTML = `<b>${st.piModel?.id || "pi model"}</b>${st.piThinking ? ` <span>${st.piThinking}</span>` : ""}`;
+    else lbl.innerHTML = `<b>${esc(st.piModel?.id || "pi model")}</b>${st.piThinking ? ` <span>${esc(st.piThinking)}</span>` : ""}`;
     caption.textContent = st.caption;
     caption.title = st.caption;
     send.disabled = st.disabled;
@@ -79,7 +80,10 @@ export function createComposer(root, h) {
     send.textContent = st.streaming ? "" : "↑";
     send.title = st.streaming ? "Stop" : "Send (Enter)";
     renderPills();
-    renderModelMenu();
+    // Rebuild only when something menu-relevant changed, and never while it's open (a mid-open
+    // rebuild destroys the button the user is about to click). The model button's click handler
+    // forces a fresh build right before opening, so staying dirty while open is harmless.
+    if (menuDirty && modelMenu.hidden) { renderModelMenu(); menuDirty = false; }
   }
   function submit() {
     if (st.disabled) return;
@@ -92,17 +96,23 @@ export function createComposer(root, h) {
   plus.onclick = (e) => { e.stopPropagation(); modelMenu.hidden = true; plusMenu.hidden = !plusMenu.hidden; };
   plusMenu.querySelector('[data-act="file"]').onclick = () => { closeMenus(); h.onPickFile?.(); };
   plusMenu.querySelectorAll("[data-opt]").forEach((i) => i.addEventListener("change", renderPills));
-  seg.addEventListener("click", (e) => { const b = e.target.closest(".seg-btn"); if (!b) return; st.harness = b.dataset.target; render(); });
+  seg.addEventListener("click", (e) => { const b = e.target.closest(".seg-btn"); if (!b) return; st.harness = b.dataset.target; menuDirty = true; render(); });
   access.onclick = () => { st.autonomous = !st.autonomous; render(); };
-  modelBtn.onclick = (e) => { e.stopPropagation(); plusMenu.hidden = true; modelMenu.hidden = !modelMenu.hidden; };
+  modelBtn.onclick = (e) => {
+    e.stopPropagation();
+    plusMenu.hidden = true;
+    const opening = modelMenu.hidden;
+    if (opening) { renderModelMenu(); menuDirty = false; }
+    modelMenu.hidden = !modelMenu.hidden;
+  };
   send.onclick = submit;
   ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } });
   ta.addEventListener("input", autosize);
   render();
 
   return {
-    setState(patch) { Object.assign(st, patch); render(); },
-    setPiChoices({ models, levels }) { if (models) st.models = models; if (levels) st.levels = levels; render(); },
+    setState(patch) { Object.assign(st, patch); menuDirty = true; render(); },
+    setPiChoices({ models, levels }) { if (models) st.models = models; if (levels) st.levels = levels; menuDirty = true; render(); },
     getOptions,
     insert(text) { ta.value += `${ta.value && !/\s$/.test(ta.value) ? " " : ""}${text}`; autosize(); ta.focus(); },
     focus() { ta.focus(); },
