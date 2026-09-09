@@ -70,6 +70,13 @@ def msgbox(title, text):
     print(f"{title}: {text}", file=sys.stderr)
 
 
+def kill_tree(proc):
+    if WIN:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], creationflags=CREATE_NO_WINDOW, capture_output=True)
+    else:
+        proc.terminate()
+
+
 def start_server(p):
     log = open(p["log"], "ab")
     kwargs = {"cwd": p["root"], "stdout": log, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
@@ -83,6 +90,8 @@ def start_server(p):
         if proc.poll() is not None:
             break
         time.sleep(0.25)
+    if proc.poll() is None:
+        kill_tree(proc)
     return None
 
 
@@ -96,10 +105,7 @@ def shutdown(p, proc):
     while proc.poll() is None and time.time() < deadline:
         time.sleep(0.1)
     if proc.poll() is None:
-        if WIN:
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], creationflags=CREATE_NO_WINDOW, capture_output=True)
-        else:
-            proc.terminate()
+        kill_tree(proc)
 
 
 def open_window(url):
@@ -135,6 +141,7 @@ def fallback(url):
     else:
         webbrowser.open(url)
         msgbox("Omni Agent", "pywebview is not installed for this Python, so Omni opened in your browser instead.\nInstall it with:  pip install pywebview")
+    return True
 
 
 def main(argv):
@@ -151,11 +158,17 @@ def main(argv):
         if started is None:
             msgbox("Omni Agent", f"The server did not start on port {p['port']}. See omni.log in the Omni Agent folder.")
             return 1
-    if open_window(p["url"]):
-        if started is not None:
+    keep = False
+    try:
+        if not open_window(p["url"]):
+            fallback(p["url"])
+            keep = True
+    except Exception as e:  # webview import worked but the window failed (e.g. no WebView2 runtime)
+        msgbox("Omni Agent", f"The window could not be opened: {e}\nOpen {p['url']} in a browser instead.")
+        return 1
+    finally:
+        if started is not None and not keep:
             shutdown(p, started)
-    else:
-        fallback(p["url"])
     return 0
 
 

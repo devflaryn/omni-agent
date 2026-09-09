@@ -24,3 +24,11 @@ test("desktop launcher defaults cwd to the Desktop", { skip: !havePython && "pyt
   const plan = JSON.parse(r.stdout);
   assert.match(plan.args[plan.args.indexOf("--cwd") + 1], /Desktop$/);
 });
+
+test("desktop launcher --plan emits exactly one --port followed by the value", { skip: !havePython && "python not on PATH" }, () => {
+  const r = spawnSync("python", [script, "--plan", "--port", "4567"], { encoding: "utf8" });
+  const plan = JSON.parse(r.stdout);
+  const count = plan.args.filter((a) => a === "--port").length;
+  assert.equal(count, 1);
+  assert.equal(plan.args[plan.args.indexOf("--port") + 1], "4567");
+});
