@@ -218,3 +218,39 @@ test("continue with fork:true and a cancelled clone (stubbed pi): 409, no prompt
   assert.equal(r.status, 409);
   assert.ok(!fakePi.calls.some((c) => c[0] === "prompt"), "prompt must not be called after a cancelled clone");
 });
+
+// ------------------------------------------------------------ claude task (pi → Claude delegation)
+test("claude task: runs Claude Code, waits for the result, returns the final text and session id", async () => {
+  const pending = post("/api/claude/task", { prompt: "count the files", cwd: "C:\p", memory: false, title: "Task from pi: count the files" });
+  await sleep(120);
+  const call = claudeCalls.at(-1);
+  assert.ok(call.args.includes("--session-id"), "a fresh task gets its own session id");
+  const sessionId = call.args[call.args.indexOf("--session-id") + 1];
+  call.proc.stdout.write(`${JSON.stringify({ type: "system", subtype: "init", session_id: sessionId, cwd: "C:\p", model: "m" })}\n`);
+  call.proc.stdout.write(`${JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "There are 3 files.", total_cost_usd: 0.01, num_turns: 2, duration_ms: 500, session_id: sessionId })}\n`);
+  call.proc.emit("exit", 0);
+  const r = await pending;
+  assert.equal(r.sid, `claude:${sessionId}`);
+  assert.equal(r.sessionId, sessionId);
+  assert.equal(r.text, "There are 3 files.");
+  assert.equal(r.isError, false);
+  assert.equal(r.turns, 2);
+  assert.equal(r.timedOut, false);
+  const st = await api("/api/state");
+  assert.equal(st.sessions.find((s) => s.sid === r.sid)?.title, "Task from pi: count the files");
+});
+
+test("claude task: times out with whatever it has and reports timedOut", async () => {
+  const pending = post("/api/claude/task", { prompt: "slow task", cwd: "C:\p", memory: false, timeoutSec: 0.3 });
+  await sleep(50);
+  const call = claudeCalls.at(-1);
+  const r = await pending;
+  assert.equal(r.timedOut, true);
+  assert.equal(r.text, "");
+  call.proc.emit("exit", 0);
+});
+
+test("claude task: empty prompt → 400", async () => {
+  const r = await fetch(`http://127.0.0.1:${port}/api/claude/task`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: " " }) });
+  assert.equal(r.status, 400);
+});

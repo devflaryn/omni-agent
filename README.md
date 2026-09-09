@@ -82,15 +82,21 @@ node scripts/install.mjs --claude-hook # Claude Code: SessionStart hook that inj
 node scripts/install.mjs --uninstall
 ```
 
-The pi extension is copied to `~/.pi/agent/extensions/omni-memory.ts` and reads
-`~/.pi/agent/omni-agent.json` (`autoRecall`, `budgetTokens`). With auto recall on, every
-pi prompt gets a small `<omni-memory>` pack appended to the system prompt.
+Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/omni-agent.json`:
+
+- `omni-memory.ts` (`autoRecall`, `budgetTokens`): the memory tools. With auto recall on, every
+  pi prompt gets a small `<omni-memory>` pack appended to the system prompt.
+- `omni-claude.ts` (`port`): a `claude_task` tool so the pi model (your local Qwen) can hand a
+  task to Claude Code and wait for the answer. The run shows up in Omni as its own chat
+  ("Task from pi: …"); the tool returns Claude's final text plus a session id that can be passed
+  back as `resume` for a follow-up. Omni Agent must be running.
 
 ## Config
 
 `omni.config.json` in this folder (all optional): `port`, `cwd`, `vaultDir`, `piModel`,
 `piProvider`, `autoStartPi`, `digestIdleSec`, `tailRecentHours`, `memoryBudgetTokens`,
-`claudeBin`, `piCli`.
+`claudeBin`, `piCli`, `piModels` (model-picker allowlist, e.g. `["orca/*"]` to show only the local Qwen and
+hide OpenRouter's catalogue), `claudeTaskTimeoutSec`.
 
 ## Layout
 

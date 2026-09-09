@@ -13,6 +13,7 @@ import { Bus } from "./bus.mjs";
 import { PiRpc } from "./pi-rpc.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
+import { filterPiModels } from "./pi-models.mjs";
 import { SessionRegistry, SessionWatcher } from "./watchers.mjs";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
@@ -180,6 +181,20 @@ export async function createApp(overrides = {}) {
     return { sid: pi.sid, pending: false, forked: !!plan.clone, forkedFrom: plan.clone ? sid : null };
   }
 
+  /** Resolve when a Claude run ends (its `run` event), or after `ms` with whatever exists. */
+  function waitForRun(sid, ms) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (out) => { if (done) return; done = true; clearTimeout(timer); bus.off("event", onEvent); resolve(out); };
+      const onEvent = (ev) => {
+        if (ev.sid !== sid) return;
+        if (ev.kind === "run") finish({ text: ev.text || "", isError: !!ev.isError, cost: ev.cost || 0, turns: ev.turns || 0, durationMs: ev.durationMs || 0, timedOut: false });
+      };
+      const timer = setTimeout(() => finish({ text: "", isError: false, cost: 0, turns: 0, durationMs: ms, timedOut: true }), ms);
+      bus.on("event", onEvent);
+    });
+  }
+
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const p = url.pathname;
@@ -256,13 +271,23 @@ export async function createApp(overrides = {}) {
           case "/api/pi/thinking": return send(res, 200, await requirePi().setThinking(body.level));
           case "/api/pi/compact": return send(res, 200, await requirePi().compact());
           case "/api/pi/stats": return send(res, 200, await requirePi().stats());
-          case "/api/pi/models": return send(res, 200, await requirePi().models());
+          case "/api/pi/models": { const r = await requirePi().models(); if (r?.data?.models) r.data.models = filterPiModels(r.data.models, cfg.piModels); return send(res, 200, r); }
           case "/api/pi/thinking-levels": return send(res, 200, await requirePi().thinkingLevels());
           case "/api/pi/state": return send(res, 200, await requirePi().refreshState());
           default: return send(res, 404, { error: "unknown pi route" });
         }
       }
       // claude
+      // pi (or any local caller) hands Claude Code a task and waits for the answer
+      if (req.method === "POST" && p === "/api/claude/task") {
+        if (!isLocal(req)) return send(res, 403, { error: "local only" });
+        const body = await readBody(req);
+        if (!body.prompt?.trim()) return send(res, 400, { error: "empty prompt" });
+        const c = await composePrompt("claude", body.prompt, { memory: body.memory, graph: body.graph, dir: body.cwd || cfg.cwd });
+        const r = claude.run({ prompt: body.prompt, cwd: body.cwd || cfg.cwd, model: body.model, resume: body.resume, appendSystem: c.system, autonomous: body.autonomous !== false, maxTurns: body.maxTurns, title: body.title });
+        const out = await waitForRun(r.sid, Math.max(1, Number(body.timeoutSec) || cfg.claudeTaskTimeoutSec) * 1000);
+        return send(res, 200, { sid: r.sid, sessionId: r.sessionId, ...out });
+      }
       if (req.method === "POST" && p === "/api/claude/run") {
         const body = await readBody(req);
         const c = await composePrompt("claude", body.prompt || "", { memory: body.memory, graph: body.graph, dir: body.cwd || cfg.cwd });

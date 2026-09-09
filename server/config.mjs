@@ -65,6 +65,10 @@ export const CONFIG = {
   cwd: argVal("--cwd", process.env.OMNI_CWD || fc.cwd || join(HOME, "Desktop")),
   piModel: argVal("--model", fc.piModel || ""),
   piProvider: argVal("--provider", fc.piProvider || ""),
+  /** Model picker allowlist, "provider/id" patterns with `*` (e.g. ["orca/*"]). Unset → every model pi knows. */
+  piModels: Array.isArray(fc.piModels) ? fc.piModels : null,
+  /** Longest a `POST /api/claude/task` (pi → Claude delegation) waits before returning what it has. */
+  claudeTaskTimeoutSec: fc.claudeTaskTimeoutSec || 900,
   /** Start the pi child at boot. `--no-pi` or {"autoStartPi":false} disables it. */
   autoStartPi: !process.argv.includes("--no-pi") && fc.autoStartPi !== false,
   /** Seconds of quiet after which a session digest is written to the vault. */

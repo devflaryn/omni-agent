@@ -2,7 +2,7 @@
 /**
  * Wire Omni Agent into the harnesses.
  *
- *   node scripts/install.mjs               install the pi extension + config
+ *   node scripts/install.mjs               install the pi extensions (memory tools + claude_task) + config
  *   node scripts/install.mjs --claude-hook also register the Claude Code SessionStart hook (user settings)
  *   node scripts/install.mjs --uninstall   remove both
  */
@@ -15,6 +15,7 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const HOME = homedir();
 const piAgent = join(HOME, ".pi", "agent");
 const extDir = join(piAgent, "extensions");
+const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts"];
 const extTarget = join(extDir, "omni-memory.ts");
 const piCfg = join(piAgent, "omni-agent.json");
 const claudeSettings = join(HOME, ".claude", "settings.json");
@@ -24,7 +25,7 @@ const args = new Set(process.argv.slice(2));
 function readJson(p, dflt) { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return dflt; } }
 
 if (args.has("--uninstall")) {
-  if (existsSync(extTarget)) { rmSync(extTarget); console.log("removed", extTarget); }
+  for (const f of EXTENSIONS) { const t = join(extDir, f); if (existsSync(t)) { rmSync(t); console.log("removed", t); } }
   if (existsSync(piCfg)) { rmSync(piCfg); console.log("removed", piCfg); }
   const s = readJson(claudeSettings, null);
   if (s?.hooks?.SessionStart) {
@@ -37,10 +38,11 @@ if (args.has("--uninstall")) {
 }
 
 mkdirSync(extDir, { recursive: true });
-copyFileSync(join(ROOT, "integrations", "pi", "omni-memory.ts"), extTarget);
-const cfg = { ...readJson(piCfg, {}), root: ROOT, vault: join(ROOT, "vault"), autoRecall: true, budgetTokens: 800 };
+for (const f of EXTENSIONS) copyFileSync(join(ROOT, "integrations", "pi", f), join(extDir, f));
+const omniCfg = readJson(join(ROOT, "omni.config.json"), {});
+const cfg = { ...readJson(piCfg, {}), root: ROOT, vault: join(ROOT, "vault"), autoRecall: true, budgetTokens: 800, port: Number(omniCfg.port) || 4400 };
 writeFileSync(piCfg, JSON.stringify(cfg, null, 2));
-console.log("pi extension installed:", extTarget);
+console.log("pi extensions installed:", EXTENSIONS.map((f) => join(extDir, f)).join(", "));
 console.log("pi config written:", piCfg);
 
 if (args.has("--claude-hook")) {

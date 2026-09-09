@@ -30,7 +30,7 @@ export class ClaudeRunner {
     return [...this.runs.values()].map(({ proc, ...r }) => r);
   }
 
-  run({ prompt, cwd, model, resume, fork = false, forkedFrom = null, appendSystem, autonomous = true, maxTurns, allowedTools }) {
+  run({ prompt, cwd, model, resume, fork = false, forkedFrom = null, appendSystem, autonomous = true, maxTurns, allowedTools, title }) {
     if (!prompt?.trim()) throw new Error("empty prompt");
     const pending = !!(resume && fork);
     if (fork && !forkedFrom) forkedFrom = `claude:${resume}`;
@@ -50,7 +50,7 @@ export class ClaudeRunner {
     const run = { sid, sessionId, cwd, model: model || null, resume: !!resume, fork: !!fork, forkedFrom, pending, startedAt: Date.now(), alive: true, exitCode: null, cost: 0, proc, prompt: prompt.slice(0, 500) };
     this.runs.set(sid, run);
     const ctx = { sid, harness: "claude" };
-    const title = prompt.replace(/\s+/g, " ").slice(0, 80);
+    title = (title || prompt).replace(/\s+/g, " ").slice(0, 80);
 
     const announce = () => {
       this.bus.emit({ ...ctx, kind: "session", ts: Date.now(), owned: true, cwd, sessionId: run.sessionId, model: model || null, title, forkedFrom: run.forkedFrom || undefined });
