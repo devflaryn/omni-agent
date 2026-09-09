@@ -9,12 +9,17 @@ It continues and replaces `Desktop/pi/pi-gui`.
 
 ## Run
 
-Double-click **Omni Agent** on the Desktop (a shortcut to `start.cmd`), or:
+Double-click **Omni Agent.cmd** (or a Desktop shortcut pointing at `pythonw.exe "…\desktop\omni_desktop.pyw"`).
+It starts the server hidden, opens a native window, and turns LAN access on so phones and laptops on
+your network can open the link shown in the sidebar footer. Needs Node 22+ and Python 3.11+ with
+`pip install pywebview`; without pywebview it falls back to an Edge app window, then your browser.
+
+Console mode is still there:
 
 ```
-start.cmd                      # opens http://127.0.0.1:4400, pi works in Desktop
+start.cmd                      # opens http://127.0.0.1:4400 in the browser, pi works in Desktop
 start.cmd "C:\some\project"    # pi works in that folder (the Graph tab uses this folder)
-start.cmd . --lan              # also reachable from phones/laptops on your network
+start.cmd . --lan              # also reachable from other devices on your network
 node server/index.mjs --no-pi  # observe only, don't start a pi child
 ```
 
@@ -40,21 +45,21 @@ Tests: `npm test`.
 
 ## What you get
 
-- **Sessions rail**: pi and Claude Code sessions grouped by harness. A pulsing dot means it
-  is working right now. "in Omni" marks sessions this app controls.
-- **Transcript**: one renderer for four sources:
-  - pi run from Omni (`pi --mode rpc`): token deltas, animated.
-  - Claude Code run from Omni (`claude -p --output-format stream-json --include-partial-messages`): token deltas, animated.
-  - pi run in a terminal: its session file is tailed, whole messages appear.
-  - Claude Code run in a terminal: its project file is tailed, whole content blocks appear.
-- **Composer**: sends to Omni's pi (steers it while it works), or resumes a Claude Code session.
-  "Attach relevant memory" prefixes a small, token-budgeted pack of vault notes instead of
-  whole files.
-- **Memory tab**: search, edit, save notes; import Claude Code's auto-memory; rebuild the index;
-  write a digest for the selected session now.
-- **Tokens tab**: input, output, cache read/write, cost (Claude price table, pi provider cost),
-  and a context bar that warns when a session should be compacted.
-- **Files tab**: browse the selected session's working directory and reference a file in a prompt.
+- **Sidebar**: every pi and Claude Code chat on this machine, grouped by day. A pulsing dot means it
+  is working right now; "in Omni" marks chats this app controls.
+- **Chat**: one renderer for four sources (pi and Claude Code run from Omni stream token by token;
+  chats run in a terminal appear whole). Tool calls fold into "Worked for 8m 4s" rows, edits
+  become an "Edited N files +a −b" card, and every turn shows
+  `Thinking… 11m 20s · 15k tokens · 86 tok/sec` while the model works.
+- **Continue any chat**: type into a chat that is closed and it resumes in place
+  (`claude -p --resume`, or Omni's pi switches to that session file). Type into a chat that is still
+  open in a terminal and Omni forks it (`--fork-session` / pi `clone`) so the terminal copy is
+  never touched. The composer caption says which will happen. "Fork into a new chat" in the ··· menu
+  forces a fork.
+- **Composer**: "Do anything", + for file references, memory and repo-graph attachments, an access
+  pill (Full access / Ask) for Claude Code, and a model / thinking picker.
+- **Right panel**: Tokens (usage, cost, context bar), Memory (search, edit, import, digest), Graph
+  (build and query a repo graph), Files (browse the chat's folder).
 
 ## The vault (`vault/`)
 
@@ -90,10 +95,10 @@ pi prompt gets a small `<omni-memory>` pack appended to the system prompt.
 ## Layout
 
 ```
-server/index.mjs      HTTP + SSE + routes           server/pi-rpc.mjs        pi --mode rpc child
-server/watchers.mjs   discovery, tailing, digests   server/claude-runner.mjs claude -p stream-json runs
-server/normalize.mjs  four sources -> one event     server/memory.mjs        the vault
-server/tokens.mjs     tally + prices                server/tailer.mjs / jsonl.mjs / bus.mjs / config.mjs
-ui/                   index.html, app.js, styles.css (no build step)
-integrations/         pi extension, Claude Code hook
+server/index.mjs      HTTP + SSE + routes           server/continue.mjs      resume-vs-fork decision
+server/pi-rpc.mjs     pi --mode rpc child           server/claude-runner.mjs claude -p stream-json runs
+server/watchers.mjs   discovery, tailing, digests   server/normalize.mjs     four sources -> one event
+server/memory.mjs     the vault                     server/tokens.mjs        tally + prices
+ui/                   index.html, styles.css, app.js + lib/transcript/composer/sidebar/panel modules
+desktop/              pywebview launcher            integrations/            pi extension, Claude Code hook
 ```
