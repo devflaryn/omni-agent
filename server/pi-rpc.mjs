@@ -62,7 +62,8 @@ export class PiRpc extends EventEmitter {
     });
     this.proc.on("error", (e) => this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "error", text: `pi spawn failed: ${e.message}` }));
     // Learn our session identity, then announce it.
-    this.refreshState().catch(() => {});
+    this.ready = this.refreshState();
+    this.ready.catch(() => {});
     return this;
   }
 
@@ -118,6 +119,10 @@ export class PiRpc extends EventEmitter {
   abort() { return this.send({ type: "abort" }); }
   async newSession() { const r = await this.send({ type: "new_session" }); await this.refreshState(); return r; }
   async switchSession(sessionPath) { const r = await this.send({ type: "switch_session", sessionPath }); await this.refreshState(); return r; }
+  /** Resolves when the child has answered get_state (its session id is known). */
+  waitReady() { return this.ready || Promise.reject(new Error("pi is not running")); }
+  /** Copies the current session into a new file and switches to it (the original stays untouched). */
+  async clone() { const r = await this.send({ type: "clone" }); await this.refreshState(); return r; }
   stats() { return this.send({ type: "get_session_stats" }); }
   models() { return this.send({ type: "get_available_models" }); }
   async setModel(provider, modelId) { const r = await this.send({ type: "set_model", provider, modelId }); await this.refreshState(); return r; }
