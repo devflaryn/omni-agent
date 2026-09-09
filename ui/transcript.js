@@ -71,7 +71,7 @@ function renderMeter(t) {
   let text;
   if (!t.done) { text = `Thinking… ${fmtDuration(ms)} · ${fmtN(tokens)} tokens`; if (ms >= 2000 && tokens) text += ` · ${tokRate(tokens, ms)} tok/sec`; }
   else if (!t.live) text = `Replied in ${fmtDuration(ms)}${tokens ? ` · ${fmtN(tokens)} tokens` : ""}`;
-  else text = `${t.sawThinking || !t.sawTool ? "Thought" : "Worked"} for ${fmtDuration(ms)} · ${fmtN(tokens)} tokens`;
+  else text = `${t.sawThinking || !t.sawTool ? "Thought" : "Worked"} for ${fmtDuration(ms)}${tokens ? ` · ${fmtN(tokens)} tokens` : ""}`;
   t.meter.textContent = text;
   t.meter.title = `${t.reported ? "Tokens reported by the provider" : "Tokens estimated from streamed text (chars ÷ 4)"}${t.thinkEls.length ? " · click to show reasoning" : ""}`;
   t.meter.classList.toggle("live", !t.done);
@@ -183,7 +183,7 @@ function editedCard(ed, cwd) {
   const head = el("div", "e-head");
   head.innerHTML = `<span class="e-title">Edited ${ed.files.length} file${ed.files.length === 1 ? "" : "s"}</span><span class="e-diff"><b class="add">+${ed.added}</b><b class="del">−${ed.removed}</b></span>`;
   const list = el("div", "e-list");
-  ed.files.forEach((f, i) => { const r = el("div", "e-row"); if (i >= 3) r.hidden = true; r.innerHTML = `<span class="e-path" title="${esc(f.path)}">${esc(relPath(f.path, cwd))}</span><span class="e-diff"><b class="add">+${f.added}</b><b class="del">−${f.removed}</b></span>`; list.appendChild(r); });
+  ed.files.forEach((f, i) => { const r = el("div", "e-row"); if (i >= 3) r.hidden = true; r.innerHTML = `<span class="e-path">${esc(relPath(f.path, cwd))}</span><span class="e-diff"><b class="add">+${f.added}</b><b class="del">−${f.removed}</b></span>`; r.querySelector(".e-path").title = f.path; list.appendChild(r); });
   c.append(head, list);
   if (ed.files.length > 3) { const more = el("button", "e-more", `Show ${ed.files.length - 3} more files ▾`); more.onclick = () => { list.querySelectorAll(".e-row[hidden]").forEach((r) => { r.hidden = false; }); more.remove(); }; c.appendChild(more); }
   return c;
@@ -223,7 +223,7 @@ export function applyEvent(view, ev) {
         t.lastMsgTs = Math.max(t.lastMsgTs, ev.ts || 0);
         if (ev.usage) { const g = ev.groupId || ev.id; if (g !== t.lastGroup) { t.lastGroup = g; t.committedOut += Math.max(ev.usage.output || 0, t.currentOut); t.currentOut = 0; t.estChars = 0; t.reported = true; } }
         if (view.stream && ev.live) {
-          const parts = [...view.stream.parts.values()].filter((p) => !p.done);
+          const parts = [...view.stream.parts.values()];
           for (const b of ev.blocks) {
             const p = parts.find((x) => (b.type === "tool_call" ? x.part === "tool_call" && x.card === view.tools.get(b.toolId) : x.part === b.type));
             if (p) { finishPart(p, b.text); if (b.type === "tool_call") setToolArgs(p.card, b.args); parts.splice(parts.indexOf(p), 1); }
@@ -251,7 +251,8 @@ export function applyEvent(view, ev) {
       break;
     }
     case "tool": {
-      const t = turnOf(view, ev.ts, true);
+      const t = turnOf(view, ev.ts, false);
+      t.lastMsgTs = Math.max(t.lastMsgTs, ev.ts || 0);
       const c = toolCard(view, t, ev);
       if (ev.phase === "start" && ev.args !== undefined) setToolArgs(c, ev.args);
       if (ev.phase === "update") { c.out.hidden = false; c.out.textContent = (ev.text || "").slice(-30000); }
