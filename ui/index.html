@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Omni Agent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<aside id="side">
+  <div class="side-top">
+    <div class="brand"><span class="mark"></span><span class="word">Omni Agent</span></div>
+    <button class="icon-btn only-small" id="btnCloseSide" title="Close">×</button>
+  </div>
+  <nav class="nav">
+    <button class="nav-item active" data-view="home">Home</button>
+    <button class="nav-item" data-view="chat">Chat</button>
+    <button class="nav-item" data-view="memory">Memory</button>
+    <button class="nav-item" data-view="graph">Graph</button>
+    <button class="nav-item" data-view="tokens">Tokens</button>
+    <button class="nav-item" data-view="files">Files</button>
+  </nav>
+  <button class="nav-item new-chat" id="btnNewChat">+ New chat</button>
+  <input id="sessionFilter" type="search" placeholder="Search history" />
+  <div id="history"></div>
+  <div class="side-foot">
+    <div class="pi-status" id="piStatus">pi: starting</div>
+    <div class="lan" id="lanInfo"></div>
+  </div>
+</aside>
+
+<main id="main">
+  <header id="top">
+    <button class="icon-btn only-small" id="btnOpenSide" title="Menu">☰</button>
+    <div class="top-title" id="topTitle">Home</div>
+    <div class="grow"></div>
+    <div class="top-model" id="topModel"></div>
+  </header>
+
+  <!-- Home -->
+  <section class="view active" id="view-home">
+    <div class="home">
+      <h1 class="hero">What should we work on?</h1>
+      <p class="hero-sub">Every pi and Claude Code session on this machine, one memory vault, live.</p>
+      <div class="composer home-composer">
+        <textarea id="homeInput" rows="1" placeholder="Describe the task, or ask a question"></textarea>
+        <div class="composer-bar">
+          <div class="seg" id="homeTarget">
+            <button class="seg-btn active" data-target="pi" title="Omni's pi harness">pi</button>
+            <button class="seg-btn" data-target="claude" title="Claude Code">Claude Code</button>
+          </div>
+          <select id="homeModel" class="pill" title="Claude model"><option value="">default model</option><option value="claude-opus-5">opus 5</option><option value="claude-fable-5-1">fable 5.1</option><option value="claude-sonnet-5">sonnet 5</option><option value="claude-haiku-4-5">haiku 4.5</option></select>
+          <label class="pill chk"><input type="checkbox" id="homeMemory" checked /> memory</label>
+          <label class="pill chk" title="Prepend a token-budgeted answer from the repo graph"><input type="checkbox" id="homeGraph" /> repo graph</label>
+          <span class="grow"></span>
+          <button class="send-btn" id="homeSend" title="Start">↑</button>
+        </div>
+      </div>
+      <div class="chips" id="dirChips"></div>
+      <div class="cwd-row"><span>Working directory</span><input id="homeCwd" /></div>
+      <div class="cards" id="homeCards"></div>
+    </div>
+  </section>
+
+  <!-- Chat -->
+  <section class="view" id="view-chat">
+    <div id="sessionHeader">
+      <div class="sh-title" id="shTitle">Pick a session</div>
+      <div class="sh-meta" id="shMeta">Choose a conversation from the history on the left, or start one from Home.</div>
+    </div>
+    <div id="transcriptWrap"><div id="transcript"></div></div>
+    <div id="composer">
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Message this session (Enter to send, Shift+Enter for a new line)"></textarea>
+        <div class="composer-bar">
+          <span class="target" id="composerTarget"></span>
+          <select id="optModel" class="pill" hidden><option value="">default model</option><option value="claude-opus-5">opus 5</option><option value="claude-fable-5-1">fable 5.1</option><option value="claude-sonnet-5">sonnet 5</option><option value="claude-haiku-4-5">haiku 4.5</option></select>
+          <label class="pill chk"><input type="checkbox" id="optMemory" checked /> memory</label>
+          <label class="pill chk" title="Prepend a token-budgeted answer from the repo graph"><input type="checkbox" id="optGraph" /> repo graph</label>
+          <label class="pill chk" id="optAutoWrap" hidden><input type="checkbox" id="optAuto" checked /> autonomous</label>
+          <span class="grow"></span>
+          <span id="liveTokens"></span>
+          <button class="send-btn" id="send">↑</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Memory -->
+  <section class="view page" id="view-memory">
+    <div class="page-inner">
+      <h2>Memory</h2>
+      <p class="lead">An Obsidian vault both harnesses read and write. One fact per note, linked with [[wikilinks]]; session digests land here on their own.</p>
+      <div class="row-tools">
+        <input id="memSearch" type="search" placeholder="Search the vault" />
+        <button class="btn" id="memNew">New memory</button>
+        <button class="btn quiet" id="memImport" title="Copy Claude Code's auto-memory notes into the vault">Import Claude memory</button>
+        <button class="btn quiet" id="memReindex">Rebuild index</button>
+        <button class="btn quiet" id="memOpen" title="Open the vault folder">Open vault folder</button>
+        <button class="btn quiet" id="memDigest" title="Write a digest for the current chat now">Digest current chat</button>
+      </div>
+      <div id="memList"></div>
+      <div id="memEditor" hidden>
+        <div class="mem-path" id="memPath"></div>
+        <textarea id="memText" spellcheck="false"></textarea>
+        <div class="row-tools">
+          <button class="btn primary" id="memSave">Save note</button>
+          <button class="btn quiet" id="memDelete">Delete</button>
+          <button class="btn quiet" id="memClose">Close</button>
+        </div>
+      </div>
+      <div id="memForm" hidden>
+        <input id="mfName" placeholder="Name (short, e.g. pi crash guard)" />
+        <input id="mfDesc" placeholder="One-line description used for recall" />
+        <select id="mfType"><option value="project">project</option><option value="feedback">feedback</option><option value="user">user</option><option value="reference">reference</option></select>
+        <textarea id="mfBody" rows="6" placeholder="The fact. Link related notes with [[name]]."></textarea>
+        <div class="row-tools">
+          <button class="btn primary" id="mfSave">Save memory</button>
+          <button class="btn quiet" id="mfCancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Graph -->
+  <section class="view page" id="view-graph">
+    <div class="page-inner wide">
+      <h2>Repo graph</h2>
+      <p class="lead" id="graphDir">Pick a session or set a working directory on Home; that folder is the repo.</p>
+      <div class="row-tools">
+        <button class="btn primary" id="graphBuild" title="Run graphify (AST extraction, no LLM) and write file notes with wikilinks into the vault">Build repo graph</button>
+        <button class="btn quiet" id="graphRefresh">Refresh</button>
+        <button class="btn quiet" id="graphOpenNotes">Notes in vault</button>
+        <input id="graphFilter" type="search" placeholder="Filter nodes (file or symbol)" style="max-width:280px" />
+        <input id="graphLimit" type="number" value="150" min="20" max="600" title="Max nodes drawn" style="width:80px" />
+      </div>
+      <div class="lead" id="graphTotals"></div>
+      <canvas id="graphCanvas"></canvas>
+      <div class="lead">Drag to pan, wheel to zoom, click a node for its links. The full graph lives in Obsidian under Graphs/.</div>
+      <div id="graphNode"></div>
+      <div class="row-tools"><input id="graphQ" type="search" placeholder="Ask the graph (BFS over the repo)" /><button class="btn" id="graphAsk">Ask</button></div>
+      <pre id="graphAnswer" hidden></pre>
+    </div>
+  </section>
+
+  <!-- Tokens -->
+  <section class="view page" id="view-tokens">
+    <div class="page-inner">
+      <h2>Tokens</h2>
+      <div class="stat-block">
+        <div class="stat-title" id="statTitle">Current chat</div>
+        <div class="tiles" id="statTiles"></div>
+        <div class="ctx"><div class="ctx-bar"><div id="ctxFill"></div></div><div class="ctx-label" id="ctxLabel"></div></div>
+      </div>
+      <div class="stat-block">
+        <div class="stat-title">All sessions today</div>
+        <div class="tiles" id="statAll"></div>
+      </div>
+      <div class="stat-block">
+        <div class="stat-title">Costliest sessions</div>
+        <div id="statTop"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Files -->
+  <section class="view page" id="view-files">
+    <div class="page-inner">
+      <h2>Files</h2>
+      <div class="lead mono" id="filesRoot"></div>
+      <div id="tree"></div>
+    </div>
+  </section>
+</main>
+
+<div id="viewer" hidden><div class="vcard">
+  <div class="vhead"><span class="vpath" id="vpath"></span><button class="btn" id="vref">Reference in prompt</button><button class="btn quiet" id="vclose">Close</button></div>
+  <pre id="vbody"></pre>
+</div></div>
+
+<div id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>

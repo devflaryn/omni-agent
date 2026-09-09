@@ -1,0 +1,13 @@
+{
+  "name": "omni-agent",
+  "version": "0.1.0",
+  "description": "Omni Agent — local agentic OS: live pi + Claude Code transcripts, Obsidian-vault memory manager, token accounting.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "test": "node --test",
+    "install-integrations": "node scripts/install.mjs"
+  }
+}

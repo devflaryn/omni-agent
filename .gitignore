@@ -1,0 +1,6 @@
+node_modules/
+vault/Sessions/
+vault/.obsidian/workspace*.json
+*.log
+graphify-out/
+omni.config.json
