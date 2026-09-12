@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -39,4 +39,28 @@ test("the shipped skills document the new omnidroid surface", () => {
   const input = readFileSync(join(process.cwd(), "skills", "omnidroid-input", "SKILL.md"), "utf8");
   assert.match(input, /^name: omnidroid-input$/m);
   assert.ok(input.includes("Driving without vision"));
+});
+
+test("install.mjs --openrouter writes the key to auth.json and the DeepSeek provider to models.json (merging)", () => {
+  const home = mkdtempSync(join(tmpdir(), "omni-home-"));
+  try {
+    const keyFile = join(home, "openrouter.txt");
+    writeFileSync(keyFile, "sk-or-v1-test\n");
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", "models.json"), JSON.stringify({ providers: { orca: { baseUrl: "http://x/v1", api: "openai-completions", apiKey: "k", models: [{ id: "Qwen/Qwen3.8-27B" }] } } }));
+    const r = spawnSync(process.execPath, [script, "--openrouter"], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, OMNI_OPENROUTER_KEY_FILE: keyFile } });
+    assert.equal(r.status, 0, r.stderr);
+    const auth = JSON.parse(readFileSync(join(home, ".pi", "agent", "auth.json"), "utf8"));
+    assert.deepEqual(auth.openrouter, { type: "api_key", key: "sk-or-v1-test" });
+    const models = JSON.parse(readFileSync(join(home, ".pi", "agent", "models.json"), "utf8"));
+    assert.ok(models.providers.orca, "existing provider kept");
+    assert.equal(models.providers.openrouter.baseUrl, "https://openrouter.ai/api/v1");
+    assert.equal(models.providers.openrouter.api, "openai-completions");
+    assert.equal(models.providers.openrouter.apiKey, "sk-or-v1-test");
+    const m = models.providers.openrouter.models.find((x) => x.id === "deepseek/deepseek-v4-flash-0731");
+    assert.ok(m, "deepseek flash 0731 present");
+    assert.deepEqual(m.input, ["text"]);
+    const missing = spawnSync(process.execPath, [script, "--openrouter"], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, OMNI_OPENROUTER_KEY_FILE: join(home, "nope.txt") } });
+    assert.equal(missing.status, 1);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

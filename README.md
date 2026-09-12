@@ -118,12 +118,42 @@ Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/
   ("Task from pi: …"); the tool returns Claude's final text plus a session id that can be passed
   back as `resume` for a follow-up. Omni Agent must be running.
 
+## Models
+
+pi's model is data: `piProvider` / `piModel` in `omni.config.json` pick the default, `piModels` filters the
+picker. The normal driver is the local Qwen (`orca/*`, served OpenAI-style from modal). While that is
+down, the test driver is **DeepSeek V4 Flash 0731 on OpenRouter**, wired as pi's "other" OpenAI-compatible
+provider:
+
+1. Put the OpenRouter key in `openrouter.txt` at the repo root (one line; gitignored, never commit it).
+2. `node scripts/install.mjs --openrouter` writes the key to `~/.pi/agent/auth.json` (0600) and pins
+   `https://openrouter.ai/api/v1` + `deepseek/deepseek-v4-flash-0731` (text only, 1.3M context, tools)
+   in `~/.pi/agent/models.json`, merging with whatever is there.
+3. `omni.config.json`: `"piProvider": "openrouter", "piModel": "deepseek/deepseek-v4-flash-0731",
+   "piModels": ["orca/*", "openrouter/deepseek/*"]`.
+
+The server also hands `OPENROUTER_API_KEY` (from `openrouter.txt`, configurable via `apiKeyFiles`) to the
+pi child, so a `$OPENROUTER_API_KEY` reference in `models.json` resolves too. DeepSeek is not multimodal:
+the omnidroid skills carry a text-only verification loop for it; the production Qwen reads screenshots.
+
+### Headless runs
+
+```
+node scripts/headless.mjs --cwd workspace/deepseek-e2e --task-file workspace/deepseek-e2e/task.md --thinking low
+node scripts/headless.mjs --cwd ~/proj --task "boot admn1b12farm9 with --no-window and report debug-info" --max-seconds 600
+```
+
+Drives the same pi child the window uses (tools, extensions, skills, memory with `--memory`) with no GUI:
+one line per tool call and result, the assistant's text, then a summary (tools used, tokens, cost) and the
+full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at `--max-seconds` (0 = no cap).
+
 ## Config
 
 `omni.config.json` in this folder (all optional): `port`, `cwd`, `vaultDir`, `piModel`,
 `piProvider`, `autoStartPi`, `digestIdleSec`, `tailRecentHours`, `memoryBudgetTokens`,
-`claudeBin`, `piCli`, `piModels` (model-picker allowlist, e.g. `["orca/*"]` to show only the local Qwen and
-hide OpenRouter's catalogue), `claudeTaskTimeoutSec`.
+`claudeBin`, `piCli`, `piBin`, `piModels` (model-picker allowlist, e.g. `["orca/*"]` to show only the local Qwen and
+hide OpenRouter's catalogue), `apiKeyFiles` (`{ "ENV_NAME": "/path/key.txt" }` handed to pi as env; default
+`OPENROUTER_API_KEY` ← `openrouter.txt`), `claudeTaskTimeoutSec`.
 
 ## Layout
 
