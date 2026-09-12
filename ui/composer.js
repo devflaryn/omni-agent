@@ -57,11 +57,15 @@ export function createComposer(root, h) {
       for (const [id, name] of CLAUDE_MODELS) { const b = el("button", id === st.claudeModel ? "on" : "", name); b.onclick = () => { st.claudeModel = id; render(); closeMenus(); }; modelMenu.appendChild(b); }
       return;
     }
-    modelMenu.appendChild(el("div", "mh", "Thinking"));
-    for (const lv of st.levels) { const b = el("button", lv === st.piThinking ? "on" : "", lv); b.onclick = () => { st.piThinking = lv; h.onPiThinking?.(lv); render(); closeMenus(); }; modelMenu.appendChild(b); }
-    modelMenu.appendChild(el("div", "mh", "Model"));
-    if (!st.models.length) modelMenu.appendChild(el("div", "mh", "pi is not running"));
-    for (const m of st.models) { const on = st.piModel && m.provider === st.piModel.provider && m.id === st.piModel.id; const b = el("button", on ? "on" : "", `${m.name || m.id} · ${m.provider}`); b.onclick = () => { st.piModel = { provider: m.provider, id: m.id }; h.onPiModel?.(m.provider, m.id); render(); closeMenus(); }; modelMenu.appendChild(b); }
+    if (st.levels.length) {
+      modelMenu.appendChild(el("div", "mh", "Thinking"));
+      for (const lv of st.levels) { const b = el("button", lv === st.piThinking ? "on" : "", lv); b.onclick = () => { st.piThinking = lv; h.onPiThinking?.(lv); render(); closeMenus(); }; modelMenu.appendChild(b); }
+    }
+    if (st.models.length) {
+      modelMenu.appendChild(el("div", "mh", "Model"));
+      for (const m of st.models) { const on = st.piModel && m.provider === st.piModel.provider && m.id === st.piModel.id; const b = el("button", on ? "on" : "", `${m.name || m.id} · ${m.provider}`); b.onclick = () => { st.piModel = { provider: m.provider, id: m.id }; h.onPiModel?.(m.provider, m.id); render(); closeMenus(); }; modelMenu.appendChild(b); }
+    }
+    if (!st.levels.length && !st.models.length) modelMenu.appendChild(el("div", "menu-empty", "Loading pi options\u2026"));
   }
   function render() {
     const claude = st.harness === "claude";

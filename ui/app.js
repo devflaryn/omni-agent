@@ -41,11 +41,14 @@ async function setPiModel(provider, id) { try { await api("/api/pi/model", { pro
 async function setPiThinking(level) { try { await api("/api/pi/thinking", { level }); } catch (e) { toast(e.message, true); } }
 async function loadPiChoices() {
   if (!S.pi.running) return;
-  try {
-    const [m, l] = await Promise.all([api("/api/pi/models"), api("/api/pi/thinking-levels")]);
-    const choices = { models: m.data?.models || [], levels: l.data?.levels || [] };
-    home.setPiChoices(choices); chat.setPiChoices(choices);
-  } catch { /* pi may still be starting */ }
+  const [m, l] = await Promise.allSettled([api("/api/pi/models"), api("/api/pi/thinking-levels")]);
+  const models = m.status === "fulfilled" ? (m.value.data?.models || []) : [];
+  const levels = l.status === "fulfilled" ? (l.value.data?.levels || []) : [];
+  // Only push what actually loaded, so one failing call never blanks the other.
+  const choices = {};
+  if (models.length) choices.models = models;
+  if (levels.length) choices.levels = levels;
+  if (choices.models || choices.levels) { home.setPiChoices(choices); chat.setPiChoices(choices); }
 }
 function piModelState() { const mdl = S.pi.state?.model; return { piModel: mdl ? { provider: mdl.provider, id: mdl.id } : null, piThinking: S.pi.state?.thinkingLevel || "" }; }
 

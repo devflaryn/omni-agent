@@ -9,6 +9,14 @@ import { createLineSplitter } from "./jsonl.mjs";
 import { normalizePiRpcEvent } from "./normalize.mjs";
 
 const normPath = (p) => (p ? resolve(String(p)).toLowerCase() : "");
+
+/**
+ * Thinking levels `set_thinking_level` accepts. pi has no RPC to enumerate them
+ * (the old `get_available_thinking_levels` was removed), so the picker uses this
+ * fixed set. "off" turns thinking off; the rest turn it on at a level. xhigh/max
+ * exist only on a few models and are omitted here.
+ */
+export const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"];
 /** Throws when an RPC response failed or was cancelled, so callers can't silently proceed. */
 const ok = (r, what) => {
   if (!r?.success) throw new Error(r?.error || `${what} failed`);
@@ -136,7 +144,7 @@ export class PiRpc extends EventEmitter {
   models() { return this.send({ type: "get_available_models" }); }
   async setModel(provider, modelId) { const r = await this.send({ type: "set_model", provider, modelId }); await this.refreshState(); return r; }
   async setThinking(level) { const r = await this.send({ type: "set_thinking_level", level }); await this.refreshState(); return r; }
-  thinkingLevels() { return this.send({ type: "get_available_thinking_levels" }); }
+  thinkingLevels() { return { success: true, data: { levels: PI_THINKING_LEVELS } }; }
   compact() { return this.send({ type: "compact" }, { timeoutMs: 600000 }); }
   messages() { return this.send({ type: "get_messages" }); }
 }

@@ -298,3 +298,5 @@ body:not(.panel-open) #panel { display: none; }
 .hist-del { flex: 0 0 auto; opacity: 0; background: transparent; border: 0; color: var(--dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 6px 8px; margin-right: 2px; border-radius: 6px; transition: opacity .12s; }
 .hist-row:hover .hist-del, .hist-row.active .hist-del, .hist-del:focus-visible { opacity: 0.75; }
 .hist-del:hover { opacity: 1; color: var(--text); background: var(--bg-3); }
+
+.menu .menu-empty { color: var(--muted); font-size: 12px; padding: 8px 10px; }
