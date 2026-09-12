@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
-import { findPiCli, apiKeyEnv } from "../server/config.mjs";
+import { findPiCli, apiKeyEnv, piChildEnv } from "../server/config.mjs";
 
 const REL = join("@earendil-works", "pi-coding-agent", "dist", "cli.js");
 
@@ -63,5 +63,19 @@ test("apiKeyEnv reads one-line key files into env vars and skips missing ones", 
     const env = apiKeyEnv({ OPENROUTER_API_KEY: join(root, "openrouter.txt"), OTHER_KEY: join(root, "nope.txt") });
     assert.deepEqual(env, { OPENROUTER_API_KEY: "sk-or-v1-abc" });
     assert.deepEqual(apiKeyEnv({}), {});
+  } finally { cleanup(); }
+});
+
+test("piChildEnv exports OMNI_DISPLAY from emulatorDisplay, honoring off-switches and key files", () => {
+  const { root, cleanup } = layout();
+  try {
+    writeFileSync(join(root, "or.txt"), "sk-or-test\n");
+    const base = { apiKeyFiles: { OPENROUTER_API_KEY: join(root, "or.txt") } };
+    assert.deepEqual(piChildEnv({ ...base, emulatorDisplay: "1600x1000" }), { OPENROUTER_API_KEY: "sk-or-test", OMNI_DISPLAY: "1600x1000" });
+    assert.deepEqual(piChildEnv({ ...base, emulatorDisplay: "1920x1200@240" }).OMNI_DISPLAY, "1920x1200@240");
+    for (const off of ["", "native", "off", "  ", "0", "false"]) {
+      assert.ok(!("OMNI_DISPLAY" in piChildEnv({ ...base, emulatorDisplay: off })), `off: ${JSON.stringify(off)}`);
+    }
+    assert.deepEqual(piChildEnv({ emulatorDisplay: "1280x800" }), { OMNI_DISPLAY: "1280x800" });
   } finally { cleanup(); }
 });

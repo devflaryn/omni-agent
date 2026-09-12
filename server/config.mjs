@@ -100,6 +100,9 @@ export const CONFIG = {
   piBin: fc.piBin || "pi",
   /** Key files handed to the pi child as environment variables (one line each, gitignored). */
   apiKeyFiles: { OPENROUTER_API_KEY: join(ROOT, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },
+  /** Guest resolution (WxH[@DPI]) exported as OMNI_DISPLAY to the pi child, so any omnidroid
+   *  the model launches boots at a higher default resolution. Empty string / "native" = off. */
+  emulatorDisplay: fc.emulatorDisplay ?? "1600x1000",
   claudeBin: process.env.OMNI_CLAUDE_BIN || fc.claudeBin || "claude",
   graphifyBin: fc.graphifyBin || "graphify",
   cwd: argVal("--cwd", process.env.OMNI_CWD || fc.cwd || join(HOME, "Desktop")),
@@ -120,3 +123,13 @@ export const CONFIG = {
   /** A non-owned session file touched within this window counts as "still open in a terminal" → fork instead of resume. */
   liveWindowMs: fc.liveWindowMs || 30000,
 };
+
+/** Environment handed to the pi child: provider API keys (from key files) plus the
+ *  emulator display override, so omnidroid launched by the model uses the higher
+ *  default resolution. Pure so it is unit-testable. */
+export function piChildEnv(cfg = CONFIG) {
+  const env = { ...apiKeyEnv(cfg.apiKeyFiles || {}) };
+  const disp = String(cfg.emulatorDisplay || "").trim();
+  if (disp && !["native", "off", "0", "false"].includes(disp.toLowerCase())) env.OMNI_DISPLAY = disp;
+  return env;
+}

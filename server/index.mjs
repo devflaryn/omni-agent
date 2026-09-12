@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { promises as fs, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { extname, join, relative, resolve, sep } from "node:path";
-import { CONFIG, ROOT, apiKeyEnv, lanAddresses } from "./config.mjs";
+import { CONFIG, ROOT, lanAddresses, piChildEnv } from "./config.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
 import { PiRpc } from "./pi-rpc.mjs";
@@ -50,7 +50,7 @@ export async function createApp(overrides = {}) {
 
   function startPi(cwd = cfg.cwd) {
     if (pi) pi.stop();
-    pi = cfg.createPi ? cfg.createPi({ cwd, bus }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, env: apiKeyEnv(cfg.apiKeyFiles), bus });
+    pi = cfg.createPi ? cfg.createPi({ cwd, bus }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, env: piChildEnv(cfg), bus });
     pi.start();
     return pi;
   }
