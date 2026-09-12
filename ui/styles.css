@@ -291,3 +291,10 @@ body:not(.panel-open) #panel { display: none; }
   #transcript, #chatComposer { padding-left: 12px; padding-right: 12px; }
   .top-title { max-width: 40vw; }
 }
+
+/* Chat history rows with a hover delete button */
+.hist-row { position: relative; display: flex; align-items: center; }
+.hist-row .hist { flex: 1 1 auto; min-width: 0; }
+.hist-del { flex: 0 0 auto; opacity: 0; background: transparent; border: 0; color: var(--dim); cursor: pointer; font-size: 12px; line-height: 1; padding: 6px 8px; margin-right: 2px; border-radius: 6px; transition: opacity .12s; }
+.hist-row:hover .hist-del, .hist-row.active .hist-del, .hist-del:focus-visible { opacity: 0.75; }
+.hist-del:hover { opacity: 1; color: var(--text); background: var(--bg-3); }

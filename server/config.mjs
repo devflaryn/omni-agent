@@ -93,6 +93,8 @@ export const CONFIG = {
   lan,
   token,
   vaultDir: process.env.OMNI_VAULT || fc.vaultDir || join(ROOT, "vault"),
+  /** Deleted chats are moved here (recoverable), never hard-unlinked. */
+  trashDir: fc.trashDir || join(HOME, ".omni-agent", "trash"),
   piSessionsDir: fc.piSessionsDir || join(HOME, ".pi", "agent", "sessions"),
   claudeProjectsDir: fc.claudeProjectsDir || join(HOME, ".claude", "projects"),
   /** pi is launched as `node cli.js --mode rpc` (no shell, no quoting issues). */

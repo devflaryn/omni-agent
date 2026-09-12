@@ -31,6 +31,7 @@ export class SessionRegistry {
     for (const s of this.sessions.values()) if (s.file && normPath(s.file) === n) return s;
     return null;
   }
+  remove(sid) { const s = this.sessions.get(sid); this.sessions.delete(sid); return s || null; }
 }
 
 function sidForFile(harness, file) {
@@ -273,6 +274,31 @@ export class SessionWatcher {
       }
     }
     return { harness: s.harness, sid, cwd: s.cwd, title: s.title, model, startedAt, endedAt: endedAt || Date.now(), usage: tally, cost: tally?.cost || 0, prompts, lastAssistant, tools };
+  }
+
+  /** Remove a session: stop tailing it, move its .jsonl to the trash dir (recoverable),
+   *  and drop it from the registry + tally. Refuses (400) a session with no file. */
+  async deleteSession(sid, { trashDir }) {
+    const s = this.registry.get(sid);
+    if (!s) throw Object.assign(new Error("unknown session"), { status: 404 });
+    if (!s.file) throw Object.assign(new Error("session has no file to delete"), { status: 400 });
+    const file = s.file;
+    const key = normPath(file);
+    const tail = this.tails.get(key);
+    if (tail) { try { tail.stop(); } catch { /* ignore */ } this.tails.delete(key); }
+    this.dirty.delete(sid);
+    let trashed = null;
+    if (existsSync(file)) {
+      const dir = join(trashDir, s.harness);
+      await fs.mkdir(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      trashed = join(dir, `${basename(file, ".jsonl")}-${stamp}.jsonl`);
+      try { await fs.rename(file, trashed); }
+      catch (e) { if (e?.code === "EXDEV") { await fs.copyFile(file, trashed); await fs.unlink(file); } else throw e; }
+    }
+    this.registry.remove(sid);
+    this.tally.reset(sid);
+    return { sid, harness: s.harness, file, trashed };
   }
 
   stop() {

@@ -34,7 +34,7 @@ export async function createApp(overrides = {}) {
 
   // Owned sessions also need registry + tally bookkeeping from their live events.
   bus.on("event", (ev) => {
-    if (ev.kind === "log") return;
+    if (ev.kind === "log" || ev.kind === "removed") return;
     const s = registry.upsert(ev.sid, {});
     if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom });
     if (ev.kind === "status") s.streaming = !!ev.streaming;
@@ -245,6 +245,16 @@ export async function createApp(overrides = {}) {
       }
       if (req.method === "POST" && (m = /^\/api\/sessions\/([^/]+)\/continue$/.exec(p))) {
         return send(res, 200, await continueSession(decodeURIComponent(m[1]), await readBody(req)));
+      }
+      if (req.method === "DELETE" && (m = /^\/api\/sessions\/([^/]+)$/.exec(p))) {
+        const sid = decodeURIComponent(m[1]);
+        const s = registry.get(sid);
+        if (!s) return send(res, 404, { error: "unknown session" });
+        const live = s.owned || (pi?.owns(s.file) ?? false) || claude.owns(s.file || "") || (s.streaming && Date.now() - (s.lastActivity || 0) < cfg.liveWindowMs);
+        if (live) return send(res, 409, { error: "that chat is still live \u2014 stop it before deleting" });
+        const out = await watcher.deleteSession(sid, { trashDir: cfg.trashDir });
+        bus.emit({ sid, harness: s.harness, kind: "removed", ts: Date.now() });
+        return send(res, 200, { ok: true, trashed: out.trashed });
       }
       if (req.method === "POST" && p === "/api/shutdown") {
         if (!isLocal(req)) return send(res, 403, { error: "local only" });

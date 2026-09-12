@@ -1,7 +1,7 @@
 /* Session rail: grouped by day, harness dot, live pulse. */
 import { el, groupLabel } from "./lib.js";
 
-export function createSidebar({ S, onSelect, onNew }) {
+export function createSidebar({ S, onSelect, onNew, onDelete }) {
   const wrap = document.querySelector("#history"), filter = document.querySelector("#sessionFilter");
   const isLive = (s) => s.streaming || Date.now() - (s.lastActivity || 0) < 20000;
   function render() {
@@ -15,13 +15,23 @@ export function createSidebar({ S, onSelect, onNew }) {
     for (const s of list) {
       const g = groupLabel(s.lastActivity || s.mtime);
       if (g !== last) { wrap.appendChild(el("div", "hist-group", g)); last = g; }
+      const row = el("div", `hist-row${s.sid === S.selected ? " active" : ""}`);
       const b = el("button", `hist${s.sid === S.selected ? " active" : ""}${isLive(s) ? " live" : ""}`);
       b.dataset.h = s.harness;
       b.title = `${s.harness} · ${s.cwd || ""}${s.forkedFrom ? " · forked" : ""}`;
       b.textContent = s.title;
       if (s.owned) b.appendChild(el("span", "own", "in Omni"));
       b.onclick = () => onSelect(s.sid);
-      wrap.appendChild(b);
+      row.appendChild(b);
+      if (onDelete) {
+        const del = el("button", "hist-del");
+        del.textContent = "✕";
+        del.title = "Delete this chat";
+        del.setAttribute("aria-label", `Delete ${s.title}`);
+        del.onclick = (e) => { e.stopPropagation(); onDelete(s.sid); };
+        row.appendChild(del);
+      }
+      wrap.appendChild(row);
     }
     if (!list.length) wrap.appendChild(el("div", "hist-group", f ? "No matches." : "No chats yet."));
   }

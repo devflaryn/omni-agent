@@ -15,6 +15,7 @@ test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_
     assert.equal(r.status, 0, r.stderr);
     assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-memory.ts")));
     assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-claude.ts")));
+    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-graph.ts")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid", "SKILL.md")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid", "reference", "omni-cli.md")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid-input", "SKILL.md")));

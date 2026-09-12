@@ -62,7 +62,8 @@ Tests: `npm test`.
 ## What you get
 
 - **Sidebar**: every pi and Claude Code chat on this machine, grouped by day. A pulsing dot means it
-  is working right now; "in Omni" marks chats this app controls.
+  is working right now; "in Omni" marks chats this app controls. Hover a chat for a ✕ to delete it —
+  it moves to `~/.omni-agent/trash/` (recoverable) and a live chat is refused until it stops.
 - **Chat**: one renderer for four sources (pi and Claude Code run from Omni stream token by token;
   chats run in a terminal appear whole). Each run of tool calls folds into one line such as
   "Used the browser, edited files, ran commands"; open it for a row per tool ("Ran git status",
@@ -117,6 +118,10 @@ Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/
   task to Claude Code and wait for the answer. The run shows up in Omni as its own chat
   ("Task from pi: …"); the tool returns Claude's final text plus a session id that can be passed
   back as `resume` for a follow-up. Omni Agent must be running.
+- `omni-graph.ts` (`port`): `graph_build`, `graph_query` and `graph_explain` tools so the pi model
+  decides mid-turn to build a repo knowledge graph or read it instead of grinding through files.
+  They shell out to the local `graphify` (no model call), so they work even with the pi model
+  endpoint down. Omni Agent must be running.
 
 ## Models
 

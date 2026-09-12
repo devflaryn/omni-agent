@@ -17,9 +17,21 @@ async function api(path, body, method) {
 }
 function toast(text, err) { const t = el("div", `toast${err ? " err" : ""}`, text); $("#toasts").appendChild(t); setTimeout(() => t.remove(), err ? 7000 : 3500); }
 const currentDir = () => S.sessions.get(S.selected)?.cwd || $("#homeCwd").value.trim() || S.config?.cwd || null;
+async function deleteChat(sid) {
+  const s = S.sessions.get(sid);
+  const name = s?.title ? `“${s.title.slice(0, 40)}”` : "this chat";
+  if (!window.confirm(`Delete ${name}?\nIt moves to the Omni trash folder and disappears here.`)) return;
+  try {
+    await api(`/api/sessions/${encodeURIComponent(sid)}`, null, "DELETE");
+    S.sessions.delete(sid); S.buffers.delete(sid);
+    if (S.selected === sid) { S.selected = null; S.view = null; showView("home"); }
+    sidebar.render(); if (S.page === "home") renderHome();
+    toast("Chat deleted");
+  } catch (e) { toast(e.message, true); }
+}
 
 // ------------------------------------------------------------- modules
-const sidebar = createSidebar({ S, onSelect: (sid) => { selectSession(sid); showView("chat"); }, onNew: () => { showView("home"); home.focus(); } });
+const sidebar = createSidebar({ S, onSelect: (sid) => { selectSession(sid); showView("chat"); }, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat });
 const panel = createPanel({ S, api, toast, onSelect: (sid) => { selectSession(sid); showView("chat"); }, currentDir, insert: (t) => (S.page === "chat" ? chat : home).insert(t), getPiContextWindow: () => S.pi.state?.model?.contextWindow });
 const home = createComposer($("#homeComposer"), { showTarget: true, onSend: homeSend, onPickFile: () => panel.open("files"), onPiModel: setPiModel, onPiThinking: setPiThinking });
 const chat = createComposer($("#chatComposer"), { onSend: chatSend, onStop: chatStop, onPickFile: () => panel.open("files"), onPiModel: setPiModel, onPiThinking: setPiThinking });
@@ -200,6 +212,7 @@ function connect() {
 let railTimer = null;
 function handle(ev) {
   S.seq = Math.max(S.seq, ev.seq || 0);
+  if (ev.kind === "removed") { S.sessions.delete(ev.sid); S.buffers.delete(ev.sid); if (S.selected === ev.sid) { S.selected = null; S.view = null; showView("home"); } sidebar.render(); if (S.page === "home") renderHome(); return; }
   if (ev.kind === "log") { if (ev.level === "system") toast(ev.text); else if (ev.level === "graphify" && ev.text) panel.graphLine(ev.text.split("\n").pop()); return; }
   const s = S.sessions.get(ev.sid) || { sid: ev.sid, harness: ev.harness, lastActivity: 0, tally: null };
   if (ev.kind === "session") Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
