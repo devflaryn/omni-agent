@@ -48,9 +48,12 @@ Tests: `npm test`.
 - **Sidebar**: every pi and Claude Code chat on this machine, grouped by day. A pulsing dot means it
   is working right now; "in Omni" marks chats this app controls.
 - **Chat**: one renderer for four sources (pi and Claude Code run from Omni stream token by token;
-  chats run in a terminal appear whole). Tool calls fold into "Worked for 8m 4s" rows, edits
-  become an "Edited N files +a −b" card, and every turn shows
-  `Thinking… 11m 20s · 15k tokens · 86 tok/sec` while the model works.
+  chats run in a terminal appear whole). Each run of tool calls folds into one line such as
+  "Used the browser, edited files, ran commands"; open it for a row per tool ("Ran git status",
+  "Edited cli.py +3 −1", a subagent's task), and open a row for its arguments and output. The status
+  line `Thinking… 11m 20s · 15k tokens · 86 tok/sec` always sits below the turn; click it to open the
+  model's reasoning in a small scrollable drawer. That open/closed choice carries over to later
+  turns, and the line is not clickable when the provider returned no reasoning.
 - **Continue any chat**: type into a chat that is closed and it resumes in place
   (`claude -p --resume`, or Omni's pi switches to that session file). Type into a chat that is still
   open in a terminal and Omni forks it (`--fork-session` / pi `clone`) so the terminal copy is

@@ -118,3 +118,41 @@ export function md(src) {
     return `<p>${h}</p>`;
   }).join("");
 }
+
+// ------------------------------------------------------- tool labels
+const one = (s, n = 120) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n)}…` : t; };
+export function toolKind(name) {
+  const n = String(name || "");
+  if (/^mcp__claude-in-chrome__/i.test(n)) return "browser";
+  if (/^(bash|powershell|shell|sh|cmd|exec)$/i.test(n)) return "shell";
+  if (EDIT_TOOLS.test(n)) return "edit";
+  if (/^(read|cat|view)$/i.test(n)) return "read";
+  if (/^(grep|glob|find|ls|search|rg)$/i.test(n)) return "search";
+  if (/^(agent|task|claude_task|subagent)$/i.test(n)) return "agent";
+  if (/^(webfetch|websearch|fetch)$/i.test(n)) return "web";
+  if (/^mcp__/i.test(n)) return "mcp";
+  return "other";
+}
+export function toolLabel(name, args, cwd) {
+  const kind = toolKind(name), a = args && typeof args === "object" ? args : {};
+  const file = a.file_path || a.path || a.notebook_path || a.file;
+  switch (kind) {
+    case "shell": { const c = one(a.command || a.cmd); return { kind, text: c ? `Ran ${c}` : "Ran a command" }; }
+    case "edit": { const st = editStats(name, a); const verb = /^write$/i.test(name) ? "Wrote" : "Edited"; return { kind, text: `${verb} ${baseName(file) || "a file"}`, added: st?.added || 0, removed: st?.removed || 0 }; }
+    case "read": return { kind, text: file ? `Read ${relPath(file, cwd)}` : "Read a file" };
+    case "search": { const q = one(a.pattern || a.query || a.glob || a.path || a.command, 80); return { kind, text: q ? `Searched ${q}` : "Searched files" }; }
+    case "agent": return { kind, text: one(a.description || a.task || a.prompt, 100) || "Ran a subagent" };
+    case "browser": return { kind, text: "Used the browser" };
+    case "web": { const q = one(a.url || a.query, 100); return { kind, text: q ? (a.url ? `Fetched ${q}` : `Searched the web for ${q}`) : "Fetched the web" }; }
+    default: { const b = one(a.command || a.file_path || a.path || a.pattern || a.query || a.skill || a.task || a.description, 80); return { kind, text: b ? `${name} ${b}` : String(name || "tool") }; }
+  }
+}
+const VERBS = { browser: ["used the browser", "Using the browser"], edit: ["edited files", "Editing a file"], shell: ["ran commands", "Running a command"], read: ["read files", "Reading a file"], search: ["searched files", "Searching files"], agent: ["ran subagents", "Running a subagent"], web: ["fetched the web", "Fetching the web"], mcp: ["used tools", "Using a tool"], other: ["used tools", "Using a tool"] };
+export function workSummary(kinds, live = false) {
+  const ks = (kinds || []).map((k) => (VERBS[k] ? k : "other"));
+  if (live) return `${(VERBS[ks[ks.length - 1]] || VERBS.other)[1]}…`;
+  const seen = [...new Set(ks.map((k) => VERBS[k][0]))];
+  if (!seen.length) return "Worked";
+  const s = seen.join(", ");
+  return s[0].toUpperCase() + s.slice(1);
+}

@@ -1,7 +1,7 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary } from "../ui/lib.js";
 
 test("fmtDuration", () => {
   assert.equal(fmtDuration(0), "0s");
@@ -84,4 +84,39 @@ test("groupLabel", () => {
   assert.equal(groupLabel(now - 3600e3, now), "Today");
   assert.equal(groupLabel(now - 86400e3, now), "Yesterday");
   assert.equal(groupLabel(now - 3 * 86400e3, now), "This week");
+});
+
+test("toolKind classifies Claude Code, pi and MCP tool names", () => {
+  assert.equal(toolKind("Bash"), "shell"); assert.equal(toolKind("PowerShell"), "shell"); assert.equal(toolKind("bash"), "shell");
+  assert.equal(toolKind("Edit"), "edit"); assert.equal(toolKind("MultiEdit"), "edit"); assert.equal(toolKind("write"), "edit"); assert.equal(toolKind("NotebookEdit"), "edit");
+  assert.equal(toolKind("Read"), "read"); assert.equal(toolKind("read"), "read");
+  assert.equal(toolKind("Grep"), "search"); assert.equal(toolKind("Glob"), "search"); assert.equal(toolKind("find"), "search"); assert.equal(toolKind("ls"), "search");
+  assert.equal(toolKind("Agent"), "agent"); assert.equal(toolKind("Task"), "agent"); assert.equal(toolKind("claude_task"), "agent");
+  assert.equal(toolKind("mcp__claude-in-chrome__computer"), "browser");
+  assert.equal(toolKind("WebFetch"), "web"); assert.equal(toolKind("WebSearch"), "web");
+  assert.equal(toolKind("mcp__archi_automate__ifc_open"), "mcp"); assert.equal(toolKind("Skill"), "other");
+});
+
+test("toolLabel gives a one-line Claude-Code-style row label", () => {
+  assert.deepEqual(toolLabel("Bash", { command: "git  status\n  --short" }), { kind: "shell", text: "Ran git status --short" });
+  assert.deepEqual(toolLabel("Edit", { file_path: "C:/p/ui/cli.py", old_string: "a", new_string: "b\nc" }, "C:/p"), { kind: "edit", text: "Edited cli.py", added: 2, removed: 1 });
+  assert.deepEqual(toolLabel("Write", { file_path: "x/new.css", content: "a\nb" }), { kind: "edit", text: "Wrote new.css", added: 2, removed: 0 });
+  assert.deepEqual(toolLabel("Read", { file_path: "C:/p/ui/app.js" }, "C:/p"), { kind: "read", text: "Read ui/app.js" });
+  assert.deepEqual(toolLabel("Grep", { pattern: "foo.*bar" }), { kind: "search", text: "Searched foo.*bar" });
+  assert.deepEqual(toolLabel("Agent", { description: "Diagnose panel visibility", prompt: "long..." }), { kind: "agent", text: "Diagnose panel visibility" });
+  assert.deepEqual(toolLabel("mcp__claude-in-chrome__computer", { action: "screenshot" }), { kind: "browser", text: "Used the browser" });
+  assert.deepEqual(toolLabel("WebFetch", { url: "https://x.y/z" }), { kind: "web", text: "Fetched https://x.y/z" });
+  assert.deepEqual(toolLabel("Skill", { skill: "graphify" }), { kind: "other", text: "Skill graphify" });
+  assert.equal(toolLabel("Bash", { command: "x".repeat(300) }).text.length <= 141, true);
+  assert.deepEqual(toolLabel("Bash", undefined), { kind: "shell", text: "Ran a command" });
+});
+
+test("workSummary joins verb phrases in first-seen order", () => {
+  assert.equal(workSummary(["browser", "edit", "shell", "edit"]), "Used the browser, edited files, ran commands");
+  assert.equal(workSummary(["shell"]), "Ran commands");
+  assert.equal(workSummary(["read", "search"]), "Read files, searched files");
+  assert.equal(workSummary(["agent", "web", "mcp", "other"]), "Ran subagents, fetched the web, used tools");
+  assert.equal(workSummary([]), "Worked");
+  assert.equal(workSummary(["shell"], true), "Running a command…");
+  assert.equal(workSummary(["edit", "browser"], true), "Using the browser…");
 });
