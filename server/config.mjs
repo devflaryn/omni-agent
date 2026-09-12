@@ -1,13 +1,52 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir, networkInterfaces } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const HOME = homedir();
 export const CONFIG_FILE = join(ROOT, "omni.config.json");
 const APPDATA = process.env.APPDATA || join(HOME, "AppData", "Roaming");
+const PI_CLI_REL = join("@earendil-works", "pi-coding-agent", "dist", "cli.js");
+
+/**
+ * Locate pi's `dist/cli.js` so the child can be spawned as `node cli.js --mode rpc`
+ * (no shell, no `.cmd` shim, no PATH surprises inside a GUI launcher).
+ * Order: the `pi` launcher on PATH (a symlink to cli.js on macOS/Linux npm installs),
+ * `%APPDATA%\npm` on Windows, then the usual global `node_modules` prefixes.
+ */
+export function findPiCli({ home = HOME, platform = process.platform, pathEnv = process.env.PATH || "", appdata = process.env.APPDATA, prefixes } = {}) {
+  const isFile = (p) => { try { return !!p && existsSync(p); } catch { return false; } };
+  for (const dir of pathEnv.split(delimiter).filter(Boolean)) {
+    const bin = join(dir, "pi");
+    if (!isFile(bin)) continue;
+    let real;
+    try { real = realpathSync(bin); } catch { continue; }
+    if (/\.(m?js)$/i.test(real)) return real;
+  }
+  const candidates = [];
+  if (platform === "win32") candidates.push(join(appdata || join(home, "AppData", "Roaming"), "npm", "node_modules"));
+  candidates.push(...(prefixes ?? [
+    join(home, ".local", "lib", "node_modules"),
+    join(home, ".npm-global", "lib", "node_modules"),
+    "/opt/homebrew/lib/node_modules",
+    "/usr/local/lib/node_modules",
+    "/usr/lib/node_modules",
+    join(home, ".bun", "install", "global", "node_modules"),
+  ]));
+  for (const prefix of candidates) { const p = join(prefix, PI_CLI_REL); if (isFile(p)) return p; }
+  return null;
+}
+
+/** { ENV_NAME: "/path/to/key.txt" } → { ENV_NAME: "<first line>" } for the files that exist. */
+export function apiKeyEnv(files) {
+  const out = {};
+  for (const [name, file] of Object.entries(files || {})) {
+    try { const v = readFileSync(file, "utf8").split(/\r?\n/)[0].trim(); if (v) out[name] = v; } catch { /* absent: the provider stays unconfigured */ }
+  }
+  return out;
+}
 
 function argVal(name, dflt) {
   const i = process.argv.indexOf(name);
@@ -40,7 +79,6 @@ export function lanAddresses() {
 }
 
 const fc = readConfigFile();
-const piCliCandidate = join(APPDATA, "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
 const lan = process.argv.includes("--lan") || fc.lan === true;
 let token = process.env.OMNI_TOKEN || fc.token || "";
 if (lan && !token) {
@@ -58,8 +96,10 @@ export const CONFIG = {
   piSessionsDir: fc.piSessionsDir || join(HOME, ".pi", "agent", "sessions"),
   claudeProjectsDir: fc.claudeProjectsDir || join(HOME, ".claude", "projects"),
   /** pi is launched as `node cli.js --mode rpc` (no shell, no quoting issues). */
-  piCli: fc.piCli || (existsSync(piCliCandidate) ? piCliCandidate : null),
+  piCli: fc.piCli || findPiCli(),
   piBin: fc.piBin || "pi",
+  /** Key files handed to the pi child as environment variables (one line each, gitignored). */
+  apiKeyFiles: { OPENROUTER_API_KEY: join(ROOT, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },
   claudeBin: process.env.OMNI_CLAUDE_BIN || fc.claudeBin || "claude",
   graphifyBin: fc.graphifyBin || "graphify",
   cwd: argVal("--cwd", process.env.OMNI_CWD || fc.cwd || join(HOME, "Desktop")),

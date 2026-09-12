@@ -9,23 +9,39 @@ It continues and replaces `Desktop/pi/pi-gui`.
 
 ## Run
 
-Double-click **Omni Agent.cmd** (or a Desktop shortcut pointing at `pythonw.exe "…\desktop\omni_desktop.pyw"`).
-It starts the server hidden, opens a native window, and turns LAN access on so phones and laptops on
-your network can open the link shown in the sidebar footer. Needs Node 22+ and Python 3.11+ with
-`pip install pywebview`; without pywebview it falls back to an Edge app window, then your browser.
+Runs on macOS (Apple silicon and Intel), Windows and Linux. Needs Node 22+; the desktop window needs
+Python 3.11+ with `pip install pywebview` (WKWebView on macOS, WebView2 on Windows); without pywebview
+it falls back to an Edge app window on Windows, or your browser elsewhere.
+
+**macOS:** double-click **Omni Agent.command** (or run `python3 desktop/omni_desktop.pyw`). It starts the
+server hidden, opens a native window, and turns LAN access on so phones and laptops on your network can
+open the link shown in the sidebar footer. The launcher finds Homebrew/nvm/fnm/volta `node` itself even when
+started from Finder; set `OMNI_NODE` to point at another binary.
+
+**Windows:** double-click **Omni Agent.cmd** (or a Desktop shortcut pointing at
+`pythonw.exe "…\desktop\omni_desktop.pyw"`).
 
 Console mode is still there:
 
 ```
-start.cmd                      # opens http://127.0.0.1:4400 in the browser, pi works in Desktop
-start.cmd "C:\some\project"    # pi works in that folder (the Graph tab uses this folder)
-start.cmd . --lan              # also reachable from other devices on your network
-node server/index.mjs --no-pi  # observe only, don't start a pi child
+./start.sh                     # macOS/Linux: opens http://127.0.0.1:4400, pi works in ~/Desktop
+./start.sh /some/project       # pi works in that folder (the Graph tab uses this folder)
+./start.sh . --lan             # also reachable from other devices on your network
+start.cmd "C:\some\project"    # the Windows equivalents
+start.cmd . --lan
+node server/index.mjs --no-pi  # observe only, don't start a pi child (any OS)
 ```
+
+pi is started as `node <pi>/dist/cli.js --mode rpc`; the entry point is found through the `pi` launcher
+on PATH (a symlink on macOS/Linux npm installs), `%APPDATA%\npm` on Windows, or the usual global
+`node_modules` prefixes. Set `piCli` in `omni.config.json` to override, or `piBin` to run a `pi` launcher
+directly.
 
 ### Use it from other devices on the network
 
-1. Run once: `scripts\allow-lan.cmd` (adds a Windows Firewall rule for TCP 4400; it asks for the admin prompt itself).
+1. Run once if the firewall blocks it: `scripts/allow-lan.sh` on macOS (allows the node binary in the
+   application firewall, asks for your password) or `scripts\allow-lan.cmd` on Windows (adds a Windows
+   Firewall rule for TCP 4400; it asks for the admin prompt itself).
 2. Start with `--lan` (or put `"lan": true` in `omni.config.json`). The window prints a link like
    `http://192.168.0.15:4400/?token=…`. Open it once on the other device; the token is then remembered in a cookie.
 3. Local use never needs the token. Anyone on the network without it only sees a token page.

@@ -5,3 +5,6 @@ vault/.obsidian/workspace*.json
 graphify-out/
 omni.config.json
 .superpowers/
+openrouter.txt
+.DS_Store
+workspace/

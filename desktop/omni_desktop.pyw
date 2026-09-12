@@ -1,9 +1,10 @@
 """Omni Agent desktop launcher.
 
 Starts the Node server hidden (no console), then opens a pywebview window on it.
-Run with pythonw so no terminal appears:  pythonw desktop\\omni_desktop.pyw [cwd] [--port N]
+  Windows:  pythonw desktop\\omni_desktop.pyw [cwd] [--port N]   (no terminal appears)
+  macOS:    python3 desktop/omni_desktop.pyw [cwd] [--port N]    (or double-click "Omni Agent.command")
   --plan   print the spawn plan as JSON and exit (used by the tests)
-Falls back to Edge app mode, then the default browser, when pywebview is missing.
+Falls back to an Edge app window (Windows), then the default browser, when pywebview is missing.
 """
 import json
 import os
@@ -18,7 +19,10 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 WIN = sys.platform.startswith("win")
+MAC = sys.platform == "darwin"
+PLATFORM = "windows" if WIN else sys.platform
 CREATE_NO_WINDOW = 0x08000000
+NODE_HINT = "node.exe" if WIN else "the node binary"
 
 
 def read_config():
@@ -37,6 +41,22 @@ def arg_value(argv, name, default=None):
     return default
 
 
+def find_node():
+    """A Finder-launched app gets a minimal PATH on macOS; look where Homebrew, nvm, fnm and volta put node."""
+    if WIN:
+        return None
+    home = os.path.expanduser("~")
+    fixed = ["/opt/homebrew/bin/node", "/usr/local/bin/node", os.path.join(home, ".volta", "bin", "node"), os.path.join(home, ".local", "bin", "node")]
+    for d in (os.path.join(home, ".nvm", "versions", "node"), os.path.join(home, ".fnm", "node-versions"), os.path.join(home, ".local", "share", "fnm", "node-versions")):
+        try:
+            for v in sorted(os.listdir(d), reverse=True):
+                fixed.append(os.path.join(d, v, "bin", "node"))
+                fixed.append(os.path.join(d, v, "installation", "bin", "node"))
+        except OSError:
+            pass
+    return next((p for p in fixed if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+
+
 def plan(argv):
     cfg = read_config()
     port = int(arg_value(argv, "--port", os.environ.get("OMNI_PORT") or cfg.get("port") or 4400))
@@ -45,10 +65,10 @@ def plan(argv):
     cwd = positional[0] if positional else desktop
     if cwd == ".":
         cwd = desktop
-    node = os.environ.get("OMNI_NODE") or shutil.which("node")
+    node = os.environ.get("OMNI_NODE") or shutil.which("node") or find_node()
     passthrough = [a for a in argv if a.startswith("--") and a not in ("--plan", "--lan", "--port")]
     args = [node or "node", os.path.join(ROOT, "server", "index.mjs"), "--cwd", cwd, "--port", str(port), "--lan"] + passthrough
-    return {"port": port, "url": f"http://127.0.0.1:{port}/?desktop=1", "node": node, "args": args, "log": os.path.join(ROOT, "omni.log"), "root": ROOT}
+    return {"port": port, "url": f"http://127.0.0.1:{port}/?desktop=1", "node": node, "args": args, "log": os.path.join(ROOT, "omni.log"), "root": ROOT, "platform": PLATFORM}
 
 
 def alive(port, timeout=1.0):
@@ -67,6 +87,14 @@ def msgbox(title, text):
             return
         except Exception:
             pass
+    elif MAC:
+        try:
+            script = 'display dialog "%s" with title "%s" buttons {"OK"} default button 1 with icon note' % (
+                text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n"), title.replace('"', '\\"'))
+            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=120)
+            return
+        except Exception:
+            pass
     print(f"{title}: {text}", file=sys.stderr)
 
 
@@ -74,7 +102,12 @@ def kill_tree(proc):
     if WIN:
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], creationflags=CREATE_NO_WINDOW, capture_output=True)
     else:
+        # SIGTERM: the server's own handler stops its pi/claude children before exiting.
         proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
 
 def start_server(p):
@@ -138,14 +171,15 @@ def open_window(url):
 
 
 def fallback(url):
-    candidates = [shutil.which("msedge"), r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"]
+    candidates = [] if not WIN else [shutil.which("msedge"), r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"]
     edge = next((c for c in candidates if c and os.path.exists(c)), None)
+    stop_hint = f"The Omni Agent server keeps running in the background; end the {NODE_HINT} process to stop it."
     if edge:
         subprocess.Popen([edge, f"--app={url}"])
-        msgbox("Omni Agent", "pywebview is not installed for this Python, so Omni opened in an Edge app window instead.\nInstall it with:  pip install pywebview\nThe Omni Agent server keeps running in the background; end the node.exe process to stop it.")
+        msgbox("Omni Agent", f"pywebview is not installed for this Python, so Omni opened in an Edge app window instead.\nInstall it with:  pip install pywebview\n{stop_hint}")
     else:
         webbrowser.open(url)
-        msgbox("Omni Agent", "pywebview is not installed for this Python, so Omni opened in your browser instead.\nInstall it with:  pip install pywebview\nThe Omni Agent server keeps running in the background; end the node.exe process to stop it.")
+        msgbox("Omni Agent", f"pywebview is not installed for this Python, so Omni opened in your browser instead.\nInstall it with:  {sys.executable} -m pip install pywebview\n{stop_hint}")
     return True
 
 
@@ -155,7 +189,7 @@ def main(argv):
         print(json.dumps(p))
         return 0
     if not p["node"]:
-        msgbox("Omni Agent", "Node.js was not found on PATH. Install Node 22+ or set OMNI_NODE to node.exe.")
+        msgbox("Omni Agent", f"Node.js was not found on PATH. Install Node 22+ or set OMNI_NODE to {NODE_HINT}.")
         return 1
     started = None
     if not alive(p["port"]):

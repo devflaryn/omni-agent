@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { promises as fs, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { extname, join, relative, resolve, sep } from "node:path";
-import { CONFIG, ROOT, lanAddresses } from "./config.mjs";
+import { CONFIG, ROOT, apiKeyEnv, lanAddresses } from "./config.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
 import { PiRpc } from "./pi-rpc.mjs";
@@ -50,7 +50,7 @@ export async function createApp(overrides = {}) {
 
   function startPi(cwd = cfg.cwd) {
     if (pi) pi.stop();
-    pi = cfg.createPi ? cfg.createPi({ cwd, bus }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, bus });
+    pi = cfg.createPi ? cfg.createPi({ cwd, bus }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, env: apiKeyEnv(cfg.apiKeyFiles), bus });
     pi.start();
     return pi;
   }
@@ -313,7 +313,7 @@ export async function createApp(overrides = {}) {
           case "/api/memory/pack": { const pack = await vault.pack(q.get("q") || "", { budgetTokens: Number(q.get("budget") || cfg.memoryBudgetTokens) }); return send(res, 200, { pack, tokens: estimateTokens(pack) }); }
           case "/api/memory/graph": return send(res, 200, await vault.graph());
           case "/api/memory/digest": { const d = await watcher.digestData(body.sid); if (!d) return send(res, 404, { error: "unknown session" }); return send(res, 200, await vault.writeSessionDigest(d)); }
-          case "/api/memory/open-vault": { spawn(process.platform === "win32" ? "explorer" : "xdg-open", [cfg.vaultDir], { detached: true, stdio: "ignore", windowsHide: true }).unref(); return send(res, 200, { ok: true }); }
+          case "/api/memory/open-vault": { spawn(process.platform === "win32" ? "explorer" : process.platform === "darwin" ? "open" : "xdg-open", [cfg.vaultDir], { detached: true, stdio: "ignore", windowsHide: true }).unref(); return send(res, 200, { ok: true }); }
           default: return send(res, 404, { error: "unknown memory route" });
         }
       }
@@ -366,7 +366,7 @@ export async function createApp(overrides = {}) {
     log(`Omni Agent on http://127.0.0.1:${cfg.port}  vault=${cfg.vaultDir}`);
     if (cfg.lan) {
       for (const a of lanAddresses()) log(`  from other devices: http://${a.address}:${cfg.port}/?token=${cfg.token}   (${a.name})`);
-      log("  token lives in omni.config.json; run scripts\\allow-lan.cmd once if Windows Firewall blocks it");
+      log(`  token lives in omni.config.json; if the firewall blocks it run ${process.platform === "win32" ? "scripts\\allow-lan.cmd" : "scripts/allow-lan.sh"} once`);
     }
     await watcher.start();
     log(`watching ${watcher.tails.size} session files (${registry.list().length} known sessions)`);

@@ -17,11 +17,13 @@ const ok = (r, what) => {
 };
 
 export class PiRpc extends EventEmitter {
-  constructor({ cli, bin = "pi", cwd, model = "", provider = "", bus }) {
+  constructor({ cli, bin = "pi", cwd, model = "", provider = "", env = {}, bus }) {
     super();
     this.cli = cli;
     this.bin = bin;
     this.cwd = cwd;
+    /** Extra environment for the child (provider API keys read from key files). */
+    this.env = env;
     this.model = model;
     this.provider = provider;
     this.bus = bus;
@@ -49,9 +51,10 @@ export class PiRpc extends EventEmitter {
     if (this.provider) args.push("--provider", this.provider);
     if (this.model) args.push("--model", this.model);
     const useNode = !!this.cli;
+    const env = { ...process.env, ...this.env };
     this.proc = useNode
-      ? spawn(process.execPath, [this.cli, ...args], { cwd: this.cwd, windowsHide: true })
-      : spawn(process.platform === "win32" ? `${this.bin}.cmd` : this.bin, args, { cwd: this.cwd, shell: process.platform === "win32", windowsHide: true });
+      ? spawn(process.execPath, [this.cli, ...args], { cwd: this.cwd, env, windowsHide: true })
+      : spawn(process.platform === "win32" ? `${this.bin}.cmd` : this.bin, args, { cwd: this.cwd, env, shell: process.platform === "win32", windowsHide: true });
 
     const splitter = createLineSplitter((line) => this.onLine(line));
     this.proc.stdout.setEncoding("utf8");

@@ -239,7 +239,8 @@ export class Vault {
 
   projectName(cwd) {
     if (!cwd) return "unknown";
-    return slugify(basename(String(cwd).replace(/[\\/]+$/, ""))) || "root";
+    // Session files may come from a Windows machine (C:\\x\\proj) or a POSIX one (/x/proj); split on both.
+    return slugify(String(cwd).replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "") || "root";
   }
 
   async ensureProject(cwd) {

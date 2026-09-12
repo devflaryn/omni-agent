@@ -21,7 +21,7 @@ export class ClaudeRunner {
   }
 
   owns(file) {
-    const id = basename(String(file || ""), ".jsonl").toLowerCase();
+    const id = basename(String(file || "").replace(/\\/g, "/"), ".jsonl").toLowerCase();
     for (const [, r] of this.runs) if (r.sessionId && r.sessionId.toLowerCase() === id && r.alive) return true;
     return false;
   }
