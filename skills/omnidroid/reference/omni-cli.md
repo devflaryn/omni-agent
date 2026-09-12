@@ -134,7 +134,10 @@ import frida
 dev = frida.get_device_manager().add_remote_device("127.0.0.1:HOST_PORT")
 sess = dev.attach("com.roblox.client")          # or a pid from debug-info.foreground.pid
 script = sess.create_script("""
-Interceptor.attach(Module.getExportByName('libc.so', 'open'), {
+// frida 17 API: the static Module.getExportByName('lib', 'sym') is GONE (TypeError: not a function).
+// Resolve through the module object, or Module.getGlobalExportByName('open') for any module.
+const openPtr = Process.getModuleByName('libc.so').getExportByName('open');
+Interceptor.attach(openPtr, {
   onEnter(args) { const p = args[0].readUtf8String(); if (p && p.indexOf('/proc') === 0) send('open ' + p); }
 });
 """)
@@ -143,7 +146,12 @@ script.load()
 ```
 
 A hook has fired when `send(...)` messages arrive on the host — that is the
-proof, not the absence of an error. Hide root from an app with the devkit tool:
+proof, not the absence of an error. A `{'type': 'error', 'description':
+'TypeError: not a function'}` message right after `script.load()` is a frida
+17 API mismatch in the JS (old `Module.getExportByName(lib, sym)` /
+`Module.findExportByName`), not anti-tamper; use the form above. Quiet Roblox
+processes rarely `open('/proc…')` on their own: hook `open`/`openat` without
+the `/proc` filter, or `read`, to see traffic within seconds. Hide root from an app with the devkit tool:
 
 ```bash
 omnidroid su <user> -- /data/local/tmp/omni-devkit/omni-hide com.roblox.client
