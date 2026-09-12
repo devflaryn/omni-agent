@@ -96,10 +96,18 @@ Inbox/                    drop anything here
 ## Wire the harnesses to the vault
 
 ```
-node scripts/install.mjs               # pi: memory_search / memory_recall / memory_save tools + auto recall
-node scripts/install.mjs --claude-hook # Claude Code: SessionStart hook that injects the memory index
+node scripts/install.mjs                 # pi: memory_search / memory_recall / memory_save tools + auto recall,
+                                         #     plus the omnidroid skills (skills/ -> ~/.pi/agent/skills/)
+node scripts/install.mjs --claude-hook   # Claude Code: SessionStart hook that injects the memory index
+node scripts/install.mjs --claude-skills # Claude Code: also copy the skills to ~/.claude/skills/
+node scripts/install.mjs --openrouter    # pi: OpenRouter provider from openrouter.txt (see "Models")
 node scripts/install.mjs --uninstall
 ```
+
+`skills/omnidroid` and `skills/omnidroid-input` teach either model how to drive the omnidroid Android
+VM engine (the sibling checkout in `Omni Apps/omnidroid`): launching accounts, the `--apk` cache,
+`frida --restart`, `debug-info`, tapping and typing, and how to verify every step from text signals
+when the model cannot see screenshots. `skills/omnidroid/reference/omni-cli.md` is the CLI reference.
 
 Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/omni-agent.json`:
 
