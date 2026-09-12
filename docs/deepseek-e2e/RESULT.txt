@@ -1,0 +1,8 @@
+REPORT
+boot: PASS — plain headless boot of admn1b12farm9 up: foreground=com.android.settings/.spa.SpaActivity, root.available=true, devkit.attached=false
+clicks: PASS — tap nav-back ui 9→2; text 'dns.google'→'dns.googleomni123' in EditText; key BACK SubSettings→NetworkDashboardActivity; swipe scrolled Dev-options list (Memory/Bug report → Running services/WebView)
+app-interaction: PASS — settings 3 states via top: NetworkDashboardActivity → tap Hotspot → SubSettings → key BACK → NetworkDashboardActivity
+frida: PASS — attach to Roblox pid 16843, Interceptor hook on libc open → 76 'HOOK open /proc/self/oom_score'; omni-hide output: props already clean / frida hidden-launch / root is Magisk
+custom-apk: PASS — bake 'apk cache: baking … as offset apk-769aef709b7d08e7' + [apk-cache] row; hit 'apk cache: hit — booting cached offset … (no install)'; debug-info offset=apk-769aef709b7d08e7
+instances-stopped: yes
+EXIT 0
