@@ -1,7 +1,7 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, fileKind, fmtBytes } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, fileKind, fmtBytes, buildTree } from "../ui/lib.js";
 import { titleFrom } from "../server/watchers.mjs";
 
 test("fmtDuration", () => {
@@ -139,4 +139,23 @@ test("fmtBytes", () => {
 test("titleFrom drops a leading memory pack so the history shows the real prompt", () => {
   assert.equal(titleFrom("<omni-memory>- **arceus-x-neo-rebuild** stuff</omni-memory>\n\nRebuild the APK"), "Rebuild the APK");
   assert.equal(titleFrom("  plain   prompt "), "plain prompt");
+});
+
+test("buildTree nests archive entries, folders first, implicit folders included", () => {
+  const t = buildTree([
+    { path: "classes.dex", size: 10 },
+    { path: "res/values/strings.xml", size: 5 },
+    { path: "res/", size: 0, dir: true },
+    { path: "assets/notes.md", size: 7 },
+    { path: "AndroidManifest.xml", size: 3 },
+    { path: "lib/arm64-v8a/libx.so", size: 99 },
+  ]);
+  assert.deepEqual(t.map((n) => `${n.dir ? "d" : "f"}:${n.name}`), ["d:assets", "d:lib", "d:res", "f:AndroidManifest.xml", "f:classes.dex"]);
+  const res = t.find((n) => n.name === "res");
+  assert.equal(res.path, "res/"); assert.equal(res.count, 1);
+  assert.deepEqual(res.children[0].children.map((n) => n.path), ["res/values/strings.xml"]);
+  const lib = t.find((n) => n.name === "lib");
+  assert.equal(lib.children[0].name, "arm64-v8a"); assert.equal(lib.children[0].children[0].size, 99);
+  assert.equal(t.find((n) => n.name === "assets").children[0].entry.path, "assets/notes.md");
+  assert.deepEqual(buildTree([]), []);
 });

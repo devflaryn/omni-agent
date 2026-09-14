@@ -224,11 +224,14 @@ body.explorer-open #explorer { display: flex; }
 .pv-md h1 { font-size: 1.35em; } .pv-md h2 { font-size: 1.2em; } .pv-md h3 { font-size: 1.08em; }
 .pv-img { max-width: 100%; height: auto; display: block; border-radius: 8px; background: repeating-conic-gradient(#1a1e22 0 25%, #14171a 0 50%) 0 0 / 16px 16px; }
 .pv-filter { margin: 0 0 8px; font-size: 12.5px; padding: 5px 9px; }
-.zip-list { display: grid; gap: 1px; }
+.zip-tree { display: grid; gap: 1px; }
+.zkids { display: grid; gap: 1px; }
 .zrow { display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; background: transparent; border: 0; color: var(--text); padding: 3px 6px; border-radius: 6px; cursor: pointer; font-size: 12.5px; font-family: var(--mono); }
-.zrow.dir { color: var(--muted); cursor: default; }
-.zrow:not(.dir):hover { background: var(--bg-3); }
-.zrow .name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.zrow.dir { color: var(--text); }
+.zrow.dir .size { font-family: var(--font); }
+.zrow:hover { background: var(--bg-3); }
+.zrow .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.zrow { min-width: 0; max-width: 100%; }
 .zrow .size { color: var(--dim); font-size: 11px; white-space: nowrap; }
 .zip-entry { margin: 0 0 12px; border: 1px solid var(--edge); border-radius: 10px; padding: 10px; background: var(--bg-2); }
 .zip-entry-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12.5px; }

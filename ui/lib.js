@@ -114,6 +114,37 @@ export function groupToolRuns(items, now = Date.now()) {
   return out;
 }
 
+// ------------------------------------------------------- archive tree
+/** Flat zip entries ({ path, size, dir, ... }) → nested tree: folders first, names sorted,
+ *  implicit folders created for entries whose parent folder has no entry of its own. */
+export function buildTree(entries) {
+  const root = { name: "", path: "", dir: true, children: new Map() };
+  const folder = (parts) => {
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      let next = cur.children.get(name);
+      if (!next) { next = { name, path: parts.slice(0, i + 1).join("/") + "/", dir: true, children: new Map() }; cur.children.set(name, next); }
+      cur = next;
+    }
+    return cur;
+  };
+  for (const e of entries || []) {
+    const clean = String(e.path || "").replace(/^\/+/, "");
+    if (!clean) continue;
+    const parts = clean.replace(/\/+$/, "").split("/");
+    if (e.dir || clean.endsWith("/")) { folder(parts); continue; }
+    const parent = folder(parts.slice(0, -1));
+    parent.children.set(parts[parts.length - 1], { name: parts[parts.length - 1], path: clean, dir: false, size: e.size, compressed: e.compressed, entry: e });
+  }
+  const finish = (n) => {
+    if (!n.dir) return n;
+    const kids = [...n.children.values()].map(finish).sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
+    return { name: n.name, path: n.path, dir: true, children: kids, count: kids.reduce((t, k) => t + (k.dir ? k.count : 1), 0) };
+  };
+  return finish(root).children;
+}
+
 // ----------------------------------------------------------- markdown
 export function md(src) {
   const blocks = String(src || "").replace(/\r\n?/g, "\n").split(/(```[\s\S]*?```)/g);

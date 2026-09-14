@@ -1,6 +1,6 @@
 /* File explorer (left column) + preview column: tree with lazy folders, previews for text, markdown,
    images and zip-like archives (.zip/.apk/.jar: entries inside, text entries readable in place). */
-import { el, esc, md, fileKind, fmtBytes } from "./lib.js";
+import { el, md, fileKind, fmtBytes, buildTree } from "./lib.js";
 
 const ICONS = {
   folder: `<svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg>`,
@@ -100,23 +100,44 @@ export function createExplorer({ api, toast, insert, onClose }) {
     if (d.tooBig) return pvBody.appendChild(el("div", "pv-note", `Archive too large to read (${fmtBytes(d.size)}).`));
     const head = el("div", "pv-note", `${d.entries.length} entries inside ${current.path.split("/").pop()}`);
     const q = el("input", "pv-filter"); q.type = "search"; q.placeholder = "Filter entries";
-    const list = el("div", "zip-list"), out = el("div", "zip-entry"); out.hidden = true;
+    const list = el("div", "zip-tree"), out = el("div", "zip-entry"); out.hidden = true;
+    const tree = buildTree(d.entries);
+    const entryRow = (n, depth) => {
+      const row = el("button", "zrow");
+      row.style.paddingLeft = `${6 + Math.max(0, depth) * 14}px`;
+      row.innerHTML = `${icon(fileKind(n.name))}<span class="name"></span><span class="size"></span>`;
+      row.querySelector(".name").textContent = depth === -1 ? n.path : n.name;
+      row.querySelector(".size").textContent = fmtBytes(n.size);
+      row.title = `${n.path} · ${fmtBytes(n.size)} (${fmtBytes(n.compressed)} compressed)`;
+      row.onclick = () => openEntry(n.entry, out);
+      return row;
+    };
+    // Folders render their children only when opened, so a 3000-entry APK stays light.
+    const folderNode = (n, depth) => {
+      const node = el("div", "znode"), row = el("button", "zrow dir"), kids = el("div", "zkids");
+      row.style.paddingLeft = `${6 + depth * 14}px`;
+      row.innerHTML = `${icon("folder")}<span class="name"></span><span class="size"></span>`;
+      row.querySelector(".name").textContent = n.name;
+      row.querySelector(".size").textContent = `${n.count}`;
+      row.title = `${n.path} · ${n.count} file${n.count === 1 ? "" : "s"}`;
+      kids.hidden = true;
+      let built = false;
+      row.onclick = () => { kids.hidden = !kids.hidden; row.querySelector(".ico").innerHTML = kids.hidden ? ICONS.folder : ICONS.folderOpen; if (!built) { built = true; for (const k of n.children) kids.appendChild(k.dir ? folderNode(k, depth + 1) : entryRow(k, depth + 1)); } };
+      node.append(row, kids);
+      return node;
+    };
     const draw = () => {
       const f = q.value.trim().toLowerCase();
       list.innerHTML = "";
+      if (!f) { for (const n of tree) list.appendChild(n.dir ? folderNode(n, 0) : entryRow(n, 0)); return; }
+      // A filter flattens to matching files, full paths shown.
       let n = 0;
       for (const e of d.entries) {
-        if (f && !e.path.toLowerCase().includes(f)) continue;
-        if (++n > 1500) { list.appendChild(el("div", "empty", "… more entries; narrow the filter")); break; }
-        const kind = e.dir ? "folder" : fileKind(e.path);
-        const row = el("button", `zrow${e.dir ? " dir" : ""}`);
-        row.innerHTML = `${icon(kind)}<span class="name"></span><span class="size"></span>`;
-        row.querySelector(".name").textContent = e.path;
-        row.querySelector(".size").textContent = e.dir ? "" : fmtBytes(e.size);
-        row.title = e.dir ? e.path : `${e.path} · ${fmtBytes(e.size)} (${fmtBytes(e.compressed)} compressed)`;
-        if (!e.dir) row.onclick = () => openEntry(e, out);
-        list.appendChild(row);
+        if (e.dir || !e.path.toLowerCase().includes(f)) continue;
+        if (++n > 1500) { list.appendChild(el("div", "empty", "… more matches; narrow the filter")); break; }
+        list.appendChild(entryRow({ name: e.path.split("/").pop(), path: e.path, size: e.size, compressed: e.compressed, entry: e }, -1));
       }
+      if (!n) list.appendChild(el("div", "empty", "No entries match."));
     };
     q.addEventListener("input", draw);
     draw();
