@@ -39,13 +39,11 @@ directly.
 
 ### Use it from other devices on the network
 
-1. Run once if the firewall blocks it: `scripts/allow-lan.sh` on macOS (allows the node binary in the
-   application firewall, asks for your password) or `scripts\allow-lan.cmd` on Windows (adds a Windows
-   Firewall rule for TCP 4400; it asks for the admin prompt itself).
-2. Start with `--lan` (or put `"lan": true` in `omni.config.json`). The window prints a link like
-   `http://192.168.0.15:4400/?token=…`. Open it once on the other device; the token is then remembered in a cookie.
-3. Local use never needs the token. Anyone on the network without it only sees a token page.
-   The token lives in `omni.config.json`; delete it to rotate.
+1. Start with `--lan` (or `"lan": true` in `omni.config.json`); the desktop launcher already does.
+2. The window prints the LAN address, e.g. `http://192.168.0.15:4400/`. Open it on any device on the
+   network. There is no login: anyone with the link can use Omni exactly like the local user, including
+   browsing folders and driving pi, so keep it on a network you trust. If the firewall blocks it run
+   `scripts/allow-lan.sh` (or `scripts\allow-lan.cmd`) once.
 
 ### Repo graphs (Graph tab)
 

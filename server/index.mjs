@@ -92,17 +92,8 @@ export async function createApp(overrides = {}) {
     if (r.startsWith("..") || (r.length && r.split(sep)[0] === "..")) return null;
     return abs;
   }
-  const normRoot = (p) => String(p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-  /** Loopback callers can browse anywhere; LAN callers may only browse a folder Omni already knows about. */
-  function fsRootAllowed(req, root) {
-    if (isLocal(req)) return true;
-    const r = normRoot(root);
-    if (!r) return false;
-    if (r === normRoot(cfg.cwd)) return true;
-    if (pi?.cwd && r === normRoot(pi.cwd)) return true;
-    for (const s of registry.list()) if (s.cwd && r === normRoot(s.cwd)) return true;
-    return false;
-  }
+  /** No login on the LAN by design: anyone with the link can browse any folder, like the local user. */
+  function fsRootAllowed(_req, root) { return !!String(root || "").trim(); }
   const TEXT_EXT = new Set([".txt", ".md", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".py", ".sh", ".bash", ".ps1", ".cmd", ".bat", ".html", ".css", ".xml", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log", ".java", ".kt", ".c", ".h", ".cpp", ".rs", ".go", ".rb", ".php", ".sql", ".smali", ".gradle", ".properties", ".env", ".gitignore", ".csv", ".jsonl"]);
   async function listDir(root, rel) {
     const abs = safeResolve(root, rel);
@@ -176,8 +167,6 @@ export async function createApp(overrides = {}) {
     } catch (e) { log("graph query failed", e.message); return ""; }
   }
   const isLocal = (req) => { const a = req.socket.remoteAddress || ""; return a === "127.0.0.1" || a === "::1" || a === "::ffff:127.0.0.1"; };
-  function cookieToken(req) { const m = /(?:^|;\s*)omni_token=([^;]+)/.exec(req.headers.cookie || ""); return m ? decodeURIComponent(m[1]) : ""; }
-  const TOKEN_PAGE = '<!doctype html><meta name=viewport content="width=device-width"><body style="font-family:system-ui;background:#0e1420;color:#e4e9f5;padding:2rem"><h2>Omni Agent</h2><p>This device needs the access token. Open the link printed in the Omni Agent window (it ends with <code>?token=…</code>), or paste the token here.</p><form><input name=token placeholder="token" style="padding:.5rem"> <button style="padding:.5rem">Open</button></form></body>';
 
   async function memoryPack(prompt) {
     const pack = await vault.pack(prompt, { budgetTokens: cfg.memoryBudgetTokens });
@@ -240,15 +229,6 @@ export async function createApp(overrides = {}) {
     try {
       const sfs = req.headers["sec-fetch-site"];
       if (req.method !== "GET" && sfs && sfs !== "same-origin" && sfs !== "none") return send(res, 403, { error: "cross-site request refused" });
-      if (cfg.token && !isLocal(req)) {
-        const supplied = q.get("token") || cookieToken(req) || (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-        if (supplied !== cfg.token) return send(res, 401, TOKEN_PAGE, "text/html; charset=utf-8");
-        if (q.get("token")) {
-          q.delete("token");
-          res.writeHead(302, { "Set-Cookie": `omni_token=${encodeURIComponent(cfg.token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000`, Location: url.pathname + (q.size ? `?${q}` : "") });
-          return res.end();
-        }
-      }
       // static UI
       if (req.method === "GET" && (p === "/" || p === "/index.html")) return send(res, 200, await fs.readFile(join(ROOT, "ui", "index.html")), MIME[".html"]);
       if (req.method === "GET" && /^\/[\w.-]+\.(js|mjs|css|svg|png|ico)$/.test(p)) {
@@ -268,7 +248,7 @@ export async function createApp(overrides = {}) {
       // state
       if (req.method === "GET" && p === "/api/state") {
         return send(res, 200, {
-          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/?token=${cfg.token}`) : [] },
+          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/`) : [] },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
           runs: claude.list(),
           sessions: registry.list().map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
@@ -449,8 +429,8 @@ export async function createApp(overrides = {}) {
     await new Promise((r) => server.listen(cfg.port, cfg.host, r));
     log(`Omni Agent on http://127.0.0.1:${cfg.port}  vault=${cfg.vaultDir}`);
     if (cfg.lan) {
-      for (const a of lanAddresses()) log(`  from other devices: http://${a.address}:${cfg.port}/?token=${cfg.token}   (${a.name})`);
-      log(`  token lives in omni.config.json; if the firewall blocks it run ${process.platform === "win32" ? "scripts\\allow-lan.cmd" : "scripts/allow-lan.sh"} once`);
+      for (const a of lanAddresses()) log(`  from other devices: http://${a.address}:${cfg.port}/   (${a.name})`);
+      log(`  no login needed; if the firewall blocks it run ${process.platform === "win32" ? "scripts\\allow-lan.cmd" : "scripts/allow-lan.sh"} once`);
     }
     await watcher.start();
     log(`watching ${watcher.tails.size} session files (${registry.list().length} known sessions)`);

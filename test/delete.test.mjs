@@ -14,7 +14,7 @@ test("DELETE /api/sessions/:sid moves the chat to trash, refuses a live one, 404
     JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-09-09T14:51:12.099Z", cwd: "/x/proj" }) + "\n" +
     JSON.stringify({ type: "message", id: "u1", timestamp: "2026-09-09T14:52:00Z", message: { role: "user", content: "hello there" } }) + "\n");
   const trashDir = join(base, "trash");
-  const app = await createApp({ port: 0, host: "127.0.0.1", lan: false, token: "", autoStartPi: false, cwd: base, vaultDir: join(base, "vault"), piSessionsDir: piDir, claudeProjectsDir: join(base, "claude"), trashDir });
+  const app = await createApp({ port: 0, host: "127.0.0.1", lan: false, autoStartPi: false, cwd: base, vaultDir: join(base, "vault"), piSessionsDir: piDir, claudeProjectsDir: join(base, "claude"), trashDir });
   await app.listen();
   const port = app.server.address().port;
   const sid = `pi:${id}`;
@@ -39,7 +39,7 @@ test("DELETE /api/sessions/:sid moves the chat to trash, refuses a live one, 404
 
 test("DELETE /api/sessions/:sid 404s an unknown session", async () => {
   const base = mkdtempSync(join(tmpdir(), "omni-del2-"));
-  const app = await createApp({ port: 0, host: "127.0.0.1", lan: false, token: "", autoStartPi: false, cwd: base, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), trashDir: join(base, "trash") });
+  const app = await createApp({ port: 0, host: "127.0.0.1", lan: false, autoStartPi: false, cwd: base, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), trashDir: join(base, "trash") });
   await app.listen();
   const port = app.server.address().port;
   try {

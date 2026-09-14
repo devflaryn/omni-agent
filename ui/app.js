@@ -259,7 +259,7 @@ async function init() {
   const st = await api("/api/state");
   S.config = st.config; S.pi = st.pi; S.runs = st.runs || [];
   for (const s of st.sessions) S.sessions.set(s.sid, s);
-  if (st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0].replace(/\?token=.*/, ""); $("#lanInfo").title = "Open this on another device on your network; the first visit needs the token link from omni.config.json"; }
+  if (st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0].replace(/\?token=.*/, ""); $("#lanInfo").title = "Open this on any device on your network; no login needed"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
   history.render();
   showView("home");

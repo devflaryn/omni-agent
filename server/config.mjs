@@ -1,5 +1,4 @@
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
 import { homedir, networkInterfaces } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,18 +79,12 @@ export function lanAddresses() {
 
 const fc = readConfigFile();
 const lan = process.argv.includes("--lan") || fc.lan === true;
-let token = process.env.OMNI_TOKEN || fc.token || "";
-if (lan && !token) {
-  token = randomBytes(12).toString("base64url");
-  writeConfigFile({ token });
-}
 
 export const CONFIG = {
   port: Number(argVal("--port", process.env.OMNI_PORT || fc.port || 4400)),
-  /** `--lan` (or {"lan":true}) listens on every interface and requires the access token from non-local devices. */
+  /** `--lan` (or {"lan":true}) listens on every interface. No token: anyone with the link can use it. */
   host: lan ? "0.0.0.0" : "127.0.0.1",
   lan,
-  token,
   vaultDir: process.env.OMNI_VAULT || fc.vaultDir || join(ROOT, "vault"),
   /** Deleted chats are moved here (recoverable), never hard-unlinked. */
   trashDir: fc.trashDir || join(HOME, ".omni-agent", "trash"),
