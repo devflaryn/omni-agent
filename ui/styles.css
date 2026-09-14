@@ -196,7 +196,7 @@ details.work.err > summary .ico { color: var(--err); }
 .fork-note button { background: none; border: 0; color: var(--caret); cursor: pointer; padding: 0; font-size: inherit; }
 
 /* ------------------------------------------------------------ explorer */
-#explorer { width: var(--explorer); flex: none; display: none; flex-direction: column; min-height: 0; background: var(--bg-2); border-right: 1px solid var(--edge); }
+#explorer { width: var(--explorer); flex: none; display: none; flex-direction: column; min-height: 0; background: var(--bg-2); border-right: 1px solid var(--edge); position: relative; }
 body.explorer-open #explorer { display: flex; }
 .ex-head { display: flex; align-items: center; gap: 2px; padding: 8px 6px 4px 12px; }
 .ex-title { font-weight: 600; font-size: 13px; flex: 1; }
@@ -213,7 +213,7 @@ body.explorer-open #explorer { display: flex; }
 #tree .empty.err { color: var(--err); }
 
 /* ------------------------------------------------------------- preview */
-#preview { width: var(--preview); flex: none; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--edge); background: var(--bg); }
+#preview { width: var(--preview); flex: none; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--edge); background: var(--bg); position: relative; }
 .pv-head { display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 12px; border-bottom: 1px solid var(--edge); }
 .pv-path { flex: 1; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pv-meta { color: var(--dim); font-size: 11.5px; white-space: nowrap; }
@@ -238,6 +238,15 @@ body.explorer-open #explorer { display: flex; }
 .zip-entry-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 12.5px; }
 .zip-entry-head b { font-weight: 500; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .zip-entry-head .size { color: var(--dim); font-size: 11px; }
+
+/* ------------------------------------------------------------ resizers */
+.resizer { position: absolute; top: 0; bottom: 0; right: -3px; width: 7px; cursor: col-resize; z-index: 5; touch-action: none; }
+.resizer.left { right: auto; left: -3px; }
+.resizer::after { content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 1px; background: transparent; transition: background 0.12s; }
+.resizer:hover::after, body.resizing .resizer::after { background: var(--pi); }
+body.resizing { cursor: col-resize; user-select: none; }
+body.resizing #panel, body.resizing #main { pointer-events: none; }
+body.resizing .resizer { pointer-events: auto; }
 
 /* -------------------------------------------------------------- drawer */
 #panel { position: fixed; top: var(--top); right: 0; bottom: 0; width: var(--panel); max-width: 100vw; background: var(--bg-2); border-left: 1px solid var(--edge); display: flex; flex-direction: column; min-height: 0; z-index: 40; transform: translateX(100%); transition: transform 0.18s ease; box-shadow: none; }

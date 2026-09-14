@@ -6,6 +6,7 @@ import { createHistory } from "./sidebar.js";
 import { createPanel } from "./panel.js";
 import { createExplorer } from "./explorer.js";
 import { createSettings } from "./settings.js";
+import { initResizers } from "./resizer.js";
 
 const $ = (s) => document.querySelector(s);
 const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, followFork: null, forceFork: false, desktop: new URLSearchParams(location.search).get("desktop") === "1" };
@@ -259,6 +260,7 @@ function handle(ev) {
 // ----------------------------------------------------------------- init
 async function init() {
   if (S.desktop) document.body.classList.add("desktop");
+  initResizers();
   const st = await api("/api/state");
   S.config = st.config; S.pi = st.pi; S.runs = st.runs || [];
   for (const s of st.sessions) S.sessions.set(s.sid, s);
