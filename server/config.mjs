@@ -99,6 +99,9 @@ export const CONFIG = {
   claudeProjectsDir: fc.claudeProjectsDir || join(HOME, ".claude", "projects"),
   /** pi is launched as `node cli.js --mode rpc` (no shell, no quoting issues). */
   piCli: fc.piCli || findPiCli(),
+  /** pi's config folder; `models.json` in it is where Omni's Providers dialog writes providers, keys and model ids. */
+  piAgentDir: fc.piAgentDir || join(HOME, ".pi", "agent"),
+  piModelsFile: fc.piModelsFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "models.json"),
   piBin: fc.piBin || "pi",
   /** Key files handed to the pi child as environment variables (one line each, gitignored). */
   apiKeyFiles: { OPENROUTER_API_KEY: join(ROOT, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },

@@ -1,6 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "node:fs";
+import { buildZip } from "./helpers/zip-fixture.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
@@ -184,7 +185,7 @@ function makeFakePi({ cwd }) {
   };
   return fakePi;
 }
-const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi });
+const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json") });
 await app2.listen();
 const port2 = app2.server.address().port;
 after(() => app2.close());
@@ -253,4 +254,66 @@ test("claude task: times out with whatever it has and reports timedOut", async (
 test("claude task: empty prompt → 400", async () => {
   const r = await fetch(`http://127.0.0.1:${port}/api/claude/task`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt: " " }) });
   assert.equal(r.status, 400);
+});
+
+// ------------------------------------------------------------ providers
+test("providers: empty at first, PUT validates, writes models.json and restarts pi back onto its session", async () => {
+  const empty = await (await fetch(`http://127.0.0.1:${port2}/api/providers`)).json();
+  assert.deepEqual(empty.providers, []);
+  assert.ok(empty.presets.some((p) => p.key === "openrouter"));
+  const bad = await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "nope", api: "openai-completions", models: ["a"] }) });
+  assert.equal(bad.status, 400);
+  // start the fake pi so the restart path is exercised
+  app2.startPi(base);
+  const before = fakePi;
+  const put = await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "sk-or-abcd1234", models: ["deepseek/deepseek-v4-flash-0731", { id: "moonshotai/kimi-k2.5", name: "Kimi" }] }) });
+  const pj = await put.json();
+  assert.equal(put.status, 200);
+  assert.equal(pj.restarted, true);
+  assert.notEqual(fakePi, before, "a new pi child was created");
+  assert.deepEqual(fakePi.calls[0], ["switch", "C:\\fake.jsonl"]);
+  assert.equal(pj.providers[0].name, "openrouter");
+  assert.equal(pj.providers[0].hasKey, true); assert.equal(pj.providers[0].keyHint, "1234"); assert.equal("apiKey" in pj.providers[0], false);
+  const onDisk = JSON.parse(readFileSync(join(base, "pi-agent", "models.json"), "utf8"));
+  assert.equal(onDisk.providers.openrouter.apiKey, "sk-or-abcd1234");
+  assert.equal(onDisk.providers.openrouter.models[1].name, "Kimi");
+});
+
+test("pi models: the picker lists only the models from models.json once providers exist", async () => {
+  const r = await (await fetch(`http://127.0.0.1:${port2}/api/pi/models`)).json();
+  assert.equal(r.data.source, "providers");
+  assert.deepEqual(r.data.models.map((m) => `${m.provider}/${m.id}`), ["openrouter/deepseek/deepseek-v4-flash-0731", "openrouter/moonshotai/kimi-k2.5"]);
+});
+
+test("providers: DELETE removes the entry; unknown → 404", async () => {
+  const del = await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "DELETE" });
+  assert.equal(del.status, 200);
+  assert.deepEqual((await del.json()).providers, []);
+  assert.equal((await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "DELETE" })).status, 404);
+});
+
+// ---------------------------------------------------------- file previews
+test("fs/read reports a kind per file family: markdown, text, image, archive, binary", async () => {
+  const dir = join(base, "proj"); mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "README.md"), "# Title\n\nhello");
+  writeFileSync(join(dir, "main.py"), "print(1)\n");
+  writeFileSync(join(dir, "pic.png"), Buffer.from("89504e470d0a1a0a0000000d49484452", "hex"));
+  writeFileSync(join(dir, "blob.bin"), Buffer.from([0, 1, 2, 3]));
+  writeFileSync(join(dir, "app.apk"), buildZip([{ name: "AndroidManifest.xml", data: "<manifest/>" }, { name: "lib/", data: "" }, { name: "assets/notes.md", data: "# inside\n".repeat(30), deflate: true }, { name: "classes.dex", data: "\u0000dex\n035" }]));
+  const read = async (p) => (await fetch(`http://127.0.0.1:${port}/api/fs/read?root=${encodeURIComponent(dir)}&path=${encodeURIComponent(p)}`)).json();
+  const md = await read("README.md"); assert.equal(md.kind, "markdown"); assert.match(md.content, /# Title/);
+  const py = await read("main.py"); assert.equal(py.kind, "text"); assert.equal(py.content, "print(1)\n");
+  const png = await read("pic.png"); assert.equal(png.kind, "image"); assert.equal(png.mime, "image/png"); assert.equal(png.size, 16);
+  const bin = await read("blob.bin"); assert.equal(bin.kind, "binary");
+  const apk = await read("app.apk"); assert.equal(apk.kind, "archive");
+  assert.deepEqual(apk.entries.map((e) => e.path), ["AndroidManifest.xml", "lib/", "assets/notes.md", "classes.dex"]);
+  assert.equal(apk.entries[1].dir, true); assert.equal(apk.entries[2].size, 270); assert.equal("offset" in apk.entries[0], false);
+  const raw = await fetch(`http://127.0.0.1:${port}/api/fs/raw?root=${encodeURIComponent(dir)}&path=pic.png`);
+  assert.equal(raw.headers.get("content-type"), "image/png"); assert.equal((await raw.arrayBuffer()).byteLength, 16);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/fs/raw?root=${encodeURIComponent(dir)}&path=main.py`)).status, 404);
+  const entry = async (e) => (await fetch(`http://127.0.0.1:${port}/api/fs/archive-entry?root=${encodeURIComponent(dir)}&path=app.apk&entry=${encodeURIComponent(e)}`)).json();
+  const notes = await entry("assets/notes.md"); assert.equal(notes.kind, "markdown"); assert.equal(notes.content, "# inside\n".repeat(30));
+  const man = await entry("AndroidManifest.xml"); assert.equal(man.kind, "text"); assert.equal(man.content, "<manifest/>");
+  assert.equal((await entry("classes.dex")).kind, "binary");
+  assert.equal((await fetch(`http://127.0.0.1:${port}/api/fs/archive-entry?root=${encodeURIComponent(dir)}&path=app.apk&entry=missing`)).status, 404);
 });

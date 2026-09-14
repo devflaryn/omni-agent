@@ -14,6 +14,8 @@ import { PiRpc } from "./pi-rpc.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
+import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, flatModels } from "./providers.mjs";
+import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
 import { SessionRegistry, SessionWatcher } from "./watchers.mjs";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
@@ -53,6 +55,16 @@ export async function createApp(overrides = {}) {
     pi = cfg.createPi ? cfg.createPi({ cwd, bus }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, env: piChildEnv(cfg), bus });
     pi.start();
     return pi;
+  }
+  /** pi reads models.json only at boot: after a provider change, relaunch the child and put it back on the session it had open. */
+  async function restartPi() {
+    if (!pi?.proc) return false;
+    const { cwd } = pi;
+    const file = pi.state?.sessionFile;
+    startPi(cwd);
+    try { await pi.waitReady(); if (file) await pi.switchSession(file); }
+    catch (e) { log("pi restart: could not restore the session", e.message); }
+    return true;
   }
 
   // ---------------------------------------------------------------- digests
@@ -101,14 +113,40 @@ export async function createApp(overrides = {}) {
       .map((e) => ({ name: e.name, dir: e.isDirectory(), path: relative(root, join(abs, e.name)).split(sep).join("/") }))
       .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
   }
+  const IMAGE_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif" };
+  const TEXT_MAX = 2 * 1024 * 1024, ARCHIVE_MAX = 400 * 1024 * 1024, IMAGE_MAX = 20 * 1024 * 1024;
+  const looksText = (buf) => !buf.subarray(0, 8000).includes(0);
+  /** What the explorer preview needs: `kind` decides the renderer. */
   async function readFileSafe(root, rel) {
     const abs = safeResolve(root, rel);
     if (!abs) throw new Error("path outside root");
     const st = await fs.stat(abs);
-    if (st.size > 2 * 1024 * 1024) return { tooBig: true, size: st.size };
-    const ext = extname(abs).toLowerCase();
-    if (!(TEXT_EXT.has(ext) || !ext)) return { binary: true, ext };
-    return { content: await fs.readFile(abs, "utf8"), ext };
+    const ext = extname(abs).toLowerCase(), size = st.size;
+    if (IMAGE_MIME[ext]) return { kind: "image", ext, size, mime: IMAGE_MIME[ext], tooBig: size > IMAGE_MAX };
+    if (isArchiveName(abs)) {
+      if (size > ARCHIVE_MAX) return { kind: "archive", ext, size, tooBig: true, entries: [] };
+      const entries = listZipEntries(await fs.readFile(abs)).map(({ offset: _o, ...e }) => e);
+      return { kind: "archive", ext, size, entries };
+    }
+    if (size > TEXT_MAX) return { kind: "binary", ext, size, tooBig: true };
+    if (!(TEXT_EXT.has(ext) || !ext)) return { kind: "binary", ext, size, binary: true };
+    const buf = await fs.readFile(abs);
+    if (!looksText(buf)) return { kind: "binary", ext, size, binary: true };
+    return { kind: ext === ".md" ? "markdown" : "text", content: buf.toString("utf8"), ext, size };
+  }
+  async function readArchiveEntry(root, rel, entryPath) {
+    const abs = safeResolve(root, rel);
+    if (!abs || !isArchiveName(abs)) throw new Error("not an archive");
+    const buf = await fs.readFile(abs);
+    const entry = listZipEntries(buf, { limit: Infinity }).find((e) => e.path === entryPath);
+    if (!entry) throw Object.assign(new Error("no such entry in the archive"), { status: 404 });
+    if (entry.dir) return { kind: "binary", path: entry.path, size: 0 };
+    if (entry.size > TEXT_MAX) return { kind: "binary", path: entry.path, size: entry.size, tooBig: true };
+    const data = readZipEntry(buf, entry);
+    const ext = extname(entry.path).toLowerCase();
+    if (IMAGE_MIME[ext]) return { kind: "image", path: entry.path, size: entry.size, mime: IMAGE_MIME[ext], data: data.toString("base64") };
+    if (!looksText(data)) return { kind: "binary", path: entry.path, size: entry.size, binary: true };
+    return { kind: ext === ".md" ? "markdown" : "text", path: entry.path, size: entry.size, content: data.toString("utf8") };
   }
 
   // ------------------------------------------------------------------ http
@@ -230,7 +268,7 @@ export async function createApp(overrides = {}) {
       // state
       if (req.method === "GET" && p === "/api/state") {
         return send(res, 200, {
-          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/?token=${cfg.token}`) : [] },
+          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/?token=${cfg.token}`) : [] },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
           runs: claude.list(),
           sessions: registry.list().map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
@@ -262,6 +300,18 @@ export async function createApp(overrides = {}) {
         setTimeout(() => { close(); process.exit(0); }, 100);
         return;
       }
+      // providers (pi's models.json)
+      if (req.method === "GET" && p === "/api/providers") {
+        const mdl = pi?.state?.model;
+        return send(res, 200, { providers: listProviders(cfg.piModelsFile), presets: PRESETS, apis: PI_APIS, file: cfg.piModelsFile, active: mdl ? { provider: mdl.provider, id: mdl.id } : null });
+      }
+      if ((req.method === "PUT" || req.method === "DELETE") && (m = /^\/api\/providers\/([^/]+)$/.exec(p))) {
+        const name = decodeURIComponent(m[1]);
+        if (req.method === "PUT") upsertProvider(cfg.piModelsFile, name, await readBody(req));
+        else if (!removeProvider(cfg.piModelsFile, name)) return send(res, 404, { error: "unknown provider" });
+        const restarted = await restartPi();
+        return send(res, 200, { ok: true, restarted, providers: listProviders(cfg.piModelsFile) });
+      }
       // pi
       if (p.startsWith("/api/pi/")) {
         const body = req.method === "POST" ? await readBody(req) : {};
@@ -281,7 +331,12 @@ export async function createApp(overrides = {}) {
           case "/api/pi/thinking": return send(res, 200, await requirePi().setThinking(body.level));
           case "/api/pi/compact": return send(res, 200, await requirePi().compact());
           case "/api/pi/stats": return send(res, 200, await requirePi().stats());
-          case "/api/pi/models": { const r = await requirePi().models(); if (r?.data?.models) r.data.models = filterPiModels(r.data.models, cfg.piModels); return send(res, 200, r); }
+          case "/api/pi/models": {
+            // Omni's own provider config wins: only the models the user typed are listed. Without one, fall back to pi's catalogue.
+            const own = flatModels(cfg.piModelsFile);
+            if (own.length) return send(res, 200, { success: true, data: { models: own, source: "providers" } });
+            const r = await requirePi().models(); if (r?.data?.models) r.data.models = filterPiModels(r.data.models, cfg.piModels); return send(res, 200, r);
+          }
           case "/api/pi/thinking-levels": return send(res, 200, await requirePi().thinkingLevels());
           case "/api/pi/state": return send(res, 200, await requirePi().refreshState());
           default: return send(res, 404, { error: "unknown pi route" });
@@ -364,6 +419,21 @@ export async function createApp(overrides = {}) {
         const root = q.get("root") || cfg.cwd;
         if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
         return send(res, 200, await readFileSafe(root, q.get("path") || ""));
+      }
+      if (req.method === "GET" && p === "/api/fs/raw") {
+        const root = q.get("root") || cfg.cwd;
+        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
+        const abs = safeResolve(root, q.get("path") || "");
+        const mime = abs ? IMAGE_MIME[extname(abs).toLowerCase()] : null;
+        if (!abs || !mime) return send(res, 404, { error: "not an image" });
+        const st = await fs.stat(abs);
+        if (st.size > IMAGE_MAX) return send(res, 413, { error: "image too large to preview" });
+        return send(res, 200, await fs.readFile(abs), mime);
+      }
+      if (req.method === "GET" && p === "/api/fs/archive-entry") {
+        const root = q.get("root") || cfg.cwd;
+        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
+        return send(res, 200, await readArchiveEntry(root, q.get("path") || "", q.get("entry") || ""));
       }
       return send(res, 404, { error: "not found" });
     } catch (e) {
