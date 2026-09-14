@@ -1,21 +1,21 @@
-/* Right panel: tab strip + the Tokens, Memory, Graph and Files features. */
+/* Right drawer: tab strip + Chats (history), Memory, Graph and Tokens. */
 import { el, esc, fmtN } from "./lib.js";
 
-export function createPanel({ S, api, toast, onSelect, currentDir, insert, getPiContextWindow }) {
+export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextWindow, onShowChats }) {
   const $ = (s) => document.querySelector(s);
-  const TABS = ["tokens", "memory", "graph", "files"];
-  let tab = "tokens";
-  try { tab = TABS.includes(localStorage.getItem("omni.tab")) ? localStorage.getItem("omni.tab") : "tokens"; } catch { /* */ }
+  const TABS = ["chats", "memory", "graph", "tokens"];
+  let tab = "chats";
+  try { tab = TABS.includes(localStorage.getItem("omni.tab")) ? localStorage.getItem("omni.tab") : "chats"; } catch { /* */ }
 
   function show(name) {
     tab = name;
     document.querySelectorAll(".ptab").forEach((b) => b.classList.toggle("active", b.dataset.tab === name));
     document.querySelectorAll(".ptab-body").forEach((b) => b.classList.toggle("active", b.id === `tab-${name}`));
     try { localStorage.setItem("omni.tab", name); } catch { /* */ }
+    if (name === "chats") onShowChats?.();
     if (name === "tokens") renderStats();
     if (name === "memory") loadMemory($("#memSearch").value.trim());
     if (name === "graph") loadGraph();
-    if (name === "files") loadFiles();
   }
   function setOpen(open) { document.body.classList.toggle("panel-open", open); try { localStorage.setItem("omni.panel", open ? "1" : "0"); } catch { /* */ } if (open) show(tab); }
   function open(name) { if (name) tab = name; setOpen(true); }
@@ -23,9 +23,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, insert, getPi
   document.querySelectorAll(".ptab").forEach((b) => { b.onclick = () => show(b.dataset.tab); });
   $("#btnPanel").onclick = toggle;
   $("#btnPanelClose").onclick = () => setOpen(false);
-  let initial = false; try { initial = localStorage.getItem("omni.panel") === "1"; } catch { /* */ }
-  if (window.innerWidth < 1100) initial = false;
-  setOpen(initial);
+  setOpen(false);
 
   // ---------------------------------------------------------------- tokens
   function tile(k, v) { const t = el("div", "tile"); t.append(el("div", "v", v), el("div", "k", k)); return t; }
@@ -94,42 +92,6 @@ export function createPanel({ S, api, toast, onSelect, currentDir, insert, getPi
   $("#memReindex").onclick = async () => { try { const r = await api("/api/memory/reindex", {}); toast(`Index rebuilt: ${r.notes} notes`); } catch (e) { toast(e.message, true); } };
   $("#memOpen").onclick = () => api("/api/memory/open-vault", {}).catch((e) => toast(e.message, true));
   $("#memDigest").onclick = async () => { if (!S.selected) return toast("Open a chat first", true); try { const r = await api("/api/memory/digest", { sid: S.selected }); toast(`Digest written: ${r.path}`); loadMemory(""); } catch (e) { toast(e.message, true); } };
-
-  // ----------------------------------------------------------------- files
-  let filesRoot = null;
-  function resetFiles() { filesRoot = null; }
-  async function loadFiles() {
-    const root = currentDir();
-    if (!root || root === filesRoot) return;
-    filesRoot = root;
-    $("#filesRoot").textContent = root;
-    await loadDir(root, "", $("#tree"));
-  }
-  async function loadDir(root, path, container) {
-    try {
-      const { entries } = await api(`/api/fs/list?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`);
-      container.innerHTML = "";
-      for (const e of entries) {
-        const node = el("div", "node"), row = el("div", "row");
-        row.append(el("span", "ico", e.dir ? "▸" : "·"), el("span", null, e.name));
-        node.appendChild(row);
-        if (e.dir) { const kids = el("div", "children"); kids.hidden = true; node.appendChild(kids); let loaded = false; row.onclick = async () => { kids.hidden = !kids.hidden; row.querySelector(".ico").textContent = kids.hidden ? "▸" : "▾"; if (!kids.hidden && !loaded) { loaded = true; await loadDir(root, e.path, kids); } }; }
-        else row.onclick = () => openFile(root, e.path);
-        container.appendChild(node);
-      }
-    } catch (e) { container.textContent = e.message; }
-  }
-  async function openFile(root, path) {
-    try {
-      const d = await api(`/api/fs/read?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`);
-      $("#vpath").textContent = path;
-      $("#vbody").textContent = d.content != null ? d.content : d.tooBig ? `(file too large: ${d.size} bytes)` : d.binary ? `(binary file: ${d.ext})` : "(unreadable)";
-      $("#viewer").hidden = false;
-      $("#vref").onclick = () => { insert(`@${path} `); $("#viewer").hidden = true; };
-    } catch (e) { toast(e.message, true); }
-  }
-  $("#vclose").onclick = () => { $("#viewer").hidden = true; };
-  $("#viewer").onclick = (e) => { if (e.target.id === "viewer") $("#viewer").hidden = true; };
 
   // ----------------------------------------------------------------- graph
   const G = { dir: null, data: null, pos: new Map(), sel: null, view: { x: 0, y: 0, k: 1 }, drag: null, raf: 0, ticks: 0 };
@@ -242,5 +204,5 @@ export function createPanel({ S, api, toast, onSelect, currentDir, insert, getPi
   };
   $("#graphQ").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#graphAsk").click(); });
 
-  return { open, toggle, show, renderStats, loadMemory, loadGraph, loadGraphList, loadFiles, resetFiles, graphLine: (t) => { $("#graphTotals").textContent = t; } };
+  return { open, toggle, show, setOpen, renderStats, loadMemory, loadGraph, loadGraphList, graphLine: (t) => { $("#graphTotals").textContent = t; } };
 }

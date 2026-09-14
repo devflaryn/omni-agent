@@ -39,7 +39,7 @@ test("validateProvider rejects bad names, urls, apis and empty model lists", () 
 });
 
 test("upsertProvider writes pi's models.json shape, keeps unknown fields and the old key when omitted", () => {
-  writeFileSync(file, JSON.stringify({ providers: { orca: { baseUrl: "https://orca/v1", api: "openai-completions", apiKey: "orca-key", compat: { supportsDeveloperRole: false }, models: [{ id: "Qwen/Qwen3.8-27B", name: "Qwen" }] } }, somethingElse: 1 }));
+  writeFileSync(file, JSON.stringify({ providers: { orca: { baseUrl: "https://orca/v1", api: "openai-completions", apiKey: "orca-key", compat: { supportsDeveloperRole: false }, models: [{ id: "Qwen/Qwen3.8-27B", name: "Qwen", input: ["text", "image"], cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } }] } }, somethingElse: 1 }));
   upsertProvider(file, "openrouter", { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "sk-or-1234", models: [{ id: "deepseek/deepseek-v4-flash-0731" }] });
   let j = JSON.parse(readFileSync(file, "utf8"));
   assert.equal(j.somethingElse, 1);
@@ -51,6 +51,14 @@ test("upsertProvider writes pi's models.json shape, keeps unknown fields and the
   j = JSON.parse(readFileSync(file, "utf8"));
   assert.equal(j.providers.openrouter.apiKey, "sk-or-1234");
   assert.deepEqual(j.providers.openrouter.models.map((m) => m.id), ["moonshotai/kimi-k2.5", "deepseek/deepseek-v4-flash-0731"]);
+  // re-saving an existing model by id alone keeps its hand-written fields (image input, cost, name)
+  upsertProvider(file, "orca", { baseUrl: "https://orca/v1", api: "openai-completions", models: [{ id: "Qwen/Qwen3.8-27B" }, "new/model"] });
+  j = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(j.providers.orca.models[0].name, "Qwen");
+  assert.deepEqual(j.providers.orca.models[0].input, ["text", "image"]);
+  assert.equal(j.providers.orca.models[0].cost.input, 1);
+  assert.equal(j.providers.orca.apiKey, "orca-key");
+  assert.equal(j.providers.orca.models[1].id, "new/model");
   // an explicit empty key clears it
   upsertProvider(file, "openrouter", { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "", models: [{ id: "a" }] });
   j = JSON.parse(readFileSync(file, "utf8"));

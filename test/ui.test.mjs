@@ -1,7 +1,8 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, fileKind, fmtBytes } from "../ui/lib.js";
+import { titleFrom } from "../server/watchers.mjs";
 
 test("fmtDuration", () => {
   assert.equal(fmtDuration(0), "0s");
@@ -62,6 +63,8 @@ test("md renders code, bold, lists and escapes html", () => {
   assert.equal(md("**hi** <b>"), "<p><b>hi</b> &lt;b&gt;</p>");
   assert.match(md("```js\nlet a = 1\n```"), /<pre><code>let a = 1<\/code><\/pre>/);
   assert.match(md("- a\n- b"), /<ul><li>a<\/li><li>b<\/li><\/ul>/);
+  // CRLF files (Windows-authored notes) render tables and lists too
+  assert.match(md("| | |\r\n|---|---|\r\n| **File** | x |\r\n"), /<table><tr><th><\/th><th><\/th><\/tr><tr><td><b>File<\/b><\/td><td>x<\/td><\/tr><\/table>/);
 });
 
 test("splitAttachments strips leading omni-memory/repo-graph packs", () => {
@@ -119,4 +122,21 @@ test("workSummary joins verb phrases in first-seen order", () => {
   assert.equal(workSummary([]), "Worked");
   assert.equal(workSummary(["shell"], true), "Running a command…");
   assert.equal(workSummary(["edit", "browser"], true), "Using the browser…");
+});
+
+test("fileKind picks the preview family from the name", () => {
+  assert.equal(fileKind("app.apk"), "archive"); assert.equal(fileKind("Bundle.ZIP"), "archive"); assert.equal(fileKind("lib.jar"), "archive");
+  assert.equal(fileKind("shot.png"), "image"); assert.equal(fileKind("a/b/photo.JPEG"), "image"); assert.equal(fileKind("logo.svg"), "image");
+  assert.equal(fileKind("README.md"), "markdown");
+  assert.equal(fileKind("main.py"), "text"); assert.equal(fileKind("Makefile"), "text"); assert.equal(fileKind(".zshrc"), "text"); assert.equal(fileKind("LICENSE"), "text");
+  assert.equal(fileKind("classes.dex"), "binary"); assert.equal(fileKind("a.tar.gz"), "binary");
+});
+
+test("fmtBytes", () => {
+  assert.equal(fmtBytes(0), "0 B"); assert.equal(fmtBytes(2048), "2.0 KB"); assert.equal(fmtBytes(5 * 1048576), "5.0 MB"); assert.equal(fmtBytes(null), "");
+});
+
+test("titleFrom drops a leading memory pack so the history shows the real prompt", () => {
+  assert.equal(titleFrom("<omni-memory>- **arceus-x-neo-rebuild** stuff</omni-memory>\n\nRebuild the APK"), "Rebuild the APK");
+  assert.equal(titleFrom("  plain   prompt "), "plain prompt");
 });

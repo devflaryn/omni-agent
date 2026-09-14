@@ -84,7 +84,20 @@ export function upsertProvider(file, name, body) {
   if (err) throw Object.assign(new Error(err), { status: 400 });
   const json = readModelsFile(file);
   const prev = json.providers[name] || {};
-  const next = { ...prev, baseUrl: String(body.baseUrl).trim(), api: body.api, models: normalizeModels(body.models) };
+  // Per model id, keep what the file already had (image input, costs, compat) and let the form override.
+  const prevById = new Map((Array.isArray(prev.models) ? prev.models : []).map((m) => [m?.id, m]));
+  const models = [];
+  for (const raw of body.models) {
+    const given = typeof raw === "string" ? { id: raw } : raw && typeof raw === "object" ? raw : {};
+    const [m] = normalizeModels([given]);
+    if (!m) continue;
+    const old = prevById.get(m.id);
+    if (!old) { models.push(m); continue; }
+    const merged = { ...old, ...m };
+    for (const k of ["name", "reasoning", "input", "contextWindow", "maxTokens", "cost"]) if (given[k] === undefined && old[k] !== undefined) merged[k] = old[k];
+    models.push(merged);
+  }
+  const next = { ...prev, baseUrl: String(body.baseUrl).trim(), api: body.api, models };
   if (body.apiKey === undefined) { if (prev.apiKey) next.apiKey = prev.apiKey; }
   else if (String(body.apiKey).trim()) next.apiKey = String(body.apiKey).trim();
   else delete next.apiKey;

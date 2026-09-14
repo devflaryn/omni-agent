@@ -6,59 +6,82 @@
 <title>Omni Agent</title>
 <link rel="stylesheet" href="/styles.css" />
 </head>
-<body class="side-open">
-<aside id="side">
-  <div class="side-top">
-    <div class="brand"><span class="mark"></span><span class="word">Omni Agent</span></div>
-    <button class="icon-btn" id="btnCloseSide" title="Hide sidebar">‹</button>
-  </div>
-  <button class="side-btn" id="btnNewChat"><span class="plus">+</span> New chat</button>
-  <input id="sessionFilter" type="search" placeholder="Search chats" />
-  <div id="history"></div>
-  <div class="side-foot">
-    <div class="pi-status" id="piStatus">pi: starting</div>
-    <div class="lan" id="lanInfo"></div>
-  </div>
-</aside>
+<body>
+<header id="top">
+  <div class="brand" id="brand" title="Home"><span class="mark"></span><span class="word">Omni Agent</span></div>
+  <div class="top-title" id="topTitle"></div>
+  <div class="menu-wrap"><button class="icon-btn" id="btnChatMenu" title="Chat actions" hidden>···</button><div class="menu" id="chatMenu" hidden></div></div>
+  <span class="grow"></span>
+  <div class="pi-status" id="piStatus" title="Omni's pi child">pi: starting</div>
+  <div class="top-model" id="topModel"></div>
+  <button class="icon-btn" id="btnExplorer" title="Files (working directory)" hidden><svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg></button>
+  <button class="icon-btn" id="btnPanel" title="Chat history"><svg viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg></button>
+  <button class="icon-btn" id="btnSettings" title="Providers and models"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.7M8 12.5v1.7M1.8 8h1.7M12.5 8h1.7M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M3.6 12.4l1.2-1.2M11.2 4.8l1.2-1.2"/></svg></button>
+</header>
 
 <main id="main">
-  <header id="top">
-    <button class="icon-btn" id="btnOpenSide" title="Show sidebar">☰</button>
-    <div class="top-title" id="topTitle">Omni Agent</div>
-    <div class="menu-wrap"><button class="icon-btn" id="btnChatMenu" title="Chat actions" hidden>···</button><div class="menu" id="chatMenu" hidden></div></div>
-    <div class="grow"></div>
-    <div class="top-model" id="topModel"></div>
-    <button class="icon-btn" id="btnPanel" title="Toggle side panel">▥</button>
-  </header>
-
-  <section class="view active" id="view-home">
-    <div class="home">
-      <h1 class="hero">What should we work on?</h1>
-      <p class="hero-sub">Every pi and Claude Code chat on this machine, one memory vault, live.</p>
-      <div id="homeComposer"></div>
-      <div class="chips" id="dirChips"></div>
-      <div class="cwd-row"><span>Working directory</span><input id="homeCwd" /></div>
-      <div class="cards" id="homeCards"></div>
+  <aside id="explorer">
+    <div class="ex-head">
+      <span class="ex-title">Files</span>
+      <button class="icon-btn small" id="explorerRefresh" title="Refresh">↻</button>
+      <button class="icon-btn small" id="explorerClose" title="Hide">×</button>
     </div>
-  </section>
+    <div class="ex-root mono" id="explorerRoot"></div>
+    <input id="explorerFilter" type="search" placeholder="Filter files" />
+    <div id="tree"></div>
+  </aside>
 
-  <section class="view" id="view-chat">
-    <div id="transcriptWrap"><div id="transcript"></div></div>
-    <div id="chatComposer"></div>
-  </section>
+  <aside id="preview" hidden>
+    <div class="pv-head">
+      <span class="pv-path mono" id="pvPath"></span>
+      <span class="pv-meta" id="pvMeta"></span>
+      <button class="btn quiet small" id="pvRaw" hidden>Raw</button>
+      <button class="btn small" id="pvRef" title="Insert @path into the prompt">Reference</button>
+      <button class="icon-btn small" id="pvClose" title="Close preview">×</button>
+    </div>
+    <div id="pvBody"></div>
+  </aside>
+
+  <div id="content">
+    <section class="view active" id="view-home">
+      <div class="home">
+        <h1 class="hero">What should we work on?</h1>
+        <p class="hero-sub">pi runs here, in the folder you pick. Every chat on this machine lives in the history drawer.</p>
+        <div id="homeComposer"></div>
+        <div class="cwd-row">
+          <span>Working directory</span>
+          <input id="homeCwd" spellcheck="false" />
+          <button class="btn quiet small" id="homeBrowse" title="Browse this folder">Files</button>
+        </div>
+        <div class="chips" id="dirChips"></div>
+      </div>
+    </section>
+
+    <section class="view" id="view-chat">
+      <div id="transcriptWrap"><div id="transcript"></div></div>
+      <div id="chatComposer"></div>
+    </section>
+  </div>
 </main>
 
 <aside id="panel">
   <div class="panel-tabs">
-    <button class="ptab active" data-tab="tokens">Tokens</button>
+    <button class="ptab active" data-tab="chats">Chats</button>
     <button class="ptab" data-tab="memory">Memory</button>
     <button class="ptab" data-tab="graph">Graph</button>
-    <button class="ptab" data-tab="files">Files</button>
+    <button class="ptab" data-tab="tokens">Tokens</button>
     <span class="grow"></span>
-    <button class="icon-btn" id="btnPanelClose" title="Close panel">×</button>
+    <button class="icon-btn" id="btnPanelClose" title="Close">×</button>
   </div>
 
-  <div class="ptab-body active" id="tab-tokens">
+  <div class="ptab-body active" id="tab-chats">
+    <button class="side-btn" id="btnNewChat"><span class="plus">+</span> New chat</button>
+    <input id="sessionFilter" type="search" placeholder="Search chats" />
+    <div id="history"></div>
+    <div class="side-foot"><div class="lan" id="lanInfo"></div></div>
+  </div>
+
+  <div class="ptab-body" id="tab-tokens">
     <div class="stat-block">
       <div class="stat-title" id="statTitle">Current chat</div>
       <div class="tiles" id="statTiles"></div>
@@ -69,7 +92,7 @@
   </div>
 
   <div class="ptab-body" id="tab-memory">
-    <p class="lead">An Obsidian vault both harnesses read and write. One fact per note; session digests land here on their own.</p>
+    <p class="lead">An Obsidian vault pi reads and writes. One fact per note; session digests land here on their own.</p>
     <div class="row-tools">
       <input id="memSearch" type="search" placeholder="Search the vault" />
       <button class="btn" id="memNew">New</button>
@@ -112,17 +135,39 @@
     <div class="row-tools"><input id="graphQ" type="search" placeholder="Ask the graph" /><button class="btn" id="graphAsk">Ask</button></div>
     <pre id="graphAnswer" hidden></pre>
   </div>
-
-  <div class="ptab-body" id="tab-files">
-    <div class="lead mono" id="filesRoot"></div>
-    <div id="tree"></div>
-  </div>
 </aside>
 
-<div id="viewer" hidden><div class="vcard">
-  <div class="vhead"><span class="vpath" id="vpath"></span><button class="btn" id="vref">Reference in prompt</button><button class="btn quiet" id="vclose">Close</button></div>
-  <pre id="vbody"></pre>
-</div></div>
+<div id="settings" class="modal" hidden>
+  <div class="dialog">
+    <div class="dlg-head">
+      <div><b>Providers</b><span class="dlg-sub">Which LLMs pi can use. Only the model ids you type here show up in the picker.</span></div>
+      <button class="icon-btn" id="settingsClose" title="Close">×</button>
+    </div>
+    <div class="dlg-body">
+      <div class="prov-list" id="provList"></div>
+      <form class="prov-form" id="provForm" onsubmit="return false">
+        <div class="pf-title" id="pfTitle">New provider</div>
+        <label>Preset<select id="pfPreset"></select></label>
+        <div class="pf-hint" id="pfHint"></div>
+        <label>Provider name<input id="pfName" placeholder="openrouter" spellcheck="false" autocomplete="off" /></label>
+        <label>Base URL<input id="pfBase" placeholder="https://openrouter.ai/api/v1" spellcheck="false" autocomplete="off" /></label>
+        <label>API<select id="pfApi"></select></label>
+        <label>API key<input id="pfKey" type="password" placeholder="API key" autocomplete="off" /></label>
+        <label>Models <span class="pf-note">one id per line · optional display name after a |</span><textarea id="pfModels" rows="6" placeholder="deepseek/deepseek-v4-flash-0731 | DeepSeek V4 Flash&#10;moonshotai/kimi-k2.5" spellcheck="false"></textarea></label>
+        <div class="pf-row">
+          <label>Context window<input id="pfCtx" type="number" placeholder="128000" min="1000" /></label>
+          <label>Max output tokens<input id="pfMax" type="number" placeholder="16384" min="256" /></label>
+        </div>
+        <div class="pf-actions">
+          <button class="btn primary" id="pfSave">Save</button>
+          <button class="btn quiet" id="pfDelete" hidden>Remove provider</button>
+          <span class="grow"></span>
+          <span class="pf-file mono" id="provFile"></span>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
 
 <div id="toasts"></div>
 <script type="module" src="/app.js"></script>

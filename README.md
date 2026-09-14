@@ -61,25 +61,27 @@ Tests: `npm test`.
 
 ## What you get
 
-- **Sidebar**: every pi and Claude Code chat on this machine, grouped by day. A pulsing dot means it
-  is working right now; "in Omni" marks chats this app controls. Hover a chat for a ✕ to delete it —
-  it moves to `~/.omni-agent/trash/` (recoverable) and a live chat is refused until it stops.
-- **Chat**: one renderer for four sources (pi and Claude Code run from Omni stream token by token;
-  chats run in a terminal appear whole). Each run of tool calls folds into one line such as
-  "Used the browser, edited files, ran commands"; open it for a row per tool ("Ran git status",
-  "Edited cli.py +3 −1", a subagent's task), and open a row for its arguments and output. The status
-  line `Thinking… 11m 20s · 15k tokens · 86 tok/sec` always sits below the turn; click it to open the
-  model's reasoning in a small scrollable drawer. That open/closed choice carries over to later
-  turns, and the line is not clickable when the provider returned no reasoning.
-- **Continue any chat**: type into a chat that is closed and it resumes in place
-  (`claude -p --resume`, or Omni's pi switches to that session file). Type into a chat that is still
-  open in a terminal and Omni forks it (`--fork-session` / pi `clone`) so the terminal copy is
-  never touched. The composer caption says which will happen. "Fork into a new chat" in the ··· menu
-  forces a fork.
-- **Composer**: "Do anything", + for file references, memory and repo-graph attachments, an access
-  pill (Full access / Ask) for Claude Code, and a model / thinking picker.
-- **Right panel**: Tokens (usage, cost, context bar), Memory (search, edit, import, digest), Graph
-  (build and query a repo graph), Files (browse the chat's folder).
+- **Home**: one container. "What should we work on?", the composer, the working directory (recent
+  folders as chips). Sending starts Omni's pi in that folder and opens the chat.
+- **Chat**: a **file explorer** on the left rooted at the chat's folder, the transcript in the middle.
+  Click a file and a preview column opens beside the tree: text files as text, `.md` rendered (with a
+  Raw toggle), images as images, and `.zip` / `.apk` / `.jar` as the list of entries inside, where a
+  text or image entry opens in place. **Reference** drops `@path` into the prompt. The folder button
+  in the top bar hides or shows the explorer.
+- **Transcript**: pi streams token by token; chats run in a terminal appear whole. Each run of tool
+  calls folds into one line such as "Edited files, ran commands"; open it for a row per tool and a
+  row for its arguments and output. The status line `Thinking… 11m 20s · 15k tokens · 86 tok/sec`
+  sits below the turn; click it for the model's reasoning.
+- **History drawer** (☰ in the top bar): every pi and Claude Code chat on this machine, grouped by
+  day, with a pulsing dot for a chat working right now. Hover for ✕ to delete (moves to
+  `~/.omni-agent/trash/`). Claude Code chats open read-only; pi chats continue in Omni's pi, or fork
+  when the chat is still open in a terminal (the composer caption says which). The drawer's other
+  tabs are Memory (search, edit, import, digest), Graph (build and query a repo graph) and Tokens.
+- **Providers** (⚙ in the top bar): pick a preset (OpenRouter, OpenAI, Anthropic, Google, DeepSeek,
+  Groq, xAI, Mistral, Together, Fireworks, Ollama, LM Studio, or any OpenAI/Anthropic-compatible
+  URL), paste the key, type the model ids one per line. The model picker lists only those models.
+- **Composer**: "Do anything", + for a file reference, memory and repo-graph attachments, and the
+  model / thinking picker. pi only: Claude Code is never launched from the UI.
 
 ## The vault (`vault/`)
 
@@ -125,21 +127,21 @@ Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/
 
 ## Models
 
-pi's model is data: `piProvider` / `piModel` in `omni.config.json` pick the default, `piModels` filters the
-picker. The normal driver is the local Qwen (`orca/*`, served OpenAI-style from modal). While that is
-down, the test driver is **DeepSeek V4 Flash 0731 on OpenRouter**, wired as pi's "other" OpenAI-compatible
-provider:
+Providers live in pi's own `~/.pi/agent/models.json`; the **Providers** dialog (⚙) edits it. Each
+provider is a base URL, an API type (`openai-completions`, `openai-responses`, `anthropic-messages`,
+`google-generative-ai`), a key and the model ids you want to see. Saving restarts Omni's pi child so it
+reads the file, then switches it back to the session it had open. Fields the dialog does not show
+(`compat`, `headers`, per-model `cost` or image input) are kept as they are.
 
-1. Put the OpenRouter key in `openrouter.txt` at the repo root (one line; gitignored, never commit it).
-2. `node scripts/install.mjs --openrouter` writes the key to `~/.pi/agent/auth.json` (0600) and pins
-   `https://openrouter.ai/api/v1` + `deepseek/deepseek-v4-flash-0731` (text only, 1.3M context, tools)
-   in `~/.pi/agent/models.json`, merging with whatever is there.
-3. `omni.config.json`: `"piProvider": "openrouter", "piModel": "deepseek/deepseek-v4-flash-0731",
-   "piModels": ["orca/*", "openrouter/deepseek/*"]`.
+Picking a model in the composer calls pi's `set_model` and writes `piProvider` / `piModel` to
+`omni.config.json`, so the next pi child starts on it. Without any provider in `models.json` the
+picker falls back to pi's own catalogue filtered by `piModels`.
 
-The server also hands `OPENROUTER_API_KEY` (from `openrouter.txt`, configurable via `apiKeyFiles`) to the
-pi child, so a `$OPENROUTER_API_KEY` reference in `models.json` resolves too. DeepSeek is not multimodal:
-the omnidroid skills carry a text-only verification loop for it; the production Qwen reads screenshots.
+`node scripts/install.mjs --openrouter` still seeds OpenRouter + DeepSeek V4 Flash from
+`openrouter.txt` for a first run. The server also hands `OPENROUTER_API_KEY` (from `openrouter.txt`,
+configurable via `apiKeyFiles`) to the pi child, so a `$OPENROUTER_API_KEY` reference in
+`models.json` resolves too. DeepSeek is not multimodal: the omnidroid skills carry a text-only
+verification loop for it; the production Qwen reads screenshots.
 
 ### Headless runs
 
@@ -156,8 +158,8 @@ full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at 
 
 `omni.config.json` in this folder (all optional): `port`, `cwd`, `vaultDir`, `piModel`,
 `piProvider`, `autoStartPi`, `digestIdleSec`, `tailRecentHours`, `memoryBudgetTokens`,
-`claudeBin`, `piCli`, `piBin`, `piModels` (model-picker allowlist, e.g. `["orca/*"]` to show only the local Qwen and
-hide OpenRouter's catalogue), `apiKeyFiles` (`{ "ENV_NAME": "/path/key.txt" }` handed to pi as env; default
+`claudeBin`, `piCli`, `piBin`, `piAgentDir` / `piModelsFile` (where the Providers dialog writes; default
+`~/.pi/agent/models.json`), `piModels` (fallback allowlist when `models.json` has no providers), `apiKeyFiles` (`{ "ENV_NAME": "/path/key.txt" }` handed to pi as env; default
 `OPENROUTER_API_KEY` ← `openrouter.txt`), `claudeTaskTimeoutSec`.
 
 ## Layout
@@ -167,6 +169,7 @@ server/index.mjs      HTTP + SSE + routes           server/continue.mjs      res
 server/pi-rpc.mjs     pi --mode rpc child           server/claude-runner.mjs claude -p stream-json runs
 server/watchers.mjs   discovery, tailing, digests   server/normalize.mjs     four sources -> one event
 server/memory.mjs     the vault                     server/tokens.mjs        tally + prices
-ui/                   index.html, styles.css, app.js + lib/transcript/composer/sidebar/panel modules
+server/providers.mjs  presets + models.json edits    server/zip.mjs           .zip/.apk listing + entry read
+ui/                   index.html, styles.css, app.js + lib/transcript/composer/explorer/settings/sidebar/panel
 desktop/              pywebview launcher            integrations/            pi extension, Claude Code hook
 ```

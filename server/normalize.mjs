@@ -17,6 +17,7 @@
  * blocks: { type: text|thinking|tool_call|tool_result|image, text?, name?, args?, toolId?, isError? }
  */
 
+import { cleanTitle } from "../ui/lib.js";
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
 export function usageFromPi(u) {
@@ -109,7 +110,7 @@ export function normalizePiEntry(entry, ctx) {
     case "model_change":
       return [base(ctx, "session", ts, { model: entry.modelId, provider: entry.provider })];
     case "session_info":
-      return entry.name ? [base(ctx, "session", ts, { title: entry.name })] : [];
+      return entry.name ? [base(ctx, "session", ts, { title: cleanTitle(entry.name) || entry.name })] : [];
     case "message":
       return piMessageToMsg(entry.message, ctx, { id: entry.id, ts: entry.timestamp, live: false });
     case "compaction":

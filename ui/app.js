@@ -1,22 +1,28 @@
-/* Omni Agent front end. Home + Chat in the main column, Tokens/Memory/Graph/Files in the right panel. */
-import { el, fmtN, baseName } from "./lib.js";
+/* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only. */
+import { el, baseName, cleanTitle } from "./lib.js";
 import { newView, applyEvent, finish, forkNote, emptyNote } from "./transcript.js";
 import { createComposer } from "./composer.js";
-import { createSidebar } from "./sidebar.js";
+import { createHistory } from "./sidebar.js";
 import { createPanel } from "./panel.js";
+import { createExplorer } from "./explorer.js";
+import { createSettings } from "./settings.js";
 
 const $ = (s) => document.querySelector(s);
-const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, memCount: 0, graphs: [], followFork: null, forceFork: false, desktop: new URLSearchParams(location.search).get("desktop") === "1" };
+const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, followFork: null, forceFork: false, desktop: new URLSearchParams(location.search).get("desktop") === "1" };
 const liveWindowMs = () => S.config?.liveWindowMs || 30000;
+/** Events replayed by the SSE stream at connect time predate this; their system toasts are stale. */
+const BOOT_TS = Date.now();
 
 async function api(path, body, method) {
-  const r = await fetch(path, body ? { method: method || "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : { method: method || "GET" });
+  const r = await fetch(path, body || (method && method !== "GET") ? { method: method || "POST", headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined } : { method: "GET" });
   const j = await r.json().catch(() => ({}));
   if (!r.ok || j.error) throw new Error(j.error || `${r.status}`);
   return j;
 }
 function toast(text, err) { const t = el("div", `toast${err ? " err" : ""}`, text); $("#toasts").appendChild(t); setTimeout(() => t.remove(), err ? 7000 : 3500); }
-const currentDir = () => S.sessions.get(S.selected)?.cwd || $("#homeCwd").value.trim() || S.config?.cwd || null;
+const homeCwd = () => $("#homeCwd").value.trim() || S.config?.cwd || "";
+const currentDir = () => (S.page === "chat" && S.sessions.get(S.selected)?.cwd) || homeCwd() || null;
+
 async function deleteChat(sid) {
   const s = S.sessions.get(sid);
   const name = s?.title ? `“${s.title.slice(0, 40)}”` : "this chat";
@@ -25,48 +31,57 @@ async function deleteChat(sid) {
     await api(`/api/sessions/${encodeURIComponent(sid)}`, null, "DELETE");
     S.sessions.delete(sid); S.buffers.delete(sid);
     if (S.selected === sid) { S.selected = null; S.view = null; showView("home"); }
-    sidebar.render(); if (S.page === "home") renderHome();
+    history.render();
     toast("Chat deleted");
   } catch (e) { toast(e.message, true); }
 }
 
 // ------------------------------------------------------------- modules
-const sidebar = createSidebar({ S, onSelect: (sid) => { selectSession(sid); showView("chat"); }, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat });
-const panel = createPanel({ S, api, toast, onSelect: (sid) => { selectSession(sid); showView("chat"); }, currentDir, insert: (t) => (S.page === "chat" ? chat : home).insert(t), getPiContextWindow: () => S.pi.state?.model?.contextWindow });
-const home = createComposer($("#homeComposer"), { showTarget: true, onSend: homeSend, onPickFile: () => panel.open("files"), onPiModel: setPiModel, onPiThinking: setPiThinking });
-const chat = createComposer($("#chatComposer"), { onSend: chatSend, onStop: chatStop, onPickFile: () => panel.open("files"), onPiModel: setPiModel, onPiThinking: setPiThinking });
-home.setState({ harness: "pi" });
+const openChat = (sid) => { selectSession(sid); showView("chat"); if (window.innerWidth < 1100) panel.setOpen(false); };
+const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat });
+const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => history.render() });
+const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat") });
+const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices(); refreshState(); } });
+const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => settings.open() };
+const home = createComposer($("#homeComposer"), { ...composerHooks, onSend: homeSend });
+const chat = createComposer($("#chatComposer"), { ...composerHooks, onSend: chatSend, onStop: chatStop });
 
-async function setPiModel(provider, id) { try { await api("/api/pi/model", { provider, modelId: id }); toast(`pi model: ${id}`); } catch (e) { toast(e.message, true); } }
+async function setPiModel(provider, id) {
+  try { await api("/api/pi/model", { provider, modelId: id }); toast(`pi model: ${id}`); }
+  catch (e) { toast(S.pi.running ? e.message : "pi is not running yet: send a message first, then pick the model", true); }
+}
 async function setPiThinking(level) { try { await api("/api/pi/thinking", { level }); } catch (e) { toast(e.message, true); } }
 async function loadPiChoices() {
-  if (!S.pi.running) return;
   const [m, l] = await Promise.allSettled([api("/api/pi/models"), api("/api/pi/thinking-levels")]);
+  const choices = {};
   const models = m.status === "fulfilled" ? (m.value.data?.models || []) : [];
   const levels = l.status === "fulfilled" ? (l.value.data?.levels || []) : [];
-  // Only push what actually loaded, so one failing call never blanks the other.
-  const choices = {};
-  if (models.length) choices.models = models;
+  if (m.status === "fulfilled") choices.models = models;
   if (levels.length) choices.levels = levels;
-  if (choices.models || choices.levels) { home.setPiChoices(choices); chat.setPiChoices(choices); }
+  if (Object.keys(choices).length) { home.setPiChoices(choices); chat.setPiChoices(choices); }
 }
 function piModelState() { const mdl = S.pi.state?.model; return { piModel: mdl ? { provider: mdl.provider, id: mdl.id } : null, piThinking: S.pi.state?.thinkingLevel || "" }; }
+async function refreshState() { try { const st = await api("/api/state"); S.pi = st.pi; S.runs = st.runs || []; updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
 
 // --------------------------------------------------------------- views
+/** `persist` only for a deliberate toggle; leaving the chat view must not remember "closed". */
+function setExplorer(open, persist = false) { document.body.classList.toggle("explorer-open", open); if (!open) explorer.closePreview(); if (persist) { try { localStorage.setItem("omni.explorer", open ? "1" : "0"); } catch { /* */ } } }
+function explorerPreferred() { try { return localStorage.getItem("omni.explorer") !== "0"; } catch { return true; } }
 function showView(name) {
   S.page = name;
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
   $("#btnChatMenu").hidden = name !== "chat";
-  if (window.innerWidth < 860) sidebar.setOpen(false);
-  if (name === "home") renderHome();
-  if (name === "chat") { updateHeader(); updateComposer(); }
+  $("#btnExplorer").hidden = name !== "chat";
+  document.body.classList.toggle("in-chat", name === "chat");
+  if (name === "home") { setExplorer(false); renderHome(); home.focus(); }
+  if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth >= 900 && explorerPreferred()); updateHeader(); updateComposer(); }
   updateTitle();
 }
 function updateTitle() {
   const s = S.sessions.get(S.selected);
-  const title = S.page === "chat" && s?.title ? s.title : "Omni Agent";
+  const title = S.page === "chat" && s?.title ? s.title : "";
   $("#topTitle").textContent = title;
-  document.title = S.page === "chat" && s?.title ? `${s.title} · Omni Agent` : "Omni Agent";
+  document.title = title ? `${title} · Omni Agent` : "Omni Agent";
 }
 
 // ---------------------------------------------------------------- home
@@ -79,62 +94,48 @@ function renderHome() {
   const cwdInput = $("#homeCwd");
   if (!cwdInput.value) cwdInput.value = S.pi.cwd || S.config?.cwd || "";
   const chips = $("#dirChips"); chips.innerHTML = "";
-  for (const d of recentDirs()) { const c = el("button", `chip${d === cwdInput.value ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; panel.resetFiles(); renderHome(); }; chips.appendChild(c); }
-  const live = [...S.sessions.values()].filter((s) => s.streaming);
-  const today = new Date().setHours(0, 0, 0, 0);
-  let tok = 0, cost = 0, n = 0;
-  for (const s of S.sessions.values()) { if (!s.tally || (s.lastActivity || s.mtime || 0) < today) continue; tok += s.tally.total; cost += s.tally.cost; n++; }
-  const recent = [...S.sessions.values()].filter((s) => s.title).sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0))[0];
-  const cards = $("#homeCards"); cards.innerHTML = "";
-  const card = (title, big, sub, onClick, cls) => { const c = el("div", `card${cls ? ` ${cls}` : ""}`); c.append(el("div", "c-title", title), el("div", "c-big", big), el("div", "c-sub", sub)); c.onclick = onClick; cards.appendChild(c); };
-  card("Working now", String(live.length), live.length ? live.map((s) => `${s.harness}: ${s.title || "…"}`).join(" · ") : recent ? `Last: ${recent.title}` : "Nothing running", () => { if (live[0]) { selectSession(live[0].sid); showView("chat"); } }, live.length ? "live" : "");
-  card("Tokens today", fmtN(tok), `${n} session${n === 1 ? "" : "s"} · $${cost.toFixed(2)}`, () => panel.open("tokens"));
-  card("Memory", String(S.memCount), S.config ? `vault: ${baseName(S.config.vault)}` : "", () => panel.open("memory"));
-  card("Repo graphs", String(S.graphs.length), S.graphs[0] ? `${S.graphs[0].name}: ${S.graphs[0].nodes} nodes` : "Build one from a chat's folder", () => panel.open("graph"));
-  $("#topModel").textContent = S.pi.state?.model?.id || "";
-  home.setState({ ...piModelState() });
+  for (const d of recentDirs()) { const c = el("button", `chip${d === cwdInput.value ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; explorer.setRoot(d); renderHome(); }; chips.appendChild(c); }
+  home.setState({ ...piModelState(), caption: S.pi.running ? `pi in ${baseName(S.pi.cwd || "")}` : "" });
+  updateHeader();
 }
 async function homeSend(text, o) {
-  const cwd = $("#homeCwd").value.trim() || S.config?.cwd;
-  home.setState({ disabled: true });
+  const cwd = homeCwd();
+  if (!cwd) return toast("Set a working directory first", true);
+  home.setState({ disabled: true, caption: "Starting pi…" });
   try {
-    if (o.target === "pi") {
-      if (!S.pi.running || (S.pi.cwd || "").toLowerCase() !== cwd.toLowerCase()) await api("/api/pi/start", { cwd }); else await api("/api/pi/new", {});
-      const st = await api("/api/state");
-      S.pi = st.pi;
-      if (!st.pi.sid) throw new Error("pi did not report a session");
-      S.sessions.set(st.pi.sid, { ...(S.sessions.get(st.pi.sid) || {}), sid: st.pi.sid, harness: "pi", owned: true, cwd, model: st.pi.state?.model?.id, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
-      selectSession(st.pi.sid); showView("chat");
-      await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph });
-      home.clear();
-    } else {
-      const r = await api("/api/claude/run", { prompt: text, cwd, model: o.model, memory: o.memory, graph: o.graph, autonomous: o.autonomous });
-      S.sessions.set(r.sid, { sid: r.sid, harness: "claude", owned: true, cwd, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
-      home.clear(); selectSession(r.sid); showView("chat");
-    }
+    if (!S.pi.running || (S.pi.cwd || "").toLowerCase() !== cwd.toLowerCase()) await api("/api/pi/start", { cwd }); else await api("/api/pi/new", {});
+    const st = await api("/api/state");
+    S.pi = st.pi;
+    if (!st.pi.sid) throw new Error("pi did not report a session");
+    S.sessions.set(st.pi.sid, { ...(S.sessions.get(st.pi.sid) || {}), sid: st.pi.sid, harness: "pi", owned: true, cwd, model: st.pi.state?.model?.id, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
+    openChat(st.pi.sid);
+    await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph });
+    home.clear();
   } catch (e) { toast(e.message, true); }
-  finally { home.setState({ disabled: false }); }
+  finally { home.setState({ disabled: false, caption: "" }); }
 }
+$("#homeCwd").addEventListener("change", () => { explorer.setRoot(homeCwd()); renderHome(); });
+$("#homeBrowse").onclick = () => { explorer.setRoot(homeCwd()); setExplorer(!document.body.classList.contains("explorer-open")); };
+$("#brand").onclick = () => showView("home");
 
 // ---------------------------------------------------------------- chat
 function target() {
   const s = S.sessions.get(S.selected);
   if (!s) return { kind: "none" };
-  if (s.harness === "pi" && s.owned && S.pi.running && S.pi.sid === s.sid) return { kind: "owned-pi", s, streaming: !!s.streaming };
-  if (s.harness === "claude" && S.runs.some((r) => r.sid === s.sid && r.alive)) return { kind: "owned-claude-running", s };
+  if (s.harness === "claude") return { kind: "claude", s };
+  if (s.owned && S.pi.running && S.pi.sid === s.sid) return { kind: "owned-pi", s, streaming: !!s.streaming };
   const live = !s.owned && (s.streaming || Date.now() - Math.max(s.lastActivity || 0, s.mtime || 0) < liveWindowMs());
   return { kind: "continue", s, live };
 }
 function updateComposer() {
   const t = target();
-  const st = { harness: t.s?.harness || "claude", streaming: false, disabled: false, caption: "", ...piModelState() };
+  const st = { streaming: false, disabled: false, caption: "", ...piModelState() };
   if (t.kind === "none") { st.caption = "Pick a chat"; st.disabled = true; }
-  else if (t.kind === "owned-pi") { st.streaming = t.streaming; st.caption = t.streaming ? "Omni's pi is working · a message steers it, empty send stops it" : "Omni's pi"; }
-  else if (t.kind === "owned-claude-running") { st.streaming = true; st.caption = "Claude Code is working · send to stop"; }
+  else if (t.kind === "claude") { st.caption = "Claude Code chat · view only in Omni"; st.disabled = true; }
+  else if (t.kind === "owned-pi") { st.streaming = t.streaming; st.caption = t.streaming ? "pi is working · a message steers it, empty send stops it" : "Omni's pi"; }
   else {
     const fork = S.forceFork || t.live;
-    const who = t.s.harness === "claude" ? "Claude Code" : "pi";
-    st.caption = fork ? `Forks ${t.live ? "the running " : "this "}${who} chat into Omni` : `Continues this ${who} chat${t.s.harness === "pi" ? " in Omni's pi" : ""}`;
+    st.caption = fork ? `Forks ${t.live ? "the running " : "this "}pi chat into Omni` : "Continues this chat in Omni's pi";
   }
   chat.setState(st);
 }
@@ -142,41 +143,48 @@ async function chatSend(text, o) {
   const t = target();
   try {
     if (t.kind === "owned-pi") { await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph }); chat.clear(); return; }
-    if (t.kind === "owned-claude-running") { await chatStop(); return; }
-    if (t.kind === "none") return;
+    if (t.kind !== "continue") return;
     chat.setState({ disabled: true, caption: "Starting…" });
-    const r = await api(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, model: o.model, autonomous: o.autonomous, fork: S.forceFork });
+    const r = await api(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, fork: S.forceFork });
     chat.clear();
     S.forceFork = false;
-    if (r.pending) { S.followFork = r.forkedFrom; toast("Forking the chat… Omni will switch to the new session as soon as Claude Code reports it."); }
-    else if (r.sid !== S.selected) { if (r.forked) toast("Forked into a new pi session"); selectSession(r.sid); }
+    if (r.sid !== S.selected) { if (r.forked) toast("Forked into a new pi session"); selectSession(r.sid); }
   } catch (e) { toast(e.message, true); }
   finally { updateComposer(); }
 }
 async function chatStop() {
   const t = target();
-  try {
-    if (t.kind === "owned-pi") await api("/api/pi/abort", {});
-    else if (t.kind === "owned-claude-running") await api("/api/claude/abort", { sid: t.s.sid });
-  } catch (e) { toast(e.message, true); }
+  try { if (t.kind === "owned-pi") await api("/api/pi/abort", {}); } catch (e) { toast(e.message, true); }
 }
 async function selectSession(sid) {
   if (S.view) finish(S.view);
   S.selected = sid;
   S.forceFork = false;
-  sidebar.render();
+  history.render();
   const s0 = S.sessions.get(sid);
   const view = newView($("#transcript"), $("#transcriptWrap"), sid, { cwd: s0?.cwd });
   S.view = view;
-  updateHeader(); updateComposer(); panel.resetFiles();
+  updateHeader(); updateComposer();
+  if (s0?.cwd) explorer.setRoot(s0.cwd);
   try {
+    const fetchedAt = Date.now();
     const h = await api(`/api/sessions/${encodeURIComponent(sid)}/history`);
     if (S.selected !== sid) return;
     if (h.session) S.sessions.set(sid, { ...(S.sessions.get(sid) || {}), ...h.session, tally: h.tally || S.sessions.get(sid)?.tally });
     const s = S.sessions.get(sid);
     view.cwd = s?.cwd || view.cwd;
-    for (const ev of h.events) applyEvent(view, ev);
-    for (const ev of S.buffers.get(sid) || []) if (ev.ts > view.lastTs || ev.kind === "delta" || ev.kind === "block") applyEvent(view, ev);
+    if (s?.cwd) explorer.setRoot(s.cwd);
+    const seen = new Set();
+    for (const ev of h.events) { applyEvent(view, ev); if (ev.kind === "msg" && ev.id) seen.add(ev.id); }
+    // Live events buffered while the chat was open elsewhere: skip messages the file already gave us.
+    // Anything older than the fetch is already in the file. The one exception: a turn still streaming has
+    // partial text that is not written yet, so its stream parts (newer than the last file message) are replayed.
+    const streaming = !!s?.streaming;
+    for (const ev of S.buffers.get(sid) || []) {
+      if (ev.kind === "msg" && ev.id && seen.has(ev.id)) continue;
+      if (ev.ts > fetchedAt) applyEvent(view, ev);
+      else if (streaming && (ev.kind === "delta" || ev.kind === "block") && ev.ts > view.lastTs) applyEvent(view, ev);
+    }
     if (!s?.streaming) finish(view);
     if (s?.forkedFrom) forkNote(view, { fromTitle: S.sessions.get(s.forkedFrom)?.title, onOpen: () => { selectSession(s.forkedFrom); } });
     $("#transcriptWrap").scrollTop = $("#transcriptWrap").scrollHeight;
@@ -186,25 +194,33 @@ async function selectSession(sid) {
   if (document.body.classList.contains("panel-open")) panel.renderStats();
 }
 function updateHeader() {
-  const s = S.sessions.get(S.selected);
+  const s = S.page === "chat" ? S.sessions.get(S.selected) : null;
   updateTitle();
-  $("#topModel").textContent = s?.model || S.pi.state?.model?.id || "";
-  $("#topModel").title = s ? `${s.harness} · ${s.cwd || ""}` : "";
+  const model = s?.model || S.pi.state?.model?.id || "";
+  $("#topModel").textContent = model;
+  $("#topModel").hidden = !model;
+  $("#topModel").title = s ? `${s.harness} · ${s.cwd || ""}` : S.pi.cwd || "";
+  const ps = $("#piStatus");
+  ps.textContent = S.pi.running ? `pi${S.pi.streaming ? " · working" : ""}` : "pi: off";
+  ps.classList.toggle("on", !!S.pi.running && !!S.pi.streaming);
+  ps.classList.toggle("off", !S.pi.running);
 }
 function renderChatMenu() {
   const m = $("#chatMenu"); m.innerHTML = "";
   const s = S.sessions.get(S.selected); if (!s) return;
   const item = (label, fn, on) => { const b = el("button", on ? "on" : "", label); b.onclick = () => { m.hidden = true; fn(); }; m.appendChild(b); };
-  item("Fork into a new chat with the next message", () => { S.forceFork = !S.forceFork; updateComposer(); chat.focus(); }, S.forceFork);
+  if (s.harness === "pi") item("Fork into a new chat with the next message", () => { S.forceFork = !S.forceFork; updateComposer(); chat.focus(); }, S.forceFork);
   item("Digest this chat to the vault", async () => { try { const r = await api("/api/memory/digest", { sid: s.sid }); toast(`Digest written: ${r.path}`); } catch (e) { toast(e.message, true); } });
   item("Copy session id", () => navigator.clipboard?.writeText(s.sid.split(":").slice(1).join(":")).then(() => toast("Session id copied")).catch(() => {}));
   item("Tokens for this chat", () => panel.open("tokens"));
   if (s.forkedFrom) item("Open the original chat", () => selectSession(s.forkedFrom));
+  item("Delete this chat", () => deleteChat(s.sid));
   m.appendChild(el("div", "mh", `${s.harness} · ${s.cwd || ""}`));
 }
 $("#btnChatMenu").onclick = (e) => { e.stopPropagation(); const m = $("#chatMenu"); if (m.hidden) renderChatMenu(); m.hidden = !m.hidden; };
 document.addEventListener("click", (e) => { if (!e.target.closest("#chatMenu, #btnChatMenu")) $("#chatMenu").hidden = true; });
-$("#homeCwd").addEventListener("change", () => { panel.resetFiles(); renderHome(); });
+$("#btnExplorer").onclick = () => { explorer.setRoot(currentDir()); setExplorer(!document.body.classList.contains("explorer-open"), true); };
+$("#btnSettings").onclick = () => settings.open();
 
 // ------------------------------------------------------------------ SSE
 function connect() {
@@ -215,28 +231,26 @@ function connect() {
 let railTimer = null;
 function handle(ev) {
   S.seq = Math.max(S.seq, ev.seq || 0);
-  if (ev.kind === "removed") { S.sessions.delete(ev.sid); S.buffers.delete(ev.sid); if (S.selected === ev.sid) { S.selected = null; S.view = null; showView("home"); } sidebar.render(); if (S.page === "home") renderHome(); return; }
-  if (ev.kind === "log") { if (ev.level === "system") toast(ev.text); else if (ev.level === "graphify" && ev.text) panel.graphLine(ev.text.split("\n").pop()); return; }
+  if (ev.kind === "removed") { S.sessions.delete(ev.sid); S.buffers.delete(ev.sid); if (S.selected === ev.sid) { S.selected = null; S.view = null; showView("home"); } history.render(); return; }
+  if (ev.kind === "log") { if (ev.level === "system" && (ev.ts || 0) >= BOOT_TS) toast(ev.text); else if (ev.level === "graphify" && ev.text) panel.graphLine(ev.text.split("\n").pop()); return; }
   const s = S.sessions.get(ev.sid) || { sid: ev.sid, harness: ev.harness, lastActivity: 0, tally: null };
-  if (ev.kind === "session") Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
+  if (ev.kind === "session") Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title ? cleanTitle(ev.title) || undefined : undefined, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
   if (ev.kind === "status") s.streaming = !!ev.streaming;
-  if (ev.kind === "msg" && ev.role === "user" && !s.title) s.title = (ev.blocks?.[0]?.text || "").replace(/\s+/g, " ").slice(0, 80);
+  if (ev.kind === "msg" && ev.role === "user" && !s.title) s.title = cleanTitle(ev.blocks?.[0]?.text || "");
   if (ev.kind === "msg" && ev.usage) { const t = s.tally || (s.tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, messages: 0, cost: 0, context: 0 }); if (!ev.groupId || t.lastGroup !== ev.groupId) { t.lastGroup = ev.groupId; t.input += ev.usage.input; t.output += ev.usage.output; t.cacheRead += ev.usage.cacheRead; t.cacheWrite += ev.usage.cacheWrite; t.total += ev.usage.total; t.messages++; t.context = ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite; t.cost += ev.cost || 0; } }
   if (ev.kind !== "session") s.lastActivity = Math.max(s.lastActivity || 0, ev.ts || 0);
   if (ev.kind === "digest") toast(`Digest saved: ${ev.path}`);
   S.sessions.set(ev.sid, s);
   if (ev.harness === "pi" && s.owned) {
     S.pi.running = true;
+    if (ev.kind === "status") S.pi.streaming = !!ev.streaming;
     if (ev.kind === "session") { if (ev.cwd) S.pi.cwd = ev.cwd; if (ev.sessionId) S.pi.sid = ev.sid; if (ev.model) S.pi.state = { ...(S.pi.state || {}), model: { ...(S.pi.state?.model || {}), id: ev.model, provider: ev.provider || S.pi.state?.model?.provider }, thinkingLevel: ev.thinkingLevel || S.pi.state?.thinkingLevel }; loadPiChoices(); }
-    $("#piStatus").textContent = `pi: ${s.model || "ready"}${s.streaming ? " · working" : ""}`; $("#piStatus").classList.toggle("on", !!s.streaming);
+    updateHeader();
   }
-  if (ev.kind === "run" && ev.harness === "claude") { const r = S.runs.find((x) => x.sid === ev.sid); if (r) r.alive = false; }
-  if (ev.kind === "session" && ev.harness === "claude" && ev.owned && !S.runs.some((r) => r.sid === ev.sid)) S.runs.push({ sid: ev.sid, alive: true });
-  if (ev.kind === "status" && ev.harness === "claude") { const r = S.runs.find((x) => x.sid === ev.sid); if (r) r.alive = !!ev.streaming; }
   const buf = S.buffers.get(ev.sid) || []; buf.push(ev); if (buf.length > 800) buf.splice(0, buf.length - 800); S.buffers.set(ev.sid, buf);
-  if (ev.kind === "session" && ev.forkedFrom && S.followFork && ev.forkedFrom === S.followFork) { S.followFork = null; selectSession(ev.sid); showView("chat"); }
+  if (ev.kind === "session" && ev.forkedFrom && S.followFork && ev.forkedFrom === S.followFork) { S.followFork = null; openChat(ev.sid); }
   if (ev.sid === S.selected && S.view) { applyEvent(S.view, ev); if ((ev.kind === "msg" || ev.kind === "run") && document.body.classList.contains("panel-open")) panel.renderStats(); if (ev.kind === "status" || ev.kind === "session") { updateHeader(); updateComposer(); } }
-  if (!railTimer) railTimer = setTimeout(() => { railTimer = null; sidebar.render(); if (S.page === "home") renderHome(); else updateComposer(); }, 250);
+  if (!railTimer) railTimer = setTimeout(() => { railTimer = null; if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "home") renderHome(); else updateComposer(); }, 250);
 }
 
 // ----------------------------------------------------------------- init
@@ -245,12 +259,11 @@ async function init() {
   const st = await api("/api/state");
   S.config = st.config; S.pi = st.pi; S.runs = st.runs || [];
   for (const s of st.sessions) S.sessions.set(s.sid, s);
-  $("#piStatus").textContent = st.pi?.running ? `pi: ${st.pi.state?.model?.id || "ready"}` : "pi: off";
   if (st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0].replace(/\?token=.*/, ""); $("#lanInfo").title = "Open this on another device on your network; the first visit needs the token link from omni.config.json"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
-  sidebar.render();
+  history.render();
   showView("home");
   connect();
-  setInterval(() => { sidebar.render(); if (S.page === "chat") updateComposer(); }, 15000);
+  setInterval(() => { if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "chat") updateComposer(); }, 15000);
 }
 init().catch((e) => toast(`Omni Agent failed to start: ${e.message}`, true));

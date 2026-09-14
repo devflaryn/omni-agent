@@ -4,6 +4,23 @@ export const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "
 export const fmtN = (n) => (n == null ? "–" : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n));
 export const ago = (ts) => { if (!ts) return ""; const d = Date.now() - ts; if (d < 60e3) return "just now"; if (d < 3600e3) return `${Math.floor(d / 60e3)} min ago`; if (d < 86400e3) return `${Math.floor(d / 3600e3)} h ago`; return `${Math.floor(d / 86400e3)} d ago`; };
 export const baseName = (p) => String(p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+export const fmtBytes = (n) => (n == null ? "" : n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`);
+
+// ---------------------------------------------------------- file kinds
+const TEXT_EXTS = new Set(["txt", "md", "markdown", "ts", "tsx", "js", "mjs", "cjs", "jsx", "json", "jsonl", "py", "sh", "bash", "zsh", "ps1", "cmd", "bat", "html", "htm", "css", "scss", "xml", "yml", "yaml", "toml", "ini", "cfg", "conf", "log", "java", "kt", "kts", "c", "h", "cpp", "hpp", "rs", "go", "rb", "php", "sql", "smali", "gradle", "properties", "env", "gitignore", "csv", "tsv", "svelte", "vue", "lua", "swift", "m", "mm", "pro", "mk", "cmake", "txt", "lock"]);
+const ARCHIVE_EXTS = /^(zip|apk|jar|aar|xapk|apks|war|ear|ipa)$/;
+const IMAGE_EXTS = /^(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/;
+/** Preview family for a file name: archive | image | markdown | text | binary. The server's `kind` is authoritative once read. */
+export function fileKind(name) {
+  const base = baseName(name);
+  const m = /\.([a-z0-9]+)$/i.exec(base);
+  const ext = m ? m[1].toLowerCase() : "";
+  if (ARCHIVE_EXTS.test(ext)) return "archive";
+  if (IMAGE_EXTS.test(ext)) return "image";
+  if (ext === "md" || ext === "markdown") return "markdown";
+  if (!ext || TEXT_EXTS.has(ext) || /^(makefile|dockerfile|license|readme|\.[a-z]+rc)$/i.test(base)) return "text";
+  return "binary";
+}
 
 export function groupLabel(ts, now = Date.now()) {
   const d = new Date(ts || 0), n = new Date(now);
@@ -41,6 +58,9 @@ export function splitAttachments(text) {
   }
   return attachments.length ? { text: s.trim(), attachments } : { text, attachments: [] };
 }
+
+/** First user text → list title, without a leading memory/graph pack. */
+export function cleanTitle(text) { return splitAttachments(String(text || "")).text.replace(/\s+/g, " ").trim().slice(0, 80); }
 
 export function relPath(path, cwd) {
   let p = String(path || "").replace(/\\/g, "/");
@@ -96,7 +116,7 @@ export function groupToolRuns(items, now = Date.now()) {
 
 // ----------------------------------------------------------- markdown
 export function md(src) {
-  const blocks = String(src || "").split(/(```[\s\S]*?```)/g);
+  const blocks = String(src || "").replace(/\r\n?/g, "\n").split(/(```[\s\S]*?```)/g);
   return blocks.map((b) => {
     const m = b.match(/^```(\w*)\n?([\s\S]*?)```$/);
     if (m) return `<pre><code>${esc(m[2].replace(/\n$/, ""))}</code></pre>`;
@@ -111,7 +131,7 @@ export function md(src) {
       return `\n<${ordered ? "ol" : "ul"}>${items}</${ordered ? "ol" : "ul"}>`;
     });
     h = h.replace(/(?:^|\n)(\|.+\|\n\|[-:| ]+\|\n(?:\|.*\|\n?)*)/g, (_, tbl) => {
-      const rows = tbl.trim().split("\n").filter((r) => !/^\|[-:| ]+\|$/.test(r));
+      const rows = tbl.trim().split("\n").filter((r) => !/^\|(?:\s*:?-+:?\s*\|)+$/.test(r));
       return `\n<table>${rows.map((r, i) => `<tr>${r.split("|").slice(1, -1).map((c) => `<${i ? "td" : "th"}>${c.trim()}</${i ? "td" : "th"}>`).join("")}</tr>`).join("")}</table>`;
     });
     h = h.replace(/\n{2,}/g, "</p><p>").replace(/(?<!>)\n(?!<)/g, "<br>");

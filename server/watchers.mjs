@@ -8,6 +8,8 @@ import { basename, join, resolve } from "node:path";
 import { JsonlTail, readAppended } from "./tailer.mjs";
 import { normalizePiEntry, normalizeClaudeEntry } from "./normalize.mjs";
 import { createTally } from "./tokens.mjs";
+import { cleanTitle } from "../ui/lib.js";
+export const titleFrom = cleanTitle;
 
 const normPath = (p) => resolve(String(p)).toLowerCase();
 
@@ -58,7 +60,7 @@ function applyToRegistry(registry, ev) {
     if (ev.model) s.model = ev.model;
     if (ev.role === "user" && !s.title) {
       const t = ev.blocks?.find((b) => b.type === "text")?.text || "";
-      if (t) s.title = t.replace(/\s+/g, " ").slice(0, 80);
+      if (t) s.title = titleFrom(t) || t.replace(/\s+/g, " ").slice(0, 80);
     }
     if (ev.role === "assistant") {
       // pi: stopReason "toolUse" => still working; claude: a tool_call block => still working

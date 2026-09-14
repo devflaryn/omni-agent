@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import { resolve } from "node:path";
 import { createLineSplitter } from "./jsonl.mjs";
 import { normalizePiRpcEvent } from "./normalize.mjs";
+import { cleanTitle } from "../ui/lib.js";
 
 const normPath = (p) => (p ? resolve(String(p)).toLowerCase() : "");
 
@@ -119,7 +120,7 @@ export class PiRpc extends EventEmitter {
     this.state = r.data;
     const newSid = `pi:${r.data.sessionId}`;
     this.sid = newSid;
-    this.bus.emit({ ...this.ctx, kind: "session", ts: Date.now(), owned: true, cwd: this.cwd, file: r.data.sessionFile, sessionId: r.data.sessionId, model: r.data.model?.id, provider: r.data.model?.provider, thinkingLevel: r.data.thinkingLevel, title: r.data.sessionName });
+    this.bus.emit({ ...this.ctx, kind: "session", ts: Date.now(), owned: true, cwd: this.cwd, file: r.data.sessionFile, sessionId: r.data.sessionId, model: r.data.model?.id, provider: r.data.model?.provider, thinkingLevel: r.data.thinkingLevel, title: cleanTitle(r.data.sessionName) || undefined });
     this.bus.emit({ ...this.ctx, kind: "status", ts: Date.now(), streaming: !!r.data.isStreaming });
     return r.data;
   }

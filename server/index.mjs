@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { promises as fs, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { extname, join, relative, resolve, sep } from "node:path";
-import { CONFIG, ROOT, lanAddresses, piChildEnv } from "./config.mjs";
+import { CONFIG, ROOT, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
 import { PiRpc } from "./pi-rpc.mjs";
@@ -16,7 +16,7 @@ import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
 import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, flatModels } from "./providers.mjs";
 import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
-import { SessionRegistry, SessionWatcher } from "./watchers.mjs";
+import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
 
@@ -43,7 +43,7 @@ export async function createApp(overrides = {}) {
     if (ev.kind === "msg" && ev.live) {
       s.messages++;
       if (ev.usage) tally.add(ev.sid, { groupId: ev.groupId || ev.id, usage: ev.usage, model: ev.model, cost: ev.cost, ts: ev.ts });
-      if (ev.role === "user" && !s.title) s.title = (ev.blocks?.find((b) => b.type === "text")?.text || "").replace(/\s+/g, " ").slice(0, 80);
+      if (ev.role === "user" && !s.title) s.title = titleFrom(ev.blocks?.find((b) => b.type === "text")?.text || "");
     }
     if (ev.kind !== "session") s.lastActivity = Math.max(s.lastActivity || 0, ev.ts || 0);
     if (!s.startedAt && ev.ts) s.startedAt = ev.ts;
@@ -316,7 +316,7 @@ export async function createApp(overrides = {}) {
       if (p.startsWith("/api/pi/")) {
         const body = req.method === "POST" ? await readBody(req) : {};
         switch (p) {
-          case "/api/pi/start": startPi(body.cwd || cfg.cwd); return send(res, 200, { ok: true, sid: pi.sid });
+          case "/api/pi/start": { startPi(body.cwd || cfg.cwd); try { await pi.waitReady(); } catch { /* the UI polls /api/state */ } return send(res, 200, { ok: true, sid: pi.sid }); }
           case "/api/pi/stop": pi?.stop(); pi = null; return send(res, 200, { ok: true });
           case "/api/pi/prompt": {
             const p0 = requirePi();
@@ -327,7 +327,11 @@ export async function createApp(overrides = {}) {
           case "/api/pi/abort": return send(res, 200, await requirePi().abort());
           case "/api/pi/new": return send(res, 200, await requirePi().newSession());
           case "/api/pi/switch": return send(res, 200, await requirePi().switchSession(body.file));
-          case "/api/pi/model": return send(res, 200, await requirePi().setModel(body.provider, body.modelId));
+          case "/api/pi/model": {
+            const r = await requirePi().setModel(body.provider, body.modelId);
+            if (r?.success !== false) { cfg.piProvider = body.provider; cfg.piModel = body.modelId; if (cfg.persistPiModel !== false) writeConfigFile({ piProvider: body.provider, piModel: body.modelId }); }
+            return send(res, 200, r);
+          }
           case "/api/pi/thinking": return send(res, 200, await requirePi().setThinking(body.level));
           case "/api/pi/compact": return send(res, 200, await requirePi().compact());
           case "/api/pi/stats": return send(res, 200, await requirePi().stats());
