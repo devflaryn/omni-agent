@@ -19,7 +19,10 @@ Add `--json` to any command you intend to parse.
 `start` returns `booted:true, ok:false, reason:"no_session"` on a `--no-token`
 boot: `ok` means "session delivered", not "guest is up". `--no-token` refuses
 nothing; a boot with a saved cookie that Roblox rejects fails early with
-`cookie_invalid` (skip the check with `--no-cookie-check`).
+`cookie_invalid` (skip the check with `--no-cookie-check`). The result also
+carries `app` (below): `app.state` is the only field that says whether the game
+process is alive and in front; `start` prints a `WARNING: the game CRASHED` line
+when it already died by the time `start` returns.
 
 **Headless agent runs pass `--no-window`.** By default `start` opens a native
 QEMU window on the host; a window is a nuisance for an unattended loop and can
@@ -80,6 +83,10 @@ To prove "first bakes, second hits": `offset list` before (no entry), first
  "debug_boot": false, "offset": "omniexec-2.735.1138-lock2", "offset_default": "…",
  "offsets_available": ["…"], "adb_serial": "127.0.0.1:PORT", "vnc": "127.0.0.1:PORT",
  "qmp_port": N, "game_package": "com.roblox.client",
+ "app": {"package": "com.roblox.client", "pid": 13210, "running": true, "foreground": true,
+         "foreground_activity": "com.roblox.client/.ActivityNativeMain",
+         "last_crash": {"when": "09-13 12:43:28.719", "pid": 13210, "line": "… FATAL EXCEPTION: main", "detail": "java.lang.NoClassDefFoundError: …"},
+         "state": "running", "hint": "the game process is alive and in the foreground"},
  "foreground": {"package": "…", "activity": "…", "pid": N},
  "root":   {"available": true, "su": "/debug_ramdisk/su", "fix": null},
  "devkit": {"attached": false, "mount": "…", "tools": "/data/local/tmp/omni-devkit",

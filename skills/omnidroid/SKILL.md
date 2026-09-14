@@ -201,6 +201,41 @@ and a `can{}` map (`screenshot`, `logcat`, `install_apk`, `run_su`, `frida`,
 `hide_root`). Every failure below otherwise looks identical from the outside
 ("the tool did nothing").
 
+### Is the game actually running? Read `app`, nothing else
+
+`debug-info --json` (and the JSON `start` prints) carries an `app` block:
+
+```json
+"app": {"package": "com.roblox.client", "pid": 13210, "running": true, "foreground": true,
+        "foreground_activity": "com.roblox.client/.ActivityNativeMain",
+        "last_crash": null, "state": "running", "hint": "…"}
+```
+
+`app.state` is the only proof the app is up:
+
+| `app.state` | meaning | what to do |
+|---|---|---|
+| `running` | process alive **and** in the foreground | proceed |
+| `background` | process alive, something else (usually the kiosk) has the screen | still launching: re-read `debug-info` after 30 s; if it stays, it lost focus |
+| `crashed` | no process, and the crash buffer holds a crash for this package (`last_crash.when/pid/detail`) | the app died; read `logcat` around `last_crash.when`, fix, relaunch. **Do not** report success |
+| `not_running` | no process, no crash recorded | it never launched or was closed |
+
+Signals that are **not** proof and were mistaken for it on 2026-09-13:
+`start` → `ok: true` (means the session broadcast was delivered),
+`session --play` → `played: true` (means the deep link fired), and logcat lines
+such as `JNI_OnLoad complete`, `lua environment ready`, `engine found` (the
+injected library loads *before* the Java layer can throw and kill the process).
+A verification paragraph that quotes those while `pidof` was empty and
+`mCurrentFocus` sat on `com.omni.kiosk` is wrong. State the `app.state` you
+read, with its timestamp, in every "it works" claim.
+
+**Launch pattern.** Run `start … --json` in the *foreground* with a long tool
+timeout (up to 600 s; a first `--apk` bake takes ~2 min) and read `app` from
+the single JSON line it prints. Do not `nohup … &` and `tail` a log: the tail
+truncates the JSON and hides the failures (the `No module named omnidroid`
+lines in the 2026-09-13 logs were the crash recorder failing to start, which is
+fixed, but a tailed log is how they went unread).
+
 ```bash
 python3 -m omnidroid screenshot alice --out /tmp/s.png
 python3 -m omnidroid capture alice --duration 20        # keyframes + logcat + process events
