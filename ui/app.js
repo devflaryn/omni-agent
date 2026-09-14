@@ -94,7 +94,7 @@ function renderHome() {
   const cwdInput = $("#homeCwd");
   if (!cwdInput.value) cwdInput.value = S.pi.cwd || S.config?.cwd || "";
   const chips = $("#dirChips"); chips.innerHTML = "";
-  for (const d of recentDirs()) { const c = el("button", `chip${d === cwdInput.value ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; explorer.setRoot(d); renderHome(); }; chips.appendChild(c); }
+  for (const d of recentDirs()) { const c = el("button", `chip${d === cwdInput.value ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; browseHome(); renderHome(); }; chips.appendChild(c); }
   home.setState({ ...piModelState(), caption: S.pi.running ? `pi in ${baseName(S.pi.cwd || "")}` : "" });
   updateHeader();
 }
@@ -114,8 +114,11 @@ async function homeSend(text, o) {
   } catch (e) { toast(e.message, true); }
   finally { home.setState({ disabled: false, caption: "" }); }
 }
-$("#homeCwd").addEventListener("change", () => { explorer.setRoot(homeCwd()); renderHome(); });
-$("#homeBrowse").onclick = () => { explorer.setRoot(homeCwd()); setExplorer(!document.body.classList.contains("explorer-open")); };
+/** Picking a folder on Home shows its tree at once; no need to start a chat first. */
+function browseHome() { explorer.setRoot(homeCwd()); setExplorer(true); }
+$("#homeCwd").addEventListener("change", () => { browseHome(); renderHome(); });
+$("#homeCwd").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); browseHome(); renderHome(); } });
+$("#homeBrowse").onclick = () => { if (document.body.classList.contains("explorer-open")) setExplorer(false); else browseHome(); };
 $("#brand").onclick = () => showView("home");
 
 // ---------------------------------------------------------------- chat

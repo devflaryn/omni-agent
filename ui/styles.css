@@ -32,7 +32,8 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .icon-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .icon-btn:hover, .icon-btn.on { color: var(--text); background: var(--bg-3); }
 .icon-btn.small { width: 26px; height: 26px; font-size: 14px; }
-:is(.btn, input, textarea, select, .side-btn, .hist, .send-btn, .ptab, .cbtn, .meter, .row, .zrow, .prov, .icon-btn, details > summary):focus-visible { outline: 2px solid var(--caret); outline-offset: 1px; }
+:is(.btn, .side-btn, .hist, .send-btn, .ptab, .cbtn, .meter, .row, .zrow, .prov, .icon-btn, details > summary):focus-visible { outline: 2px solid var(--caret); outline-offset: 1px; }
+input, textarea, select { outline: none; }
 input[type="search"], input[type="text"], input[type="number"], input[type="password"], input:not([type]), select, textarea { width: 100%; background: var(--bg-2); border: 1px solid var(--edge); border-radius: 8px; padding: 7px 10px; color: var(--text); }
 input:focus, textarea:focus, select:focus { border-color: var(--edge-2); outline: none; }
 .menu-wrap { position: relative; }
