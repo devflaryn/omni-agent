@@ -33,10 +33,10 @@ test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_
 
 test("the shipped skills document the new omnidroid surface", () => {
   const ref = readFileSync(join(process.cwd(), "skills", "omnidroid", "reference", "omni-cli.md"), "utf8");
-  for (const s of ["frida <user> --restart", "--apk-once", "apk-<sha256", "[apk-cache]", "frida.restart", "devkit.attached", "view <user> --hide", "--vnc-viewer", "warm list", "--no-window"]) assert.ok(ref.includes(s), `reference mentions ${s}`);
+  for (const s of ["frida <user> --restart", "--apk-once", "apk-<sha256", "[apk-cache]", "frida.restart", "devkit.attached", "view <user> --hide", "--vnc-viewer", "warm list", "--no-window", "kiosk_failure", "--place"]) assert.ok(ref.includes(s), `reference mentions ${s}`);
   const skill = readFileSync(join(process.cwd(), "skills", "omnidroid", "SKILL.md"), "utf8");
   assert.match(skill, /^name: omnidroid$/m);
-  for (const s of ["--restart", "--apk-once", "--no-window", "view <name> --hide", "warm list|prune|clear|bake"]) assert.ok(skill.includes(s), `skill mentions ${s}`);
+  for (const s of ["--restart", "--apk-once", "--no-window", "view <name> --hide", "warm list|prune|clear|bake", "OMNI-", "--place", "kiosk_failure"]) assert.ok(skill.includes(s), `skill mentions ${s}`);
   const input = readFileSync(join(process.cwd(), "skills", "omnidroid-input", "SKILL.md"), "utf8");
   assert.match(input, /^name: omnidroid-input$/m);
   assert.ok(input.includes("Driving without vision"));

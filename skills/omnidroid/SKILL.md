@@ -31,7 +31,9 @@ tool.
    username**, and that username is also the instance name. Accounts are
    created only by `omnidroid login`.
 2. **The Roblox VERSION is an offset, chosen per launch.** The base ships no
-   Roblox. `start` with no `--offset` uses the base's default offset.
+   Roblox. `start` with no `--offset` uses the base's default offset **if one
+   exists** — check `offset list` first; a base can have none baked (see
+   "Roblox versions" below).
 3. **Instances are ephemeral.** There is no `create`; `start` allocates one and
    every guest write is discarded at power-off. One live instance per username;
    two different usernames run side by side.
@@ -39,12 +41,22 @@ tool.
 ## The loop
 
 ```bash
-python3 -m omnidroid offset list          # which Roblox versions exist (* = default)
+python3 -m omnidroid offset list          # which Roblox versions exist (* = default) — can be NONE
 python3 -m omnidroid list --stats         # what is running, ports, version, mode
-python3 -m omnidroid start alice --place 8737899170
+python3 -m omnidroid start alice --place 8737899170                     # only if offset list showed a default
+python3 -m omnidroid start alice --place 8737899170 --apk build.apk     # no default baked: use --apk or offset create first
 python3 -m omnidroid debug-info alice     # ← when anything is unclear or failed
 python3 -m omnidroid stop alice
 ```
+
+**Check `offset list` before assuming a default exists.** A base can ship with
+*no* Roblox baked at all (e.g. the arm base after a system rebake retires its
+offsets) — `offset list` then reports "base 'arm' has NO Roblox baked" and a
+bare `start alice` fails with `no_offset`. Bake or boot one first: `start alice
+--apk ~/Downloads/Roblox-2.738.1397.apk` (caches it) or `offset create NAME
+--apk FILE`. A stock, unmodified Roblox APK from `~/Downloads` boots but has no
+cookie-reading code, so it cannot log in (`not_logged_in`) — fine for a smoke
+test, not for a real session.
 
 ## Roblox versions ("offsets")
 
@@ -72,11 +84,11 @@ Per launch:
 
 | You want | Command |
 |---|---|
-| the default version | `start alice` |
+| the default version | `start alice` (only if `offset list` shows one — a base can ship with none) |
 | a specific baked version | `start alice --offset 2.740.101` |
 | a custom build, cached for next time | `start alice --apk build.apk` |
 | a custom build, installed once and thrown away | `start alice --apk build.apk --apk-once` |
-| the clean base, no game | `start alice --no-offset` |
+| the clean base, no game | `start alice --no-offset` (currently a bug: refused unless `--apk` is also passed — see "Things that will bite you") |
 
 **`--apk` is a cached, launchable version.** The first launch of a file bakes it
 as a content-addressed offset `apk-<sha256[:16]>` (~1–2 min, one `[apk-cache]`
@@ -89,8 +101,9 @@ keeps the old throwaway path. Use `offset create NAME --apk …` when you want a
 human-readable name that the cache will never evict.
 
 Errors here are deliberately hard, never silent fallbacks:
-`no_offset` (you named a version that is not baked — the message lists what
-is), `no_default_offset` (several offsets, none marked default).
+`no_offset` (you named a version that is not baked, or the base has none baked
+at all — the message lists what is), `no_default_offset` (several offsets,
+none marked default).
 
 ## Launching an account
 
@@ -98,8 +111,18 @@ is), `no_default_offset` (several offsets, none marked default).
 python3 -m omnidroid login --token-file cookie.txt       # saves under the real username
 python3 -m omnidroid accounts --verify                   # are the saved cookies still live?
 python3 -m omnidroid start alice --place 8737899170 --json
-python3 -m omnidroid session alice --place 606849621     # change the saved place
+python3 -m omnidroid session alice --place 606849621     # change the saved place AND re-join now if running
 ```
+
+`session <user> --place` updates the saved place for the next launch, and —
+whenever `alice` is currently running — always re-joins it immediately with
+the new place (`deliver_session(play=True)`). This is unconditional now; the
+old `--play` flag is still accepted but is a no-op kept only so existing
+scripts do not break. Use `session <user> --place <id>` to restart the game on
+a live instance instead of `am force-stop`ing it yourself (see "When the game
+dies" below).
+
+`start --place` was always immediate and is unchanged.
 
 `--place` is the **numeric placeId only** — in
 `https://www.roblox.com/games/606849621/Jailbreak` it is `606849621`.
@@ -208,26 +231,62 @@ and a `can{}` map (`screenshot`, `logcat`, `install_apk`, `run_su`, `frida`,
 ```json
 "app": {"package": "com.roblox.client", "pid": 13210, "running": true, "foreground": true,
         "foreground_activity": "com.roblox.client/.ActivityNativeMain",
-        "last_crash": null, "state": "running", "hint": "…"}
+        "last_crash": null, "state": "running", "hint": "…",
+        "kiosk_failure": null}
 ```
 
-`app.state` is the only proof the app is up:
+`app.state` is the only proof the app is up (unchanged: `running|background|
+crashed|not_running`), but **read `app.kiosk_failure` before deciding what
+`background` means**:
 
 | `app.state` | meaning | what to do |
 |---|---|---|
 | `running` | process alive **and** in the foreground | proceed |
-| `background` | process alive, something else (usually the kiosk) has the screen | still launching: re-read `debug-info` after 30 s; if it stays, it lost focus |
+| `background` | process alive, something else has the screen | check `app.kiosk_failure` first (below) — it may be the kiosk's failure screen counting down to its own relaunch, not "still launching"; only if `kiosk_failure` is null/already relaunched should you treat it as still-launching and re-read `debug-info` after 30 s |
 | `crashed` | no process, and the crash buffer holds a crash for this package (`last_crash.when/pid/detail`) | the app died; read `logcat` around `last_crash.when`, fix, relaunch. **Do not** report success |
 | `not_running` | no process, no crash recorded | it never launched or was closed |
 
 Signals that are **not** proof and were mistaken for it on 2026-09-13:
 `start` → `ok: true` (means the session broadcast was delivered),
-`session --play` → `played: true` (means the deep link fired), and logcat lines
-such as `JNI_OnLoad complete`, `lua environment ready`, `engine found` (the
-injected library loads *before* the Java layer can throw and kill the process).
-A verification paragraph that quotes those while `pidof` was empty and
-`mCurrentFocus` sat on `com.omni.kiosk` is wrong. State the `app.state` you
-read, with its timestamp, in every "it works" claim.
+`session … --place` → immediate re-join (means the deep link fired, not that
+the app is up), and logcat lines such as `JNI_OnLoad complete`, `lua
+environment ready`, `engine found` (the injected library loads *before* the
+Java layer can throw and kill the process). A verification paragraph that
+quotes those while `pidof` was empty and `mCurrentFocus` sat on
+`com.omni.kiosk` is wrong. State the `app.state` you read, with its timestamp,
+in every "it works" claim.
+
+### When the game dies, the kiosk shows a failure screen
+
+`com.omni.kiosk` (versionName 1.1, baked into the arm base 2026-09-16) no
+longer goes black when Roblox dies or gets displaced — it shows a FAILURE
+SCREEN: a headline (`Roblox crashed`, `Roblox was killed (signal 9)`, `Roblox
+stopped responding`, `Roblox went to the background`, `Roblox was
+force-stopped`), an error code `OMNI-<REASON>-<attempt>`, detail text, the
+line "For full details check the logs: `omnidroid logcat <instance> --tag
+OmniKiosk`", and a ⟳ countdown that relaunches the game **by itself**: 5 s,
+then 15, 30, 60, then 60 s forever. A tap relaunches at once. The counter
+resets after 3 healthy minutes.
+
+`debug-info --json` → `app.kiosk_failure` is `null` normally, or `{attempt,
+code, reason, package, delay_s, detail, when, relaunched_after, current}`.
+`current: true` means the failure screen is up right now; `current: false`
+with a failure present means it already relaunched (the hint then reads "last
+kiosk failure … (since relaunched)").
+
+**Do not relaunch the game manually on `state: crashed`/`background` without
+checking `app.kiosk_failure.current` first** — the kiosk may already be
+counting down to its own relaunch, and a second launch races it. Read the
+logs, then either let the countdown finish or make it immediate yourself with
+`omnidroid session <user> --place <id>` (or a tap, via the `omnidroid-input`
+skill) — never `am force-stop`, which itself triggers a `FORCE_STOPPED`
+failure screen (the host's own `start`/`session`/install restarts never do,
+since the kiosk only reacts to unannounced deaths).
+
+Reasons seen live (arm/Android 16): `CRASH`, `CRASH_NATIVE`, `ANR`,
+`LOW_MEMORY`, `SIGNALED`, `FORCE_STOPPED`, `EXIT_SELF`, `BACKGROUND`,
+`UNAVAILABLE`. `am crash com.roblox.client` records `EXIT_SELF` (Roblox's own
+crash handler exits itself, 15 ms–22 s later); `kill -9` records `SIGNALED`.
 
 **Launch pattern.** Run `start … --json` in the *foreground* with a long tool
 timeout (up to 600 s; a first `--apk` bake takes ~2 min) and read `app` from
@@ -239,7 +298,7 @@ fixed, but a tailed log is how they went unread).
 ```bash
 python3 -m omnidroid screenshot alice --out /tmp/s.png
 python3 -m omnidroid capture alice --duration 20        # keyframes + logcat + process events
-python3 -m omnidroid logcat alice --tag OmniKiosk
+python3 -m omnidroid logcat alice --tag OmniKiosk       # one line per relaunch: FAILURE attempt=N code=OMNI-<REASON>-N reason=<REASON> pkg=<pkg> delay=<s> detail=<first line>
 python3 -m omnidroid adb alice -- shell dumpsys activity activities
 
 python3 -m omnidroid su alice -- id -u
@@ -296,8 +355,9 @@ different fixes (`omnidroid frida <name> --restart` vs `omnidroid root-base`).
 
 A model without vision can still verify everything: `debug-info --json`
 (`foreground`, `root`, `devkit`, `frida`, `can`), `logcat <name> [--tag TAG]`
-(`OmniBootstrap` for the session cookie, `ActivityTaskManager` for launches and
-`Displayed …` lines after a tap opened something), `adb <name> -- shell dumpsys
+(`OmniBootstrap` for the session cookie, `OmniKiosk` for `FAILURE
+attempt=… code=OMNI-<REASON>-… reason=…` relaunch lines, `ActivityTaskManager`
+for launches and `Displayed …` lines after a tap opened something), `adb <name> -- shell dumpsys
 window | grep mCurrentFocus` (which window has focus right now), `adb <name> --
 shell dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'`,
 and the `omnidroid-input` skill's `state` and `ui` commands (element list with
@@ -328,6 +388,15 @@ cold boot.
 - **A `.ROBLOSECURITY` cookie is full account access.** Prefer `--token-file`
   over `--token` (an argv token is visible to every process on the host), and
   never echo a cookie into your own output.
+- **`start --no-offset` / `--offset none` alone is currently REFUSED** (engine
+  bug in `build_acct(allow_no_offset=…)`) — pass `--apk FILE` too even when you
+  just want the clean base.
+- **`omnidroid su alice -- 'kill -9 $(pidof com.roblox.client)'` does not
+  substitute** — `$(pidof …)` is not expanded for you. Resolve the pid first
+  (`su alice -- pidof com.roblox.client`) and pass the number literally.
+- **Offsets on a base can all be retired by a system rebake** (it happened to
+  arm's on 2026-09-16) — `offset list` then shows none and every bare `start`
+  fails `no_offset` until someone bakes or boots one with `--apk`.
 
 ## Related
 

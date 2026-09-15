@@ -134,6 +134,15 @@ back in full colour, not black.
   `com.android.settings` does not. `launch` checks the foreground app
   afterwards and exits non-zero rather than claiming a launch that did not
   happen, so trust its exit code. If it is blocked, drive the pinned app.
+- **The kiosk is not just a pinner — it also self-heals.** If a screenshot
+  shows a headline like "Roblox crashed"/"Roblox was killed (signal 9)", an
+  error code `OMNI-<REASON>-<attempt>`, and a ⟳ countdown instead of the game,
+  that is the kiosk's own failure screen (no more black-screen-on-death), and
+  it is already relaunching the game by itself (5 s, then 15, 30, 60, then 60 s
+  forever). `tap` anywhere on it relaunches immediately — no need to hunt for a
+  button. Verify the game is actually back with `state`/`debug-info`, not just
+  by the screen changing. Full detail and the reason codes are in the
+  `omnidroid` skill.
 - **Ambiguous labels.** `tap --text` refuses when several elements match and
   prints the candidates; narrow the string, use `--id`, or pass `--first`. When
   a label and its button both match, the clickable one is chosen.

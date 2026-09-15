@@ -22,7 +22,9 @@ nothing; a boot with a saved cookie that Roblox rejects fails early with
 `cookie_invalid` (skip the check with `--no-cookie-check`). The result also
 carries `app` (below): `app.state` is the only field that says whether the game
 process is alive and in front; `start` prints a `WARNING: the game CRASHED` line
-when it already died by the time `start` returns.
+when it already died by the time `start` returns. `app.kiosk_failure` (below)
+says whether the kiosk's own failure/relaunch screen is involved — check it
+before treating `state: background` as "still launching".
 
 **Headless agent runs pass `--no-window`.** By default `start` opens a native
 QEMU window on the host; a window is a nuisance for an unattended loop and can
@@ -45,6 +47,15 @@ An offset is a named, thin `/data` overlay carrying one baked Roblox build.
 `offset list` shows them (`*` = default); `offset create NAME --apk FILE`
 bakes one on purpose; `offset default NAME` switches the default; `offset
 remove NAME [--keep-image]` deletes one (refuses while in use).
+
+**A base can have zero offsets baked.** A system rebake retires every offset
+on that base (it happened to arm's on 2026-09-16, images moved to
+`~/Desktop/OmniImages-backup/`); `offset list` then reports "base 'arm' has NO
+Roblox baked" and a bare `start <user>` fails `no_offset` until one is baked
+(`offset create NAME --apk FILE`) or booted ad hoc (`start <user> --apk
+FILE`). Do not assume a default exists — check `offset list` first. A stock,
+unmodified Roblox APK boots but has no cookie-reading code and cannot log in
+(`not_logged_in`).
 
 ### `start --apk FILE` is a cached, launchable version
 
@@ -80,13 +91,17 @@ To prove "first bakes, second hits": `offset list` before (no entry), first
 
 ```json
 {"ok": true, "name": "…", "base": "arm", "arch": "arm", "mode": "playable",
- "debug_boot": false, "offset": "omniexec-2.735.1138-lock2", "offset_default": "…",
+ "debug_boot": false, "offset": "apk-3f9a2b1c4d5e6f70", "offset_default": "…",
  "offsets_available": ["…"], "adb_serial": "127.0.0.1:PORT", "vnc": "127.0.0.1:PORT",
  "qmp_port": N, "game_package": "com.roblox.client",
  "app": {"package": "com.roblox.client", "pid": 13210, "running": true, "foreground": true,
          "foreground_activity": "com.roblox.client/.ActivityNativeMain",
          "last_crash": {"when": "09-13 12:43:28.719", "pid": 13210, "line": "… FATAL EXCEPTION: main", "detail": "java.lang.NoClassDefFoundError: …"},
-         "state": "running", "hint": "the game process is alive and in the foreground"},
+         "state": "running", "hint": "the game process is alive and in the foreground",
+         "kiosk_failure": {"attempt": 2, "code": "OMNI-SIGNALED-2", "reason": "SIGNALED",
+                            "package": "com.roblox.client", "delay_s": 15,
+                            "detail": "…", "when": "09-16 10:04:11.220",
+                            "relaunched_after": null, "current": true}},
  "foreground": {"package": "…", "activity": "…", "pid": N},
  "root":   {"available": true, "su": "/debug_ramdisk/su", "fix": null},
  "devkit": {"attached": false, "mount": "…", "tools": "/data/local/tmp/omni-devkit",
@@ -104,12 +119,46 @@ To prove "first bakes, second hits": `offset list` before (no entry), first
   when the devkit is already attached). `frida.start` starts/forwards the server.
 - `can.frida` / `can.hide_root` are `true` only with root **and** the devkit.
 - `foreground` is the text signal for "did my tap land / which app is up".
+- `offsets_available` **can be `[]`** — a base can ship, or be rebaked down to,
+  zero offsets; do not assume `offset` or `offset_default` is non-null.
+- `app.kiosk_failure` — `null`, or the kiosk's own failure/relaunch record
+  (headline reason, `OMNI-<REASON>-<attempt>` code, `delay_s` until the next
+  auto-relaunch, `current: true` while the failure screen is on screen right
+  now). Read it before deciding what `app.state: "background"` means — it can
+  now mean "the kiosk's failure screen is up, counting down", not just "still
+  launching". See "Kiosk failure screen" below.
 
-Other text signals: `logcat <user> [--tag TAG] [--clear]`,
+Other text signals: `logcat <user> [--tag TAG] [--clear]` (`OmniKiosk` carries
+the `FAILURE attempt=… code=… reason=… pkg=… delay=… detail=…` line below),
 `adb <user> -- shell dumpsys activity activities`, `adb <user> -- shell
 dumpsys window | grep mCurrentFocus`, `su <user> -- '<script>'` (its own flags
-go BEFORE the name), `screenshot <user> --out X.png`, `capture <user>
---duration S`.
+go BEFORE the name; `su <user> -- 'kill -9 $(pidof …)'` does **not**
+substitute — resolve the pid with a separate `su` call first and pass it
+literally), `screenshot <user> --out X.png`, `capture <user> --duration S`.
+
+### Kiosk failure screen
+
+`com.omni.kiosk` (versionName 1.1, baked into the arm base 2026-09-16) shows a
+FAILURE SCREEN instead of going black when Roblox dies or is displaced:
+headline (e.g. "Roblox crashed", "Roblox was killed (signal 9)", "Roblox
+stopped responding", "Roblox went to the background", "Roblox was
+force-stopped"), error code `OMNI-<REASON>-<attempt>`, detail text, "check the
+logs: `omnidroid logcat <instance> --tag OmniKiosk`", and a ⟳ countdown that
+relaunches the game itself: 5 s, 15, 30, 60, then 60 s forever; a tap
+relaunches at once; the counter resets after 3 healthy minutes. Every attempt
+logs one `OmniKiosk` line:
+`FAILURE attempt=<n> code=OMNI-<REASON>-<n> reason=<REASON> pkg=<pkg>
+delay=<s> detail=<first line>`. Reasons seen live: `CRASH`, `CRASH_NATIVE`,
+`ANR`, `LOW_MEMORY`, `SIGNALED`, `FORCE_STOPPED`, `EXIT_SELF`, `BACKGROUND`,
+`UNAVAILABLE` (`am crash com.roblox.client` → `EXIT_SELF`; `kill -9` →
+`SIGNALED`).
+
+The host's own `start`/`session`/install restarts never trigger this — only an
+unannounced death does. Force-stopping the app yourself
+(`am force-stop com.roblox.client`) DOES trigger it (`FORCE_STOPPED`); use
+`omnidroid session <user> --place <id>` to restart the game instead. Never
+relaunch manually while `app.kiosk_failure.current: true` — the kiosk is
+already counting down and a second launch races it.
 
 ## frida
 
@@ -181,5 +230,9 @@ boot on this Mac is ~29 s, so a missing warm cache is not a blocker.
 ## Accounts and sessions
 
 `login` (visible browser or `--token-file`), `accounts [--verify]`, `session
-<user> [--place ID] [--clear]`. `--place` is the numeric placeId only. A
+<user> [--place ID] [--clear]`. `--place` is the numeric placeId only. On a
+RUNNING instance, `session <user> --place <id>` always re-joins immediately
+with the new place (`deliver_session(play=True)`) — this is unconditional now;
+the old `--play` flag is still accepted but is a no-op kept only for backward
+compatibility. `start --place` was always immediate and is unchanged. A
 `.ROBLOSECURITY` cookie is full account access: never print one.
