@@ -308,7 +308,8 @@ Call ONE tool at a time. Investigate before you conclude; back every important c
 don't burn extra calls padding it."""
 
 _WRITER_CONTRACT = """
-You MAY modify the workspace with your tools. After any change, VERIFY it with an objective check \
+Use the tools needed for your assigned task. Modify files when the task calls for changes; an investigation \
+still ends with findings. After any change, VERIFY it with an objective check \
 (build / disassemble / test / inspect) and state in your final answer whether the change is VERIFIED and how."""
 
 _JSON_NUDGE = ('Your last reply was not valid JSON. Reply with a single raw JSON object only — either '
@@ -361,18 +362,15 @@ def resolve_allowed_tools(agent_def):
     - explicit allowed_tools override wins (still safety-filtered for read agents);
     - else a READ agent gets the read-only slice of its declared toolsets plus a
       read-only core base (or the whole read-only universe if no toolsets);
-    - a WRITE agent gets the full core working set plus the FULL surface of its
-      declared toolsets (mutating tools included).
+    - a WRITE agent gets every registered tool (mutating tools included),
+      except orchestrator-owned state and recursive delegation.
     A read agent can NEVER end up holding a mutating tool (final safety filter)."""
     optin = agent_def.allow_optin_read
     if agent_def.allowed_tools is not None:
         tools = set(agent_def.allowed_tools)
     elif agent_def.is_write:
-        core_work = set(registry.tools_in_group(CORE_GROUP))
-        domain = set()
-        for ts in agent_def.toolsets:
-            domain |= set(registry.tools_in_group(ts))
-        tools = core_work | domain
+        # Worker persona toolsets aid discovery, not limit capability.
+        tools = set(registry._tools)
     else:
         core_read = {n for n in registry.tools_in_group(CORE_GROUP)
                      if is_readonly_tool(n, optin)}
@@ -591,6 +589,18 @@ def _build_messages(agent_def, allowed, task, context, run_dir, schema=None):
         contract = _SUBAGENT_CONTRACT + (_WRITER_CONTRACT if agent_def.is_write else "")
     tool_prompt = registry.get_tool_prompt(allowed_tools=allowed)
     parts = [agent_def.system_prompt.strip()]
+    # Give every dispatch path the actual tool cwd, including temporary copies.
+    # This does not depend on the orchestrator remembering to pass a root hint.
+    try:
+        import devices
+        from host_exec import workspace_root
+        remote = devices.active()
+        root = remote.remote_root if remote else workspace_root()
+        if root:
+            parts.append(f"WORKING DIRECTORY: {root}. Use this real directory for file operations. "
+                         "Keep outputs here; the user controls any promotion to another workspace.")
+    except RuntimeError:
+        pass  # Standalone tests and pure analysis agents need no workspace.
     if contract:
         parts.append(contract)
     if _wants_skill_index(agent_def):
@@ -702,6 +712,9 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
         except (TypeError, ValueError):
             max_steps = DEFAULT_MAX_STEPS
         messages = _build_messages(agent_def, allowed, task, context, run_dir, schema=schema)
+        if scope:
+            messages[0]["content"] += ("\n\nOWNED PATHS: " + ", ".join(scope) +
+                                        ". Coordinate changes outside these paths with the orchestrator.")
         ladder, ladder_note = resolve_model_ladder(agent_def, tier, models)
         if ladder_note:
             result["note"] = ladder_note
@@ -718,7 +731,7 @@ def run_subagent(agent_def, task, context="", run_dir=None, on_event=None,
         key = _KEY_ALLOCATOR.acquire(llm.active_key_pool())
         llm.set_subagent_context(pinned_key=key, models=ladder)
         _emit_event(on_event, {"type": "subagent_started", "agent": agent_def.name,
-                               "task": task[:160], "key_label": _mask(key), "mode": agent_def.mode,
+                               "task": task, "key_label": _mask(key), "mode": agent_def.mode,
                                "sub_id": sub_id, "tier": eff_tier,
                                "model": (ladder[0] if ladder else None),
                                "scope": list(scope or [])})
@@ -762,8 +775,26 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
     compactions = 0
     started = started if started is not None else time.monotonic()
 
+    def chat(role, content, **extra):
+        _emit_event(on_event, {"type": "subagent_chat", "agent": agent_name,
+                              "sub_id": sub_id, "role": role, "content": content, **extra})
+
+    def stream(event):
+        if event.get("type") == "reasoning_stream":
+            return  # Main Thinking telemetry must not overwrite a worker's answer draft.
+        _emit_event(on_event, {**event, "type": "subagent_stream", "agent": agent_name,
+                              "sub_id": sub_id})
+
+    def forced_final(note):
+        with llm.stream_events(stream if on_event else None):
+            final = _force_final(agent_def, messages, temperature, steps, tools_used,
+                                 result, note=note, tokens=tokens, schema=schema)
+        chat("assistant", final.get("report", ""))
+        return final
+
     while steps < max_steps:
-        raw = ask_llm(messages, temperature=temperature)
+        with llm.stream_events(stream if on_event else None):
+            raw = ask_llm(messages, temperature=temperature)
         u = llm.take_last_usage()
         tokens += (u["total"] if u else _estimate_tokens(messages, raw))
         result["tokens"] = tokens
@@ -774,6 +805,7 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
         messages.append({"role": "assistant", "content": raw})
 
         if rtype == "final_answer":
+            chat("assistant", _content_to_text(payload))
             if schema:
                 candidate = payload
                 # Models routinely hand back the JSON as a STRING. Parse before
@@ -836,6 +868,7 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                                        "non-JSON output could not satisfy the schema") if p))
                     return result
                 salvage = strip_reasoning(raw)
+                chat("assistant", salvage)
                 note = "; ".join(p for p in (result.get("note"),
                                              "salvaged from non-JSON output") if p)
                 result.update(ok=True, report=salvage, raw_report=salvage, steps=steps,
@@ -845,6 +878,8 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
             continue
         parse_errors = 0
 
+        if payload.get("explanation"):
+            chat("assistant", payload["explanation"])
         tool_name = payload.get("tool")
         tool_args = payload.get("args", {}) or {}
         sig = (tool_name, json.dumps(tool_args, sort_keys=True, default=str))
@@ -861,7 +896,9 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
 
         steps += 1
         tools_used.append(tool_name)
+        chat("tool_call", json.dumps(tool_args, ensure_ascii=False, default=str), tool=tool_name)
         feedback = _execute(agent_def, allowed, tool_name, tool_args)
+        chat("tool_result", str(feedback), tool=tool_name)
         messages.append({"role": "user", "content": f"TOOL RESULT:\n{feedback}"})
 
         _emit_event(on_event, {"type": "subagent_progress", "agent": agent_name,
@@ -884,13 +921,9 @@ def _run_loop(agent_def, messages, allowed, temperature, max_steps, result,
                                        "last_tool": f"(compacted context x{compactions})",
                                        "key_label": key_label, "sub_id": sub_id})
                 continue
-            return _force_final(agent_def, messages, temperature, steps, tools_used, result,
-                                note="stopped early — sub-context grew large.", tokens=tokens,
-                                schema=schema)
+            return forced_final("stopped early — sub-context grew large.")
 
-    return _force_final(agent_def, messages, temperature, steps, tools_used, result,
-                        note=f"reached the {max_steps}-step budget.", tokens=tokens,
-                        schema=schema)
+    return forced_final(f"reached the {max_steps}-step budget.")
 
 
 # --- parallel waves ----------------------------------------------------------

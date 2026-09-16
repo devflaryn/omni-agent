@@ -39,34 +39,29 @@
 
     :root {
       color-scheme: dark;
-      /* "Instrument": cool machined graphite, one warm signal.
-         Surfaces separate by TONE — bg / panel / raised — and --term-line is
-         reserved for real edges (inputs, the run rail), never for
-         outlining a panel. Every value below is contrast-verified; see
-         docs/superpowers/specs/2026-08-21-ui-restyle-design.md. */
-      --term-bg: 19 21 24;         /* #131518 */
-      --term-panel: 23 25 28;      /* #17191C */
-      --term-raised: 31 34 38;     /* #1F2226 — selected tab, hovered row, chip */
-      --term-line: 42 46 51;       /* #2A2E33 */
-      --term-muted: 154 160 166;   /* #9AA0A6 — 6.93 bg / 6.67 panel */
-      --term-text: 232 234 236;    /* #E8EAEC — 15.16 on bg */
-      --term-cyan: 230 164 74;     /* #E6A44A — the accent */
-      --term-green: 127 159 122;   /* #7F9F7A */
-      --term-magenta: 138 155 176; /* #8A9BB0 */
-      --term-orange: 194 154 94;   /* #C29A5E — duller than the accent on purpose */
-      --term-red: 196 115 107;     /* #C4736B */
-      --term-gray: 95 106 114;     /* #5F6A72 */
+      /* Neutral, near-black surfaces with white actions. Historical term-*
+         names remain stable; RGB triples are checked by test_contrast.mjs. */
+      --term-bg: 10 10 10;
+      --term-panel: 17 17 17;
+      --term-raised: 29 29 29;
+      --term-line: 43 43 43;
+      --term-muted: 160 160 160;
+      --term-text: 240 240 240;
+      --term-cyan: 245 245 245;
+      --term-green: 127 159 122;
+      --term-magenta: 138 155 176;
+      --term-orange: 194 154 94;
+      --term-red: 196 115 107;
+      --term-gray: 106 106 106;
 
-      /* Five of six -fg variants equal their base: the desaturated status
-         palette already clears AA. Only gray needed lifting (base is 3.30). */
-      --term-cyan-fg: 230 164 74;     /* 8.51 / 8.20 */
-      --term-green-fg: 127 159 122;   /* 6.22 / 5.99 */
-      --term-red-fg: 196 115 107;     /* 5.24 / 5.04 */
-      --term-magenta-fg: 138 155 176; /* 6.44 / 6.20 */
-      --term-orange-fg: 194 154 94;   /* 7.04 / 6.78 */
-      --term-gray-fg: 138 147 153;    /* #8A9399 — 5.85 bg / 5.63 panel / 5.11 raised */
-      --shimmer-base: 122 130 137;
-      --shimmer-hi: 232 234 236;
+      --term-cyan-fg: 235 235 235;
+      --term-green-fg: 127 159 122;
+      --term-red-fg: 196 115 107;
+      --term-magenta-fg: 138 155 176;
+      --term-orange-fg: 194 154 94;
+      --term-gray-fg: 151 151 151;
+      --shimmer-base: 137 137 137;
+      --shimmer-hi: 245 245 245;
       --shimmer-glow: rgba(255, 255, 255, .12);
 
       /* ---- spacing: 4px grid ---- */
@@ -87,7 +82,7 @@
       --control-h-sm: 26px; --control-h-md: 32px; --control-h-lg: 38px;
 
       /* ---- radii ---- */
-      --radius-sm: 6px; --radius-md: 10px; --radius-lg: 14px; --radius-full: 999px;
+      --radius-sm: 10px; --radius-md: 14px; --radius-lg: 22px; --radius-full: 999px;
 
       /* ---- layout ---- */
       --sidebar-w: 288px;   /* was a hard-coded Tailwind w-72 */
@@ -106,20 +101,20 @@
     }
     html.light {
       color-scheme: light;
-      /* Instrument light: a neutral base with the same warm signal accent. */
+      /* Light mode keeps the same neutral hierarchy with dark actions. */
       --term-bg: 250 250 250;      /* #FAFAFA */
       --term-panel: 255 255 255;   /* #FFFFFF */
-      --term-raised: 241 242 244;  /* #F1F2F4 */
-      --term-line: 227 229 232;    /* #E3E5E8 */
+      --term-raised: 242 242 242;
+      --term-line: 228 228 228;
       --term-muted: 90 97 103;     /* #5A6167 — 6.02 / 6.29 */
       --term-text: 26 28 31;       /* #1A1C1F — 16.36 on bg */
-      --term-cyan: 147 105 47;        /* #93692F — label 4.68, ring 4.36 */
+      --term-cyan: 28 28 28;
       --term-green: 95 119 92;        /* #5F775C — label 4.70, ring 4.38 */
       --term-red: 163 95 89;          /* #A35F59 — label 4.64, ring 4.32 */
       --term-orange: 138 109 67;      /* #8A6D43 — label 4.63, ring 4.31 */
       --term-magenta: 102 115 130;    /* #667382 — label 4.64, ring 4.32 */
       --term-gray: 95 106 114;        /* #5F6A72 — 5.31/5.54/4.94 */
-      --term-cyan-fg: 138 98 44;      /* #8A622C — 5.21 / 5.43 / 4.85 raised */
+      --term-cyan-fg: 38 38 38;
       --term-green-fg: 90 113 87;     /* #5A7157 — 5.11 / 5.34 / 4.76 */
       --term-red-fg: 153 90 83;       /* #995A53 — 5.10 / 5.33 / 4.76 */
       --term-magenta-fg: 97 108 123;  /* #616C7B — 5.11 / 5.33 / 4.76 */
@@ -203,7 +198,7 @@
     }
     @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: 0% 0; } }
 
-    /* Separator inside the Thinking… suffix "(1h 55m 4s · 56k tokens)". Sized
+    /* Separator inside the Thinking… suffix "1h 55m 4s · 56k tokens". Sized
        well below the surrounding text so it reads as punctuation between two
        figures rather than as a third glyph competing with them. */
     .think-dot {
@@ -212,6 +207,16 @@
       margin: 0 .4em;
       vertical-align: .08em;
     }
+    .thinking-panel { color: rgb(var(--term-muted)); }
+    .thinking-panel summary { cursor: pointer; padding: 8px 0; list-style: none; }
+    .thinking-panel summary::-webkit-details-marker { display: none; }
+    .thinking-panel summary::before { content: '›'; display: inline-block; margin-right: 8px; }
+    .thinking-panel[open] summary::before { transform: rotate(90deg); }
+    .thinking-panel summary:focus-visible { outline: 2px solid rgb(var(--term-cyan)); border-radius: 10px; }
+    .think-content { white-space: pre-wrap; overflow-wrap: anywhere; overflow-y: auto;
+      max-height: 360px; font: inherit; line-height: 1.65; margin: 8px 0 14px;
+      padding: 14px 18px; border-radius: 16px; background: rgb(var(--term-panel)); }
+    .think-notice { font-size: 11px; }
 
     /* Offscreen chat rows skip layout + paint entirely; `auto` keeps each
        row's last rendered size so scroll position stays stable. This is what
@@ -321,8 +326,8 @@
       text-align: left;
       overflow-wrap: break-word;
       background: rgb(var(--term-panel));
-      border-radius: 14px; border-top-right-radius: 4px;
-      padding: 7px 12px;
+      border-radius: 20px;
+      padding: 10px 16px;
     }
 
     /* --- chat composer: one rounded surface (claude.ai style) — textarea on
@@ -331,10 +336,10 @@
        Tailwind utilities so the precompiled tailwind.css needs no rebuild. --- */
     .composer {
       border: 1px solid rgb(var(--term-line));
-      background: rgb(var(--term-panel));
-      border-radius: 20px;
-      padding: 10px 10px 8px 14px;
-      box-shadow: 0 6px 24px rgb(0 0 0 / .10);
+      background: rgb(var(--term-raised));
+      border-radius: 26px;
+      padding: 12px 12px 10px 18px;
+      box-shadow: 0 8px 30px rgb(0 0 0 / .14);
       transition: border-color var(--dur-base) ease;
     }
     .composer:focus-within { border-color: rgb(var(--term-cyan) / .55); }
@@ -425,7 +430,7 @@
        busy-toggle of `hidden` wins deterministically regardless of CSS order */
     .composer-btn {
       display: grid; place-items: center; width: 32px; height: 32px;
-      flex-shrink: 0; border-radius: 10px; color: rgb(var(--term-bg));
+      flex-shrink: 0; border-radius: var(--radius-full); color: rgb(var(--term-bg));
       box-shadow: 0 1px 2px rgb(0 0 0 / .18);
     }
     .composer-btn.hidden { display: none; }
@@ -577,8 +582,8 @@
     .btn {
       display: inline-flex; align-items: center; justify-content: center; gap: var(--space-2);
       height: var(--control-h-md); padding: 0 var(--space-4);
-      border: 1px solid rgb(var(--term-line)); border-radius: var(--radius-full);
-      background: transparent; color: rgb(var(--term-text));
+      border: 1px solid transparent; border-radius: var(--radius-full);
+      background: rgb(var(--term-raised)); color: rgb(var(--term-text));
       font-size: var(--text-sm); font-weight: 500; line-height: 1;
       white-space: nowrap; cursor: pointer;
     }
@@ -590,15 +595,13 @@
       background: rgb(var(--term-cyan)); border-color: transparent; color: rgb(var(--term-bg)); font-weight: 600;
     }
     .btn-primary:hover:not(:disabled) { background: rgb(var(--term-cyan)); opacity: .9; }
-    .btn-ghost { border-color: transparent; color: rgb(var(--term-muted)); }
+    .btn-ghost { background: transparent; border-color: transparent; color: rgb(var(--term-muted)); }
     .btn-ghost:hover:not(:disabled) { background: rgb(var(--term-line) / .6); color: rgb(var(--term-text)); }
     .btn-danger { color: rgb(var(--term-red-fg)); }
     .btn-danger:hover:not(:disabled) { border-color: rgb(var(--term-red)); background: rgb(var(--term-red) / .12); }
-    /* Outlined accent. The graph panel hand-rolled this string three times
-       ("border-term-cyan … text-term-cyan … hover:bg-term-line/60"); naming it
-       is what lets those three controls sit on the shared control scale. */
-    .btn-accent { border-color: rgb(var(--term-cyan)); color: rgb(var(--term-cyan-fg)); font-weight: 600; }
-    .btn-accent:hover:not(:disabled) { background: rgb(var(--term-cyan) / .12); }
+    /* Secondary actions share the quiet, filled surface treatment. */
+    .btn-accent { border-color: transparent; color: rgb(var(--term-cyan-fg)); font-weight: 600; }
+    .btn-accent:hover:not(:disabled) { background: rgb(var(--term-line)); }
     .btn-sm { height: var(--control-h-sm); padding: 0 var(--space-3); font-size: var(--text-xs); }
     .btn-lg { height: var(--control-h-lg); padding: 0 var(--space-5); font-size: var(--text-base); }
     /* .btn sets display, and Tailwind's .hidden has the SAME specificity — this
@@ -783,14 +786,14 @@
     .modal-head {
       display: flex; align-items: center; gap: var(--space-3); flex-shrink: 0;
       padding: var(--space-3) var(--space-4);
-      border-bottom: 1px solid rgb(var(--term-line));
+      border-bottom: 0;
     }
     .modal-title { font-family: var(--font-serif, inherit); font-size: var(--text-lg); color: rgb(var(--term-text)); }
     .modal-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; padding: var(--space-4); }
     .modal-foot {
       display: flex; align-items: center; gap: var(--space-3); flex-shrink: 0;
       padding: var(--space-3) var(--space-4);
-      border-top: 1px solid rgb(var(--term-line));
+      border-top: 0;
     }
 
     /* ================= layout / responsive =================
@@ -840,7 +843,7 @@
       text-align: left; background: transparent; cursor: pointer;
     }
     .ws-row:hover { background: rgb(var(--term-line) / .45); }
-    .ws-row.selected { background: rgb(var(--term-cyan) / .14); border-color: rgb(var(--term-cyan) / .5); }
+    .ws-row.selected { background: rgb(var(--term-raised)); border-color: transparent; }
     .ws-row:focus-visible { outline: 2px solid rgb(var(--term-cyan)); outline-offset: -2px; }
     .ws-main { min-width: 0; flex: 1; }
     .ws-name {
@@ -904,7 +907,7 @@
       border-radius: var(--radius-md); cursor: pointer;
     }
     .llm-prow:hover { background: rgb(var(--term-line) / .45); }
-    .llm-prow.selected { background: rgb(var(--term-cyan) / .14); border-color: rgb(var(--term-cyan) / .5); }
+    .llm-prow.selected { background: rgb(var(--term-raised)); border-color: transparent; }
     /* Provider rows reuse .ws-actions, but the reveal rules above are scoped to
        .ws-row — without these the remove button sits at opacity 0 forever while
        still swallowing clicks. */
@@ -1208,6 +1211,7 @@
     @keyframes ico-spin { to { transform: rotate(360deg); } }
     @media (prefers-reduced-motion: reduce) { .ico-spin { animation: none; } }
   </style>
+  <link rel="stylesheet" href="workspace_view.css" />
 </head>
 <body class="h-full font-sans t-base text-term-text antialiased">
 
@@ -1219,7 +1223,7 @@
       <div class="mb-8 flex items-center gap-3">
         <div class="grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-term-cyan font-serif italic text-term-bg t-lg" >O</div>
         <div class="min-w-0">
-          <h1 class="font-serif text-term-text t-xl" >Omni Agent</h1>
+          <h1 class="font-semibold text-term-text t-xl" >Omni Agent</h1>
           <p class="text-term-muted t-xs" >Open a workspace to begin</p>
         </div>
       </div>
@@ -1257,7 +1261,7 @@
 
     <!-- RIGHT: recent workspaces -->
     <div class="flex min-w-0 flex-1 flex-col">
-      <div class="flex items-center gap-3 border-b border-term-line px-6 py-4">
+      <div class="flex items-center gap-3 px-6 py-4">
         <div class="min-w-0 flex-1">
           <div class="eyebrow">Recent</div>
           <div id="recentCount" class="text-term-muted t-xs" >—</div>
@@ -1272,13 +1276,13 @@
         <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="text-term-muted"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
         <div class="text-term-text t-base" >No workspaces yet</div>
         <div class="text-term-muted t-xs" style="max-width:320px">
-          Open a folder to start. The agent works directly on this machine, in the folder you pick.
+          Open a folder to start. Work in a temporary copy and apply selected files when ready.
         </div>
       </div>
 
-      <div class="flex items-center gap-3 border-t border-term-line px-6 py-3">
+      <div class="flex items-center gap-3 px-6 py-3">
         <span id="startError" class="min-w-0 flex-1 truncate text-term-red t-xs" ></span>
-        <span class="shrink-0 text-term-muted t-2xs" >Tools run on this machine, scoped to the selected workspace.</span>
+        <label class="shrink-0 text-term-muted t-xs"><input id="temporaryWorkspace" type="checkbox" checked /> Use a temporary working copy</label>
         <button id="startSessionBtn" class="btn btn-primary btn-lg shrink-0" disabled>Open</button>
       </div>
     </div>
@@ -1289,10 +1293,10 @@
 
     <!-- LEFT: FILE TREE -->
     <aside id="sidebar" class="flex flex-col bg-term-panel">
-      <div class="flex items-center justify-between gap-2 border-b border-term-line px-3 py-2">
+      <div class="flex items-center justify-between gap-2 px-3 py-2">
         <div class="min-w-0">
           <div class="eyebrow">workspace</div>
-          <div id="treeProjectName" class="truncate font-serif text-term-text t-lg" >—</div>
+          <div id="treeProjectName" class="truncate font-semibold text-term-text t-lg" >—</div>
         </div>
         <div class="flex items-center gap-0.5 shrink-0">
           <button id="uploadFilesBtn" title="Upload files into the workspace" class="icon-btn">
@@ -1318,13 +1322,13 @@
     <!-- RIGHT: CHAT -->
     <main class="flex-1 flex flex-col min-w-0 bg-term-bg">
       <!-- top bar -->
-      <header class="flex h-12 items-center gap-2 bg-term-panel px-3">
+      <header class="flex h-12 items-center gap-2 bg-term-bg px-3">
         <button id="sidebarExpandBtn" title="Show the file tree" class="icon-btn">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
         </button>
         <div class="flex items-center gap-2 min-w-0">
           <span class="h-2 w-2 shrink-0 rounded-full bg-term-green"></span>
-          <span id="projectBadge" class="truncate font-serif text-term-text t-lg" >project</span>
+          <span id="projectBadge" class="truncate font-semibold text-term-text t-lg" >project</span>
         </div>
         <div class="ml-auto flex items-center gap-1 text-term-muted t-xs" >
           <!-- Which machine tools run on. A safety control, not decoration —
@@ -1343,12 +1347,13 @@
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           </button>
           <button id="themeToggle" title="Toggle light / dark mode" class="icon-btn"></button>
+          <button id="workingCopyBtn" type="button" class="btn btn-sm">Working copy</button>
           <button id="changeSessionBtn" title="Switch workspace" class="btn btn-sm">change</button>
         </div>
       </header>
 
       <!-- tab bar -->
-      <div class="flex items-center bg-term-panel px-3 py-1.5">
+      <div class="flex items-center bg-term-bg px-3 py-1.5">
         <!-- Same segmented control as the Text/Vision switch in LLM settings.
              It was a bespoke pill group whose active state came only from text
              colour — switchTab toggled border-term-cyan on buttons that have no
@@ -1746,6 +1751,17 @@
   <script defer src="workflow_library.js"></script>
   <script defer src="device_view.js"></script>
   <script defer src="icons.js"></script>
+  <dialog id="workingCopyDialog" aria-labelledby="workingCopyTitle">
+    <h2 id="workingCopyTitle" class="working-copy-title">Workspace changes</h2>
+    <p id="workingCopyMessage" role="status"></p>
+    <div id="workingCopyFiles"></div>
+    <div class="working-copy-actions">
+      <button id="workingCopyRefresh" class="btn">Refresh</button>
+      <button id="workingCopyClose" class="btn">Close</button>
+      <button id="workingCopyApply" class="btn btn-primary" disabled>Apply selected</button>
+    </div>
+  </dialog>
   <script src="app.js"></script>
+  <script src="workspace_view.js"></script>
 </body>
 </html>

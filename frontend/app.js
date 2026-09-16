@@ -306,53 +306,87 @@ function renderUserMessage(content) {
 let thinkingEl = null;     // the live "Thinking…" shimmer line, if any
 let currentGroup = null;   // the action group following the most recent thought
 
-// Live run telemetry surfaced on the Thinking… line: "Thinking… (31m 5s · 214k tokens)".
-// convoTokens = total size of the MAIN conversation in real provider-reported
-// tokens (from the 'status' event's convo_tokens). It counts every main-thread
-// message ever sent — including ones auto-summarization later discarded — so it
-// only ever climbs. Subagent spend is deliberately excluded. runStartTs = the
-// wall-clock origin of the current run, reset on each user message.
+// Elapsed run time plus generated tokens and generation speed for the active request.
 let convoTokens = 0;
 let runStartTs = null;
 let _thinkTicker = null;
+let thinkingStats = null;
 
 // Reset the live-render state (called whenever the chat is cleared/replaced).
 function resetActivityState() {
   if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
   thinkingEl = null;
+  thinkingStats = null;
   currentGroup = null;
   convoTokens = 0;
   runStartTs = null;
   resetConcurrencyDock();
 }
 
-// Fill the elapsed/tokens suffix on the live Thinking… line, rendered as
-// "(1h 55m 4s · 56k tokens)" — elapsed first, joined by a deliberately small
-// middot. With only one value available the parens hold just that value; with
-// neither, nothing is rendered (no empty parens).
+// Use centered middots without parentheses; provider usage replaces live estimates.
 function _updateThinkingMeta() {
   if (!thinkingEl) return;
   const meta = thinkingEl.querySelector('.think-meta');
   if (!meta) return;
   const parts = [];
   if (runStartTs != null) parts.push(escapeHtml(window.formatClock(performance.now() - runStartTs)));
-  if (convoTokens > 0) parts.push(escapeHtml(`${window.formatTokens(convoTokens)} tokens`));
+  if (thinkingStats?.tokens > 0) {
+    parts.push(escapeHtml(`${window.formatTokens(thinkingStats.tokens)} tokens`));
+    if (thinkingStats.tokens_per_second != null)
+      parts.push(`${Math.round(thinkingStats.tokens_per_second)} tok/sec`);
+  }
+  meta.title = thinkingStats?.estimated
+    ? 'Generated tokens and speed are estimated from text (approximately 4 characters per token).'
+    : 'Generated tokens reported by the provider; speed averages generation time.';
   meta.innerHTML = parts.length
-    ? ` (${parts.join('<span class="think-dot">·</span>')})`
+    ? ` ${parts.join('<span class="think-dot">·</span>')}`
     : '';
 }
 
 function startThinking() {
   if (thinkingEl) { _updateThinkingMeta(); return; } // JSON-retry leg: reuse the existing line
-  const el = document.createElement('div');
-  el.className = 'py-0.5 font-mono t-sm leading-5';
-  el.innerHTML = `<span class="text-term-cyan">${icon('loader', 'ico-spin')}</span> ` +
-    `<span class="shimmer">Thinking…</span><span class="think-meta text-term-muted"></span>`;
+  thinkingStats = null;
+  const el = document.createElement('details');
+  el.className = 'thinking-panel py-0.5 t-sm leading-5';
+  el.innerHTML = `<summary><span class="think-label shimmer">Thinking…</span>` +
+    `<span class="think-meta text-term-muted"></span></summary>` +
+    `<div class="think-notice text-term-muted">Waiting for model reasoning…</div>` +
+    `<pre class="think-content"></pre>`;
   appendRow(el);
   thinkingEl = el;
   _updateThinkingMeta();
   if (_thinkTicker) clearInterval(_thinkTicker);
   _thinkTicker = setInterval(_updateThinkingMeta, 1000); // tick elapsed while thinking
+}
+
+function renderReasoningStream(ev) {
+  if (!thinkingEl && ev.phase !== 'delta') return;
+  if (thinkingStats && thinkingStats.stream_id !== ev.stream_id) closeThinking();
+  startThinking();
+  thinkingStats = ev;
+  _updateThinkingMeta();
+  const body = thinkingEl.querySelector('.think-content');
+  const follow = body.scrollHeight - body.scrollTop - body.clientHeight < 40;
+  body.textContent = ev.content || '';
+  if (follow) body.scrollTop = body.scrollHeight;
+  thinkingEl.dataset.hasReasoning = ev.content ? 'true' : '';
+  thinkingEl.querySelector('.think-notice').textContent = ev.truncated
+    ? 'Showing the latest reasoning; earlier text was trimmed.'
+    : ev.content ? 'Reasoning supplied by the model.' : 'No reasoning received from the model yet.';
+  if (ev.phase === 'reset') closeThinking('Interrupted');
+}
+
+function closeThinking(label = 'Thought') {
+  if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
+  if (!thinkingEl) return;
+  _updateThinkingMeta();
+  if (thinkingEl.dataset.hasReasoning) {
+    const title = thinkingEl.querySelector('.think-label');
+    title.classList.remove('shimmer');
+    title.textContent = label;
+  } else thinkingEl.remove();
+  thinkingEl = null;
+  thinkingStats = null;
 }
 
 // An explanation arrived (as a 'thought' event). Complete the current action
@@ -361,8 +395,9 @@ function startThinking() {
 // tool call opens a fresh group folded beneath this explanation. Events with no
 // text fall through, so their action just extends the current group.
 function finishThinking(ev) {
+  clearAssistantStreams();
   if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
-  if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+  closeThinking();
   const text = (ev.text || '').trim();
   if (!text) return;
   if (currentGroup) completeGroup(currentGroup);
@@ -800,8 +835,9 @@ function finishTool(ev) {
 // End of a run (done / stop / session change): complete the current group so
 // its silver title settles solid and it collapses (freezing any live row).
 function finalizeLiveLines() {
+  clearAssistantStreams();
   if (_thinkTicker) { clearInterval(_thinkTicker); _thinkTicker = null; }
-  if (thinkingEl) { thinkingEl.remove(); thinkingEl = null; }
+  closeThinking();
   if (currentGroup) completeGroup(currentGroup);
 }
 
@@ -829,7 +865,35 @@ function argSummary(args) {
   return '';
 }
 
+// A live draft is replaced by the authoritative thought/final event. Provider
+// retries and cancelled requests remove their own draft using its request id.
+const _assistantStreams = new Map();
+function renderAssistantStream(ev) {
+  let el = _assistantStreams.get(ev.stream_id);
+  if (ev.phase === 'end' || ev.phase === 'reset') {
+    if (el) el.remove();
+    _assistantStreams.delete(ev.stream_id);
+    return;
+  }
+  if (!ev.content) return;
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'assistant-stream py-1 whitespace-pre-wrap text-term-text leading-6';
+    el.setAttribute('aria-label', 'Assistant response streaming');
+    appendRow(el);
+    _assistantStreams.set(ev.stream_id, el);
+  }
+  // Plain text during generation also keeps partial Markdown/HTML harmless.
+  el.textContent = ev.content;
+  scrollDown();
+}
+function clearAssistantStreams() {
+  _assistantStreams.forEach(el => el.remove());
+  _assistantStreams.clear();
+}
+
 function renderFinalAnswer(ev) {
+  clearAssistantStreams();
   finalizeLiveLines();
   const el = document.createElement('div');
   el.className = 'py-1';
@@ -1051,6 +1115,8 @@ function _waveRowKey(ev) {
 }
 
 function resetConcurrencyDock() {
+  _subagentChats.clear();
+  clearAssistantStreams();
   if (_waveTicker) { clearInterval(_waveTicker); _waveTicker = null; }
   if (_freezeTimer) { clearTimeout(_freezeTimer); _freezeTimer = null; }
   _wave = null;
@@ -1094,6 +1160,11 @@ function waveRestore(ev) {
   _wave = null; // static — not a live wave
   let doneCount = 0;
   rows.forEach(r => {
+    const history = Array.isArray(r.chat) ? r.chat : [];
+    if (!history.some(item => item.role === 'user')) subagentChat({ ...r, role: 'user', content: r.task || '' });
+    history.forEach(item => subagentChat({ ...r, ...item }));
+    const restoredChat = _agentChat(r);
+    restoredChat.title.textContent = `${r.agent || 'Agent'} · ${r.running ? 'interrupted' : (r.ok ? 'completed' : 'failed')}`;
     const row = document.createElement('div');
     row.className = 'cbar cbar-done ' + (r.running ? '' : (r.ok ? 'cbar-ok' : 'cbar-failed'));
     row.innerHTML =
@@ -1127,6 +1198,7 @@ function _modelTierLabel(tier, model) {
 }
 
 function subagentStarted(ev) {
+  subagentChat({ ...ev, role: "user", content: ev.task || "" });
   _ensureWave();
   _hudOnStart(ev);
   const key = _waveRowKey(ev);
@@ -1163,6 +1235,75 @@ function _completedSection() {
   return sec;
 }
 
+const _subagentChats = new Map();
+function _agentChat(ev) {
+  const id = ev.sub_id || _waveRowKey(ev);
+  let chat = _subagentChats.get(id);
+  if (chat) return chat;
+  const dock = _dock();
+  let list = dock.querySelector('.cdock-chat-list');
+  if (!list) {
+    list = document.createElement('div');
+    list.className = 'cdock-chat-list';
+    dock.appendChild(list);
+  }
+  const details = document.createElement('details');
+  details.className = 'subagent-chat';
+  const title = document.createElement('summary');
+  title.textContent = `${ev.agent || 'Agent'} · live chat`;
+  details.appendChild(title);
+  const messages = document.createElement('div');
+  messages.className = 'subagent-chat-messages';
+  messages.setAttribute('aria-label', `${ev.agent || 'Agent'} conversation`);
+  details.appendChild(messages);
+  list.appendChild(details);
+  chat = { details, title, messages, streams: new Map() };
+  _subagentChats.set(id, chat);
+  while (_subagentChats.size > 24) {
+    const oldest = _subagentChats.keys().next().value;
+    _subagentChats.get(oldest).details.remove();
+    _subagentChats.delete(oldest);
+  }
+  return chat;
+}
+function subagentChat(ev) {
+  const chat = _agentChat(ev);
+  const nearBottom = chat.messages.scrollHeight - chat.messages.scrollTop - chat.messages.clientHeight < 80;
+  const entry = document.createElement('div');
+  entry.className = 'subagent-chat-message';
+  const label = document.createElement('div');
+  label.className = 'text-term-muted t-2xs';
+  label.textContent = ev.tool ? `${ev.role === 'tool_call' ? 'Running' : 'Result'} · ${ev.tool}` : ev.role;
+  entry.appendChild(label);
+  const body = document.createElement('div');
+  body.className = 'whitespace-pre-wrap';
+  const text = typeof ev.content === 'string' ? ev.content : JSON.stringify(ev.content);
+  body.textContent = text.length > 16000 ? text.slice(0, 16000) + '\n[Display truncated]' : text;
+  entry.appendChild(body);
+  chat.messages.appendChild(entry);
+  while (chat.messages.children.length > 80) chat.messages.firstElementChild.remove();
+  if (nearBottom) chat.messages.scrollTop = chat.messages.scrollHeight;
+}
+function subagentStream(ev) {
+  const chat = _agentChat(ev);
+  let entry = chat.streams.get(ev.stream_id);
+  if (ev.phase === 'end' || ev.phase === 'reset') {
+    if (entry) entry.remove();
+    chat.streams.delete(ev.stream_id);
+    return;
+  }
+  if (!entry) {
+    entry = document.createElement('div');
+    entry.className = 'subagent-chat-message assistant-stream whitespace-pre-wrap';
+    chat.messages.appendChild(entry);
+    chat.streams.set(ev.stream_id, entry);
+  }
+  const nearBottom = chat.messages.scrollHeight - chat.messages.scrollTop - chat.messages.clientHeight < 80;
+  const text = ev.content || '';
+  entry.textContent = text.length > 16000 ? text.slice(0, 16000) + '\n[Display truncated]' : text;
+  if (nearBottom) chat.messages.scrollTop = chat.messages.scrollHeight;
+}
+
 function subagentProgress(ev) {
   if (!_wave) return;
   const bar = _wave.bars.get(_waveRowKey(ev));
@@ -1173,6 +1314,12 @@ function subagentProgress(ev) {
 }
 
 function subagentDone(ev) {
+  const chat = _subagentChats.get(ev.sub_id || _waveRowKey(ev));
+  if (chat) {
+    chat.title.textContent = `${ev.agent || 'Agent'} · ${ev.ok ? 'completed' : 'failed'}`;
+    chat.streams.forEach(entry => entry.remove());
+    chat.streams.clear();
+  }
   if (!_wave) return;
   const bar = _wave.bars.get(_waveRowKey(ev));
   if (!bar) return;
@@ -2357,6 +2504,10 @@ window.__agent = {
       case 'thought': finishThinking(ev); break;
       case 'tool_running': startTool(ev); break;
       case 'tool_result': finishTool(ev); break;
+      case 'assistant_stream': renderAssistantStream(ev); break;
+      case 'reasoning_stream': renderReasoningStream(ev); break;
+      case 'subagent_chat': subagentChat(ev); break;
+      case 'subagent_stream': subagentStream(ev); break;
       case 'final_answer': renderFinalAnswer(ev); break;
       case 'active_llm': onActiveLlm(ev); break;
       case 'system': renderSystem(ev.content); break;
@@ -2876,7 +3027,7 @@ async function startSession() {
   if (!_selectedWs) { $('startError').textContent = 'Select a workspace folder first.'; return; }
   const btn = $('startSessionBtn'); btn.disabled = true; btn.textContent = 'Starting session…';
   try {
-    const res = await pywebview.api.start_session(_selectedWs);
+    const res = await pywebview.api.start_session(_selectedWs, document.getElementById('temporaryWorkspace').checked);
     if (!res.ok) $('startError').textContent = res.error || 'Failed to start session.';
   } catch (e) {
     $('startError').textContent = '' + e;
@@ -2891,7 +3042,7 @@ async function pickWorkspaceAndStart() {
   $('startError').textContent = '';
   const btn = $('openFolderBtn');
   const prev = btn ? btn.textContent : '';
-  if (btn) { btn.disabled = true; btn.textContent = 'Selecting + mounting…'; }
+  if (btn) { btn.disabled = true; btn.textContent = 'Opening folder…'; }
   try {
     const res = await pywebview.api.select_workspace();   // native picker + bind-mount
     if (res && res.cancelled) return;

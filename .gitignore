@@ -34,8 +34,16 @@ agent_workspaces.json
 # Test fixtures: large APK binaries are NOT committed (see test-assets/README.md)
 test-assets/*.apk
 
-# Local test scripts live here and are NOT pushed to GitHub.
-/tests/
+# Local test scripts remain ignored, except maintained engine regressions.
+/tests/*
+!/tests/test_headless_engine.py
+!/tests/test_working_copy.py
+!/tests/test_llm_streaming.py
+!/tests/frontend/
+/tests/frontend/*
+!/tests/frontend/test_live_streaming.mjs
+!/tests/frontend/preview_bridge.js
+!/tests/frontend/preview_server.py
 
 # ── Additional local state / junk ──────────────────────────────
 # Agent/tooling scratch (extra assistants + probe dirs)

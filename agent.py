@@ -14,7 +14,6 @@ import shutil
 import hashlib
 import zipfile
 import subprocess
-import webview
 
 # On Windows the default console/file encoding is cp1252, which can't handle
 # Unicode characters the LLM emits (arrows, checkmarks, em-dashes, etc.).
@@ -74,7 +73,7 @@ from tools.output_distillers import NOISY_TOOLS, distill as distill_output
 import subagents  # generalized isolated-context subagent engine
 import plugins     # Claude-Code-style plugin system (agents/skills/commands/hooks)
 
-MEMORY_DIR = "./memory"
+MEMORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory")
 
 # --- Workspace selection (Part 2 redesign) -----------------------------------
 # There is NO fixed workspace folder any more. The user PICKS a host folder at
@@ -84,6 +83,7 @@ MEMORY_DIR = "./memory"
 # folder, under MEMORY_DIR keyed by the folder's absolute path.
 _WS_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "agent_workspaces.json")
+_working_root = None  # current real temporary working directory
 _active_workspace = None  # abspath of the currently selected folder, or None
 
 
@@ -145,7 +145,7 @@ def _project_root(project=None):
     """Absolute host root of the active project. The PICKED FOLDER IS THE ROOT
     (no project-subfolder layer). `project` is accepted for call-site
     compatibility but ignored — there is one active picked folder."""
-    return active_workspace()
+    return _working_root or active_workspace()
 
 
 def _memory_dir_for(root):
@@ -267,7 +267,7 @@ RENDERABLE_EVENT_TYPES = {"user_message", "thought", "tool_result", "final_answe
 # compact snapshot (session["dock"]) that is persisted and replayed on reopen — so
 # the Subagents menu doesn't vanish on a refresh.
 DOCK_EVENT_TYPES = {"wave_started", "subagent_started", "subagent_progress",
-                    "subagent_done", "wave_done"}
+                    "subagent_done", "subagent_chat", "wave_done"}
 DOCK_MAX_ROWS = 24           # cap restored rows so a long multi-wave run stays bounded
 
 
@@ -420,9 +420,9 @@ EXPLANATION_CADENCE_NUDGE = 6
 # streak past that many pure look-ups is a fan-out the model has clearly not taken.
 # Was 8; lowered to catch chronic solo-reading a step sooner.
 try:
-    SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "6")))
+    SOLO_READ_NUDGE = max(0, int(os.environ.get("OMNI_SOLO_READ_NUDGE", "0")))
 except ValueError:
-    SOLO_READ_NUDGE = 6
+    SOLO_READ_NUDGE = 0
 
 # Soft per-session ceiling on PREMIUM subagent dispatches. Advisory: over-budget
 # @premium requests degrade to standard rather than being blocked. 0 = unlimited.
@@ -447,7 +447,7 @@ DELEGATION_TOOLS = {"dispatch_agents", "ask_codebase"}
 #     not speed.
 # Set OMNI_AUTO_DELEGATE=0 to turn the whole behaviour off and go back to
 # advisory-only nudges.
-AUTO_DELEGATE = (os.environ.get("OMNI_AUTO_DELEGATE", "1").strip().lower()
+AUTO_DELEGATE = (os.environ.get("OMNI_AUTO_DELEGATE", "0").strip().lower()
                  not in ("0", "false", "no", "off"))
 # Independent research steps needed before a wave is auto-tagged. One lone
 # lookup is not a wave, and hijacking it would just annoy; two is a real fan-out.
@@ -489,7 +489,7 @@ STRATEGY_RESYNC_FINDINGS = 5     # new findings before nudging a brief reconcile
 # chosen approach (autonomously — never asks the user) BEFORE planning, then make
 # subagent-driven execution the DEFAULT (unless the user clearly asked for inline).
 # Behind superpowers_enabled; OFF (OMNI_SUPERPOWERS=0) is byte-identical to today.
-SUPERPOWERS_DEFAULT = (os.environ.get("OMNI_SUPERPOWERS", "1").strip().lower()
+SUPERPOWERS_DEFAULT = (os.environ.get("OMNI_SUPERPOWERS", "0").strip().lower()
                        not in ("0", "false", "no", "off"))
 # The persona the auto-brainstorm dispatches (must exist on disk / in a plugin).
 SUPERPOWERS_BRAINSTORMER = "brainstormer"
@@ -1662,7 +1662,10 @@ def _ultra_keyword_requested(text):
 class AgentApi:
     """Bridge exposed to the webview frontend as `pywebview.api.*`."""
 
-    def __init__(self):
+    def __init__(self, event_sink=None):
+        self._event_lock = threading.RLock()
+        self._event_listeners = [event_sink] if event_sink else []
+        self._working_copy = None
         self._window = None
         self._lock = threading.Lock()
         self._busy = False
@@ -1691,6 +1694,15 @@ class AgentApi:
         # for deliberate delegation too, not only auto read-waves.
         subagents.set_ui_sink(self._emit)
 
+    def add_event_listener(self, callback):
+        """Attach a presentation adapter; all execution stays in this engine."""
+        self._event_listeners.append(callback)
+
+    def wait(self, timeout=None):
+        if self._thread:
+            self._thread.join(timeout)
+        return not self._busy
+
     def set_window(self, window):
         self._window = window
 
@@ -1710,6 +1722,13 @@ class AgentApi:
 
     # --- helpers -------------------------------------------------------------
     def _emit(self, event):
+        lock = getattr(self, "_event_lock", None)
+        if lock is None:
+            return self._deliver_event(event)
+        with lock:
+            return self._deliver_event(event)
+
+    def _deliver_event(self, event):
         # Record renderable events into the session transcript so the chat can be
         # replayed after a webview refresh / renderer crash / app restart. Cap the
         # stored text fields and the list length so the transcript can't grow
@@ -1734,13 +1753,11 @@ class AgentApi:
         # survives a refresh / reopen (the wave/subagent events are NOT part of
         # the chat transcript).
         self._track_dock(event)
-        if self._window is None:
-            return
-        try:
-            js = "window.__agent.onEvent(" + json.dumps(event, ensure_ascii=False) + ")"
-            self._window.evaluate_js(js)
-        except Exception:
-            pass
+        for callback in tuple(getattr(self, "_event_listeners", ())):
+            try:
+                callback(dict(event))
+            except Exception:
+                pass  # A disconnected renderer must never stop the engine.
 
     def _track_dock(self, event):
         """Fold a subagent/wave event into session['dock'] — a compact, JSON-safe
@@ -1754,15 +1771,16 @@ class AgentApi:
         if et not in DOCK_EVENT_TYPES:
             return
         try:
-            dock = s.setdefault("dock", {"rows": [], "index": {}, "done": False, "wave_id": None})
+            if not isinstance(s.get("dock"), dict):
+                s["dock"] = {"rows": [], "index": {}, "done": False, "wave_id": None}
+            dock = s["dock"]
 
             def _key(ev):
                 return ev.get("sub_id") or f"{ev.get('agent') or ''}::{ev.get('key_label') or ''}"
 
             if et == "wave_started":
-                # A fresh parallel wave replaces the previous snapshot.
-                dock["rows"] = []
-                dock["index"] = {}
+                # Keep recent chats across waves, matching the live chat dock.
+                # The existing row cap bounds the persisted history.
                 dock["done"] = False
                 dock["wave_id"] = event.get("wave_id")
             elif et == "subagent_started":
@@ -1771,7 +1789,7 @@ class AgentApi:
                        "task": event.get("task"), "tier": event.get("tier"),
                        "model": event.get("model"), "key_label": event.get("key_label"),
                        "running": True, "ok": None, "steps": 0, "tokens": 0,
-                       "elapsed_s": 0, "escalated": False}
+                       "elapsed_s": 0, "escalated": False, "chat": []}
                 if k in dock["index"]:
                     dock["rows"][dock["index"][k]].update(row)
                 else:
@@ -1780,6 +1798,12 @@ class AgentApi:
                     if len(dock["rows"]) > DOCK_MAX_ROWS:
                         dock["rows"] = dock["rows"][-DOCK_MAX_ROWS:]
                     dock["index"] = {(_key(r)): i for i, r in enumerate(dock["rows"])}
+            elif et == "subagent_chat":
+                idx = dock["index"].get(_key(event))
+                if idx is not None:
+                    chat = dock["rows"][idx].setdefault("chat", [])
+                    chat.append({**event, "content": _ui_trunc(event.get("content", ""), UI_RESULT_CAP)})
+                    del chat[:-80]
             elif et in ("subagent_progress", "subagent_done"):
                 idx = dock["index"].get(_key(event))
                 if idx is not None:
@@ -2094,6 +2118,14 @@ class AgentApi:
                          "subagent dispatches used this session]")
         section += "\n\n" + _ultra_prompt_segment(self.session)
         section += "\n\n" + _device_prompt_segment(self.session)
+        if self.session.get("temporary"):
+            section += ("\n\nWORKING DIRECTORY: " + self.session["root"] +
+                        ". This is a persistent temporary working copy. Read and write here using real paths. "
+                        "Do not edit the source workspace directly; the user promotes selected changes through the UI or CLI. "
+                        "The working copy is not a security sandbox.")
+        if not self.session.get("superpowers_enabled"):
+            section += ("\n\nBegin new tasks in the main agent: inspect the request and relevant files before "
+                        "assigning subagents. Delegate only concrete, bounded work once you understand its scope.")
         self.session["messages"][0]["content"] = (
             self.session["base_system_prompt"] + "\n" + tools_section + section
         )
@@ -2678,12 +2710,44 @@ class AgentApi:
             return {"ok": False, "error": str(e)}
         return {"ok": True}
 
+    def working_copy_status(self):
+        if not self.session:
+            return {"ok": False, "error": "No active session."}
+        wc = getattr(self, "_working_copy", None)
+        try:
+            return {"ok": True, "temporary": wc is not None,
+                    "root": self.session["root"],
+                    "workspace": self.session.get("workspace", self.session["root"]),
+                    "busy": self._busy, "changes": wc.changes() if wc and not self._busy else []}
+        except (OSError, ValueError, RuntimeError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def promote_changes(self, paths, overwrite=False):
+        # This is a human-facing shell command, deliberately not a model tool.
+        with self._lock:
+            if not isinstance(paths, list) or not paths:
+                return {"ok": False, "error": "Select at least one changed file."}
+            if self._busy:
+                return {"ok": False, "error": "Stop the run before applying files."}
+            if not getattr(self, "_working_copy", None):
+                return {"ok": False, "error": "This session edits the workspace in place."}
+            if devices.is_remote():
+                return {"ok": False, "error": "Cannot promote local files while an SSH device is selected."}
+            try:
+                result = self._working_copy.promote(paths, overwrite=overwrite)
+                self._emit({"type": "system", "content": "Applied selected working-copy changes to the workspace."})
+                return {"ok": True, "result": result, "working_copy": self.working_copy_status()}
+            except (OSError, ValueError, RuntimeError) as exc:
+                return {"ok": False, "error": str(exc)}
+
     def select_workspace(self, path=None):
         """Pick (or accept) a host folder to use as the workspace ROOT: validate
         it, persist it as last-used, and make it the folder every tool command
         runs in (set_workspace also reports any missing tools). Selecting a new
         folder just re-points it. Pass an explicit `path` to skip the dialog
         (recent list / automation)."""
+        if self._busy:
+            return {"ok": False, "error": "Stop the run before switching workspaces."}
         if not path:
             picked = self.pick_folder()
             if not picked.get("ok"):
@@ -2693,12 +2757,7 @@ class AgentApi:
                 return {"ok": True, "cancelled": True}
         if not os.path.isdir(path):
             return {"ok": False, "error": f"Not a folder: {path}"}
-        root = set_active_workspace(path)
-        self._emit({"type": "log", "content": f"[Workspace] Activating {root}..."})
-        try:
-            set_workspace(root)   # make it the command cwd + tool preflight
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        root = os.path.abspath(path)
         return {"ok": True, "path": root, "label": _ws_label(root)}
 
     def create_project(self, name):
@@ -2738,7 +2797,7 @@ class AgentApi:
         if self._window is None:
             return {"ok": False, "error": "Window not ready."}
         try:
-            result = self._window.create_file_dialog(webview.FOLDER_DIALOG)
+            result = self._window.create_file_dialog("FOLDER_DIALOG")
         except Exception as e:
             return {"ok": False, "error": str(e)}
         if not result:
@@ -3052,18 +3111,54 @@ class AgentApi:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def start_session(self, project=None):
-        # `project` may be an absolute folder path (recent list / just-picked
-        # folder) or None (use the active/last-used workspace).
-        if project and os.path.isdir(project):
-            set_active_workspace(project)
+    def start_session(self, project=None, temporary=True):
+        """Open the same engine session from either presentation adapter."""
+        global _active_workspace, _working_root
+        with self._lock:
+            if self._busy:
+                return {"ok": False, "error": "Stop the current run before switching sessions."}
+            if project is not None and not os.path.isdir(project):
+                return {"ok": False, "error": f"Not a folder: {project}"}
+            old = (_active_workspace, _working_root, self.session,
+                   getattr(self, "_working_copy", None), devices.active())
+            self._persist_session()
+            try:
+                result = self._start_session(project, temporary)
+            except Exception as exc:
+                result = {"ok": False, "error": f"Cannot open session: {exc}"}
+            if result.get("ok"):
+                set_active_workspace(self.session["workspace"])
+                return result
+            _active_workspace, _working_root, self.session, self._working_copy, device = old
+            devices.set_active(device.id if device else None)
+            previous_root = _working_root or _active_workspace
+            if previous_root:
+                try:
+                    set_workspace(previous_root)
+                except Exception as exc:
+                    result["error"] += f"; previous workspace could not be restored: {exc}"
+            return result
+
+    def _start_session(self, project=None, temporary=True):
+        global _working_root
         try:
-            root = active_workspace()
+            root = os.path.abspath(project) if project else active_workspace()
         except RuntimeError as e:
             return {"ok": False, "error": str(e)}
-        project_name = _ws_label(root)
-        memory_dir = _memory_dir_for(root)
+        workspace = root
+        project_name = _ws_label(workspace)
+        memory_dir = _memory_dir_for(workspace)
+        if temporary:
+            memory_dir = os.path.join(memory_dir, "staged")
         os.makedirs(memory_dir, exist_ok=True)
+        try:
+            from working_copy import WorkingCopy
+            working_copy = WorkingCopy.open(workspace, memory_dir) if temporary else None
+            root = str(working_copy.root) if working_copy else workspace
+        except (OSError, ValueError, RuntimeError) as exc:
+            return {"ok": False, "error": f"Cannot prepare working copy: {exc}"}
+        self._working_copy = working_copy
+        _working_root = root
 
         # Ensure the picked folder is the active workspace. Skip if
         # select_workspace already activated this exact root.
@@ -3090,6 +3185,8 @@ class AgentApi:
         # from the old chat). Fall back to the latest memory summary only if there
         # is no saved conversation for this project.
         saved_messages, saved_transcript, saved_task, saved_stats = self._load_persisted(memory_dir)
+        if temporary and devices.is_remote():
+            return {"ok": False, "error": "Temporary copies run on this computer. Use in-place mode for an SSH device."}
         last_summary_text = None
         if saved_messages is not None:
             messages = saved_messages
@@ -3124,6 +3221,8 @@ class AgentApi:
 
         self.session = {
             "project": project_name,
+            "workspace": workspace,
+            "temporary": bool(temporary),
             "root": root,
             "messages": messages,
             "base_system_prompt": base_system_prompt,
@@ -3331,6 +3430,7 @@ class AgentApi:
             "import_source": _read_import_meta(s.get("root", "")),
             "transcript": s.get("transcript", []),
             "busy": self._busy,
+            "working_copy": self.working_copy_status(),
         })
         # The chip is painted once at init() and then only by `device_changed`.
         # _load_persisted() reinstates (or clears) devices._active for the project
@@ -3517,6 +3617,8 @@ class AgentApi:
         return devices.probe(d)
 
     def select_device(self, device_id):
+        if getattr(self, "_working_copy", None):
+            return {"ok": False, "error": "SSH devices require an in-place session. Start with temporary=False (CLI: --in-place)."}
         """Switch the machine work happens on. Recorded in the transcript so a
         later reader is never left guessing which computer a command ran on."""
         # Routing is read per tool call from a process-wide global, so switching
@@ -4058,7 +4160,7 @@ class AgentApi:
             return {"ok": False, "error": "Destination is outside the workspace."}
 
         try:
-            result = self._window.create_file_dialog(webview.OPEN_DIALOG, allow_multiple=True)
+            result = self._window.create_file_dialog("OPEN_DIALOG", allow_multiple=True)
         except Exception as e:
             return {"ok": False, "error": str(e)}
         if not result:
@@ -4417,13 +4519,18 @@ class AgentApi:
                 "graphs": listing.get("graphs", []) if isinstance(listing, dict) else []}
 
     def end_session(self):
+        global _working_root
         self.stop()
+        if not self.wait(10):
+            return {"ok": False, "error": "The run is still stopping. Retry after it finishes."}
         self._persist_session()
         planning.clear_active_plan(notify=False)
         planning.set_context(None, notify_callback=None)
         strategy.set_context(None, notify_callback=None)
         superpowers.set_context(None, notify_callback=None)
         self.session = None
+        self._working_copy = None
+        _working_root = None
         self._emit({"type": "session_ended"})
         return {"ok": True}
 
@@ -5293,8 +5400,9 @@ class AgentApi:
         (response_type, payload, raw_response, elapsed_ms)."""
         self._emit({"type": "thinking_start"})
         start_time = time.time()
-        raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
-                               active_groups=s.get("active_toolsets"))
+        with llm.stream_events(self._emit):
+            raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
+                                   active_groups=s.get("active_toolsets"))
         self._count_conversation_usage(s)
         elapsed_ms = int((time.time() - start_time) * 1000)
         self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
@@ -5310,8 +5418,9 @@ class AgentApi:
             s["messages"].append({"role": "user", "content": JSON_CORRECTION_MSG})
             self._emit({"type": "thinking_start"})
             start_time = time.time()
-            raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
-                               active_groups=s.get("active_toolsets"))
+            with llm.stream_events(self._emit):
+                raw_response = ask_llm(s["messages"], temperature=MAIN_LOOP_TEMPERATURE,
+                                   active_groups=s.get("active_toolsets"))
             self._count_conversation_usage(s)
             elapsed_ms += int((time.time() - start_time) * 1000)
             self._emit({"type": "thinking_end", "elapsed_ms": elapsed_ms})
@@ -5873,65 +5982,42 @@ class AgentApi:
         except Exception as e:
             self._emit({"type": "error", "content": f"Agent loop crashed: {e}"})
         finally:
-            with self._lock:
-                self._busy = False
-            # A keyword-armed ultra mode covers exactly the turn that asked for
-            # it. The header toggle is unaffected (it never sets ultra_turn_only).
-            if s.get("ultra_turn_only"):
-                s["ultra_turn_only"] = False
-                s["ultra"] = False
-                self._refresh_system_prompt()
-                self._emit({"type": "ultra_mode", "ultra": False})
-            self._refresh_tree(force=True)  # push the final tree state once, at the end
-            # Save the conversation + transcript so a refresh / restart can
-            # restore this chat and continue from here.
-            self._persist_session()
-            self._emit({"type": "done"})
+            try:
+                # Keyword-armed Ultra applies to this turn only.
+                if s.get("ultra_turn_only"):
+                    s["ultra_turn_only"] = False
+                    s["ultra"] = False
+                    self._refresh_system_prompt()
+                    self._emit({"type": "ultra_mode", "ultra": False})
+                self._refresh_tree(force=True)
+            except Exception as exc:
+                self._emit({"type": "error", "content": f"Could not refresh the completed session: {exc}"})
+            try:
+                self._persist_session()
+            finally:
+                # Never leave the shell busy because a renderer/cleanup failed.
+                with self._lock:
+                    self._busy = False
+                self._emit({"type": "done"})
+
+
+
+# Public engine name; AgentApi remains the compatibility name for plugins.
+AgentEngine = AgentApi
 
 
 def main():
-    api = AgentApi()
-    frontend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "frontend", "index.html"))
-    if not os.path.isfile(frontend_path):
-        print(f"[ERROR] Frontend not found at {frontend_path}")
-        sys.exit(1)
-    window = webview.create_window(
-        "Omni Agent",
-        url=frontend_path,
-        js_api=api,
-        width=1320,
-        height=840,
-        min_size=(980, 600),
-        # pywebview defaults this to False, which injects
-        # `body { -webkit-user-select: none }` into the whole webview — that is
-        # what made chat messages impossible to drag-select or copy. Selection
-        # policy now lives in frontend/index.html instead (chrome stays
-        # unselectable, transcript/output/file text is selectable).
-        text_select=True,
-    )
-    api.set_window(window)
-
-    # OpenAI-compatible passthrough proxy: a single keyless endpoint on the LAN
-    # that fronts the whole LLM fallback stack, so BYOK tools (opencode, Cursor,
-    # curl) can reuse this machine's providers. Opt out with OMNI_API_SERVER=0;
-    # override bind with OMNI_API_HOST / OMNI_API_PORT. Never fatal to the app.
-    if os.environ.get("OMNI_API_SERVER", "1") != "0":
-        try:
-            import api_server
-            api_server.start_in_background(
-                host=os.environ.get("OMNI_API_HOST", api_server.DEFAULT_HOST),
-                port=int(os.environ.get("OMNI_API_PORT", api_server.DEFAULT_PORT)),
-            )
-        except OSError as e:
-            print(f"[api-server] not started ({e}) — is the port already in use?")
-        except Exception as e:
-            print(f"[api-server] failed to start: {e}")
-
-    # DevTools (Web Inspector) no longer auto-opens on launch. Opt back in with
-    # OMNI_DEVTOOLS=1 when you actually need to debug the renderer.
-    _devtools = os.environ.get("OMNI_DEVTOOLS", "0").strip().lower() in ("1", "true", "yes", "on")
-    webview.start(debug=_devtools)
+    if "--cli" in sys.argv[1:] or "--headless" in sys.argv[1:]:
+        from cli import main as cli_main
+        return cli_main([arg for arg in sys.argv[1:] if arg not in ("--cli", "--headless")])
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        print("Omni Agent\n  python agent.py                         Desktop\n"
+              "  python agent.py --cli PROJECT            Terminal\n"
+              "  python agent.py --cli --help             Terminal options")
+        return 0
+    from desktop import main as desktop_main
+    return desktop_main()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -11,6 +11,48 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 
+## Shared engine, temporary copies, and streaming (2026-09)
+
+The desktop and CLI share `agent.AgentEngine` (the compatibility name remains
+`AgentApi`). `agent.py --cli PROJECT` / `--headless` runs without importing
+pywebview; `desktop.py` alone owns that dependency and the JavaScript event bridge.
+Presentation adapters subscribe through `add_event_listener`; keep execution and
+session decisions in Python. `requirements-headless.txt` installs the same engine
+without the desktop runtime. See `README.md` for commands and limitations.
+
+Sessions default to `working_copy.WorkingCopy`: a resumable real temporary directory
+outside the source project. `session["root"]` and `host_exec` point to that copy;
+`session["workspace"]` identifies the source. Tools must use the working root.
+Selected publication is a human-facing engine method, not an agent tool. In-place
+mode is explicit (`--in-place`, or uncheck the desktop checkbox) and is required
+for existing SSH device routing. Staged and in-place conversations have separate
+memory directories. Copies are not security sandboxes or Git worktrees.
+
+`llm.stream_events` binds request-local public-text streaming via contextvars;
+Provider-supplied reasoning travels separately as transient `reasoning_stream`
+events (OpenAI reasoning fields, inline think tags, and Anthropic thinking deltas).
+The desktop renders these in expandable Thinking rows; never fold them into the
+public answer draft. Generated-token telemetry uses provider completion usage
+when supplied and character-based estimates beforehand, with an explanatory
+tooltip. Reasoning display is bounded to the latest 256,000 characters and stays
+inspectable for the current view, but is not persisted to the transcript.
+`llm._await_or_stop` transfers that context into provider threads. Never use one
+global streaming callback for concurrent agents. Draft stream events are transient;
+persist completed subagent chat events only, bounded in each dock row's `chat`.
+
+Automatic superpowers/auto-assignment and solo-read nudges now default OFF. The
+main agent inspects a task before assigning bounded subagent work. Normal workers
+(including researcher/native analyst) have every domain tool; explicit reviewers
+remain read-only. `dispatch_agents` accepts write-capable personas and `scope`, with
+the existing scoped workspace lock preserving concurrency ownership. It is now
+classified as potentially mutating. Recursive workflow/agent dispatch and strategic
+state writes remain orchestrator-owned.
+
+The current UI palette is neutral near-black with white primary actions. Historical
+`--term-cyan` now holds white in dark mode. Preserve RGB triples and contrast checks.
+`frontend/workspace_view.js` only renders engine change lists and sends user-selected
+paths; publication logic belongs in `working_copy.py`.
+
 ## Execution model: real paths on the real machine
 
 Tools run **directly on the user's machine**, in the user's project folder, the

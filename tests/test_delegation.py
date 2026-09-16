@@ -77,7 +77,7 @@ def test_delegated_step_autodispatches_and_folds_report(monkeypatch):
     investigation.set_active(inv, notify=False)
 
     seen = {}
-    def fake_run(agent_def, task, context="", run_dir=None, on_event=None):
+    def fake_run(agent_def, task, context="", run_dir=None, on_event=None, **kwargs):
         seen["agent"] = agent_def.name
         seen["task"] = task
         return {"agent": agent_def.name, "ok": True, "report": "root check at Root.smali:42",
@@ -163,16 +163,16 @@ def test_dispatch_agents_runs_read_wave_and_returns_reports():
     assert "finding from the wave" in text
 
 
-def test_dispatch_agents_rejects_write_and_unknown():
+def test_dispatch_agents_accepts_write_and_rejects_unknown():
     _reset()
     subagents.ask_llm = _script([_final("x")])
     out = dispatch_agents(specs=[
-        {"agent": "implementer", "task": "patch it"},     # write -> rejected
+        {"agent": "implementer", "task": "patch it"},     # write -> accepted
         {"agent": "ghost", "task": "look"},               # unknown -> rejected
     ])
-    # both specs unrunnable -> an error naming the problems
-    assert "error" in out
-    assert "write-capable" in out["error"] and "unknown agent 'ghost'" in out["error"]
+    assert "stdout" in out
+    assert "implementer" in out["stdout"]
+    assert "unknown agent 'ghost'" in out["stdout"]
 
 
 def test_dispatch_agents_synthesize_merges():
@@ -199,11 +199,12 @@ def test_dispatch_agents_forwards_tier_and_models(monkeypatch):
                         lambda: type("R", (), {"get_agent": staticmethod(lambda n: ad)})())
     out = delegation_tools.dispatch_agents([
         {"agent": "researcher", "task": "t1", "tier": "cheap"},
-        {"agent": "researcher", "task": "t2", "models": ["glm"]},
+        {"agent": "researcher", "task": "t2", "models": ["glm"], "scope": ["src/**"]},
     ])
     assert "error" not in out
     assert captured["specs"][0]["tier"] == "cheap"
     assert captured["specs"][1]["models"] == ["glm"]
+    assert captured["specs"][1]["scope"] == ["src/**"]
 
 
 def test_ladder_hint_lists_configured_models(monkeypatch):
@@ -296,7 +297,7 @@ if __name__ == "__main__":
         lambda: test_unknown_delegate_is_handled_not_crashed(mp),
         lambda: test_delegation_disabled_does_nothing(mp),
         test_dispatch_agents_runs_read_wave_and_returns_reports,
-        test_dispatch_agents_rejects_write_and_unknown,
+        test_dispatch_agents_accepts_write_and_rejects_unknown,
         test_dispatch_agents_synthesize_merges,
     ]
     names = ["autodispatch", "write_unverified", "unknown_delegate", "disabled",

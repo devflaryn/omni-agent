@@ -1,4 +1,6 @@
 import collections
+import contextvars
+from llm_streaming import stream_events, streaming_enabled, collect_stream
 import json
 import os
 import re
@@ -1381,12 +1383,17 @@ def _openai_request(cfg, messages, temperature):
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
 
+    streaming = streaming_enabled()
+    if streaming:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
     last_error = None
     last_kind = None
     for _ in range(MAX_RETRIES):
         try:
             response = requests.post(url, json=payload, headers=headers,
-                                     timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+                                     timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+                                     **({"stream": True} if streaming else {}))
             # NVIDIA NIM queue: HTTP 202 means "too many requests — result pending".
             # Poll briefly; if the queue doesn't clear, report this provider busy so
             # the fallback chain moves on instead of waiting the queue out.
@@ -1409,9 +1416,11 @@ def _openai_request(cfg, messages, temperature):
                 return {"ok": False, "error_kind": _classify_status(response.status_code),
                         "error": f"{cfg['label']} HTTP {response.status_code}: {response.text[:800]}"}
             try:
-                data = response.json()
-            except Exception:
-                return {"ok": False, "error": f"Invalid JSON from {cfg['label']}:\n{response.text[:800]}"}
+                data = (collect_stream(response, "openai") if streaming and
+                        "text/event-stream" in response.headers.get("Content-Type", "")
+                        else response.json())
+            except Exception as e:
+                return {"ok": False, "error": f"Invalid response from {cfg['label']}: {e}"}
 
             # Cline wraps the standard OpenAI response inside a top-level "data"
             # envelope, e.g. {"data": {"choices": [...]}}. Unwrap only when the top
@@ -1615,12 +1624,16 @@ def _anthropic_request(cfg, messages, temperature):
         "anthropic-version": "2023-06-01",
     }
 
+    streaming = streaming_enabled()
+    if streaming:
+        payload["stream"] = True
     last_error = None
     last_kind = None
     for _ in range(MAX_RETRIES):
         try:
             response = requests.post(url, json=payload, headers=headers,
-                                     timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT))
+                                     timeout=(CONNECT_TIMEOUT, REQUEST_TIMEOUT),
+                                     **({"stream": True} if streaming else {}))
             if response.status_code == 429:
                 return {"ok": False, "rate_limited": True, "error_kind": "rate_limit",
                         "error": (f"Anthropic rate-limited this key (HTTP 429): "
@@ -1629,9 +1642,11 @@ def _anthropic_request(cfg, messages, temperature):
                 return {"ok": False, "error_kind": _classify_status(response.status_code),
                         "error": f"Anthropic HTTP {response.status_code}: {response.text[:800]}"}
             try:
-                data = response.json()
-            except Exception:
-                return {"ok": False, "error": f"Invalid JSON from Anthropic:\n{response.text[:800]}"}
+                data = (collect_stream(response, "anthropic") if streaming and
+                        "text/event-stream" in response.headers.get("Content-Type", "")
+                        else response.json())
+            except Exception as e:
+                return {"ok": False, "error": f"Invalid response from Anthropic: {e}"}
 
             if data.get("type") == "error":
                 return {"ok": False, "error": f"Anthropic error: {json.dumps(data.get('error', data))[:800]}"}
@@ -2367,7 +2382,8 @@ def _await_or_stop(fn, poll=0.1):
             result["last_usage"] = getattr(_TL, "last_usage", None)
             done.set()
 
-    threading.Thread(target=_worker, daemon=True).start()
+    request_context = contextvars.copy_context()
+    threading.Thread(target=lambda: request_context.run(_worker), daemon=True).start()
     while not done.wait(poll):
         if _stop_requested():
             return {"__stopped__": True}

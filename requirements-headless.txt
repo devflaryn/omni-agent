@@ -1,0 +1,7 @@
+# Same engine and tools; pywebview is only needed by the desktop adapter.
+requests==2.32.5
+questionary==2.0.1
+rich==13.7.0
+textual==6.2.1
+pillow==11.1.0
+frida==17.15.4

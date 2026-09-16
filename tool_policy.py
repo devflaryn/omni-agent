@@ -28,6 +28,7 @@ follow.
 # recorded passing test) objectively checks it. The main loop's validation gate
 # and the planning gate both key off this set.
 MUTATING_TOOLS = {
+    "dispatch_agents",  # May launch full-capability workers; review their changes.
     "write_file", "replace_in_file", "move_file", "delete_path",
     "patch_smali_method", "insert_smali_code",
     "patch_at_offset_with_bytes", "patch_bytes_at_offset", "patch_binary_string",
@@ -115,7 +116,7 @@ READONLY_OPTIN_TOOLS = {
 # from EVERY subagent's tool surface so delegation can't recurse (a subagent may
 # not dispatch more subagents, ask_codebase, or run a review — that stays the
 # orchestrator's job and keeps depth and cost bounded).
-SUBAGENT_EXCLUDED = {"dispatch_agents", "ask_codebase", "review_conclusion",
+SUBAGENT_EXCLUDED = {"run_workflow", "dispatch_agents", "ask_codebase", "review_conclusion",
                      "strategy_set", "strategy_update"}
 
 
