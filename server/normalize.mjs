@@ -55,6 +55,30 @@ function contentText(content) {
     .join("\n");
 }
 
+/** Largest base64 payload carried on an event; bigger images stay in the file but are not shown. */
+const IMAGE_DATA_MAX = 8 * 1024 * 1024;
+/** Image blocks of a tool result (pi `{type:"image",data,mimeType}` or Claude `{type:"image",source:{...}}`) → `[{ mimeType, data }]`. */
+export function contentImages(content) {
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const c of content) {
+    if (c?.type !== "image") continue;
+    const data = c.data ?? c.source?.data;
+    const mimeType = c.mimeType ?? c.source?.media_type;
+    if (typeof data !== "string" || !data || data.length > IMAGE_DATA_MAX) continue;
+    out.push({ mimeType: mimeType || "image/png", data });
+  }
+  return out;
+}
+/** A tool_result block; `images` is only present when the result carried some. */
+function toolResultBlock(toolId, name, content, isError) {
+  const b = { type: "tool_result", toolId, name, text: contentText(content), isError: !!isError };
+  if (name === undefined) delete b.name;
+  const images = contentImages(content);
+  if (images.length) b.images = images;
+  return b;
+}
+
 // ------------------------------------------------------------------ pi
 
 function piBlocks(content) {
@@ -78,7 +102,7 @@ export function piMessageToMsg(message, ctx, { id, ts, live }) {
   if (role === "toolResult") {
     return [base(ctx, "msg", t, {
       id, role: "tool", live: !!live,
-      blocks: [{ type: "tool_result", toolId: message.toolCallId, name: message.toolName, text: contentText(message.content), isError: !!message.isError }],
+      blocks: [toolResultBlock(message.toolCallId, message.toolName, message.content, message.isError)],
     })];
   }
   if (role === "user" || role === "assistant") {
@@ -95,6 +119,8 @@ export function piMessageToMsg(message, ctx, { id, ts, live }) {
   }
   if (role === "custom" || role === "bashExecution") {
     const text = contentText(message.content) || message.command || "";
+    // The fallback extension's switch notice reads as a plain system line ("model error on a/x → switched to b/y").
+    if (message.customType === "omni-fallback") return [base(ctx, "msg", t, { id, role: "system", live: !!live, fallback: true, blocks: [{ type: "text", text }] })];
     return [base(ctx, "msg", t, { id, role: "system", live: !!live, blocks: [{ type: "text", text: `[${message.customType || role}] ${text}`.trim() }] })];
   }
   return [];
@@ -157,8 +183,12 @@ export function normalizePiRpcEvent(ev, ctx) {
       return [base(ctx, "tool", now, { toolId: ev.toolCallId, name: ev.toolName, phase: "start", args: ev.args })];
     case "tool_execution_update":
       return [base(ctx, "tool", now, { toolId: ev.toolCallId, name: ev.toolName, phase: "update", text: contentText(ev.partialResult?.content) })];
-    case "tool_execution_end":
-      return [base(ctx, "tool", now, { toolId: ev.toolCallId, name: ev.toolName, phase: "end", text: contentText(ev.result?.content), isError: !!ev.isError })];
+    case "tool_execution_end": {
+      const out = { toolId: ev.toolCallId, name: ev.toolName, phase: "end", text: contentText(ev.result?.content), isError: !!ev.isError };
+      const images = contentImages(ev.result?.content);
+      if (images.length) out.images = images;
+      return [base(ctx, "tool", now, out)];
+    }
     case "compaction_start":
       return [base(ctx, "status", now, { compacting: true })];
     case "compaction_end":
@@ -181,7 +211,7 @@ function claudeBlocks(content) {
     if (c.type === "text") { if (c.text) out.push({ type: "text", text: c.text }); }
     else if (c.type === "thinking") { if (c.thinking?.trim()) out.push({ type: "thinking", text: c.thinking }); }
     else if (c.type === "tool_use") out.push({ type: "tool_call", toolId: c.id, name: c.name, args: c.input });
-    else if (c.type === "tool_result") out.push({ type: "tool_result", toolId: c.tool_use_id, text: contentText(c.content), isError: !!c.is_error });
+    else if (c.type === "tool_result") out.push(toolResultBlock(c.tool_use_id, undefined, c.content, c.is_error));
     else if (c.type === "image") out.push({ type: "image", mimeType: c.source?.media_type, data: c.source?.data });
   }
   return out;

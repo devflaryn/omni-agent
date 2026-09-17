@@ -138,3 +138,28 @@ test("usage helpers", () => {
   assert.deepEqual(usageFromPi({ input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10 }), { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 });
   assert.deepEqual(usageFromClaude({ input_tokens: 1, output_tokens: 2 }), { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, total: 3 });
 });
+
+test("tool results keep the images the read tool returned (pi file, pi rpc, claude)", () => {
+  const png = "iVBORw0KGgo=";
+  const [ev] = normalizePiEntry({ type: "message", id: "m9", timestamp: "t", message: { role: "toolResult", toolCallId: "c9", toolName: "read", content: [{ type: "text", text: "Read image file [image/png]" }, { type: "image", data: png, mimeType: "image/png" }], isError: false } }, ctx);
+  assert.equal(ev.blocks[0].text, "Read image file [image/png]\n[image]");
+  assert.deepEqual(ev.blocks[0].images, [{ mimeType: "image/png", data: png }]);
+  const [rpc] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "read", result: { content: [{ type: "text", text: "x" }, { type: "image", data: png, mimeType: "image/jpeg" }] }, isError: false }, ctx);
+  assert.deepEqual(rpc.images, [{ mimeType: "image/jpeg", data: png }]);
+  const [plain] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash", result: { content: [{ type: "text", text: "x" }] } }, ctx);
+  assert.equal("images" in plain, false, "text-only results carry no images key");
+  const [cl] = normalizeClaudeEntry({ type: "user", uuid: "u9", timestamp: "t", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_9", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: png } }] }] } }, { sid: "claude:x", harness: "claude" });
+  assert.deepEqual(cl.blocks[0].images, [{ mimeType: "image/png", data: png }]);
+  const [big] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "read", result: { content: [{ type: "image", data: "a".repeat(9 * 1024 * 1024), mimeType: "image/png" }] } }, ctx);
+  assert.equal("images" in big, false, "oversized images are dropped from the event");
+});
+
+test("pi custom omni-fallback message -> plain system line flagged as a fallback (other custom types keep their tag)", () => {
+  const fb = normalizePiRpcEvent({ type: "message_end", message: { role: "custom", customType: "omni-fallback", content: "model error on a/x → switched to b/y", display: true } }, ctx);
+  assert.equal(fb[0].role, "system");
+  assert.equal(fb[0].fallback, true);
+  assert.equal(fb[0].blocks[0].text, "model error on a/x → switched to b/y");
+  const other = normalizePiRpcEvent({ type: "message_end", message: { role: "custom", customType: "note", content: "hi" } }, ctx);
+  assert.equal(other[0].blocks[0].text, "[note] hi");
+  assert.equal(other[0].fallback, undefined);
+});

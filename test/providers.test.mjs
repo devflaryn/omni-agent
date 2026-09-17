@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PRESETS, PI_APIS, readModelsFile, listProviders, upsertProvider, removeProvider, flatModels, normalizeModels, validateProvider } from "../server/providers.mjs";
+import { PRESETS, PI_APIS, readModelsFile, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels, normalizeModels, validateProvider } from "../server/providers.mjs";
 
 const base = mkdtempSync(join(tmpdir(), "omni-prov-"));
 const file = join(base, "models.json");
@@ -87,4 +87,14 @@ test("removeProvider drops the entry and leaves the rest", () => {
   const j = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(Object.keys(j.providers), ["openrouter"]);
   assert.equal(removeProvider(file, "missing"), false);
+});
+
+test("reorderProviders rewrites the provider order (the fallback chain); unknown names are ignored, unlisted ones trail", () => {
+  const f = join(base, "order.json");
+  writeFileSync(f, JSON.stringify({ providers: { a: { baseUrl: "https://a/v1", api: "openai-completions", models: [{ id: "a1" }, { id: "a2" }] }, b: { baseUrl: "https://b/v1", api: "openai-completions", models: [{ id: "b1" }] }, c: { baseUrl: "https://c/v1", api: "openai-completions", models: [{ id: "c1" }] } }, compat: { keep: true } }));
+  assert.deepEqual(reorderProviders(f, ["c", "nope", "a", "c"]), ["c", "a", "b"]);
+  const j = JSON.parse(readFileSync(f, "utf8"));
+  assert.deepEqual(Object.keys(j.providers), ["c", "a", "b"]);
+  assert.deepEqual(j.compat, { keep: true }, "other top-level keys survive");
+  assert.deepEqual(flatModels(f).map((m) => `${m.provider}/${m.id}`), ["c/c1", "a/a1", "a/a2", "b/b1"], "the picker and the fallback chain follow the new order");
 });

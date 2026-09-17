@@ -42,6 +42,17 @@ export default async function omniGraph(pi: ExtensionAPI) {
 	const port = Number(cfg.port) || 4400;
 	const base = `http://127.0.0.1:${port}`;
 
+	// Tell the model, every turn, that the graph tools exist and whether this repo already has a graph,
+	// so it reaches for graph_query on structural questions instead of grinding through files.
+	pi.on("before_agent_start", async (event, ctx) => {
+		const dir = ctx.cwd;
+		const built = existsSync(join(dir, "graphify-out", "graph.json"));
+		const note = built
+			? `A knowledge graph of ${dir} already exists. For questions about the structure of this repository (what talks to what, where something is used, what a module depends on), call graph_query first and graph_explain for one file or symbol; only read the source when you need the exact code. Call graph_build to refresh the graph after large changes.`
+			: `No knowledge graph exists for ${dir} yet. When you need to understand how this repository fits together before making changes (more than one or two files involved), call graph_build once (seconds, no model call), then graph_query for structural questions and graph_explain for one file or symbol.`;
+		return { systemPrompt: `${event.systemPrompt}\n\nRepo graph tools (graph_build / graph_query / graph_explain): ${note}` };
+	});
+
 	async function call(path: string, body: Record<string, unknown>): Promise<any> {
 		let r: Response;
 		try {

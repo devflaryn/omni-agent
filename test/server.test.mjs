@@ -39,7 +39,8 @@ const fakeSpawn = (bin, args, opts) => {
   return p;
 };
 // liveWindowMs: 0 — the fixture files were written a moment ago and would otherwise count as "open in a terminal".
-const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0 });
+// `hook` is pinned so the developer's own omni.config.json (where the goal hook may be on) never leaks into the assertions.
+const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
 await app.listen();
 const port = app.server.address().port;
 const api = async (path, opts) => {
@@ -174,18 +175,20 @@ test("cross-site POSTs are refused, same-origin/absent header POSTs are not", as
 
 // -------------------------------------------------------- stubbed-pi continue
 let fakePi = null;
-function makeFakePi({ cwd }) {
+function makeFakePi({ cwd, model, provider, thinking }) {
   fakePi = {
-    proc: {}, sid: "pi:fake", cwd, streaming: false, state: { sessionFile: "C:\\fake.jsonl" }, calls: [], failClone: false,
+    proc: {}, sid: "pi:fake", cwd, model, provider, thinking, streaming: false, state: { sessionFile: "C:\\fake.jsonl" }, calls: [], failClone: false,
     start() {}, stop() {}, owns() { return false; },
     waitReady() { return Promise.resolve(this.state); },
     async switchSession(f) { this.calls.push(["switch", f]); this.sid = "pi:01a086a6-c763-777d-8188-9a868c6a2266"; },
     async clone() { this.calls.push(["clone"]); if (this.failClone) throw new Error("clone was cancelled"); this.sid = "pi:cloned"; },
     async prompt(m) { this.calls.push(["prompt", m]); return { ok: true }; },
+    async setModel(p, id) { this.calls.push(["model", p, id]); return { success: true }; },
+    async setThinking(l) { this.calls.push(["thinking", l]); return { success: true }; },
   };
   return fakePi;
 }
-const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json") });
+const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), persistHook: false, persistPiModel: false });
 await app2.listen();
 const port2 = app2.server.address().port;
 after(() => app2.close());
@@ -285,6 +288,24 @@ test("pi models: the picker lists only the models from models.json once provider
   assert.deepEqual(r.data.models.map((m) => `${m.provider}/${m.id}`), ["openrouter/deepseek/deepseek-v4-flash-0731", "openrouter/moonshotai/kimi-k2.5"]);
 });
 
+test("providers-order: POST rewrites the provider order in models.json without restarting pi", async () => {
+  await fetch(`http://127.0.0.1:${port2}/api/providers/modal`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "https://modal.example/v1", api: "openai-completions", apiKey: "k", models: ["Qwen/Qwen3.8-27B"] }) });
+  const before = fakePi;
+  const bad = await fetch(`http://127.0.0.1:${port2}/api/providers-order`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ order: "modal" }) });
+  assert.equal(bad.status, 400);
+  const r = await fetch(`http://127.0.0.1:${port2}/api/providers-order`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ order: ["modal", "openrouter"] }) });
+  const j = await r.json();
+  assert.equal(r.status, 200);
+  assert.deepEqual(j.order, ["modal", "openrouter"]);
+  assert.deepEqual(j.providers.map((p) => p.name), ["modal", "openrouter"]);
+  assert.equal(fakePi, before, "reordering does not relaunch pi");
+  const onDisk = JSON.parse(readFileSync(join(base, "pi-agent", "models.json"), "utf8"));
+  assert.deepEqual(Object.keys(onDisk.providers), ["modal", "openrouter"]);
+  const models = await (await fetch(`http://127.0.0.1:${port2}/api/pi/models`)).json();
+  assert.equal(models.data.models[0].provider, "modal", "the picker follows the new order");
+  await fetch(`http://127.0.0.1:${port2}/api/providers/modal`, { method: "DELETE" });
+});
+
 test("providers: DELETE removes the entry; unknown → 404", async () => {
   const del = await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "DELETE" });
   assert.equal(del.status, 200);
@@ -316,4 +337,44 @@ test("fs/read reports a kind per file family: markdown, text, image, archive, bi
   const man = await entry("AndroidManifest.xml"); assert.equal(man.kind, "text"); assert.equal(man.content, "<manifest/>");
   assert.equal((await entry("classes.dex")).kind, "binary");
   assert.equal((await fetch(`http://127.0.0.1:${port}/api/fs/archive-entry?root=${encodeURIComponent(dir)}&path=app.apk&entry=missing`)).status, 404);
+});
+
+test("goal hook settings: /api/hook reads, validates and updates the keeper", async () => {
+  const before = await api("/api/hook");
+  assert.deepEqual(before.hook, { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000 });
+  const st = await api("/api/state");
+  assert.deepEqual(st.hook, before.hook, "state carries the same settings");
+  const r = await fetch(`http://127.0.0.1:${port}/api/hook`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, provider: "openrouter", model: "deepseek/x", maxIdleNudges: 999 }) });
+  const j = await r.json();
+  assert.equal(j.hook.enabled, true);
+  assert.equal(j.hook.model, "deepseek/x");
+  assert.equal(j.hook.maxIdleNudges, 50, "clamped");
+  assert.equal(app.keeper.config.enabled, true);
+  const back = await fetch(`http://127.0.0.1:${port}/api/hook`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: false }) });
+  assert.equal((await back.json()).hook.model, "deepseek/x", "a partial update keeps the other fields");
+  assert.equal(app.keeper.config.enabled, false);
+});
+
+test("model and thinking choices made before pi runs are remembered and handed to the next pi child", async () => {
+  // `app` has no pi child at all
+  const m = await fetch(`http://127.0.0.1:${port}/api/pi/model`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "openrouter", modelId: "deepseek/x" }) });
+  const mj = await m.json();
+  assert.equal(m.status, 200);
+  assert.equal(mj.pending, true);
+  assert.equal(mj.modelId, "deepseek/x");
+  const t = await fetch(`http://127.0.0.1:${port}/api/pi/thinking`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ level: "low" }) });
+  assert.equal((await t.json()).pending, true);
+  const bad = await fetch(`http://127.0.0.1:${port}/api/pi/thinking`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ level: "turbo" }) });
+  assert.equal(bad.status, 400);
+  const st = await api("/api/state");
+  assert.equal(st.pi.running, false);
+  assert.deepEqual([st.config.piProvider, st.config.piModel, st.config.piThinking], ["openrouter", "deepseek/x", "low"]);
+  // the stubbed-pi app: a live child gets the change at once, and the next child is created with the saved choices
+  fakePi.calls.length = 0;
+  const r = await post2("/api/pi/model", { provider: "orca", modelId: "qwen" });
+  assert.equal(r.json.pending, undefined, "a live child applies the model immediately");
+  await post2("/api/pi/thinking", { level: "high" });
+  assert.deepEqual(fakePi.calls, [["model", "orca", "qwen"], ["thinking", "high"]]);
+  await post2("/api/pi/start", { cwd: base });
+  assert.deepEqual([fakePi.model, fakePi.provider, fakePi.thinking], ["qwen", "orca", "high"]);
 });

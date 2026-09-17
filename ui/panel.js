@@ -137,12 +137,13 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
     };
     G.raf = requestAnimationFrame(step);
   }
-  const COLORS = ["#7cc9ff", "#f2b84b", "#b39cff", "#57d69a", "#ff7b7b", "#ffa94d", "#7dd3fc", "#f9a8d4", "#a3e635", "#fb7185", "#c4b5fd", "#67e8f9"];
+  const COLORS = ["#2450e6", "#1f9d8a", "#c4802a", "#8a4fd6", "#c92a2a", "#2a8bc9", "#7a9a1f", "#d2478f", "#4f6fd6", "#3a9d5c", "#b05a2a", "#5c6b8a"];
+  const themeVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   function drawGraph() {
     const c = $("#graphCanvas"), ctx = c.getContext("2d");
     const W = c.width, H = c.height;
     ctx.clearRect(0, 0, W, H);
-    if (!G.data) { ctx.fillStyle = "#6b6b6b"; ctx.font = `${13 * devicePixelRatio}px system-ui, sans-serif`; ctx.fillText("No graph loaded.", 16 * devicePixelRatio, 28 * devicePixelRatio); return; }
+    if (!G.data) { ctx.fillStyle = themeVar("--muted"); ctx.font = `${13 * devicePixelRatio}px system-ui, sans-serif`; ctx.fillText("No graph loaded.", 16 * devicePixelRatio, 28 * devicePixelRatio); return; }
     ctx.save(); ctx.translate(G.view.x, G.view.y); ctx.scale(G.view.k, G.view.k);
     const selLinks = new Set();
     ctx.lineWidth = devicePixelRatio;
@@ -150,9 +151,11 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
       const a = G.pos.get(l.source), b = G.pos.get(l.target); if (!a || !b) continue;
       const hot = G.sel && (l.source === G.sel || l.target === G.sel);
       if (hot) selLinks.add(l.source === G.sel ? l.target : l.source);
-      ctx.strokeStyle = hot ? "rgba(124,201,255,0.9)" : "rgba(154,154,163,0.16)";
+      ctx.strokeStyle = hot ? themeVar("--accent") : themeVar("--line-2"); ctx.globalAlpha = hot ? 1 : 0.7;
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
     }
+    ctx.globalAlpha = 1;
+    const inkColor = themeVar("--ink");
     ctx.font = `${11 * devicePixelRatio}px system-ui, sans-serif`;
     for (const n of G.data.nodes) {
       const p = G.pos.get(n.id); const r = (3 + Math.min(10, Math.sqrt(n.degree))) * devicePixelRatio;
@@ -160,7 +163,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
       ctx.globalAlpha = dim ? 0.25 : 1;
       ctx.fillStyle = COLORS[(n.community ?? 0) % COLORS.length];
       ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
-      if (n.degree >= 4 || n.id === G.sel || selLinks.has(n.id)) { ctx.fillStyle = "#ececec"; ctx.fillText(n.label.slice(0, 28), p.x + r + 3, p.y + 4 * devicePixelRatio); }
+      if (n.degree >= 4 || n.id === G.sel || selLinks.has(n.id)) { ctx.fillStyle = inkColor; ctx.fillText(n.label.slice(0, 28), p.x + r + 3, p.y + 4 * devicePixelRatio); }
       ctx.globalAlpha = 1;
     }
     ctx.restore();

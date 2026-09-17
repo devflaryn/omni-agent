@@ -71,11 +71,19 @@ test("piChildEnv exports OMNI_DISPLAY from emulatorDisplay, honoring off-switche
   try {
     writeFileSync(join(root, "or.txt"), "sk-or-test\n");
     const base = { apiKeyFiles: { OPENROUTER_API_KEY: join(root, "or.txt") } };
-    assert.deepEqual(piChildEnv({ ...base, emulatorDisplay: "1600x1000" }), { OPENROUTER_API_KEY: "sk-or-test", OMNI_DISPLAY: "1600x1000" });
+    assert.deepEqual(piChildEnv({ ...base, emulatorDisplay: "1600x1000" }), { OPENROUTER_API_KEY: "sk-or-test", OMNI_DISPLAY: "1600x1000", OMNI_MEMORY: "server" });
     assert.deepEqual(piChildEnv({ ...base, emulatorDisplay: "1920x1200@240" }).OMNI_DISPLAY, "1920x1200@240");
     for (const off of ["", "native", "off", "  ", "0", "false"]) {
       assert.ok(!("OMNI_DISPLAY" in piChildEnv({ ...base, emulatorDisplay: off })), `off: ${JSON.stringify(off)}`);
     }
-    assert.deepEqual(piChildEnv({ emulatorDisplay: "1280x800" }), { OMNI_DISPLAY: "1280x800" });
+    assert.deepEqual(piChildEnv({ emulatorDisplay: "1280x800" }), { OMNI_DISPLAY: "1280x800", OMNI_MEMORY: "server" });
+  } finally { cleanup(); }
+});
+
+test("piChildEnv marks the child as server-owned so the omni-memory extension leaves memory to the composer toggle", () => {
+  const { cleanup } = layout();
+  try {
+    // The server attaches the vault pack per prompt (composer checkbox); the extension must not add its own on top.
+    assert.equal(piChildEnv({ emulatorDisplay: "" }).OMNI_MEMORY, "server");
   } finally { cleanup(); }
 });

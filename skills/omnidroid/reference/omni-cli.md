@@ -10,10 +10,11 @@ Add `--json` to any command you intend to parse.
 
 | Command | What it does | JSON you get |
 |---|---|---|
-| `start <user> [--place ID] [--offset NAME \| --no-offset] [--apk FILE [--apk-once]] [--debug] [--no-window] [--mode M] [--no-token] [--no-warm] [--json]` | Boot an ephemeral instance for a saved account, deliver its Roblox session, land in the place. | `{name, place_id, offset, arch, debug, adb_port, vnc_port, session, booted, ok, reason?}` |
+| `start <user> [--place ID] [--offset NAME \| --no-offset] [--apk FILE [--apk-once]] [--debug] [--no-window] [--mode M] [--res WxH] [--no-token] [--no-warm] [--json]` | Boot an ephemeral instance for a saved account, deliver its Roblox session, land in the place. | `{name, place_id, offset, arch, debug, adb_port, vnc_port, session, booted, ok, reason?}` |
 | `stop <user> [--timeout S]` | Power off (in-guest shutdown → QMP quit → kill). Never call it just because a viewer closed. | `{ok}` |
 | `list [--stats]` | Running instances: ports, live offset, mode. | rows |
 | `debug-info <user> --json` | **Start here when anything is unclear.** Capabilities + fixes (below). | see below |
+| `res <user> [WxH]` | Report the live guest resolution, or change it (restarts the instance — see "Resolution"). | `{ok, name, res, previous, restarted}` |
 | `remove <user>` | DESTRUCTIVE: deletes the account entry and runtime. Not a cleanup command. | |
 
 `start` returns `booted:true, ok:false, reason:"no_session"` on a `--no-token`
@@ -40,6 +41,47 @@ fail on a machine with no display session.
 | `view <user>` | Show the window of a running instance. `--start` boots it first (same pipeline as `start`; `--mode`, `--debug`, `--offset`, `--timeout` apply). |
 | `view <user> --hide` | Hide the window (and close an explicit VNC viewer) **without stopping the instance**. |
 | `view <user> --vnc-viewer [--viewer 'vncviewer {host}::{port}']` | Open the Python VNC viewer (or an external client template) instead of the native window, for a headless boot. |
+
+## Resolution
+
+| Command | Notes |
+|---|---|
+| `start <user> --res 1920x1200` | Boot at this guest resolution. Also on `view --start`. |
+| `res <user>` | Report the live size (the guest's `wm size` **Physical** line). |
+| `res <user> <WxH> [--json]` | Change it — **restarts** the instance, keeping account / offset / mode / `--debug` / place. Prints old → new. |
+
+The resolution is the **virtio-gpu framebuffer**
+(`-device virtio-gpu-pci,xres=W,yres=H`), never a `wm size` override. Two
+consequences an agent must know:
+
+- `adb shell wm size` shows only `Physical size: WxH` — **no `Override size:`
+  line** — and `screencap` comes out at exactly that size. `wm size` /
+  `wm density` would write `display_size_forced` / `display_density_forced`
+  into Settings, which any app can read; nothing here does.
+- It is **fixed at boot**. Android does not follow a live window resize
+  (dragging the window scales the picture). That is why `res <user> <WxH>`
+  restarts rather than poking the running guest, and why `res` on a stopped
+  instance is refused with a pointer to `start --res`.
+
+Default (no `--res`): the largest 16:10 rung that fits the host monitor —
+1280x800, 1440x900, 1680x1050, 1920x1200, 2560x1600 — so you normally do not
+pass it at all. `OMNI_DISPLAY=WxH` is the env equivalent; `--res` wins, and an
+`@dpi` suffix is accepted but ignored (the density override is the same tell).
+Farming is exempt: it keeps its 480x270 + dpi 80 override.
+
+**OPEN (measured 2026-09-16).** On a WINDOWED boot the guest still takes the
+window's startup size: `--res 1920x1200` sets `xres=1920,yres=1200` on the
+device, yet `wm size` reports `Physical size: 534x334` and screenshots come
+out 534x334. The identical launch with `--no-window` reports `Physical size:
+1920x1200` and screenshots at 1920x1200. Cause: with `-display
+cocoa,zoom-to-fit=on` the window is freely resizable and QEMU pushes its size
+to the guest, which follows it. **Pass `--no-window` when the resolution
+matters**, and verify with `res <user>` instead of trusting the flag.
+
+Known tells, out of scope here: QEMU's EDID reports the panel as
+`QEMU Monitor` / PnP `RHT` through `Display.getDeviceProductInfo()`; and
+`wm size reset` (run in every performance-mode tune-up) leaves an empty
+`display_size_forced=` row in Settings.
 
 ## Roblox versions ("offsets") and custom APKs
 
@@ -91,7 +133,7 @@ To prove "first bakes, second hits": `offset list` before (no entry), first
 
 ```json
 {"ok": true, "name": "…", "base": "arm", "arch": "arm", "mode": "playable",
- "debug_boot": false, "offset": "apk-3f9a2b1c4d5e6f70", "offset_default": "…",
+ "res": [1920, 1200], "debug_boot": false, "offset": "apk-3f9a2b1c4d5e6f70", "offset_default": "…",
  "offsets_available": ["…"], "adb_serial": "127.0.0.1:PORT", "vnc": "127.0.0.1:PORT",
  "qmp_port": N, "game_package": "com.roblox.client",
  "app": {"package": "com.roblox.client", "pid": 13210, "running": true, "foreground": true,

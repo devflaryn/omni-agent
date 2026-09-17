@@ -209,6 +209,49 @@ program. `--quality balanced` trades visuals back for frame rate; `--mem` and
 Do **not** run farming and expect a usable screenshot: it is 480x270 at 5 fps
 by design.
 
+## Resolution: `--res`, and `omnidroid res`
+
+```bash
+python3 -m omnidroid start alice --res 1920x1200        # boot at this size
+python3 -m omnidroid res alice                          # report the live size
+python3 -m omnidroid res alice 1440x900 --json          # change it (restarts)
+```
+
+The resolution is the **virtio-gpu framebuffer**
+(`-device virtio-gpu-pci,xres=W,yres=H`), not a `wm size` override. So the
+guest reports it as its own `Physical size` with **no `Override size:` line**,
+and screenshots come out at exactly that size. This matters beyond sharpness:
+`wm size` / `wm density` write `display_size_forced` /
+`display_density_forced` into Settings, which **any app can read** — nothing
+here writes one. (Farming keeps its 480x270 + dpi 80 override.)
+
+- **Default = the host monitor**, snapped to a 16:10 ladder: 1280x800,
+  1440x900, 1680x1050, 1920x1200, 2560x1600. You rarely need `--res`.
+- **Fixed at boot.** Android does *not* follow a live window resize — dragging
+  the window scales the picture, it does not change `Physical size`. That is
+  why `omnidroid res <name> <WxH>` **restarts** the instance (same account,
+  offset, mode, `--debug`, place) instead of poking the live one.
+- `res` with no size just reports; `--json` →
+  `{"ok", "name", "res": [w,h], "previous": [w,h], "restarted"}`.
+- The live size is in `debug-info` and `list` as `res`.
+- An instance that is not running is refused — boot it with `start --res`.
+- `OMNI_DISPLAY=WxH` is the env equivalent (`--res` wins). An `@dpi` suffix is
+  ignored on purpose: the density override is the same Settings tell.
+
+**OPEN, measured 2026-09-16 — a WINDOWED boot still takes the window's
+startup size.** `--res 1920x1200` puts `xres=1920,yres=1200` on the device,
+but with the native cocoa window the guest comes up at `Physical size:
+534x334`; the same launch with `--no-window` gives `Physical size: 1920x1200`
+and a 1920x1200 screenshot. **So pass `--no-window` when the resolution has to
+be right** — which is what an unattended agent run should be doing anyway.
+Always read the size back (`res <user>` or `adb … shell wm size`) rather than
+trusting the flag.
+
+Known tells, out of scope: QEMU's EDID reports the panel as `QEMU Monitor` /
+PnP `RHT` via `Display.getDeviceProductInfo()`, and the `wm size reset` that
+opens every tune-up leaves an EMPTY `display_size_forced=` row in Settings (no
+override in effect, but a stock device has no such row).
+
 ## Debugging
 
 ```bash
@@ -406,5 +449,5 @@ cold boot.
 - `omnidroid-input` skill — tap/type/swipe/read the screen of a running instance.
 - `HOWTO.md` §3a (offsets), §7 (modes), §7a (debugging) in the omnidroid repo.
 - `MODES.md` — the full playable-vs-farming rationale and the measured numbers.
-- Omni Agent (`Desktop/omni-agent`) installs this skill for pi with
+- Omni Agent (`Desktop/Omni Apps/omni-agent`) installs this skill for pi with
   `node scripts/install.mjs` and drives unattended runs with `scripts/headless.mjs`.

@@ -7,14 +7,15 @@ import { createServer } from "node:http";
 import { promises as fs, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { extname, join, relative, resolve, sep } from "node:path";
-import { CONFIG, ROOT, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
+import { CONFIG, ROOT, hookConfig, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
-import { PiRpc } from "./pi-rpc.mjs";
+import { PiRpc, PI_THINKING_LEVELS } from "./pi-rpc.mjs";
+import { GoalKeeper, JUDGE_SYSTEM, runJudge } from "./hook.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
-import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, flatModels } from "./providers.mjs";
+import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels } from "./providers.mjs";
 import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
 import { Vault } from "./memory.mjs";
@@ -33,6 +34,13 @@ export async function createApp(overrides = {}) {
 
   const isOwned = (file) => (pi?.owns(file) ?? false) || claude.owns(file);
   const watcher = new SessionWatcher({ piSessionsDir: cfg.piSessionsDir, claudeProjectsDir: cfg.claudeProjectsDir, bus, tally, registry, isOwned, recentHours: cfg.tailRecentHours, log });
+  // Goal hook: a judge model (any configured provider, through `pi -p`) decides whether pi may stop; if not, pi is re-engaged.
+  const keeper = new GoalKeeper({
+    bus, log,
+    getPi: (sid) => (pi?.proc && pi.sid === sid ? pi : null),
+    judge: cfg.judge || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn }, { system: JUDGE_SYSTEM, input })),
+    config: hookConfig(cfg.hook),
+  });
 
   // Owned sessions also need registry + tally bookkeeping from their live events.
   bus.on("event", (ev) => {
@@ -52,7 +60,7 @@ export async function createApp(overrides = {}) {
 
   function startPi(cwd = cfg.cwd) {
     if (pi) pi.stop();
-    pi = cfg.createPi ? cfg.createPi({ cwd, bus }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, env: piChildEnv(cfg), bus });
+    pi = cfg.createPi ? cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, env: piChildEnv(cfg), bus });
     pi.start();
     return pi;
   }
@@ -248,8 +256,9 @@ export async function createApp(overrides = {}) {
       // state
       if (req.method === "GET" && p === "/api/state") {
         return send(res, 200, {
-          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/`) : [] },
+          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/`) : [], piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
+          hook: keeper.config,
           runs: claude.list(),
           sessions: registry.list().map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
           seq: bus.seq,
@@ -280,10 +289,27 @@ export async function createApp(overrides = {}) {
         setTimeout(() => { close(); process.exit(0); }, 100);
         return;
       }
+      // goal hook
+      if (p === "/api/hook") {
+        if (req.method === "GET") return send(res, 200, { hook: keeper.config });
+        if (req.method === "PUT" || req.method === "POST") {
+          const next = hookConfig({ ...keeper.config, ...(await readBody(req)) });
+          keeper.setConfig(next);
+          if (cfg.persistHook !== false) writeConfigFile({ hook: next });
+          return send(res, 200, { hook: next });
+        }
+      }
       // providers (pi's models.json)
       if (req.method === "GET" && p === "/api/providers") {
         const mdl = pi?.state?.model;
         return send(res, 200, { providers: listProviders(cfg.piModelsFile), presets: PRESETS, apis: PI_APIS, file: cfg.piModelsFile, active: mdl ? { provider: mdl.provider, id: mdl.id } : null });
+      }
+      // Fallback priority: the provider order in models.json. pi's omni-fallback extension reads the file per switch, so no restart.
+      if (req.method === "POST" && p === "/api/providers-order") {
+        const body = await readBody(req);
+        if (!Array.isArray(body.order)) return send(res, 400, { error: "order must be an array of provider names" });
+        const order = reorderProviders(cfg.piModelsFile, body.order);
+        return send(res, 200, { ok: true, order, providers: listProviders(cfg.piModelsFile) });
       }
       if ((req.method === "PUT" || req.method === "DELETE") && (m = /^\/api\/providers\/([^/]+)$/.exec(p))) {
         const name = decodeURIComponent(m[1]);
@@ -304,15 +330,22 @@ export async function createApp(overrides = {}) {
             const c = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(p0.sid) });
             return send(res, 200, await p0.prompt(c.text, { images: body.images }));
           }
-          case "/api/pi/abort": return send(res, 200, await requirePi().abort());
+          case "/api/pi/abort": { const p0 = requirePi(); keeper.cancel(p0.sid); return send(res, 200, await p0.abort()); }
           case "/api/pi/new": return send(res, 200, await requirePi().newSession());
           case "/api/pi/switch": return send(res, 200, await requirePi().switchSession(body.file));
+          // Model and thinking level are remembered even when pi is not running yet: the next pi child starts with them.
           case "/api/pi/model": {
-            const r = await requirePi().setModel(body.provider, body.modelId);
+            if (!body.provider || !body.modelId) return send(res, 400, { error: "provider and modelId are required" });
+            const r = pi?.proc ? await pi.setModel(body.provider, body.modelId) : { success: true, pending: true };
             if (r?.success !== false) { cfg.piProvider = body.provider; cfg.piModel = body.modelId; if (cfg.persistPiModel !== false) writeConfigFile({ piProvider: body.provider, piModel: body.modelId }); }
-            return send(res, 200, r);
+            return send(res, 200, { ...r, provider: cfg.piProvider, modelId: cfg.piModel });
           }
-          case "/api/pi/thinking": return send(res, 200, await requirePi().setThinking(body.level));
+          case "/api/pi/thinking": {
+            if (!PI_THINKING_LEVELS.includes(body.level)) return send(res, 400, { error: `level must be one of ${PI_THINKING_LEVELS.join(", ")}` });
+            const r = pi?.proc ? await pi.setThinking(body.level) : { success: true, pending: true };
+            if (r?.success !== false) { cfg.piThinking = body.level; if (cfg.persistPiModel !== false) writeConfigFile({ piThinking: body.level }); }
+            return send(res, 200, { ...r, level: cfg.piThinking });
+          }
           case "/api/pi/compact": return send(res, 200, await requirePi().compact());
           case "/api/pi/stats": return send(res, 200, await requirePi().stats());
           case "/api/pi/models": {
@@ -440,13 +473,14 @@ export async function createApp(overrides = {}) {
 
   function close() {
     clearInterval(digestTimer);
+    keeper.dispose();
     watcher.stop();
     pi?.stop();
     claude.stopAll();
     server.close();
   }
 
-  return { server, listen, close, bus, vault, registry, tally, watcher, claude, get pi() { return pi; }, startPi, cfg };
+  return { server, listen, close, bus, vault, registry, tally, watcher, claude, keeper, get pi() { return pi; }, startPi, cfg };
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || process.argv[1]?.endsWith("index.mjs")) {

@@ -11,6 +11,8 @@
  *
  * Config: ~/.pi/agent/omni-agent.json  { "root": "<omni-agent folder>", "autoRecall": true, "budgetTokens": 800 }
  * Installed by: node scripts/install.mjs   (in the omni-agent folder)
+ * Auto recall is skipped when OMNI_MEMORY=server (a pi child owned by Omni's server): there the composer's
+ * memory checkbox decides per prompt and the server attaches the pack itself.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -111,7 +113,11 @@ export default async function omniMemory(pi: ExtensionAPI) {
 		},
 	});
 
-	if (cfg.autoRecall !== false) {
+	// Omni's server spawns its pi child with OMNI_MEMORY=server and attaches the vault pack itself, per prompt,
+	// according to the composer's "Attach relevant memory" checkbox. Auto recall here would put memory back on
+	// every turn regardless of that choice, so it only runs for a pi started outside Omni (terminal, headless pi).
+	const serverOwned = process.env.OMNI_MEMORY === "server";
+	if (cfg.autoRecall !== false && !serverOwned) {
 		pi.on("before_agent_start", async (event) => {
 			try {
 				const pack = await vault.pack(event.prompt, { budgetTokens: budget });

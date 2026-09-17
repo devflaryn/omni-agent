@@ -1,0 +1,514 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-16T00:00:00Z",
+  "title": "Design System: Omni Agent",
+  "extensions": {
+    "colorMeta": {
+      "accent": {
+        "role": "primary",
+        "displayName": "Cobalt",
+        "canonical": "#2450e6",
+        "darkValue": "#7aa2ff",
+        "tonalRamp": [
+          "oklch(22% 0.12 265)",
+          "oklch(32% 0.17 265)",
+          "oklch(42% 0.21 265)",
+          "oklch(50% 0.22 265)",
+          "oklch(60% 0.19 265)",
+          "oklch(72% 0.13 265)",
+          "oklch(84% 0.07 265)",
+          "oklch(95% 0.02 265)"
+        ]
+      },
+      "accent-soft": {
+        "role": "primary",
+        "displayName": "Cobalt Wash",
+        "canonical": "rgba(36, 80, 230, 0.10)",
+        "darkValue": "rgba(122, 162, 255, 0.14)",
+        "tonalRamp": [
+          "oklch(22% 0.12 265)",
+          "oklch(32% 0.17 265)",
+          "oklch(42% 0.21 265)",
+          "oklch(50% 0.22 265)",
+          "oklch(60% 0.19 265)",
+          "oklch(72% 0.13 265)",
+          "oklch(84% 0.07 265)",
+          "oklch(95% 0.02 265)"
+        ]
+      },
+      "ground": {
+        "role": "neutral",
+        "displayName": "Ground",
+        "canonical": "#fbfbfa",
+        "darkValue": "#141414",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#fbfbfa"
+        ]
+      },
+      "field": {
+        "role": "neutral",
+        "displayName": "Field",
+        "canonical": "#f3f3f1",
+        "darkValue": "#1b1b1a",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "field-2": {
+        "role": "neutral",
+        "displayName": "Field 2",
+        "canonical": "#ebebe8",
+        "darkValue": "#222221",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "field-3": {
+        "role": "neutral",
+        "displayName": "Field 3",
+        "canonical": "#e2e2de",
+        "darkValue": "#2a2a29",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Line",
+        "canonical": "#dcdcd8",
+        "darkValue": "#2b2b2a",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "line-2": {
+        "role": "neutral",
+        "displayName": "Line 2",
+        "canonical": "#c9c9c4",
+        "darkValue": "#3a3a38",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#141414",
+        "darkValue": "#ececea",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted",
+        "canonical": "#6b6b66",
+        "darkValue": "#a09f9a",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "dim": {
+        "role": "neutral",
+        "displayName": "Dim",
+        "canonical": "#9a9a94",
+        "darkValue": "#6e6e69",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "inverse": {
+        "role": "neutral",
+        "displayName": "Inverse",
+        "canonical": "#141414",
+        "darkValue": "#ececea",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "scrim": {
+        "role": "neutral",
+        "displayName": "Scrim",
+        "canonical": "rgba(20, 20, 20, 0.28)",
+        "darkValue": "rgba(0, 0, 0, 0.5)",
+        "tonalRamp": [
+          "#141414",
+          "#6b6b66",
+          "#9a9a94",
+          "#c9c9c4",
+          "#dcdcd8",
+          "#e2e2de",
+          "#ebebe8",
+          "#f3f3f1"
+        ]
+      },
+      "err": {
+        "role": "error",
+        "displayName": "Signal Red",
+        "canonical": "#c92a2a",
+        "darkValue": "#ff7070",
+        "tonalRamp": [
+          "oklch(22% 0.09 28)",
+          "oklch(32% 0.13 28)",
+          "oklch(42% 0.17 28)",
+          "oklch(52% 0.19 28)",
+          "oklch(62% 0.18 28)",
+          "oklch(74% 0.12 28)",
+          "oklch(86% 0.06 28)",
+          "oklch(95% 0.02 28)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "The Home heading only; 24px fixed on the phone."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Dialog and provider form titles."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Pane titles, ledger block titles, active drawer tab, the wordmark."
+      },
+      "prose": {
+        "displayName": "Prose",
+        "purpose": "Assistant text and the composer textarea, capped at a 760px measure."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Document default, Home subline, markdown preview."
+      },
+      "control": {
+        "displayName": "Control",
+        "purpose": "Buttons, menu items, history rows, tabs, the status meter, tool labels."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Chips, tree rows, secondary notes, ledger keys, toasts."
+      },
+      "caption": {
+        "displayName": "Caption",
+        "purpose": "Composer caption, file meta, timestamps, menu headers, hints."
+      },
+      "group-label": {
+        "displayName": "Group Label",
+        "purpose": "Uppercase day-group labels in the history list."
+      },
+      "mono": {
+        "displayName": "Mono",
+        "purpose": "Paths, ids, model names, statuses and every figure, with tabular numerals."
+      },
+      "mono-block": {
+        "displayName": "Mono Block",
+        "purpose": "Code blocks, tool output and the memory editor."
+      }
+    },
+    "shadows": [
+      {
+        "name": "float",
+        "value": "0 8px 24px rgba(20, 20, 20, 0.10), 0 1px 2px rgba(20, 20, 20, 0.06)",
+        "darkValue": "0 8px 24px rgba(0, 0, 0, 0.45), 0 1px 2px rgba(0, 0, 0, 0.4)",
+        "purpose": "Toasts. The only small floating surface."
+      },
+      {
+        "name": "float-lg",
+        "value": "0 24px 60px rgba(20, 20, 20, 0.16), 0 2px 6px rgba(20, 20, 20, 0.06)",
+        "darkValue": "0 24px 60px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.4)",
+        "purpose": "The providers dialog, the lightbox image, and the phone explorer sheet."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease",
+        "value": "cubic-bezier(0.2, 0.7, 0.2, 1)",
+        "purpose": "The single easing curve for every transition and animation."
+      },
+      {
+        "name": "slide",
+        "value": "transform 0.18s",
+        "purpose": "Drawer slide-in from the right (translateX(100%) to none)."
+      },
+      {
+        "name": "breathe",
+        "value": "opacity 1 to 0.35, 1.4s-1.6s infinite",
+        "purpose": "Live dots in the top bar, the status meter and history rows. Opacity only."
+      },
+      {
+        "name": "tok-in",
+        "value": "opacity 0 to 1, translateY(2px) to 0, 0.16s",
+        "purpose": "Each streamed token fades up."
+      },
+      {
+        "name": "appear",
+        "value": "opacity 0 to 1, translateY(3px) to 0, 0.15s-0.22s",
+        "purpose": "New turns, the dialog, lightbox and toasts."
+      },
+      {
+        "name": "hover",
+        "value": "background, border-color, color 0.12s",
+        "purpose": "Control hover and focus-within changes."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "animation: none; transition: none",
+        "purpose": "prefers-reduced-motion removes all of the above."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "drawer-pushes",
+        "value": "1200px",
+        "purpose": "At and above: the open history drawer pushes the main row aside by 360px."
+      },
+      {
+        "name": "narrow-preview",
+        "value": "1100px",
+        "purpose": "At and below: the preview pane narrows from 440px to 380px."
+      },
+      {
+        "name": "phone",
+        "value": "760px",
+        "purpose": "At and below: 48px top bar, explorer/preview/drawer as sheets, 40px touch targets, caption above the composer bar, single-column dialog."
+      }
+    ],
+    "widths": {
+      "top": "44px",
+      "explorer": "260px",
+      "preview": "440px",
+      "panel": "360px",
+      "measure": "760px",
+      "home": "720px"
+    }
+  },
+  "components": [
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "The default control: transparent with a hairline, fills one step on hover.",
+      "html": "<button class=\"ds-btn\">Save</button> <button class=\"ds-btn ds-btn-quiet\">Cancel</button>",
+      "css": ".ds-btn { background: transparent; color: var(--ink, #141414); border: 1px solid var(--line-2, #c9c9c4); border-radius: 6px; padding: 5px 11px; cursor: pointer; font: 13px/1.3 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; white-space: nowrap; transition: background 0.12s cubic-bezier(0.2,0.7,0.2,1), border-color 0.12s cubic-bezier(0.2,0.7,0.2,1); } .ds-btn:hover { background: var(--field, #f3f3f1); border-color: var(--dim, #9a9a94); } .ds-btn:focus-visible { outline: 2px solid var(--accent, #2450e6); outline-offset: 2px; } .ds-btn-quiet { border-color: transparent; color: var(--muted, #6b6b66); } .ds-btn-quiet:hover { color: var(--ink, #141414); border-color: transparent; }"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Solid accent, used for the one committing action in a dialog or form.",
+      "html": "<button class=\"ds-btn-primary\">Save provider</button>",
+      "css": ".ds-btn-primary { background: var(--accent, #2450e6); color: var(--accent-ink, #ffffff); border: 1px solid var(--accent, #2450e6); border-radius: 6px; padding: 5px 11px; cursor: pointer; font: 600 13px/1.3 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; transition: filter 0.12s cubic-bezier(0.2,0.7,0.2,1); } .ds-btn-primary:hover { filter: brightness(1.06); } .ds-btn-primary:focus-visible { outline: 2px solid var(--accent, #2450e6); outline-offset: 2px; } .ds-btn-primary[disabled] { opacity: 0.45; pointer-events: none; }"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": "icon-button",
+      "description": "32px borderless square holding a 16px stroked SVG; ink on field-2 when hovered or on.",
+      "html": "<button class=\"ds-icon-btn\" title=\"Chat history\"><svg viewBox=\"0 0 16 16\"><path d=\"M2.5 4h11M2.5 8h11M2.5 12h7\"/></svg></button> <button class=\"ds-icon-btn ds-on\" title=\"Files\"><svg viewBox=\"0 0 16 16\"><path d=\"M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z\"/></svg></button>",
+      "css": ".ds-icon-btn { background: transparent; border: 0; color: var(--muted, #6b6b66); cursor: pointer; width: 32px; height: 32px; border-radius: 6px; display: inline-grid; place-items: center; padding: 0; transition: background 0.12s cubic-bezier(0.2,0.7,0.2,1), color 0.12s cubic-bezier(0.2,0.7,0.2,1); } .ds-icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; display: block; } .ds-icon-btn:hover, .ds-icon-btn.ds-on { color: var(--ink, #141414); background: var(--field-2, #ebebe8); } .ds-icon-btn:focus-visible { outline: 2px solid var(--accent, #2450e6); outline-offset: 2px; }"
+    },
+    {
+      "name": "Send / Stop Control",
+      "kind": "button",
+      "refersTo": "send-button",
+      "description": "The 30px circle that is the only solid accent in the first viewport; inverts to a stop square while running, greys out when disabled.",
+      "html": "<span style=\"display:inline-flex;gap:8px\"><button class=\"ds-send\" title=\"Send\"><svg viewBox=\"0 0 16 16\"><path d=\"M8 13V3M4 7l4-4 4 4\"/></svg></button><button class=\"ds-send ds-stop\" title=\"Stop\"></button><button class=\"ds-send\" disabled title=\"Send\"><svg viewBox=\"0 0 16 16\"><path d=\"M8 13V3M4 7l4-4 4 4\"/></svg></button></span>",
+      "css": ".ds-send { width: 30px; height: 30px; border-radius: 50%; border: 0; background: var(--accent, #2450e6); color: var(--accent-ink, #ffffff); cursor: pointer; display: grid; place-items: center; padding: 0; transition: filter 0.12s cubic-bezier(0.2,0.7,0.2,1), background 0.12s cubic-bezier(0.2,0.7,0.2,1); } .ds-send svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; display: block; } .ds-send:hover { filter: brightness(1.08); } .ds-send:focus-visible { outline: 2px solid var(--accent, #2450e6); outline-offset: 2px; } .ds-stop { background: var(--inverse, #141414); color: var(--inverse-ink, #fbfbfa); } .ds-stop::before { content: ''; width: 10px; height: 10px; background: currentColor; border-radius: 2px; } .ds-send[disabled] { background: var(--field-2, #ebebe8); color: var(--dim, #9a9a94); cursor: default; }"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Ground fill on a hairline; focus turns the hairline to ink with no glow.",
+      "html": "<input class=\"ds-input\" type=\"search\" placeholder=\"Filter files\">",
+      "css": ".ds-input { width: 100%; max-width: 280px; background: var(--ground, #fbfbfa); border: 1px solid var(--line-2, #c9c9c4); border-radius: 6px; padding: 6px 10px; color: var(--ink, #141414); font: 13px/1.3 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; outline: none; transition: border-color 0.12s cubic-bezier(0.2,0.7,0.2,1); } .ds-input::placeholder { color: var(--dim, #9a9a94); } .ds-input:focus { border-color: var(--ink, #141414); }"
+    },
+    {
+      "name": "Composer",
+      "kind": "custom",
+      "refersTo": "composer",
+      "description": "The hairline rectangle at the foot of every view: textarea, attach circle, model chip, caption and the send circle.",
+      "html": "<div class=\"ds-composer\"><textarea class=\"ds-ta\" rows=\"2\" placeholder=\"Do anything\"></textarea><div class=\"ds-cbar\"><button class=\"ds-cbtn ds-round\" title=\"Attach\"><svg viewBox=\"0 0 16 16\"><path d=\"M8 3v10M3 8h10\"/></svg></button><button class=\"ds-cbtn\"><span class=\"ds-lbl\"><b>deepseek/deepseek-v4-flash</b> <span>high</span></span><svg viewBox=\"0 0 16 16\" style=\"width:12px;height:12px;opacity:.7\"><path d=\"m4 6 4 4 4-4\"/></svg></button><span class=\"ds-grow\"></span><span class=\"ds-caption\">pi \u00b7 ready</span><button class=\"ds-send\" title=\"Send\"><svg viewBox=\"0 0 16 16\"><path d=\"M8 13V3M4 7l4-4 4 4\"/></svg></button></div></div>",
+      "css": ".ds-composer { background: var(--ground, #fbfbfa); border: 1px solid var(--line-2, #c9c9c4); border-radius: 6px; padding: 10px 10px 8px; max-width: 560px; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; transition: border-color 0.12s cubic-bezier(0.2,0.7,0.2,1); } .ds-composer:focus-within { border-color: var(--ink, #141414); } .ds-ta { width: 100%; background: transparent; border: 0; padding: 4px 6px; resize: none; min-height: 40px; line-height: 1.5; font: inherit; font-size: 15px; color: var(--ink, #141414); outline: none; } .ds-ta::placeholder { color: var(--dim, #9a9a94); } .ds-cbar { display: flex; align-items: center; gap: 4px; margin-top: 6px; } .ds-grow { flex: 1; } .ds-cbtn { background: transparent; border: 1px solid var(--line-2, #c9c9c4); color: var(--muted, #6b6b66); cursor: pointer; font-size: 12.5px; border-radius: 6px; padding: 4px 8px; display: inline-flex; align-items: center; gap: 6px; line-height: 1.3; min-height: 30px; } .ds-cbtn:hover { color: var(--ink, #141414); border-color: var(--dim, #9a9a94); } .ds-cbtn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; display: block; } .ds-cbtn.ds-round { width: 30px; height: 30px; padding: 0; justify-content: center; border-radius: 50%; } .ds-lbl b { font-weight: 500; color: var(--ink, #141414); font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-size: 12px; } .ds-caption { font-size: 11.5px; color: var(--dim, #9a9a94); margin-right: 6px; } .ds-send { width: 30px; height: 30px; border-radius: 50%; border: 0; background: var(--accent, #2450e6); color: var(--accent-ink, #ffffff); cursor: pointer; display: grid; place-items: center; padding: 0; } .ds-send svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; display: block; } .ds-send:hover { filter: brightness(1.08); } .ds-composer :focus-visible { outline: 2px solid var(--accent, #2450e6); outline-offset: 2px; }"
+    },
+    {
+      "name": "Chip",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Hairline chips in mono for recent folders on Home; the active one turns its border to ink.",
+      "html": "<span style=\"display:inline-flex;gap:6px\"><button class=\"ds-chip ds-active\">omni-agent</button><button class=\"ds-chip\">omnidroid</button><button class=\"ds-chip\">vault</button></span>",
+      "css": ".ds-chip { background: transparent; border: 1px solid var(--line-2, #c9c9c4); border-radius: 6px; padding: 3px 10px; font: 12.5px/1.4 'SF Mono', ui-monospace, Menlo, monospace; color: var(--muted, #6b6b66); cursor: pointer; } .ds-chip:hover { color: var(--ink, #141414); border-color: var(--dim, #9a9a94); } .ds-chip.ds-active { color: var(--ink, #141414); border-color: var(--ink, #141414); } .ds-chip:focus-visible { outline: 2px solid var(--accent, #2450e6); outline-offset: 2px; }"
+    },
+    {
+      "name": "Top Bar",
+      "kind": "nav",
+      "refersTo": "top-bar",
+      "description": "44px ground bar with a bottom hairline: mark and wordmark, chat title, pi status with the live dot, mono model id, icon buttons.",
+      "html": "<div class=\"ds-top\"><span class=\"ds-brand\"><span class=\"ds-mark\"></span><span class=\"ds-word\">Omni Agent</span></span><span class=\"ds-title\">Omni droid resolution and color compatibility</span><span class=\"ds-grow\"></span><span class=\"ds-status ds-on\">pi \u00b7 working</span><span class=\"ds-model\">deepseek/deepseek-v4-flash</span><button class=\"ds-icon-btn\"><svg viewBox=\"0 0 16 16\"><path d=\"M2.5 4h11M2.5 8h11M2.5 12h7\"/></svg></button></div>",
+      "css": ".ds-top { display: flex; align-items: center; gap: 4px; height: 44px; padding: 0 8px 0 16px; border-bottom: 1px solid var(--line, #dcdcd8); background: var(--ground, #fbfbfa); font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; color: var(--ink, #141414); } .ds-brand { display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 0; } .ds-mark { width: 10px; height: 10px; border-radius: 2px; background: var(--ink, #141414); } .ds-word { font-weight: 600; letter-spacing: -0.01em; font-size: 13.5px; } .ds-title { font-size: 13px; color: var(--muted, #6b6b66); padding: 0 6px 0 12px; border-left: 1px solid var(--line, #dcdcd8); margin-left: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40%; } .ds-grow { flex: 1; } .ds-status { font-size: 12.5px; color: var(--muted, #6b6b66); padding: 0 6px 0 4px; display: flex; align-items: center; gap: 7px; white-space: nowrap; } .ds-status::before { content: ''; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--dim, #9a9a94); } .ds-status.ds-on { color: var(--ink, #141414); } .ds-status.ds-on::before { background: var(--accent, #2450e6); border-color: var(--accent, #2450e6); animation: ds-breathe 1.6s cubic-bezier(0.2,0.7,0.2,1) infinite; } @keyframes ds-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } } .ds-model { font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--muted, #6b6b66); padding: 0 10px 0 6px; } .ds-icon-btn { background: transparent; border: 0; color: var(--muted, #6b6b66); cursor: pointer; width: 32px; height: 32px; border-radius: 6px; display: inline-grid; place-items: center; padding: 0; } .ds-icon-btn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; display: block; } .ds-icon-btn:hover { color: var(--ink, #141414); background: var(--field-2, #ebebe8); } @media (prefers-reduced-motion: reduce) { .ds-status.ds-on::before { animation: none; } }"
+    },
+    {
+      "name": "Menu",
+      "kind": "nav",
+      "refersTo": "menu",
+      "description": "A floating list on the ground with a hairline and no shadow; the chosen item is bold with a stroked check.",
+      "html": "<div class=\"ds-menu\"><div class=\"ds-mh\">OpenRouter</div><button class=\"ds-mi ds-on\">deepseek/deepseek-v4-flash</button><button class=\"ds-mi\">anthropic/claude-sonnet</button><button class=\"ds-mi ds-manage\">Manage providers</button></div>",
+      "css": ".ds-menu { min-width: 240px; max-width: 300px; background: var(--ground, #fbfbfa); border: 1px solid var(--line-2, #c9c9c4); border-radius: 6px; padding: 4px; display: grid; gap: 1px; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; } .ds-mh { color: var(--dim, #9a9a94); font-size: 11.5px; font-weight: 500; padding: 6px 10px 3px; } .ds-mi { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: transparent; border: 0; color: var(--ink, #141414); padding: 7px 10px; border-radius: 6px; cursor: pointer; font-size: 13px; line-height: 1.3; font-family: inherit; } .ds-mi:hover { background: var(--field, #f3f3f1); } .ds-mi.ds-on { font-weight: 600; } .ds-mi.ds-on::after { content: ''; margin-left: auto; width: 14px; height: 14px; background: var(--ink, #141414); -webkit-mask: url('data:image/svg+xml,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"black\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m3.5 8.5 3 3 6-7\"/></svg>') center / contain no-repeat; mask: url('data:image/svg+xml,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 16 16\" fill=\"none\" stroke=\"black\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"m3.5 8.5 3 3 6-7\"/></svg>') center / contain no-repeat; } .ds-manage { color: var(--accent, #2450e6); border-top: 1px solid var(--line, #dcdcd8); border-radius: 0 0 6px 6px; margin-top: 4px; padding-top: 10px; } .ds-mi:focus-visible { outline: 2px solid var(--accent, #2450e6); outline-offset: 2px; }"
+    },
+    {
+      "name": "Status Meter and Tool Group",
+      "kind": "custom",
+      "refersTo": "list-row",
+      "description": "The last line of a turn: a folded tool-group summary above a live meter with elapsed and tokens in tabular figures.",
+      "html": "<div class=\"ds-turn\"><details class=\"ds-work\" open><summary><span class=\"ds-ico\"><svg viewBox=\"0 0 16 16\"><path d=\"M3 5h10M3 8h10M3 11h7\"/></svg></span><span class=\"ds-wlbl\">Used tools, ran commands</span></summary><div class=\"ds-witems\"><div class=\"ds-tool ds-running\"><span class=\"ds-ico\"><svg viewBox=\"0 0 16 16\"><path d=\"M3 4.5 6.5 8 3 11.5M8 12h5\"/></svg></span><span class=\"ds-tlbl\">omni app start --json</span><span class=\"ds-st\">12s</span></div><div class=\"ds-tool ds-err\"><span class=\"ico ds-ico\"><svg viewBox=\"0 0 16 16\"><path d=\"m10.5 3 2.5 2.5L6 12.5H3.5V10zM9 4.5l2.5 2.5\"/></svg></span><span class=\"ds-tlbl\">edit omnidroid/window.py</span><span class=\"ds-st\">failed</span></div></div></details><button class=\"ds-meter ds-live\"><span class=\"ds-dot\"></span><span>Thinking \u00b7 10m 47s \u00b7 47.8k tokens</span></button></div>",
+      "css": ".ds-turn { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; color: var(--muted, #6b6b66); max-width: 520px; } .ds-ico { display: inline-grid; place-items: center; width: 16px; height: 16px; color: var(--dim, #9a9a94); } .ds-ico svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; display: block; } .ds-work > summary { cursor: pointer; padding: 3px 0; list-style: none; display: flex; align-items: center; gap: 8px; font-size: 13.5px; } .ds-work > summary::-webkit-details-marker { display: none; } .ds-work > summary:hover { color: var(--ink, #141414); } .ds-witems { margin: 4px 0 2px 7px; padding: 0 0 0 16px; border-left: 1px solid var(--line, #dcdcd8); display: grid; gap: 2px; } .ds-tool { display: flex; gap: 8px; align-items: center; font-size: 13px; padding: 3px 0; } .ds-tlbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .ds-st { font-size: 11.5px; color: var(--dim, #9a9a94); margin-left: auto; font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; } .ds-running .ds-st, .ds-running .ds-ico { color: var(--accent, #2450e6); } .ds-err .ds-st, .ds-err .ds-ico { color: var(--err, #c92a2a); } .ds-meter { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: transparent; border: 0; color: var(--muted, #6b6b66); font: 13px/1.5 inherit; font-family: inherit; padding: 4px 0; margin: 2px 0 0; border-radius: 6px; cursor: pointer; font-variant-numeric: tabular-nums; } .ds-meter:hover { color: var(--ink, #141414); } .ds-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim, #9a9a94); } .ds-meter.ds-live { color: var(--ink, #141414); } .ds-meter.ds-live .ds-dot { background: var(--accent, #2450e6); animation: ds-breathe 1.4s cubic-bezier(0.2,0.7,0.2,1) infinite; } @keyframes ds-breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } } @media (prefers-reduced-motion: reduce) { .ds-meter.ds-live .ds-dot { animation: none; } }"
+    },
+    {
+      "name": "Ledger Row",
+      "kind": "card",
+      "refersTo": "list-row",
+      "description": "The Tokens tab: figures as ruled rows, not tiles; keys muted, values mono and tabular.",
+      "html": "<div class=\"ds-ledger\"><div class=\"ds-lt\">All sessions today</div><div class=\"ds-row\"><span class=\"ds-k\">input</span><span class=\"ds-v\">11.42M</span></div><div class=\"ds-row\"><span class=\"ds-k\">output</span><span class=\"ds-v\">882.3k</span></div><div class=\"ds-row\"><span class=\"ds-k\">cost</span><span class=\"ds-v\">$97.96</span></div><div class=\"ds-ctx\"><div class=\"ds-bar\"><div class=\"ds-fill\" style=\"width:19%\"></div></div><div class=\"ds-cl\">context 186.7k of 1.00M (19%)</div></div></div>",
+      "css": ".ds-ledger { max-width: 320px; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; color: var(--ink, #141414); } .ds-lt { font-size: 13px; font-weight: 600; margin-bottom: 4px; padding-bottom: 6px; border-bottom: 1px solid var(--line, #dcdcd8); } .ds-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--line, #dcdcd8); } .ds-k { font-size: 12.5px; color: var(--muted, #6b6b66); } .ds-v { font-size: 13px; font-weight: 500; font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; } .ds-ctx { margin-top: 10px; } .ds-bar { height: 4px; background: var(--field-3, #e2e2de); border-radius: 2px; overflow: hidden; } .ds-fill { height: 100%; background: var(--ink, #141414); } .ds-cl { font-size: 11.5px; color: var(--muted, #6b6b66); margin-top: 6px; font-family: 'SF Mono', ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; }"
+    },
+    {
+      "name": "Toast",
+      "kind": "custom",
+      "refersTo": "toast",
+      "description": "Inverse-filled notice with the small floating shadow; red fill for errors.",
+      "html": "<div style=\"display:grid;gap:6px;max-width:380px\"><div class=\"ds-toast\">Chat moved to trash</div><div class=\"ds-toast ds-err\">pi exited: provider key missing</div></div>",
+      "css": ".ds-toast { background: var(--inverse, #141414); color: var(--inverse-ink, #fbfbfa); border-radius: 6px; padding: 8px 12px; font: 12.5px/1.45 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif; box-shadow: 0 8px 24px rgba(20, 20, 20, 0.10), 0 1px 2px rgba(20, 20, 20, 0.06); } .ds-toast.ds-err { background: var(--err, #c92a2a); color: #fff; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Monochrome Scale",
+    "overview": "Omni Agent is a control room over agent runs already happening on this machine, and its window is built to be read before it is read: one fine neutral scale from near-white ground to near-black ink, with state and hierarchy carried by weight, size and hairlines rather than by color. A single cobalt accent is spent on exactly one meaning, \"act or alive\": the send button, the keyboard focus ring, the breathing live dot, links, and the icon of a tool that is running right now. Red appears only when something failed. Everything else is grey, and the greys are graded precisely enough that a pane, a hover, a selection and a border each occupy their own step.\n\nThe system is dense but calm: an operator's ledger, not a landing page. Panes are fields one step darker than the ground and are separated by hairlines, never by shadows; only things that float (menus, the dialog, toasts, phone sheets) carry an offset shadow. Type is the platform UI sans at 400 and 600 (500 for a selected row), with SF Mono for anything a machine wrote: paths, ids, model names, figures. Numbers align with tabular numerals so the token ledger and elapsed counters read like a column of figures. The same ramp inverts under the system dark scheme for the phone at night; roles stay identical, only the values flip.\n\nIt refuses the category arrangement it replaced: dark glass, a glowing pill composer, an amber halo, decorative gradients. Motion is limited to three things (a sliding sheet, a breathing dot, a fading token) and all three stop under reduced motion.",
+    "keyCharacteristics": [
+      "One nine-step neutral ramp (ground, field, field-2, field-3, line, line-2, ink, muted, dim) inverted in dark with identical roles.",
+      "One accent, cobalt, spent only on the primary action and the live signal; red only on errors.",
+      "Hairline separation between panes; shadows reserved for floating surfaces.",
+      "Platform sans at two working weights; mono with tabular numerals for machine text and figures.",
+      "A single 6px radius; the send and attach controls are the only circles.",
+      "Stroked 16px SVG icons at 1.5px; no glyph characters, no rasters."
+    ],
+    "rules": [
+      {
+        "name": "The Act-or-Alive Rule",
+        "body": "The accent may fill or stroke only what the user is about to do (send, focus) or what is alive right now (live dot, running tool, streaming caret) plus links. It is never a decoration, a heading color or a hover.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Step Rule",
+        "body": "A pane sits one step off its parent: ground to field, field to field-2 on hover, field-3 when selected. Nothing skips a step and nothing is tinted.",
+        "section": "colors"
+      },
+      {
+        "name": "The Red Means Failed Rule",
+        "body": "Red is an error state, never a warning, a delete affordance at rest or an emphasis.",
+        "section": "colors"
+      },
+      {
+        "name": "The Machine Text Rule",
+        "body": "Anything produced or consumed by a machine, i.e. a path, an id, a model name, a count, a size, an elapsed time, is set in mono with tabular numerals. Prose never is.",
+        "section": "typography"
+      },
+      {
+        "name": "The Two Weights Rule",
+        "body": "400 for reading, 600 for a title or the selected tab; 500 is reserved for the selected row and ledger figures. No 700, no light weights.",
+        "section": "typography"
+      },
+      {
+        "name": "The Hairline Not Shadow Rule",
+        "body": "Panes that belong to the layout are separated by a 1px line. A shadow means the surface is floating and will go away.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do separate panes with a 1px line hairline and step the fill one notch (ground to field); use shadows only on surfaces that float.",
+      "Do spend the accent only on send, focus, live dots, running tools, the streaming caret and links; leave every other state to weight and grey.",
+      "Do set paths, ids, model names and every figure in mono with tabular numerals; keep prose in the platform sans at 400 and 600.",
+      "Do keep 6px as the only radius on rectangles; circles are the send and attach controls and status dots alone.",
+      "Do draw icons as 16px inline SVG at 1.5px stroke, round caps and joins, in currentColor.",
+      "Do mark a focused input by turning its hairline to ink, and every other focusable element with the 2px accent outline.",
+      "Do keep both schemes role-identical: the same token names, inverted values, no per-scheme layout."
+    ],
+    "donts": [
+      "Don't add gradients, glows, blurred halos, glass or tinted greys; the ramp is neutral and flat.",
+      "Don't use red for anything but a failed state, and never as a delete color at rest.",
+      "Don't use pill radii on rectangles or shadows on panes, messages, inputs or menus.",
+      "Don't ship web fonts, icon fonts, unicode glyph icons or raster icons; the app must draw itself offline on the LAN.",
+      "Don't animate anything beyond the sheet slide, the breathing dot and the token fade.",
+      "Don't introduce a second accent or tint headings; hierarchy comes from size and weight only."
+    ]
+  }
+}

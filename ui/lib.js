@@ -59,6 +59,40 @@ export function splitAttachments(text) {
   return attachments.length ? { text: s.trim(), attachments } : { text, attachments: [] };
 }
 
+// ------------------------------------------------------------- hooks
+/** Prompts Omni sent on the user's behalf (the goal hook) are wrapped so a replayed session file shows a notice, not a user bubble. */
+const HOOK_RE = /^\s*<omni-hook\b([^>]*)>([\s\S]*?)<\/omni-hook>\s*$/;
+const attr = (attrs, name) => { const m = new RegExp(`\\b${name}="([^"]*)"`).exec(attrs || ""); return m ? m[1].replace(/&quot;/g, '"').replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&") : ""; };
+/** `{ name, note, body }` for a hook-wrapped message, else null. `note` is the one line the chat shows. */
+export function hookInfo(text) {
+  const m = HOOK_RE.exec(String(text ?? ""));
+  if (!m) return null;
+  const name = attr(m[1], "name") || "hook";
+  return { name, note: attr(m[1], "note") || `A ${name} hook re-engaged the agent`, body: m[2].trim() };
+}
+export function hookMessage(name, note, body) {
+  const q = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return `<omni-hook name="${q(name)}" note="${q(note)}">\n${String(body ?? "").trim()}\n</omni-hook>`;
+}
+
+// ------------------------------------------------------- token rate
+/**
+ * Output rate over the most recent `windowMs` of streamed samples `{ ts, chars }`, in tokens/sec
+ * (chars ÷ 4). 0 when nothing arrived in the last `staleMs` (the model is waiting on a tool) or the
+ * window holds too little to measure, so the meter can drop the figure instead of showing a stale one.
+ */
+export function rollingRate(samples, now = Date.now(), { windowMs = 5000, staleMs = 1500 } = {}) {
+  if (!samples?.length) return 0;
+  const last = samples[samples.length - 1];
+  if (now - last.ts > staleMs) return 0;
+  const from = now - windowMs;
+  let chars = 0, first = 0;
+  for (let i = samples.length - 1; i >= 0; i--) { const s = samples[i]; if (s.ts < from) break; chars += s.chars || 0; first = s.ts; }
+  // Time the window actually covers: the whole window once it is full, else since the first sample (never under 1 s, so the first tokens do not spike).
+  const span = Math.max(Math.min(windowMs, now - first), 1000);
+  return Math.round(chars / 4 / (span / 1000));
+}
+
 /** First user text → list title, without a leading memory/graph pack. */
 export function cleanTitle(text) { return splitAttachments(String(text || "")).text.replace(/\s+/g, " ").trim().slice(0, 80); }
 

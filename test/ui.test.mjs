@@ -1,7 +1,7 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, fileKind, fmtBytes, buildTree } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage } from "../ui/lib.js";
 import { titleFrom } from "../server/watchers.mjs";
 
 test("fmtDuration", () => {
@@ -158,4 +158,29 @@ test("buildTree nests archive entries, folders first, implicit folders included"
   assert.equal(lib.children[0].name, "arm64-v8a"); assert.equal(lib.children[0].children[0].size, 99);
   assert.equal(t.find((n) => n.name === "assets").children[0].entry.path, "assets/notes.md");
   assert.deepEqual(buildTree([]), []);
+});
+
+test("rollingRate measures only the last 5 s of streamed output and goes quiet while waiting on a tool", () => {
+  const now = 100000;
+  const steady = Array.from({ length: 50 }, (_, i) => ({ ts: now - 10000 + i * 200, chars: 40 })); // 200 tok/s for 10 s
+  assert.equal(rollingRate(steady, now), 50, "40 chars every 200 ms = 10 tok per 200 ms = 50 tok/s over the window");
+  const burstThenWait = [...steady.slice(0, 40), { ts: now - 2000, chars: 40 }];
+  assert.equal(rollingRate(burstThenWait, now), 0, "newest sample older than 1.5 s: the model is waiting");
+  const fast = [{ ts: now - 900, chars: 400 }, { ts: now - 600, chars: 400 }, { ts: now - 300, chars: 400 }, { ts: now, chars: 400 }];
+  assert.equal(rollingRate(fast, now), 400, "a fresh burst is measured over at least 1 s, not the split second it took");
+  const slowStart = [{ ts: now - 30000, chars: 4000 }, { ts: now - 200, chars: 40 }];
+  assert.equal(rollingRate(slowStart, now), 10, "tokens from before the window do not count");
+  assert.equal(rollingRate([], now), 0);
+  assert.equal(rollingRate(null, now), 0);
+});
+
+test("hookMessage round-trips through hookInfo; plain prompts are not hooks", () => {
+  const m = hookMessage("goal", 'Goal hook re-engaged the agent (1/5): said "done" too early', "Keep going.\nFinish the tests.");
+  const info = hookInfo(m);
+  assert.equal(info.name, "goal");
+  assert.equal(info.note, 'Goal hook re-engaged the agent (1/5): said "done" too early');
+  assert.equal(info.body, "Keep going.\nFinish the tests.");
+  assert.equal(hookInfo("Please read <omni-hook> docs"), null);
+  assert.equal(hookInfo(""), null);
+  assert.equal(hookInfo('<omni-hook name="x">body</omni-hook>').note, "A x hook re-engaged the agent");
 });

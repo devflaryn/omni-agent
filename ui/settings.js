@@ -26,17 +26,85 @@ export function createSettings({ api, toast, onChanged }) {
   function renderList() {
     list.innerHTML = "";
     for (const p of data.providers) {
+      const item = el("div", "prov-item");
+      item.dataset.name = p.name;
       const b = el("button", `prov${p.name === editing ? " active" : ""}`);
       const on = data.active?.provider === p.name;
       b.innerHTML = `<span class="pn"></span><span class="pm"></span>`;
       b.querySelector(".pn").textContent = p.name + (on ? " · active" : "");
       b.querySelector(".pm").textContent = `${p.models.length} model${p.models.length === 1 ? "" : "s"} · ${p.hasKey ? `key •••${p.keyHint}` : "no key"}`;
       b.onclick = () => edit(p.name);
-      list.appendChild(b);
+      // The six-dot grip under each provider: drag (or arrow keys) to set the fallback order, top first.
+      const grip = el("button", "prov-grip");
+      grip.type = "button";
+      grip.title = "Drag to reorder · top is tried first";
+      grip.setAttribute("aria-label", `Move ${p.name} in the fallback order`);
+      grip.addEventListener("pointerdown", (e) => startDrag(e, item, grip));
+      grip.addEventListener("keydown", (e) => {
+        const d = e.key === "ArrowUp" || e.key === "ArrowLeft" ? -1 : e.key === "ArrowDown" || e.key === "ArrowRight" ? 1 : 0;
+        if (!d) return;
+        e.preventDefault();
+        const sib = d < 0 ? item.previousElementSibling : item.nextElementSibling;
+        if (!sib || !sib.classList.contains("prov-item")) return;
+        if (d < 0) list.insertBefore(item, sib); else list.insertBefore(sib, item);
+        grip.focus();
+        saveOrder();
+      });
+      item.append(b, grip);
+      list.appendChild(item);
     }
     const add = el("button", "prov add", "+ Add provider");
     add.onclick = startNew;
     list.appendChild(add);
+  }
+  const items = () => [...list.querySelectorAll(".prov-item")];
+  const currentOrder = () => items().map((it) => it.dataset.name);
+  function startDrag(e, item, grip) {
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    const row = getComputedStyle(list).flexDirection.startsWith("row");
+    const axis = (ev) => (row ? ev.clientX : ev.clientY);
+    const mid = (r) => (row ? r.left + r.width / 2 : r.top + r.height / 2);
+    const pid = e.pointerId;
+    item.classList.add("dragging");
+    // Listeners live on the window: moving the item in the DOM would release a pointer capture on the grip.
+    const move = (ev) => {
+      if (ev.pointerId !== pid) return;
+      const pos = axis(ev);
+      const others = items().filter((it) => it !== item);
+      const before = others.find((it) => pos < mid(it.getBoundingClientRect()));
+      if (before) { if (item.nextElementSibling !== before) list.insertBefore(item, before); }
+      else { const last = others[others.length - 1]; if (last && last.nextElementSibling !== item) list.insertBefore(item, last.nextElementSibling); }
+    };
+    let done = false;
+    const up = (ev) => {
+      if (ev.pointerId !== pid || done) return;
+      done = true;
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      item.classList.remove("dragging");
+      grip.focus({ preventScroll: true });
+      saveOrder();
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  }
+  let saving = null;
+  async function saveOrder() {
+    if (saving) await saving;
+    const order = currentOrder();
+    if (order.join("\n") === data.providers.map((p) => p.name).join("\n")) return;
+    saving = (async () => {
+      try {
+        const r = await api("/api/providers-order", { order }, "POST");
+        data.providers = r.providers;
+        toast(`Fallback order: ${r.order.join(" → ")}`);
+        onChanged?.();
+      } catch (e) { toast(e.message, true); renderList(); }
+    })();
+    try { await saving; } finally { saving = null; }
   }
   function presetFor(key) { return data.presets.find((p) => p.key === key); }
   function applyPreset() {

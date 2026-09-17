@@ -106,6 +106,8 @@ export const CONFIG = {
   cwd: argVal("--cwd", process.env.OMNI_CWD || fc.cwd || join(HOME, "Desktop")),
   piModel: argVal("--model", fc.piModel || ""),
   piProvider: argVal("--provider", fc.piProvider || ""),
+  /** Thinking level pi starts with (off|minimal|low|medium|high); "" = pi's own default. The picker persists it. */
+  piThinking: argVal("--thinking", fc.piThinking || ""),
   /** Model picker allowlist, "provider/id" patterns with `*` (e.g. ["orca/*"]). Unset → every model pi knows. */
   piModels: Array.isArray(fc.piModels) ? fc.piModels : null,
   /** Longest a `POST /api/claude/task` (pi → Claude delegation) waits before returning what it has. */
@@ -120,14 +122,33 @@ export const CONFIG = {
   graphBudgetTokens: fc.graphBudgetTokens || 900,
   /** A non-owned session file touched within this window counts as "still open in a terminal" → fork instead of resume. */
   liveWindowMs: fc.liveWindowMs || 30000,
+  /** Goal hook: when Omni's pi stops, a judge model decides whether the user's request is done and re-engages pi if not. */
+  hook: hookConfig(fc.hook),
 };
 
-/** Environment handed to the pi child: provider API keys (from key files) plus the
- *  emulator display override, so omnidroid launched by the model uses the higher
- *  default resolution. Pure so it is unit-testable. */
+/** Normalized goal-hook settings. Empty provider/model = judge with the chat's current model. */
+export function hookConfig(raw = {}) {
+  const h = raw && typeof raw === "object" ? raw : {};
+  const int = (v, dflt, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : dflt; };
+  return {
+    enabled: h.enabled === true,
+    provider: String(h.provider || "").trim(),
+    model: String(h.model || "").trim(),
+    /** Consecutive re-engagements without a single tool call before the keeper gives up; otherwise it never stops. */
+    maxIdleNudges: int(h.maxIdleNudges, 5, 1, 50),
+    graceMs: int(h.graceMs, 2000, 0, 600000),
+  };
+}
+
+/** Environment handed to the pi child: provider API keys (from key files), the emulator display
+ *  override (so omnidroid launched by the model uses the higher default resolution), and
+ *  OMNI_MEMORY=server, which tells the omni-memory extension that this child is Omni's own:
+ *  the server attaches the vault pack per prompt (composer checkbox), so the extension must not
+ *  add its own on every turn. Pure so it is unit-testable. */
 export function piChildEnv(cfg = CONFIG) {
   const env = { ...apiKeyEnv(cfg.apiKeyFiles || {}) };
   const disp = String(cfg.emulatorDisplay || "").trim();
   if (disp && !["native", "off", "0", "false"].includes(disp.toLowerCase())) env.OMNI_DISPLAY = disp;
+  env.OMNI_MEMORY = "server";
   return env;
 }

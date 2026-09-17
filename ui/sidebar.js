@@ -24,7 +24,7 @@ export function createHistory({ S, onSelect, onNew, onDelete }) {
       else if (s.owned) b.appendChild(el("span", "own", "in Omni"));
       b.onclick = () => onSelect(s.sid);
       row.appendChild(b);
-      const del = el("button", "hist-del", "✕");
+      const del = el("button", "hist-del"); del.innerHTML = `<svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>`;
       del.title = "Delete this chat";
       del.setAttribute("aria-label", `Delete ${s.title}`);
       del.onclick = (e) => { e.stopPropagation(); onDelete(s.sid); };

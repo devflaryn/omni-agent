@@ -43,15 +43,26 @@ const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("
 const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => history.render() });
 const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat") });
 const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices(); refreshState(); } });
-const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => settings.open() };
+const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => settings.open(), onHook: setHook };
 const home = createComposer($("#homeComposer"), { ...composerHooks, onSend: homeSend });
 const chat = createComposer($("#chatComposer"), { ...composerHooks, onSend: chatSend, onStop: chatStop });
 
+/** Choices made before pi runs are saved on the server and applied when it starts, so the picker never "forgets". */
 async function setPiModel(provider, id) {
-  try { await api("/api/pi/model", { provider, modelId: id }); toast(`pi model: ${id}`); }
-  catch (e) { toast(S.pi.running ? e.message : "pi is not running yet: send a message first, then pick the model", true); }
+  try {
+    const r = await api("/api/pi/model", { provider, modelId: id });
+    S.config = { ...(S.config || {}), piProvider: provider, piModel: id };
+    toast(r.pending ? `pi model: ${id} (applies when pi starts)` : `pi model: ${id}`);
+    if (S.page === "home") renderHome(); else updateComposer();
+  } catch (e) { toast(e.message, true); }
 }
-async function setPiThinking(level) { try { await api("/api/pi/thinking", { level }); } catch (e) { toast(e.message, true); } }
+async function setPiThinking(level) {
+  try {
+    await api("/api/pi/thinking", { level });
+    S.config = { ...(S.config || {}), piThinking: level };
+    if (S.page === "home") renderHome(); else updateComposer();
+  } catch (e) { toast(e.message, true); }
+}
 async function loadPiChoices() {
   const [m, l] = await Promise.allSettled([api("/api/pi/models"), api("/api/pi/thinking-levels")]);
   const choices = {};
@@ -61,8 +72,24 @@ async function loadPiChoices() {
   if (levels.length) choices.levels = levels;
   if (Object.keys(choices).length) { home.setPiChoices(choices); chat.setPiChoices(choices); }
 }
-function piModelState() { const mdl = S.pi.state?.model; return { piModel: mdl ? { provider: mdl.provider, id: mdl.id } : null, piThinking: S.pi.state?.thinkingLevel || "" }; }
-async function refreshState() { try { const st = await api("/api/state"); S.pi = st.pi; S.runs = st.runs || []; updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
+/** What the picker shows: pi's live state when it runs, else the saved choice the next pi child will start with. */
+function piModelState() {
+  const mdl = S.pi.running ? S.pi.state?.model : null;
+  const c = S.config || {};
+  const piModel = mdl ? { provider: mdl.provider, id: mdl.id } : c.piModel ? { provider: c.piProvider, id: c.piModel } : null;
+  const piThinking = (S.pi.running ? S.pi.state?.thinkingLevel : "") || c.piThinking || "";
+  return { piModel, piThinking, hook: S.hook };
+}
+async function refreshState() { try { const st = await api("/api/state"); S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || S.hook; if (st.config) S.config = st.config; updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
+/** Goal hook settings live in omni.config.json through the server; the menu reflects the saved state. */
+async function setHook(patch) {
+  try {
+    const r = await api("/api/hook", patch, "PUT");
+    S.hook = r.hook;
+    toast(patch.enabled === true ? "Goal hook on: pi is re-engaged when it stops early" : patch.enabled === false ? "Goal hook off" : `Judge model: ${r.hook.model || "same as the chat"}`);
+    if (S.page === "home") renderHome(); else updateComposer();
+  } catch (e) { toast(e.message, true); }
+}
 
 // --------------------------------------------------------------- views
 /** `persist` only for a deliberate toggle; leaving the chat view must not remember "closed". */
@@ -74,8 +101,9 @@ function showView(name) {
   $("#btnChatMenu").hidden = name !== "chat";
   $("#btnExplorer").hidden = name !== "chat";
   document.body.classList.toggle("in-chat", name === "chat");
-  if (name === "home") { setExplorer(false); renderHome(); home.focus(); }
-  if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth >= 900 && explorerPreferred()); updateHeader(); updateComposer(); }
+  // Both composers share the remembered attachment choices (memory / repo graph).
+  if (name === "home") { setExplorer(false); home.reloadOptions(); renderHome(); home.focus(); }
+  if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth > 760 && explorerPreferred()); chat.reloadOptions(); updateHeader(); updateComposer(); }
   updateTitle();
 }
 function updateTitle() {
@@ -201,7 +229,8 @@ function updateHeader() {
   const s = S.page === "chat" ? S.sessions.get(S.selected) : null;
   updateTitle();
   const model = s?.model || S.pi.state?.model?.id || "";
-  $("#topModel").textContent = model;
+  // A foreign chat's model is labelled with its harness so the slot never implies pi is running it.
+  $("#topModel").textContent = s && s.harness !== "pi" && model ? `${s.harness} · ${model}` : model;
   $("#topModel").hidden = !model;
   $("#topModel").title = s ? `${s.harness} · ${s.cwd || ""}` : S.pi.cwd || "";
   const ps = $("#piStatus");
@@ -236,7 +265,7 @@ let railTimer = null;
 function handle(ev) {
   S.seq = Math.max(S.seq, ev.seq || 0);
   if (ev.kind === "removed") { S.sessions.delete(ev.sid); S.buffers.delete(ev.sid); if (S.selected === ev.sid) { S.selected = null; S.view = null; showView("home"); } history.render(); return; }
-  if (ev.kind === "log") { if (ev.level === "system" && (ev.ts || 0) >= BOOT_TS) toast(ev.text); else if (ev.level === "graphify" && ev.text) panel.graphLine(ev.text.split("\n").pop()); return; }
+  if (ev.kind === "log") { if (ev.level === "system" && (ev.ts || 0) >= BOOT_TS) toast(ev.text); else if (ev.level === "graphify" && ev.text) panel.graphLine(ev.text.split("\n").pop()); else if (ev.level === "hook" && ev.text && (ev.ts || 0) >= BOOT_TS && /failed|gave up|not JSON/.test(ev.text)) toast(ev.text, true); return; }
   const s = S.sessions.get(ev.sid) || { sid: ev.sid, harness: ev.harness, lastActivity: 0, tally: null };
   if (ev.kind === "session") Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title ? cleanTitle(ev.title) || undefined : undefined, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
   if (ev.kind === "status") s.streaming = !!ev.streaming;
@@ -262,7 +291,7 @@ async function init() {
   if (S.desktop) document.body.classList.add("desktop");
   initResizers();
   const st = await api("/api/state");
-  S.config = st.config; S.pi = st.pi; S.runs = st.runs || [];
+  S.config = st.config; S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || null;
   for (const s of st.sessions) S.sessions.set(s.sid, s);
   if (st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0].replace(/\?token=.*/, ""); $("#lanInfo").title = "Open this on any device on your network; no login needed"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);

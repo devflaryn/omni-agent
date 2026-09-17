@@ -26,7 +26,7 @@ const ok = (r, what) => {
 };
 
 export class PiRpc extends EventEmitter {
-  constructor({ cli, bin = "pi", cwd, model = "", provider = "", env = {}, bus }) {
+  constructor({ cli, bin = "pi", cwd, model = "", provider = "", thinking = "", env = {}, bus }) {
     super();
     this.cli = cli;
     this.bin = bin;
@@ -35,6 +35,7 @@ export class PiRpc extends EventEmitter {
     this.env = env;
     this.model = model;
     this.provider = provider;
+    this.thinking = thinking;
     this.bus = bus;
     this.proc = null;
     this.pending = new Map();
@@ -59,6 +60,7 @@ export class PiRpc extends EventEmitter {
     const args = ["--mode", "rpc"];
     if (this.provider) args.push("--provider", this.provider);
     if (this.model) args.push("--model", this.model);
+    if (this.thinking) args.push("--thinking", this.thinking);
     const useNode = !!this.cli;
     const env = { ...process.env, ...this.env };
     this.proc = useNode
@@ -100,6 +102,8 @@ export class PiRpc extends EventEmitter {
     }
     if (ev.type === "agent_start" || ev.type === "turn_start") this.streaming = true;
     if (ev.type === "agent_settled") this.streaming = false;
+    // The omni-fallback extension switched models inside pi: re-read state so the session's model label follows.
+    if (ev.type === "message_end" && ev.message?.customType === "omni-fallback") this.refreshState().catch(() => {});
     for (const out of normalizePiRpcEvent(ev, this.ctx)) this.bus.emit(out);
     this.emit("pi", ev);
   }
@@ -125,17 +129,42 @@ export class PiRpc extends EventEmitter {
     return r.data;
   }
 
-  async prompt(message, { images } = {}) {
+  /** `echo: false` for prompts the user did not type (hooks): no user bubble is broadcast. */
+  async prompt(message, { images, echo = true } = {}) {
     const cmd = { type: "prompt", message };
     if (images?.length) cmd.images = images;
     if (this.streaming) cmd.streamingBehavior = "steer";
     // Echo the user's prompt as a live message so every viewer sees it at once.
-    this.bus.emit({ ...this.ctx, kind: "msg", ts: Date.now(), id: `u-${Date.now()}`, role: "user", live: true, blocks: [{ type: "text", text: message }] });
+    if (echo) this.bus.emit({ ...this.ctx, kind: "msg", ts: Date.now(), id: `u-${Date.now()}`, role: "user", live: true, blocks: [{ type: "text", text: message }] });
     return this.send(cmd);
   }
 
   abort() { return this.send({ type: "abort" }); }
-  async newSession() { const r = await this.send({ type: "new_session" }); await this.refreshState(); return r; }
+  /**
+   * pi rebuilds the runtime on `new_session` from its launch flags, so a model or thinking level picked
+   * after the child started would silently fall back. Re-apply the remembered picks to the new session.
+   */
+  async newSession() {
+    const r = await this.send({ type: "new_session" });
+    await this.refreshState();
+    await this.applyPicks();
+    return r;
+  }
+  async applyPicks() {
+    const st = this.state || {};
+    let changed = false;
+    if (this.model && (st.model?.provider !== this.provider || st.model?.id !== this.model)) {
+      const m = await this.send({ type: "set_model", provider: this.provider, modelId: this.model });
+      if (m?.success) changed = true;
+      else this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi could not switch the new chat to ${this.provider}/${this.model}: ${m?.error || "set_model failed"}` });
+    }
+    if (this.thinking && st.thinkingLevel !== this.thinking) {
+      const t = await this.send({ type: "set_thinking_level", level: this.thinking });
+      if (t?.success) changed = true;
+      else this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi could not set thinking to ${this.thinking}: ${t?.error || "set_thinking_level failed"}` });
+    }
+    if (changed) await this.refreshState();
+  }
   async switchSession(sessionPath) { const r = ok(await this.send({ type: "switch_session", sessionPath }), "switch_session"); await this.refreshState(); return r; }
   /** Resolves when the child has answered get_state (its session id is known). */
   waitReady() { return this.ready || Promise.reject(new Error("pi is not running")); }
@@ -143,8 +172,19 @@ export class PiRpc extends EventEmitter {
   async clone() { const r = ok(await this.send({ type: "clone" }), "clone"); await this.refreshState(); return r; }
   stats() { return this.send({ type: "get_session_stats" }); }
   models() { return this.send({ type: "get_available_models" }); }
-  async setModel(provider, modelId) { const r = await this.send({ type: "set_model", provider, modelId }); await this.refreshState(); return r; }
-  async setThinking(level) { const r = await this.send({ type: "set_thinking_level", level }); await this.refreshState(); return r; }
+  /** A successful pick is remembered: new sessions and the auto-restart start from it, not from the boot flags. */
+  async setModel(provider, modelId) {
+    const r = await this.send({ type: "set_model", provider, modelId });
+    if (r?.success) { this.provider = provider; this.model = modelId; }
+    await this.refreshState();
+    return r;
+  }
+  async setThinking(level) {
+    const r = await this.send({ type: "set_thinking_level", level });
+    if (r?.success) this.thinking = level;
+    await this.refreshState();
+    return r;
+  }
   thinkingLevels() { return { success: true, data: { levels: PI_THINKING_LEVELS } }; }
   compact() { return this.send({ type: "compact" }, { timeoutMs: 600000 }); }
   messages() { return this.send({ type: "get_messages" }); }

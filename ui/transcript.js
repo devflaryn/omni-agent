@@ -1,5 +1,5 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
-import { el, esc, md, fmtN, fmtDuration, tokRate, groupToolRuns, splitAttachments, toolLabel, workSummary } from "./lib.js";
+import { el, md, fmtN, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, workSummary } from "./lib.js";
 
 const active = { view: null, timer: null };
 const THINK_KEY = "omni.thinking.open";
@@ -18,7 +18,10 @@ const ICONS = {
   other: `<svg viewBox="0 0 16 16"><path d="M9.5 3.5a3 3 0 0 0 3 3L6 13a1.4 1.4 0 0 1-2-2l6.5-6.5a3 3 0 0 0-1-1z"/></svg>`,
   work: `<svg viewBox="0 0 16 16"><path d="M3 5h10M3 8h10M3 11h7"/></svg>`,
   compact: `<svg viewBox="0 0 16 16"><path d="M3 3h10v3H3zM3.5 6v6.5h9V6M6.5 9h3"/></svg>`,
+  hook: `<svg viewBox="0 0 16 16"><path d="M12.5 8a4.5 4.5 0 1 1-1.3-3.2M12.5 2.5v2.8h-2.8"/></svg>`,
   chev: `<svg viewBox="0 0 16 16"><path d="m6 4 4 4-4 4"/></svg>`,
+  copy: `<svg viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2A1 1 0 0 0 9.5 2.5h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>`,
+  close: `<svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>`,
 };
 const icon = (kind, cls = "ico") => `<span class="${cls}">${ICONS[kind] || ICONS.other}</span>`;
 
@@ -49,7 +52,7 @@ function scrollBottom(view) { const w = view.wrap; if (w.scrollHeight - w.scroll
 function openTurn(view, ts, live) {
   closeTurn(view);
   const t = { el: el("div", "turn"), meter: el("button", "meter"), reason: el("div", "reason"), body: el("div", "tbody"), startTs: ts || Date.now(), started: false, live: !!live, done: false, endTs: 0, lastMsgTs: 0,
-    items: [], workEls: [], curWork: null, cards: [], rblocks: [], reasonOpen: thinkOpen, committedOut: 0, currentOut: 0, estChars: 0, reported: false, lastGroup: null, sawThinking: false, sawTool: false };
+    items: [], workEls: [], curWork: null, cards: [], rblocks: [], reasonOpen: thinkOpen, committedOut: 0, currentOut: 0, estChars: 0, reported: false, lastGroup: null, sawThinking: false, sawTool: false, samples: [] };
   t.meter.hidden = true;
   t.meter.innerHTML = `<span class="dot"></span><span class="mtext"></span>${icon("chev", "chev")}`;
   t.reason.hidden = true;
@@ -87,9 +90,15 @@ function markStarted(t) {
 function renderMeter(t) {
   if (!t.started) return;
   const tokens = t.committedOut + (t.currentOut || Math.ceil(t.estChars / 4));
-  const ms = (t.done ? t.endTs : Date.now()) - t.startTs;
+  const now = Date.now();
+  const ms = (t.done ? t.endTs : now) - t.startTs;
   let text;
-  if (!t.done) { text = `Thinking… ${fmtDuration(ms)} · ${fmtN(tokens)} tokens`; if (ms >= 2000 && tokens) text += ` · ${tokRate(tokens, ms)} tok/sec`; }
+  if (!t.done) {
+    text = `Thinking… ${fmtDuration(ms)} · ${fmtN(tokens)} tokens`;
+    // Rate over the last 5 s of streamed output only; while the model waits on a tool there is no rate to show.
+    const rate = rollingRate(t.samples, now);
+    if (rate) text += ` · ${rate} tok/sec`;
+  }
   else if (!t.live) text = `Replied in ${fmtDuration(ms)}${tokens ? ` · ${fmtN(tokens)} tokens` : ""}`;
   else text = `${t.sawThinking || !t.sawTool ? "Thought" : "Worked"} for ${fmtDuration(ms)}${tokens ? ` · ${fmtN(tokens)} tokens` : ""}`;
   t.meter.querySelector(".mtext").textContent = text;
@@ -112,11 +121,39 @@ function workGroup(t) {
   const d = el("details", "work on");
   d.innerHTML = `<summary>${icon("work")}<span class="wlbl">Working…</span>${icon("chev", "chev")}</summary><div class="witems"></div>`;
   t.body.appendChild(d);
-  const w = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".wlbl"), items: d.querySelector(".witems"), cards: [] };
+  const w = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".wlbl"), items: d.querySelector(".witems"), cards: [], imgs: null };
   t.workEls.push(w);
   t.curWork = w;
   t.sawTool = true;
   return w;
+}
+/** Images a tool returned (a `read` of a PNG) sit under the work group as small boxes; click one for a large preview. */
+function addImages(c, images) {
+  const w = c.work;
+  if (!w || !images?.length) return;
+  if (!w.imgs) { w.imgs = el("div", "imgs"); w.el.insertAdjacentElement("afterend", w.imgs); }
+  for (const im of images) {
+    const b = el("button", "thumb");
+    b.title = `${c.label.text} · click to preview`;
+    const i = el("img");
+    i.src = `data:${im.mimeType};base64,${im.data}`;
+    i.alt = c.label.text;
+    b.appendChild(i);
+    b.onclick = () => openLightbox(i.src, c.label.text);
+    w.imgs.appendChild(b);
+  }
+}
+function openLightbox(src, caption) {
+  document.querySelector(".lightbox")?.remove();
+  const box = el("div", "lightbox");
+  box.innerHTML = `<button class="lb-close icon-btn" title="Close (Esc)">${ICONS.close}</button><figure><img alt=""><figcaption></figcaption></figure>`;
+  box.querySelector("img").src = src;
+  box.querySelector("figcaption").textContent = caption || "";
+  const close = () => { box.remove(); document.removeEventListener("keydown", onKey); };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  box.onclick = (e) => { if (e.target.tagName !== "IMG") close(); };
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(box);
 }
 function breakWork(t) { t.curWork = null; t.items.push({ kind: "text" }); }
 function updateWorkLabels(t, final) {
@@ -144,6 +181,7 @@ function toolCard(view, t, { toolId, name, args, ts }) {
   c.view = view; c.turn = t;
   setToolArgs(c, args);
   const w = workGroup(t);
+  c.work = w;
   w.items.appendChild(d);
   w.cards.push(c);
   t.items.push(c.item);
@@ -163,9 +201,10 @@ function setToolArgs(c, args) {
   if (args === undefined) return;
   c.args.textContent = (typeof args === "string" ? args : JSON.stringify(args, null, 2)) || "";
 }
-function setToolResult(c, text, isError, ts) {
+function setToolResult(c, text, isError, ts, images) {
   c.out.hidden = false; c.out.textContent = (text || "").slice(0, 30000);
   c.el.classList.remove("running"); c.el.classList.add(isError ? "err" : "ok");
+  if (images?.length && !c.gotImages) { c.gotImages = true; addImages(c, images); }
   if (c.item.endTs == null) c.item.endTs = ts || Date.now();
   updateWorkLabels(c.turn, false);
   const ms = c.item.endTs - c.item.startTs;
@@ -186,7 +225,7 @@ function renderBlocks(view, t, blocks, ts) {
     if (b.type === "text") { breakWork(t); const d = el("div", "text"); d.innerHTML = md(b.text); t.body.appendChild(d); markStarted(t); }
     else if (b.type === "thinking") { if (String(b.text || "").trim()) reasonBlock(t).textContent = b.text; markStarted(t); }
     else if (b.type === "tool_call") { const c = toolCard(view, t, { ...b, ts }); if (b.args !== undefined) setToolArgs(c, b.args); }
-    else if (b.type === "tool_result") { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts }); setToolResult(c, b.text, b.isError, ts); }
+    else if (b.type === "tool_result") { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts }); setToolResult(c, b.text, b.isError, ts, b.images); }
     else if (b.type === "image") { breakWork(t); const i = el("img"); i.src = `data:${b.mimeType};base64,${b.data}`; i.style.maxWidth = "100%"; t.body.appendChild(i); }
   }
 }
@@ -227,7 +266,7 @@ function closeStream(view) {
 // --------------------------------------------------------------- cards
 function actionRow(t) {
   const row = el("div", "actions");
-  const copy = el("button", "icon-btn", "⧉"); copy.title = "Copy reply";
+  const copy = el("button", "icon-btn"); copy.innerHTML = ICONS.copy; copy.title = "Copy reply";
   copy.onclick = () => { const text = [...t.body.querySelectorAll(".text")].map((d) => d.innerText).join("\n\n"); navigator.clipboard?.writeText(text).catch(() => {}); };
   row.appendChild(copy);
   return row;
@@ -254,6 +293,8 @@ export function applyEvent(view, ev) {
       const p = streamPart(view, ev.index, ev.part, ev);
       const t = view.turn;
       t.estChars += (ev.delta || "").length;
+      t.samples.push({ ts: Date.now(), chars: (ev.delta || "").length });
+      if (t.samples.length > 2000) t.samples.splice(0, t.samples.length - 1000);
       if (p.part === "tool_call") { p.card.argText += ev.delta; p.card.args.textContent = p.card.argText; }
       else {
         p.text += ev.delta; p.stream.appendChild(el("span", "tok", ev.delta));
@@ -280,12 +321,15 @@ export function applyEvent(view, ev) {
         if (!ev.live) renderMeter(t);
       } else if (ev.role === "tool") {
         const t = turnOf(view, ev.ts, ev.live);
-        for (const b of ev.blocks) { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts: ev.ts }); setToolResult(c, b.text, b.isError, ev.ts); }
+        for (const b of ev.blocks) { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts: ev.ts }); setToolResult(c, b.text, b.isError, ev.ts, b.images); }
         t.lastMsgTs = Math.max(t.lastMsgTs, ev.ts || 0);
       } else if (ev.role === "user") {
         closeTurn(view);
-        const m = el("div", `msg user${animate ? " appear" : ""}`);
         const raw = ev.blocks.map((b) => b.text || (b.type === "image" ? "[image]" : "")).filter(Boolean).join("\n");
+        // A prompt Omni sent for the user (the goal hook, replayed from the session file) is a notice, never a bubble.
+        const hook = hookInfo(raw);
+        if (hook) { eventLine(view, "hook", hook.note); openTurn(view, ev.ts, !!ev.live); break; }
+        const m = el("div", `msg user${animate ? " appear" : ""}`);
         const { text, attachments } = splitAttachments(raw);
         const body = el("div", "body", text);
         m.appendChild(body);
@@ -310,11 +354,12 @@ export function applyEvent(view, ev) {
       const c = toolCard(view, t, ev);
       if (ev.phase === "start" && ev.args !== undefined) setToolArgs(c, ev.args);
       if (ev.phase === "update") { c.out.hidden = false; c.out.textContent = (ev.text || "").slice(-30000); }
-      if (ev.phase === "end") setToolResult(c, ev.text, ev.isError, ev.ts);
+      if (ev.phase === "end") setToolResult(c, ev.text, ev.isError, ev.ts, ev.images);
       scrollBottom(view);
       break;
     }
     case "status": if (ev.streaming === false) closeTurn(view); break;
+    case "hook": { closeTurn(view); eventLine(view, "hook", ev.text || "A hook re-engaged the agent"); openTurn(view, ev.ts, true); scrollBottom(view); break; }
     case "compaction": { closeTurn(view); eventLine(view, "compact", "Context automatically compacted"); break; }
     case "run": {
       closeTurn(view);

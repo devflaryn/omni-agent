@@ -68,8 +68,19 @@ Tests: `npm test`.
   in the top bar hides or shows the explorer.
 - **Transcript**: pi streams token by token; chats run in a terminal appear whole. Each run of tool
   calls folds into one line such as "Edited files, ran commands"; open it for a row per tool and a
-  row for its arguments and output. The status line `Thinking… 11m 20s · 15k tokens · 86 tok/sec`
-  sits below the turn; click it for the model's reasoning.
+  row for its arguments and output. Images the model reads (a `read` of a PNG) appear as small boxes
+  under that line; click one for a large preview overlay. The status line
+  `Thinking… 11m 20s · 15k tokens · 86 tok/sec` sits below the turn; the rate covers only the last
+  five seconds of streamed output and disappears while the model waits on a tool. Click the line for
+  the model's reasoning.
+- **Goal hook** (model menu in the composer → *Goal hook*): the same idea as Claude Code's goal loop.
+  When pi stops, a judge model (any configured provider, run through `pi -p` with no tools) reads
+  your request and the tail of pi's work and answers whether it is done. If pi stopped early, it is
+  re-engaged and the chat shows one line, `Goal hook re-engaged the agent (#1): …`, never the hook's
+  message. There is no limit on re-engagements: it keeps going until the judge says done, a new
+  prompt or Stop ends it, or the agent made no tool call in `maxIdleNudges` (5) re-engaged runs in a
+  row — that means it is refusing or cannot act, and nudging would loop for nothing. The judge
+  defaults to the chat's model; pick another under *Judge model*.
 - **History drawer** (☰ in the top bar): every pi and Claude Code chat on this machine, grouped by
   day, with a pulsing dot for a chat working right now. Hover for ✕ to delete (moves to
   `~/.omni-agent/trash/`). Claude Code chats open read-only; pi chats continue in Omni's pi, or fork
@@ -78,8 +89,17 @@ Tests: `npm test`.
 - **Providers** (⚙ in the top bar): pick a preset (OpenRouter, OpenAI, Anthropic, Google, DeepSeek,
   Groq, xAI, Mistral, Together, Fireworks, Ollama, LM Studio, or any OpenAI/Anthropic-compatible
   URL), paste the key, type the model ids one per line. The model picker lists only those models.
+  The list is also the **fallback order**: drag the six-dot grip under a provider (or focus it and
+  use the arrow keys) to move it. When a model returns any error, pi switches to the next model
+  below it and continues the turn — the failed model's error is never sent to the new model.
 - **Composer**: "Do anything", + for a file reference, memory and repo-graph attachments, and the
-  model / thinking picker. pi only: Claude Code is never launched from the UI.
+  model / thinking picker. The attachment choices are remembered across reloads and shared by Home
+  and Chat; a model or thinking level picked before pi runs is saved in `omni.config.json` and the
+  next pi child starts with it. pi only: Claude Code is never launched from the UI.
+- **Graph tools for the model**: pi has `graph_build`, `graph_query` and `graph_explain` (the
+  `omni-graph.ts` extension). Every turn the system prompt says whether the chat's folder already has
+  a graph, so the model builds one on its own when a task spans several files and asks the graph
+  instead of reading the whole tree. Reinstall with `node scripts/install.mjs` after updating.
 
 ## The vault (`vault/`)
 
@@ -113,7 +133,9 @@ when the model cannot see screenshots. `skills/omnidroid/reference/omni-cli.md` 
 Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/omni-agent.json`:
 
 - `omni-memory.ts` (`autoRecall`, `budgetTokens`): the memory tools. With auto recall on, every
-  pi prompt gets a small `<omni-memory>` pack appended to the system prompt.
+  prompt of a pi started from a terminal gets a small `<omni-memory>` pack appended to the system
+  prompt. Omni's own pi child (spawned with `OMNI_MEMORY=server`) skips that: there the composer's
+  "Attach relevant memory" checkbox decides per prompt and the server attaches the pack itself.
 - `omni-claude.ts` (`port`): a `claude_task` tool so the pi model (your local Qwen) can hand a
   task to Claude Code and wait for the answer. The run shows up in Omni as its own chat
   ("Task from pi: …"); the tool returns Claude's final text plus a session id that can be passed
@@ -134,6 +156,18 @@ reads the file, then switches it back to the session it had open. Fields the dia
 Picking a model in the composer calls pi's `set_model` and writes `piProvider` / `piModel` to
 `omni.config.json`, so the next pi child starts on it. Without any provider in `models.json` the
 picker falls back to pi's own catalogue filtered by `piModels`.
+
+**Fallback.** The `omni-fallback.ts` pi extension (installed by `scripts/install.mjs`) reads
+`models.json` in file order — providers as the dialog lists them, each provider's model lines in
+sequence — and treats it as a chain. When a run ends because the model returned an error (any
+error: 4xx, 5xx, connection, empty body), the extension switches pi to the model below the current
+one and continues the same turn on it at once; for a transient error pi's own retry simply runs on
+the switched model. The errored assistant messages and the extension's "model error on a/x →
+switched to b/y" notice are filtered out of the LLM context, so the new model sees the conversation
+exactly as the failed one did. The chain stops at the bottom of the list: the last error stays
+visible and the user picks a model or reorders. Dragging in the dialog posts
+`/api/providers-order` and rewrites the provider order without restarting pi. The switch is per
+session: a new chat starts back on the picked model, and Omni's top bar follows the switch.
 
 `node scripts/install.mjs --openrouter` still seeds OpenRouter + DeepSeek V4 Flash from
 `openrouter.txt` for a first run. The server also hands `OPENROUTER_API_KEY` (from `openrouter.txt`,
@@ -158,7 +192,8 @@ full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at 
 `piProvider`, `autoStartPi`, `digestIdleSec`, `tailRecentHours`, `memoryBudgetTokens`,
 `claudeBin`, `piCli`, `piBin`, `piAgentDir` / `piModelsFile` (where the Providers dialog writes; default
 `~/.pi/agent/models.json`), `piModels` (fallback allowlist when `models.json` has no providers), `apiKeyFiles` (`{ "ENV_NAME": "/path/key.txt" }` handed to pi as env; default
-`OPENROUTER_API_KEY` ← `openrouter.txt`), `claudeTaskTimeoutSec`.
+`OPENROUTER_API_KEY` ← `openrouter.txt`), `claudeTaskTimeoutSec`, `hook` (`{ "enabled", "provider",
+"model", "maxIdleNudges": 5, "graceMs": 2000 }`; the model menu writes it).
 
 ## Layout
 

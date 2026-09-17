@@ -106,6 +106,22 @@ export function upsertProvider(file, name, body) {
   return next;
 }
 
+/**
+ * Rewrite `providers` in the given order (names not listed keep their relative order after the listed ones).
+ * The order is the model fallback chain: when a model errors, pi's omni-fallback extension moves to the next
+ * model in `flatModels()` order, i.e. this provider order with each provider's model lines in sequence.
+ * @returns {string[]} the resulting order
+ */
+export function reorderProviders(file, names) {
+  const json = readModelsFile(file);
+  const wanted = (Array.isArray(names) ? names : []).map(String).filter((n, i, a) => n in json.providers && a.indexOf(n) === i);
+  const rest = Object.keys(json.providers).filter((n) => !wanted.includes(n));
+  const order = [...wanted, ...rest];
+  json.providers = Object.fromEntries(order.map((n) => [n, json.providers[n]]));
+  writeModelsFile(file, json);
+  return order;
+}
+
 export function removeProvider(file, name) {
   const json = readModelsFile(file);
   if (!(name in json.providers)) return false;
