@@ -1,453 +1,139 @@
 ---
 name: omnidroid
-description: Use when driving the omnidroid Android VM manager from the CLI — launching a Roblox account into a place, choosing or baking a Roblox version ("offset"), booting a custom APK through the --apk cache, running root/su commands, starting frida-server (frida --restart on a running instance), hiding root from an app, reading debug-info/logcat, hiding or showing the window, and picking a performance vs farming mode. Trigger on "launch/start an account", "join place <id>", "test this APK in the emulator", "bake a Roblox version", "which Roblox is running", "run su in the VM", "attach frida", "hook the app", "why did the instance not start", or any omnidroid command.
+description: Use when running Roblox (or any APK) on omnidroid, the native ARM64-Android engine in "Omni Apps/omnidroid" (Rust, no VM) — booting an instance through the omnidroid MCP tools (start_instance, screenshot, list_instances, stop_instance) or the `omnidroid` CLI (play, aosp, login, which), signing in with a saved cookie, joining a place, picking the APK, headless runs and the control channel, and proving a session really signed in and joined from its log. Trigger on "boot/launch omnidroid", "start an instance", "join place <id>", "run this APK", "sign in with the cookie", "take a screenshot of the instance", "is the game running", or any omnidroid_* / mcp__omnidroid__* tool. For hooking, calling or dumping a .so use the omnidroid-frida skill; for the old QEMU manager (offsets, `omnidroid su`, frida-server) use omnidroid-qemu.
 ---
 
 # Driving omnidroid
 
-`omnidroid` is the QEMU Android manager at
-`/Users/berat/Desktop/Omni Apps/omnidroid`. Run it from that directory:
+`omnidroid` (the checkout at `Desktop/Omni Apps/omnidroid`) runs the arm64 Android Roblox engine
+as a native desktop app: the APK's `lib/arm64-v8a` libraries are loaded by its own ELF loader and
+run by dynarmic, with bionic, JNI, the NDK, Vulkan/GLES, audio, input and networking implemented
+on the host. **There is no VM, no QEMU, no adb, no `su`, no frida-server.** Commands such as
+`omnidroid start/offset/session/debug-info/su/frida` belong to the old QEMU manager
+(`omnidroid-qemu` skill) and do not exist here.
 
-```bash
-cd "/Users/berat/Desktop/Omni Apps/omnidroid"
-omnidroid <command> [--json]              # installed launcher (same as python3 -m omnidroid)
-```
+Two ways to run a game:
 
-Add `--json` to any command when you want to parse the result. The full
-agent-facing command/flag/JSON reference is `reference/omni-cli.md` next to
-this file — read it when you need an exact flag or field name.
+| path | what boots | how |
+|---|---|---|
+| **real-AOSP** (the current goal) | real Android (system_server, SurfaceFlinger…) on omnidroid's own Linux ABI layer; the APK is `pm install`ed and started from its launcher | MCP `start_instance`, or `omnidroid aosp` |
+| **old path** | the engine alone, JNI without a JVM | `omnidroid play` |
 
-**Unattended runs: always `start … --no-window`.** `start` opens a native QEMU
-window by default; hide one later with `view <name> --hide` (the instance keeps
-running), show it with `view <name>`, or use `--vnc-viewer` for a headless boot.
+## The MCP tools (preferred for an agent)
 
-To *tap, type, swipe and read the screen* of a running instance, use the
-**`omnidroid-input`** skill instead — that is a different job and a different
-tool.
+omnidroid ships an MCP server, `omni-mcp` (`crates/omni-mcp`). Omni Agent wires it in:
 
-## The three things to get right
+- **pi**: the `omni-mcp.ts` extension registers every tool as `omnidroid_<tool>`
+  (`omnidroid_start_instance`, `omnidroid_screenshot`, …).
+- **Claude Code**: `node scripts/install.mjs --claude-mcp` registers it as `omnidroid`, tools
+  `mcp__omnidroid__<tool>`.
 
-1. **An account is a Roblox `.ROBLOSECURITY` cookie stored under its real
-   username**, and that username is also the instance name. Accounts are
-   created only by `omnidroid login`.
-2. **The Roblox VERSION is an offset, chosen per launch.** The base ships no
-   Roblox. `start` with no `--offset` uses the base's default offset **if one
-   exists** — check `offset list` first; a base can have none baked (see
-   "Roblox versions" below).
-3. **Instances are ephemeral.** There is no `create`; `start` allocates one and
-   every guest write is discarded at power-off. One live instance per username;
-   two different usernames run side by side.
+Below, tools are named without the prefix. **No `omnidroid_*` tools?** The binary is not built or
+not configured: in the omnidroid repo `cargo build --release -p omni-mcp`, then in omni-agent
+`node scripts/install.mjs` and restart pi. Its path lives in `~/.pi/agent/omni-agent.json` →
+`omniMcp.command`.
 
-## The loop
+### Live instance
 
-```bash
-python3 -m omnidroid offset list          # which Roblox versions exist (* = default) — can be NONE
-python3 -m omnidroid list --stats         # what is running, ports, version, mode
-python3 -m omnidroid start alice --place 8737899170                     # only if offset list showed a default
-python3 -m omnidroid start alice --place 8737899170 --apk build.apk     # no default baked: use --apk or offset create first
-python3 -m omnidroid debug-info alice     # ← when anything is unclear or failed
-python3 -m omnidroid stop alice
-```
-
-**Check `offset list` before assuming a default exists.** A base can ship with
-*no* Roblox baked at all (e.g. the arm base after a system rebake retires its
-offsets) — `offset list` then reports "base 'arm' has NO Roblox baked" and a
-bare `start alice` fails with `no_offset`. Bake or boot one first: `start alice
---apk ~/Downloads/Roblox-2.738.1397.apk` (caches it) or `offset create NAME
---apk FILE`. A stock, unmodified Roblox APK from `~/Downloads` boots but has no
-cookie-reading code, so it cannot log in (`not_logged_in`) — fine for a smoke
-test, not for a real session.
-
-## Roblox versions ("offsets")
-
-An offset is a named, thin `/data` overlay carrying one baked Roblox build.
-They are **siblings**: creating one never replaces or disturbs another, and one
-is marked default.
-
-```bash
-python3 -m omnidroid offset list [--json]
-python3 -m omnidroid offset show [<name>]
-python3 -m omnidroid offset create 2.740.101 --apk ~/Downloads/roblox.apk
-python3 -m omnidroid offset create --apk build.apk        # name from the APK's versionName
-python3 -m omnidroid offset create test --apk build.apk --default
-python3 -m omnidroid offset default 2.731.944             # roll back in one command
-python3 -m omnidroid offset remove test                   # DESTRUCTIVE: entry + image
-```
-
-Baking takes ~2 minutes and produces a ~130 MB overlay. It **refuses while any
-instance is running**, and it aborts loudly if the guest rejects the APK — the
-commonest cause being a signature mismatch (a replacement must be signed with
-the same key as the build baked into the system image; an officially-signed
-Roblox will not install over a re-signed one, or the reverse).
-
-Per launch:
-
-| You want | Command |
+| tool | does |
 |---|---|
-| the default version | `start alice` (only if `offset list` shows one — a base can ship with none) |
-| a specific baked version | `start alice --offset 2.740.101` |
-| a custom build, cached for next time | `start alice --apk build.apk` |
-| a custom build, installed once and thrown away | `start alice --apk build.apk --apk-once` |
-| the clean base, no game | `start alice --no-offset` (currently a bug: refused unless `--apk` is also passed — see "Things that will bite you") |
+| `start_instance {apk?, cookie?, place?, gpu?, size?, minutes?}` | spawns `omnidroid aosp …` and **returns at once** with `instance_id`, `pid`, `screenshot_path` |
+| `screenshot {instance_id?}` | the latest framebuffer PNG: `path`, `width`, `height` (a vision model in pi also gets the image) |
+| `list_instances` | every instance this server started: `running`, `uptime_s`, `apk`, `place`, `screenshot_path` |
+| `stop_instance {instance_id}` | kills it |
+| `install_apk {apk}` / `login {cookie}` / `join_place {place}` | **only record defaults for the NEXT `start_instance`** — they never touch a running instance |
+| `launch_app` | the same as `start_instance` |
 
-**`--apk` is a cached, launchable version.** The first launch of a file bakes it
-as a content-addressed offset `apk-<sha256[:16]>` (~1–2 min, one `[apk-cache]`
-row in `offset list`, ~130–450 MB) and boots it; every later launch of the same
-file boots that cached offset with **no reinstall** (`apk cache: hit`, no
-`apk_install` stage). A cached build never becomes the default; the last three
-are kept. The bake refuses while any instance is running (the build is then
-installed live instead), so stop instances before a first launch. `--apk-once`
-keeps the old throwaway path. Use `offset create NAME --apk …` when you want a
-human-readable name that the cache will never evict.
+- `cookie` is a cookie file path or a name `omnidroid login` saved; `place` is the numeric placeId
+  (`https://www.roblox.com/games/8737899170/…` → `8737899170`); `gpu` is `vulkan|gl|auto`;
+  `size` is `WxH`; `minutes` bounds the session (default 30).
+- `apk` falls back to `OMNI_MCP_APK` (set in `omniMcp.env`). There is no auto-pick here: without
+  either, `start_instance` fails with "no APK".
+- A boot takes **minutes**. `screenshot` answers "no frame yet … (still booting?)" until the
+  display has presented one; poll it every 20–30 s, don't spin.
+- Instances belong to the omni-mcp process. In pi it is kept across chat switches and closed on
+  quit — **quitting pi stops every instance it booted**. A tool call that times out (600 s,
+  `omniMcp.timeoutSec`) restarts omni-mcp, which also stops them.
 
-Errors here are deliberately hard, never silent fallbacks:
-`no_offset` (you named a version that is not baked, or the base has none baked
-at all — the message lists what is), `no_default_offset` (several offsets,
-none marked default).
+### What `start_instance` actually runs — and why a failure is silent
 
-## Launching an account
+`omnidroid aosp` runs `cargo test --release -p omni-linux --test r_roblox -- --ignored` in the
+repo (`OMNI_MCP_REPO`, default: three levels above the binary). omni-mcp throws that process's
+output away, so **a build error, a bad cookie or a missing APK shows up only as
+`running: false` in `list_instances`**. Therefore:
 
-```bash
-python3 -m omnidroid login --token-file cookie.txt       # saves under the real username
-python3 -m omnidroid accounts --verify                   # are the saved cookies still live?
-python3 -m omnidroid start alice --place 8737899170 --json
-python3 -m omnidroid session alice --place 606849621     # change the saved place AND re-join now if running
-```
+1. **Build first**, where you can see the output (Windows: PowerShell, not Git Bash — Git Bash
+   mangles the variable into a relative path):
+   ```powershell
+   $env:OMNIDROID_DYNARMIC_BUILD_DIR = "C:\od-unified"     # a SHORT path; MSVC fails past MAX_PATH
+   cargo build --release -p omnidroid -p omni-mcp
+   cargo test --release -p omni-linux --test r_roblox --no-run
+   ```
+   and give omni-mcp the same variable in `omniMcp.env` so a rebuild inside `aosp` works too.
+2. **Read the session's own log**, never trust the tool's `ok`: every line goes to
+   `<temp>/omni-linux-r-<pid>.log` (the newest one; `%TEMP%` on Windows, `$TMPDIR`/`/tmp`
+   elsewhere), and a frame every 20 s to `<temp>/omni-linux-r-<pid>-shots/NNNN.png`.
 
-`session <user> --place` updates the saved place for the next launch, and —
-whenever `alice` is currently running — always re-joins it immediately with
-the new place (`deliver_session(play=True)`). This is unconditional now; the
-old `--play` flag is still accepted but is a no-op kept only so existing
-scripts do not break. Use `session <user> --place <id>` to restart the game on
-a live instance instead of `am force-stop`ing it yourself (see "When the game
-dies" below).
+### Proof, in order — quote the line you saw
 
-`start --place` was always immediate and is unchanged.
+| line in the log | means |
+|---|---|
+| `[r] cookie planted: …` then `[r] relaunched: 0` | the cookie went into the app's own cookie store |
+| `DID_LOG_IN` | signed in |
+| `Joining game` | the place's deep link was taken (the gate fails a `--place` run without it) |
+| `onGameLoaded: placeId:…` | in the world; in-world figures start ~2 min after it |
+| `Upgrade required` | the APK is too old for Roblox's servers |
+| `GUEST THREAD DIED` | always a bug — report it with the lines around it |
 
-`--place` is the **numeric placeId only** — in
-`https://www.roblox.com/games/606849621/Jailbreak` it is `606849621`.
-Omit `--place` to land on the account's home screen, logged in.
+`start_instance` returning an `instance_id`, a PNG existing, or `running: true` is **not** proof
+the game is up. Say which log line you read, and when.
 
-`start` refuses *before allocating anything* when there is no saved cookie
-(`no_token`) or when Roblox no longer recognises it (`cookie_invalid`; the
-check fails open on network problems, skip it with `--no-cookie-check`).
-
-**Proving a login is REAL.** `ok: true` / "joined place …" only means the deep
-link fired. The one line that proves a session cookie was actually installed:
-
-```bash
-python3 -m omnidroid logcat alice --tag OmniBootstrap
-# OmniBootstrap: session cookie installed (N chars)
-```
-
-A stock/unmodified Roblox APK has **no code path that reads a session cookie**
-and will sit on its own login screen while everything reports success. When
-`--apk` is used, `start` checks for this itself and fails with `not_logged_in`.
-
-## The screen never sleeps or blanks
-
-Every boot, every mode, no command and no watchdog: the engine writes Android's
-own developer settings into /data — Developer options on, **Stay awake** for
-every plug type, an effectively infinite inactivity timer, the three
-"user is away" timers and the screensaver off, plus a kernel wakelock when
-rooted.
-
-```
-[start alice] awake: never blanks — wakefulness=Awake, screen-off timeout 2147483s
-```
-
-Verify with `dumpsys power`, never `settings get` — the setting is not the
-effective value (PowerManagerService clamps `-1` up to a **ten second** blank).
-Kill switch: `OMNI_NO_AWAKE=1`.
-
-## Permission prompts and ANR dialogs are handled for you
-
-Every boot, before the mode tuning, the engine grants what would otherwise
-need a tap and silences the framework's error dialogs:
-
-```
-[start alice] consent: full disk access, install-unknown, error dialogs off (2 package(s), 7 runtime permission(s) granted)
-```
-
-full disk access (`MANAGE_EXTERNAL_STORAGE`), install-unknown-apps, the
-storage/overlay app-ops, every dangerous runtime permission each package
-declares, and `hide_error_dialogs=1` — so a crash or an ANR kills the app
-instead of parking "Roblox keeps stopping" over the screen. It needs no root
-and applies to every base, offset and `--apk` one-off.
-
-- `OMNI_NO_CONSENT=1 omnidroid start …` turns it off — do this when you WANT
-  to see a crash dialog while reproducing something.
-- `omnidroid offset consent <name>|--all` bakes it into an offset image. Only
-  the dialog half is image state; the app-ops and grants are re-applied on
-  every boot regardless (the permission APEX re-derives them at boot).
-- **Still needs a tap:** after install-unknown is granted, an app that
-  installs an APK gets PackageInstaller's own "Update this app?" screen. No
-  setting suppresses it — use the `omnidroid-input` skill.
-
-## Modes: playable vs farming
+## The CLI
 
 ```bash
-python3 -m omnidroid start alice                        # playable — the DEFAULT
-python3 -m omnidroid start alice --mode gaming          # + a native host window
-python3 -m omnidroid start alice --mode farming         # minimum footprint
-python3 -m omnidroid start alice --mem 4096 --smp 4 --quality balanced
+cd "Omni Apps/omnidroid"
+target/release/omnidroid which [--apk X]            # which APK a run would use, and why
+target/release/omnidroid login [<user> [<pass>]]    # sign in in Chromium once; keeps the cookie by name
+target/release/omnidroid aosp --apk X --cookie <name|file> --place 8737899170 --minutes 30 [--size 1600x900] [--gpu vulkan|gl|auto] [--with-systemui]
+target/release/omnidroid play --cookie <name> --place 8737899170 [--minutes N] [--fresh] [--phone] [--headless|--no-window] [--control cmds.txt]
 ```
 
-| Mode | For | RAM / vCPU |
-|---|---|---|
-| `playable` (default) | playing **and every test you run** | sized to the host, 4–8 GB / 4–8 |
-| `gaming` | the same, plus a native window | same |
-| `hard` / `brutal` | a tight host | 3 GB / 4, 2 GB / 2 |
-| `farming` | many instances at once | 2 GB / 1, ballooned to ~896 MB |
+Full flags, environment switches and the `--control` commands: `reference/omni-cli.md`.
 
-`playable` deliberately takes as much of the host as it safely can and applies
-the `high` render profile (real textures, lighting, post-FX). **Test in
-`playable`** — a screenshot at farming quality is a screenshot of a different
-program. `--quality balanced` trades visuals back for frame rate; `--mem` and
-`--smp` override the host-derived size.
-
-Do **not** run farming and expect a usable screenshot: it is 480x270 at 5 fps
-by design.
-
-## Resolution: `--res`, and `omnidroid res`
-
-```bash
-python3 -m omnidroid start alice --res 1920x1200        # boot at this size
-python3 -m omnidroid res alice                          # report the live size
-python3 -m omnidroid res alice 1440x900 --json          # change it (restarts)
-```
-
-The resolution is the **virtio-gpu framebuffer**
-(`-device virtio-gpu-pci,xres=W,yres=H`), not a `wm size` override. So the
-guest reports it as its own `Physical size` with **no `Override size:` line**,
-and screenshots come out at exactly that size. This matters beyond sharpness:
-`wm size` / `wm density` write `display_size_forced` /
-`display_density_forced` into Settings, which **any app can read** — nothing
-here writes one. (Farming keeps its 480x270 + dpi 80 override.)
-
-- **Default = the host monitor**, snapped to a 16:10 ladder: 1280x800,
-  1440x900, 1680x1050, 1920x1200, 2560x1600. You rarely need `--res`.
-- **Fixed at boot.** Android does *not* follow a live window resize — dragging
-  the window scales the picture, it does not change `Physical size`. That is
-  why `omnidroid res <name> <WxH>` **restarts** the instance (same account,
-  offset, mode, `--debug`, place) instead of poking the live one.
-- `res` with no size just reports; `--json` →
-  `{"ok", "name", "res": [w,h], "previous": [w,h], "restarted"}`.
-- The live size is in `debug-info` and `list` as `res`.
-- An instance that is not running is refused — boot it with `start --res`.
-- `OMNI_DISPLAY=WxH` is the env equivalent (`--res` wins). An `@dpi` suffix is
-  ignored on purpose: the density override is the same Settings tell.
-
-**OPEN, measured 2026-09-16 — a WINDOWED boot still takes the window's
-startup size.** `--res 1920x1200` puts `xres=1920,yres=1200` on the device,
-but with the native cocoa window the guest comes up at `Physical size:
-534x334`; the same launch with `--no-window` gives `Physical size: 1920x1200`
-and a 1920x1200 screenshot. **So pass `--no-window` when the resolution has to
-be right** — which is what an unattended agent run should be doing anyway.
-Always read the size back (`res <user>` or `adb … shell wm size`) rather than
-trusting the flag.
-
-Known tells, out of scope: QEMU's EDID reports the panel as `QEMU Monitor` /
-PnP `RHT` via `Display.getDeviceProductInfo()`, and the `wm size reset` that
-opens every tune-up leaves an EMPTY `display_size_forced=` row in Settings (no
-override in effect, but a stock device has no such row).
-
-## Debugging
-
-```bash
-python3 -m omnidroid debug-info alice --json    # START HERE
-```
-
-That one call tells you whether root is available (`root.available`), whether
-the devkit is attached (`devkit.attached`), whether frida is up
-(`frida.running`) and the exact command that would fix it (`frida.restart`,
-`null` when nothing is missing), which offset and mode are live, what is in
-the foreground (`foreground.package/activity/pid`), the adb/VNC/QMP endpoints,
-and a `can{}` map (`screenshot`, `logcat`, `install_apk`, `run_su`, `frida`,
-`hide_root`). Every failure below otherwise looks identical from the outside
-("the tool did nothing").
-
-### Is the game actually running? Read `app`, nothing else
-
-`debug-info --json` (and the JSON `start` prints) carries an `app` block:
-
-```json
-"app": {"package": "com.roblox.client", "pid": 13210, "running": true, "foreground": true,
-        "foreground_activity": "com.roblox.client/.ActivityNativeMain",
-        "last_crash": null, "state": "running", "hint": "…",
-        "kiosk_failure": null}
-```
-
-`app.state` is the only proof the app is up (unchanged: `running|background|
-crashed|not_running`), but **read `app.kiosk_failure` before deciding what
-`background` means**:
-
-| `app.state` | meaning | what to do |
-|---|---|---|
-| `running` | process alive **and** in the foreground | proceed |
-| `background` | process alive, something else has the screen | check `app.kiosk_failure` first (below) — it may be the kiosk's failure screen counting down to its own relaunch, not "still launching"; only if `kiosk_failure` is null/already relaunched should you treat it as still-launching and re-read `debug-info` after 30 s |
-| `crashed` | no process, and the crash buffer holds a crash for this package (`last_crash.when/pid/detail`) | the app died; read `logcat` around `last_crash.when`, fix, relaunch. **Do not** report success |
-| `not_running` | no process, no crash recorded | it never launched or was closed |
-
-Signals that are **not** proof and were mistaken for it on 2026-09-13:
-`start` → `ok: true` (means the session broadcast was delivered),
-`session … --place` → immediate re-join (means the deep link fired, not that
-the app is up), and logcat lines such as `JNI_OnLoad complete`, `lua
-environment ready`, `engine found` (the injected library loads *before* the
-Java layer can throw and kill the process). A verification paragraph that
-quotes those while `pidof` was empty and `mCurrentFocus` sat on
-`com.omni.kiosk` is wrong. State the `app.state` you read, with its timestamp,
-in every "it works" claim.
-
-### When the game dies, the kiosk shows a failure screen
-
-`com.omni.kiosk` (versionName 1.1, baked into the arm base 2026-09-16) no
-longer goes black when Roblox dies or gets displaced — it shows a FAILURE
-SCREEN: a headline (`Roblox crashed`, `Roblox was killed (signal 9)`, `Roblox
-stopped responding`, `Roblox went to the background`, `Roblox was
-force-stopped`), an error code `OMNI-<REASON>-<attempt>`, detail text, the
-line "For full details check the logs: `omnidroid logcat <instance> --tag
-OmniKiosk`", and a ⟳ countdown that relaunches the game **by itself**: 5 s,
-then 15, 30, 60, then 60 s forever. A tap relaunches at once. The counter
-resets after 3 healthy minutes.
-
-`debug-info --json` → `app.kiosk_failure` is `null` normally, or `{attempt,
-code, reason, package, delay_s, detail, when, relaunched_after, current}`.
-`current: true` means the failure screen is up right now; `current: false`
-with a failure present means it already relaunched (the hint then reads "last
-kiosk failure … (since relaunched)").
-
-**Do not relaunch the game manually on `state: crashed`/`background` without
-checking `app.kiosk_failure.current` first** — the kiosk may already be
-counting down to its own relaunch, and a second launch races it. Read the
-logs, then either let the countdown finish or make it immediate yourself with
-`omnidroid session <user> --place <id>` (or a tap, via the `omnidroid-input`
-skill) — never `am force-stop`, which itself triggers a `FORCE_STOPPED`
-failure screen (the host's own `start`/`session`/install restarts never do,
-since the kiosk only reacts to unannounced deaths).
-
-Reasons seen live (arm/Android 16): `CRASH`, `CRASH_NATIVE`, `ANR`,
-`LOW_MEMORY`, `SIGNALED`, `FORCE_STOPPED`, `EXIT_SELF`, `BACKGROUND`,
-`UNAVAILABLE`. `am crash com.roblox.client` records `EXIT_SELF` (Roblox's own
-crash handler exits itself, 15 ms–22 s later); `kill -9` records `SIGNALED`.
-
-**Launch pattern.** Run `start … --json` in the *foreground* with a long tool
-timeout (up to 600 s; a first `--apk` bake takes ~2 min) and read `app` from
-the single JSON line it prints. Do not `nohup … &` and `tail` a log: the tail
-truncates the JSON and hides the failures (the `No module named omnidroid`
-lines in the 2026-09-13 logs were the crash recorder failing to start, which is
-fixed, but a tailed log is how they went unread).
-
-```bash
-python3 -m omnidroid screenshot alice --out /tmp/s.png
-python3 -m omnidroid capture alice --duration 20        # keyframes + logcat + process events
-python3 -m omnidroid logcat alice --tag OmniKiosk       # one line per relaunch: FAILURE attempt=N code=OMNI-<REASON>-N reason=<REASON> pkg=<pkg> delay=<s> detail=<first line>
-python3 -m omnidroid adb alice -- shell dumpsys activity activities
-
-python3 -m omnidroid su alice -- id -u
-python3 -m omnidroid su alice -- 'pm list packages | grep roblox'
-
-python3 -m omnidroid frida alice --restart              # instance is up without the devkit? relaunch it as a --debug boot (same account/offset/mode/session) and start frida
-python3 -m omnidroid frida alice                        # start + forward; prints the -H target (--json: host_port, attach)
-python3 -m omnidroid frida alice --status               # exit 1 if not running
-python3 -m omnidroid su alice -- /data/local/tmp/omni-devkit/omni-hide com.roblox.client   # hide root from the app
-python3 -m omnidroid start alice --debug --no-window    # or plan the devkit in from the start
-```
-
-**frida needs no pre-planning any more.** If `frida` answers `no_devkit` (or
-`debug-info` shows `devkit.attached: false`), run `frida <name> --restart`: it
-stops the plain instance, relaunches it with the devkit attached and the same
-Roblox version, mode and session, then starts and forwards frida-server. Ports
-can change across the restart, so re-read `debug-info` afterwards. From the
-host, attach with frida 17.15.4 from
-`/Library/Frameworks/Python.framework/Versions/3.13/bin/python3` (see the
-reference for a working `Interceptor.attach` snippet); a hook has fired only
-when its `send()` messages arrive.
-
-### Always use `omnidroid su`, never hand-rolled root
-
-Three traps, all silent, all previously re-derived and re-broken by callers:
-
-1. Magisk's `su` is **not on `$PATH`** — it lives in `/debug_ramdisk/su`.
-2. MagiskSU **permutes argv**, so `su 0 id -u` reads `-u` as an *su option* and
-   exits 2. It must be `su 0 sh -c '<script>'`.
-3. `adb shell` does **not** forward argv — it joins the arguments and re-parses
-   them in the guest shell, so an unquoted `a; b` runs a fragment of itself and
-   still reports success.
-
-`omnidroid su` handles all three and exits with the guest command's own status.
-It fails with `no_root` rather than quietly running as uid `shell` — a silent
-privilege downgrade produces wrong output that looks right.
-
-**Its own flags go BEFORE the name**, because everything after the name is the
-guest command: `python3 -m omnidroid su --json alice -- id -u`. Getting the
-order wrong is caught and reported, not executed.
-
-### Root vs devkit
-
-Root is baked into **every** shipped base. `--debug` adds only the *devkit
-disk* (frida-server + the `omni-*` tools), and only for that boot. So:
-
-- APK swap, `su`, screenshots, logcat — work on any boot, no `--debug`.
-- frida and `omni-hide` — need the devkit **and** a rooted base.
-
-`omnidroid frida` distinguishes those two failures by name, because they need
-different fixes (`omnidroid frida <name> --restart` vs `omnidroid root-base`).
-
-### Text-only signals (when you cannot look at a screenshot)
-
-A model without vision can still verify everything: `debug-info --json`
-(`foreground`, `root`, `devkit`, `frida`, `can`), `logcat <name> [--tag TAG]`
-(`OmniBootstrap` for the session cookie, `OmniKiosk` for `FAILURE
-attempt=… code=OMNI-<REASON>-… reason=…` relaunch lines, `ActivityTaskManager`
-for launches and `Displayed …` lines after a tap opened something), `adb <name> -- shell dumpsys
-window | grep mCurrentFocus` (which window has focus right now), `adb <name> --
-shell dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'`,
-and the `omnidroid-input` skill's `state` and `ui` commands (element list with
-tap centres on native screens). Prove a tap landed by reading the state
-*before and after* and comparing, never by assuming.
-
-### Warm cache
-
-`omnidroid warm list|prune|clear|bake <name>` manages the warm-restore boot
-cache; `warm list --json` says how much disk is free and why a restore missed.
-It needs a lot of free disk for the memory image; a cold boot is ~30 s on this
-Mac, so do not block on it. `start --no-warm` (or `OMNI_NO_WARM=1`) forces a
-cold boot.
+- **APK choice**: `--apk`, else `OMNI_APK`, else the APK in the repo root with the highest
+  versionCode. The stock `Roblox-2.738.1397.apk` in the repo root is no longer accepted by
+  Roblox's servers; real runs use a newer APK passed with `--apk` (since 2026-09-29 the owner's
+  `~/Desktop/Roblox-2.740.931.apk`, a Delta build that is never kicked).
+- **Cookies**: `login` keeps them as `<app-data>/../cookies/<name>.txt`; `--cookie` takes that
+  name, a file, or (`play` only) the value. Storage is per account.
+- **`play` runs until the window closes** (or `--minutes`). End every run cleanly — a killed run
+  is judged a crash at the next launch of that storage; after one, pass `--fresh`.
+- **Headless `play`**: `--headless` runs and presents every frame without drawing; `--no-window`
+  has no window at all. With `--control FILE`, append lines to FILE (or type on stdin):
+  `headless on|off`, `screenshot <path>` (a real frame, rendered and saved), `status`.
 
 ## Things that will bite you
 
-- **Do not `omnidroid remove` to clean up.** `stop` powers off; `remove` is
-  destructive and deletes the account's store entry.
-- **Baking refuses while anything is running.** `omnidroid list` first.
-- **`offset remove` refuses while that version is in use** — the qcow2 is open
-  by a live QEMU.
-- **Changing the default offset does not touch a running instance.** `list`
-  reports the version the live boot actually picked.
-- **First boot on a cold host is minutes** (dexopt), not a hang. The engine's
-  own timeout governs.
-- **Do not disturb a running experiment** — check for a live `capture --auto`
-  or an overnight run before driving or stopping an instance.
-- **A `.ROBLOSECURITY` cookie is full account access.** Prefer `--token-file`
-  over `--token` (an argv token is visible to every process on the host), and
-  never echo a cookie into your own output.
-- **`start --no-offset` / `--offset none` alone is currently REFUSED** (engine
-  bug in `build_acct(allow_no_offset=…)`) — pass `--apk FILE` too even when you
-  just want the clean base.
-- **`omnidroid su alice -- 'kill -9 $(pidof com.roblox.client)'` does not
-  substitute** — `$(pidof …)` is not expanded for you. Resolve the pid first
-  (`su alice -- pidof com.roblox.client`) and pass the number literally.
-- **Offsets on a base can all be retired by a system rebake** (it happened to
-  arm's on 2026-09-16) — `offset list` then shows none and every bare `start`
-  fails `no_offset` until someone bakes or boots one with `--apk`.
+- **Credentials**: never print, log, or copy a cookie value or password; pass cookie *files* or
+  saved names. A dead cookie: ask the owner. Never work around Roblox security (captchas, the
+  country check).
+- **Network**: Roblox is ISP-blocked here; each host needs a bypass (WARP / VPN). The accounts are
+  Turkish, and a cookie used through another country's exit gets killed. Check `loc=TR` at
+  `https://www.cloudflare.com/cdn-cgi/trace` first. GoodbyeDPI breaks UDP/QUIC and teleports. A
+  `TlsVerificationFail` means no bypass is on.
+- **Never build on Windows while a game is being played** — a build exhausted the commit limit
+  once and killed guest threads. One live run per host at a time; builds may run in parallel.
+- A full `C:` shows up as `ENOMEM` in every spawn: prune `target/*/incremental`.
+- From Git Bash, `export MSYS_NO_PATHCONV=1` before anything that takes guest paths.
+- Graphics buffers of finished sessions (`omni-shm-*` in the temp dir) are cleaned by the next
+  `aosp` run, not by a killed one.
+- Measure in Pet Simulator 99, place `8737899170` (joined directly, no teleport).
 
 ## Related
 
-- `reference/omni-cli.md` (next to this file) — every command, flag and JSON
-  field an agent needs, including `--apk` caching, `frida --restart`,
-  `debug-info`, `view --hide/--vnc-viewer` and `warm`.
-- `omnidroid-input` skill — tap/type/swipe/read the screen of a running instance.
-- `HOWTO.md` §3a (offsets), §7 (modes), §7a (debugging) in the omnidroid repo.
-- `MODES.md` — the full playable-vs-farming rationale and the measured numbers.
-- Omni Agent (`Desktop/Omni Apps/omni-agent`) installs this skill for pi with
-  `node scripts/install.mjs` and drives unattended runs with `scripts/headless.mjs`.
+- `omnidroid-frida` skill — the lab debugger over the same MCP server: load a `.so`, call its
+  functions with crafted inputs, intercept, patch, dump.
+- `reference/omni-cli.md` — every flag, switch and log marker.
+- The omnidroid repo: `docs/HANDOFF.md` (current state, "Running"), `docs/STATUS.md`,
+  `crates/omni-mcp/README.md`.
+- `omnidroid-qemu` / `omnidroid-input` skills — the retired QEMU manager (`Omni Apps/omnidroid-old`).

@@ -121,16 +121,23 @@ node scripts/install.mjs                 # pi: memory_search / memory_recall / m
                                          #     plus the omnidroid skills (skills/ -> ~/.pi/agent/skills/)
 node scripts/install.mjs --claude-hook   # Claude Code: SessionStart hook that injects the memory index
 node scripts/install.mjs --claude-skills # Claude Code: also copy the skills to ~/.claude/skills/
+node scripts/install.mjs --claude-mcp    # Claude Code: register omnidroid's MCP server (tools mcp__omnidroid__*)
 node scripts/install.mjs --openrouter    # pi: OpenRouter provider from openrouter.txt (see "Models")
 node scripts/install.mjs --uninstall
 ```
 
-`skills/omnidroid` and `skills/omnidroid-input` teach either model how to drive the omnidroid Android
-VM engine (the sibling checkout in `Omni Apps/omnidroid`): launching accounts, the `--apk` cache,
-`frida --restart`, `debug-info`, tapping and typing, and how to verify every step from text signals
-when the model cannot see screenshots. `skills/omnidroid/reference/omni-cli.md` is the CLI reference.
+The skills teach either model the omnidroid engine (the sibling checkout in `Omni Apps/omnidroid`):
 
-Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/omni-agent.json`:
+- `skills/omnidroid` — booting an instance through the MCP tools or the `omnidroid` CLI
+  (`play`, `aosp`, `login`), cookies and places, and proving a session signed in and joined from its
+  log; `reference/omni-cli.md` holds every flag, switch and the MCP server's env.
+- `skills/omnidroid-frida` — the Frida-style lab debugger over the same MCP server: load an arm64
+  `.so`, call its functions with crafted inputs, intercept / `replace_return`, breakpoints, patch
+  code, trace syscalls, dump the module; with the rules measured against the real server.
+- `skills/omnidroid-qemu`, `skills/omnidroid-input` — the retired QEMU/Python VM manager
+  (`Omni Apps/omnidroid-old`), kept for when it is asked for by name.
+
+The pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/omni-agent.json`:
 
 - `omni-memory.ts` (`autoRecall`, `budgetTokens`): the memory tools. With auto recall on, every
   prompt of a pi started from a terminal gets a small `<omni-memory>` pack appended to the system
@@ -140,6 +147,14 @@ Two pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/
   task to Claude Code and wait for the answer. The run shows up in Omni as its own chat
   ("Task from pi: …"); the tool returns Claude's final text plus a session id that can be passed
   back as `resume` for a follow-up. Omni Agent must be running.
+- `omni-mcp.ts` (`omniMcp`): pi has no MCP client, so this is one. It starts omnidroid's
+  `omni-mcp` (`<omnidroid>/target/release/omni-mcp[.exe]`, filled in by the installer; build it with
+  `cargo build --release -p omni-mcp`) and registers each of its tools as `omnidroid_<tool>` —
+  `start_instance` / `screenshot` / `list_instances` for a live instance, `lab_load` /
+  `call_function` / `intercept` / `dump_module` … for the lab debugger. The server is kept across
+  chat switches and closed when pi quits (which stops the instances it booted); a call past
+  `timeoutSec` (600) restarts it. `omniMcp.env` is passed to the server (`OMNI_MCP_APK`,
+  `OMNI_MCP_COOKIE`, `OMNI_MCP_PLACE`, `OMNIDROID_DYNARMIC_BUILD_DIR`, …).
 - `omni-graph.ts` (`port`): `graph_build`, `graph_query` and `graph_explain` tools so the pi model
   decides mid-turn to build a repo knowledge graph or read it instead of grinding through files.
   They shell out to the local `graphify` (no model call), so they work even with the pi model

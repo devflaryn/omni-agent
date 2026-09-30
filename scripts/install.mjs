@@ -2,16 +2,21 @@
 /**
  * Wire Omni Agent into the harnesses.
  *
- *   node scripts/install.mjs                 install the pi extensions (memory tools + claude_task), the
- *                                            omnidroid skills (skills/ -> ~/.pi/agent/skills/) + config
+ *   node scripts/install.mjs                 install the pi extensions (memory tools, claude_task, graph tools,
+ *                                            model fallback, omnidroid's MCP tools), the omnidroid skills
+ *                                            (skills/ -> ~/.pi/agent/skills/) + config
  *   node scripts/install.mjs --claude-hook   also register the Claude Code SessionStart hook (user settings)
  *   node scripts/install.mjs --claude-skills also copy the skills to ~/.claude/skills/ (Claude Code)
+ *   node scripts/install.mjs --claude-mcp    also register omnidroid's omni-mcp with Claude Code (user scope)
  *   node scripts/install.mjs --openrouter    also wire OpenRouter into pi from openrouter.txt (auth.json +
  *                                            a models.json provider on https://openrouter.ai/api/v1)
  *   node scripts/install.mjs --uninstall     remove everything this script installed
  *
- * OMNI_HOME overrides the home directory (tests).
+ * OMNI_HOME overrides the home directory (tests). OMNI_OMNIDROID names the omnidroid checkout whose
+ * target/release/omni-mcp the MCP tools run (default: the sibling ../omnidroid). OMNI_CLAUDE_BIN names
+ * the claude CLI for --claude-mcp.
  */
+import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,8 +26,8 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const HOME = process.env.OMNI_HOME || homedir();
 const piAgent = join(HOME, ".pi", "agent");
 const extDir = join(piAgent, "extensions");
-const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-fallback.ts"];
-const SKILLS = ["omnidroid", "omnidroid-input"];
+const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-fallback.ts", "omni-mcp.ts"];
+const SKILLS = ["omnidroid", "omnidroid-frida", "omnidroid-qemu", "omnidroid-input"];
 const piSkillsDir = join(piAgent, "skills");
 const claudeSkillsDir = join(HOME, ".claude", "skills");
 const piCfg = join(piAgent, "omni-agent.json");
@@ -42,6 +47,9 @@ export const OPENROUTER = {
     cost: { input: 0.04, output: 0.08, cacheRead: 0, cacheWrite: 0 },
   }],
 };
+const omnidroidDir = process.env.OMNI_OMNIDROID || join(dirname(ROOT), "omnidroid");
+const omniMcpBin = join(omnidroidDir, "target", "release", process.platform === "win32" ? "omni-mcp.exe" : "omni-mcp");
+const claudeBin = process.env.OMNI_CLAUDE_BIN || "claude";
 const hookCmd = `node "${join(ROOT, "integrations", "claude", "session-start-hook.mjs")}"`;
 const args = new Set(process.argv.slice(2));
 
@@ -72,10 +80,37 @@ function installOpenRouter() {
   console.log(`OpenRouter wired for pi: ${authPath} (openrouter key), ${modelsPath} (${OPENROUTER.baseUrl}, ${OPENROUTER.models.map((m) => m.id).join(", ")})`);
 }
 
+/** The omni-mcp pi extension's block of omni-agent.json: keep what the owner set, point `command` at the
+ *  built omni-mcp unless the one configured still exists. */
+function omniMcpConfig(prev = {}) {
+  const keep = prev.command && existsSync(prev.command);
+  return { ...prev, command: keep ? prev.command : omniMcpBin };
+}
+
+/** Claude Code gets the same server as `omnidroid` (tools mcp__omnidroid__*), with the same env. */
+function claudeMcp(add, mcp) {
+  const run = (...a) => {
+    // A .js/.mjs launcher runs under node; a Windows .cmd shim only runs through the shell, which needs
+    // its arguments quoted by hand (paths here have spaces: "Omni Apps").
+    if (/\.m?js$/i.test(claudeBin)) return spawnSync(process.execPath, [claudeBin, ...a], { encoding: "utf8" });
+    const r = spawnSync(claudeBin, a, { encoding: "utf8" });
+    if (!r.error || process.platform !== "win32") return r;
+    const q = (x) => (/[\s"&|<>^()]/.test(x) ? `"${x.replace(/"/g, '\\"')}"` : x);
+    return spawnSync([claudeBin, ...a].map(q).join(" "), { encoding: "utf8", shell: true });
+  };
+  run("mcp", "remove", "--scope", "user", "omnidroid");
+  if (!add) { console.log("removed omnidroid MCP server from Claude Code"); return; }
+  const env = Object.entries(mcp.env || {}).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+  const r = run("mcp", "add", "--scope", "user", ...env, "omnidroid", "--", mcp.command, ...(mcp.args || []));
+  if (r.status !== 0) { console.error(`--claude-mcp: \`${claudeBin} mcp add\` failed: ${(r.stderr || r.stdout || r.error?.message || "").trim()}`); process.exit(1); }
+  console.log(`Claude Code MCP server added: omnidroid -> ${mcp.command}`);
+}
+
 if (args.has("--uninstall")) {
   for (const f of EXTENSIONS) { const t = join(extDir, f); if (existsSync(t)) { rmSync(t); console.log("removed", t); } }
   for (const s of SKILLS) for (const dir of [piSkillsDir, ...(args.has("--claude-skills") ? [claudeSkillsDir] : [])]) { const t = join(dir, s); if (existsSync(t)) { rmSync(t, { recursive: true }); console.log("removed", t); } }
   if (existsSync(piCfg)) { rmSync(piCfg); console.log("removed", piCfg); }
+  if (args.has("--claude-mcp")) claudeMcp(false);
   const s = readJson(claudeSettings, null);
   if (s?.hooks?.SessionStart) {
     s.hooks.SessionStart = s.hooks.SessionStart.filter((h) => !JSON.stringify(h).includes("session-start-hook.mjs"));
@@ -89,13 +124,16 @@ if (args.has("--uninstall")) {
 mkdirSync(extDir, { recursive: true });
 for (const f of EXTENSIONS) copyFileSync(join(ROOT, "integrations", "pi", f), join(extDir, f));
 const omniCfg = readJson(join(ROOT, "omni.config.json"), {});
-const cfg = { ...readJson(piCfg, {}), root: ROOT, vault: join(ROOT, "vault"), autoRecall: true, budgetTokens: 800, port: Number(omniCfg.port) || 4400 };
+const prevCfg = readJson(piCfg, {});
+const cfg = { ...prevCfg, root: ROOT, vault: join(ROOT, "vault"), autoRecall: true, budgetTokens: 800, port: Number(omniCfg.port) || 4400, omniMcp: omniMcpConfig(prevCfg.omniMcp) };
 writeFileSync(piCfg, JSON.stringify(cfg, null, 2));
 console.log("pi extensions installed:", EXTENSIONS.map((f) => join(extDir, f)).join(", "));
 console.log("pi config written:", piCfg);
+if (!existsSync(cfg.omniMcp.command)) console.log(`omni-mcp not built yet (${cfg.omniMcp.command}): in ${omnidroidDir} run \`cargo build --release -p omni-mcp\`; the omnidroid_* tools appear once it exists.`);
 installSkills(piSkillsDir);
 if (args.has("--claude-skills")) installSkills(claudeSkillsDir);
 if (args.has("--openrouter")) installOpenRouter();
+if (args.has("--claude-mcp")) claudeMcp(true, cfg.omniMcp);
 
 if (args.has("--claude-hook")) {
   const s = readJson(claudeSettings, {});

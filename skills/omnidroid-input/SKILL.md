@@ -1,9 +1,14 @@
 ---
 name: omnidroid-input
-description: Use when you need to drive an omnidroid Android VM's screen yourself — tapping buttons, typing into fields, pressing keys, swiping, or reading what is currently on screen. Trigger on "click/tap in the VM", "type into the emulator", "drive the instance", "what's on screen", "press back/enter", or any step that would otherwise be handed to the user to do by hand in the GUI.
+description: LEGACY — only for the retired QEMU/Python omnidroid VM manager (Omni Apps/omnidroid-old), when the owner asks for it by name. Use when you need to drive that QEMU VM's screen yourself — tapping buttons, typing into fields, pressing keys, swiping, or reading what is currently on screen. Trigger on "click/tap in the VM", "type into the emulator", "drive the instance", "what's on screen", "press back/enter", or any step that would otherwise be handed to the user to do by hand in the GUI.
 ---
 
-# Driving an omnidroid VM
+# Driving a QEMU omnidroid VM (legacy)
+
+> **Legacy.** This is the retired QEMU/Python Android VM manager, not today's omnidroid. On the
+> Windows PC its checkout is `Desktop/Omni Apps/omnidroid-old`; `Omni Apps/omnidroid` is now the
+> native Rust engine, driven with the **`omnidroid`** skill (and **`omnidroid-frida`** for hooking
+> and dumping). Use this skill only when the owner asks for the QEMU manager by name.
 
 You can operate a running omnidroid instance directly. Do not ask the user to
 click things in the VM for you — do it, then verify: with a screenshot when you
@@ -11,10 +16,10 @@ can see images, with `state`/`ui`/logcat when you cannot (see "Driving without
 vision" below).
 
 Tool: `tools/omni_input.py` in the omnidroid checkout
-(`/Users/berat/Desktop/Omni Apps/omnidroid`). Run it with `python3`.
+(`Desktop/Omni Apps/omnidroid-old`). Run it with `python3`.
 
 ```bash
-cd "/Users/berat/Desktop/Omni Apps/omnidroid"
+cd "$HOME/Desktop/Omni Apps/omnidroid-old"
 python3 tools/omni_input.py [--name INSTANCE] [--json] <command>
 ```
 
@@ -22,7 +27,7 @@ python3 tools/omni_input.py [--name INSTANCE] [--json] <command>
 when several are. `omnidroid list` shows them.
 
 To *launch* an instance, choose a Roblox version, bake one, run root commands
-or start frida, use the **`omnidroid`** skill — this one is only about driving
+or start frida, use the **`omnidroid-qemu`** skill — this one is only about driving
 a screen that is already up.
 
 **Drive in `playable` mode** (the default). A farming instance is 480x270 at
@@ -142,7 +147,7 @@ back in full colour, not black.
   forever). `tap` anywhere on it relaunches immediately — no need to hunt for a
   button. Verify the game is actually back with `state`/`debug-info`, not just
   by the screen changing. Full detail and the reason codes are in the
-  `omnidroid` skill.
+  `omnidroid-qemu` skill.
 - **Ambiguous labels.** `tap --text` refuses when several elements match and
   prints the candidates; narrow the string, use `--id`, or pass `--first`. When
   a label and its button both match, the clickable one is chosen.
@@ -174,11 +179,11 @@ MagiskSU permutes argv, so a bare trailing flag is misread as an su option.
 
 ## Related
 
-- **`omnidroid` skill** — launching accounts, Roblox versions (offsets), modes,
+- **`omnidroid-qemu` skill** — launching accounts, Roblox versions (offsets), modes,
   `su`, frida, and `debug-info`. Reach for it whenever the problem is not
   "what is on screen right now".
 - `omnidroid screenshot <name> --out X.png` — the plain screenshot path.
 - `omnidroid debug-info <name>` — why a step silently did nothing.
 - `omnidroid adb <name> -- <args>` — arbitrary adb, slower (full engine start).
-- `omnidroid` skill's `reference/omni-cli.md` — the CLI reference (frida,
+- `omnidroid-qemu` skill's `reference/omni-cli.md` — the CLI reference (frida,
   `--apk` cache, `debug-info` fields, `view --hide`).
