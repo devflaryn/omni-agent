@@ -139,6 +139,34 @@ take its library into the lab: the warm device's installed APKs are host files
 `lab_load` it. Watch the live app itself through the omnidroid skill: its log in the device's host log file,
 `shell` (dumpsys, its files as root) and `screenshot`. (The retired QEMU manager had a real frida-server: omnidroid-qemu.)
 
+## The dynamic RE workbench
+
+To reverse-engineer a `.so` and prove a **rebuilt** one behaves the same, the MCP server carries a
+loop on top of the lab (see `crates/omni-mcp/README.md` in the omnidroid repo):
+
+- `lab_load_apk {apk, target?, session?}` — load a target `.so` (from an APK, or a bare `.so`) into a
+  named session, resolving imports against its co-loaded `lib/arm64-v8a` siblings; returns the
+  loaded modules and every import still **unresolved** (stub those with `intercept`). For an APK,
+  `target` names the `.so` to reconstruct.
+- `lab_trace {symbol|address, arg_spec, session?}` — call via an **arg_spec**
+  (`{scalar}` / `{in_buffer:hex}` / `{out_buffer:len}` / `{inout_buffer:hex}`): buffers are
+  allocated and output buffers read back. Returns `ret`, `ret1`, instruction count, out-buffer bytes.
+- `lab_corpus {templates, seed?, count?}` — a **reproducible** input corpus (`{kind:scalar}` /
+  `{kind:buffer,len}` / `{kind:out_buffer,len}` / `{kind:const,value}`), stored by `corpus_id`;
+  the same `seed` reproduces it.
+- `lab_diff {symbol, corpus_id, original?, candidate?}` — differential-test the `original` session
+  against the `candidate` over the corpus; returns `total`, `matched`, and the first divergence
+  (`ret` / `out_buffers` / `fault`). **Equivalence is relative to the corpus**, never universal.
+- `lab_build {sources:[{name,text}], flags?, soname?}` — compile candidate C into an arm64 `.so` the
+  lab can load. Needs an arm64 clang on the host (`OMNI_NDK` / `ANDROID_NDK_HOME`, or a `clang` on
+  `PATH` with an `aarch64` target); without one it returns `{error:"toolchain missing", looked_for}`
+  rather than a wrong-arch artifact.
+
+Set `session` to `"original"` / `"candidate"` on the loads so `lab_diff` has two sessions to compare.
+A self-decrypting/packed `.so` is handled the lab way: `call_function` (or `lab_trace`) its unpacker,
+then `dump_module` the now-decrypted image. Functions that need real libc/JNI/global state do not run
+in isolation yet — resolve what you can, `intercept` the rest, and reconstruct the parts that do run.
+
 ## Reporting
 
 Quote the tool's own result (`ret`, the `events`, the hex) with the inputs you passed. A value
