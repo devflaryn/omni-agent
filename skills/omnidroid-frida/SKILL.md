@@ -129,6 +129,16 @@ mmap, 172 getpid …). No kernel answers, so results after the first syscall are
 **Dump**: `dump_module {"out_path": "C:/…/lib.dumped.so"}` — after running the unpacker if the
 library is packed.
 
+## A live app's native code
+
+There is no frida-server for an app running on omnidroid's real-AOSP path: the guest kernel has no
+`ptrace`, so nothing attaches to or injects into a live process. To hook what a running app runs,
+take its library into the lab: the warm device's installed APKs are host files
+(`<device dir>/data/app/*/<package>-*/base.apk`; `device_status` gives the device dir, or `shell
+{command: "pm path <package>"}` the guest path), so unzip `lib/arm64-v8a/<lib>.so` from there and
+`lab_load` it. Watch the live app itself through the omnidroid skill: its log in the device's host log file,
+`shell` (dumpsys, its files as root) and `screenshot`. (The retired QEMU manager had a real frida-server: omnidroid-qemu.)
+
 ## Reporting
 
 Quote the tool's own result (`ret`, the `events`, the hex) with the inputs you passed. A value

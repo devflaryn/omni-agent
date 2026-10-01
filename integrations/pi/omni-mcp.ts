@@ -5,7 +5,7 @@
  * binary (JSON-RPC 2.0 over stdio, one message per line), asks it for its tools and registers each
  * one as a pi tool named `omnidroid_<tool>`:
  *
- *   live instance   omnidroid_start_instance / stop_instance / list_instances / screenshot / …
+ *   devices, apps   omnidroid_start_instance {apk} (the warm device) / shell / screenshot / stop_app / …
  *   lab debugger    omnidroid_lab_load, then call_function / intercept / read_mem / dump_module / …
  *                   (Frida-style, at the emulation layer; see the omnidroid-frida skill)
  *
@@ -266,7 +266,7 @@ export default function omniMcp(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		if (!registered.size) return;
-		const note = `omnidroid tools (${prefix}*) drive the omnidroid engine through its MCP server: ${prefix}start_instance boots the real-AOSP path for an APK (minutes; poll ${prefix}screenshot), and ${prefix}lab_load + ${prefix}call_function / ${prefix}intercept / ${prefix}read_mem / ${prefix}dump_module are a Frida-style debugger for one arm64 .so at the emulation layer (not attached to a running game). Read the omnidroid skill (live) or the omnidroid-frida skill (lab) before using them. Addresses are strings ("0x…").`;
+		const note = `omnidroid tools (${prefix}*) drive omnidroid -- real Android 15 running on its own Linux layer, arm64 translated, no VM -- through its MCP server. Any APK: ${prefix}start_instance {apk} installs it on the host's one warm Android device (by content: the same bytes are reused) and answers once its first screen is up (seconds when the device is warm; a first call boots the device, ~1-4 min); ${prefix}shell runs a command on that device (root with uid 0), ${prefix}screenshot shows it, ${prefix}stop_instance / ${prefix}stop_app stop the app and keep the device warm. Native code: ${prefix}lab_load + ${prefix}call_function / ${prefix}intercept / ${prefix}read_mem / ${prefix}dump_module are a Frida-style debugger for one arm64 .so at the emulation layer (not attached to a live app; there is no frida-server here). Read the omnidroid skill (devices, apps) or the omnidroid-frida skill (the lab) before using them. Addresses are strings ("0x…"). The omni_* tools, if present, are the retired QEMU manager: only when asked for it by name.`;
 		return { systemPrompt: `${event.systemPrompt}\n\n${note}` };
 	});
 }

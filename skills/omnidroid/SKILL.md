@@ -1,6 +1,6 @@
 ---
 name: omnidroid
-description: Use when running Roblox (or any APK) on omnidroid, the native ARM64-Android engine in "Omni Apps/omnidroid" (Rust, no VM) — booting an instance through the omnidroid MCP tools (start_instance, screenshot, list_instances, stop_instance) or the `omnidroid` CLI (play, aosp, login, which), signing in with a saved cookie, joining a place, picking the APK, headless runs and the control channel, and proving a session really signed in and joined from its log. Trigger on "boot/launch omnidroid", "start an instance", "join place <id>", "run this APK", "sign in with the cookie", "take a screenshot of the instance", "is the game running", or any omnidroid_* / mcp__omnidroid__* tool. For hooking, calling or dumping a .so use the omnidroid-frida skill; for the old QEMU manager (offsets, `omnidroid su`, frida-server) use omnidroid-qemu.
+description: Use when running Roblox or any APK on omnidroid, the native ARM64-Android engine in "Omni Apps/omnidroid" (Rust, no VM) — installing and testing any APK in seconds on the host's warm Android device (start_instance / install_apk / shell / stop_app / uninstall_apk / device_status / stop_device), looking inside a running app (its log, files, process), booting a Roblox instance through the omnidroid MCP tools (start_instance, screenshot, list_instances, stop_instance) or the `omnidroid` CLI (play, aosp, login, which), signing in with a saved cookie, joining a place, picking the APK, headless runs and the control channel, and proving a session really signed in and joined from its log. Trigger on "boot/launch omnidroid", "start an instance", "join place <id>", "run this APK", "sign in with the cookie", "take a screenshot of the instance", "is the game running", or any omnidroid_* / mcp__omnidroid__* tool. For hooking, calling or dumping a .so use the omnidroid-frida skill; for the old QEMU manager (offsets, `omnidroid su`, frida-server) use omnidroid-qemu.
 ---
 
 # Driving omnidroid
@@ -33,15 +33,52 @@ not configured: in the omnidroid repo `cargo build --release -p omni-mcp`, then 
 `node scripts/install.mjs` and restart pi. Its path lives in `~/.pi/agent/omni-agent.json` →
 `omniMcp.command`.
 
-### Live instance
+### Any APK on the warm device (no cookie)
+
+Without `cookie`, `start_instance {apk}` and `install_apk {apk}` use the host's **one warm
+device** (Android booted and idle, no app of its own): the APK is installed unless the device
+already holds the same bytes (SHA-256, not version), another test app is uninstalled first, and
+`start_instance` **blocks until the launcher Activity is displayed**, answering `state:
+app_on_screen` with seconds per step. No warm device up: the call boots one (~45-60 s from its saved
+copy; the first ever ~2 min; the whole first call ~70-80 s) and it stays up for the next APKs, beyond
+this server. Report: `docs/MORNING-2026-10-01-fast-boot.md`.
 
 | tool | does |
 |---|---|
-| `start_instance {apk?, cookie?, place?, gpu?, size?, minutes?}` | spawns `omnidroid aosp …` and **returns at once** with `instance_id`, `pid`, `screenshot_path` |
+| `start_instance {apk}` | install by content + start; ~2 s same APK, ~8-10 s a rebuilt/other small APK (a spare app process is kept ready), ~27 s Roblox (i7) |
+| `install_apk {apk}` | install by content now, no start |
+| `stop_instance {instance_id, device?}` | force-stop + clear the app; the device stays warm (`device: true` shuts it) |
+| `shell {command, uid?}` | adb-shell style on the warm device (`pm`, `am`, `dumpsys`, `logcat -d`) |
+| `uninstall_apk {package}` / `stop_app {package}` | on the warm device |
+| `device_status` / `stop_device` | none/booting/ready + test apps / shut it down |
+
+- `screenshot` right after a start waits for a fresh frame (<=3 s).
+- From a terminal: `python tools/device_ctl.py "<command>"` (control channel `<dir>.ctl`).
+- Never two devices per host: a warm device will not boot while a Roblox session/standby runs.
+- Quitting pi (the MCP server exiting) force-stops the apps it started; the device stays up.
+
+**Looking inside a running app** (the warm device has no adb, no frida-server -- the guest kernel
+has no `ptrace`, so nothing can be injected into a live process):
+
+| want | how |
+|---|---|
+| its log | the device's log file on the host -- `device_status` → `log` (`<device dir>.log`): every Android log line (`I/Tag(pid): ...`) lands there; grep it with your file tools. In-guest `logcat -d` is empty here |
+| its process | `shell "dumpsys activity processes | grep <package>"` (pid, state). `pidof`/`ps` do not see apps: each runs in a host process of its own |
+| what is on screen / its state | `screenshot`; `shell "dumpsys activity top"`, `"dumpsys window | grep mCurrentFocus"` |
+| its files, prefs, databases | `shell {command: "ls -R /data/data/com.example.app", uid: 0}`, `cat` a file (root reads any) |
+| input | `shell "input tap X Y"`, `"input text hello"`, `"input keyevent KEYCODE_BACK"` |
+| its native code, hooked | the installed APK is on the host: `<device dir>/data/app/*/<package>-*/base.apk` (`device_status` gives the dir); unzip `lib/arm64-v8a/*.so` and use the **omnidroid-frida** lab (`lab_load`, `intercept`, `call_function`, `dump_module`) |
+| a fresh start of it | `stop_app {package}` then `start_instance {apk}` (same bytes: no reinstall) |
+
+### Roblox sessions (with `cookie`)
+
+| tool | does |
+|---|---|
+| `start_instance {apk?, cookie?, place?, gpu?, size?, minutes?}` | **returns at once** with `instance_id`, `state`, `screenshot_path`: takes over the waiting standby instance (below) when there is one, else spawns `omnidroid aosp …` |
 | `screenshot {instance_id?}` | the latest framebuffer PNG: `path`, `width`, `height` (a vision model in pi also gets the image) |
-| `list_instances` | every instance this server started: `running`, `uptime_s`, `apk`, `place`, `screenshot_path` |
-| `stop_instance {instance_id}` | kills it |
-| `install_apk {apk}` / `login {cookie}` / `join_place {place}` | **only record defaults for the NEXT `start_instance`** — they never touch a running instance |
+| `list_instances` | each instance's **`state`** (`booting`, `signed_in`, `joining`, `in_game` + `in_place`, `stopped`), `log`, `screenshot_path` — poll this, not screenshots |
+| `stop_instance {instance_id}` | ends it (its `stop` file: the device shuts down and is removed); a standby stopped this way is replaced by a new one |
+| `login {cookie}` / `join_place {place}` | **only record defaults for the NEXT `start_instance`** — they never touch a running instance |
 | `launch_app` | the same as `start_instance` |
 
 - `cookie` is a cookie file path or a name `omnidroid login` saved; `place` is the numeric placeId
@@ -49,10 +86,15 @@ not configured: in the omnidroid repo `cargo build --release -p omni-mcp`, then 
   `size` is `WxH`; `minutes` bounds the session (default 30).
 - `apk` falls back to `OMNI_MCP_APK` (set in `omniMcp.env`). There is no auto-pick here: without
   either, `start_instance` fails with "no APK".
-- A boot takes **minutes**. `screenshot` answers "no frame yet … (still booting?)" until the
-  display has presented one; poll it every 20–30 s, don't spin.
+- **How long.** With `OMNI_MCP_STANDBY=1` the server keeps one instance booted, signed in and in
+  `OMNI_MCP_PLACE`, started when a client connects and left running when it quits:
+  `start_instance` for that place answers `state: in_game` in milliseconds; another place is joined
+  in ~30-50 s. Without a standby: the first session for an APK + account boots a new device
+  (~8 min, and saves it); later ones boot the saved device (~3.5 min to in-game). Poll
+  `list_instances` every 10-20 s until `in_game`, don't spin.
 - Instances belong to the omni-mcp process. In pi it is kept across chat switches and closed on
-  quit — **quitting pi stops every instance it booted**. A tool call that times out (600 s,
+  quit — **quitting pi stops every instance it booted**, except a standby it took over, which is
+  given back still running for the next session. A tool call that times out (600 s,
   `omniMcp.timeoutSec`) restarts omni-mcp, which also stops them.
 
 ### What `start_instance` actually runs — and why a failure is silent

@@ -84,7 +84,12 @@ function installOpenRouter() {
  *  built omni-mcp unless the one configured still exists. */
 function omniMcpConfig(prev = {}) {
   const keep = prev.command && existsSync(prev.command);
-  return { ...prev, command: keep ? prev.command : omniMcpBin };
+  // omni-mcp's `omnidroid aosp` runs cargo, which rebuilds dynarmic unless it gets the build
+  // directory the omnidroid build used (Windows: a short path, MSVC fails past MAX_PATH): the
+  // installer's own OMNIDROID_DYNARMIC_BUILD_DIR, unless the config already names one.
+  const dyn = process.env.OMNIDROID_DYNARMIC_BUILD_DIR;
+  const env = { ...(dyn ? { OMNIDROID_DYNARMIC_BUILD_DIR: dyn } : {}), ...(prev.env || {}) };
+  return { ...prev, ...(Object.keys(env).length ? { env } : {}), command: keep ? prev.command : omniMcpBin };
 }
 
 /** Claude Code gets the same server as `omnidroid` (tools mcp__omnidroid__*), with the same env. */
