@@ -127,12 +127,23 @@ export class GoalKeeper {
   setConfig(patch) { this.config = { ...this.config, ...patch }; if (!this.config.enabled) for (const g of this.goals.values()) clearTimeout(g.timer); return this.config; }
 
   goal(sid) { return this.goals.get(sid) || null; }
-  setGoal(sid, text) {
+  setGoal(sid, text, explicit = false) {
     const prev = this.goals.get(sid);
     if (prev) clearTimeout(prev.timer);
-    const g = { text, seq: (prev?.seq || 0) + 1, nudges: 0, idleNudges: 0, nudged: false, progress: false, ran: false, aborted: false, stopReason: "", tail: [], timer: null, checking: false };
+    const g = { text, explicit, seq: (prev?.seq || 0) + 1, nudges: 0, idleNudges: 0, nudged: false, progress: false, ran: false, aborted: false, stopReason: "", tail: [], timer: null, checking: false };
     this.goals.set(sid, g);
     return g;
+  }
+  /**
+   * Set an **explicit**, persistent goal (from the `/goal` command): it overrides the implicit
+   * "last user prompt" goal and is NOT replaced by subsequent plain prompts, so the agent keeps
+   * working toward it until the judge says it is done. Empty text clears the explicit lock, so the
+   * next prompt becomes the goal again.
+   */
+  setExplicitGoal(sid, text) {
+    const t = String(text ?? "").trim();
+    if (!t) { const g = this.goals.get(sid); if (g) g.explicit = false; return g || null; }
+    return this.setGoal(sid, t, true);
   }
   /** The user stopped the agent (or the run was aborted): leave it alone until the next prompt. */
   cancel(sid) { const g = this.goals.get(sid); if (!g) return; clearTimeout(g.timer); g.timer = null; g.aborted = true; }
@@ -143,7 +154,8 @@ export class GoalKeeper {
     if (ev.kind === "msg" && ev.live) {
       if (ev.role === "user") {
         const text = (ev.blocks || []).map((b) => b.text || "").join("\n");
-        if (!hookInfo(text)) this.setGoal(ev.sid, text);
+        // A plain prompt sets the goal, UNLESS an explicit /goal is locked in for this chat.
+        if (!hookInfo(text)) { const cur = this.goals.get(ev.sid); if (!(cur && cur.explicit)) this.setGoal(ev.sid, text); }
         return;
       }
       if (!g) return;

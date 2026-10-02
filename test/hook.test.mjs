@@ -136,6 +136,29 @@ test("judge failures, non-JSON replies, a disabled hook and aborted runs never n
   s.keeper.dispose();
 });
 
+test("an explicit /goal persists across plain prompts and is what the judge sees", async () => {
+  const s = setup({ verdicts: [{ done: false, reason: "r" }] });
+  s.keeper.setExplicitGoal(SID, "Port the whole module");
+  assert.equal(s.keeper.goal(SID).text, "Port the whole module");
+  assert.equal(s.keeper.goal(SID).explicit, true);
+  // A plain user prompt must NOT replace the explicit goal (it is a step toward it).
+  s.user("also fix the typo");
+  assert.equal(s.keeper.goal(SID).text, "Port the whole module", "explicit goal survives a plain prompt");
+  s.run(); s.assistant("planned."); s.settle(); await sleep(60);
+  assert.match(s.judgeCalls[0].input, /Port the whole module/, "the judge sees the explicit goal");
+  s.keeper.dispose();
+});
+
+test("setExplicitGoal('') clears the explicit lock so a prompt sets the goal again", () => {
+  const s = setup();
+  s.keeper.setExplicitGoal(SID, "Big goal");
+  s.keeper.setExplicitGoal(SID, "");
+  s.user("new task");
+  assert.equal(s.keeper.goal(SID).text, "new task");
+  assert.equal(!!s.keeper.goal(SID).explicit, false);
+  s.keeper.dispose();
+});
+
 test("the judge's pick follows the hook config over the chat model, and a new run while judging discards the verdict", async () => {
   let release;
   const gate = new Promise((r) => { release = r; });

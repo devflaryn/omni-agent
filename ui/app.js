@@ -127,7 +127,30 @@ function renderHome() {
   home.setState({ ...piModelState(), caption: S.pi.running ? `pi in ${baseName(S.pi.cwd || "")}` : "" });
   updateHeader();
 }
+// `/goal <text>` sets a persistent goal the keeper re-engages the agent toward until a judge says
+// it is done; `/goal` or `/goal show` reports it; `/goal clear` drops it. Handled here, never sent
+// to the model. Returns true when the input was a goal command.
+async function goalCommand(text, composer) {
+  const m = /^\/goal\b\s*([\s\S]*)$/.exec(text.trim());
+  if (!m) return false;
+  const arg = m[1].trim();
+  try {
+    if (!arg || arg === "show") {
+      const g = await api("/api/goal");
+      toast(g.goal ? `Goal: ${g.goal}${g.nudges ? ` · re-engaged ${g.nudges}×` : ""}` : "No goal set — type /goal <text> to set one");
+    } else if (arg === "clear") {
+      await api("/api/goal", { goal: "" }, "POST");
+      toast("Goal cleared");
+    } else {
+      await api("/api/goal", { goal: arg }, "POST");
+      toast("Goal set — the agent will be re-engaged until it's done");
+    }
+    composer?.clear?.();
+  } catch (e) { toast(e.message, true); }
+  return true;
+}
 async function homeSend(text, o) {
+  if (await goalCommand(text, home)) return;
   const cwd = homeCwd();
   if (!cwd) return toast("Set a working directory first", true);
   home.setState({ disabled: true, caption: "Starting pi…" });
@@ -172,6 +195,7 @@ function updateComposer() {
   chat.setState(st);
 }
 async function chatSend(text, o) {
+  if (await goalCommand(text, chat)) return;
   const t = target();
   try {
     if (t.kind === "owned-pi") { await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph }); chat.clear(); return; }

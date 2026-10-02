@@ -299,6 +299,19 @@ export async function createApp(overrides = {}) {
           return send(res, 200, { hook: next });
         }
       }
+      // explicit goal (the /goal command): set a persistent goal and arm the keeper
+      if (p === "/api/goal") {
+        const g0 = keeper.goal(pi?.sid);
+        if (req.method === "GET") return send(res, 200, { goal: g0?.text || "", explicit: !!g0?.explicit, nudges: g0?.nudges || 0, enabled: keeper.config.enabled });
+        if (req.method === "POST" || req.method === "PUT") {
+          if (!pi?.sid) return send(res, 400, { error: "no active pi session; start a chat first" });
+          const goal = String((await readBody(req)).goal ?? "").trim();
+          keeper.setExplicitGoal(pi.sid, goal);
+          // Setting a goal arms the keeper so the agent is re-engaged until the goal is done.
+          if (goal && !keeper.config.enabled) { keeper.setConfig({ ...keeper.config, enabled: true }); if (cfg.persistHook !== false) writeConfigFile({ hook: keeper.config }); }
+          return send(res, 200, { goal, explicit: !!goal, enabled: keeper.config.enabled });
+        }
+      }
       // providers (pi's models.json)
       if (req.method === "GET" && p === "/api/providers") {
         const mdl = pi?.state?.model;
