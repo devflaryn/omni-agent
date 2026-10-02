@@ -11,7 +11,7 @@ import { CONFIG, ROOT, hookConfig, lanAddresses, piChildEnv, writeConfigFile } f
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
 import { PiRpc, PI_THINKING_LEVELS } from "./pi-rpc.mjs";
-import { GoalKeeper, JUDGE_SYSTEM, runJudge } from "./hook.mjs";
+import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM, runJudge } from "./hook.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
@@ -39,6 +39,8 @@ export async function createApp(overrides = {}) {
     bus, log,
     getPi: (sid) => (pi?.proc && pi.sid === sid ? pi : null),
     judge: cfg.judge || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn }, { system: JUDGE_SYSTEM, input })),
+    // The status-box summarizer: same separate-LLM mechanism as the judge, chat model by default.
+    summarize: cfg.summarize || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn }, { system: SUMMARY_SYSTEM, input })),
     config: hookConfig(cfg.hook),
   });
 

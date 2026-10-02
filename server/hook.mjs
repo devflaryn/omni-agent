@@ -18,7 +18,31 @@ It must NOT stop when it only described a plan, stopped part-way ("next I will�
 Reply with exactly one JSON object and nothing else:
 {"done": true or false, "reason": "one short sentence", "nudge": "when done is false: one or two sentences telling the agent precisely what to do next"}`;
 
+export const SUMMARY_SYSTEM = `You write a tiny status box for someone watching a coding agent work. You get the goal and the most recent part of the agent's work.
+Reply with 2 to 4 short sentences, plain text, no preamble, no markdown headings: what the goal is, what has been done so far, and what is left or the immediate next step. Be concrete and specific; name files/actions. If nothing has happened yet, say so in one sentence.`;
+
 const clip = (s, n) => { const t = String(s ?? ""); return t.length > n ? `${t.slice(0, n)}…` : t; };
+
+/** The text the summarizer reads — the goal plus the recent work tail, within a budget. Pure. */
+export function buildSummaryInput({ goal, tail = [] }, { maxChars = 6000 } = {}) {
+  let work = [];
+  let used = 0;
+  for (let i = tail.length - 1; i >= 0; i--) { const line = tail[i]; if (used + line.length > maxChars && work.length) break; work.unshift(line); used += line.length; }
+  if (!work.length) work = ["(the agent has not done anything yet)"];
+  return [
+    "Goal:",
+    "<goal>",
+    clip(goal, 2000),
+    "</goal>",
+    "",
+    "Most recent work (most recent last):",
+    "<work>",
+    ...work,
+    "</work>",
+    "",
+    "Write the 2-4 sentence status box now.",
+  ].join("\n");
+}
 
 /** The text the judge reads. Pure, so it is testable. */
 export function buildJudgeInput({ goal, tail = [], nudges = 0, idleNudges = 0, maxIdleNudges = 5, stopReason = "" }, { maxChars = 6000 } = {}) {
@@ -109,11 +133,13 @@ export class GoalKeeper {
    * @param {(sid: string) => object|null} o.getPi  Omni's pi child when it owns `sid`, else null.
    * @param {(input: string, pick: {provider, model}) => Promise<string>} o.judge  returns the judge's raw reply.
    */
-  constructor({ bus, getPi, judge, config = {}, log = () => {} }) {
+  constructor({ bus, getPi, judge, summarize, config = {}, log = () => {} }) {
     this.bus = bus;
     this.getPi = getPi;
     this.judge = judge;
-    this.config = { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, ...config };
+    // A separate one-off LLM call (runJudge-style) that writes the status box. Optional.
+    this.summarizeFn = summarize || null;
+    this.config = { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true, ...config };
     this.log = log;
     // sid -> { text, seq, nudges, idleNudges, nudged, progress, ran, aborted, stopReason, tail: [], timer, checking }
     // The keeper re-engages without limit; it only gives up after `maxIdleNudges` re-engagements in a row
@@ -173,7 +199,11 @@ export class GoalKeeper {
 
   onSettled(sid) {
     const g = this.goals.get(sid);
-    if (!g || !this.config.enabled || g.aborted || g.checking) return;
+    if (!g || g.aborted) return;
+    // Refresh the status box on every settle (a milestone), independent of the re-engage toggle,
+    // using a separate summarizer LLM. Fire-and-forget so it never blocks the goal check.
+    this.makeSummary(sid).catch((e) => this.log("summary failed", e.message));
+    if (!this.config.enabled || g.checking) return;
     g.ran = false;
     // The run that just settled was a re-engaged one: did the agent actually do anything (a tool call)?
     if (g.nudged) { g.idleNudges = g.progress ? 0 : g.idleNudges + 1; g.nudged = false; }
@@ -181,6 +211,17 @@ export class GoalKeeper {
     clearTimeout(g.timer);
     const seq = g.seq;
     g.timer = setTimeout(() => { g.timer = null; this.check(sid, seq).catch((e) => this.log("goal hook failed", e.message)); }, this.config.graceMs);
+  }
+
+  /** Write the status box with the separate summarizer LLM and broadcast it as a `summary` event. */
+  async makeSummary(sid) {
+    const g = this.goals.get(sid);
+    const pi = this.getPi(sid);
+    if (!g || !this.summarizeFn || this.config.summaries === false || !pi) return;
+    const input = buildSummaryInput({ goal: g.text, tail: g.tail });
+    const pick = { provider: this.config.summaryProvider || this.config.provider || pi.state?.model?.provider || "", model: this.config.summaryModel || this.config.model || pi.state?.model?.id || "" };
+    const text = clip(String(await this.summarizeFn(input, pick) ?? "").trim(), 1200);
+    if (text) this.bus.emit({ sid, harness: "pi", kind: "summary", ts: Date.now(), goal: g.text, explicit: !!g.explicit, nudges: g.nudges, text });
   }
 
   async check(sid, seq) {

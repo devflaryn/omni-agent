@@ -95,6 +95,29 @@ async function setHook(patch) {
 /** `persist` only for a deliberate toggle; leaving the chat view must not remember "closed". */
 function setExplorer(open, persist = false) { document.body.classList.toggle("explorer-open", open); if (!open) explorer.closePreview(); if (persist) { try { localStorage.setItem("omni.explorer", open ? "1" : "0"); } catch { /* */ } } }
 function explorerPreferred() { try { return localStorage.getItem("omni.explorer") !== "0"; } catch { return true; } }
+// The toggleable TLDR/goal-progress box, filled by the separate summarizer (a `summary` SSE event).
+function summaryOn() { try { return localStorage.getItem("omni.summary") !== "off"; } catch { return true; } }
+function renderSummary() {
+  const box = $("#summaryBox"), btn = $("#btnSummary");
+  const s = S.selected ? S.sessions.get(S.selected) : null;
+  const sum = s?.summary;
+  const have = S.page === "chat" && !!sum;
+  if (btn) { btn.hidden = !have; btn.classList.toggle("on", have && summaryOn()); }
+  if (!box) return;
+  if (!have || !summaryOn()) { box.hidden = true; return; }
+  box.hidden = false;
+  box.textContent = "";
+  const head = el("div", "summary-head");
+  head.appendChild(el("span", "summary-tag", sum.goal ? "Goal" : "Summary"));
+  if (sum.goal) head.appendChild(el("span", "summary-goal", sum.goal));
+  if (sum.nudges) head.appendChild(el("span", "summary-nudges", `re-engaged ${sum.nudges}×`));
+  const x = el("button", "summary-x", "×");
+  x.title = "Hide the summary box (toggle it from the header)";
+  x.onclick = () => { try { localStorage.setItem("omni.summary", "off"); } catch { /* */ } renderSummary(); };
+  head.appendChild(x);
+  box.appendChild(head);
+  box.appendChild(el("div", "summary-body", sum.text || ""));
+}
 function showView(name) {
   S.page = name;
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${name}`));
@@ -104,6 +127,7 @@ function showView(name) {
   // Both composers share the remembered attachment choices (memory / repo graph).
   if (name === "home") { setExplorer(false); home.reloadOptions(); renderHome(); home.focus(); }
   if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth > 760 && explorerPreferred()); chat.reloadOptions(); updateHeader(); updateComposer(); }
+  renderSummary();
   updateTitle();
 }
 function updateTitle() {
@@ -277,6 +301,7 @@ function renderChatMenu() {
 $("#btnChatMenu").onclick = (e) => { e.stopPropagation(); const m = $("#chatMenu"); if (m.hidden) renderChatMenu(); m.hidden = !m.hidden; };
 document.addEventListener("click", (e) => { if (!e.target.closest("#chatMenu, #btnChatMenu")) $("#chatMenu").hidden = true; });
 $("#btnExplorer").onclick = () => { explorer.setRoot(currentDir()); setExplorer(!document.body.classList.contains("explorer-open"), true); };
+$("#btnSummary").onclick = () => { try { localStorage.setItem("omni.summary", summaryOn() ? "off" : "on"); } catch { /* */ } renderSummary(); };
 $("#btnSettings").onclick = () => settings.open();
 
 // ------------------------------------------------------------------ SSE
@@ -297,6 +322,7 @@ function handle(ev) {
   if (ev.kind === "msg" && ev.usage) { const t = s.tally || (s.tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, messages: 0, cost: 0, context: 0 }); if (!ev.groupId || t.lastGroup !== ev.groupId) { t.lastGroup = ev.groupId; t.input += ev.usage.input; t.output += ev.usage.output; t.cacheRead += ev.usage.cacheRead; t.cacheWrite += ev.usage.cacheWrite; t.total += ev.usage.total; t.messages++; t.context = ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite; t.cost += ev.cost || 0; } }
   if (ev.kind !== "session") s.lastActivity = Math.max(s.lastActivity || 0, ev.ts || 0);
   if (ev.kind === "digest") toast(`Digest saved: ${ev.path}`);
+  if (ev.kind === "summary") { s.summary = { text: ev.text || "", goal: ev.goal || "", nudges: ev.nudges || 0, ts: ev.ts }; if (ev.sid === S.selected) renderSummary(); }
   S.sessions.set(ev.sid, s);
   if (ev.harness === "pi" && s.owned) {
     S.pi.running = true;

@@ -7,14 +7,14 @@ import { hookInfo } from "../ui/lib.js";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const SID = "pi:abc";
 
-function setup({ verdicts = [], config = {} } = {}) {
+function setup({ verdicts = [], config = {}, summarize } = {}) {
   const bus = new Bus();
   const pi = { proc: {}, sid: SID, streaming: false, state: { model: { provider: "orca", id: "qwen" } }, prompts: [], async prompt(m, o) { this.prompts.push([m, o]); return { success: true }; } };
   const judgeCalls = [];
   const judge = async (input, pick) => { judgeCalls.push({ input, pick }); const v = verdicts.shift(); if (v instanceof Error) throw v; return typeof v === "string" ? v : JSON.stringify(v); };
   const events = [];
   bus.on("event", (ev) => events.push(ev));
-  const keeper = new GoalKeeper({ bus, getPi: (sid) => (sid === SID ? pi : null), judge, config: { enabled: true, graceMs: 10, maxIdleNudges: 2, ...config } });
+  const keeper = new GoalKeeper({ bus, getPi: (sid) => (sid === SID ? pi : null), judge, summarize, config: { enabled: true, graceMs: 10, maxIdleNudges: 2, summaries: !summarize ? false : true, ...config } });
   const emit = (ev) => bus.emit({ sid: SID, harness: "pi", ts: Date.now(), ...ev });
   const user = (text) => emit({ kind: "msg", role: "user", live: true, id: `u${Date.now()}`, blocks: [{ type: "text", text }] });
   const assistant = (text, stopReason = "stop") => emit({ kind: "msg", role: "assistant", live: true, id: `a${Date.now()}`, stopReason, blocks: [{ type: "text", text }] });
@@ -156,6 +156,19 @@ test("setExplicitGoal('') clears the explicit lock so a prompt sets the goal aga
   s.user("new task");
   assert.equal(s.keeper.goal(SID).text, "new task");
   assert.equal(!!s.keeper.goal(SID).explicit, false);
+  s.keeper.dispose();
+});
+
+test("the keeper emits a summary event on settle via a separate summarizer, even with re-engage off", async () => {
+  const s = setup({ config: { enabled: false }, summarize: async () => "Wrote the loader in loader.rs. Next: write the tests." });
+  s.user("Build the loader");
+  s.run(); s.assistant("working on it"); s.settle();
+  await sleep(60);
+  const sum = s.events.find((e) => e.kind === "summary");
+  assert.ok(sum, "a summary event is emitted on settle");
+  assert.match(sum.text, /Wrote the loader in loader\.rs/);
+  assert.equal(sum.goal, "Build the loader");
+  assert.equal(s.pi.prompts.length, 0, "re-engage stays off; only the summary fired");
   s.keeper.dispose();
 });
 

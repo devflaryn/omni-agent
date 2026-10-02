@@ -341,7 +341,7 @@ test("fs/read reports a kind per file family: markdown, text, image, archive, bi
 
 test("goal hook settings: /api/hook reads, validates and updates the keeper", async () => {
   const before = await api("/api/hook");
-  assert.deepEqual(before.hook, { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000 });
+  assert.deepEqual(before.hook, { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true });
   const st = await api("/api/state");
   assert.deepEqual(st.hook, before.hook, "state carries the same settings");
   const r = await fetch(`http://127.0.0.1:${port}/api/hook`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, provider: "openrouter", model: "deepseek/x", maxIdleNudges: 999 }) });

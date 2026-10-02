@@ -500,3 +500,14 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field-2); }
   #toasts { left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); }
   .toast { max-width: none; }
 }
+
+/* The goal/summary TLDR box, pinned at the top of a chat (renderSummary in app.js). */
+.summary-box { margin: 10px 16px 0; padding: 10px 12px; background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--r); font-size: 13px; color: var(--ink); }
+.summary-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.summary-tag { font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--accent); white-space: nowrap; }
+.summary-goal { flex: 1; min-width: 0; color: var(--ink); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.summary-nudges { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.summary-x { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.summary-x:hover { color: var(--ink); }
+.summary-body { color: var(--muted); line-height: 1.45; white-space: pre-wrap; }
+#btnSummary.on { color: var(--accent); }

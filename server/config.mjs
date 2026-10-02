@@ -137,6 +137,8 @@ export function hookConfig(raw = {}) {
     /** Consecutive re-engagements without a single tool call before the keeper gives up; otherwise it never stops. */
     maxIdleNudges: int(h.maxIdleNudges, 5, 1, 50),
     graceMs: int(h.graceMs, 2000, 0, 600000),
+    /** Whether the separate summarizer writes the status box on each settle (default on). */
+    summaries: h.summaries !== false,
   };
 }
 
