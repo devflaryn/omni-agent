@@ -511,3 +511,15 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field-2); }
 .summary-x:hover { color: var(--ink); }
 .summary-body { color: var(--muted); line-height: 1.45; white-space: pre-wrap; }
 #btnSummary.on { color: var(--accent); }
+
+/* Make all transcript text selectable and copyable on every surface — including the pywebview
+   desktop window, where content can default to non-selectable. Interactive chrome keeps defaults. */
+#transcript, #transcript .text, #transcript pre, #transcript code, #transcript .io, #transcript .witems, #summaryBox, .summary-body, .msg {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+/* Per-tool-card copy button (args + output), shown on hover of the card body. */
+#transcript .io { position: relative; }
+#transcript .io-copy { position: absolute; top: 4px; right: 4px; opacity: 0; transition: opacity 0.12s var(--ease); }
+#transcript .tool:hover .io-copy, #transcript .io-copy:focus-visible { opacity: 0.7; }
+#transcript .io-copy:hover { opacity: 1; }

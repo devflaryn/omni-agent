@@ -176,8 +176,10 @@ function toolCard(view, t, { toolId, name, args, ts }) {
   let c = toolId ? view.tools.get(toolId) : null;
   if (c) return c;
   const d = el("details", "tool running");
-  d.innerHTML = `<summary>${icon("other")}<span class="tlbl"></span><span class="tdiff" hidden></span><span class="st">running</span>${icon("chev", "chev")}</summary><div class="io"><pre class="args"></pre><pre class="out" hidden></pre></div>`;
+  d.innerHTML = `<summary>${icon("other")}<span class="tlbl"></span><span class="tdiff" hidden></span><span class="st">running</span>${icon("chev", "chev")}</summary><div class="io"><button class="io-copy icon-btn" title="Copy args + output">${ICONS.copy}</button><pre class="args"></pre><pre class="out" hidden></pre></div>`;
   c = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".tlbl"), diff: d.querySelector(".tdiff"), args: d.querySelector(".args"), out: d.querySelector(".out"), st: d.querySelector(".st"), argText: "", call: { name: name || "tool", args: undefined }, label: { kind: "other", text: name || "tool" }, item: { kind: "tool", startTs: ts || Date.now(), endTs: null } };
+  const ioCopy = d.querySelector(".io-copy");
+  if (ioCopy) ioCopy.onclick = (e) => { e.preventDefault(); e.stopPropagation(); const parts = [c.args.textContent, c.out.hidden ? "" : c.out.textContent].filter(Boolean); navigator.clipboard?.writeText(parts.join("\n\n")).catch(() => {}); };
   c.view = view; c.turn = t;
   setToolArgs(c, args);
   const w = workGroup(t);
