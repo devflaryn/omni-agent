@@ -355,6 +355,13 @@ test("goal hook settings: /api/hook reads, validates and updates the keeper", as
   assert.equal(app.keeper.config.enabled, false);
 });
 
+test("goal: /api/goal reports an empty goal and rejects a set without a pi session", async () => {
+  const empty = await api("/api/goal");
+  assert.equal(empty.goal, "");
+  const r = await api("/api/goal", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ goal: "Do the thing" }) });
+  assert.match(r.error, /no active pi session/);
+});
+
 test("model and thinking choices made before pi runs are remembered and handed to the next pi child", async () => {
   // `app` has no pi child at all
   const m = await fetch(`http://127.0.0.1:${port}/api/pi/model`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: "openrouter", modelId: "deepseek/x" }) });
