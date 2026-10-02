@@ -73,12 +73,17 @@ test("omni-mcp: a JSON-RPC error from a tool is thrown (pi marks it isError) and
   } finally { await x.quit(); }
 });
 
-test("omni-mcp: a call that never answers times out, and the next call starts a fresh server", async () => {
+test("omni-mcp: a slow call is kept alive and surfaced to the agent, not killed", async () => {
   const x = await load({ command: process.execPath, args: [FAKE], env: { FAKE_MCP: "1" }, timeoutSec: 1 });
   try {
-    await assert.rejects(x.run("omnidroid_hang", {}), /did not answer tools\/call in 1 s; it was restarted/);
+    // A call that does not return in time must RESOLVE with a keep-alive note (not reject/kill),
+    // so the agent decides whether to wait or move on and the server + lab survive.
+    const slow = await x.run("omnidroid_hang", {});
+    assert.equal(slow.isError ?? false, false, "a slow call is not an error");
+    assert.match(slow.content[0].text, /without returning|still alive|slow|intact|move on/i, "slow call surfaces a keep-alive note");
+    // The server stayed up: a later call still works without a restart.
     const r = await x.run("omnidroid_echo", { len: 2 });
-    assert.equal(JSON.parse(r.content[0].text).got.len, 2);
+    assert.equal(JSON.parse(r.content[0].text).got.len, 2, "server alive after a slow call");
   } finally { await x.quit(); }
 });
 

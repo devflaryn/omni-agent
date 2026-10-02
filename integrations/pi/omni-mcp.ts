@@ -45,6 +45,22 @@ function loadConfig(): OmniMcpConfig {
 
 const PROTOCOL_VERSION = "2024-11-05";
 const MAX_CHARS = 12000;
+
+/** A tool call that did not return within its timeout. The server is NOT killed: the call stays
+ *  pending (a late answer is delivered through `onLate`), so the lab and other progress survive. */
+export class SlowCallError extends Error {
+	method: string;
+	elapsedMs: number;
+	constructor(method: string, elapsedMs: number) {
+		super(`${method} did not return in ${Math.round(elapsedMs / 1000)} s`);
+		this.name = "SlowCallError";
+		this.method = method;
+		this.elapsedMs = elapsedMs;
+	}
+}
+
+/** What a late (post-timeout) answer carries back to the caller. */
+export type LatePayload = { text: string; images: { data: string; mimeType: string }[]; isError: boolean };
 const clip = (s: string) => (s.length > MAX_CHARS ? `${s.slice(0, MAX_CHARS)}\n… (${s.length - MAX_CHARS} more characters truncated)` : s);
 
 /** A minimal MCP client over a child's stdio: requests matched to responses by id. */
@@ -52,7 +68,7 @@ export class McpStdioClient {
 	private child: ChildProcess | null = null;
 	private buf = "";
 	private nextId = 1;
-	private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout | null; child: ChildProcess }>();
+	private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout | null; child: ChildProcess; timedOut?: boolean; onLate?: (err: Error | null, result?: any) => void }>();
 	private stderrTail = "";
 	private starting: Promise<void> | null = null;
 	private cfg: OmniMcpConfig;
@@ -112,7 +128,13 @@ export class McpStdioClient {
 			if (!p) continue;
 			this.pending.delete(msg.id);
 			if (p.timer) clearTimeout(p.timer);
-			if (msg.error) p.reject(new Error(String(msg.error.message ?? JSON.stringify(msg.error))));
+			const error = msg.error ? new Error(String(msg.error.message ?? JSON.stringify(msg.error))) : null;
+			if (p.timedOut) {
+				// The awaiting promise already settled (SlowCallError); deliver the late answer out-of-band.
+				p.onLate?.(error, msg.result);
+				continue;
+			}
+			if (error) p.reject(error);
 			else p.resolve(msg.result);
 		}
 	}
@@ -121,18 +143,24 @@ export class McpStdioClient {
 
 	notify(method: string, params: unknown) { this.send({ jsonrpc: "2.0", method, params }); }
 
-	/** One request. A timeout kills the server (it is single-threaded: a stuck call blocks all others). */
-	request(method: string, params: unknown, timeoutMs = 600_000, signal?: AbortSignal): Promise<any> {
+	/** One request. On timeout the server is **kept alive** (the lab and other progress survive): the
+	 *  promise rejects with a {@link SlowCallError}, but the call stays pending and a late answer is
+	 *  delivered through `onLate`. (omni-mcp is single-threaded, so a truly stuck call still occupies
+	 *  the server until it is cancelled or finishes — but nothing is lost.) */
+	request(method: string, params: unknown, timeoutMs = 600_000, signal?: AbortSignal, onLate?: (err: Error | null, result?: any) => void): Promise<any> {
 		const child = this.child;
 		if (!child) return Promise.reject(new Error("omni-mcp is not running"));
 		const id = this.nextId++;
 		return new Promise((resolve, reject) => {
 			const timer = timeoutMs > 0 ? setTimeout(() => {
-				this.pending.delete(id);
-				reject(new Error(`omni-mcp did not answer ${method} in ${Math.round(timeoutMs / 1000)} s; it was restarted (a loaded lab is gone: lab_load again)`));
-				this.close(0);
+				const p = this.pending.get(id);
+				if (!p) return;
+				p.timedOut = true;
+				p.timer = null;
+				// Keep the entry (and the server) so a late answer still reaches `onLate`.
+				reject(new SlowCallError(method, timeoutMs));
 			}, timeoutMs) : null;
-			this.pending.set(id, { resolve, reject, timer, child });
+			this.pending.set(id, { resolve, reject, timer, child, onLate });
 			signal?.addEventListener("abort", () => {
 				if (!this.pending.delete(id)) return;
 				if (timer) clearTimeout(timer);
@@ -143,13 +171,19 @@ export class McpStdioClient {
 	}
 
 	/** Call a tool; returns the text the server answered with (omni-mcp answers one JSON text item). */
-	async callTool(name: string, args: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<{ text: string; images: { data: string; mimeType: string }[] }> {
+	async callTool(name: string, args: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal, onLate?: (err: Error | null, payload?: LatePayload) => void): Promise<{ text: string; images: { data: string; mimeType: string }[] }> {
 		await this.start();
-		const result = await this.request("tools/call", { name, arguments: args }, timeoutMs, signal);
-		const content: any[] = Array.isArray(result?.content) ? result.content : [];
-		const text = content.filter((c) => c?.type === "text").map((c) => String(c.text)).join("\n");
-		const images = content.filter((c) => c?.type === "image" && c.data).map((c) => ({ data: String(c.data), mimeType: String(c.mimeType || "image/png") }));
-		if (result?.isError) throw new Error(text || `${name} failed`);
+		const parse = (result: any): LatePayload => {
+			const content: any[] = Array.isArray(result?.content) ? result.content : [];
+			const text = content.filter((c) => c?.type === "text").map((c) => String(c.text)).join("\n");
+			const images = content.filter((c) => c?.type === "image" && c.data).map((c) => ({ data: String(c.data), mimeType: String(c.mimeType || "image/png") }));
+			return { text, images, isError: !!result?.isError };
+		};
+		// If the call times out and later finishes, hand the parsed payload to `onLate`.
+		const lateInner = onLate ? (err: Error | null, result?: any) => onLate(err, err ? undefined : parse(result)) : undefined;
+		const result = await this.request("tools/call", { name, arguments: args }, timeoutMs, signal, lateInner);
+		const { text, images, isError } = parse(result);
+		if (isError) throw new Error(text || `${name} failed`);
 		return { text, images };
 	}
 
@@ -236,7 +270,33 @@ export default function omniMcp(pi: ExtensionAPI) {
 				parameters,
 				prepareArguments: (args: unknown) => coerceArgs(parameters, args),
 				async execute(_id: string, params: any, signal: AbortSignal | undefined, _update: unknown, ctx: any) {
-					const { text, images } = await client().callTool(t.name, params ?? {}, timeoutMs, signal);
+					// If this call times out but the server later finishes it, post the result as a
+					// follow-up so nothing is lost (the server and lab stayed alive meanwhile).
+					const onLate = (err: Error | null, payload?: LatePayload) => {
+						if (err || !payload) return;
+						try {
+							pi.sendMessage?.(
+								`✓ ${name} finished after running long${payload.isError ? " (with an error)" : ""}:\n${clip(pretty(payload.text))}`,
+								{ deliverAs: "followUp" },
+							);
+						} catch { /* best effort */ }
+					};
+					let text: string;
+					let images: { data: string; mimeType: string }[];
+					try {
+						({ text, images } = await client().callTool(t.name, params ?? {}, timeoutMs, signal, onLate));
+					} catch (e) {
+						if (e instanceof SlowCallError) {
+							// Keep-alive: tell the agent and let it decide, rather than failing the whole run.
+							const secs = Math.round(e.elapsedMs / 1000);
+							return {
+								content: [{ type: "text", text:
+									`⏱ ${name} has run ${secs}s without returning. The omni-mcp server and your loaded lab are still alive — nothing was lost. The call may be slow or stuck. Decide: wait and call ${name} again to keep going, or move on to something else. If it finishes on its own I'll post the result.` }],
+								details: { tool: t.name, slow: true, elapsedMs: e.elapsedMs },
+							};
+						}
+						throw e;
+					}
 					let parsed: unknown;
 					try { parsed = JSON.parse(text); } catch { parsed = undefined; }
 					const content: any[] = [{ type: "text", text: clip(pretty(text)) }, ...images.map((i) => ({ type: "image", ...i }))];
