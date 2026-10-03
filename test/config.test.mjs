@@ -102,3 +102,14 @@ test("hookConfig clamps and defaults the new numbers", () => {
   assert.equal(h.loopK, 3);
   assert.equal(h.judgeTimeoutMs, 120000);
 });
+
+test("piChildEnv puts the tools bin dir first on the pi child's PATH when it exists", () => {
+  const env = piChildEnv({ toolsBinDir: "/opt/retools/bin", apiKeyFiles: {} }, { path: "/usr/bin:/bin", exists: () => true });
+  assert.ok(env.PATH.startsWith("/opt/retools/bin"), "tools bin should be prepended");
+  assert.ok(env.PATH.includes("/usr/bin"), "existing PATH preserved");
+  assert.equal(env.OMNI_MEMORY, "server");
+});
+test("piChildEnv does not touch PATH when the tools bin dir is absent", () => {
+  const env = piChildEnv({ toolsBinDir: "/nope", apiKeyFiles: {} }, { path: "/usr/bin", exists: () => false });
+  assert.equal(env.PATH, undefined);
+});

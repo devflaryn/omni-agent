@@ -168,3 +168,5 @@ if (args.has("--claude-hook")) {
 } else {
   console.log("Claude Code hook not installed (opt in with --claude-hook).");
 }
+
+console.log("RE tools (jadx/apktool/baksmali/smali, CLI-only, on the pi PATH): run `node scripts/install-tools.mjs` once.");

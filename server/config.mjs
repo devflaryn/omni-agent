@@ -131,6 +131,10 @@ export const CONFIG = {
   restartHealthyMs: Number(fc.restartHealthyMs) || 120000,
   /** Where unattended run ledgers live. */
   runsDir: fc.runsDir || join(fc.vaultDir || join(ROOT, "vault"), "Runs"),
+  /** CLI reverse-engineering tools (jadx/apktool/baksmali/smali) are pre-installed here and this
+   *  bin dir is put on the pi child's PATH, so the agent finds working headless CLIs instead of
+   *  re-downloading them from GitHub or launching a GUI. Provisioned by `node scripts/install-tools.mjs`. */
+  toolsBinDir: fc.toolsBinDir || join(HOME, ".omni-agent", "tools", "bin"),
 };
 
 /** Normalized goal-hook settings. Empty provider/model = judge with the chat's current model. */
@@ -160,10 +164,14 @@ export function hookConfig(raw = {}) {
  *  OMNI_MEMORY=server, which tells the omni-memory extension that this child is Omni's own:
  *  the server attaches the vault pack per prompt (composer checkbox), so the extension must not
  *  add its own on every turn. Pure so it is unit-testable. */
-export function piChildEnv(cfg = CONFIG) {
+export function piChildEnv(cfg = CONFIG, { path = process.env.PATH || "", exists = existsSync } = {}) {
   const env = { ...apiKeyEnv(cfg.apiKeyFiles || {}) };
   const disp = String(cfg.emulatorDisplay || "").trim();
   if (disp && !["native", "off", "0", "false"].includes(disp.toLowerCase())) env.OMNI_DISPLAY = disp;
   env.OMNI_MEMORY = "server";
+  // Put the pre-installed RE tools (jadx/apktool/baksmali/smali, CLI-only) first on PATH so the
+  // agent finds working headless commands instead of re-downloading them or launching a GUI.
+  const bin = cfg.toolsBinDir;
+  if (bin && exists(bin)) env.PATH = `${bin}${delimiter}${path}`;
   return env;
 }
