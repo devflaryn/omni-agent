@@ -113,3 +113,16 @@ test("PiRpc re-reads state when the omni-fallback extension switches models (the
   assert.equal(notice.role, "system");
   assert.match(notice.blocks[0].text, /^model error on modal\/Qwen/);
 });
+
+test("a stdin 'error' event does not throw out of PiRpc", async () => {
+  const bus = { emit() {}, on() {}, off() {} };
+  const pi = new PiRpc({ cli: null, bin: "node", cwd: process.cwd(), bus });
+  // fake proc with a stdin that emits 'error'
+  const { EventEmitter } = await import("node:events");
+  const stdin = new EventEmitter(); stdin.writable = true; stdin.write = () => true;
+  const stdout = new EventEmitter(); stdout.setEncoding = () => {};
+  const stderr = new EventEmitter(); stderr.setEncoding = () => {};
+  pi.proc = Object.assign(new EventEmitter(), { stdin, stdout, stderr, kill() {} });
+  pi.attachPipeGuards(); // new method under test
+  assert.doesNotThrow(() => stdin.emit("error", Object.assign(new Error("EPIPE"), { code: "EPIPE" })));
+});

@@ -66,6 +66,7 @@ export class PiRpc extends EventEmitter {
     this.proc = useNode
       ? spawn(process.execPath, [this.cli, ...args], { cwd: this.cwd, env, windowsHide: true })
       : spawn(process.platform === "win32" ? `${this.bin}.cmd` : this.bin, args, { cwd: this.cwd, env, shell: process.platform === "win32", windowsHide: true });
+    this.attachPipeGuards();
 
     const splitter = createLineSplitter((line) => this.onLine(line));
     this.proc.stdout.setEncoding("utf8");
@@ -85,6 +86,11 @@ export class PiRpc extends EventEmitter {
     this.ready = this.refreshState();
     this.ready.catch(() => {});
     return this;
+  }
+
+  attachPipeGuards() {
+    // A dead pi mid-write would otherwise emit an unhandled 'error' on stdin and kill the server.
+    this.proc?.stdin?.on("error", (e) => this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi stdin error: ${e.code || e.message}` }));
   }
 
   stop() {
