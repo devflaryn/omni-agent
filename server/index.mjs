@@ -64,6 +64,7 @@ export async function createApp(overrides = {}) {
     if (pi) pi.stop();
     pi = cfg.createPi ? cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, env: piChildEnv(cfg), bus });
     pi.start();
+    pi.startWatchdog?.({ stallMs: cfg.stallMs });
     return pi;
   }
   /** pi reads models.json only at boot: after a provider change, relaunch the child and put it back on the session it had open. */
@@ -483,6 +484,7 @@ export async function createApp(overrides = {}) {
     await watcher.start();
     log(`watching ${watcher.tails.size} session files (${registry.list().length} known sessions)`);
     if (cfg.autoStartPi) startPi(cfg.cwd);
+    keeper.startHeartbeat?.();
     return server;
   }
 
@@ -504,4 +506,7 @@ if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || proc
   const bye = () => { app.close(); process.exit(0); };
   process.on("SIGINT", bye);
   process.on("SIGTERM", bye);
+  // A multi-day unattended run must survive a stray error: log and keep the process up.
+  process.on("uncaughtException", (e) => log("uncaughtException", e?.stack || e));
+  process.on("unhandledRejection", (e) => log("unhandledRejection", e?.stack || e));
 }

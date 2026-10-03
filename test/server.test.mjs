@@ -341,7 +341,7 @@ test("fs/read reports a kind per file family: markdown, text, image, archive, bi
 
 test("goal hook settings: /api/hook reads, validates and updates the keeper", async () => {
   const before = await api("/api/hook");
-  assert.deepEqual(before.hook, { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true });
+  assert.deepEqual(before.hook, { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true, summaryProvider: "", summaryModel: "", judgeTimeoutMs: 120000, heartbeatMs: 60000, loopK: 3 });
   const st = await api("/api/state");
   assert.deepEqual(st.hook, before.hook, "state carries the same settings");
   const r = await fetch(`http://127.0.0.1:${port}/api/hook`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, provider: "openrouter", model: "deepseek/x", maxIdleNudges: 999 }) });
@@ -360,6 +360,23 @@ test("goal: /api/goal reports an empty goal and rejects a set without a pi sessi
   assert.equal(empty.goal, "");
   const r = await api("/api/goal", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ goal: "Do the thing" }) });
   assert.match(r.error, /no active pi session/);
+});
+
+// --------------------------------------------------------- watchdog wiring
+function fakePiFactory() {
+  return ({ cwd, model, provider, thinking } = {}) => ({
+    proc: {}, sid: "pi:watchdog", cwd, model, provider, thinking, streaming: false, state: {}, _watchdogStarted: false,
+    start() {}, stop() {}, owns() { return false; },
+    waitReady() { return Promise.resolve(this.state); },
+    startWatchdog() { this._watchdogStarted = true; },
+  });
+}
+
+test("startPi starts the stall watchdog", async () => {
+  const app = await createApp({ autoStartPi: false, createPi: fakePiFactory(), port: 0 });
+  const pi = app.startPi(process.cwd());
+  assert.ok(pi.watchdogTimer || pi._watchdogStarted, "watchdog should be armed");
+  app.close();
 });
 
 test("model and thinking choices made before pi runs are remembered and handed to the next pi child", async () => {
