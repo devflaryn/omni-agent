@@ -1,7 +1,7 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, isDuplicateUserMessage, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage } from "../ui/lib.js";
 import { titleFrom } from "../server/watchers.mjs";
 
 test("fmtDuration", () => {
@@ -183,4 +183,13 @@ test("hookMessage round-trips through hookInfo; plain prompts are not hooks", ()
   assert.equal(hookInfo("Please read <omni-hook> docs"), null);
   assert.equal(hookInfo(""), null);
   assert.equal(hookInfo('<omni-hook name="x">body</omni-hook>').note, "A x hook re-engaged the agent");
+});
+
+test("isDuplicateUserMessage collapses the optimistic echo + file entry for one send, keeps distinct prompts", () => {
+  const prev = { text: "hello world", ts: 1000 };
+  assert.equal(isDuplicateUserMessage(prev, "hello world", 1200), true);   // echo vs file entry, ~instant
+  assert.equal(isDuplicateUserMessage(prev, "hello world", 900), true);    // file entry before echo (reselect)
+  assert.equal(isDuplicateUserMessage(prev, "hello world", 1000 + 20000), false); // same text, 20s later = a real re-send
+  assert.equal(isDuplicateUserMessage(prev, "different", 1200), false);    // different prompt
+  assert.equal(isDuplicateUserMessage(null, "hello world", 1200), false);  // nothing before
 });

@@ -1,5 +1,5 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
-import { el, md, fmtN, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, workSummary } from "./lib.js";
+import { el, md, fmtN, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, workSummary, isDuplicateUserMessage } from "./lib.js";
 
 const active = { view: null, timer: null };
 const THINK_KEY = "omni.thinking.open";
@@ -27,7 +27,7 @@ const icon = (kind, cls = "ico") => `<span class="${cls}">${ICONS[kind] || ICONS
 
 export function newView(root, wrap, sid, { cwd } = {}) {
   root.innerHTML = "";
-  const view = { sid, root, wrap, cwd: cwd || "", harness: sid.split(":")[0], tools: new Map(), turn: null, stream: null, lastTs: 0, empty: null };
+  const view = { sid, root, wrap, cwd: cwd || "", harness: sid.split(":")[0], tools: new Map(), turn: null, stream: null, lastTs: 0, empty: null, lastUser: null };
   active.view = view;
   if (!active.timer) active.timer = setInterval(() => {
     const v = active.view, t = v?.turn;
@@ -331,6 +331,11 @@ export function applyEvent(view, ev) {
         // A prompt Omni sent for the user (the goal hook, replayed from the session file) is a notice, never a bubble.
         const hook = hookInfo(raw);
         if (hook) { eventLine(view, "hook", hook.note); openTurn(view, ev.ts, !!ev.live); break; }
+        // The same send reaches us as two events — the optimistic echo (id `u-<ts>`) and pi's
+        // session-file entry (its own uuid) — which would otherwise draw two identical bubbles.
+        // Collapse the second one (keeping the turn it already opened) instead of splitting the turn.
+        if (isDuplicateUserMessage(view.lastUser, raw, ev.ts)) break;
+        view.lastUser = { text: raw, ts: ev.ts || Date.now() };
         const m = el("div", `msg user${animate ? " appear" : ""}`);
         const { text, attachments } = splitAttachments(raw);
         const body = el("div", "body", text);

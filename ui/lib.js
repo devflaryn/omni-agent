@@ -241,3 +241,14 @@ export function workSummary(kinds, live = false) {
   const s = seen.join(", ");
   return s[0].toUpperCase() + s.slice(1);
 }
+
+/**
+ * True when an incoming user message is the same prompt as the previously rendered one and arrives
+ * within `windowMs` — i.e. the optimistic echo (`u-<ts>` id) and pi's session-file entry (its own
+ * uuid) for the SAME send, which otherwise render as two bubbles. Distinct prompts, even with
+ * identical text sent far enough apart, are not collapsed. Pure, so it is unit-tested.
+ */
+export function isDuplicateUserMessage(prev, text, ts, windowMs = 15000) {
+  if (!prev || prev.text !== text) return false;
+  return Math.abs((ts || 0) - (prev.ts || 0)) <= windowMs;
+}
