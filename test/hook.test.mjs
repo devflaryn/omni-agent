@@ -74,9 +74,10 @@ test("keeper re-engages pi with a hook-wrapped prompt (not echoed) and emits a h
   s.keeper.dispose();
 });
 
-test("keeper stays quiet when the judge says done, keeps re-engaging without limit while the agent works, and gives up only after maxIdleNudges runs without a tool call", async () => {
+test("keeper stays quiet when the judge says done, keeps re-engaging without limit, and never permanently gives up", async () => {
   const notDone = (i) => ({ done: false, reason: `r${i}` });
-  const s = setup({ verdicts: [{ done: true, reason: "finished" }, ...Array.from({ length: 12 }, (_, i) => notDone(i + 1))] });
+  // loopK high so loop-escalation never fires here — this test is about never permanently stopping.
+  const s = setup({ config: { loopK: 99 }, verdicts: [{ done: true, reason: "finished" }, ...Array.from({ length: 12 }, (_, i) => notDone(i + 1))] });
   const toolCall = () => s.emit({ kind: "msg", role: "assistant", live: true, id: `t${Date.now()}`, stopReason: "toolUse", blocks: [{ type: "tool_call", toolId: "c1", name: "bash", args: { command: "ls" } }] });
   s.user("Do X");
   s.run(); s.assistant("Done."); s.settle();
@@ -85,20 +86,18 @@ test("keeper stays quiet when the judge says done, keeps re-engaging without lim
   // five re-engaged runs that each make a tool call: well past the old cap of 5, still going
   for (let i = 1; i <= 5; i++) { s.run(); toolCall(); s.assistant("More."); s.settle(); await sleep(50); assert.equal(s.pi.prompts.length, i); }
   assert.equal(s.events.filter((e) => e.kind === "hook").at(-1).idle, 0);
-  // a nudged run with no tool call counts as idle; a later one with a tool call resets the count
+  // a nudged run with no tool call counts as idle (tracked in the hook event), but it still re-engages
   s.run(); s.assistant("I cannot."); s.settle(); await sleep(50);
   assert.equal(s.pi.prompts.length, 6);
-  assert.match(hookInfo(s.pi.prompts[5][0]).note, /^Goal hook re-engaged the agent \(#6 · no tool calls in the last 1 of 2\): r6/);
+  assert.match(hookInfo(s.pi.prompts[5][0]).note, /^Goal hook re-engaged the agent \(#6\): r6/);
   s.run(); toolCall(); s.assistant("Trying."); s.settle(); await sleep(50);
   assert.equal(s.pi.prompts.length, 7);
   assert.equal(s.events.filter((e) => e.kind === "hook").at(-1).idle, 0, "a tool call reset the idle count");
-  // two idle runs in a row (maxIdleNudges: 2) → the keeper gives up without asking the judge again
+  // two idle runs in a row (old maxIdleNudges cap of 2) no longer stops it — the keeper self-heals
   s.run(); s.assistant("No."); s.settle(); await sleep(50);
   assert.equal(s.pi.prompts.length, 8);
   s.run(); s.assistant("No."); s.settle(); await sleep(50);
-  assert.equal(s.pi.prompts.length, 8, "no ninth nudge");
-  assert.equal(s.judgeCalls.length, 9, "the judge is not asked once the agent stopped acting");
-  assert.ok(s.events.some((e) => e.kind === "log" && /gave up after 8 re-engagements — the agent made no tool call in the last 2/.test(e.text)));
+  assert.equal(s.pi.prompts.length, 9, "it keeps re-engaging — no permanent give-up");
   s.keeper.dispose();
 });
 
@@ -120,19 +119,17 @@ test("a new user prompt during the grace period cancels the pending check; an ab
   s.keeper.dispose();
 });
 
-test("judge failures, non-JSON replies, a disabled hook and aborted runs never nudge", async () => {
-  const s = setup({ verdicts: [new Error("provider down"), "not json at all", { done: false, reason: "r" }] });
+test("fail open: judge failures and non-JSON replies re-engage anyway; a disabled hook never nudges", async () => {
+  const s = setup({ verdicts: [new Error("provider down"), "not json at all"] });
   s.user("Go");
   s.run(); s.assistant("…"); s.settle(); await sleep(50);
   s.run(); s.assistant("…"); s.settle(); await sleep(50);
-  assert.equal(s.pi.prompts.length, 0);
+  assert.equal(s.pi.prompts.length, 2, "a thrown judge and junk JSON both fail open and re-engage");
   assert.equal(s.events.filter((e) => e.kind === "log" && /judge (failed|reply was not JSON)/.test(e.text)).length, 2);
-  s.run(); s.assistant("…", "aborted"); s.settle(); await sleep(50);
-  assert.equal(s.judgeCalls.length, 2, "an aborted assistant message skips the judge");
   s.user("Go again");
   s.keeper.setConfig({ enabled: false });
   s.run(); s.assistant("…"); s.settle(); await sleep(50);
-  assert.equal(s.judgeCalls.length, 2);
+  assert.equal(s.judgeCalls.length, 2, "a disabled hook does not ask the judge");
   s.keeper.dispose();
 });
 
@@ -184,4 +181,51 @@ test("the judge's pick follows the hook config over the chat model, and a new ru
   release(); await sleep(20);
   assert.equal(s.pi.prompts.length, 0);
   s.keeper.dispose();
+});
+
+function fakeBus() { const h = []; return { on: (_e, f) => h.push(f), off() {}, emit(ev) { for (const f of h) f(ev); } }; }
+
+test("re-engage message contains the verbatim goal text", async () => {
+  const bus = fakeBus();
+  const prompts = [];
+  const pi = { sid: "pi:1", proc: {}, streaming: false, state: { model: { provider: "p", id: "m" } }, prompt: async (msg) => prompts.push(msg) };
+  const keeper = new GoalKeeper({ bus, getPi: () => pi, judge: async () => '{"done":false,"reason":"keep going","nudge":"do X"}', config: { enabled: true, graceMs: 0, heartbeatMs: 999999 } });
+  keeper.setGoal("pi:1", "REVERSE libfoo.so exactly");
+  const g = keeper.goal("pi:1"); g.ran = true; g.tail = ["assistant: ok"];
+  await keeper.check("pi:1", g.seq);
+  assert.ok(prompts.some((p) => p.includes("REVERSE libfoo.so exactly")));
+});
+
+test("a judge that never returns JSON fails open (re-engages), never permanently stops", async () => {
+  const bus = fakeBus();
+  const prompts = [];
+  const pi = { sid: "pi:1", proc: {}, streaming: false, state: {}, prompt: async (m) => prompts.push(m) };
+  const keeper = new GoalKeeper({ bus, getPi: () => pi, judge: async () => "garbage not json", config: { enabled: true, graceMs: 0, heartbeatMs: 999999, loopK: 3 } });
+  keeper.setGoal("pi:1", "goal");
+  const g = keeper.goal("pi:1"); g.ran = true;
+  await keeper.check("pi:1", g.seq);
+  assert.equal(prompts.length, 1); // re-engaged despite no verdict
+});
+
+test("same failure fingerprint loopK times escalates with a different-approach steer", async () => {
+  const bus = fakeBus();
+  const prompts = [];
+  const pi = { sid: "pi:1", proc: {}, streaming: false, state: {}, prompt: async (m) => prompts.push(m) };
+  const keeper = new GoalKeeper({ bus, getPi: () => pi, judge: async () => '{"done":false,"reason":"err","nudge":"retry"}', config: { enabled: true, graceMs: 0, heartbeatMs: 999999, loopK: 2 } });
+  keeper.setGoal("pi:1", "goal");
+  const g = keeper.goal("pi:1");
+  g.tail = ["tool error build: undefined symbol foo"];
+  for (let i = 0; i < 2; i++) { g.ran = true; await keeper.check("pi:1", g.seq); }
+  assert.ok(prompts.at(-1).toLowerCase().includes("different approach"));
+});
+
+test("cancel pauses (resumable), it does not permanently latch", () => {
+  const bus = fakeBus();
+  const pi = { sid: "pi:1", proc: {}, streaming: false, state: {} };
+  const keeper = new GoalKeeper({ bus, getPi: () => pi, judge: async () => "{}", config: { enabled: true } });
+  keeper.setGoal("pi:1", "goal");
+  keeper.cancel("pi:1");
+  assert.equal(keeper.goal("pi:1").paused, true);
+  keeper.resume("pi:1");
+  assert.equal(keeper.goal("pi:1").paused, false);
 });

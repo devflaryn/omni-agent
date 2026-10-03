@@ -127,6 +127,12 @@ export function runJudge({ cli, bin = "pi", provider, model, env = {}, cwd, spaw
   });
 }
 
+/** A short signature of the current failure/tail so the keeper can detect "stuck on the same thing". */
+export function fingerprint(tail = []) {
+  const last = [...tail].reverse().find((l) => /error|fail|undefined|cannot|exception/i.test(l)) || tail.at(-1) || "";
+  return String(last).replace(/0x[0-9a-f]+|\d+/gi, "#").replace(/\s+/g, " ").trim().slice(0, 160);
+}
+
 export class GoalKeeper {
   /**
    * @param {object} o
@@ -139,7 +145,8 @@ export class GoalKeeper {
     this.judge = judge;
     // A separate one-off LLM call (runJudge-style) that writes the status box. Optional.
     this.summarizeFn = summarize || null;
-    this.config = { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true, ...config };
+    this.config = { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true, heartbeatMs: 60000, loopK: 3, judgeTimeoutMs: 120000, ...config };
+    this.heartbeatTimer = null;
     this.log = log;
     // sid -> { text, seq, nudges, idleNudges, nudged, progress, ran, aborted, stopReason, tail: [], timer, checking }
     // The keeper re-engages without limit; it only gives up after `maxIdleNudges` re-engagements in a row
@@ -149,14 +156,14 @@ export class GoalKeeper {
     bus.on("event", this.onEvent);
   }
 
-  dispose() { this.bus.off("event", this.onEvent); for (const g of this.goals.values()) clearTimeout(g.timer); this.goals.clear(); }
-  setConfig(patch) { this.config = { ...this.config, ...patch }; if (!this.config.enabled) for (const g of this.goals.values()) clearTimeout(g.timer); return this.config; }
+  dispose() { this.bus.off("event", this.onEvent); this.stopHeartbeat(); for (const g of this.goals.values()) clearTimeout(g.timer); this.goals.clear(); }
+  setConfig(patch) { this.config = { ...this.config, ...patch }; if (!this.config.enabled) { for (const g of this.goals.values()) clearTimeout(g.timer); this.stopHeartbeat(); } else this.startHeartbeat(); return this.config; }
 
   goal(sid) { return this.goals.get(sid) || null; }
   setGoal(sid, text, explicit = false) {
     const prev = this.goals.get(sid);
     if (prev) clearTimeout(prev.timer);
-    const g = { text, explicit, seq: (prev?.seq || 0) + 1, nudges: 0, idleNudges: 0, nudged: false, progress: false, ran: false, aborted: false, stopReason: "", tail: [], timer: null, checking: false };
+    const g = { text, explicit, seq: (prev?.seq || 0) + 1, nudges: 0, idleNudges: 0, nudged: false, progress: false, ran: false, aborted: false, paused: false, sameFailCount: 0, lastFingerprint: "", stopReason: "", tail: [], timer: null, checking: false };
     this.goals.set(sid, g);
     return g;
   }
@@ -171,8 +178,9 @@ export class GoalKeeper {
     if (!t) { const g = this.goals.get(sid); if (g) g.explicit = false; return g || null; }
     return this.setGoal(sid, t, true);
   }
-  /** The user stopped the agent (or the run was aborted): leave it alone until the next prompt. */
-  cancel(sid) { const g = this.goals.get(sid); if (!g) return; clearTimeout(g.timer); g.timer = null; g.aborted = true; }
+  /** The user paused the agent: stop nudging until resumed or a new prompt arrives. Not permanent. */
+  cancel(sid) { const g = this.goals.get(sid); if (!g) return; clearTimeout(g.timer); g.timer = null; g.paused = true; }
+  resume(sid) { const g = this.goals.get(sid); if (!g) return; g.paused = false; }
 
   onEvent(ev) {
     if (ev.harness !== "pi" || !this.getPi(ev.sid)) return;
@@ -188,7 +196,7 @@ export class GoalKeeper {
       const line = tailLine(ev);
       if (line) { g.tail.push(line); if (g.tail.length > 60) g.tail.splice(0, g.tail.length - 60); }
       if (ev.role === "tool" || (ev.blocks || []).some((b) => b.type === "tool_call")) g.progress = true;
-      if (ev.role === "assistant" && ev.stopReason) { g.stopReason = ev.stopReason; if (ev.stopReason === "aborted") g.aborted = true; }
+      if (ev.role === "assistant" && ev.stopReason) g.stopReason = ev.stopReason;
       return;
     }
     if (ev.kind === "status" && g) {
@@ -199,7 +207,7 @@ export class GoalKeeper {
 
   onSettled(sid) {
     const g = this.goals.get(sid);
-    if (!g || g.aborted) return;
+    if (!g || g.paused) return;
     // Refresh the status box on every settle (a milestone), independent of the re-engage toggle,
     // using a separate summarizer LLM. Fire-and-forget so it never blocks the goal check.
     this.makeSummary(sid).catch((e) => this.log("summary failed", e.message));
@@ -227,8 +235,11 @@ export class GoalKeeper {
   async check(sid, seq) {
     const g = this.goals.get(sid);
     const pi = this.getPi(sid);
-    if (!g || g.seq !== seq || g.aborted || !pi || pi.streaming) return null;
-    if (g.idleNudges >= this.config.maxIdleNudges) { this.emitLog(sid, `goal hook: gave up after ${g.nudges} re-engagements — the agent made no tool call in the last ${g.idleNudges}`); return null; }
+    if (!g || g.seq !== seq || g.paused || !pi || pi.streaming) return null;
+    // Consume the "a run just happened" flag; a *new* run started while the judge thinks re-sets it.
+    g.ran = false;
+    // No permanent give-up: idle nudges are still counted for context, but a true loop is handled by
+    // escalation below (try a different approach), never by stopping the keeper for good.
     g.checking = true;
     let verdict = null;
     try {
@@ -239,20 +250,43 @@ export class GoalKeeper {
       if (!verdict) this.emitLog(sid, `goal hook: judge reply was not JSON: ${clip(reply, 200)}`);
     } catch (e) { this.emitLog(sid, `goal hook: judge failed: ${e.message}`); }
     finally { g.checking = false; }
-    // Anything that happened while the judge was thinking wins: a new prompt, an abort, a new run.
-    if (!verdict || g.seq !== seq || g.aborted || pi.streaming || g.ran) return verdict;
-    if (verdict.done) { this.emitLog(sid, `goal hook: done (${verdict.reason})`); return verdict; }
-    g.nudges++;
-    g.nudged = true;
-    const idle = g.idleNudges ? ` · no tool calls in the last ${g.idleNudges} of ${this.config.maxIdleNudges}` : "";
-    const note = `Goal hook re-engaged the agent (#${g.nudges}${idle})${verdict.reason ? `: ${verdict.reason}` : ""}`;
-    const body = `Automatic goal check: your last turn ended before the user's request was finished.${verdict.reason ? ` ${verdict.reason}` : ""}${verdict.nudge ? ` ${verdict.nudge}` : ""}\nContinue the original request now and stop only when it is completely done, or when you truly need something only the user can provide.`;
+    if (g.seq !== seq || g.paused || pi.streaming || g.ran) return verdict;
+    // Fail open: a missing/failed verdict is treated as "not done", so the run never stops on a judge hiccup.
+    if (verdict?.done) { this.emitLog(sid, `goal hook: done (${verdict.reason})`); return verdict; }
+    const reason = verdict?.reason || "(no judge verdict — assuming not done)";
+    const nudge = verdict?.nudge || "";
+    // Loop detection: same failure signature loopK times → escalate instead of nudging the same way.
+    const fp = fingerprint(g.tail);
+    g.sameFailCount = fp && fp === g.lastFingerprint ? g.sameFailCount + 1 : 0;
+    g.lastFingerprint = fp;
+    const escalate = g.sameFailCount + 1 >= this.config.loopK;
+    g.nudges++; g.nudged = true;
+    const note = `Goal hook re-engaged the agent (#${g.nudges}${escalate ? ", escalating" : ""})${reason ? `: ${reason}` : ""}`;
+    const body = escalate
+      ? `You have been stuck on the same problem for ${g.sameFailCount + 1} attempts. STOP repeating it and try a DIFFERENT APPROACH. If a model/tool keeps failing, switch strategy or mark this sub-task blocked in your progress notes and move on to another part of the goal.\n\nThe original goal, verbatim:\n${g.text}\n\n${nudge}`
+      : `Automatic goal check: your last turn ended before the request was finished.${reason ? ` ${reason}` : ""}${nudge ? ` ${nudge}` : ""}\n\nThe original goal, verbatim:\n${g.text}\n\nContinue now and stop only when it is completely done, or when you truly need something only the user can provide.`;
+    if (escalate && this.onEscalate) { try { await this.onEscalate(sid, g); } catch { /* best effort */ } }
     try {
       await pi.prompt(hookMessage("goal", note, body), { echo: false });
-      this.bus.emit({ sid, harness: "pi", kind: "hook", ts: Date.now(), name: "goal", attempt: g.nudges, idle: g.idleNudges, maxIdle: this.config.maxIdleNudges, reason: verdict.reason, text: note });
+      this.bus.emit({ sid, harness: "pi", kind: "hook", ts: Date.now(), name: "goal", attempt: g.nudges, idle: g.idleNudges, maxIdle: this.config.maxIdleNudges, reason, escalate, text: note });
     } catch (e) { this.emitLog(sid, `goal hook: could not re-engage pi: ${e.message}`); }
     return verdict;
   }
+
+  startHeartbeat() {
+    this.stopHeartbeat();
+    if (!this.config.heartbeatMs) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.config.enabled) return;
+      for (const [sid, g] of this.goals) {
+        const pi = this.getPi(sid);
+        if (!pi || pi.streaming || g.paused || g.checking) continue;
+        this.check(sid, g.seq).catch((e) => this.log("heartbeat check failed", e.message));
+      }
+    }, this.config.heartbeatMs);
+    this.heartbeatTimer.unref?.();
+  }
+  stopHeartbeat() { if (this.heartbeatTimer) clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
 
   emitLog(sid, text) { this.log(text); this.bus.emit({ sid, harness: "pi", kind: "log", ts: Date.now(), level: "hook", text }); }
 }
