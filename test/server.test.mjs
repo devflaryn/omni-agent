@@ -362,6 +362,45 @@ test("goal: /api/goal reports an empty goal and rejects a set without a pi sessi
   assert.match(r.error, /no active pi session/);
 });
 
+// ---------------------------------------------- goal kickoff + full-halt stop
+let goalPi = null;
+function makeGoalPi({ cwd, model, provider, thinking } = {}) {
+  goalPi = {
+    proc: {}, sid: "pi:goal", cwd, model, provider, thinking, streaming: false, state: { sessionFile: "C:\\goal.jsonl" }, calls: [],
+    start() {}, stop() { this.calls.push(["stop"]); }, owns() { return false; },
+    waitReady() { return Promise.resolve(this.state); },
+    async prompt(m) { this.calls.push(["prompt", m]); return { ok: true }; },
+    async abort() { this.calls.push(["abort"]); return { success: true }; },
+  };
+  return goalPi;
+}
+const app3 = await createApp({ port: 0, vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeGoalPi, persistHook: false, persistPiModel: false, hook: { enabled: false } });
+await app3.listen();
+const port3 = app3.server.address().port;
+after(() => app3.close());
+const post3 = async (path, body) => { const r = await fetch(`http://127.0.0.1:${port3}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); return { status: r.status, json: await r.json().catch(() => ({})) }; };
+
+test("goal kickoff: POST /api/goal sends the goal as a prompt and arms the keeper", async () => {
+  app3.startPi(base);
+  goalPi.calls.length = 0;
+  const r = await post3("/api/goal", { goal: "do X" });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.started, true);
+  assert.ok(goalPi.calls.some((c) => c[0] === "prompt" && c[1] === "do X"), "the goal was sent as a kickoff prompt");
+  assert.equal(app3.keeper.config.enabled, true, "setting a goal arms the keeper");
+});
+
+test("full halt: POST /api/pi/abort aborts pi and turns the goal hook off", async () => {
+  app3.startPi(base);
+  await fetch(`http://127.0.0.1:${port3}/api/hook`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
+  assert.equal(app3.keeper.config.enabled, true);
+  goalPi.calls.length = 0;
+  const r = await post3("/api/pi/abort", {});
+  assert.equal(r.status, 200);
+  assert.ok(goalPi.calls.some((c) => c[0] === "abort"), "pi.abort() was called");
+  assert.equal(app3.keeper.config.enabled, false, "a full-halt stop turns the goal hook off");
+});
+
 // --------------------------------------------------------- watchdog wiring
 function fakePiFactory() {
   return ({ cwd, model, provider, thinking } = {}) => ({

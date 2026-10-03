@@ -167,7 +167,7 @@ async function goalCommand(text, composer) {
       toast("Goal cleared");
     } else {
       await api("/api/goal", { goal: arg }, "POST");
-      toast("Goal set — the agent will be re-engaged until it's done");
+      toast("Goal set and started — the agent will work until it's done.");
     }
     composer?.clear?.();
   } catch (e) { toast(e.message, true); }

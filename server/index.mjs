@@ -332,7 +332,8 @@ export async function createApp(overrides = {}) {
           keeper.setExplicitGoal(pi.sid, goal);
           // Setting a goal arms the keeper so the agent is re-engaged until the goal is done.
           if (goal && !keeper.config.enabled) { keeper.setConfig({ ...keeper.config, enabled: true }); if (cfg.persistHook !== false) writeConfigFile({ hook: keeper.config }); }
-          return send(res, 200, { goal, explicit: !!goal, enabled: keeper.config.enabled });
+          if (goal) { try { await pi.prompt(goal); } catch { /* goal is set + hook armed; the keeper will re-engage */ } }
+          return send(res, 200, { goal, explicit: !!goal, enabled: keeper.config.enabled, started: !!goal });
         }
       }
       // providers (pi's models.json)
@@ -366,7 +367,12 @@ export async function createApp(overrides = {}) {
             const c = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(p0.sid) });
             return send(res, 200, await p0.prompt(c.text, { images: body.images }));
           }
-          case "/api/pi/abort": { const p0 = requirePi(); keeper.cancel(p0.sid); return send(res, 200, await p0.abort()); }
+          case "/api/pi/abort": {
+            const p0 = requirePi();
+            keeper.cancel(p0.sid);
+            if (keeper.config.enabled) { keeper.setConfig({ ...keeper.config, enabled: false }); if (cfg.persistHook !== false) writeConfigFile({ hook: keeper.config }); }
+            return send(res, 200, await p0.abort());
+          }
           case "/api/pi/new": return send(res, 200, await requirePi().newSession());
           case "/api/pi/switch": return send(res, 200, await requirePi().switchSession(body.file));
           // Model and thinking level are remembered even when pi is not running yet: the next pi child starts with them.

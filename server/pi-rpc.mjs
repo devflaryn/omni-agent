@@ -195,7 +195,11 @@ export class PiRpc extends EventEmitter {
     return this.send(cmd);
   }
 
-  abort() { return this.send({ type: "abort" }); }
+  async abort() {
+    this.send({ type: "abort_bash" }).catch(() => {});
+    this.send({ type: "clear_queue" }).catch(() => {});
+    return this.send({ type: "abort" });
+  }
   /**
    * pi rebuilds the runtime on `new_session` from its launch flags, so a model or thinking level picked
    * after the child started would silently fall back. Re-apply the remembered picks to the new session.

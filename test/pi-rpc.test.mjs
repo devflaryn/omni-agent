@@ -146,6 +146,14 @@ test("C1: a crash captures the resume anchor and a transient empty-session event
   assert.equal(pi.restoring, false, "restoring is cleared once resume finished");
 });
 
+test("abort() is a full stop: writes abort_bash, clear_queue, and abort frames to pi.proc.stdin", async () => {
+  const { pi, cmds } = fakePi();
+  await pi.refreshState();
+  cmds.length = 0;
+  await pi.abort();
+  assert.deepEqual(cmds.map((c) => c.type), ["abort_bash", "clear_queue", "abort"], "cancels in-flight tools, clears the queue, then aborts the run");
+});
+
 test("watchdog aborts+restarts a wedged stream", () => {
   const bus = { emit() {}, on() {}, off() {} };
   const pi = new PiRpc({ cli: null, bin: "node", cwd: process.cwd(), bus });
