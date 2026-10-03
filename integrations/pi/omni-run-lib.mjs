@@ -40,6 +40,34 @@ export function renderCompactionSummary({ goal, ledgerMd = "", serializedSpan = 
 
 export const shouldOffload = (content, { maxChars = 12000 } = {}) => String(content ?? "").length > maxChars;
 
+/** Map an image media type to a bare file extension (no dot). Unknown → "bin". */
+export function extForMediaType(mediaType = "") {
+  const m = String(mediaType ?? "").toLowerCase();
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("png")) return "png";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("svg")) return "svg";
+  if (m.includes("bmp")) return "bmp";
+  if (m.includes("avif")) return "avif";
+  return "bin";
+}
+
+/** Extract the base64 payload + media type of an image content block, across the two
+ *  common shapes (pi flat `{ data, mimeType }` and Anthropic nested `{ source: { data, media_type } }`).
+ *  Returns null for non-image blocks or blocks without inline base64 data. */
+export function imageBlockData(block) {
+  if (!block || block.type !== "image") return null;
+  if (typeof block.data === "string" && block.data) {
+    return { data: block.data, mediaType: block.mimeType || block.mediaType || block.media_type || "" };
+  }
+  const src = block.source;
+  if (src && typeof src.data === "string" && src.data) {
+    return { data: src.data, mediaType: src.media_type || src.mediaType || src.mimeType || "" };
+  }
+  return null;
+}
+
 export function offloadReference({ sha, bytes, preview, path }) {
   return [
     `⟨offloaded ${bytes} bytes → ${path} (sha256 ${sha.slice(0, 16)})⟩`,
