@@ -124,6 +124,12 @@ export const CONFIG = {
   liveWindowMs: fc.liveWindowMs || 30000,
   /** Goal hook: when Omni's pi stops, a judge model decides whether the user's request is done and re-engages pi if not. */
   hook: hookConfig(fc.hook),
+  /** Watchdog: pi claims to be streaming but produced no event for this long → abort+restart. */
+  stallMs: Number(fc.stallMs) || 360000,
+  /** Restart counter resets after the child streamed healthily this long. */
+  restartHealthyMs: Number(fc.restartHealthyMs) || 120000,
+  /** Where unattended run ledgers live. */
+  runsDir: fc.runsDir || join(fc.vaultDir || join(ROOT, "vault"), "Runs"),
 };
 
 /** Normalized goal-hook settings. Empty provider/model = judge with the chat's current model. */
@@ -139,6 +145,12 @@ export function hookConfig(raw = {}) {
     graceMs: int(h.graceMs, 2000, 0, 600000),
     /** Whether the separate summarizer writes the status box on each settle (default on). */
     summaries: h.summaries !== false,
+    summaryProvider: String(h.summaryProvider || "").trim(),
+    summaryModel: String(h.summaryModel || "").trim(),
+    judgeTimeoutMs: int(h.judgeTimeoutMs, 120000, 10000, 600000),
+    heartbeatMs: int(h.heartbeatMs, 60000, 5000, 3600000),
+    /** Same failure signature this many times in a row → escalate instead of nudging again. */
+    loopK: int(h.loopK, 3, 2, 20),
   };
 }
 

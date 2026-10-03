@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, delimiter } from "node:path";
-import { findPiCli, apiKeyEnv, piChildEnv } from "../server/config.mjs";
+import { findPiCli, apiKeyEnv, piChildEnv, hookConfig } from "../server/config.mjs";
 
 const REL = join("@earendil-works", "pi-coding-agent", "dist", "cli.js");
 
@@ -86,4 +86,19 @@ test("piChildEnv marks the child as server-owned so the omni-memory extension le
     // The server attaches the vault pack per prompt (composer checkbox); the extension must not add its own on top.
     assert.equal(piChildEnv({ emulatorDisplay: "" }).OMNI_MEMORY, "server");
   } finally { cleanup(); }
+});
+
+test("hookConfig surfaces summary model, judge timeout, heartbeat, loopK", () => {
+  const h = hookConfig({ summaryProvider: "orca", summaryModel: "Qwen/Qwen3.8-27B", judgeTimeoutMs: 90000, heartbeatMs: 60000, loopK: 3 });
+  assert.equal(h.summaryProvider, "orca");
+  assert.equal(h.summaryModel, "Qwen/Qwen3.8-27B");
+  assert.equal(h.judgeTimeoutMs, 90000);
+  assert.equal(h.heartbeatMs, 60000);
+  assert.equal(h.loopK, 3);
+});
+test("hookConfig clamps and defaults the new numbers", () => {
+  const h = hookConfig({});
+  assert.equal(h.heartbeatMs, 60000);
+  assert.equal(h.loopK, 3);
+  assert.equal(h.judgeTimeoutMs, 120000);
 });
