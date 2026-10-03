@@ -31,9 +31,14 @@ export async function createApp(overrides = {}) {
   const vault = new Vault(cfg.vaultDir).ensure();
   const claude = new ClaudeRunner({ bin: cfg.claudeBin, bus, spawn: cfg.claudeSpawn });
   let pi = null;
+  // The durable run ledger. Null in normal GUI use; the unattended runner (scripts/run.mjs) opens one
+  // via cfg so the goal + counters persist and survive a pi restart. Every use is guarded with `?.`.
+  let runLedger = cfg.runLedger || null;
 
   const isOwned = (file) => (pi?.owns(file) ?? false) || claude.owns(file);
   const watcher = new SessionWatcher({ piSessionsDir: cfg.piSessionsDir, claudeProjectsDir: cfg.claudeProjectsDir, bus, tally, registry, isOwned, recentHours: cfg.tailRecentHours, log });
+  // A thin proxy so the keeper always reads the *current* runLedger (which may be set/replaced later).
+  const ledgerProxy = { writeControl: (p) => runLedger?.writeControl(p), goalText: () => runLedger?.goalText() || "" };
   // Goal hook: a judge model (any configured provider, through `pi -p`) decides whether pi may stop; if not, pi is re-engaged.
   const keeper = new GoalKeeper({
     bus, log,
@@ -42,6 +47,8 @@ export async function createApp(overrides = {}) {
     // The status-box summarizer: same separate-LLM mechanism as the judge, chat model by default.
     summarize: cfg.summarize || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn }, { system: SUMMARY_SYSTEM, input })),
     config: hookConfig(cfg.hook),
+    ledger: ledgerProxy,
+    onEscalate: async (sid, g) => { runLedger?.appendEvent?.({ kind: "escalate", sid, nudges: g.nudges, fingerprint: g.lastFingerprint }); },
   });
 
   // Owned sessions also need registry + tally bookkeeping from their live events.
@@ -49,6 +56,11 @@ export async function createApp(overrides = {}) {
     if (ev.kind === "log" || ev.kind === "removed") return;
     const s = registry.upsert(ev.sid, {});
     if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom });
+    // Invariant: run.json.sessionFile always names pi's current session file, and pi.resumeFile mirrors it.
+    if (ev.kind === "session" && ev.owned && ev.harness === "pi" && ev.file) {
+      runLedger?.writeControl({ sessionFile: ev.file });
+      if (pi) pi.resumeFile = ev.file;
+    }
     if (ev.kind === "status") s.streaming = !!ev.streaming;
     if (ev.kind === "msg" && ev.live) {
       s.messages++;
@@ -72,9 +84,13 @@ export async function createApp(overrides = {}) {
     if (!pi?.proc) return false;
     const { cwd } = pi;
     const file = pi.state?.sessionFile;
+    const prevSid = pi.sid;
     startPi(cwd);
     try { await pi.waitReady(); if (file) await pi.switchSession(file); }
     catch (e) { log("pi restart: could not restore the session", e.message); }
+    // Move the keeper's goal + counters onto pi's new session id so a restart never drops the goal.
+    keeper.attachToSid(prevSid, pi.sid);
+    if (pi) { pi.resumeFile = pi.state?.sessionFile || file; runLedger?.writeControl({ sessionFile: pi.resumeFile }); }
     return true;
   }
 

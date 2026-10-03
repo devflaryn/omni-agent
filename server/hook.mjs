@@ -139,12 +139,18 @@ export class GoalKeeper {
    * @param {(sid: string) => object|null} o.getPi  Omni's pi child when it owns `sid`, else null.
    * @param {(input: string, pick: {provider, model}) => Promise<string>} o.judge  returns the judge's raw reply.
    */
-  constructor({ bus, getPi, judge, summarize, config = {}, log = () => {} }) {
+  constructor({ bus, getPi, judge, summarize, config = {}, log = () => {}, ledger = null, onEscalate = null }) {
     this.bus = bus;
     this.getPi = getPi;
     this.judge = judge;
     // A separate one-off LLM call (runJudge-style) that writes the status box. Optional.
     this.summarizeFn = summarize || null;
+    // Optional RunLedger-like durable store (writeControl/goalText). Null in normal GUI use — only the
+    // durable unattended runner sets one. Every use is guarded with `?.` so nothing breaks when null.
+    this.ledger = ledger;
+    this.onEscalate = onEscalate;
+    // The sid the goal currently lives on, so a restart can carry it onto pi's new session id.
+    this._lastSid = null;
     this.config = { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true, heartbeatMs: 60000, loopK: 3, judgeTimeoutMs: 120000, ...config };
     this.heartbeatTimer = null;
     this.log = log;
@@ -165,7 +171,19 @@ export class GoalKeeper {
     if (prev) clearTimeout(prev.timer);
     const g = { text, explicit, seq: (prev?.seq || 0) + 1, nudges: 0, idleNudges: 0, nudged: false, progress: false, ran: false, aborted: false, paused: false, sameFailCount: 0, lastFingerprint: "", stopReason: "", tail: [], timer: null, checking: false };
     this.goals.set(sid, g);
+    this._lastSid = sid;
+    this.ledger?.writeControl?.({ goalText: text });
     return g;
+  }
+  /** After a pi restart (new session id), carry the goal + counters to the new sid so a crash doesn't drop the goal. */
+  attachToSid(oldSid, newSid) {
+    if (oldSid === newSid) return;
+    const g = this.goals.get(oldSid);
+    if (!g) return;
+    clearTimeout(g.timer); g.timer = null;
+    this.goals.delete(oldSid);
+    this.goals.set(newSid, g);
+    this._lastSid = newSid;
   }
   /**
    * Set an **explicit**, persistent goal (from the `/goal` command): it overrides the implicit
@@ -236,6 +254,7 @@ export class GoalKeeper {
     const g = this.goals.get(sid);
     const pi = this.getPi(sid);
     if (!g || g.seq !== seq || g.paused || !pi || pi.streaming) return null;
+    this._lastSid = sid;
     // Consume the "a run just happened" flag; a *new* run started while the judge thinks re-sets it.
     g.ran = false;
     // No permanent give-up: idle nudges are still counted for context, but a true loop is handled by
@@ -261,6 +280,7 @@ export class GoalKeeper {
     g.lastFingerprint = fp;
     const escalate = g.sameFailCount + 1 >= this.config.loopK;
     g.nudges++; g.nudged = true;
+    this.ledger?.writeControl?.({ counters: { nudges: g.nudges } });
     const note = `Goal hook re-engaged the agent (#${g.nudges}${escalate ? ", escalating" : ""})${reason ? `: ${reason}` : ""}`;
     const body = escalate
       ? `You have been stuck on the same problem for ${g.sameFailCount + 1} attempts. STOP repeating it and try a DIFFERENT APPROACH. If a model/tool keeps failing, switch strategy or mark this sub-task blocked in your progress notes and move on to another part of the goal.\n\nThe original goal, verbatim:\n${g.text}\n\n${nudge}`

@@ -230,6 +230,26 @@ test("cancel pauses (resumable), it does not permanently latch", () => {
   assert.equal(keeper.goal("pi:1").paused, false);
 });
 
+test("setGoal persists the goal text to the ledger", () => {
+  const bus = fakeBus();
+  const writes = [];
+  const ledger = { writeControl: (p) => writes.push(p), goalText: () => "" };
+  const pi = { sid: "pi:1", proc: {}, streaming: false, state: {} };
+  const keeper = new GoalKeeper({ bus, getPi: () => pi, judge: async () => "{}", ledger, config: {} });
+  keeper.setGoal("pi:1", "DO THE THING");
+  assert.ok(writes.some((w) => w.goalText === "DO THE THING"));
+});
+
+test("attachToSid moves goal state to a new session id after a restart", () => {
+  const bus = fakeBus();
+  const pi = { sid: "pi:2", proc: {}, streaming: false, state: {} };
+  const keeper = new GoalKeeper({ bus, getPi: () => pi, judge: async () => "{}", config: {} });
+  keeper.setGoal("pi:1", "goal", true);
+  keeper.attachToSid("pi:1", "pi:2");
+  assert.equal(keeper.goal("pi:2").text, "goal");
+  assert.equal(keeper.goal("pi:1"), null);
+});
+
 test("summarizer uses summaryProvider/summaryModel when set", async () => {
   const bus = fakeBus();
   let pick = null;
