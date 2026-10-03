@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import { createLineSplitter } from "./jsonl.mjs";
 import { normalizePiRpcEvent } from "./normalize.mjs";
 import { cleanTitle } from "../ui/lib.js";
+import { restartDelay, nextRestartState, stalled } from "./watchdog.mjs";
 
 const normPath = (p) => (p ? resolve(String(p)).toLowerCase() : "");
 
@@ -45,6 +46,11 @@ export class PiRpc extends EventEmitter {
     this.streaming = false;
     this.stopped = false;
     this.restarts = 0;
+    this.resumeFile = null;
+    this.onRestart = null;
+    this.lastEventAt = 0;
+    this.lastHealthyAt = 0;
+    this.watchdogTimer = null;
   }
 
   get ctx() {
@@ -73,14 +79,7 @@ export class PiRpc extends EventEmitter {
     this.proc.stdout.on("data", (c) => splitter.push(c));
     this.proc.stderr.setEncoding("utf8");
     this.proc.stderr.on("data", (t) => this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "stderr", text: t }));
-    this.proc.on("exit", (code) => {
-      this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi exited (code ${code})` });
-      for (const [, p] of this.pending) p.reject(new Error("pi exited"));
-      this.pending.clear();
-      this.proc = null;
-      this.streaming = false;
-      if (!this.stopped && this.restarts++ < 20) setTimeout(() => this.start(), 800);
-    });
+    this.proc.on("exit", (code) => this.handleExit(code));
     this.proc.on("error", (e) => this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "error", text: `pi spawn failed: ${e.message}` }));
     // Learn our session identity, then announce it.
     this.ready = this.refreshState();
@@ -95,18 +94,56 @@ export class PiRpc extends EventEmitter {
 
   stop() {
     this.stopped = true;
+    this.stopWatchdog();
     try { this.proc?.kill(); } catch { /* ignore */ }
+  }
+
+  async handleExit(code) {
+    this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi exited (code ${code})` });
+    for (const [, p] of this.pending) p.reject(new Error("pi exited"));
+    this.pending.clear();
+    this.proc = null;
+    this.streaming = false;
+    if (this.stopped) return;
+    const reset = nextRestartState({ restarts: this.restarts, lastHealthyAt: this.lastHealthyAt });
+    this.restarts = reset.restarts;
+    const delay = restartDelay(this.restarts++);
+    setTimeout(() => {
+      this.start();
+      this.ready?.then(() => this.resumeSession()).catch((e) => this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi resume failed: ${e.message}` }));
+    }, delay);
+  }
+
+  /** After a restart, put the child back on the session it had, then let the supervisor replay. */
+  async resumeSession() {
+    if (this.resumeFile) { try { await this.switchSession(this.resumeFile); } catch (e) { this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `switch_session on resume failed: ${e.message}` }); } }
+    if (this.onRestart) await this.onRestart();
+  }
+
+  startWatchdog({ stallMs = 360000, intervalMs = 30000 } = {}) {
+    this.stopWatchdog();
+    this.watchdogTimer = setInterval(() => this.checkStall({ stallMs }), intervalMs);
+    this.watchdogTimer.unref?.();
+  }
+  stopWatchdog() { if (this.watchdogTimer) clearInterval(this.watchdogTimer); this.watchdogTimer = null; }
+
+  checkStall({ now = Date.now(), stallMs = 360000 } = {}) {
+    if (!stalled({ streaming: this.streaming, lastEventAt: this.lastEventAt, now, stallMs })) return;
+    this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi stream stalled ${Math.round((now - this.lastEventAt) / 1000)}s — aborting + restarting` });
+    this.abort?.().catch(() => {});
+    try { this.proc?.kill(); } catch { /* exit handler restarts */ }
   }
 
   onLine(line) {
     let ev;
     try { ev = JSON.parse(line); } catch { return this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "raw", text: line }); }
+    this.lastEventAt = Date.now();
     if (ev.type === "response") {
       const p = ev.id != null ? this.pending.get(ev.id) : null;
       if (p) { this.pending.delete(ev.id); p.resolve(ev); }
       return;
     }
-    if (ev.type === "agent_start" || ev.type === "turn_start") this.streaming = true;
+    if (ev.type === "agent_start" || ev.type === "turn_start") { this.streaming = true; this.lastHealthyAt = Date.now(); }
     if (ev.type === "agent_settled") this.streaming = false;
     // The omni-fallback extension switched models inside pi: re-read state so the session's model label follows.
     if (ev.type === "message_end" && ev.message?.customType === "omni-fallback") this.refreshState().catch(() => {});

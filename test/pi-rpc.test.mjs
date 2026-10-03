@@ -114,6 +114,29 @@ test("PiRpc re-reads state when the omni-fallback extension switches models (the
   assert.match(notice.blocks[0].text, /^model error on modal\/Qwen/);
 });
 
+test("restart resumes the saved session file via the onRestart hook", async () => {
+  const bus = { emit() {}, on() {}, off() {} };
+  const pi = new PiRpc({ cli: null, bin: "node", cwd: process.cwd(), bus });
+  pi.resumeFile = "/sessions/keep.jsonl";
+  let resumedTo = null;
+  pi.switchSession = async (f) => { resumedTo = f; };
+  pi.waitReady = async () => {};
+  pi.start = () => { pi.onRestart && pi.onRestart(); return pi; }; // stub spawn
+  await pi.handleExit(0); // new method invoked by the real 'exit' listener
+  // onRestart default resumes:
+  await pi.resumeSession();
+  assert.equal(resumedTo, "/sessions/keep.jsonl");
+});
+
+test("watchdog aborts+restarts a wedged stream", () => {
+  const bus = { emit() {}, on() {}, off() {} };
+  const pi = new PiRpc({ cli: null, bin: "node", cwd: process.cwd(), bus });
+  pi.streaming = true; pi.lastEventAt = 0;
+  let aborted = false; pi.abort = async () => { aborted = true; };
+  pi.checkStall({ now: 10_000_000, stallMs: 360000 });
+  assert.equal(aborted, true);
+});
+
 test("a stdin 'error' event does not throw out of PiRpc", async () => {
   const bus = { emit() {}, on() {}, off() {} };
   const pi = new PiRpc({ cli: null, bin: "node", cwd: process.cwd(), bus });
