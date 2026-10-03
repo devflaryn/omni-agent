@@ -20,8 +20,12 @@ export class Bus extends EventEmitter {
     this.ring.push(ev);
     if (this.ring.length > this.ringSize) this.ring.splice(0, this.ring.length - this.ringSize);
     const line = `data: ${JSON.stringify(ev)}\n\n`;
+    const CAP = 4 * 1024 * 1024;
     for (const res of this.clients) {
-      try { res.write(line); } catch { this.clients.delete(res); }
+      try {
+        if ((res.writableLength || 0) > CAP) { this.clients.delete(res); try { res.end?.(); } catch { /* */ } continue; }
+        res.write(line);
+      } catch { this.clients.delete(res); }
     }
     super.emit("event", ev);
     return true;
