@@ -24,10 +24,14 @@ test("sets OMNI_RUN_DIR, creates a ledger, sets the explicit goal, and does NOT 
   let gotGoal = null;
   const app = fakeApp({ onGoal: (g) => (gotGoal = g) });
   let resolved = false;
-  const p = runUnattended({ cwd: process.cwd(), goal: "REVERSE IT", runsRoot, createApp: async () => app, pollMs: 10 }).then((r) => { resolved = true; return r; });
+  let capturedOpts = null;
+  const p = runUnattended({ cwd: process.cwd(), goal: "REVERSE IT", runsRoot, createApp: async (opts) => { capturedOpts = opts; return app; }, pollMs: 10 }).then((r) => { resolved = true; return r; });
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(gotGoal, "REVERSE IT");
   assert.ok(process.env.OMNI_RUN_DIR && process.env.OMNI_RUN_DIR.includes(runsRoot.split(/[\\/]/).pop()));
+  // the ledger must be handed to createApp so the supervisor engages durable-run persistence
+  assert.ok(capturedOpts && capturedOpts.runLedger, "createApp must receive a runLedger");
+  assert.equal(capturedOpts.runLedger.dir, process.env.OMNI_RUN_DIR, "runLedger must be this run's ledger");
   app._settle();
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(resolved, false, "a settle must not end the unattended run");

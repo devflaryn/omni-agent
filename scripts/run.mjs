@@ -26,7 +26,7 @@ export async function runUnattended({ cwd, goal, provider, model, thinking, runI
   ledger.writeControl({ status: "running" });
   out(`run ${ledger.runId} · ledger ${ledger.dir}`);
 
-  const app = await createApp({ port, host: "127.0.0.1", lan: false, cwd, autoStartPi: false, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}) });
+  const app = await createApp({ port, host: "127.0.0.1", lan: false, cwd, autoStartPi: false, runLedger: ledger, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}) });
   await app.listen();
   const pi = app.startPi(cwd);
   // Mirror pi's session file into the ledger so a restart resumes it.
