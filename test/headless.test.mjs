@@ -15,10 +15,11 @@ test("formatEvent renders tool starts/ends and assistant text, hides deltas", ()
   assert.equal(formatEvent({ kind: "msg", role: "assistant", blocks: [{ type: "thinking", text: "hmm" }], ts: 5000 }, { started }), null);
 });
 
-test("token delta events are not written to the long-run log", () => {
-  assert.equal(logWorthKeeping({ kind: "msg", phase: "delta" }), false);
-  assert.equal(logWorthKeeping({ kind: "token" }), false);
+test("per-token delta events are not written to the long-run log", () => {
+  assert.equal(logWorthKeeping({ kind: "delta", part: "text", delta: "x" }), false);
+  assert.equal(logWorthKeeping({ kind: "delta", part: "thinking", delta: "y" }), false);
   assert.equal(logWorthKeeping({ kind: "tool", phase: "end" }), true);
+  assert.equal(logWorthKeeping({ kind: "msg", role: "assistant" }), true);
   assert.equal(logWorthKeeping({ kind: "status", streaming: false }), true);
 });
 

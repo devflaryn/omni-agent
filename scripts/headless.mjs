@@ -39,9 +39,11 @@ export function formatEvent(ev, { started = Date.now(), width = 160 } = {}) {
   return null;
 }
 
-/** Keep structured checkpoints out of a multi-day log; drop per-token deltas. Pure. */
+/** Keep structured checkpoints out of a multi-day log; drop the high-frequency per-token
+ *  stream events. The real per-token events are kind:"delta" (server/normalize.mjs). Pure. */
 export function logWorthKeeping(ev) {
-  if (ev.kind === "token") return false;
+  if (ev.kind === "delta") return false;              // per-token text/thinking/tool_args stream
+  if (ev.kind === "token") return false;              // defensive
   if (ev.kind === "msg" && ev.phase === "delta") return false;
   if (ev.kind === "log" && ev.level === "delta") return false;
   return true;
