@@ -36,6 +36,17 @@ test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
+test("installer copies omni-run and its lib siblings into pi's extensions", () => {
+  const home = mkdtempSync(join(tmpdir(), "omni-home-"));
+  try {
+    const r = run(home);
+    assert.equal(r.status, 0, r.stderr);
+    for (const f of ["omni-run.ts", "omni-run-lib.mjs", "omni-fallback-lib.mjs", "omni-fallback.ts"]) {
+      assert.ok(existsSync(join(home, ".pi", "agent", "extensions", f)), `${f} should be installed`);
+    }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("the shipped skills document today's omnidroid, its MCP tools, and keep the QEMU manager as legacy", () => {
   const read = (...p) => readFileSync(join(process.cwd(), "skills", ...p), "utf8");
   const skill = read("omnidroid", "SKILL.md");
