@@ -27,14 +27,16 @@ export default function omniRun(pi: ExtensionAPI) {
 	const artifactsDir = join(dir, "artifacts");
 	const controlFile = join(dir, "run.json");
 	const goal = () => { try { return JSON.parse(readText(controlFile)).goalText || ""; } catch { return ""; } };
-	// Optional cheap summarizer model: run.json.model.summary = "provider/id"
-	const summaryModel = () => { try { return JSON.parse(readText(controlFile)).model?.summary || ""; } catch { return ""; } };
 
 	// 1) Re-inject goal + ledger every LLM call (not persisted; pi's context semantics).
 	pi.on("context", (ev: any) => {
-		const block = renderContextBlock({ goal: goal(), ledgerMd: readText(ledgerFile) }, { budget: 4000 });
-		const sys = { role: "system", content: [{ type: "text", text: block }] };
-		return { messages: [sys, ...ev.messages] };
+		try {
+			const block = renderContextBlock({ goal: goal(), ledgerMd: readText(ledgerFile) }, { budget: 4000 });
+			const sys = { role: "system", content: [{ type: "text", text: block }] };
+			return { messages: [sys, ...ev.messages] };
+		} catch {
+			return undefined; // no-op: keep the original messages
+		}
 	});
 
 	// 2) Fixed-budget compaction derived from the ledger (thinking off). Never grows.
