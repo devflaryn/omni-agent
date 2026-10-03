@@ -5,7 +5,7 @@
  */
 import { promises as fs, existsSync, watch } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { JsonlTail, readAppended } from "./tailer.mjs";
+import { JsonlTail, readAppended, readTail } from "./tailer.mjs";
 import { normalizePiEntry, normalizeClaudeEntry } from "./normalize.mjs";
 import { createTally } from "./tokens.mjs";
 import { cleanTitle } from "../ui/lib.js";
@@ -231,13 +231,13 @@ export class SessionWatcher {
   }
 
   /** Full normalized history for a session (from its file). */
-  async history(sid) {
+  async history(sid, { maxBytes = 8 * 1024 * 1024 } = {}) {
     const s = this.registry.get(sid);
     if (!s?.file) return { events: [], tally: null };
     const harness = s.harness;
     const ctx = { sid, harness };
     let r;
-    try { r = await readAppended(s.file, 0, ""); } catch (e) { if (e?.code === "ENOENT") return { events: [], tally: this.tally.has(sid) ? this.tally.get(sid) : null }; throw e; }
+    try { r = await readTail(s.file, { maxBytes }); } catch (e) { if (e?.code === "ENOENT") return { events: [], tally: this.tally.has(sid) ? this.tally.get(sid) : null }; throw e; }
     const events = [];
     const tally = createTally();
     for (const o of r.objects) {
@@ -246,10 +246,9 @@ export class SessionWatcher {
         if (ev.kind === "msg" && ev.usage) tally.add(sid, { groupId: ev.groupId || ev.id, usage: ev.usage, model: ev.model, cost: ev.cost, ts: ev.ts });
       }
     }
-    // refresh the live tally with the authoritative file numbers
     this.tally.reset(sid);
     for (const ev of events) if (ev.kind === "msg" && ev.usage) this.tally.add(sid, { groupId: ev.groupId || ev.id, usage: ev.usage, model: ev.model, cost: ev.cost, ts: ev.ts });
-    return { events, tally: tally.get(sid) };
+    return { events, tally: tally.get(sid), truncated: r.truncated };
   }
 
   /** Build the digest input for the vault from a session's history. */

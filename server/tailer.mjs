@@ -26,6 +26,26 @@ export async function readAppended(path, offset, pending) {
   }
 }
 
+/** Read only the final `maxBytes` of an append-only JSONL file, discarding the first
+ *  (possibly partial) line so every returned object is a clean parse. For history views
+ *  of multi-day sessions that must never load the whole file into one string. */
+export async function readTail(path, { maxBytes = 8 * 1024 * 1024 } = {}) {
+  const st = await fs.stat(path);
+  const start = st.size > maxBytes ? st.size - maxBytes : 0;
+  const len = st.size - start;
+  const fh = await fs.open(path, "r");
+  try {
+    const buf = Buffer.alloc(len);
+    await fh.read(buf, 0, len, start);
+    let text = buf.toString("utf8");
+    if (start > 0) { const nl = text.indexOf("\n"); text = nl >= 0 ? text.slice(nl + 1) : ""; }
+    const objects = [];
+    const s = createLineSplitter((line) => { try { objects.push(JSON.parse(line)); } catch { /* skip */ } });
+    s.push(text); s.flush();
+    return { objects, truncated: start > 0 };
+  } finally { await fh.close(); }
+}
+
 export class JsonlTail {
   constructor(path, { fromEnd = true, intervalMs = 700, onObject, onError } = {}) {
     this.path = path;
