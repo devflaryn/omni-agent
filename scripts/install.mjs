@@ -28,6 +28,7 @@ const piAgent = join(HOME, ".pi", "agent");
 const extDir = join(piAgent, "extensions");
 const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-fallback.ts", "omni-fallback-lib.mjs", "omni-mcp.ts", "omni-run.ts", "omni-run-lib.mjs"];
 const SKILLS = ["omnidroid", "omnidroid-frida", "omnidroid-qemu", "omnidroid-input"];
+const AGENTS = ["scout.md", "re-analyst.md", "droid-operator.md"];
 const piSkillsDir = join(piAgent, "skills");
 const claudeSkillsDir = join(HOME, ".claude", "skills");
 const piCfg = join(piAgent, "omni-agent.json");
@@ -113,6 +114,8 @@ function claudeMcp(add, mcp) {
 
 if (args.has("--uninstall")) {
   for (const f of EXTENSIONS) { const t = join(extDir, f); if (existsSync(t)) { rmSync(t); console.log("removed", t); } }
+  { const t = join(extDir, "subagent"); if (existsSync(t)) { rmSync(t, { recursive: true }); console.log("removed", t); } }
+  // The default agents (agents/*.md) are left in place: they may be user-edited.
   for (const s of SKILLS) for (const dir of [piSkillsDir, ...(args.has("--claude-skills") ? [claudeSkillsDir] : [])]) { const t = join(dir, s); if (existsSync(t)) { rmSync(t, { recursive: true }); console.log("removed", t); } }
   if (existsSync(piCfg)) { rmSync(piCfg); console.log("removed", piCfg); }
   if (args.has("--claude-mcp")) claudeMcp(false);
@@ -128,6 +131,19 @@ if (args.has("--uninstall")) {
 
 mkdirSync(extDir, { recursive: true });
 for (const f of EXTENSIONS) copyFileSync(join(ROOT, "integrations", "pi", f), join(extDir, f));
+// The subagent extension ships whole; its default agent definitions seed agents/ only when absent (never clobber a user's edits).
+const subagentDir = join(extDir, "subagent");
+cpSync(join(ROOT, "integrations", "pi", "subagent"), subagentDir, { recursive: true });
+console.log("pi subagent extension installed:", subagentDir);
+const agentsSrc = join(ROOT, "integrations", "pi", "agents");
+const agentsDir = join(piAgent, "agents");
+mkdirSync(agentsDir, { recursive: true });
+for (const f of AGENTS) {
+  const t = join(agentsDir, f);
+  if (existsSync(t)) { console.log("agent kept (not overwritten):", t); continue; }
+  copyFileSync(join(agentsSrc, f), t);
+  console.log("agent installed:", t);
+}
 const omniCfg = readJson(join(ROOT, "omni.config.json"), {});
 const prevCfg = readJson(piCfg, {});
 const cfg = { ...prevCfg, root: ROOT, vault: join(ROOT, "vault"), autoRecall: true, budgetTokens: 800, port: Number(omniCfg.port) || 4400, omniMcp: omniMcpConfig(prevCfg.omniMcp) };

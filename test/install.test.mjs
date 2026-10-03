@@ -36,6 +36,30 @@ test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
+test("install.mjs ships the subagent extension and seeds the default agents, uninstall keeps the agents", () => {
+  const home = mkdtempSync(join(tmpdir(), "omni-home-"));
+  try {
+    const r = run(home);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "subagent", "index.ts")), "subagent index.ts installed");
+    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "subagent", "agents.ts")), "subagent agents.ts installed");
+    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "scout.md")), "scout.md seeded");
+    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "re-analyst.md")), "re-analyst.md seeded");
+    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "droid-operator.md")), "droid-operator.md seeded");
+    // A user-edited agent is never clobbered.
+    const edited = join(home, ".pi", "agent", "agents", "scout.md");
+    writeFileSync(edited, "EDITED BY USER");
+    const r2 = run(home);
+    assert.equal(r2.status, 0, r2.stderr);
+    assert.equal(readFileSync(edited, "utf8"), "EDITED BY USER", "existing agent file not overwritten");
+    // Uninstall drops the extension but leaves the (possibly user-edited) agents.
+    const u = run(home, "--uninstall");
+    assert.equal(u.status, 0, u.stderr);
+    assert.ok(!existsSync(join(home, ".pi", "agent", "extensions", "subagent")), "subagent extension removed on uninstall");
+    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "scout.md")), "agents kept on uninstall");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("installer copies omni-run and its lib siblings into pi's extensions", () => {
   const home = mkdtempSync(join(tmpdir(), "omni-home-"));
   try {
