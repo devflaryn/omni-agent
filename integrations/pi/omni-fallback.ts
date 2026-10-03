@@ -18,41 +18,14 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { modelsFile, readChain, modelsBelow, nextModelOnHealthy } from "./omni-fallback-lib.mjs";
 
 export const NOTICE = "omni-fallback";
 
 interface Slot { provider: string; id: string }
 
-/** models.json path the way pi resolves it (PI_CODING_AGENT_DIR overrides ~/.pi/agent). */
-export function modelsFile(env: NodeJS.ProcessEnv = process.env): string {
-	const dir = env.PI_CODING_AGENT_DIR ? env.PI_CODING_AGENT_DIR.replace(/^~(?=$|[\\/])/, homedir()) : join(homedir(), ".pi", "agent");
-	return join(dir, "models.json");
-}
-
-/** The fallback chain: providers in file order, each provider's models in line order. */
-export function readChain(file: string): Slot[] {
-	if (!existsSync(file)) return [];
-	let json: any;
-	try { json = JSON.parse(readFileSync(file, "utf8")); } catch { return []; }
-	const out: Slot[] = [];
-	for (const [provider, p] of Object.entries<any>(json?.providers && typeof json.providers === "object" ? json.providers : {})) {
-		for (const m of Array.isArray(p?.models) ? p.models : []) {
-			const id = typeof m === "string" ? m : String(m?.id ?? "");
-			if (id) out.push({ provider, id });
-		}
-	}
-	return out;
-}
-
-/** Models below `current` in the chain, in order. Empty when `current` is not listed or is last. */
-export function modelsBelow(chain: Slot[], current: Slot | undefined): Slot[] {
-	if (!current) return [];
-	const i = chain.findIndex((s) => s.provider === current.provider && s.id === current.id);
-	return i < 0 ? [] : chain.slice(i + 1);
-}
+let healthy = 0;
+const COOLDOWN = 5;
 
 const short = (s: unknown, n = 160) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 
@@ -72,7 +45,21 @@ export default function omniFallback(pi: ExtensionAPI) {
 	// on the new model, with the notice and the errored turn filtered out of what it reads.
 	pi.on("agent_end", async (ev: any, ctx: any) => {
 		const failed = Array.isArray(ev.messages) ? ev.messages[ev.messages.length - 1] : undefined;
-		if (!failed || failed.role !== "assistant" || failed.stopReason !== "error") return;
+		if (!failed || failed.role !== "assistant" || failed.stopReason !== "error") {
+			// A healthy turn: step one model back up toward the primary once the cooldown passes.
+			healthy++;
+			const current = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+			const up = nextModelOnHealthy(readChain(modelsFile()), current, { cooldownTurns: COOLDOWN, healthyTurns: healthy });
+			if (up) {
+				const model = ctx.modelRegistry?.find?.(up.provider, up.id);
+				if (model && await pi.setModel(model)) {
+					healthy = 0;
+					await pi.sendMessage({ customType: NOTICE, content: `recovered up to ${up.provider}/${up.id}`, display: true }, { deliverAs: "steer" });
+				}
+			}
+			return;
+		}
+		healthy = 0; // an error resets the recovery clock
 		const current: Slot | undefined = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : failed.provider && failed.model ? { provider: failed.provider, id: failed.model } : undefined;
 		for (const next of modelsBelow(readChain(modelsFile()), current)) {
 			const model = ctx.modelRegistry?.find?.(next.provider, next.id);
