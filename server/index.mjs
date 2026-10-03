@@ -38,7 +38,7 @@ export async function createApp(overrides = {}) {
   const keeper = new GoalKeeper({
     bus, log,
     getPi: (sid) => (pi?.proc && pi.sid === sid ? pi : null),
-    judge: cfg.judge || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn }, { system: JUDGE_SYSTEM, input })),
+    judge: cfg.judge || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn, timeoutMs: hookConfig(cfg.hook).judgeTimeoutMs }, { system: JUDGE_SYSTEM, input })),
     // The status-box summarizer: same separate-LLM mechanism as the judge, chat model by default.
     summarize: cfg.summarize || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn }, { system: SUMMARY_SYSTEM, input })),
     config: hookConfig(cfg.hook),

@@ -229,3 +229,13 @@ test("cancel pauses (resumable), it does not permanently latch", () => {
   keeper.resume("pi:1");
   assert.equal(keeper.goal("pi:1").paused, false);
 });
+
+test("summarizer uses summaryProvider/summaryModel when set", async () => {
+  const bus = fakeBus();
+  let pick = null;
+  const pi = { sid: "pi:1", proc: {}, streaming: false, state: { model: { provider: "chatP", id: "chatM" } } };
+  const keeper = new GoalKeeper({ bus, getPi: () => pi, judge: async () => "{}", summarize: async (_i, p) => { pick = p; return "ok"; }, config: { enabled: false, summaries: true, summaryProvider: "sumP", summaryModel: "sumM" } });
+  keeper.setGoal("pi:1", "g");
+  await keeper.makeSummary("pi:1");
+  assert.deepEqual(pick, { provider: "sumP", model: "sumM" });
+});
