@@ -39,6 +39,14 @@ export function formatEvent(ev, { started = Date.now(), width = 160 } = {}) {
   return null;
 }
 
+/** Keep structured checkpoints out of a multi-day log; drop per-token deltas. Pure. */
+export function logWorthKeeping(ev) {
+  if (ev.kind === "token") return false;
+  if (ev.kind === "msg" && ev.phase === "delta") return false;
+  if (ev.kind === "log" && ev.level === "delta") return false;
+  return true;
+}
+
 export async function runHeadless({ cwd, task, provider, model, thinking, maxSeconds = 0, memory = false, log, port = 4491, out = console.log, cfg = {} }) {
   const started = Date.now();
   const app = await createApp({ port, host: "127.0.0.1", lan: false, cwd, autoStartPi: false, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}), ...cfg });
@@ -57,7 +65,7 @@ export async function runHeadless({ cwd, task, provider, model, thinking, maxSec
     let timer = null;
     const onEvent = (ev) => {
       if (ev.sid !== pi.sid && ev.sid !== "pi:pending") return;
-      if (log) appendFileSync(log, `${JSON.stringify(ev)}\n`);
+      if (log && logWorthKeeping(ev)) appendFileSync(log, `${JSON.stringify(ev)}\n`);
       if (ev.kind === "tool" && ev.phase === "start") tools.set(ev.name, (tools.get(ev.name) || 0) + 1);
       if (ev.kind === "msg" && ev.role === "assistant") {
         if (ev.usage) for (const k of Object.keys(tokens)) tokens[k] += ev.usage[k] || 0;

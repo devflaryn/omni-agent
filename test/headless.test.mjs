@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatEvent, runHeadless } from "../scripts/headless.mjs";
+import { formatEvent, logWorthKeeping, runHeadless } from "../scripts/headless.mjs";
 
 test("formatEvent renders tool starts/ends and assistant text, hides deltas", () => {
   const started = 1000;
@@ -13,6 +13,13 @@ test("formatEvent renders tool starts/ends and assistant text, hides deltas", ()
   assert.equal(formatEvent({ kind: "msg", role: "assistant", blocks: [{ type: "text", text: "Booted." }], ts: 5000 }, { started }), "    4s 🤖 Booted.");
   assert.equal(formatEvent({ kind: "delta", part: "text", delta: "x", ts: 5000 }, { started }), null);
   assert.equal(formatEvent({ kind: "msg", role: "assistant", blocks: [{ type: "thinking", text: "hmm" }], ts: 5000 }, { started }), null);
+});
+
+test("token delta events are not written to the long-run log", () => {
+  assert.equal(logWorthKeeping({ kind: "msg", phase: "delta" }), false);
+  assert.equal(logWorthKeeping({ kind: "token" }), false);
+  assert.equal(logWorthKeeping({ kind: "tool", phase: "end" }), true);
+  assert.equal(logWorthKeeping({ kind: "status", streaming: false }), true);
 });
 
 test("runHeadless prompts the pi child, streams its events and settles with a summary", async () => {
