@@ -276,8 +276,8 @@ export default function omniMcp(pi: ExtensionAPI) {
 						if (err || !payload) return;
 						try {
 							pi.sendMessage?.(
-								`✓ ${name} finished after running long${payload.isError ? " (with an error)" : ""}:\n${clip(pretty(payload.text))}`,
-								{ deliverAs: "followUp" },
+								{ customType: "omnidroid-late", content: `✓ ${name} finished after running long${payload.isError ? " (with an error)" : ""}:\n${clip(pretty(payload.text))}`, display: true },
+								{ deliverAs: "followUp", triggerTurn: true },
 							);
 						} catch { /* best effort */ }
 					};
