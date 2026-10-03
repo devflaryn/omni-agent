@@ -128,6 +128,24 @@ test("restart resumes the saved session file via the onRestart hook", async () =
   assert.equal(resumedTo, "/sessions/keep.jsonl");
 });
 
+test("C1: a crash captures the resume anchor and a transient empty-session event can't clobber it", async () => {
+  const bus = { emit() {}, on() {}, off() {} };
+  const pi = new PiRpc({ cli: null, bin: "node", cwd: process.cwd(), bus });
+  pi.state = { sessionFile: "/sessions/goal.jsonl" }; // the live (goal) session before the crash
+  let resumedTo = null;
+  pi.switchSession = async (f) => { resumedTo = f; };
+  pi.start = () => pi; // stub spawn; leaves pi.ready undefined so the restart timer can't auto-resume
+  await pi.handleExit(1);
+  assert.equal(pi.restoring, true, "restoring is latched for the restart window");
+  assert.equal(pi.resumeFile, "/sessions/goal.jsonl", "the crashed session was captured as the anchor");
+  // The fresh child opens an empty session; the supervisor mirror is gated on !pi.restoring, so it must NOT overwrite.
+  if (!pi.restoring) pi.resumeFile = "/sessions/empty.jsonl";
+  assert.equal(pi.resumeFile, "/sessions/goal.jsonl", "the empty session did not clobber the anchor");
+  await pi.resumeSession();
+  assert.equal(resumedTo, "/sessions/goal.jsonl", "resume switched to the captured goal session, not the empty one");
+  assert.equal(pi.restoring, false, "restoring is cleared once resume finished");
+});
+
 test("watchdog aborts+restarts a wedged stream", () => {
   const bus = { emit() {}, on() {}, off() {} };
   const pi = new PiRpc({ cli: null, bin: "node", cwd: process.cwd(), bus });

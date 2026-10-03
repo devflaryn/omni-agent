@@ -70,7 +70,10 @@ Run `node scripts/install.mjs` once first so pi loads the `omni-run` extension
 (context re-injection + durable compaction) and the recovering model fallback.
 
 For weak small-context models, set in `~/.pi/agent/settings.json` a longer
-`httpIdleTimeoutMs` (e.g. 600000) coordinated below Omni's `stallMs`, and make sure each
+`httpIdleTimeoutMs` (e.g. 600000) so pi's own HTTP retry runs before Omni's watchdog kills and
+restarts the child. Keep it strictly BELOW Omni's `stallMs` (default 900000) — i.e.
+`httpIdleTimeoutMs` 600000 < `stallMs` 900000 — so the watchdog only fires after pi's own retry
+has had its chance. Also make sure each
 model's `contextWindow` in `~/.pi/agent/models.json` matches reality (DeepSeek V4 Flash is
 1.3M; the chat-dated DeepSeek is 128k — a wrong value makes pi compact too late or too often).
 

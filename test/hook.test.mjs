@@ -83,6 +83,10 @@ test("keeper stays quiet when the judge says done, keeps re-engaging without lim
   s.run(); s.assistant("Done."); s.settle();
   await sleep(50);
   assert.equal(s.pi.prompts.length, 0);
+  // A done verdict is now terminal (I2): the goal latches `done` and the keeper stops judging it.
+  assert.equal(s.keeper.goal(SID).done, true);
+  // A fresh prompt starts a new (not-done) goal; the keeper then re-engages it without limit.
+  s.user("Do X");
   // five re-engaged runs that each make a tool call: well past the old cap of 5, still going
   for (let i = 1; i <= 5; i++) { s.run(); toolCall(); s.assistant("More."); s.settle(); await sleep(50); assert.equal(s.pi.prompts.length, i); }
   assert.equal(s.events.filter((e) => e.kind === "hook").at(-1).idle, 0);
@@ -248,6 +252,24 @@ test("attachToSid moves goal state to a new session id after a restart", () => {
   keeper.attachToSid("pi:1", "pi:2");
   assert.equal(keeper.goal("pi:2").text, "goal");
   assert.equal(keeper.goal("pi:1"), null);
+});
+
+test("I2: a done verdict latches g.done, persists status:done, and stops further checks", async () => {
+  const bus = fakeBus();
+  const writes = [];
+  const ledger = { writeControl: (p) => writes.push(p), goalText: () => "" };
+  const pi = { sid: "pi:1", proc: {}, streaming: false, state: { model: { provider: "orca", id: "qwen" } } };
+  let judgeCalls = 0;
+  const keeper = new GoalKeeper({ bus, getPi: (sid) => (sid === "pi:1" ? pi : null), judge: async () => { judgeCalls++; return '{"done":true,"reason":"finished"}'; }, ledger, config: { enabled: true } });
+  const g = keeper.setGoal("pi:1", "do it");
+  await keeper.check("pi:1", g.seq);
+  assert.equal(judgeCalls, 1);
+  assert.equal(g.done, true, "done is latched on the goal");
+  assert.ok(writes.some((w) => w.status === "done"), "status:done persisted to the ledger");
+  // A subsequent check (e.g. a heartbeat tick) must early-return without re-judging the finished goal.
+  await keeper.check("pi:1", g.seq);
+  assert.equal(judgeCalls, 1, "no re-judge after done — a judge hiccup can't resurrect a completed goal");
+  keeper.dispose();
 });
 
 test("summarizer uses summaryProvider/summaryModel when set", async () => {

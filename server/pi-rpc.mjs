@@ -48,6 +48,10 @@ export class PiRpc extends EventEmitter {
     this.restarts = 0;
     this.resumeFile = null;
     this.onRestart = null;
+    // True from the moment a crashed session is captured until resumeSession() has put the child
+    // back on it. While true, the supervisor must NOT mirror the transient empty-session `session`
+    // event over the resume anchor (that was C1: resume landed in the empty session).
+    this.restoring = false;
     this.lastEventAt = 0;
     this.lastHealthyAt = 0;
     this.watchdogTimer = null;
@@ -105,6 +109,10 @@ export class PiRpc extends EventEmitter {
     this.proc = null;
     this.streaming = false;
     if (this.stopped) return;
+    // Capture the session the crashed child had BEFORE a fresh child opens an empty one, and latch
+    // `restoring` so the empty session's `session` event can't clobber this anchor (C1).
+    this.resumeFile = this.state?.sessionFile || this.resumeFile;
+    this.restoring = true;
     const reset = nextRestartState({ restarts: this.restarts, lastHealthyAt: this.lastHealthyAt });
     this.restarts = reset.restarts;
     const delay = restartDelay(this.restarts++);
@@ -116,8 +124,13 @@ export class PiRpc extends EventEmitter {
 
   /** After a restart, put the child back on the session it had, then let the supervisor replay. */
   async resumeSession() {
-    if (this.resumeFile) { try { await this.switchSession(this.resumeFile); } catch (e) { this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `switch_session on resume failed: ${e.message}` }); } }
-    if (this.onRestart) await this.onRestart();
+    try {
+      if (this.resumeFile) { try { await this.switchSession(this.resumeFile); } catch (e) { this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `switch_session on resume failed: ${e.message}` }); } }
+      if (this.onRestart) await this.onRestart();
+    } finally {
+      // Resume is over (success, failure, or no anchor to resume): let the supervisor mirror session events again.
+      this.restoring = false;
+    }
   }
 
   startWatchdog({ stallMs = 360000, intervalMs = 30000 } = {}) {

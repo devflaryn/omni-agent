@@ -57,7 +57,9 @@ export async function createApp(overrides = {}) {
     const s = registry.upsert(ev.sid, {});
     if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom });
     // Invariant: run.json.sessionFile always names pi's current session file, and pi.resumeFile mirrors it.
-    if (ev.kind === "session" && ev.owned && ev.harness === "pi" && ev.file) {
+    // Gated on !pi.restoring so the transient empty session a fresh child opens during a crash restart
+    // cannot clobber the resume anchor before resumeSession() reads it (C1).
+    if (ev.kind === "session" && ev.owned && ev.harness === "pi" && ev.file && !pi?.restoring) {
       runLedger?.writeControl({ sessionFile: ev.file });
       if (pi) pi.resumeFile = ev.file;
     }
@@ -75,6 +77,8 @@ export async function createApp(overrides = {}) {
   function startPi(cwd = cfg.cwd) {
     if (pi) pi.stop();
     pi = cfg.createPi ? cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, env: piChildEnv(cfg), bus });
+    // The auto-restart path re-attaches the goal: keeper._lastSid holds the pre-restart sid, pi.sid the new one (C1).
+    pi.onRestart = async () => { keeper.attachToSid(keeper._lastSid, pi.sid); };
     pi.start();
     pi.startWatchdog?.({ stallMs: cfg.stallMs });
     return pi;

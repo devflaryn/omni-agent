@@ -30,7 +30,7 @@ export async function runUnattended({ cwd, goal, provider, model, thinking, runI
   await app.listen();
   const pi = app.startPi(cwd);
   // Mirror pi's session file into the ledger so a restart resumes it.
-  app.bus.on("event", (ev) => { if (ev.kind === "session" && ev.harness === "pi" && ev.owned && ev.file) { ledger.writeControl({ sessionFile: ev.file }); if (app.pi) app.pi.resumeFile = ev.file; } });
+  app.bus.on("event", (ev) => { if (ev.kind === "session" && ev.harness === "pi" && ev.owned && ev.file && !app.pi?.restoring) { ledger.writeControl({ sessionFile: ev.file }); if (app.pi) app.pi.resumeFile = ev.file; } });
 
   await pi.waitReady();
   if (thinking) await pi.setThinking(thinking).catch(() => {});

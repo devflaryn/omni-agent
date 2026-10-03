@@ -124,8 +124,9 @@ export const CONFIG = {
   liveWindowMs: fc.liveWindowMs || 30000,
   /** Goal hook: when Omni's pi stops, a judge model decides whether the user's request is done and re-engages pi if not. */
   hook: hookConfig(fc.hook),
-  /** Watchdog: pi claims to be streaming but produced no event for this long → abort+restart. */
-  stallMs: Number(fc.stallMs) || 360000,
+  /** Watchdog: pi claims to be streaming but produced no event for this long → abort+restart.
+   *  Must stay ABOVE pi's own `httpIdleTimeoutMs` so pi's in-process HTTP retry runs first (I3). */
+  stallMs: Number(fc.stallMs) || 900000,
   /** Restart counter resets after the child streamed healthily this long. */
   restartHealthyMs: Number(fc.restartHealthyMs) || 120000,
   /** Where unattended run ledgers live. */

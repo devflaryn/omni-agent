@@ -169,7 +169,7 @@ export class GoalKeeper {
   setGoal(sid, text, explicit = false) {
     const prev = this.goals.get(sid);
     if (prev) clearTimeout(prev.timer);
-    const g = { text, explicit, seq: (prev?.seq || 0) + 1, nudges: 0, idleNudges: 0, nudged: false, progress: false, ran: false, aborted: false, paused: false, sameFailCount: 0, lastFingerprint: "", stopReason: "", tail: [], timer: null, checking: false };
+    const g = { text, explicit, seq: (prev?.seq || 0) + 1, nudges: 0, idleNudges: 0, nudged: false, progress: false, ran: false, aborted: false, paused: false, done: false, sameFailCount: 0, lastFingerprint: "", stopReason: "", tail: [], timer: null, checking: false };
     this.goals.set(sid, g);
     this._lastSid = sid;
     this.ledger?.writeControl?.({ goalText: text });
@@ -225,7 +225,7 @@ export class GoalKeeper {
 
   onSettled(sid) {
     const g = this.goals.get(sid);
-    if (!g || g.paused) return;
+    if (!g || g.paused || g.done) return;
     // Refresh the status box on every settle (a milestone), independent of the re-engage toggle,
     // using a separate summarizer LLM. Fire-and-forget so it never blocks the goal check.
     this.makeSummary(sid).catch((e) => this.log("summary failed", e.message));
@@ -253,7 +253,7 @@ export class GoalKeeper {
   async check(sid, seq) {
     const g = this.goals.get(sid);
     const pi = this.getPi(sid);
-    if (!g || g.seq !== seq || g.paused || !pi || pi.streaming) return null;
+    if (!g || g.seq !== seq || g.paused || g.done || !pi || pi.streaming) return null;
     this._lastSid = sid;
     // Consume the "a run just happened" flag; a *new* run started while the judge thinks re-sets it.
     g.ran = false;
@@ -271,7 +271,9 @@ export class GoalKeeper {
     finally { g.checking = false; }
     if (g.seq !== seq || g.paused || pi.streaming || g.ran) return verdict;
     // Fail open: a missing/failed verdict is treated as "not done", so the run never stops on a judge hiccup.
-    if (verdict?.done) { this.emitLog(sid, `goal hook: done (${verdict.reason})`); return verdict; }
+    // A genuine done is the one legitimate terminal state: latch it and persist "done" so the runner
+    // finishes and the heartbeat stops re-judging a completed goal (I2 — distinct from fail-open).
+    if (verdict?.done) { g.done = true; this.ledger?.writeControl?.({ status: "done" }); this.emitLog(sid, `goal hook: done (${verdict.reason})`); return verdict; }
     const reason = verdict?.reason || "(no judge verdict — assuming not done)";
     const nudge = verdict?.nudge || "";
     // Loop detection: same failure signature loopK times → escalate instead of nudging the same way.
@@ -300,7 +302,7 @@ export class GoalKeeper {
       if (!this.config.enabled) return;
       for (const [sid, g] of this.goals) {
         const pi = this.getPi(sid);
-        if (!pi || pi.streaming || g.paused || g.checking) continue;
+        if (!pi || pi.streaming || g.paused || g.checking || g.done) continue;
         this.check(sid, g.seq).catch((e) => this.log("heartbeat check failed", e.message));
       }
     }, this.config.heartbeatMs);
