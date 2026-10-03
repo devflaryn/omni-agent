@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerHooks } from "node:module";
 import { ROOT, findPiCli } from "../server/config.mjs";
+import { modelsFile, readChain, modelsBelow } from "../integrations/pi/omni-fallback-lib.mjs";
 
 const EXT = join(ROOT, "integrations", "pi", "omni-fallback.ts");
 const piCli = findPiCli();
@@ -63,14 +64,14 @@ async function load(chain = CHAIN, { setModelOk = () => true } = {}) {
 const errored = (provider, model, errorMessage = "400 Bad Request: no body") => ({ role: "assistant", content: [{ type: "text", text: "" }], provider, model, stopReason: "error", errorMessage });
 
 test("readChain / modelsBelow: providers in file order, models in line order; the model below the current one is next", { skip }, async () => {
-  const { mod, cleanup } = await load();
+  const { cleanup } = await load();
   try {
-    const chain = mod.readChain(mod.modelsFile());
+    const chain = readChain(modelsFile());
     assert.deepEqual(chain.map((s) => `${s.provider}/${s.id}`), ["modal/Qwen/Qwen3.8-27B", "openrouter/deepseek/deepseek-v4-flash-0731", "openrouter/z-ai/glm-5.3-flash:floor"]);
-    assert.deepEqual(mod.modelsBelow(chain, { provider: "modal", id: "Qwen/Qwen3.8-27B" }).map((s) => s.id), ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3-flash:floor"]);
-    assert.deepEqual(mod.modelsBelow(chain, { provider: "openrouter", id: "z-ai/glm-5.3-flash:floor" }), [], "the last model has nothing below it");
-    assert.deepEqual(mod.modelsBelow(chain, { provider: "other", id: "x" }), [], "a model outside the list has no fallback");
-    assert.deepEqual(mod.readChain(join(tmpdir(), "nope-omni.json")), []);
+    assert.deepEqual(modelsBelow(chain, { provider: "modal", id: "Qwen/Qwen3.8-27B" }).map((s) => s.id), ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3-flash:floor"]);
+    assert.deepEqual(modelsBelow(chain, { provider: "openrouter", id: "z-ai/glm-5.3-flash:floor" }), [], "the last model has nothing below it");
+    assert.deepEqual(modelsBelow(chain, { provider: "other", id: "x" }), [], "a model outside the list has no fallback");
+    assert.deepEqual(readChain(join(tmpdir(), "nope-omni.json")), []);
   } finally { cleanup(); }
 });
 

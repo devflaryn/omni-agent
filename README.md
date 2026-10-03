@@ -57,6 +57,23 @@ in the composer to prepend that answer to a prompt, so the model reads the graph
 
 Tests: `npm test`.
 
+### Unattended multi-day runs
+
+`node scripts/run.mjs --cwd <project> --goal "…"` starts a durable run: it keeps one
+pi session alive for days, re-engaging it toward the goal, surviving crashes (it resumes
+the same session), compacting without losing the goal, and offloading huge tool output.
+State lives in `vault/Runs/<run-id>/` (`run.json`, `ledger.md`, `events.jsonl`, `artifacts/`).
+Resume after a reboot with `--resume <run-id>`. The desktop/browser GUI is a read-only
+observer — open `http://127.0.0.1:4400` to watch; closing it never stops the run.
+
+Run `node scripts/install.mjs` once first so pi loads the `omni-run` extension
+(context re-injection + durable compaction) and the recovering model fallback.
+
+For weak small-context models, set in `~/.pi/agent/settings.json` a longer
+`httpIdleTimeoutMs` (e.g. 600000) coordinated below Omni's `stallMs`, and make sure each
+model's `contextWindow` in `~/.pi/agent/models.json` matches reality (DeepSeek V4 Flash is
+1.3M; the chat-dated DeepSeek is 128k — a wrong value makes pi compact too late or too often).
+
 ## What you get
 
 - **Home**: one container. "What should we work on?", the composer, the working directory (recent
