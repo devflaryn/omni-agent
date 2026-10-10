@@ -4,6 +4,33 @@ The native engine at `Desktop/Omni Apps/omnidroid` (Rust workspace). Binaries in
 `target/release/`: `omnidroid[.exe]` (the launcher), `omni-mcp[.exe]` (the MCP server),
 `omni-linux-run[.exe]` (the real-AOSP runner, for probing boots by hand).
 
+## The app (what runs apps now)
+
+```text
+omnidroid                       the app: warm Androids, any APK in windows of its own, a command line
+omnidroid <app.apk> [xN]        the app, launching N instances
+omnidroid serve [--port <n>]    the app without its screen (pool + MCP), until stdin closes
+omnidroid help commands         the one-shot commands below (scripts, and the app's own use)
+```
+
+Settings (`settings` / `set <key> <value>` in the app; `<app-data>/../app.conf`, or `OMNI_APP_CONFIG`):
+
+| key | default | meaning |
+|---|---|---|
+| `idle_close_minutes` | 5 | close an Android that has run no app this long (0: never) |
+| `keep_warm` | 1 | Androids kept up in all, busy or idle |
+| `warm_on_start` | true | warm an Android when the app opens |
+| `stop_on_exit` | true | stop every Android when the app quits (else the next start adopts them) |
+| `max_devices` | 0 | the most Androids at once (0: no limit) |
+| `instance_size` | 1280x720 | a new instance's display and window |
+| `gpu`, `device_ram_mb` | auto, 0 | the Androids' GPU backend and RAM |
+| `mcp_enabled`, `mcp_port` | false, 7457 | the MCP server on `http://127.0.0.1:<port>/mcp` (`mcp on|off|register|status`) |
+
+A pool Android is `omnidroid aosp --warm` with `OMNI_MULTI_DISPLAY=1` (displays added at runtime,
+each a window), `OMNI_PRIMARY_WINDOW=0`, users visible on displays of their own
+(`fw.visible_bg_users=1`), `ro.hw_timeout_multiplier` 5 and no spare app process; its files are
+`<temp>/omni-warm-<secs>` (`.log`, `.png`, `.d<display>.png` per instance, `.pool`, `.launcher.log`).
+
 ## Build
 
 ```text

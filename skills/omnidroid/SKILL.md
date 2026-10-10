@@ -1,6 +1,6 @@
 ---
 name: omnidroid
-description: Use when running any APK on omnidroid, the native ARM64-Android engine in "Omni Apps/omnidroid" (Rust, no VM) — installing and testing any APK in seconds on the host's warm Android device (start_instance / install_apk / shell / stop_app / uninstall_apk / device_status / stop_device), looking inside a running app (its log, files, process, screen), driving it with input, running a session of its own with an installed plugin's options (args / link_id), the `omnidroid` CLI (`omnidroid <app.apk>`, aosp, play, which, plugins), headless runs and the control channel. Trigger on "run this APK", "install/launch/start this app", "boot omnidroid", "start an instance", "take a screenshot of the instance", "is the app running", or any omnidroid_* / mcp__omnidroid__* tool. For hooking, calling or dumping a .so use the omnidroid-frida skill; for the old QEMU manager (offsets, `omnidroid su`, frida-server) use omnidroid-qemu.
+description: Use when running any APK on omnidroid, the native ARM64-Android engine in "Omni Apps/omnidroid" (Rust, no VM), through the omnidroid app's MCP server — launching any APK as one or many instances (start_instance {apk, count} / wait_instance / list_instances / screenshot / input / stop_instance), managing the app's warm Androids (list_devices / warm_device / stop_device / shell / settings / pool_log), looking inside a running app (its log, files, screen), and what to tell the person when the tools are missing (open `omnidroid`, `mcp on`). Trigger on "run this APK", "launch 3 instances of", "install/launch/start this app", "start an instance", "take a screenshot of the instance", "tap/type in the app", "is the app running", or any omnidroid_* / mcp__omnidroid__* tool. For hooking, calling or dumping a .so use the omnidroid-frida skill; for the old QEMU manager (offsets, `omnidroid su`, frida-server) use omnidroid-qemu.
 ---
 
 # Driving omnidroid
@@ -17,129 +17,72 @@ own manifest, it is installed with `pm install` and started from its launcher, a
 
 | path | what boots | how |
 |---|---|---|
-| **real Android** (default, any APK) | real Android on omnidroid's Linux ABI layer; the APK `pm install`ed and started from its launcher | MCP `start_instance {apk}`, or `omnidroid <app.apk>` (= `omnidroid aosp --apk …`) |
+| **real Android** (default, any APK) | real Android on omnidroid's Linux ABI layer; the APK `pm install`ed and started from its launcher | MCP `start_instance {apk, count}`, or `run <apk>` in the omnidroid app |
 | **fast path** (opt-in) | the APK's native code alone, no Java runtime — only apps whose Java side the engine answers itself | `omnidroid play` |
 
-## The MCP tools (preferred for an agent)
+## The MCP tools (how an agent drives omnidroid)
 
-omnidroid ships an MCP server, `omni-mcp` (`crates/omni-mcp`). Omni Agent wires it in:
+omnidroid is **an app** now: `omnidroid` (no arguments) opens a full-screen terminal app that keeps
+warm Androids and runs any APK on them, each instance in a window of its own. Agents do not run
+`omnidroid` commands in a terminal; they use **the app's MCP server**, which the person turns on in
+the app (`mcp on`: `http://127.0.0.1:7457/mcp`, this computer only, from then on at every start).
 
-- **pi**: the `omni-mcp.ts` extension registers every tool as `omnidroid_<tool>`
-  (`omnidroid_start_instance`, `omnidroid_screenshot`, …).
-- **Claude Code**: `node scripts/install.mjs --claude-mcp` registers it as `omnidroid`, tools
-  `mcp__omnidroid__<tool>`.
+- **Claude Code**: `mcp on` in the app registers it (`claude mcp add --transport http --scope user
+  omnidroid <url>`); tools `mcp__omnidroid__<tool>`.
+- **pi (Omni Agent)**: `omni-mcp.ts` runs `omni-mcp --connect <url>` (the stdio bridge to the app;
+  `node scripts/install.mjs` sets it up); tools `omnidroid_<tool>`.
+- **Any other agent**: the URL (MCP over HTTP), or `omni-mcp --connect <url>` as a stdio server.
 
-Below, tools are named without the prefix. **No `omnidroid_*` tools?** The binary is not built or
-not configured: in the omnidroid repo `cargo build --release -p omnidroid -p omni-mcp`, then in
-omni-agent `node scripts/install.mjs` and restart pi. Its path lives in
-`~/.pi/agent/omni-agent.json` → `omniMcp.command`.
-
-### Any APK on the warm device
-
-`start_instance {apk}` and `install_apk {apk}` (with no `args` or `link_id`) use the host's **one
-warm device** (Android booted and idle, no app of its own): the APK is installed unless the device
-already holds the same bytes (SHA-256, not version), another test app is uninstalled first, and
-`start_instance` **blocks until the launcher Activity is displayed**, answering `state:
-app_on_screen` with seconds per step. No warm device up: the call boots one (~45-60 s from its saved
-copy; the first ever ~2 min; the whole first call ~70-80 s) and it stays up for the next APKs, beyond
-this server. `apk` is the APK's **host path** (absolute); the user can hand you any APK.
+**No tools, or "the omnidroid app's MCP server is not reachable"?** The app is not open, or MCP is
+off in it: ask the person to open `omnidroid` and type `mcp on`. Never start the app or devices from a
+shell yourself.
 
 | tool | does |
 |---|---|
-| `start_instance {apk}` | install by content + start; ~2 s same APK, ~8-10 s a rebuilt/other small APK (a spare app process is kept ready), ~30 s a large game |
-| `install_apk {apk}` | install by content now, no start |
-| `stop_instance {instance_id, device?}` | force-stop + clear the app; the device stays warm (`device: true` shuts it) |
-| `shell {command, uid?}` | adb-shell style on the warm device (`pm`, `am`, `dumpsys`, `input`) |
-| `uninstall_apk {package}` / `stop_app {package}` | on the warm device |
-| `device_status` / `stop_device` | none/booting/ready + test apps / shut it down |
-| `screenshot {instance_id?}` | the latest framebuffer PNG: `path`, `width`, `height` (a vision model in pi also gets the image) |
+| `start_instance {apk, count?}` | launch any APK (an absolute host path) as `count` instances (1-64); answers their ids **at once** |
+| `wait_instance {instance_id, timeout?}` | wait until it runs (its launcher Activity displayed) or ends; answers its state and screenshot path |
+| `list_instances` | each: package, `device` (the Android), `user`, `display`, `state` (`waiting`, `installing`, `starting`, `running`, `closing`, `ended: <why>`), `screenshot` |
+| `screenshot {instance_id}` | its display as a PNG (written every second): path, width, height |
+| `input {instance_id, action, ...}` | `tap {x,y}`, `swipe {x,y,x2,y2,ms}`, `text {text}`, `key {key: KEYCODE_BACK}` on its display |
+| `stop_instance {instance_id}` | close it: the app stopped, its window gone; the Android stays warm |
+| `shell {command, device?, uid?}` | adb-shell style on an Android (`uid: 0` root); default the first ready one |
+| `list_devices` / `warm_device` / `stop_device {device}` | the warm Androids: state, idle time, builds installed, instances |
+| `settings {key?, value?}` / `pool_log {lines?}` | the app's settings (idle_close_minutes, keep_warm, ...) / its log |
 
-- `screenshot` right after a start waits for a fresh frame (<=3 s).
-- From a terminal: `python tools/device_ctl.py "<command>"` (control channel `<dir>.ctl`).
-- Never two devices per host: a warm device will not boot while a session of its own runs.
-- Quitting pi (the MCP server exiting) force-stops the apps it started; the device stays up.
+**Where an instance goes**: an APK is known by its bytes, not its package and version. The same APK
+file again runs on the Android that has it (each instance is an Android user of its own on a display
+of its own); another package goes into a warm Android beside the others; another build of a package
+that is **running** gets an Android of its own, while a build installed but not running is replaced.
+A first launch on a fresh Android takes ~1-2 min (install, a user, the start); the next ones less.
+Androids idle (no app) for `idle_close_minutes` are closed, `keep_warm` stay up.
 
-**Proof an app is up**: `start_instance` answering `state: app_on_screen` means Android displayed
-its launcher Activity. Then `screenshot` and look at it; `shell "dumpsys window | grep
-mCurrentFocus"` names the focused window. If the app dies, the device log (`device_status` →
-`log`) has `Process <package> (pid N) has died` and, for a crash, the `FATAL EXCEPTION` /
-`Fatal signal` lines above it — quote the line you saw.
+**Proof an app is up**: `wait_instance` answering `running` means Android displayed its launcher
+Activity. Then `screenshot` it and look. `ended: the app stopped` means its Activity left its display
+(a crash, or the app closed itself): read the Android's log (`list_devices` → `log`) for
+`FATAL EXCEPTION` / `Fatal signal` / `has died` and quote the line.
 
-**Looking inside a running app** (the warm device has no adb, no frida-server -- the guest kernel
-has no `ptrace`, so nothing can be injected into a live process):
+**Looking inside a running app** (no adb, no frida-server -- the guest kernel has no `ptrace`):
 
 | want | how |
 |---|---|
-| its log | the device's log file on the host -- `device_status` → `log` (`<device dir>.log`): every Android log line (`I/Tag(pid): ...`) lands there; grep it with your file tools. In-guest `logcat -d` is empty here |
-| its process | `shell "dumpsys activity processes | grep <package>"` (pid, state). `pidof`/`ps` do not see apps: each runs in a host process of its own |
-| what is on screen / its state | `screenshot`; `shell "dumpsys activity top"`, `"dumpsys window | grep mCurrentFocus"` |
-| its files, prefs, databases | `shell {command: "ls -R /data/data/com.example.app", uid: 0}`, `cat` a file (root reads any) |
-| input | `shell "input tap X Y"`, `"input text hello"`, `"input keyevent KEYCODE_BACK"` |
-| a link into the app | `shell "am start -a android.intent.action.VIEW -d '<uri>' <package>"` |
-| its native code, hooked | the installed APK is on the host: `<device dir>/data/app/*/<package>-*/base.apk` (`device_status` gives the dir); unzip `lib/arm64-v8a/*.so` and use the **omnidroid-frida** lab (`lab_load`, `intercept`, `call_function`, `dump_module`) |
-| a fresh start of it | `stop_app {package}` then `start_instance {apk}` (same bytes: no reinstall) |
+| its log | `list_devices` → `log`: every Android log line of that Android (`I/Tag(pid): ...`); grep it with your file tools |
+| what is on screen | `screenshot {instance_id}`; `shell "dumpsys activity activities | grep -E 'Display #|ActivityRecord'"` |
+| its files | `shell {command: "ls -R /data/user/<user>/com.example.app", uid: 0}` (each instance is its own user) |
+| its native code, hooked | the installed APK is on the host under the Android's dir (`data/app/*/<package>-*/base.apk`); unzip `lib/arm64-v8a/*.so` and use the **omnidroid-frida** lab |
 
-### A session of its own (a plugin's options)
+## The app (for the person, not the agent)
 
-What one app needs beyond install-and-start (a sign-in cookie, a link opened once the app is up,
-the log lines that say how far it got) is an omnidroid **plugin**'s, never the launcher's
-(`omnidroid plugins` lists the installed ones; `omnidroid help` lists their options).
-`start_instance {apk, args?, link_id?}` with `args` (e.g. `["--cookie", "acct"]`) or `link_id`
-boots a device of its own through `omnidroid aosp` and **returns at once**:
-
-| tool | does |
-|---|---|
-| `start_instance {apk, args?, link_id?, gpu?, size?, minutes?}` | spawns `omnidroid aosp --apk … <args>`; `link_id` is the id the plugin's link opens once the app is ready |
-| `list_instances` | each instance's **`state`**: `booting`, `signed_in`, `link_taken`, `loaded` (+ `loaded_id`), `stopped` — as far as its plugin names markers; `log`, `screenshot_path` — poll this, not screenshots |
-| `stop_instance {instance_id}` | ends it (its `stop` file: the device shuts down) |
-
-- An option no installed plugin adds is refused, with a hint naming the repository's plugin that
-  adds it.
-- Without the plugin's markers a session shows `booting` until it stops: read its log.
-- The first session for an APK (and account) boots a new device (minutes) and saves it; later ones
-  boot the saved copy. Poll `list_instances` every 10-20 s, don't spin.
-- Instances belong to the omni-mcp process: **quitting pi stops every instance it booted**. A tool
-  call that times out (600 s, `omniMcp.timeoutSec`) restarts omni-mcp, which also stops them.
-
-**A session's failures are silent to the tool** (omni-mcp throws the launcher's output away): a
-build error or a missing APK shows only as `running: false`. Build first where you can see the
-output (`cargo build --release -p omnidroid -p omni-mcp`, and
-`cargo test --release -p omni-linux --test r_app --no-run`), then read the session's own log:
-`<temp>/omni-linux-r-<pid>.log` (`%TEMP%` on Windows, `$TMPDIR`/`/tmp` elsewhere; the MCP's are
-`omni-linux-r-mcp-*`), a frame every 20 s in `<temp>/omni-linux-r-<pid>-shots/NNNN.png`.
-
-| line in a session's log | means |
-|---|---|
-| `[r] boot_completed=1` | Android is up |
-| `[r] pm install: 0` | installed |
-| `[r] package <pkg>` / `[r] launcher <activity>` | what will be started |
-| `[r] am start: 0` | the launcher Activity was started |
-| `frames presented` | the app drew |
-| `GUEST THREAD DIED` | always a bug — report it with the lines around it |
-
-## The CLI
-
-```bash
-cd "Omni Apps/omnidroid"
-target/release/omnidroid ~/apks/app.apk                 # any APK on real Android (a warm device if one is up)
-target/release/omnidroid aosp --apk X --minutes 30 [--size 1600x900] [--gpu vulkan|gl|auto] [--with-systemui]
-target/release/omnidroid aosp --warm                     # a warm device, no app (what start_instance uses)
-target/release/omnidroid play --apk X [--minutes N] [--fresh] [--phone] [--headless|--no-window] [--control cmds.txt]
-target/release/omnidroid which [--apk X]                 # which APK a run would use, and why
-target/release/omnidroid plugins                         # installed plugins (their options: omnidroid help)
+```text
+omnidroid                       open the app (it warms an Android)
+omnidroid <app.apk> [xN]        open it and launch N instances
+omnidroid serve [--port <n>]    the app without its screen: the pool and MCP, until stdin closes
 ```
 
-Full flags, environment switches and the `--control` commands: `reference/omni-cli.md`.
-
-- **APK choice**: a bare `*.apk` path or `--apk`, else `OMNI_APK`, else the APK in the repo root with
-  the highest versionCode. Pass the user's APK explicitly.
-- **`play` is the fast path for the few apps it serves** (it has no Java runtime); it refuses an APK
-  whose manifest names no native Activity library. Use the default (`aosp`) for anything else.
-- **`play` runs until the window closes** (or `--minutes`). End every run cleanly — a killed run
-  is judged a crash at the next launch of that storage; after one, pass `--fresh`.
-- **Headless `play`**: `--headless` runs and presents every frame without drawing; `--no-window`
-  has no window at all. With `--control FILE`, append lines to FILE (or type on stdin):
-  `headless on|off`, `screenshot <path>` (a real frame, rendered and saved), `status`.
+At its prompt: `run <apk> [xN]`, `close <#id>|all`, `warm`, `kill <D#>|all`, `shell <D#> <cmd>`,
+`plugins ...`, `settings`, `set <key> <value>`, `mcp on|off|register|status`, `help`, `quit`.
+Settings live in `<app-data>/../app.conf`. The one-shot commands scripts used (`omnidroid aosp`,
+`play`, `which`) still exist (`omnidroid help commands`) but are not how an agent runs apps; full
+flags: `reference/omni-cli.md`.
 
 ## Things that will bite you
 

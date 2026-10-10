@@ -7,13 +7,15 @@
  *                                            (skills/ -> ~/.pi/agent/skills/) + config
  *   node scripts/install.mjs --claude-hook   also register the Claude Code SessionStart hook (user settings)
  *   node scripts/install.mjs --claude-skills also copy the skills to ~/.claude/skills/ (Claude Code)
- *   node scripts/install.mjs --claude-mcp    also register omnidroid's omni-mcp with Claude Code (user scope)
+ *   node scripts/install.mjs --claude-mcp    also register the omnidroid app's MCP server with Claude Code (user
+ *                                            scope, HTTP: the app serves it once `mcp on` is set in it)
  *   node scripts/install.mjs --openrouter    also wire OpenRouter into pi from openrouter.txt (auth.json +
  *                                            a models.json provider on https://openrouter.ai/api/v1)
  *   node scripts/install.mjs --uninstall     remove everything this script installed
  *
  * OMNI_HOME overrides the home directory (tests). OMNI_OMNIDROID names the omnidroid checkout whose
- * target/release/omni-mcp the MCP tools run (default: the sibling ../omnidroid). OMNI_CLAUDE_BIN names
+ * target/release/omni-mcp pi runs as the bridge to the app (default: the sibling ../omnidroid).
+ * OMNI_APP_MCP_URL is the app's MCP server (default http://127.0.0.1:7457/mcp). OMNI_CLAUDE_BIN names
  * the claude CLI for --claude-mcp.
  */
 import { spawnSync } from "node:child_process";
@@ -51,6 +53,9 @@ export const OPENROUTER = {
 const omnidroidDir = process.env.OMNI_OMNIDROID || join(dirname(ROOT), "omnidroid");
 const omniMcpBin = join(omnidroidDir, "target", "release", process.platform === "win32" ? "omni-mcp.exe" : "omni-mcp");
 const claudeBin = process.env.OMNI_CLAUDE_BIN || "claude";
+// The omnidroid app serves MCP over HTTP on this computer (`mcp on` in the app): every agent drives
+// the same pool of warm Androids through it.
+const appMcpUrl = process.env.OMNI_APP_MCP_URL || "http://127.0.0.1:7457/mcp";
 const hookCmd = `node "${join(ROOT, "integrations", "claude", "session-start-hook.mjs")}"`;
 const args = new Set(process.argv.slice(2));
 
@@ -82,18 +87,17 @@ function installOpenRouter() {
 }
 
 /** The omni-mcp pi extension's block of omni-agent.json: keep what the owner set, point `command` at the
- *  built omni-mcp unless the one configured still exists. */
+ *  built omni-mcp unless the one configured still exists, and make it the bridge to the omnidroid app's
+ *  MCP server (`omni-mcp --connect <url>`) unless the owner gave it other arguments. */
 function omniMcpConfig(prev = {}) {
   const keep = prev.command && existsSync(prev.command);
-  // omni-mcp's `omnidroid aosp` runs cargo, which rebuilds dynarmic unless it gets the build
-  // directory the omnidroid build used (Windows: a short path, MSVC fails past MAX_PATH): the
-  // installer's own OMNIDROID_DYNARMIC_BUILD_DIR, unless the config already names one.
   const dyn = process.env.OMNIDROID_DYNARMIC_BUILD_DIR;
   const env = { ...(dyn ? { OMNIDROID_DYNARMIC_BUILD_DIR: dyn } : {}), ...(prev.env || {}) };
-  return { ...prev, ...(Object.keys(env).length ? { env } : {}), command: keep ? prev.command : omniMcpBin };
+  const args = prev.args && prev.args.length ? prev.args : ["--connect", appMcpUrl];
+  return { ...prev, ...(Object.keys(env).length ? { env } : {}), command: keep ? prev.command : omniMcpBin, args };
 }
 
-/** Claude Code gets the same server as `omnidroid` (tools mcp__omnidroid__*), with the same env. */
+/** Claude Code gets the omnidroid app's server as `omnidroid` (tools mcp__omnidroid__*), over HTTP. */
 function claudeMcp(add, mcp) {
   const run = (...a) => {
     // A .js/.mjs launcher runs under node; a Windows .cmd shim only runs through the shell, which needs
@@ -106,10 +110,9 @@ function claudeMcp(add, mcp) {
   };
   run("mcp", "remove", "--scope", "user", "omnidroid");
   if (!add) { console.log("removed omnidroid MCP server from Claude Code"); return; }
-  const env = Object.entries(mcp.env || {}).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
-  const r = run("mcp", "add", "--scope", "user", ...env, "omnidroid", "--", mcp.command, ...(mcp.args || []));
+  const r = run("mcp", "add", "--transport", "http", "--scope", "user", "omnidroid", appMcpUrl);
   if (r.status !== 0) { console.error(`--claude-mcp: \`${claudeBin} mcp add\` failed: ${(r.stderr || r.stdout || r.error?.message || "").trim()}`); process.exit(1); }
-  console.log(`Claude Code MCP server added: omnidroid -> ${mcp.command}`);
+  console.log(`Claude Code MCP server added: omnidroid -> ${appMcpUrl} (the omnidroid app serves it once \`mcp on\` is set there)`);
 }
 
 if (args.has("--uninstall")) {

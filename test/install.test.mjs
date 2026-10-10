@@ -27,6 +27,7 @@ test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_
     const cfg = JSON.parse(readFileSync(join(home, ".pi", "agent", "omni-agent.json"), "utf8"));
     assert.equal(cfg.autoRecall, true);
     assert.match(cfg.omniMcp.command, /omnidroid[\\/]target[\\/]release[\\/]omni-mcp(\.exe)?$/, "omni-mcp points at the sibling omnidroid build");
+    assert.deepEqual(cfg.omniMcp.args, ["--connect", "http://127.0.0.1:7457/mcp"], "pi reaches the omnidroid app's server through the bridge");
     assert.ok(!existsSync(join(home, ".claude", "settings.json")), "no Claude hook without --claude-hook");
     const u = run(home, "--uninstall", "--claude-skills");
     assert.equal(u.status, 0, u.stderr);
@@ -75,7 +76,7 @@ test("the shipped skills document today's omnidroid, its MCP tools, and keep the
   const read = (...p) => readFileSync(join(process.cwd(), "skills", ...p), "utf8");
   const skill = read("omnidroid", "SKILL.md");
   assert.match(skill, /^name: omnidroid$/m);
-  for (const s of ["omnidroid_start_instance", "mcp__omnidroid__", "start_instance", "list_instances", "omni-linux-r-", "app_on_screen", "Any APK", "link_id", "omnidroid aosp", "--claude-mcp", "omnidroid-frida"]) assert.ok(skill.includes(s), `omnidroid skill mentions ${s}`);
+  for (const s of ["omnidroid_<tool>", "mcp__omnidroid__", "start_instance {apk, count?}", "wait_instance", "list_instances", "input {instance_id", "mcp on", "--connect", "Any APK", "not reachable", "omnidroid-frida"]) assert.ok(skill.includes(s), `omnidroid skill mentions ${s}`);
   for (const s of ["DID_LOG_IN", "Joining game", "8737899170", "Roblox"]) assert.ok(!skill.includes(s), `the omnidroid skill is about any APK, not one app (${s})`);
   assert.ok(skill.includes("`omnidroid start/offset/session/debug-info/su/frida` belong to the old QEMU manager"), "the QEMU commands are named as not existing here");
   const ref = read("omnidroid", "reference", "omni-cli.md");
@@ -95,7 +96,7 @@ test("the shipped skills document today's omnidroid, its MCP tools, and keep the
   assert.ok(input.includes("Driving without vision"));
 });
 
-test("install.mjs keeps an omniMcp.command that still exists and registers it with Claude Code on --claude-mcp", () => {
+test("install.mjs keeps an omniMcp.command that still exists and registers the app's server with Claude Code on --claude-mcp", () => {
   const home = mkdtempSync(join(tmpdir(), "omni-home-"));
   try {
     const bin = join(home, "my-omni-mcp.exe");
@@ -108,10 +109,10 @@ test("install.mjs keeps an omniMcp.command that still exists and registers it wi
     const r = runEnv(home, { OMNI_CLAUDE_BIN: fakeClaude }, "--claude-mcp");
     assert.equal(r.status, 0, r.stderr);
     const cfg = JSON.parse(readFileSync(join(home, ".pi", "agent", "omni-agent.json"), "utf8"));
-    assert.deepEqual(cfg.omniMcp, { command: bin, env: { OMNI_MCP_PLACE: "8737899170" }, timeoutSec: 120 });
+    assert.deepEqual(cfg.omniMcp, { command: bin, env: { OMNI_MCP_PLACE: "8737899170" }, timeoutSec: 120, args: ["--connect", "http://127.0.0.1:7457/mcp"] });
     const calls = readFileSync(log, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
     assert.deepEqual(calls[0], ["mcp", "remove", "--scope", "user", "omnidroid"]);
-    assert.deepEqual(calls[1], ["mcp", "add", "--scope", "user", "-e", "OMNI_MCP_PLACE=8737899170", "omnidroid", "--", bin]);
+    assert.deepEqual(calls[1], ["mcp", "add", "--transport", "http", "--scope", "user", "omnidroid", "http://127.0.0.1:7457/mcp"]);
     const u = runEnv(home, { OMNI_CLAUDE_BIN: fakeClaude }, "--uninstall", "--claude-mcp");
     assert.equal(u.status, 0, u.stderr);
     assert.deepEqual(JSON.parse(readFileSync(log, "utf8").trim().split(/\r?\n/).at(-1)), ["mcp", "remove", "--scope", "user", "omnidroid"]);
