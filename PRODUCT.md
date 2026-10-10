@@ -20,7 +20,7 @@ A single window over the agents that already run on this machine, rather than a 
 
 ## Operating Context
 
-- The dominant job is watching long agent runs on omnidroid / Roblox work: pi driving Android VMs, APK rebuilds, frida hooks, custom APK boots. Tool activity, run status and the elapsed/token line matter more than prose polish. Runs last minutes to hours and are often observed from a phone.
+- The dominant job is watching long agent runs on omnidroid work: pi running APKs on Android, APK rebuilds, frida hooks, custom APK boots. Tool activity, run status and the elapsed/token line matter more than prose polish. Runs last minutes to hours and are often observed from a phone.
 - Secondary job: general coding chats in project folders, with the file explorer and preview beside the transcript.
 - Surfaces: Home (prompt + working directory), Chat (explorer, preview, transcript, composer), history drawer (Chats, Memory, Graph, Tokens), Providers dialog, toasts.
 - Runtime: Node 22 server on port 4400, static `ui/` (vanilla HTML/CSS/ES modules, no framework, no build step), SSE for live events. Desktop window is WKWebView via pywebview; phone use is Mobile Safari / Chrome over LAN.

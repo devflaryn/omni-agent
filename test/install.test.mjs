@@ -75,10 +75,11 @@ test("the shipped skills document today's omnidroid, its MCP tools, and keep the
   const read = (...p) => readFileSync(join(process.cwd(), "skills", ...p), "utf8");
   const skill = read("omnidroid", "SKILL.md");
   assert.match(skill, /^name: omnidroid$/m);
-  for (const s of ["omnidroid_start_instance", "mcp__omnidroid__", "start_instance", "list_instances", "omni-linux-r-", "DID_LOG_IN", "Joining game", "--cookie", "omnidroid aosp", "--claude-mcp", "omnidroid-frida"]) assert.ok(skill.includes(s), `omnidroid skill mentions ${s}`);
+  for (const s of ["omnidroid_start_instance", "mcp__omnidroid__", "start_instance", "list_instances", "omni-linux-r-", "app_on_screen", "Any APK", "link_id", "omnidroid aosp", "--claude-mcp", "omnidroid-frida"]) assert.ok(skill.includes(s), `omnidroid skill mentions ${s}`);
+  for (const s of ["DID_LOG_IN", "Joining game", "8737899170", "Roblox"]) assert.ok(!skill.includes(s), `the omnidroid skill is about any APK, not one app (${s})`);
   assert.ok(skill.includes("`omnidroid start/offset/session/debug-info/su/frida` belong to the old QEMU manager"), "the QEMU commands are named as not existing here");
   const ref = read("omnidroid", "reference", "omni-cli.md");
-  for (const s of ["--headless", "--no-window", "--control", "OMNI_MCP_APK", "OMNI_MCP_REPO", "timeoutSec", "--with-systemui"]) assert.ok(ref.includes(s), `reference mentions ${s}`);
+  for (const s of ["--headless", "--no-window", "--control", "OMNI_MCP_APK", "OMNI_MCP_ARGS", "OMNI_MCP_REPO", "timeoutSec", "--with-systemui", "r_app"]) assert.ok(ref.includes(s), `reference mentions ${s}`);
   const lab = read("omnidroid-frida", "SKILL.md");
   assert.match(lab, /^name: omnidroid-frida$/m);
   for (const s of ["lab_load", "call_function", "intercept", "replace_return", "run_until_stop", "dump_module", "write_mem", "load_code", "trace_syscalls", "does NOT attach", "never fires", "0x0 faulted"]) assert.ok(lab.includes(s), `frida skill mentions ${s}`);

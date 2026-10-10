@@ -16,7 +16,7 @@
  *
  * Config: ~/.pi/agent/omni-agent.json
  *   { "omniMcp": { "command": "<omnidroid>/target/release/omni-mcp[.exe]", "args": [],
- *                  "env": { "OMNI_MCP_APK": "…", "OMNI_MCP_COOKIE": "…", "OMNI_MCP_REPO": "…" },
+ *                  "env": { "OMNI_MCP_APK": "…", "OMNI_MCP_REPO": "…" },
  *                  "timeoutSec": 600, "prefix": "omnidroid_", "enabled": true } }
  * Installed by: node scripts/install.mjs   (in the omni-agent folder; it fills `command` in)
  */

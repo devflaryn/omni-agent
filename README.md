@@ -148,9 +148,10 @@ node scripts/install.mjs --uninstall
 
 The skills teach either model the omnidroid engine (the sibling checkout in `Omni Apps/omnidroid`):
 
-- `skills/omnidroid` — booting an instance through the MCP tools or the `omnidroid` CLI
-  (`play`, `aosp`, `login`), cookies and places, and proving a session signed in and joined from its
-  log; `reference/omni-cli.md` holds every flag, switch and the MCP server's env.
+- `skills/omnidroid` — running any APK through the MCP tools (`start_instance {apk}` on the warm
+  device) or the `omnidroid` CLI (`omnidroid <app.apk>`, `aosp`, `play`), looking inside the running
+  app, and sessions with an installed plugin's options; `reference/omni-cli.md` holds every flag,
+  switch and the MCP server's env.
 - `skills/omnidroid-frida` — the Frida-style lab debugger over the same MCP server: load an arm64
   `.so`, call its functions with crafted inputs, intercept / `replace_return`, breakpoints, patch
   code, trace syscalls, dump the module; with the rules measured against the real server.
@@ -174,7 +175,7 @@ The pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/
   `call_function` / `intercept` / `dump_module` … for the lab debugger. The server is kept across
   chat switches and closed when pi quits (which stops the instances it booted); a call past
   `timeoutSec` (600) restarts it. `omniMcp.env` is passed to the server (`OMNI_MCP_APK`,
-  `OMNI_MCP_COOKIE`, `OMNI_MCP_PLACE`, `OMNIDROID_DYNARMIC_BUILD_DIR`, …).
+  `OMNI_MCP_REPO`, `OMNIDROID_DYNARMIC_BUILD_DIR`, …).
 - `omni-graph.ts` (`port`): `graph_build`, `graph_query` and `graph_explain` tools so the pi model
   decides mid-turn to build a repo knowledge graph or read it instead of grinding through files.
   They shell out to the local `graphify` (no model call), so they work even with the pi model

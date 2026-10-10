@@ -10,7 +10,7 @@ The native engine at `Desktop/Omni Apps/omnidroid` (Rust workspace). Binaries in
 # Windows, in PowerShell (Git Bash turns the variable into a relative path)
 $env:OMNIDROID_DYNARMIC_BUILD_DIR = "C:\od-unified"      # short path: MSVC fails past MAX_PATH
 cargo build --release -p omnidroid -p omni-mcp
-cargo test --release -p omni-linux --test r_roblox --no-run        # what `aosp` / start_instance run
+cargo test --release -p omni-linux --test r_app --no-run           # what `aosp` / a session of its own run
 cargo test -p omni-android --release --test gameactivity --no-run  # what `play` runs
 ```
 
@@ -19,22 +19,21 @@ macOS: `. ~/.cargo/env` first in a non-interactive ssh. One build dir per worktr
 ## Commands
 
 ```text
-omnidroid [play] [--apk <path>] [--cookie <file|name|value>] [--place <id>] [--join-delay <s>]
-                 [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
+omnidroid <app.apk> [aosp options]                   # = omnidroid aosp --apk <app.apk>
+omnidroid [aosp] [--apk <path>] [--minutes <n>] [--size <w>x<h>] [--gpu vulkan|gl|auto]
+                 [--with-systemui] [--fresh-device] [--standby] [--instance <dir>]
+                 [--root] [--module <id,...>] [--su all|<pkg,...>] [--no-clipboard]
+omnidroid aosp --warm [--instance <dir>] [--minutes <n>]   # a warm device, no app
+omnidroid play   [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
                  [--headless] [--no-window] [--control <file>]
-omnidroid aosp   [--apk <path>] [--cookie <file|name>] [--place <id>] [--minutes <n>]
-                 [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
 omnidroid which  [--apk <path>]
-omnidroid login  [<username> [<password>]] [--dir <dir>]
-omnidroid help
+omnidroid plugins [list | add [--link] <dir> | remove | enable | disable | new]
+omnidroid help                                       # also every installed plugin's options
 ```
 
 | flag | meaning |
 |---|---|
-| `--apk` | the APK (else `OMNI_APK`, else the repo-root APK with the highest versionCode; `which` prints the choice) |
-| `--cookie` | a file holding a `.ROBLOSECURITY` cookie, or a name `login` saved (`<app-data>/../cookies/<name>.txt`); `play` also takes the value itself. Storage is per account (`<app-data>/../accounts/<name>`) |
-| `--place` | numeric placeId, joined once signed in (`OMNI_JOIN_PLACE`) |
-| `--join-delay` | `play`: seconds before joining (default 20; `OMNI_JOIN_DELAY`) |
+| `--apk` (or a bare `*.apk` path) | any APK (else `OMNI_APK`, else the repo-root APK with the highest versionCode; `which` prints the choice) |
 | `--minutes` | end the session after n minutes (`play`: default when the window closes; `aosp`: default 30) |
 | `--fresh` | `play`: a fresh install; use after a killed run |
 | `--phone` | `play`: touch screen, the mouse is a finger, no keyboard |
@@ -46,14 +45,19 @@ omnidroid help
 | `--gpu` | `aosp`: `vulkan`, `gl` or `auto` (Vulkan with a Vulkan GPU, else the host's GLES; `OMNI_GPU`) |
 | `--with-systemui` | `aosp`: keep SystemUI and the launcher (default: a single-app kiosk device) |
 
-`login` with no arguments opens Chromium for you to sign in; with a username and password they are
-typed for you; a username alone uses its saved password.
+Options an app needs beyond install-and-start (a sign-in, a link to open) are an installed
+plugin's (`omnidroid plugins`, `plugins/README.md` in the repo); `omnidroid help` lists them.
 
 ## `aosp` session files
 
-`omnidroid aosp` = `cargo test --release -q -p omni-linux --test r_roblox -- --ignored
---nocapture` in the repo, with `OMNI_WINDOW=1`, `OMNI_R_MINUTES`, `OMNI_TEST_APK`,
-`OMNI_R_COOKIE`, `OMNI_R_PLACE`, `OMNI_WINDOW_SIZE`, `OMNI_GPU`, `OMNI_R_KIOSK` set from the flags.
+`omnidroid aosp` = the warm device when one is up (the APK installed and started on it), else
+`cargo test --release -q -p omni-linux --test r_app -- --ignored --nocapture` in the repo, with
+`OMNI_WINDOW=1`, `OMNI_R_MINUTES`, `OMNI_TEST_APK`, `OMNI_R_PACKAGE` (from the manifest),
+`OMNI_WINDOW_SIZE`, `OMNI_GPU`, `OMNI_R_KIOSK` set from the flags. What a session does beyond
+install-and-start is a plugin's, as variables (`omni_linux::app_session`): `OMNI_R_COOKIE` (a cookie
+file for the app's WebView store), `OMNI_R_LINK` + `OMNI_R_LINK_ID` (a link opened once the app is
+ready), the markers `OMNI_R_LINK_READY`, `OMNI_R_SIGNED_IN`, `OMNI_R_LINK_TAKEN`, `OMNI_R_LOADED`,
+`OMNI_R_DISCONNECTED`, and `OMNI_R_LOCALE` (default en-US).
 
 - log: `<temp>/omni-linux-r-<pid>.log` (every line)
 - frames: `<temp>/omni-linux-r-<pid>-shots/NNNN.png` every 20 s
@@ -68,8 +72,8 @@ JSON-RPC errors carrying the server's message. `omni-mcp --help` lists the env.
 | env (all optional; in pi put them in `~/.pi/agent/omni-agent.json` → `omniMcp.env`) | meaning |
 |---|---|
 | `OMNI_MCP_APK` | default APK for `start_instance` |
-| `OMNI_MCP_COOKIE` | default cookie file or saved name |
-| `OMNI_MCP_PLACE` | default place id |
+| `OMNI_MCP_ARGS` | default launcher options for a session of its own (a plugin's), whitespace separated. Leave unset for general use: with it every `start_instance` boots a session instead of using the warm device |
+| `OMNI_MCP_LINK_ID` | default id a session's link opens |
 | `OMNI_MCP_GPU` | `vulkan` / `gl` / `auto` (default `auto`) |
 | `OMNI_MCP_SIZE` | display `WxH` |
 | `OMNI_MCP_DEVICE_RAM_MB` | device RAM, passed on as `OMNI_DEVICE_RAM_MB` |
@@ -87,11 +91,12 @@ Claude Code: `node scripts/install.mjs --claude-mcp` (in omni-agent) runs
 
 ## Log markers
 
-`DID_LOG_IN` · `Joining game` · `JOIN: ... returned 1` · `submitStartGameTask` ·
-`onGameLoaded: placeId:...` (in-world timing starts after it plus ~2 min) ·
-`FRAMES: +Ns ..., T presents (+X in the last 5s)` (fps = X/5) · `GUEST THREAD DIED` (always a bug) ·
-the close's `SessionHistory "IAB"`/`"IB"` (clean) · `Upgrade required` (APK too old) ·
-`[r] cookie planted: …` / `[r] relaunched: 0` (aosp sign-in).
+`[r] boot_completed=1` · `[r] pm install: 0` · `[r] package <pkg>` / `[r] launcher <activity>` ·
+`[r] am start: 0` · `[zygote] launching <pkg>` · `frames presented` ·
+`Process <pkg> (pid N) has died` (with `FATAL EXCEPTION` / `Fatal signal` above it for a crash) ·
+`GUEST THREAD DIED` (always a bug) · `[r] cookie planted: ok` (a plugin's sign-in) ·
+`[r] link for <id>` (a plugin's link sent) · `FRAMES: +Ns ..., T presents (+X in the last 5s)`
+(`play`: fps = X/5). A plugin's own markers are logged again as `[t] +<secs>s <line>`.
 
 ## Environment switches (read once at start; each announces itself in the log)
 
@@ -99,7 +104,6 @@ the close's `SessionHistory "IAB"`/`"IB"` (clean) · `Upgrade required` (APK too
 |---|---|
 | `OMNI_KEYBOARD_MOUSE=1` | host keyboard and mouse as the device's (`play`'s default; `--phone` = touch) |
 | `OMNI_FPS_CAP=<fps>` | pace frames from underneath |
-| `OMNI_GRAPHICS_QUALITY=1..10` | the game's saved quality |
 | `OMNI_AUDIO=off` | no audio |
 | `OMNI_GUEST_MEMORY_MB`, `OMNI_GUEST_CPUS` | the device's RAM and CPU count |
 | `OMNI_WINDOW_SIZE=<w>x<h>` | initial window size; on the real-AOSP path the display's size at boot |
@@ -109,7 +113,6 @@ the close's `SessionHistory "IAB"`/`"IB"` (clean) · `Upgrade required` (APK too
 | `OMNI_MEM_REPORT=1` / `=every:<s>` | `MEMREPORT` lines: memory by owner |
 | `OMNI_PERF=<s>` | per-thread PERF blocks every s seconds |
 | `OMNI_PAUSE_IN_BACKGROUND=1` | Android's pause-in-background (default: keep playing) |
-| `OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY`, `OMNI_DEEPLINK` | join a place |
 | `OMNI_GUEST_ENV=K=V,..` | extra guest environment |
 | `OMNI_LOG_TIME=1` | stamp log lines |
 | `OMNI_NET_TRACE=1`, `OMNI_GPU_TRACE=1`, `OMNI_INIT_TRACE=1`, `OMNI_TRACE_SERVICE=<name>` | real-AOSP diagnostics |
