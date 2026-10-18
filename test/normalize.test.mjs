@@ -163,3 +163,13 @@ test("pi custom omni-fallback message -> plain system line flagged as a fallback
   assert.equal(other[0].blocks[0].text, "[note] hi");
   assert.equal(other[0].fallback, undefined);
 });
+
+test("the plan tool's state rides on its result (live tool event and tool-result message); other tools' details are dropped", () => {
+  const plan = { v: 1, milestones: [{ id: "1", title: "M", steps: [] }], brainstorm: null };
+  const [live] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "plan", result: { content: [{ type: "text", text: "Plan created" }], details: { plan, events: ["created"], ok: true } } }, ctx);
+  assert.deepEqual(live.details, { plan, events: ["created"], ok: true });
+  const [other] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c2", toolName: "bash", result: { content: [], details: { truncation: null } } }, ctx);
+  assert.equal(other.details, undefined);
+  const [msg] = normalizePiEntry({ type: "message", id: "e1", timestamp: 1, message: { role: "toolResult", toolCallId: "c1", toolName: "plan", content: [{ type: "text", text: "ok" }], details: { plan, events: ["created"] } } }, ctx);
+  assert.deepEqual(msg.blocks[0].details, { plan, events: ["created"], ok: true });
+});

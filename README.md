@@ -93,14 +93,47 @@ model's `contextWindow` in `~/.pi/agent/models.json` matches reality (DeepSeek V
   `Thinking… 11m 20s · 15k tokens · 86 tok/sec` sits below the turn; the rate covers only the last
   five seconds of streamed output and disappears while the model waits on a tool. Click the line for
   the model's reasoning.
-- **Goal hook** (model menu in the composer → *Goal hook*): the same idea as Claude Code's goal loop.
-  When pi stops, a judge model (any configured provider, run through `pi -p` with no tools) reads
-  your request and the tail of pi's work and answers whether it is done. If pi stopped early, it is
-  re-engaged and the chat shows one line, `Goal hook re-engaged the agent (#1): …`, never the hook's
-  message. There is no limit on re-engagements: it keeps going until the judge says done, a new
-  prompt or Stop ends it, or the agent made no tool call in `maxIdleNudges` (5) re-engaged runs in a
-  row — that means it is refusing or cannot act, and nudging would loop for nothing. The judge
-  defaults to the chat's model; pick another under *Judge model*.
+- **Planner** (the `plan` tool, `omni-plan.ts`): for any task bigger than a few tool calls the agent
+  works the way the superpowers brainstorm → write-plan → execute flow does. **brainstorm** first:
+  the goal in its own words and its scope, assumptions to check, at least two approaches with their
+  trade-offs, the chosen one and why, and success criteria. The tool refuses a plan without this.
+  Then **create**: milestones of small steps, each with a `done_when` check. Then execute one step at a
+  time, marking it **done** only with evidence. **revise** (with a reason) keeps the finished steps and
+  replaces the rest. **ask_user** parks the plan until you answer. While a plan is open, a short
+  reminder of it (current milestone, current step, its check) is added to the newest message of each
+  model call, so it survives compactions and does not break the prompt cache. `/plan` in a terminal pi
+  prints it.
+- **Goal hook** (model menu in the composer → *Goal hook*): the same idea as Claude Code's Stop hook,
+  driven by the plan instead of a judge model. It acts only when pi has really stopped (nothing
+  running or queued). Every plan change reaches the server on the RPC stream, so the hook knows without
+  asking any model: unfinished steps → pi is re-engaged at once on the current step and its check;
+  every step done → the goal is closed for good; waiting on `ask_user` → it stays quiet until you
+  reply. A `/goal` must be planned: until there is a plan, pi is re-engaged to brainstorm and plan it.
+  Work without a plan just ends when pi stops; if pi used tools, it is first asked once to confirm it
+  is finished or plan the rest (`planlessNudges`, 1). The old judge is opt-in for that case only
+  (`judgeFallback`). The chat shows one line, `Goal hook re-engaged the agent (#1): plan step 2.1 is
+  not done (3/7)`, never the hook's message.
+  Stops that were not the agent's choice are handled separately, because a plain "continue" would just
+  fail again:
+  - a reply cut off by the output limit (`length`, usually a long think) is re-engaged with "think
+    briefly, make the tool call now";
+  - a provider outage (5xx, 429, timeouts, `no upstreams available`) is retried after a back-off that
+    doubles from `errorBackoffMs` (15 s) up to 10 min;
+  - a rejected request (a 400, usually a context that grew too big or a malformed tail) is retried
+    once, then the context is compacted (`errorCompactAfter`, 2). If it is still rejected after that,
+    the goal pauses with a note instead of piling up re-engages.
+  The same step stopping `loopK` (3) times in a row escalates ("try a different approach, revise or
+  skip it"). `maxIdleNudges` (5) re-engages in a row without a tool call or plan change pause the goal;
+  any message resumes it.
+  **Goal box** (pinned above the chat): the goal, the phase and `x/y steps`, a progress bar with one
+  segment per milestone, the current step with its check, and *Show plan* for the whole checklist.
+  This updates live from the plan with no model call. Its status text comes from a separate
+  summarizer in a side conversation of its own: one pi session per goal under
+  `~/.omni-agent/status-sessions/`, never the agent's chat. It writes only when the plan moves (plan
+  written or revised, a milestone reached, the plan finished), never on timers or tool counts. It uses
+  the chat's model unless *Status box model* (or `summaryProvider`/`summaryModel`) says otherwise.
+  Re-engages restate the goal verbatim only every `restateEvery` (10) times and after a compaction.
+  All of these are `hook` keys in `omni.config.json`.
 - **History drawer** (☰ in the top bar): every pi and Claude Code chat on this machine, grouped by
   day, with a pulsing dot for a chat working right now. Hover for ✕ to delete (moves to
   `~/.omni-agent/trash/`). Claude Code chats open read-only; pi chats continue in Omni's pi, or fork
@@ -137,7 +170,7 @@ Inbox/                    drop anything here
 ## Wire the harnesses to the vault
 
 ```
-node scripts/install.mjs                 # pi: memory_search / memory_recall / memory_save tools + auto recall,
+node scripts/install.mjs                 # pi: memory_search / memory_recall / memory_save tools + auto recall, MCP clients,
                                          #     plus the omnidroid skills (skills/ -> ~/.pi/agent/skills/)
 node scripts/install.mjs --claude-hook   # Claude Code: SessionStart hook that injects the memory index
 node scripts/install.mjs --claude-skills # Claude Code: also copy the skills to ~/.claude/skills/
@@ -148,10 +181,12 @@ node scripts/install.mjs --uninstall
 
 The skills teach either model the omnidroid engine (the sibling checkout in `Omni Apps/omnidroid`):
 
-- `skills/omnidroid` — running any APK through the MCP tools (`start_instance {apk}` on the warm
-  device) or the `omnidroid` CLI (`omnidroid <app.apk>`, `aosp`, `play`), looking inside the running
-  app, and sessions with an installed plugin's options; `reference/omni-cli.md` holds every flag,
-  switch and the MCP server's env.
+- `skills/omnidroid` — running any APK through the omnidroid app's MCP tools
+  (`start_instance {apk, count, options}` on its pool of warm Androids, one pool shared by every
+  omnidroid window) or the `omnidroid` CLI (`omnidroid <app.apk> [xN] [plugin options]`, `aosp`,
+  `play`), a plugin's options on a launch (`--cookie <account> --place <id>`: each instance signed in,
+  then the link opened), the WebView tools, and looking inside the running app;
+  `reference/omni-cli.md` holds every flag, switch and the MCP server's env.
 - `skills/omnidroid-frida` — the Frida-style lab debugger over the same MCP server: load an arm64
   `.so`, call its functions with crafted inputs, intercept / `replace_return`, breakpoints, patch
   code, trace syscalls, dump the module; with the rules measured against the real server.
@@ -160,6 +195,7 @@ The skills teach either model the omnidroid engine (the sibling checkout in `Omn
 
 The pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/omni-agent.json`:
 
+- `omni-plan.ts` + `omni-plan-lib.mjs` (a copy of `ui/plan.js`, the state machine the server and the goal box share): the `plan` tool.
 - `omni-memory.ts` (`autoRecall`, `budgetTokens`): the memory tools. With auto recall on, every
   prompt of a pi started from a terminal gets a small `<omni-memory>` pack appended to the system
   prompt. Omni's own pi child (spawned with `OMNI_MEMORY=server`) skips that: there the composer's
@@ -171,11 +207,34 @@ The pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/
 - `omni-mcp.ts` (`omniMcp`): pi has no MCP client, so this is one. It starts omnidroid's
   `omni-mcp` (`<omnidroid>/target/release/omni-mcp[.exe]`, filled in by the installer; build it with
   `cargo build --release -p omni-mcp`) and registers each of its tools as `omnidroid_<tool>` —
-  `start_instance` / `screenshot` / `list_instances` for a live instance, `lab_load` /
+  `start_instance` / `screenshot` / `list_instances` / `web_*` for a live instance, `lab_load` /
   `call_function` / `intercept` / `dump_module` … for the lab debugger. The server is kept across
   chat switches and closed when pi quits (which stops the instances it booted); a call past
   `timeoutSec` (600) restarts it. `omniMcp.env` is passed to the server (`OMNI_MCP_APK`,
   `OMNI_MCP_REPO`, `OMNIDROID_DYNARMIC_BUILD_DIR`, …).
+- `omni-mcp-servers.ts` (`mcpServers`): any other MCP server. The block has Claude Code's
+  `.mcp.json` shape, so a server's README snippet can be pasted as-is; each tool becomes a pi tool
+  named `mcp__<server>__<tool>`, the same names Claude Code uses:
+
+  ```json
+  { "mcpServers": {
+      "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/src"] },
+      "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/",
+                  "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" } },
+      "parked": { "command": "…", "disabled": true } } }
+  ```
+
+  Transports are stdio (`command`, `args`, `env`, `cwd`) and Streamable HTTP (`"type": "http"`,
+  `url`, `headers`). The old SSE transport and OAuth sign-in are not supported; put a token in
+  `headers`. `${VAR}` / `${VAR:-default}` are read from the environment. `timeoutSec` (300) caps
+  one call. Servers start with the pi session, survive a chat switch and close when pi quits; one
+  that fails to start shows a warning and is listed as unavailable in the system prompt, and the
+  others still load. A server's `tools/list_changed` adds its new tools mid-session. Edit
+  the file and restart pi, or use the **MCP servers** tab in the Providers dialog (⚙): add, edit,
+  disable or remove a server, paste a README's JSON snippet to fill the form, and **Test connection**
+  to see its tools before saving. Saving restarts pi back onto its chat. Env and header values are
+  masked in the dialog (a `${VAR}` reference is shown as-is) and kept when saved back unchanged.
+  `install.mjs` keeps this block, including on `--uninstall`.
 - `omni-graph.ts` (`port`): `graph_build`, `graph_query` and `graph_explain` tools so the pi model
   decides mid-turn to build a repo knowledge graph or read it instead of grinding through files.
   They shell out to the local `graphify` (no model call), so they work even with the pi model
@@ -188,6 +247,7 @@ provider is a base URL, an API type (`openai-completions`, `openai-responses`, `
 `google-generative-ai`), a key and the model ids you want to see. Saving restarts Omni's pi child so it
 reads the file, then switches it back to the session it had open. Fields the dialog does not show
 (`compat`, `headers`, per-model `cost` or image input) are kept as they are.
+The dialog's second tab, **MCP servers**, edits the tool servers pi connects to (see `omni-mcp-servers.ts` above).
 
 Picking a model in the composer calls pi's `set_model` and writes `piProvider` / `piModel` to
 `omni.config.json`, so the next pi child starts on it. Without any provider in `models.json` the

@@ -18,6 +18,8 @@ test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_
     assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-claude.ts")));
     assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-graph.ts")));
     assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-mcp.ts")));
+    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-mcp-lib.mjs")));
+    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-mcp-servers.ts")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid-frida", "SKILL.md")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid-qemu", "reference", "omni-cli.md")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid", "SKILL.md")));
@@ -66,9 +68,11 @@ test("installer copies omni-run and its lib siblings into pi's extensions", () =
   try {
     const r = run(home);
     assert.equal(r.status, 0, r.stderr);
-    for (const f of ["omni-run.ts", "omni-run-lib.mjs", "omni-fallback-lib.mjs", "omni-fallback.ts"]) {
+    for (const f of ["omni-run.ts", "omni-run-lib.mjs", "omni-fallback-lib.mjs", "omni-fallback.ts", "omni-plan.ts", "omni-plan-lib.mjs"]) {
       assert.ok(existsSync(join(home, ".pi", "agent", "extensions", f)), `${f} should be installed`);
     }
+    // The planner's lib is the shared state machine itself (ui/plan.js), not the repo's re-export shim.
+    assert.equal(readFileSync(join(home, ".pi", "agent", "extensions", "omni-plan-lib.mjs"), "utf8"), readFileSync(join(process.cwd(), "ui", "plan.js"), "utf8"));
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -76,7 +80,7 @@ test("the shipped skills document today's omnidroid, its MCP tools, and keep the
   const read = (...p) => readFileSync(join(process.cwd(), "skills", ...p), "utf8");
   const skill = read("omnidroid", "SKILL.md");
   assert.match(skill, /^name: omnidroid$/m);
-  for (const s of ["omnidroid_<tool>", "mcp__omnidroid__", "start_instance {apk, count?}", "wait_instance", "list_instances", "input {instance_id", "mcp on", "--connect", "Any APK", "not reachable", "omnidroid-frida"]) assert.ok(skill.includes(s), `omnidroid skill mentions ${s}`);
+  for (const s of ["omnidroid_<tool>", "mcp__omnidroid__", "start_instance {apk, count?, options?}", "--cookie", "One pool per computer", "wait_instance", "list_instances", "input {instance_id", "mcp on", "--connect", "Any APK", "not reachable", "omnidroid-frida"]) assert.ok(skill.includes(s), `omnidroid skill mentions ${s}`);
   for (const s of ["DID_LOG_IN", "Joining game", "8737899170", "Roblox"]) assert.ok(!skill.includes(s), `the omnidroid skill is about any APK, not one app (${s})`);
   assert.ok(skill.includes("`omnidroid start/offset/session/debug-info/su/frida` belong to the old QEMU manager"), "the QEMU commands are named as not existing here");
   const ref = read("omnidroid", "reference", "omni-cli.md");
@@ -140,5 +144,19 @@ test("install.mjs --openrouter writes the key to auth.json and the DeepSeek prov
     assert.deepEqual(m.input, ["text"]);
     const missing = spawnSync(process.execPath, [script, "--openrouter"], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, OMNI_OPENROUTER_KEY_FILE: join(home, "nope.txt") } });
     assert.equal(missing.status, 1);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("install.mjs keeps the owner's mcpServers on reinstall and on uninstall", () => {
+  const home = mkdtempSync(join(tmpdir(), "omni-home-"));
+  try {
+    const mcpServers = { fs: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"] } };
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", "omni-agent.json"), JSON.stringify({ mcpServers }));
+    assert.equal(run(home).status, 0);
+    const file = join(home, ".pi", "agent", "omni-agent.json");
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")).mcpServers, mcpServers);
+    assert.equal(run(home, "--uninstall").status, 0);
+    assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { mcpServers });
   } finally { rmSync(home, { recursive: true, force: true }); }
 });

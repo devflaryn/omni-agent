@@ -248,4 +248,6 @@ export class PiRpc extends EventEmitter {
   thinkingLevels() { return { success: true, data: { levels: PI_THINKING_LEVELS } }; }
   compact() { return this.send({ type: "compact" }, { timeoutMs: 600000 }); }
   messages() { return this.send({ type: "get_messages" }); }
+  /** Every session entry incl. pre-compaction history, plus the active leaf (the goal hook recovers the plan from it). */
+  entries() { return this.send({ type: "get_entries" }); }
 }

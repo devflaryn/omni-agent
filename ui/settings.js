@@ -1,5 +1,6 @@
 /* Providers dialog: pick a preset, paste a key, type the model ids. Writes pi's models.json through the server. */
 import { el, esc } from "./lib.js";
+import { createMcpSettings } from "./mcp-settings.js";
 
 export function createSettings({ api, toast, onChanged }) {
   const $ = (s) => document.querySelector(s);
@@ -11,7 +12,23 @@ export function createSettings({ api, toast, onChanged }) {
   let data = { providers: [], presets: [], apis: [], active: null };
   let editing = null; // provider name being edited, or null for a new one
 
-  function open() { modal.hidden = false; load(); }
+  const mcp = createMcpSettings({ api, toast, onChanged });
+  // Two tabs in one dialog: the models pi can use, and the MCP servers it connects to.
+  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody"), sub: $("#subModels") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody"), sub: $("#subMcp") } };
+  let tab = "models";
+  function showTab(name) {
+    tab = name;
+    for (const [k, t] of Object.entries(tabs)) {
+      const on = k === name;
+      t.btn.classList.toggle("active", on); t.btn.setAttribute("aria-selected", String(on));
+      t.body.hidden = !on; t.sub.hidden = !on;
+    }
+    if (name === "mcp") mcp.load(); else load();
+  }
+  tabs.models.btn.onclick = () => showTab("models");
+  tabs.mcp.btn.onclick = () => showTab("mcp");
+
+  function open(which = tab) { modal.hidden = false; showTab(which); }
   function close() { modal.hidden = true; }
   async function load() {
     try { data = await api("/api/providers"); } catch (e) { toast(e.message, true); return; }

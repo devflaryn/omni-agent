@@ -148,10 +148,18 @@
 <div id="settings" class="modal" hidden>
   <div class="dialog">
     <div class="dlg-head">
-      <div><b>Providers</b><span class="dlg-sub">Which LLMs pi can use. Only the model ids you type here show up in the picker. The list is also the fallback order: when a model errors, pi moves to the next model below it (drag the dots to reorder).</span></div>
+      <div>
+        <b>Providers</b>
+        <div class="dlg-tabs" role="tablist">
+          <button class="seg-btn active" role="tab" id="tabModels" aria-selected="true" aria-controls="provBody">Models</button>
+          <button class="seg-btn" role="tab" id="tabMcp" aria-selected="false" aria-controls="mcpBody">MCP servers</button>
+        </div>
+        <span class="dlg-sub" id="subModels">Which LLMs pi can use. Only the model ids you type here show up in the picker. The list is also the fallback order: when a model errors, pi moves to the next model below it (drag the dots to reorder).</span>
+        <span class="dlg-sub" id="subMcp" hidden>Tool servers pi connects to. Each tool shows up as mcp__&lt;server&gt;__&lt;tool&gt;. Saving restarts pi so it connects.</span>
+      </div>
       <button class="icon-btn" id="settingsClose" title="Close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
-    <div class="dlg-body">
+    <div class="dlg-body" id="provBody" role="tabpanel">
       <div class="prov-list" id="provList"></div>
       <form class="prov-form" id="provForm" onsubmit="return false">
         <div class="pf-title" id="pfTitle">New provider</div>
@@ -171,6 +179,43 @@
           <button class="btn quiet" id="pfDelete" hidden>Remove provider</button>
           <span class="grow"></span>
           <span class="pf-file mono" id="provFile"></span>
+        </div>
+      </form>
+    </div>
+    <div class="dlg-body" id="mcpBody" role="tabpanel" hidden>
+      <div class="prov-list" id="mcpList"></div>
+      <form class="prov-form" id="mcpForm" onsubmit="return false">
+        <div class="pf-title" id="mfTitle">New MCP server</div>
+        <details class="mf-paste" id="mfPasteBox">
+          <summary>Paste JSON from a server's README</summary>
+          <textarea id="mfPaste" rows="5" spellcheck="false" placeholder='{ "github": { "type": "http", "url": "https://api.githubcopilot.com/mcp/" } }'></textarea>
+          <div class="pf-actions"><button class="btn" id="mfPasteFill" type="button">Fill the form</button><span class="pf-hint" id="mfPasteHint"></span></div>
+        </details>
+        <div class="pf-row">
+          <label>Server name<input id="mfName" placeholder="github" spellcheck="false" autocomplete="off" /></label>
+          <label>Transport<select id="mfType"><option value="stdio">stdio · runs a command</option><option value="http">http · connects to a URL</option></select></label>
+        </div>
+        <div class="mf-stdio">
+          <label>Command<input id="mfCommand" placeholder="npx" spellcheck="false" autocomplete="off" /></label>
+          <label>Arguments <span class="pf-note">one per line</span><textarea id="mfArgs" rows="3" spellcheck="false" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/Users/me/src"></textarea></label>
+          <label>Environment <span class="pf-note">KEY=value per line · ${VAR} reads Omni's environment</span><textarea id="mfEnv" rows="2" spellcheck="false" placeholder="API_TOKEN=..."></textarea></label>
+          <label>Working directory <span class="pf-note">optional</span><input id="mfCwd" spellcheck="false" autocomplete="off" /></label>
+        </div>
+        <div class="mf-http" hidden>
+          <label>URL<input id="mfUrl" placeholder="https://example.com/mcp" spellcheck="false" autocomplete="off" /></label>
+          <label>Headers <span class="pf-note">Name: value per line · e.g. Authorization: Bearer ${GITHUB_TOKEN}</span><textarea id="mfHeaders" rows="2" spellcheck="false"></textarea></label>
+        </div>
+        <div class="pf-row">
+          <label>Call timeout (seconds)<input id="mfTimeout" type="number" placeholder="300" min="1" /></label>
+          <label class="mf-check"><input id="mfEnabled" type="checkbox" checked /> Enabled</label>
+        </div>
+        <div class="mf-test" id="mfTestOut" hidden></div>
+        <div class="pf-actions">
+          <button class="btn primary" id="mfSave">Save</button>
+          <button class="btn" id="mfTest" type="button">Test connection</button>
+          <button class="btn quiet" id="mfDelete" type="button" hidden>Remove server</button>
+          <span class="grow"></span>
+          <span class="pf-file mono" id="mcpFile"></span>
         </div>
       </form>
     </div>

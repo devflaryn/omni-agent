@@ -8,7 +8,7 @@
  *   msg      { id, groupId?, role: user|assistant|tool|system, blocks[], usage?, model?, cost?, live }
  *   delta    { index, part: text|thinking|tool_args, delta, toolId? }
  *   block    { index, phase: start|end, part, toolId?, name?, text? }
- *   tool     { toolId, name, phase: start|update|end, args?, text?, isError? }
+ *   tool     { toolId, name, phase: start|update|end, args?, text?, isError?, details? }   (details: the plan tool's state only)
  *   status   { streaming }
  *   usage    { usage }
  *   compaction { summary }
@@ -18,6 +18,7 @@
  */
 
 import { cleanTitle } from "../ui/lib.js";
+import { PLAN_TOOL } from "../ui/plan.js";
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
 export function usageFromPi(u) {
@@ -79,6 +80,12 @@ function toolResultBlock(toolId, name, content, isError) {
   return b;
 }
 
+/** The plan tool's state rides along on its result (the goal hook and the status box read it); other tools' details are dropped. */
+function planDetails(out, name, details) {
+  if (name === PLAN_TOOL && details && typeof details === "object" && details.plan) out.details = { plan: details.plan, events: details.events || [], ok: details.ok !== false };
+  return out;
+}
+
 // ------------------------------------------------------------------ pi
 
 function piBlocks(content) {
@@ -102,7 +109,7 @@ export function piMessageToMsg(message, ctx, { id, ts, live }) {
   if (role === "toolResult") {
     return [base(ctx, "msg", t, {
       id, role: "tool", live: !!live,
-      blocks: [toolResultBlock(message.toolCallId, message.toolName, message.content, message.isError)],
+      blocks: [planDetails(toolResultBlock(message.toolCallId, message.toolName, message.content, message.isError), message.toolName, message.details)],
     })];
   }
   if (role === "user" || role === "assistant") {
@@ -184,7 +191,7 @@ export function normalizePiRpcEvent(ev, ctx) {
     case "tool_execution_update":
       return [base(ctx, "tool", now, { toolId: ev.toolCallId, name: ev.toolName, phase: "update", text: contentText(ev.partialResult?.content) })];
     case "tool_execution_end": {
-      const out = { toolId: ev.toolCallId, name: ev.toolName, phase: "end", text: contentText(ev.result?.content), isError: !!ev.isError };
+      const out = planDetails({ toolId: ev.toolCallId, name: ev.toolName, phase: "end", text: contentText(ev.result?.content), isError: !!ev.isError }, ev.toolName, ev.result?.details);
       const images = contentImages(ev.result?.content);
       if (images.length) out.images = images;
       return [base(ctx, "tool", now, out)];

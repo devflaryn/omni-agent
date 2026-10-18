@@ -17,6 +17,7 @@ const ICONS = {
   mcp: `<svg viewBox="0 0 16 16"><path d="M5 2v3M11 2v3M3.5 5h9v2a4.5 4.5 0 0 1-9 0zM8 11.5V14"/></svg>`,
   other: `<svg viewBox="0 0 16 16"><path d="M9.5 3.5a3 3 0 0 0 3 3L6 13a1.4 1.4 0 0 1-2-2l6.5-6.5a3 3 0 0 0-1-1z"/></svg>`,
   work: `<svg viewBox="0 0 16 16"><path d="M3 5h10M3 8h10M3 11h7"/></svg>`,
+  plan: `<svg viewBox="0 0 16 16"><path d="m2.5 4 1 1 2-2M2.5 8.5l1 1 2-2M7.5 4h6M7.5 8.5h6M3 12.5h.5M7.5 12.5h6"/></svg>`,
   compact: `<svg viewBox="0 0 16 16"><path d="M3 3h10v3H3zM3.5 6v6.5h9V6M6.5 9h3"/></svg>`,
   hook: `<svg viewBox="0 0 16 16"><path d="M12.5 8a4.5 4.5 0 1 1-1.3-3.2M12.5 2.5v2.8h-2.8"/></svg>`,
   chev: `<svg viewBox="0 0 16 16"><path d="m6 4 4 4-4 4"/></svg>`,

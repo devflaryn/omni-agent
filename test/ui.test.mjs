@@ -2,6 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, isDuplicateUserMessage, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage } from "../ui/lib.js";
+import { parsePairs, formatPairs, parsePastedServer } from "../ui/mcp-settings.js";
 import { titleFrom } from "../server/watchers.mjs";
 
 test("fmtDuration", () => {
@@ -192,4 +193,27 @@ test("isDuplicateUserMessage collapses the optimistic echo + file entry for one 
   assert.equal(isDuplicateUserMessage(prev, "hello world", 1000 + 20000), false); // same text, 20s later = a real re-send
   assert.equal(isDuplicateUserMessage(prev, "different", 1200), false);    // different prompt
   assert.equal(isDuplicateUserMessage(null, "hello world", 1200), false);  // nothing before
+});
+
+test("mcp settings: env/header lines round-trip, and README snippets in every common shape fill the form", () => {
+  assert.deepEqual(parsePairs("A=1\n# note\n\nB = x=y\nbad", "="), { A: "1", B: "x=y" });
+  assert.deepEqual(parsePairs("Authorization: Bearer ${T}", ":"), { Authorization: "Bearer ${T}" });
+  assert.equal(formatPairs({ Authorization: "Bearer x" }, ":"), "Authorization: Bearer x");
+  assert.equal(formatPairs({ A: "1" }, "="), "A=1");
+  const fs = { command: "npx", args: ["-y", "pkg"] };
+  assert.deepEqual(parsePastedServer(JSON.stringify({ mcpServers: { fs } })), ["fs", fs]);
+  assert.deepEqual(parsePastedServer(JSON.stringify({ servers: { fs } })), ["fs", fs]);
+  assert.deepEqual(parsePastedServer(`"fs": ${JSON.stringify(fs)}`), ["fs", fs], "a fragment without outer braces");
+  assert.deepEqual(parsePastedServer(JSON.stringify({ url: "https://x/mcp" })), ["", { url: "https://x/mcp" }]);
+  assert.throws(() => parsePastedServer("nope"), /not JSON/);
+  assert.throws(() => parsePastedServer("{\"a\": 1}"), /no server/);
+});
+
+test("plan tool calls read as plan moves in the transcript", () => {
+  assert.equal(toolKind("plan"), "plan");
+  assert.equal(toolLabel("plan", { action: "brainstorm", chosen: "wrap fetch" }).text, "Brainstormed: wrap fetch");
+  assert.equal(toolLabel("plan", { action: "create", milestones: [{}, {}] }).text, "Planned 2 milestones");
+  assert.equal(toolLabel("plan", { action: "done", step: "1.2" }).text, "Finished step 1.2");
+  assert.equal(toolLabel("plan", { action: "show" }).text, "Checked the plan");
+  assert.equal(workSummary(["plan", "shell"]), "Updated the plan, ran commands");
 });

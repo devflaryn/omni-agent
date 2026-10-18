@@ -96,6 +96,8 @@ export const CONFIG = {
   piAgentDir: fc.piAgentDir || join(HOME, ".pi", "agent"),
   piModelsFile: fc.piModelsFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "models.json"),
   piBin: fc.piBin || "pi",
+  /** pi's Omni extension config; its `mcpServers` block is what the Providers dialog's MCP servers tab edits. */
+  piExtConfigFile: fc.piExtConfigFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "omni-agent.json"),
   /** Key files handed to the pi child as environment variables (one line each, gitignored). */
   apiKeyFiles: { OPENROUTER_API_KEY: join(ROOT, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },
   /** Guest resolution (WxH[@DPI]) exported as OMNI_DISPLAY to the pi child, so any omnidroid
@@ -122,7 +124,7 @@ export const CONFIG = {
   graphBudgetTokens: fc.graphBudgetTokens || 900,
   /** A non-owned session file touched within this window counts as "still open in a terminal" → fork instead of resume. */
   liveWindowMs: fc.liveWindowMs || 30000,
-  /** Goal hook: when Omni's pi stops, a judge model decides whether the user's request is done and re-engages pi if not. */
+  /** Goal hook: when Omni's pi stops before its plan is finished, it is re-engaged (see server/hook.mjs). */
   hook: hookConfig(fc.hook),
   /** Watchdog: pi claims to be streaming but produced no event for this long → abort+restart.
    *  Must stay ABOVE pi's own `httpIdleTimeoutMs` so pi's in-process HTTP retry runs first (I3). */
@@ -130,6 +132,8 @@ export const CONFIG = {
   /** Restart counter resets after the child streamed healthily this long. */
   restartHealthyMs: Number(fc.restartHealthyMs) || 120000,
   /** Where unattended run ledgers live. */
+  /** The status-box summarizer's own side conversations (one pi session per goal), apart from the chats. */
+  statusSessionsDir: fc.statusSessionsDir || join(HOME, ".omni-agent", "status-sessions"),
   runsDir: fc.runsDir || join(fc.vaultDir || join(ROOT, "vault"), "Runs"),
   /** CLI reverse-engineering tools (jadx/apktool/baksmali/smali) are pre-installed here and this
    *  bin dir is put on the pi child's PATH, so the agent finds working headless CLIs instead of
@@ -137,7 +141,7 @@ export const CONFIG = {
   toolsBinDir: fc.toolsBinDir || join(HOME, ".omni-agent", "tools", "bin"),
 };
 
-/** Normalized goal-hook settings. Empty provider/model = judge with the chat's current model. */
+/** Normalized goal-hook settings. Empty provider/model = the (opt-in) judge uses the chat's current model. */
 export function hookConfig(raw = {}) {
   const h = raw && typeof raw === "object" ? raw : {};
   const int = (v, dflt, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : dflt; };
@@ -148,14 +152,25 @@ export function hookConfig(raw = {}) {
     /** Consecutive re-engagements without a single tool call before the keeper gives up; otherwise it never stops. */
     maxIdleNudges: int(h.maxIdleNudges, 5, 1, 50),
     graceMs: int(h.graceMs, 2000, 0, 600000),
-    /** Whether the separate summarizer writes the status box on each settle (default on). */
+    /** Whether the separate summarizer conversation writes the status box (default on) — never into pi's context.
+     *  Paced by the plan, not by time or tool calls: when the plan is written or revised, at each milestone, at the end. */
     summaries: h.summaries !== false,
+    /** Re-engages restate the goal verbatim only every N times (and after a compaction); 0 = only after a compaction. */
+    restateEvery: int(h.restateEvery, 10, 0, 1000),
     summaryProvider: String(h.summaryProvider || "").trim(),
     summaryModel: String(h.summaryModel || "").trim(),
     judgeTimeoutMs: int(h.judgeTimeoutMs, 120000, 10000, 600000),
     heartbeatMs: int(h.heartbeatMs, 60000, 5000, 3600000),
-    /** Same failure signature this many times in a row → escalate instead of nudging again. */
+    /** Same failure signature (or the same plan step) this many times in a row → escalate instead of nudging again. */
     loopK: int(h.loopK, 3, 2, 20),
+    /** Work without a plan that ends normally: ask the judge model (opt-in) instead of the deterministic rule. */
+    judgeFallback: h.judgeFallback === true,
+    /** Work without a plan that used tools: how many "confirm it is done, or plan the rest" re-engages before it counts as finished. */
+    planlessNudges: int(h.planlessNudges, 1, 0, 10),
+    /** Consecutive rejected requests (e.g. 400) before the context is compacted to recover. */
+    errorCompactAfter: int(h.errorCompactAfter, 2, 1, 10),
+    /** First back-off after a transient provider error (5xx, 429, timeouts); doubles per repeat, capped at 10 min. */
+    errorBackoffMs: int(h.errorBackoffMs, 15000, 1000, 600000),
   };
 }
 

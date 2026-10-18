@@ -15,6 +15,7 @@ import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM, runJudge } from "./hook.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
+import { listMcpServers, upsertMcpServer, removeMcpServer, testMcpServer } from "./mcp.mjs";
 import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels } from "./providers.mjs";
 import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
@@ -39,13 +40,14 @@ export async function createApp(overrides = {}) {
   const watcher = new SessionWatcher({ piSessionsDir: cfg.piSessionsDir, claudeProjectsDir: cfg.claudeProjectsDir, bus, tally, registry, isOwned, recentHours: cfg.tailRecentHours, log });
   // A thin proxy so the keeper always reads the *current* runLedger (which may be set/replaced later).
   const ledgerProxy = { writeControl: (p) => runLedger?.writeControl(p), goalText: () => runLedger?.goalText() || "" };
-  // Goal hook: a judge model (any configured provider, through `pi -p`) decides whether pi may stop; if not, pi is re-engaged.
+  // Goal hook: re-engages pi while its plan (the `plan` tool) has unfinished steps — no model decides that.
   const keeper = new GoalKeeper({
     bus, log,
     getPi: (sid) => (pi?.proc && pi.sid === sid ? pi : null),
-    judge: cfg.judge || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn, timeoutMs: hookConfig(cfg.hook).judgeTimeoutMs }, { system: JUDGE_SYSTEM, input })),
-    // The status-box summarizer: same separate-LLM mechanism as the judge, chat model by default.
-    summarize: cfg.summarize || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn }, { system: SUMMARY_SYSTEM, input })),
+    // Opt-in only (hook.judgeFallback): a judge model for work the agent did without a plan.
+    judge: cfg.judge || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn, timeoutMs: keeper.config.judgeTimeoutMs }, { system: JUDGE_SYSTEM, input })),
+    // The status box: a side conversation of its own per goal (its own pi session file), chat model by default.
+    summarize: cfg.summarize || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn, timeoutMs: keeper.config.judgeTimeoutMs, conversation: pick.conversation && cfg.statusSessionsDir ? { dir: cfg.statusSessionsDir, id: pick.conversation } : null }, { system: SUMMARY_SYSTEM, input })),
     config: hookConfig(cfg.hook),
     ledger: ledgerProxy,
     onEscalate: async (sid, g) => { runLedger?.appendEvent?.({ kind: "escalate", sid, nudges: g.nudges, fingerprint: g.lastFingerprint }); },
@@ -282,6 +284,7 @@ export async function createApp(overrides = {}) {
           config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: cfg.lan ? lanAddresses().map((a) => `http://${a.address}:${cfg.port}/`) : [], piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
           hook: keeper.config,
+          goal: pi?.sid ? keeper.status(pi.sid) : null,
           runs: claude.list(),
           sessions: registry.list().map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
           seq: bus.seq,
@@ -324,15 +327,15 @@ export async function createApp(overrides = {}) {
       }
       // explicit goal (the /goal command): set a persistent goal and arm the keeper
       if (p === "/api/goal") {
-        const g0 = keeper.goal(pi?.sid);
-        if (req.method === "GET") return send(res, 200, { goal: g0?.text || "", explicit: !!g0?.explicit, nudges: g0?.nudges || 0, enabled: keeper.config.enabled });
+        if (req.method === "GET") return send(res, 200, keeper.status(q.get("sid") || pi?.sid));
         if (req.method === "POST" || req.method === "PUT") {
           if (!pi?.sid) return send(res, 400, { error: "no active pi session; start a chat first" });
           const goal = String((await readBody(req)).goal ?? "").trim();
           keeper.setExplicitGoal(pi.sid, goal);
           // Setting a goal arms the keeper so the agent is re-engaged until the goal is done.
           if (goal && !keeper.config.enabled) { keeper.setConfig({ ...keeper.config, enabled: true }); if (cfg.persistHook !== false) writeConfigFile({ hook: keeper.config }); }
-          if (goal) { try { await pi.prompt(goal); } catch { /* goal is set + hook armed; the keeper will re-engage */ } }
+          // The kickoff says up front that this goal is tracked by its plan (the keeper insists on one anyway).
+          if (goal) { try { await pi.prompt(`${goal}\n\n(Tracked goal: first brainstorm and plan it with the plan tool, then work through the plan until every step is done.)`); } catch { /* goal is set + hook armed; the keeper will re-engage */ } }
           return send(res, 200, { goal, explicit: !!goal, enabled: keeper.config.enabled, started: !!goal });
         }
       }
@@ -354,6 +357,21 @@ export async function createApp(overrides = {}) {
         else if (!removeProvider(cfg.piModelsFile, name)) return send(res, 404, { error: "unknown provider" });
         const restarted = await restartPi();
         return send(res, 200, { ok: true, restarted, providers: listProviders(cfg.piModelsFile) });
+      }
+      // MCP servers (pi's omni-agent.json → mcpServers). pi loads them at boot, so a change restarts it.
+      if (req.method === "GET" && p === "/api/mcp") {
+        return send(res, 200, { servers: listMcpServers(cfg.piExtConfigFile), file: cfg.piExtConfigFile });
+      }
+      if (req.method === "POST" && p === "/api/mcp-test") {
+        const body = await readBody(req);
+        return send(res, 200, await testMcpServer(cfg.piExtConfigFile, String(body.name || "").trim(), body));
+      }
+      if ((req.method === "PUT" || req.method === "DELETE") && (m = /^\/api\/mcp\/([^/]+)$/.exec(p))) {
+        const name = decodeURIComponent(m[1]);
+        if (req.method === "PUT") { const body = await readBody(req); upsertMcpServer(cfg.piExtConfigFile, name, body, { rename: body.rename }); }
+        else if (!removeMcpServer(cfg.piExtConfigFile, name)) return send(res, 404, { error: "unknown MCP server" });
+        const restarted = await restartPi();
+        return send(res, 200, { ok: true, restarted, servers: listMcpServers(cfg.piExtConfigFile) });
       }
       // pi
       if (p.startsWith("/api/pi/")) {

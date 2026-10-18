@@ -7,6 +7,7 @@ import { createPanel } from "./panel.js";
 import { createExplorer } from "./explorer.js";
 import { createSettings } from "./settings.js";
 import { initResizers } from "./resizer.js";
+import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
 
 const $ = (s) => document.querySelector(s);
 const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, followFork: null, forceFork: false, desktop: new URLSearchParams(location.search).get("desktop") === "1" };
@@ -86,7 +87,7 @@ async function setHook(patch) {
   try {
     const r = await api("/api/hook", patch, "PUT");
     S.hook = r.hook;
-    toast(patch.enabled === true ? "Goal hook on: pi is re-engaged when it stops early" : patch.enabled === false ? "Goal hook off" : `Judge model: ${r.hook.model || "same as the chat"}`);
+    toast(patch.enabled === true ? "Goal hook on: pi is re-engaged until its plan is finished" : patch.enabled === false ? "Goal hook off" : `Status box model: ${r.hook.model || "same as the chat"}`);
     if (S.page === "home") renderHome(); else updateComposer();
   } catch (e) { toast(e.message, true); }
 }
@@ -95,28 +96,84 @@ async function setHook(patch) {
 /** `persist` only for a deliberate toggle; leaving the chat view must not remember "closed". */
 function setExplorer(open, persist = false) { document.body.classList.toggle("explorer-open", open); if (!open) explorer.closePreview(); if (persist) { try { localStorage.setItem("omni.explorer", open ? "1" : "0"); } catch { /* */ } } }
 function explorerPreferred() { try { return localStorage.getItem("omni.explorer") !== "0"; } catch { return true; } }
-// The toggleable TLDR/goal-progress box, filled by the separate summarizer (a `summary` SSE event).
+// The goal box pinned above a chat: the goal, the agent's plan (live from `plan` events, so it is always
+// current with no model call) and the status written by the separate summarizer at each milestone.
 function summaryOn() { try { return localStorage.getItem("omni.summary") !== "off"; } catch { return true; } }
+function planOpen() { try { return localStorage.getItem("omni.planOpen") === "1"; } catch { return false; } }
+const goalBox = (s) => s.goalBox || (s.goalBox = { goal: "", plan: null, summary: "", summaryAt: 0, nudges: 0, done: false });
+/** The newest plan in a history replay (the plan tool's results carry it). */
+function planFromEvents(events) {
+  let plan = null;
+  for (const ev of events) if (ev.kind === "msg" && ev.role === "tool") for (const b of ev.blocks || []) if (b.name === PLAN_TOOL && b.details?.plan) plan = asPlan(b.details) || plan;
+  return plan;
+}
+const STEP_MARK = { done: "✓", skipped: "–", active: "›", pending: "" };
 function renderSummary() {
   const box = $("#summaryBox"), btn = $("#btnSummary");
   const s = S.selected ? S.sessions.get(S.selected) : null;
-  const sum = s?.summary;
-  const have = S.page === "chat" && !!sum;
+  const gb = s?.goalBox;
+  const plan = gb?.plan && (gb.plan.brainstorm || gb.plan.milestones?.length) ? gb.plan : null;
+  // A quick question gets no box: only a plan, a written status or an explicit /goal shows one.
+  const have = S.page === "chat" && !!gb && !!(gb.summary || plan || (gb.goal && gb.explicit));
   if (btn) { btn.hidden = !have; btn.classList.toggle("on", have && summaryOn()); }
   if (!box) return;
   if (!have || !summaryOn()) { box.hidden = true; return; }
   box.hidden = false;
   box.textContent = "";
+  const pr = plan ? planProgress(plan) : null;
   const head = el("div", "summary-head");
-  head.appendChild(el("span", "summary-tag", sum.goal ? "Goal" : "Summary"));
-  if (sum.goal) head.appendChild(el("span", "summary-goal", sum.goal));
-  if (sum.nudges) head.appendChild(el("span", "summary-nudges", `re-engaged ${sum.nudges}×`));
+  head.appendChild(el("span", "summary-tag", gb.goal ? "Goal" : "Plan"));
+  head.appendChild(el("span", "summary-goal", gb.goal || (plan?.brainstorm?.understanding ?? "")));
+  const phase = !pr ? "" : pr.complete ? "complete" : pr.phase === "execute" ? `${pr.done + pr.skipped}/${pr.steps} steps` : pr.phase === "plan" ? "planning" : pr.phase === "waiting" ? "waiting for you" : "brainstorming";
+  const at = gb.summaryAt || plan?.updatedAt;
+  const meta = [gb.done ? "done" : phase, gb.nudges ? `re-engaged ${gb.nudges}×` : "", at ? `updated ${new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""].filter(Boolean).join(" · ");
+  if (meta) head.appendChild(el("span", "summary-nudges", meta));
+  if (plan?.milestones?.length) {
+    const t = el("button", `summary-toggle${planOpen() ? " open" : ""}`, planOpen() ? "Hide plan" : "Show plan");
+    t.onclick = () => { try { localStorage.setItem("omni.planOpen", planOpen() ? "0" : "1"); } catch { /* */ } renderSummary(); };
+    head.appendChild(t);
+  }
   const x = el("button", "summary-x", "×");
-  x.title = "Hide the summary box (toggle it from the header)";
+  x.title = "Hide the goal box (toggle it from the header)";
   x.onclick = () => { try { localStorage.setItem("omni.summary", "off"); } catch { /* */ } renderSummary(); };
   head.appendChild(x);
   box.appendChild(head);
-  box.appendChild(el("div", "summary-body", sum.text || ""));
+  if (plan?.milestones?.length) {
+    // One segment per milestone, as wide as its share of the steps, filled by its finished steps.
+    const bar = el("div", "plan-bar");
+    for (const m of plan.milestones) {
+      const fin = m.steps.filter((st) => st.status === "done" || st.status === "skipped").length;
+      const seg = el("div", `plan-seg${fin === m.steps.length ? " full" : ""}`);
+      seg.style.flex = String(m.steps.length);
+      seg.title = `Milestone ${m.id}: ${m.title} (${fin}/${m.steps.length})`;
+      const fill = el("div", "plan-fill"); fill.style.width = `${Math.round((fin / m.steps.length) * 100)}%`;
+      seg.appendChild(fill); bar.appendChild(seg);
+    }
+    box.appendChild(bar);
+  }
+  if (pr?.waiting) box.appendChild(el("div", "plan-now waiting", `Waiting for you: ${pr.waiting.question}`));
+  else if (pr?.current && !pr.complete) {
+    const now = el("div", "plan-now");
+    now.append(el("span", "plan-now-k", pr.currentMilestone ? `Milestone ${pr.currentMilestone.id} · ${pr.current.id}` : pr.current.id), el("span", "plan-now-t", pr.current.title));
+    if (pr.current.doneWhen) now.appendChild(el("span", "plan-now-c", `done when ${pr.current.doneWhen}`));
+    box.appendChild(now);
+  } else if (pr?.phase === "plan") box.appendChild(el("div", "plan-now", `Approach: ${plan.brainstorm?.chosen || ""}. Writing the plan…`));
+  if (gb.summary) box.appendChild(el("div", "summary-body", gb.summary));
+  else if (!plan) box.appendChild(el("div", "summary-body", "No plan yet. The status is written when the agent plans the work and at each milestone."));
+  if (plan?.milestones?.length && planOpen()) {
+    const ol = el("div", "plan-list");
+    for (const m of plan.milestones) {
+      const fin = m.steps.every((st) => st.status === "done" || st.status === "skipped");
+      ol.appendChild(el("div", `plan-m${fin ? " fin" : ""}`, `${m.id}. ${m.title}`));
+      for (const st of m.steps) {
+        const row = el("div", `plan-step ${st.status}`);
+        row.append(el("span", "plan-mark", STEP_MARK[st.status] || ""), el("span", "plan-sid", st.id), el("span", "plan-st", st.title));
+        row.title = st.status === "done" ? `evidence: ${st.evidence}` : st.status === "skipped" ? `skipped: ${st.note}` : `done when: ${st.doneWhen}`;
+        ol.appendChild(row);
+      }
+    }
+    box.appendChild(ol);
+  }
 }
 function showView(name) {
   S.page = name;
@@ -151,9 +208,9 @@ function renderHome() {
   home.setState({ ...piModelState(), caption: S.pi.running ? `pi in ${baseName(S.pi.cwd || "")}` : "" });
   updateHeader();
 }
-// `/goal <text>` sets a persistent goal the keeper re-engages the agent toward until a judge says
-// it is done; `/goal` or `/goal show` reports it; `/goal clear` drops it. Handled here, never sent
-// to the model. Returns true when the input was a goal command.
+// `/goal <text>` sets a persistent goal: the agent brainstorms and plans it, and the keeper re-engages
+// it until every plan step is done; `/goal` or `/goal show` reports it; `/goal clear` drops it.
+// Handled here, never sent to the model. Returns true when the input was a goal command.
 async function goalCommand(text, composer) {
   const m = /^\/goal\b\s*([\s\S]*)$/.exec(text.trim());
   if (!m) return false;
@@ -161,13 +218,14 @@ async function goalCommand(text, composer) {
   try {
     if (!arg || arg === "show") {
       const g = await api("/api/goal");
-      toast(g.goal ? `Goal: ${g.goal}${g.nudges ? ` · re-engaged ${g.nudges}×` : ""}` : "No goal set — type /goal <text> to set one");
+      const pg = g.progress ? ` · ${g.progress.complete ? "plan complete" : g.progress.steps ? `${g.progress.done + g.progress.skipped}/${g.progress.steps} steps` : g.progress.phase}` : g.goal ? " · no plan yet" : "";
+      toast(g.goal ? `Goal: ${g.goal}${pg}${g.nudges ? ` · re-engaged ${g.nudges}×` : ""}` : "No goal set — type /goal <text> to set one");
     } else if (arg === "clear") {
       await api("/api/goal", { goal: "" }, "POST");
       toast("Goal cleared");
     } else {
       await api("/api/goal", { goal: arg }, "POST");
-      toast("Goal set and started — the agent will work until it's done.");
+      toast("Goal set — the agent plans it first, then works until every step is done.");
     }
     composer?.clear?.();
   } catch (e) { toast(e.message, true); }
@@ -256,6 +314,9 @@ async function selectSession(sid) {
     if (s?.cwd) explorer.setRoot(s.cwd);
     const seen = new Set();
     for (const ev of h.events) { applyEvent(view, ev); if (ev.kind === "msg" && ev.id) seen.add(ev.id); }
+    // A reopened chat gets its plan back from the plan tool's results in the file (live events keep it current after).
+    const histPlan = planFromEvents(h.events);
+    if (histPlan && s && !((s.goalBox?.plan?.updatedAt || 0) > (histPlan.updatedAt || 0))) { goalBox(s).plan = histPlan; renderSummary(); }
     // Live events buffered while the chat was open elsewhere: skip messages the file already gave us.
     // Anything older than the fetch is already in the file. The one exception: a turn still streaming has
     // partial text that is not written yet, so its stream parts (newer than the last file message) are replayed.
@@ -322,7 +383,10 @@ function handle(ev) {
   if (ev.kind === "msg" && ev.usage) { const t = s.tally || (s.tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, messages: 0, cost: 0, context: 0 }); if (!ev.groupId || t.lastGroup !== ev.groupId) { t.lastGroup = ev.groupId; t.input += ev.usage.input; t.output += ev.usage.output; t.cacheRead += ev.usage.cacheRead; t.cacheWrite += ev.usage.cacheWrite; t.total += ev.usage.total; t.messages++; t.context = ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite; t.cost += ev.cost || 0; } }
   if (ev.kind !== "session") s.lastActivity = Math.max(s.lastActivity || 0, ev.ts || 0);
   if (ev.kind === "digest") toast(`Digest saved: ${ev.path}`);
-  if (ev.kind === "summary") { s.summary = { text: ev.text || "", goal: ev.goal || "", nudges: ev.nudges || 0, ts: ev.ts }; if (ev.sid === S.selected) renderSummary(); }
+  if (ev.kind === "summary") { Object.assign(goalBox(s), { summary: ev.text || "", summaryAt: ev.ts, goal: ev.goal || goalBox(s).goal, explicit: !!ev.explicit, nudges: ev.nudges || 0, done: !!ev.done }); if (ev.sid === S.selected) renderSummary(); }
+  if (ev.kind === "plan") { Object.assign(goalBox(s), { plan: ev.plan, goal: ev.goal || goalBox(s).goal }); if (ev.sid === S.selected) renderSummary(); }
+  if (ev.kind === "goal") { Object.assign(goalBox(s), { goal: ev.goal || goalBox(s).goal, explicit: !!ev.explicit, done: !!ev.done, nudges: ev.nudges || 0, plan: ev.plan || goalBox(s).plan }); if (ev.sid === S.selected) renderSummary(); }
+  if (ev.kind === "hook" && ev.attempt) { goalBox(s).nudges = ev.attempt; if (ev.sid === S.selected) renderSummary(); }
   S.sessions.set(ev.sid, s);
   if (ev.harness === "pi" && s.owned) {
     S.pi.running = true;
@@ -343,6 +407,8 @@ async function init() {
   const st = await api("/api/state");
   S.config = st.config; S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || null;
   for (const s of st.sessions) S.sessions.set(s.sid, s);
+  // The goal Omni's pi is working on right now (plan, status, re-engages) survives a page reload.
+  if (st.goal && st.pi?.sid && S.sessions.get(st.pi.sid)) Object.assign(goalBox(S.sessions.get(st.pi.sid)), { goal: st.goal.goal, explicit: st.goal.explicit, plan: st.goal.plan, summary: st.goal.summary, summaryAt: st.goal.summaryAt, nudges: st.goal.nudges, done: st.goal.done });
   if (st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0].replace(/\?token=.*/, ""); $("#lanInfo").title = "Open this on any device on your network; no login needed"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
   history.render();

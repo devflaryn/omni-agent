@@ -39,7 +39,8 @@ export async function runUnattended({ cwd, goal, provider, model, thinking, runI
     app.keeper.setExplicitGoal(pi.sid, goalText);
     app.keeper.setConfig({ ...app.keeper.config, enabled: true });
     app.keeper.startHeartbeat?.();
-    if (!runId) await pi.prompt(goalText); // first launch kicks off the work; a resume relies on the heartbeat
+    if (!runId) await pi.prompt(goalText); // first launch kicks off the work
+    else { const g = app.keeper.goal(pi.sid); if (g) g.recheck = true; } // a resume: the heartbeat's first check reads the plan from the session and carries on
   }
 
   const started = Date.now();

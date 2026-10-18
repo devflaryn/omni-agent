@@ -437,6 +437,19 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field-2); }
 .pf-note { color: var(--dim); font-size: 11.5px; margin-left: 6px; }
 .pf-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .pf-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.dlg-tabs { display: flex; gap: 4px; margin: 6px 0 6px; }
+.mf-stdio, .mf-http { display: grid; gap: 10px; }
+.mf-stdio[hidden], .mf-http[hidden], .dlg-body[hidden] { display: none; }
+.prov-form label.mf-check { display: flex; align-items: center; gap: 8px; align-self: end; padding-bottom: 6px; color: var(--ink); }
+.mf-paste summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+.mf-paste[open] { display: grid; gap: 8px; }
+.mf-paste textarea { width: 100%; box-sizing: border-box; }
+.mf-test { border: 1px solid var(--line); border-radius: var(--r); background: var(--field); padding: 8px 10px; font-size: 12.5px; max-height: 180px; overflow: auto; }
+.mf-test.err { color: var(--err); border-color: var(--err); white-space: pre-wrap; word-break: break-word; }
+.mf-test ul { margin: 6px 0 0; padding-left: 16px; }
+.mf-test li { margin: 2px 0; }
+.mf-test code { font-family: var(--mono); font-size: 12px; }
+.mf-test .d { color: var(--muted); }
 .pf-file { color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
 
 /* ---------------------------------------------------------------- toasts */
@@ -510,6 +523,30 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field-2); }
 .summary-x { margin-left: auto; border: none; background: none; color: var(--muted); font-size: 16px; line-height: 1; cursor: pointer; padding: 0 2px; }
 .summary-x:hover { color: var(--ink); }
 .summary-body { color: var(--muted); line-height: 1.45; white-space: pre-wrap; }
+.summary-toggle { border: none; background: none; color: var(--accent); font: inherit; font-size: 11.5px; cursor: pointer; padding: 0 2px; white-space: nowrap; }
+.summary-toggle:hover { text-decoration: underline; }
+.summary-toggle + .summary-x { margin-left: 0; }
+/* Plan progress: one segment per milestone, sized by its steps. */
+.plan-bar { display: flex; gap: 3px; height: 4px; margin: 6px 0 7px; }
+.plan-seg { position: relative; background: var(--line); border-radius: 2px; overflow: hidden; min-width: 6px; }
+.plan-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); opacity: 0.55; transition: width 0.3s var(--ease); }
+.plan-seg.full .plan-fill { opacity: 1; }
+.plan-now { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin-bottom: 4px; color: var(--ink); }
+.plan-now.waiting { color: var(--accent); font-weight: 500; }
+.plan-now-k { font-family: var(--mono); font-size: 11px; color: var(--accent); white-space: nowrap; }
+.plan-now-t { font-weight: 500; min-width: 0; }
+.plan-now-c { color: var(--dim); font-size: 12px; }
+.plan-list { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); max-height: 40vh; overflow-y: auto; }
+.plan-m { font-weight: 600; font-size: 12px; margin: 6px 0 2px; color: var(--ink); }
+.plan-m:first-child { margin-top: 0; }
+.plan-m.fin { color: var(--muted); }
+.plan-step { display: grid; grid-template-columns: 14px 30px 1fr; gap: 4px; font-size: 12.5px; color: var(--ink); padding: 1px 0; }
+.plan-step.done, .plan-step.skipped { color: var(--dim); }
+.plan-step.skipped .plan-st { text-decoration: line-through; }
+.plan-step.active { color: var(--accent); font-weight: 500; }
+.plan-mark { text-align: center; color: var(--accent); }
+.plan-step.skipped .plan-mark { color: var(--dim); }
+.plan-sid { font-family: var(--mono); font-size: 11px; color: var(--dim); padding-top: 1px; }
 #btnSummary.on { color: var(--accent); }
 
 /* Make all transcript text selectable and copyable on every surface — including the pywebview

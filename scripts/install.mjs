@@ -2,8 +2,8 @@
 /**
  * Wire Omni Agent into the harnesses.
  *
- *   node scripts/install.mjs                 install the pi extensions (memory tools, claude_task, graph tools,
- *                                            model fallback, omnidroid's MCP tools), the omnidroid skills
+ *   node scripts/install.mjs                 install the pi extensions (memory tools, the planner, claude_task, graph tools,
+ *                                            model fallback, omnidroid's MCP tools, any MCP server in mcpServers), the omnidroid skills
  *                                            (skills/ -> ~/.pi/agent/skills/) + config
  *   node scripts/install.mjs --claude-hook   also register the Claude Code SessionStart hook (user settings)
  *   node scripts/install.mjs --claude-skills also copy the skills to ~/.claude/skills/ (Claude Code)
@@ -28,7 +28,9 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const HOME = process.env.OMNI_HOME || homedir();
 const piAgent = join(HOME, ".pi", "agent");
 const extDir = join(piAgent, "extensions");
-const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-fallback.ts", "omni-fallback-lib.mjs", "omni-mcp.ts", "omni-run.ts", "omni-run-lib.mjs"];
+const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-fallback.ts", "omni-fallback-lib.mjs", "omni-mcp.ts", "omni-mcp-lib.mjs", "omni-mcp-servers.ts", "omni-run.ts", "omni-run-lib.mjs", "omni-plan.ts", "omni-plan-lib.mjs"];
+/** Extension files whose installed copy comes from elsewhere in the repo (the planner's state machine is shared with the server and UI). */
+const EXT_SOURCE = { "omni-plan-lib.mjs": join("ui", "plan.js") };
 const SKILLS = ["omnidroid", "omnidroid-frida", "omnidroid-qemu", "omnidroid-input"];
 const AGENTS = ["scout.md", "re-analyst.md", "droid-operator.md"];
 const piSkillsDir = join(piAgent, "skills");
@@ -120,7 +122,12 @@ if (args.has("--uninstall")) {
   { const t = join(extDir, "subagent"); if (existsSync(t)) { rmSync(t, { recursive: true }); console.log("removed", t); } }
   // The default agents (agents/*.md) are left in place: they may be user-edited.
   for (const s of SKILLS) for (const dir of [piSkillsDir, ...(args.has("--claude-skills") ? [claudeSkillsDir] : [])]) { const t = join(dir, s); if (existsSync(t)) { rmSync(t, { recursive: true }); console.log("removed", t); } }
-  if (existsSync(piCfg)) { rmSync(piCfg); console.log("removed", piCfg); }
+  if (existsSync(piCfg)) {
+    // The owner's own MCP servers are theirs, not ours: keep that block, drop the rest.
+    const servers = readJson(piCfg, {}).mcpServers;
+    if (servers && Object.keys(servers).length) { writeFileSync(piCfg, JSON.stringify({ mcpServers: servers }, null, 2)); console.log("kept mcpServers in", piCfg); }
+    else { rmSync(piCfg); console.log("removed", piCfg); }
+  }
   if (args.has("--claude-mcp")) claudeMcp(false);
   const s = readJson(claudeSettings, null);
   if (s?.hooks?.SessionStart) {
@@ -133,7 +140,7 @@ if (args.has("--uninstall")) {
 }
 
 mkdirSync(extDir, { recursive: true });
-for (const f of EXTENSIONS) copyFileSync(join(ROOT, "integrations", "pi", f), join(extDir, f));
+for (const f of EXTENSIONS) copyFileSync(join(ROOT, EXT_SOURCE[f] || join("integrations", "pi", f)), join(extDir, f));
 // The subagent extension ships whole; its default agent definitions seed agents/ only when absent (never clobber a user's edits).
 const subagentDir = join(extDir, "subagent");
 cpSync(join(ROOT, "integrations", "pi", "subagent"), subagentDir, { recursive: true });

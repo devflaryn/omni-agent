@@ -209,6 +209,7 @@ const one = (s, n = 120) => { const t = String(s ?? "").replace(/\s+/g, " ").tri
 export function toolKind(name) {
   const n = String(name || "");
   if (/^mcp__claude-in-chrome__/i.test(n)) return "browser";
+  if (/^plan$/i.test(n)) return "plan";
   if (/^(bash|powershell|shell|sh|cmd|exec)$/i.test(n)) return "shell";
   if (EDIT_TOOLS.test(n)) return "edit";
   if (/^(read|cat|view)$/i.test(n)) return "read";
@@ -228,11 +229,16 @@ export function toolLabel(name, args, cwd) {
     case "search": { const q = one(a.pattern || a.query || a.glob || a.path || a.command, 80); return { kind, text: q ? `Searched ${q}` : "Searched files" }; }
     case "agent": return { kind, text: one(a.description || a.task || a.prompt, 100) || "Ran a subagent" };
     case "browser": return { kind, text: "Used the browser" };
+    case "plan": {
+      const step = one(a.step, 20);
+      const t = { brainstorm: `Brainstormed${a.chosen ? `: ${one(a.chosen, 80)}` : ""}`, create: `Planned ${Array.isArray(a.milestones) ? `${a.milestones.length} milestone${a.milestones.length === 1 ? "" : "s"}` : "the work"}`, start: `Started step ${step}`, done: `Finished step ${step || "(current)"}`, skip: `Skipped step ${step}`, revise: `Revised the plan${a.reason ? `: ${one(a.reason, 80)}` : ""}`, ask_user: `Asked: ${one(a.question, 80)}` }[a.action];
+      return { kind, text: t || "Checked the plan" };
+    }
     case "web": { const q = one(a.url || a.query, 100); return { kind, text: q ? (a.url ? `Fetched ${q}` : `Searched the web for ${q}`) : "Fetched the web" }; }
     default: { const b = one(a.command || a.file_path || a.path || a.pattern || a.query || a.skill || a.task || a.description, 80); return { kind, text: b ? `${name} ${b}` : String(name || "tool") }; }
   }
 }
-const VERBS = { browser: ["used the browser", "Using the browser"], edit: ["edited files", "Editing a file"], shell: ["ran commands", "Running a command"], read: ["read files", "Reading a file"], search: ["searched files", "Searching files"], agent: ["ran subagents", "Running a subagent"], web: ["fetched the web", "Fetching the web"], mcp: ["used tools", "Using a tool"], other: ["used tools", "Using a tool"] };
+const VERBS = { plan: ["updated the plan", "Planning"], browser: ["used the browser", "Using the browser"], edit: ["edited files", "Editing a file"], shell: ["ran commands", "Running a command"], read: ["read files", "Reading a file"], search: ["searched files", "Searching files"], agent: ["ran subagents", "Running a subagent"], web: ["fetched the web", "Fetching the web"], mcp: ["used tools", "Using a tool"], other: ["used tools", "Using a tool"] };
 export function workSummary(kinds, live = false) {
   const ks = (kinds || []).map((k) => (VERBS[k] ? k : "other"));
   if (live) return `${(VERBS[ks[ks.length - 1]] || VERBS.other)[1]}…`;

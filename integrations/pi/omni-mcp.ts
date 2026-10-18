@@ -5,7 +5,8 @@
  * binary (JSON-RPC 2.0 over stdio, one message per line), asks it for its tools and registers each
  * one as a pi tool named `omnidroid_<tool>`:
  *
- *   devices, apps   omnidroid_start_instance {apk} (the warm device) / shell / screenshot / stop_app / …
+ *   devices, apps   omnidroid_start_instance {apk, count, options} (the app's pool of warm Androids) /
+ *                   wait_instance / screenshot / input / shell / web_* / …
  *   lab debugger    omnidroid_lab_load, then call_function / intercept / read_mem / dump_module / …
  *                   (Frida-style, at the emulation layer; see the omnidroid-frida skill)
  *
@@ -21,10 +22,12 @@
  * Installed by: node scripts/install.mjs   (in the omni-agent folder; it fills `command` in)
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { McpStdioClient, SlowCallError, coerceArgs, normalizeSchema } from "./omni-mcp-lib.mjs";
+
+export { McpStdioClient, SlowCallError, coerceArgs, normalizeSchema };
 
 export interface OmniMcpConfig {
 	command?: string;
@@ -43,202 +46,19 @@ function loadConfig(): OmniMcpConfig {
 	try { return (JSON.parse(readFileSync(p, "utf8")).omniMcp ?? {}) as OmniMcpConfig; } catch { return {}; }
 }
 
-const PROTOCOL_VERSION = "2024-11-05";
 const MAX_CHARS = 12000;
-
-/** A tool call that did not return within its timeout. The server is NOT killed: the call stays
- *  pending (a late answer is delivered through `onLate`), so the lab and other progress survive. */
-export class SlowCallError extends Error {
-	method: string;
-	elapsedMs: number;
-	constructor(method: string, elapsedMs: number) {
-		super(`${method} did not return in ${Math.round(elapsedMs / 1000)} s`);
-		this.name = "SlowCallError";
-		this.method = method;
-		this.elapsedMs = elapsedMs;
-	}
-}
 
 /** What a late (post-timeout) answer carries back to the caller. */
 export type LatePayload = { text: string; images: { data: string; mimeType: string }[]; isError: boolean };
 const clip = (s: string) => (s.length > MAX_CHARS ? `${s.slice(0, MAX_CHARS)}\n… (${s.length - MAX_CHARS} more characters truncated)` : s);
 
-/** A minimal MCP client over a child's stdio: requests matched to responses by id. */
-export class McpStdioClient {
-	private child: ChildProcess | null = null;
-	private buf = "";
-	private nextId = 1;
-	private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: NodeJS.Timeout | null; child: ChildProcess; timedOut?: boolean; onLate?: (err: Error | null, result?: any) => void }>();
-	private stderrTail = "";
-	private starting: Promise<void> | null = null;
-	private cfg: OmniMcpConfig;
-	tools: McpTool[] = [];
-
-	constructor(cfg: OmniMcpConfig) { this.cfg = cfg; }
-
-	get alive(): boolean { return !!this.child && this.child.exitCode === null && !this.child.killed; }
-
-	/** Start the server and run the MCP handshake (once; concurrent callers share it). */
-	start(): Promise<void> {
-		if (this.alive && !this.starting) return Promise.resolve();
-		if (!this.starting) this.starting = this.spawnAndInit().finally(() => { this.starting = null; });
-		return this.starting;
-	}
-
-	private async spawnAndInit(): Promise<void> {
-		const command = this.cfg.command;
-		if (!command) throw new Error("omni-mcp is not configured: set omniMcp.command in ~/.pi/agent/omni-agent.json (node scripts/install.mjs fills it in)");
-		if (!existsSync(command)) throw new Error(`omni-mcp not found at ${command}: build it in the omnidroid repo with \`cargo build --release -p omni-mcp\``);
-		const child = spawn(command, this.cfg.args ?? [], {
-			env: { ...process.env, ...(this.cfg.env ?? {}) },
-			stdio: ["pipe", "pipe", "pipe"],
-			windowsHide: true,
-		});
-		this.child = child;
-		this.buf = "";
-		this.stderrTail = "";
-		child.stdout!.setEncoding("utf8");
-		child.stdout!.on("data", (chunk: string) => this.onData(chunk));
-		child.stderr!.setEncoding("utf8");
-		child.stderr!.on("data", (chunk: string) => { this.stderrTail = (this.stderrTail + chunk).slice(-4000); });
-		child.stdin!.on("error", () => { /* a dead server surfaces through "exit" */ });
-		const failAll = (why: string) => {
-			if (this.child === child) this.child = null;
-			for (const [id, p] of this.pending) { if (p.child !== child) continue; if (p.timer) clearTimeout(p.timer); p.reject(new Error(why)); this.pending.delete(id); }
-		};
-		child.on("error", (e) => failAll(`omni-mcp could not run (${command}): ${e.message}`));
-		child.on("exit", (code, signal) => failAll(`omni-mcp exited (${signal ?? `code ${code}`})${this.stderrTail ? `: ${this.stderrTail.trim()}` : ""}`));
-
-		await this.request("initialize", { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: "omni-agent", version: "0.1.0" } }, 30_000);
-		this.notify("notifications/initialized", {});
-		const listed = await this.request("tools/list", {}, 30_000);
-		this.tools = Array.isArray(listed?.tools) ? listed.tools : [];
-	}
-
-	private onData(chunk: string) {
-		this.buf += chunk;
-		let nl: number;
-		while ((nl = this.buf.indexOf("\n")) >= 0) {
-			const line = this.buf.slice(0, nl).trim();
-			this.buf = this.buf.slice(nl + 1);
-			if (!line) continue;
-			let msg: any;
-			try { msg = JSON.parse(line); } catch { continue; }
-			const p = typeof msg?.id === "number" ? this.pending.get(msg.id) : undefined;
-			if (!p) continue;
-			this.pending.delete(msg.id);
-			if (p.timer) clearTimeout(p.timer);
-			const error = msg.error ? new Error(String(msg.error.message ?? JSON.stringify(msg.error))) : null;
-			if (p.timedOut) {
-				// The awaiting promise already settled (SlowCallError); deliver the late answer out-of-band.
-				p.onLate?.(error, msg.result);
-				continue;
-			}
-			if (error) p.reject(error);
-			else p.resolve(msg.result);
-		}
-	}
-
-	private send(obj: unknown) { this.child?.stdin?.write(`${JSON.stringify(obj)}\n`); }
-
-	notify(method: string, params: unknown) { this.send({ jsonrpc: "2.0", method, params }); }
-
-	/** One request. On timeout the server is **kept alive** (the lab and other progress survive): the
-	 *  promise rejects with a {@link SlowCallError}, but the call stays pending and a late answer is
-	 *  delivered through `onLate`. (omni-mcp is single-threaded, so a truly stuck call still occupies
-	 *  the server until it is cancelled or finishes — but nothing is lost.) */
-	request(method: string, params: unknown, timeoutMs = 600_000, signal?: AbortSignal, onLate?: (err: Error | null, result?: any) => void): Promise<any> {
-		const child = this.child;
-		if (!child) return Promise.reject(new Error("omni-mcp is not running"));
-		const id = this.nextId++;
-		return new Promise((resolve, reject) => {
-			const timer = timeoutMs > 0 ? setTimeout(() => {
-				const p = this.pending.get(id);
-				if (!p) return;
-				p.timedOut = true;
-				p.timer = null;
-				// Keep the entry (and the server) so a late answer still reaches `onLate`.
-				reject(new SlowCallError(method, timeoutMs));
-			}, timeoutMs) : null;
-			this.pending.set(id, { resolve, reject, timer, child, onLate });
-			signal?.addEventListener("abort", () => {
-				if (!this.pending.delete(id)) return;
-				if (timer) clearTimeout(timer);
-				reject(new Error(`${method} cancelled (omni-mcp may still finish it)`));
-			}, { once: true });
-			this.send({ jsonrpc: "2.0", id, method, params });
-		});
-	}
-
-	/** Call a tool; returns the text the server answered with (omni-mcp answers one JSON text item). */
-	async callTool(name: string, args: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal, onLate?: (err: Error | null, payload?: LatePayload) => void): Promise<{ text: string; images: { data: string; mimeType: string }[] }> {
-		await this.start();
-		const parse = (result: any): LatePayload => {
-			const content: any[] = Array.isArray(result?.content) ? result.content : [];
-			const text = content.filter((c) => c?.type === "text").map((c) => String(c.text)).join("\n");
-			const images = content.filter((c) => c?.type === "image" && c.data).map((c) => ({ data: String(c.data), mimeType: String(c.mimeType || "image/png") }));
-			return { text, images, isError: !!result?.isError };
-		};
-		// If the call times out and later finishes, hand the parsed payload to `onLate`.
-		const lateInner = onLate ? (err: Error | null, result?: any) => onLate(err, err ? undefined : parse(result)) : undefined;
-		const result = await this.request("tools/call", { name, arguments: args }, timeoutMs, signal, lateInner);
-		const { text, images, isError } = parse(result);
-		if (isError) throw new Error(text || `${name} failed`);
-		return { text, images };
-	}
-
-	/** End the server: close stdin (it exits at EOF and stops its instances), then kill it if it lingers. */
-	close(graceMs = 3000) {
-		const child = this.child;
-		this.child = null;
-		if (!child) return;
-		try { child.stdin?.end(); } catch { /* already closed */ }
-		if (graceMs <= 0) { child.kill(); return; }
-		const t = setTimeout(() => { if (child.exitCode === null) child.kill(); }, graceMs);
-		t.unref?.();
-	}
-}
-
-/**
- * An MCP inputSchema made acceptable to every provider pi talks to: an `array` with no `items` is
- * rejected by OpenAI and Google, so its items become strings (omni-mcp reads every integer as a
- * decimal or `0x…` string too; a 64-bit address does not fit a JSON number anyway).
- */
-export function normalizeSchema(schema: any): any {
-	const s = schema && typeof schema === "object" ? structuredClone(schema) : {};
-	if (s.type !== "object") s.type = "object";
-	s.properties = s.properties && typeof s.properties === "object" ? s.properties : {};
-	for (const p of Object.values<any>(s.properties)) {
-		if (p?.type === "array" && !p.items) p.items = { type: "string", description: "decimal or 0x-hex" };
-	}
-	if (!Array.isArray(s.required) || !s.required.length) delete s.required;
-	return s;
-}
-
-/** Models send `"0x10"` for a number or `16` for a string; turn each into what the schema says. */
-export function coerceArgs(schema: any, args: unknown): unknown {
-	if (!args || typeof args !== "object" || Array.isArray(args)) return args;
-	const out: Record<string, unknown> = { ...(args as Record<string, unknown>) };
-	const props = schema?.properties ?? {};
-	const asNumber = (v: unknown) => {
-		if (typeof v !== "string") return v;
-		const t = v.trim();
-		const n = /^0x[0-9a-f]+$/i.test(t) ? Number.parseInt(t, 16) : /^\d+(\.\d+)?$/.test(t) ? Number(t) : Number.NaN;
-		return Number.isFinite(n) ? n : v;
-	};
-	for (const [k, v] of Object.entries(out)) {
-		const p = props[k];
-		if (!p || v === null || v === undefined) continue;
-		if (p.type === "string" && (typeof v === "number" || typeof v === "boolean")) out[k] = String(v);
-		else if ((p.type === "number" || p.type === "integer") && typeof v === "string") out[k] = asNumber(v);
-		else if (p.type === "boolean" && typeof v === "string") out[k] = v === "true" ? true : v === "false" ? false : v;
-		else if (p.type === "array" && Array.isArray(v) && p.items?.type === "string") out[k] = v.map((x) => (typeof x === "number" ? String(x) : x));
-		else if (p.type === "array" && typeof v === "string" && v.trim().startsWith("[")) {
-			try { out[k] = coerceArgs({ properties: { x: p } }, { x: JSON.parse(v) }).x; } catch { /* leave it for validation to report */ }
-		}
-	}
-	return out;
-}
+/** omnidroid's omni-mcp, with its own setup hints. */
+const omniClient = (cfg: OmniMcpConfig) => new McpStdioClient({
+	...cfg,
+	name: "omni-mcp",
+	notConfigured: "omni-mcp is not configured: set omniMcp.command in ~/.pi/agent/omni-agent.json (node scripts/install.mjs fills it in)",
+	notFound: (command: string) => `omni-mcp not found at ${command}: build it in the omnidroid repo with \`cargo build --release -p omni-mcp\``,
+});
 
 const pretty = (text: string) => { try { return JSON.stringify(JSON.parse(text), null, 1); } catch { return text; } };
 
@@ -253,7 +73,7 @@ export default function omniMcp(pi: ExtensionAPI) {
 	const registered = new Set<string>();
 
 	function client(): McpStdioClient {
-		if (!G.__omniMcp) G.__omniMcp = new McpStdioClient(cfg);
+		if (!G.__omniMcp) G.__omniMcp = omniClient(cfg);
 		return G.__omniMcp;
 	}
 
@@ -326,7 +146,7 @@ export default function omniMcp(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		if (!registered.size) return;
-		const note = `omnidroid tools (${prefix}*) drive omnidroid -- real Android 15 running on its own Linux layer, arm64 translated, no VM -- through its MCP server. The tools are the omnidroid app's (it must be open, with \`mcp on\` set in it; an "is not reachable" error means it is not). Any APK: ${prefix}start_instance {apk, count} launches it as count instances and answers their ids at once -- each runs in a window of its own on one of the app's warm Androids (the same APK file again shares an Android, another package goes in beside it, another build of a running package gets an Android of its own); ${prefix}wait_instance {instance_id} waits until it runs; ${prefix}screenshot {instance_id} and ${prefix}input {instance_id, action: tap|swipe|text|key} see and drive it; ${prefix}list_instances / ${prefix}list_devices show the state; ${prefix}shell runs a command on an Android (root with uid 0); ${prefix}stop_instance closes one. Native code: ${prefix}lab_load + ${prefix}call_function / ${prefix}intercept / ${prefix}read_mem / ${prefix}dump_module are a Frida-style debugger for one arm64 .so at the emulation layer (not attached to a live app; there is no frida-server here). RE workbench (reverse-engineer a .so and prove a rebuilt one matches): ${prefix}lab_load_apk (load a target + its siblings, report unresolved imports), ${prefix}lab_trace (call via an arg_spec of scalars/buffers), ${prefix}lab_corpus (a reproducible input corpus), ${prefix}lab_diff (differential-test original vs candidate over the corpus), ${prefix}lab_build (compile candidate C to an arm64 .so; needs an arm64 clang/NDK on the host). Read the omnidroid skill (devices, apps) or the omnidroid-frida skill (the lab + the workbench) before using them. Addresses are strings ("0x…"). The omni_* tools, if present, are the retired QEMU manager: only when asked for it by name.`;
+		const note = `omnidroid tools (${prefix}*) drive omnidroid -- real Android 15 running on its own Linux layer, arm64 translated, no VM -- through its MCP server. The tools are the omnidroid app's (it must be open, with \`mcp on\` set in it, or \`omnidroid serve\` running; an "is not reachable" error means it is not). Every omnidroid window on the computer shares that one pool: what the person launches you see too. Any APK: ${prefix}start_instance {apk, count} launches it as count instances and answers their ids at once -- each runs in a window of its own on one of the app's warm Androids, as an Android user of its own (the same APK file again shares an Android, another package goes in beside it, another build of a running package gets an Android of its own); \`options\` passes an installed plugin's options as on the command line (e.g. "--cookie <file or saved name> --place <id>": each instance signed in as that account, then the link opened; follow it in ${prefix}pool_log); ${prefix}wait_instance {instance_id} waits until it runs; ${prefix}screenshot {instance_id} and ${prefix}input {instance_id, action: tap|swipe|text|key} see and drive it; ${prefix}list_instances / ${prefix}list_devices show the state; ${prefix}shell runs a command on an Android (root with uid 0); ${prefix}stop_instance closes one; ${prefix}web_pages / web_dom / web_click / web_type / web_eval / web_screenshot drive an instance's WebViews (sign-in pages, captchas). Native code: ${prefix}lab_load + ${prefix}call_function / ${prefix}intercept / ${prefix}read_mem / ${prefix}dump_module are a Frida-style debugger for one arm64 .so at the emulation layer (not attached to a live app; there is no frida-server here). RE workbench (reverse-engineer a .so and prove a rebuilt one matches): ${prefix}lab_load_apk (load a target + its siblings, report unresolved imports), ${prefix}lab_trace (call via an arg_spec of scalars/buffers), ${prefix}lab_corpus (a reproducible input corpus), ${prefix}lab_diff (differential-test original vs candidate over the corpus), ${prefix}lab_build (compile candidate C to an arm64 .so; needs an arm64 clang/NDK on the host). Read the omnidroid skill (devices, apps) or the omnidroid-frida skill (the lab + the workbench) before using them. Addresses are strings ("0x…"). The omni_* tools, if present, are the retired QEMU manager: only when asked for it by name.`;
 		return { systemPrompt: `${event.systemPrompt}\n\n${note}` };
 	});
 }

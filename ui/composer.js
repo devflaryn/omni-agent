@@ -78,17 +78,18 @@ export function createComposer(root, h) {
     manage.onclick = () => { closeMenus(); h.onManageProviders?.(); };
     modelMenu.appendChild(manage);
   }
-  /** Goal hook: a judge model re-engages pi when it stops before the request is done. */
+  /** Goal hook: re-engages pi while its plan has unfinished steps; the model picked here writes the status box. */
   function renderHookSection() {
     const hk = st.hook;
     const head = el("div", "mh", "Goal hook");
-    head.title = "When pi stops, a judge model checks whether your request is done and re-engages pi if not";
+    head.title = "When pi stops while its plan still has unfinished steps, it is re-engaged on the current step";
     modelMenu.appendChild(head);
     const row = el("div", "seg-row");
     for (const [lbl, on] of [["off", false], ["on", true]]) { const b = el("button", `seg-btn${hk.enabled === on ? " active" : ""}`, lbl); b.onclick = () => { h.onHook?.({ enabled: on }); closeMenus(); }; row.appendChild(b); }
     modelMenu.appendChild(row);
     if (!hk.enabled) return;
-    const judge = el("div", "mh", "Judge model");
+    const judge = el("div", "mh", "Status box model");
+    judge.title = "Writes the goal box status at each milestone, in a side conversation of its own (never the chat)";
     modelMenu.appendChild(judge);
     const same = el("button", !hk.provider && !hk.model ? "on" : "", "Same as the chat");
     same.onclick = () => { h.onHook?.({ provider: "", model: "" }); closeMenus(); };

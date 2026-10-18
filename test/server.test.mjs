@@ -188,7 +188,7 @@ function makeFakePi({ cwd, model, provider, thinking }) {
   };
   return fakePi;
 }
-const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), persistHook: false, persistPiModel: false });
+const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false });
 await app2.listen();
 const port2 = app2.server.address().port;
 after(() => app2.close());
@@ -313,6 +313,52 @@ test("providers: DELETE removes the entry; unknown → 404", async () => {
   assert.equal((await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "DELETE" })).status, 404);
 });
 
+// ------------------------------------------------------------ MCP servers
+test("mcp servers: PUT validates, writes mcpServers beside the other keys, masks secrets, keeps them on re-save, restarts pi", async () => {
+  const file = join(base, "pi-agent", "omni-agent.json");
+  writeFileSync(file, JSON.stringify({ autoRecall: true, omniMcp: { command: "/x/omni-mcp" } }));
+  const put = (name, body) => fetch(`http://127.0.0.1:${port2}/api/mcp/${name}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  assert.deepEqual((await (await fetch(`http://127.0.0.1:${port2}/api/mcp`)).json()).servers, []);
+  assert.equal((await put("bad name", { command: "npx" })).status, 400);
+  assert.equal((await put("fs", { type: "stdio" })).status, 400, "stdio needs a command");
+  assert.equal((await put("gh", { type: "http", url: "ftp://x" })).status, 400, "http needs an http(s) url");
+  app2.startPi(base);
+  const before = fakePi;
+  const r = await put("gh", { type: "http", url: "https://api.example.com/mcp", headers: { Authorization: "Bearer secret-token-9876", "X-Ref": "${GH_TOKEN}" }, timeoutSec: 60 });
+  const j = await r.json();
+  assert.equal(r.status, 200);
+  assert.equal(j.restarted, true);
+  assert.notEqual(fakePi, before, "pi restarts so it connects");
+  assert.equal(j.servers[0].headers.Authorization, "••••••••9876", "a secret is masked");
+  assert.equal(j.servers[0].headers["X-Ref"], "${GH_TOKEN}", "an env reference is shown as-is");
+  let disk = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(disk.autoRecall, true); assert.equal(disk.omniMcp.command, "/x/omni-mcp", "other keys are kept");
+  assert.deepEqual(disk.mcpServers.gh, { type: "http", url: "https://api.example.com/mcp", headers: { Authorization: "Bearer secret-token-9876", "X-Ref": "${GH_TOKEN}" }, timeoutSec: 60 });
+  // Saving the form back with the mask keeps the stored secret; renaming keeps the position.
+  await put("fs", { type: "stdio", command: "npx", args: ["-y", "pkg"], env: { TOKEN: "abc" } });
+  await put("github", { rename: "gh", type: "http", url: "https://api.example.com/mcp", headers: j.servers[0].headers, disabled: true });
+  disk = JSON.parse(readFileSync(file, "utf8"));
+  assert.deepEqual(Object.keys(disk.mcpServers), ["github", "fs"]);
+  assert.equal(disk.mcpServers.github.headers.Authorization, "Bearer secret-token-9876");
+  assert.equal(disk.mcpServers.github.disabled, true);
+  assert.deepEqual(disk.mcpServers.fs, { command: "npx", args: ["-y", "pkg"], env: { TOKEN: "abc" } });
+  assert.equal((await put("github", { rename: "fs", command: "x" })).status, 409, "a rename onto another server is refused");
+  const del = await fetch(`http://127.0.0.1:${port2}/api/mcp/github`, { method: "DELETE" });
+  assert.deepEqual((await del.json()).servers.map((s) => s.name), ["fs"]);
+  assert.equal((await fetch(`http://127.0.0.1:${port2}/api/mcp/github`, { method: "DELETE" })).status, 404);
+});
+
+test("mcp-test: connects with the pi extension's client and lists the tools, or says why not", async () => {
+  const test = (body) => fetch(`http://127.0.0.1:${port2}/api/mcp-test`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then((r) => r.json());
+  const ok = await test({ name: "fake", type: "stdio", command: process.execPath, args: [join(process.cwd(), "test", "helpers", "fake-mcp.mjs")], env: { FAKE_MCP: "1" } });
+  assert.equal(ok.ok, true, ok.error);
+  assert.deepEqual(ok.tools.map((t) => t.name), ["echo", "fail", "hang"]);
+  const down = await test({ name: "down", type: "http", url: "http://127.0.0.1:9/mcp" });
+  assert.equal(down.ok, false);
+  assert.match(down.error, /not reachable/);
+  assert.match((await test({ name: "x", type: "stdio" })).error, /needs a command/);
+});
+
 // ---------------------------------------------------------- file previews
 test("fs/read reports a kind per file family: markdown, text, image, archive, binary", async () => {
   const dir = join(base, "proj"); mkdirSync(dir, { recursive: true });
@@ -341,7 +387,7 @@ test("fs/read reports a kind per file family: markdown, text, image, archive, bi
 
 test("goal hook settings: /api/hook reads, validates and updates the keeper", async () => {
   const before = await api("/api/hook");
-  assert.deepEqual(before.hook, { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true, summaryProvider: "", summaryModel: "", judgeTimeoutMs: 120000, heartbeatMs: 60000, loopK: 3 });
+  assert.deepEqual(before.hook, { enabled: false, provider: "", model: "", maxIdleNudges: 5, graceMs: 2000, summaries: true, restateEvery: 10, summaryProvider: "", summaryModel: "", judgeTimeoutMs: 120000, heartbeatMs: 60000, loopK: 3, judgeFallback: false, planlessNudges: 1, errorCompactAfter: 2, errorBackoffMs: 15000 });
   const st = await api("/api/state");
   assert.deepEqual(st.hook, before.hook, "state carries the same settings");
   const r = await fetch(`http://127.0.0.1:${port}/api/hook`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, provider: "openrouter", model: "deepseek/x", maxIdleNudges: 999 }) });
@@ -386,7 +432,11 @@ test("goal kickoff: POST /api/goal sends the goal as a prompt and arms the keepe
   const r = await post3("/api/goal", { goal: "do X" });
   assert.equal(r.status, 200);
   assert.equal(r.json.started, true);
-  assert.ok(goalPi.calls.some((c) => c[0] === "prompt" && c[1] === "do X"), "the goal was sent as a kickoff prompt");
+  const kick = goalPi.calls.find((c) => c[0] === "prompt");
+  assert.ok(kick && kick[1].startsWith("do X\n\n"), "the goal was sent as a kickoff prompt");
+  assert.match(kick[1], /brainstorm and plan it with the plan tool/, "the kickoff asks for a plan up front");
+  const g = await (await fetch(`http://127.0.0.1:${port3}/api/goal`)).json();
+  assert.equal(g.goal, "do X"); assert.equal(g.explicit, true); assert.equal(g.plan, null, "no plan until the agent writes one");
   assert.equal(app3.keeper.config.enabled, true, "setting a goal arms the keeper");
 });
 

@@ -8,10 +8,17 @@ The native engine at `Desktop/Omni Apps/omnidroid` (Rust workspace). Binaries in
 
 ```text
 omnidroid                       the app: warm Androids, any APK in windows of its own, a command line
-omnidroid <app.apk> [xN]        the app, launching N instances
+omnidroid <app.apk> [xN] [plugin options]   the app, launching N instances (e.g. --cookie <c> --place <id>)
 omnidroid serve [--port <n>]    the app without its screen (pool + MCP), until stdin closes
 omnidroid help commands         the one-shot commands below (scripts, and the app's own use)
 ```
+
+Every window and `serve` on a computer share one pool (`omnidroid host`, a process of its own, found
+through `pool.host` beside `app.conf`; its output in `pool.host.log`). At the prompt: `run <apk> [xN]
+[plugin options]`; MCP: `start_instance {apk, count, options}`. A launch's plugin options run the
+plugins' `session-start` hooks as `aosp` does; their `OMNI_R_COOKIE` is planted for the instance's own
+Android user, their `OMNI_R_LINK` + `OMNI_R_LINK_ID` opened on its display once `OMNI_R_LINK_READY` or
+`OMNI_R_SIGNED_IN` is logged (`omni_pool::extras`).
 
 Settings (`settings` / `set <key> <value>` in the app; `<app-data>/../app.conf`, or `OMNI_APP_CONFIG`):
 
