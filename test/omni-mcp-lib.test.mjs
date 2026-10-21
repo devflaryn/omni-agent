@@ -74,3 +74,25 @@ test("repeatNudge: fires only on a watched read repeating byte-identical, never 
   assert.equal(repeatNudge(prev, "screenshot", "{}", "A"), null, "not a watched read → no nudge");
   assert.equal(repeatNudge(null, "list_devices", "{}", "A"), null, "no previous call → no nudge");
 });
+
+test("trimInstanceList: an oversized ended-heavy list stays VALID JSON under the 12000 clip (the production truncation)", () => {
+  // Reproduces the 15 real cases: ended instances carry a crash `details` blob, pushing pretty past the clip.
+  const CLIP = 12000;
+  const clip = (s) => (s.length > CLIP ? s.slice(0, CLIP) + "\n… (truncated)" : s);
+  const inst = (id, live) => ({
+    apk: `\\?\C:\Users\berat\Desktop\rebuild\work\own${id}_signed.apk`, device: 1, display: 1,
+    instance_id: id, package: "com.roblox.client", screenshot: null,
+    sha256: "a62a96dd16ecc485374a46c1f674bb42588243c6632504f526620efb16a6" + String(id).padStart(4, "0"),
+    state: live ? "running" : "ended: the app stopped", up_s: 30000 + id, user: 10,
+    ...(live ? {} : { details: [`crash: signal 11 (SIGSEGV) in pid ${700000 + id}.`, "  #00 pc 5f8758 libzstd-jni.so", "  #01 pc df10f0 payload"] }),
+  });
+  const data = { instances: [...Array.from({ length: 30 }, (_, i) => inst(i + 1, false)), inst(90, true), inst(91, true)] };
+  const text = JSON.stringify(data);
+  const pretty = JSON.stringify(JSON.parse(text), null, 1);
+  assert.ok(pretty.length > CLIP, "the raw pretty form overflows the clip (as the 15 real ones did)");
+  assert.throws(() => JSON.parse(clip(pretty)), "OLD behavior: clipping the raw pretty form yields broken JSON");
+  const shown = clip(trimInstanceList(text) ?? pretty);
+  const parsed = JSON.parse(shown); // must not throw
+  assert.ok(parsed.instances.some((i) => i.state === "running"), "live instances kept");
+  assert.equal(parsed.omittedEnded.count, 26);
+});
