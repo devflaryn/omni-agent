@@ -20,7 +20,7 @@ import { compact, convertToLlm, generateSummaryWithUsage, serializeConversation 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { CONTEXT_GUIDANCE, chunkBySize, contextStatusNote, foldIntoSummary, summaryInputBudget, tokensOfChars } from "./omni-context-lib.mjs";
+import { CONTEXT_GUIDANCE, chunkBySize, contextStatusNote, foldIntoSummary, repairToolCallIds, summaryInputBudget, tokensOfChars } from "./omni-context-lib.mjs";
 
 /** pi's own default for compaction.reserveTokens. */
 const PI_RESERVE_TOKENS = 16384;
@@ -34,6 +34,17 @@ function piSettingsFile(): string {
 }
 
 export default function omniContext(pi: ExtensionAPI) {
+	// A tool call saved without an id would 400 every later request; repaired on the way out (the saved session is
+	// left as it is). Independent of the context policy below, so it stays on when that is turned off.
+	pi.on("context", async (ev: any) => {
+		try {
+			const messages = repairToolCallIds(ev?.messages);
+			return messages ? { messages } : undefined;
+		} catch {
+			return undefined;
+		}
+	});
+
 	if (String(process.env.OMNI_CONTEXT || "").toLowerCase() === "off") return;
 	const compaction = readJson(piSettingsFile())?.compaction ?? {};
 	if (compaction.enabled === false) return;

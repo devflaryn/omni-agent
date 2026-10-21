@@ -42,14 +42,20 @@ async function load({ files = {}, env = {} } = {}) {
   process.env.HOME = home; process.env.USERPROFILE = home;
   delete process.env.PI_CODING_AGENT_DIR; delete process.env.OMNI_CONTEXT;
   for (const [k, v] of Object.entries(typeof env === "function" ? env(home) : env)) process.env[k] = v;
-  const on = {};
+  const handlers = {};
   try {
     const mod = await import(`${pathToFileURL(EXT).href}?${Math.random()}`);
-    mod.default({ on: (name, fn) => { on[name] = fn; }, registerTool: () => assert.fail("no tools"), sendMessage: () => assert.fail("no messages") });
+    mod.default({ on: (name, fn) => { (handlers[name] ||= []).push(fn); }, registerTool: () => assert.fail("no tools"), sendMessage: () => assert.fail("no messages") });
   } finally {
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });
   }
+  // pi chains handlers of one event: each sees the messages the one before it returned.
+  const on = Object.fromEntries(Object.entries(handlers).map(([name, fns]) => [name, fns.length === 1 ? fns[0] : async (ev, ctx) => {
+    let messages = ev.messages, changed = false;
+    for (const fn of fns) { const r = await fn({ ...ev, messages }, ctx); if (r?.messages) { messages = r.messages; changed = true; } }
+    return changed ? { messages } : undefined;
+  }]));
   const context = (messages, usage) => on.context({ type: "context", messages }, { getContextUsage: () => usage });
   return { on, context };
 }
@@ -127,9 +133,38 @@ test("omni-context: pi's defaults without config (reserve 16384, from 70%); PI_C
   assert.match((await moved.context(convo(), { tokens: 150000, contextWindow: 272384 })).messages[2].content[1].text, /75%/);
 });
 
-test("omni-context: OMNI_CONTEXT=off and compaction.enabled=false register nothing", { skip }, async () => {
-  assert.deepEqual((await load({ env: { OMNI_CONTEXT: "off" } })).on, {});
-  assert.deepEqual((await load({ files: { "settings.json": { compaction: { enabled: false } } } })).on, {});
+test("omni-context: OMNI_CONTEXT=off and compaction.enabled=false register only the tool-call id repair", { skip }, async () => {
+  for (const x of [await load({ env: { OMNI_CONTEXT: "off" } }), await load({ files: { "settings.json": { compaction: { enabled: false } } } })]) {
+    assert.deepEqual(Object.keys(x.on), ["context"]);
+    assert.equal(await x.context(convo(), { tokens: 250000, contextWindow: 280576 }), undefined, "no status note");
+    assert.equal((await x.context(idless(), undefined)).messages[2].toolCallId, "call_omni_2_1");
+  }
+});
+
+// What a malformed provider stream leaves in the session: a tool call with no id and no name, and pi's error result.
+const idless = () => [
+  { role: "user", content: [{ type: "text", text: "rebuild the payload" }], timestamp: 1 },
+  { role: "assistant", content: [{ type: "thinking", thinking: "…" }, { type: "toolCall", id: "", name: "", arguments: { task: "x" } }], stopReason: "toolUse", timestamp: 2 },
+  { role: "toolResult", toolCallId: "", toolName: "", content: [{ type: "text", text: "Tool  not found" }], isError: true, timestamp: 3 },
+];
+
+test("omni-context: a saved tool call without an id is given one (with its result) before the request, beside the status note", { skip }, async () => {
+  const x = await load();
+  const messages = idless();
+  const before = JSON.stringify(messages);
+  const r = await x.context(messages, undefined);
+  assert.equal(r.messages[0], messages[0], "untouched messages are the same objects");
+  assert.deepEqual(r.messages[1].content[1], { type: "toolCall", id: "call_omni_2_1", name: "unknown_tool", arguments: { task: "x" } });
+  assert.equal(r.messages[1].content[0], messages[1].content[0]);
+  assert.equal(r.messages[2].toolCallId, "call_omni_2_1");
+  assert.equal(r.messages[2].toolName, "unknown_tool");
+  assert.equal(JSON.stringify(messages), before, "the session's own messages are not changed");
+  assert.deepEqual((await x.context(idless(), undefined)).messages, r.messages, "the same ids every request (prompt cache kept)");
+  // Both handlers apply: the repair, then the note on the newest message.
+  const both = await x.context(idless(), { tokens: 250000, contextWindow: 272384 });
+  assert.equal(both.messages[2].toolCallId, "call_omni_2_1");
+  assert.match(both.messages[2].content[1].text, /\[context: 98%/);
+  assert.equal(await x.context(convo(), undefined), undefined, "a healthy conversation is passed through");
 });
 
 // A run of `n` turns of ~`chars` serialized characters each (thinking dominates, as in the long deepseek chats).

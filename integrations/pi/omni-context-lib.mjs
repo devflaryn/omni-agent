@@ -36,7 +36,8 @@ const THINK_CLAIMS = [
   /\b(?:at|near|reached|hit|hitting|approaching) (?:the )?(?:very |absolute |practical |hard )?(?:end|limit|edge) of (?:my |the |this turn's |this session's |practical )?(?:context|budget|token budget|context budget|context window)\b/i,
   /\b(?:end|limit) of (?:my |the )?(?:practical )?context\b/i,
   /\bat the budget limit\b|\b(?:my |the )?(?:token |context )?budget (?:is )?(?:nearly |almost |essentially )?(?:exhausted|spent|gone|used up)\b/i,
-  /\b(?:very little|no|little|not much) (?:context|budget|room) (?:left|remaining)\b|\bhave (?:very little|little|almost no|no) context\b/i,
+  // "I have very little context" is the budget; "very little context about/on what to continue" is missing information.
+  /\b(?:very little|no|little|not much) (?:context|budget|room) (?:left|remaining)\b|\bhave (?:very little|little|almost no|no) context\b(?! (?:about|regarding|on|for|of|into|around|as to|what|why|how|here|from|beyond|other than|besides)\b)/i,
   /\bcontext (?:is )?(?:very high|nearly gone|almost gone|getting (?:very )?(?:high|large|long))\b|\bgiven (?:the )?context limits?\b/i,
   /\bgiven the session'?s length\b/i,
 ];
@@ -114,6 +115,9 @@ const lastParagraph = (text) => { const parts = String(text || "").trim().split(
  * @param {string} [m.userText]     the last real user message (a requested handoff is not a stop)
  * @returns {{ kind: "context-stop"|"asks-user"|"length-cap"|"length"|"error"|"aborted"|"tool-use"|"normal", reason: string }}
  */
+/** Below this prompt size a context claim found only in the reasoning is not taken as a context stop. */
+export const THINK_MIN_PROMPT = 64000;
+
 export function classifyStop({ text = "", thinking = "", stopReason = "stop", usage = null, maxTokens = 0, userText = "" } = {}) {
   if (stopReason === "error") return { kind: "error", reason: "the provider returned an error" };
   if (stopReason === "aborted") return { kind: "aborted", reason: "the run was aborted" };
@@ -132,8 +136,11 @@ export function classifyStop({ text = "", thinking = "", stopReason = "stop", us
   if (sessionStop) return { kind: "context-stop", reason: `it stopped "for this session" ("${clipMatch(t, sessionStop)}")` };
   const handoff = HANDOFF.find((re) => re.test(t)) || weakHandoff(t);
   if (handoff) return { kind: "context-stop", reason: `it wrote a handoff for another session ("${clipMatch(t, handoff)}")` };
-  // The final message's reasoning is where it decides to wrap up (its end matters most; cap the scan).
-  const th = plain(thinking).slice(-12000);
+  // The final message's reasoning is where it decides to wrap up (its end matters most; cap the scan). Reasoning alone
+  // is weaker evidence than the reply ("I have very little context" also means "too little information"), so on a
+  // small prompt it does not count: every real context stop in the recorded chats came at 369k+ tokens.
+  const prompt = (Number(usage?.input) || 0) + (Number(usage?.cacheRead) || 0);
+  const th = prompt > 0 && prompt < THINK_MIN_PROMPT ? "" : plain(thinking).slice(-12000);
   const thought = th && [...CONTEXT_CLAIMS, ...THINK_CLAIMS].find((re) => re.test(th));
   if (thought) return { kind: "context-stop", reason: `it wrapped up believing its context was used up ("${clipMatch(th, thought)}")` };
   if (ASKS_USER.test(lastParagraph(t).slice(-600))) return { kind: "asks-user", reason: "it asked the user something" };
@@ -217,6 +224,37 @@ export async function foldIntoSummary({ chunks, previousSummary, summarize, last
   let summary = previousSummary;
   for (let i = 0; i < chunks.length - 1; i++) summary = await summarize(chunks[i], summary, i);
   return last(chunks[chunks.length - 1] || [], summary);
+}
+
+/**
+ * A tool call the provider streamed without an id (seen from deepseek via OpenRouter: empty id, empty name) is saved
+ * that way, and pi replays it on every later request as `tool_call_id: ""`, which the API rejects with a 400 — the
+ * session can never take another turn. Gives each such call a stable id (and a name when it has none) and hands the
+ * ids to the results that follow it, in order. Null when nothing needs repairing, so the messages stay byte-identical.
+ */
+export const UNNAMED_TOOL = "unknown_tool";
+export function repairToolCallIds(messages) {
+  if (!Array.isArray(messages)) return null;
+  let out = null, queue = [];
+  const put = (i, m) => { if (!out) out = messages.slice(); out[i] = m; };
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role === "assistant" && Array.isArray(m.content)) {
+      queue = [];
+      if (!m.content.some((c) => c?.type === "toolCall" && (!c.id || !c.name))) continue;
+      const content = m.content.map((c, j) => {
+        if (c?.type !== "toolCall" || (c.id && c.name)) return c;
+        const fixed = { ...c, id: c.id || `call_omni_${Number(m.timestamp) || i}_${j}`, name: c.name || UNNAMED_TOOL };
+        if (!c.id) queue.push(fixed);
+        return fixed;
+      });
+      put(i, { ...m, content });
+    } else if (m?.role === "toolResult" && !m.toolCallId && queue.length) {
+      const call = queue.shift();
+      put(i, { ...m, toolCallId: call.id, toolName: m.toolName || call.name });
+    }
+  }
+  return out;
 }
 
 /**

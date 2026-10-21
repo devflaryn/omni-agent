@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CONTEXT_GUIDANCE, classifyStop, contextContinueMessage, contextSkipReason, contextStatusNote, effectiveContextWindow, userAskedForHandoff } from "../integrations/pi/omni-context-lib.mjs";
+import { CONTEXT_GUIDANCE, UNNAMED_TOOL, classifyStop, contextContinueMessage, contextSkipReason, contextStatusNote, effectiveContextWindow, repairToolCallIds, userAskedForHandoff } from "../integrations/pi/omni-context-lib.mjs";
 
 const stop = (text, extra = {}) => classifyStop({ text, stopReason: "stop", ...extra });
 const NEUTRAL = "Summary: the loader resolves both imports now and the unit tests pass. Steps 4 and 5 of the plan are still open.";
@@ -245,4 +245,47 @@ test("oversized compaction: the per-request budget, chunking at message boundari
   assert.deepEqual(calls, ["a<S0", "b<S(a)"]);
   assert.equal(out.summary, "final(c|S(b))");
   assert.equal((await foldIntoSummary({ chunks: [["only"]], previousSummary: undefined, summarize: async () => assert.fail("no middle chunks"), last: async (m, p) => ({ summary: `${m[0]}:${p}` }) })).summary, "only:undefined");
+});
+
+test("a context claim found only in the reasoning counts on a big prompt, not on a small one ('very little context' = too little information)", () => {
+  const thinking = "The user said continue. I have very little context. The device is still booting, so I will report what I know.";
+  const text = "Here is where things stand: the device is still booting.";
+  assert.equal(classifyStop({ text, thinking, stopReason: "stop", usage: { input: 2000, cacheRead: 40000, output: 300 } }).kind, "normal", "42k prompt: not a context stop");
+  assert.equal(classifyStop({ text, thinking, stopReason: "stop", usage: { input: 2000, cacheRead: 595000, output: 300 } }).kind, "context-stop", "597k prompt: it is");
+  assert.equal(classifyStop({ text, thinking, stopReason: "stop" }).kind, "context-stop", "size unknown: counts");
+  assert.equal(classifyStop({ text: "I ran out of context, so I will stop here.", stopReason: "stop", usage: { input: 30000, output: 20 } }).kind, "context-stop", "a claim in the reply counts at any size");
+  assert.equal(classifyStop({ text, thinking: "I have very little context about what they want next.", stopReason: "stop", usage: { input: 500000, output: 20 } }).kind, "normal", "information sense never counts");
+});
+
+test("repairToolCallIds: a tool call saved without an id (or name) gets a stable one, handed to its results in order", () => {
+  const user = { role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 };
+  const ok = { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "bash", arguments: {} }], timestamp: 2 };
+  const okResult = { role: "toolResult", toolCallId: "t1", toolName: "bash", content: [], isError: false, timestamp: 3 };
+  assert.equal(repairToolCallIds([user, ok, okResult]), null, "nothing to repair: null, so the request is byte-identical");
+  assert.equal(repairToolCallIds(undefined), null);
+  assert.equal(repairToolCallIds([]), null);
+
+  const bad = { role: "assistant", content: [{ type: "text", text: "two calls" }, { type: "toolCall", id: "", name: "", arguments: { a: 1 } }, { type: "toolCall", id: "keep", name: "read", arguments: {} }, { type: "toolCall", name: "bash", arguments: {} }], timestamp: 1700000000000 };
+  const r1 = { role: "toolResult", toolCallId: "", toolName: "", content: [], isError: true, timestamp: 5 };
+  const r2 = { role: "toolResult", toolCallId: "keep", toolName: "read", content: [], isError: false, timestamp: 6 };
+  const r3 = { role: "toolResult", toolCallId: "", toolName: "bash", content: [], isError: false, timestamp: 7 };
+  const input = [user, bad, r1, r2, r3, ok, okResult];
+  const snapshot = JSON.stringify(input);
+  const out = repairToolCallIds(input);
+  assert.equal(JSON.stringify(input), snapshot, "the input is not mutated");
+  assert.equal(out[0], user); assert.equal(out[3], r2); assert.equal(out[5], ok); assert.equal(out[6], okResult);
+  assert.deepEqual(out[1].content.map((c) => [c.id, c.name]), [[undefined, undefined], ["call_omni_1700000000000_1", UNNAMED_TOOL], ["keep", "read"], ["call_omni_1700000000000_3", "bash"]]);
+  assert.equal(out[1].content[0], bad.content[0]);
+  assert.deepEqual([out[2].toolCallId, out[2].toolName], ["call_omni_1700000000000_1", UNNAMED_TOOL]);
+  assert.deepEqual([out[4].toolCallId, out[4].toolName], ["call_omni_1700000000000_3", "bash"]);
+  assert.deepEqual(repairToolCallIds(input), out, "deterministic: the same ids on every request");
+  // No timestamp: the message's position. A result with no id and no id-less call before it is left alone.
+  const noTs = repairToolCallIds([user, { role: "assistant", content: [{ type: "toolCall", id: "", name: "x", arguments: {} }] }, { ...r1 }]);
+  assert.equal(noTs[1].content[0].id, "call_omni_1_0");
+  assert.equal(noTs[2].toolCallId, "call_omni_1_0");
+  assert.equal(repairToolCallIds([user, { ...r1 }]), null);
+  // A named call with an id is never touched even beside a broken one; a nameless call with an id keeps the id.
+  const named = repairToolCallIds([{ role: "assistant", content: [{ type: "toolCall", id: "z9", name: "", arguments: {} }], timestamp: 4 }, { ...okResult, toolCallId: "z9", toolName: "" }]);
+  assert.deepEqual([named[0].content[0].id, named[0].content[0].name], ["z9", UNNAMED_TOOL]);
+  assert.equal(named[1].toolCallId, "z9", "its result already points at it");
 });
