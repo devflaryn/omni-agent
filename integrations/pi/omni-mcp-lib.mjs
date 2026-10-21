@@ -120,6 +120,21 @@ export function waitDeviceVerdict(text, targetId = null) {
 	return { done, ready, booting, devices };
 }
 
+/**
+ * Read-only state queries where the SAME call giving the SAME result back-to-back means the model is
+ * spinning, not making progress (the measured runs had 16 such identical repeats, mostly list_devices).
+ * Only these tools are watched, and only a byte-identical result triggers the note, so a poll that shows
+ * real change (the common, legitimate case — 216 of 232 list_devices calls) is never nudged.
+ */
+const REPEAT_WATCH = new Set(["list_devices", "device_status", "list_instances", "list_maps", "list_symbols"]);
+
+/** A one-line note to prepend when a watched read repeats with no change at all, else null. `prev` is the previous call's {name,args,result}. */
+export function repeatNudge(prev, toolName, argsJson, resultText) {
+	if (!REPEAT_WATCH.has(toolName)) return null;
+	if (!prev || prev.name !== toolName || prev.args !== argsJson || prev.result !== resultText) return null;
+	return `(identical to your previous ${toolName} call — nothing has changed since. Don't keep polling: wait with wait_device / wait_instance for a change, or take a different step.)`;
+}
+
 /** What a client answers a request the *server* sends (ping is required; the rest are capabilities we do not offer). */
 function answerServerRequest(msg) {
 	if (msg.method === "ping") return { jsonrpc: "2.0", id: msg.id, result: {} };

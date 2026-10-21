@@ -112,6 +112,18 @@ test("omni-mcp: list_instances keeps live instances and trims the pile of ended 
   } finally { await x.quit(); }
 });
 
+test("omni-mcp: a watched read repeated with no change gets a one-line 'nothing changed' note on the repeat only", async () => {
+  globalThis.__omniLastCall = undefined; // isolate from other tests sharing this process (prod: one process per session)
+  const x = await load({ command: process.execPath, args: [FAKE], env: { FAKE_MCP: "1", FAKE_MCP_LIFECYCLE: "1" } });
+  try {
+    // The fake list_instances returns the same list every call → the second call is a byte-identical repeat.
+    const first = await x.run("omnidroid_list_instances", {});
+    assert.doesNotMatch(first.content[0].text, /nothing has changed/, "the first call is not nudged");
+    const second = await x.run("omnidroid_list_instances", {});
+    assert.match(second.content[0].text, /nothing has changed since/, "the identical repeat is nudged");
+  } finally { await x.quit(); }
+});
+
 test("omni-mcp: wait_device blocks server-side until the device is ready, so the model makes one call not a poll loop", async () => {
   // Fake list_devices reports "booting" for the first 2 polls, then "ready"; fast poll so the test is quick.
   const x = await load({ command: process.execPath, args: [FAKE], env: { FAKE_MCP: "1", FAKE_MCP_LIFECYCLE: "1", FAKE_MCP_BOOT_POLLS: "2" }, waitPollMs: 20 });

@@ -64,3 +64,13 @@ test("waitDeviceVerdict: no target → done once a device exists and none is sti
   const v = waitDeviceVerdict(mix("ready", "closing"));
   assert.deepEqual([v.done, v.booting], [false, [2]], "closing counts as still coming/going");
 });
+
+test("repeatNudge: fires only on a watched read repeating byte-identical, never on change or other tools", async () => {
+  const { repeatNudge } = await import("../integrations/pi/omni-mcp-lib.mjs");
+  const prev = { name: "list_devices", args: "{}", result: "A" };
+  assert.match(repeatNudge(prev, "list_devices", "{}", "A"), /nothing has changed/);
+  assert.equal(repeatNudge(prev, "list_devices", "{}", "B"), null, "result changed → no nudge (real progress)");
+  assert.equal(repeatNudge(prev, "list_devices", '{"x":1}', "A"), null, "different args → no nudge");
+  assert.equal(repeatNudge(prev, "screenshot", "{}", "A"), null, "not a watched read → no nudge");
+  assert.equal(repeatNudge(null, "list_devices", "{}", "A"), null, "no previous call → no nudge");
+});

@@ -21,14 +21,21 @@ import { PLAN_TOOL, PLAN_ACTIONS, applyPlanAction, asPlan, clearWaiting, emptyPl
 
 const HOOK_PROMPT = /^\s*<omni-hook\b/;
 
+// The fields are optional and extra properties are allowed on purpose: the state machine
+// (applyPlanAction → normalizeMilestones/normalizeSteps in omni-plan-lib.mjs) is already tolerant of the
+// model's near-miss shapes (done_when on a milestone, `tasks` for `steps`, a missing title it derives),
+// but pi validates this schema BEFORE execute() runs — a strict schema hard-rejected those calls (the
+// measured runs lost 3 `revise` calls to "milestones.N.title: must have required properties title"). The
+// descriptions still steer the model; a genuinely unusable plan comes back as a readable, fixable tool
+// result from planProblems, not a validation failure the model cannot see the body of.
 const Step = Type.Object({
-	title: Type.String({ description: "One concrete action, e.g. 'add the retry loop to fetchUser in src/api.ts'" }),
-	done_when: Type.String({ description: "The check that proves this step worked, e.g. 'npm test passes', 'the log shows 200'" }),
-});
+	title: Type.Optional(Type.String({ description: "One concrete action, e.g. 'add the retry loop to fetchUser in src/api.ts'" })),
+	done_when: Type.Optional(Type.String({ description: "The check that proves this step worked, e.g. 'npm test passes', 'the log shows 200'" })),
+}, { additionalProperties: true });
 const Milestone = Type.Object({
-	title: Type.String({ description: "A meaningful checkpoint, e.g. 'Parser handles all fixtures'" }),
-	steps: Type.Array(Step, { description: "2-6 small steps that reach the milestone" }),
-});
+	title: Type.Optional(Type.String({ description: "A meaningful checkpoint, e.g. 'Parser handles all fixtures'" })),
+	steps: Type.Optional(Type.Array(Step, { description: "2-6 small steps that reach the milestone, each with a done_when check" })),
+}, { additionalProperties: true });
 
 export default function omniPlan(pi: ExtensionAPI) {
 	let plan: any = emptyPlan();

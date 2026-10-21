@@ -8,11 +8,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 import { registerHooks } from "node:module";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { existsSync } from "node:fs";
 import { ROOT, findPiCli } from "../server/config.mjs";
 
 const EXT = join(ROOT, "integrations", "pi", "omni-plan.ts");
 const piCli = findPiCli();
+// pi-ai's own argument validator, beside the installed pi — the same gate pi applies before execute().
+const piRoot = piCli && dirname(dirname(piCli));
+const VALIDATION = piRoot && [join(piRoot, "node_modules", "@earendil-works", "pi-ai"), join(dirname(piRoot), "pi-ai")]
+  .map((d) => join(d, "dist", "utils", "validation.js")).find((f) => existsSync(f));
 
 if (piCli) {
   const extUrl = pathToFileURL(EXT).href;
@@ -54,6 +59,26 @@ test("omni-plan: the plan tool keeps its state in details and the context gets a
   assert.match(ctx.messages[2].content.at(-1).text, /<omni-plan phase="execute" progress="0\/1">[\s\S]*1\.1 write parser/);
   assert.equal(messages[2].content.length, 1, "the original message is not mutated");
   assert.equal(await x.on.context({ messages: [{ role: "assistant", content: [] }] }), undefined, "only appended after a user/tool message");
+});
+
+test("omni-plan: pi's validator accepts the near-miss milestone shapes the model actually sent (no hard reject)", { skip: !VALIDATION && "pi (with pi-ai) is not installed" }, async () => {
+  const validation = await import(pathToFileURL(VALIDATION).href);
+  const x = await load();
+  const tool = { name: "plan", parameters: x.tools.plan.parameters };
+  // The exact shapes that hard-failed in the real runs: a milestone carrying done_when (an extra field) with
+  // no milestone-level title, and a milestone with no steps. These must now pass validation…
+  const nearMiss = { action: "revise", reason: "learned the plan was wrong", milestones: [
+    { done_when: "install reaches the overlay", steps: [{ title: "patch init_array[1]", done_when: "breadcrumb file appears" }] },
+    { title: "Acceptance" },
+  ] };
+  const ok = validation.validateToolArguments(tool, { type: "toolCall", id: "1", name: "plan", arguments: nearMiss });
+  assert.ok(ok, "the relaxed schema validates the near-miss milestones");
+  // …and the tolerant state machine turns them into a usable plan with derived titles/steps.
+  await x.tools.plan.execute("b", BRAIN);
+  await x.tools.plan.execute("c", PLAN);
+  const r = await x.tools.plan.execute("r", nearMiss);
+  assert.equal(r.details.ok, true, `revise accepted: ${r.content[0].text}`);
+  assert.ok(r.details.plan.milestones.every((m) => m.title && m.steps.length), "every milestone ends up with a title and at least one step");
 });
 
 test("omni-plan: state is rebuilt from the session branch; a real user message clears ask_user", { skip: !piCli && "pi is not installed" }, async () => {

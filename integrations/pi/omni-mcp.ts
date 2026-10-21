@@ -25,9 +25,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { McpStdioClient, SlowCallError, coerceArgs, idempotentStopNote, normalizeSchema, trimInstanceList, waitDeviceVerdict } from "./omni-mcp-lib.mjs";
+import { McpStdioClient, SlowCallError, coerceArgs, idempotentStopNote, normalizeSchema, repeatNudge, trimInstanceList, waitDeviceVerdict } from "./omni-mcp-lib.mjs";
 
-export { McpStdioClient, SlowCallError, coerceArgs, idempotentStopNote, normalizeSchema, trimInstanceList, waitDeviceVerdict };
+export { McpStdioClient, SlowCallError, coerceArgs, idempotentStopNote, normalizeSchema, repeatNudge, trimInstanceList, waitDeviceVerdict };
 
 export interface OmniMcpConfig {
 	command?: string;
@@ -64,7 +64,7 @@ const omniClient = (cfg: OmniMcpConfig) => new McpStdioClient({
 const pretty = (text: string) => { try { return JSON.stringify(JSON.parse(text), null, 1); } catch { return text; } };
 
 /** The client outlives an extension reload (a session switch re-imports this module). */
-const G = globalThis as unknown as { __omniMcp?: McpStdioClient };
+const G = globalThis as unknown as { __omniMcp?: McpStdioClient; __omniLastCall?: { name: string; args: string; result: string } };
 
 export default function omniMcp(pi: ExtensionAPI) {
 	const cfg = loadConfig();
@@ -127,7 +127,12 @@ export default function omniMcp(pi: ExtensionAPI) {
 					try { parsed = JSON.parse(text); } catch { parsed = undefined; }
 					// list_instances is mostly ended instances the model does not need in full; trim the shown text
 					// (details.result keeps the complete parsed object) so it stops overflowing the clip below.
-					const shown = (t.name === "list_instances" && trimInstanceList(text)) || pretty(text);
+					let shown = (t.name === "list_instances" && trimInstanceList(text)) || pretty(text);
+					// A watched read that returns byte-identical to the last one: nudge the model off a no-progress poll.
+					const argsJson = JSON.stringify(params ?? {});
+					const nudge = repeatNudge(G.__omniLastCall, t.name, argsJson, text);
+					if (nudge) shown = `${nudge}\n${shown}`;
+					G.__omniLastCall = { name: t.name, args: argsJson, result: text };
 					const content: any[] = [{ type: "text", text: clip(shown) }, ...images.map((i) => ({ type: "image", ...i }))];
 					// A screenshot is only a path to a text-only model; a model that reads images gets the frame.
 					const png = t.name === "screenshot" ? (parsed as any)?.path : undefined;
