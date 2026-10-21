@@ -12,14 +12,16 @@ function layout() {
   return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-test("findPiCli follows the `pi` symlink on PATH (npm --prefix ~/.local layout)", () => {
+test("findPiCli follows the `pi` symlink on PATH (npm --prefix ~/.local layout)", (t) => {
   const { root, cleanup } = layout();
   try {
     const cli = join(root, ".local", "lib", "node_modules", REL);
     mkdirSync(join(cli, ".."), { recursive: true });
     writeFileSync(cli, "// cli");
     mkdirSync(join(root, ".local", "bin"), { recursive: true });
-    symlinkSync(join("..", "lib", "node_modules", REL), join(root, ".local", "bin", "pi"));
+    // Windows refuses symlinks without Developer Mode or admin rights (EPERM): that is the machine, not findPiCli.
+    try { symlinkSync(join("..", "lib", "node_modules", REL), join(root, ".local", "bin", "pi")); }
+    catch (e) { if (e.code === "EPERM" && process.platform === "win32") return t.skip("this Windows account may not create symlinks"); throw e; }
     const found = findPiCli({ home: root, platform: "darwin", pathEnv: join(root, ".local", "bin"), appdata: undefined });
     assert.equal(found, realpathSync(cli));
   } finally { cleanup(); }
