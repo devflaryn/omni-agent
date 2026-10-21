@@ -25,9 +25,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { McpStdioClient, SlowCallError, coerceArgs, normalizeSchema } from "./omni-mcp-lib.mjs";
+import { McpStdioClient, SlowCallError, coerceArgs, idempotentStopNote, normalizeSchema, trimInstanceList, waitDeviceVerdict } from "./omni-mcp-lib.mjs";
 
-export { McpStdioClient, SlowCallError, coerceArgs, normalizeSchema };
+export { McpStdioClient, SlowCallError, coerceArgs, idempotentStopNote, normalizeSchema, trimInstanceList, waitDeviceVerdict };
 
 export interface OmniMcpConfig {
 	command?: string;
@@ -36,6 +36,7 @@ export interface OmniMcpConfig {
 	timeoutSec?: number;
 	prefix?: string;
 	enabled?: boolean;
+	waitPollMs?: number;
 }
 
 export interface McpTool { name: string; description?: string; inputSchema?: any }
@@ -95,9 +96,11 @@ export default function omniMcp(pi: ExtensionAPI) {
 					const onLate = (err: Error | null, payload?: LatePayload) => {
 						if (err || !payload) return;
 						try {
+							// omni-agents' turn tracker: no wake-up while a prompt is starting or after Stop (pi's run-flag race).
+							const wake = (globalThis as any).__omniTurn?.wakeOptions?.() ?? { deliverAs: "followUp", triggerTurn: true };
 							pi.sendMessage?.(
 								{ customType: "omnidroid-late", content: `✓ ${name} finished after running long${payload.isError ? " (with an error)" : ""}:\n${clip(pretty(payload.text))}`, display: true },
-								{ deliverAs: "followUp", triggerTurn: true },
+								wake,
 							);
 						} catch { /* best effort */ }
 					};
@@ -106,6 +109,9 @@ export default function omniMcp(pi: ExtensionAPI) {
 					try {
 						({ text, images } = await client().callTool(t.name, params ?? {}, timeoutMs, signal, onLate));
 					} catch (e) {
+						// A stop whose target had already ended is a no-op success, not a failure the model must react to.
+						const note = idempotentStopNote(t.name, (e as Error)?.message);
+						if (note) return { content: [{ type: "text", text: note }], details: { tool: t.name, idempotent: true } };
 						if (e instanceof SlowCallError) {
 							// Keep-alive: tell the agent and let it decide, rather than failing the whole run.
 							const secs = Math.round(e.elapsedMs / 1000);
@@ -119,7 +125,10 @@ export default function omniMcp(pi: ExtensionAPI) {
 					}
 					let parsed: unknown;
 					try { parsed = JSON.parse(text); } catch { parsed = undefined; }
-					const content: any[] = [{ type: "text", text: clip(pretty(text)) }, ...images.map((i) => ({ type: "image", ...i }))];
+					// list_instances is mostly ended instances the model does not need in full; trim the shown text
+					// (details.result keeps the complete parsed object) so it stops overflowing the clip below.
+					const shown = (t.name === "list_instances" && trimInstanceList(text)) || pretty(text);
+					const content: any[] = [{ type: "text", text: clip(shown) }, ...images.map((i) => ({ type: "image", ...i }))];
 					// A screenshot is only a path to a text-only model; a model that reads images gets the frame.
 					const png = t.name === "screenshot" ? (parsed as any)?.path : undefined;
 					if (png && !images.length && ctx?.model?.input?.includes?.("image")) {
@@ -131,10 +140,52 @@ export default function omniMcp(pi: ExtensionAPI) {
 		}
 	}
 
+	const pollMs = Math.max(50, Number(cfg.waitPollMs) || 3000);
+	const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
+		const t = setTimeout(resolve, ms);
+		signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+	});
+
+	/**
+	 * A blocking device wait the server lacks: poll list_devices server-side until a device is ready (or all
+	 * have finished coming up), so the model makes one call instead of polling by hand. Synthesized here — it
+	 * drives the server's own list_devices — so it needs that tool present.
+	 */
+	function registerWaitDevice() {
+		const name = `${prefix}wait_device`;
+		if (registered.has(name) || !client().tools.some((t) => t.name === "list_devices")) return;
+		registered.add(name);
+		pi.registerTool({
+			name,
+			label: "omnidroid wait_device",
+			description: `Wait until a warm Android is ready (booted), at most \`timeout\` seconds (default 300). Blocks server-side by polling list_devices for you — use it after warm_device, or whenever a device is still "booting", instead of calling ${prefix}list_devices in a loop. Answers the final devices snapshot. (omnidroid MCP helper, synthesized by omni-agent.)`,
+			parameters: { type: "object", properties: {
+				device: { type: "number", description: "the device id to wait for (omit: wait until none is still booting)" },
+				timeout: { type: "number", description: "seconds to wait (default 300)" },
+			} } as any,
+			async execute(_id: string, params: any, signal: AbortSignal | undefined) {
+				const target = params?.device != null ? Number(params.device) : null;
+				const deadline = Date.now() + Math.max(1, Number(params?.timeout) || 300) * 1000;
+				let waited = 0;
+				let text = "";
+				for (;;) {
+					if (signal?.aborted) return { content: [{ type: "text", text: `wait_device aborted after ${waited}s` }], details: { tool: "wait_device", ready: false, aborted: true } };
+					({ text } = await client().callTool("list_devices", {}, timeoutMs, signal));
+					const v = waitDeviceVerdict(text, target);
+					if (v.done) return { content: [{ type: "text", text: `ready after ${waited}s:\n${pretty(text)}` }], details: { tool: "wait_device", ready: true, waitedMs: waited * 1000, result: JSON.parse(text) } };
+					if (Date.now() >= deadline) return { content: [{ type: "text", text: `still not ready after ${waited}s (booting: ${v.booting.join(", ") || "none"}):\n${pretty(text)}` }], details: { tool: "wait_device", ready: false, waitedMs: waited * 1000, result: JSON.parse(text) } };
+					await sleep(pollMs, signal);
+					waited += Math.round(pollMs / 1000) || 1;
+				}
+			},
+		} as any);
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			await client().start();
 			registerAll(client().tools);
+			registerWaitDevice();
 		} catch (e: any) {
 			ctx?.ui?.notify?.(`omnidroid MCP tools unavailable: ${e?.message || e}`, "warning");
 		}
@@ -146,7 +197,7 @@ export default function omniMcp(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		if (!registered.size) return;
-		const note = `omnidroid tools (${prefix}*) drive omnidroid -- real Android 15 running on its own Linux layer, arm64 translated, no VM -- through its MCP server. The tools are the omnidroid app's (it must be open, with \`mcp on\` set in it, or \`omnidroid serve\` running; an "is not reachable" error means it is not). Every omnidroid window on the computer shares that one pool: what the person launches you see too. Any APK: ${prefix}start_instance {apk, count} launches it as count instances and answers their ids at once -- each runs in a window of its own on one of the app's warm Androids, as an Android user of its own (the same APK file again shares an Android, another package goes in beside it, another build of a running package gets an Android of its own); \`options\` passes an installed plugin's options as on the command line (e.g. "--cookie <file or saved name> --place <id>": each instance signed in as that account, then the link opened; follow it in ${prefix}pool_log); ${prefix}wait_instance {instance_id} waits until it runs; ${prefix}screenshot {instance_id} and ${prefix}input {instance_id, action: tap|swipe|text|key} see and drive it; ${prefix}list_instances / ${prefix}list_devices show the state; ${prefix}shell runs a command on an Android (root with uid 0); ${prefix}stop_instance closes one; ${prefix}web_pages / web_dom / web_click / web_type / web_eval / web_screenshot drive an instance's WebViews (sign-in pages, captchas). Native code: ${prefix}lab_load + ${prefix}call_function / ${prefix}intercept / ${prefix}read_mem / ${prefix}dump_module are a Frida-style debugger for one arm64 .so at the emulation layer (not attached to a live app; there is no frida-server here). RE workbench (reverse-engineer a .so and prove a rebuilt one matches): ${prefix}lab_load_apk (load a target + its siblings, report unresolved imports), ${prefix}lab_trace (call via an arg_spec of scalars/buffers), ${prefix}lab_corpus (a reproducible input corpus), ${prefix}lab_diff (differential-test original vs candidate over the corpus), ${prefix}lab_build (compile candidate C to an arm64 .so; needs an arm64 clang/NDK on the host). Read the omnidroid skill (devices, apps) or the omnidroid-frida skill (the lab + the workbench) before using them. Addresses are strings ("0x…"). The omni_* tools, if present, are the retired QEMU manager: only when asked for it by name.`;
+		const note = `omnidroid tools (${prefix}*) drive omnidroid -- real Android 15 running on its own Linux layer, arm64 translated, no VM -- through its MCP server. The tools are the omnidroid app's (it must be open, with \`mcp on\` set in it, or \`omnidroid serve\` running; an "is not reachable" error means it is not). Every omnidroid window on the computer shares that one pool: what the person launches you see too. Any APK: ${prefix}start_instance {apk, count} launches it as count instances and answers their ids at once -- each runs in a window of its own on one of the app's warm Androids, as an Android user of its own (the same APK file again shares an Android, another package goes in beside it, another build of a running package gets an Android of its own); \`options\` passes an installed plugin's options as on the command line (e.g. "--cookie <file or saved name> --place <id>": each instance signed in as that account, then the link opened; follow it in ${prefix}pool_log); ${prefix}wait_instance {instance_id} waits until it runs; ${prefix}screenshot {instance_id} and ${prefix}input {instance_id, action: tap|swipe|text|key} see and drive it; ${prefix}list_instances / ${prefix}list_devices show the state (a device is still "booting"? call ${prefix}wait_device to block until it is ready instead of polling ${prefix}list_devices in a loop); ${prefix}shell runs a command on an Android (root with uid 0); ${prefix}stop_instance closes one; ${prefix}web_pages / web_dom / web_click / web_type / web_eval / web_screenshot drive an instance's WebViews (sign-in pages, captchas). Native code: ${prefix}lab_load + ${prefix}call_function / ${prefix}intercept / ${prefix}read_mem / ${prefix}dump_module are a Frida-style debugger for one arm64 .so at the emulation layer (not attached to a live app; there is no frida-server here). RE workbench (reverse-engineer a .so and prove a rebuilt one matches): ${prefix}lab_load_apk (load a target + its siblings, report unresolved imports), ${prefix}lab_trace (call via an arg_spec of scalars/buffers), ${prefix}lab_corpus (a reproducible input corpus), ${prefix}lab_diff (differential-test original vs candidate over the corpus), ${prefix}lab_build (compile candidate C to an arm64 .so; needs an arm64 clang/NDK on the host). Read the omnidroid skill (devices, apps) or the omnidroid-frida skill (the lab + the workbench) before using them. Addresses are strings ("0x…"). The omni_* tools, if present, are the retired QEMU manager: only when asked for it by name.`;
 		return { systemPrompt: `${event.systemPrompt}\n\n${note}` };
 	});
 }

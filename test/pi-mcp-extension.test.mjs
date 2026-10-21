@@ -87,6 +87,55 @@ test("omni-mcp: a slow call is kept alive and surfaced to the agent, not killed"
   } finally { await x.quit(); }
 });
 
+test("omni-mcp: a stop on an already-ended target is a no-op success, not an error the model must react to", async () => {
+  const x = await load({ command: process.execPath, args: [FAKE], env: { FAKE_MCP: "1", FAKE_MCP_LIFECYCLE: "1" } });
+  try {
+    const gone = await x.run("omnidroid_stop_instance", { instance_id: 999 }); // omnidroid: "#999 ended already"
+    assert.match(gone.content[0].text, /already in the state you asked for/);
+    assert.equal(gone.details.idempotent, true);
+    const ok = await x.run("omnidroid_stop_instance", { instance_id: 30 }); // a live one still stops normally
+    assert.equal(JSON.parse(ok.content[0].text).stopped, true);
+  } finally { await x.quit(); }
+});
+
+test("omni-mcp: list_instances keeps live instances and trims the pile of ended ones instead of overflowing the clip", async () => {
+  const x = await load({ command: process.execPath, args: [FAKE], env: { FAKE_MCP: "1", FAKE_MCP_LIFECYCLE: "1" } });
+  try {
+    const r = await x.run("omnidroid_list_instances", {});
+    const shown = JSON.parse(r.content[0].text);
+    assert.ok(shown.instances.some((i) => i.instance_id === 30 && i.state === "running"), "the live instance is kept");
+    assert.ok(shown.instances.some((i) => i.instance_id === 31), "every live instance is kept");
+    assert.equal(shown.instances.filter((i) => String(i.state).startsWith("ended")).length, 4, "only the newest few ended kept in full");
+    assert.equal(shown.omittedEnded.count, 20, "the rest are summarized");
+    assert.ok(shown.omittedEnded.instances.every((i) => i.instance_id && i.state), "summary still names ids and states");
+    assert.equal(r.details.result.instances.length, 26, "details.result keeps the complete list");
+  } finally { await x.quit(); }
+});
+
+test("omni-mcp: wait_device blocks server-side until the device is ready, so the model makes one call not a poll loop", async () => {
+  // Fake list_devices reports "booting" for the first 2 polls, then "ready"; fast poll so the test is quick.
+  const x = await load({ command: process.execPath, args: [FAKE], env: { FAKE_MCP: "1", FAKE_MCP_LIFECYCLE: "1", FAKE_MCP_BOOT_POLLS: "2" }, waitPollMs: 20 });
+  try {
+    assert.ok(x.tools.has("omnidroid_wait_device"), "the synthesized wait_device is registered");
+    const r = await x.run("omnidroid_wait_device", { device: 2, timeout: 10 });
+    assert.equal(r.details.ready, true);
+    assert.match(r.content[0].text, /ready after/);
+    assert.equal(r.details.result.devices[0].state, "ready");
+    const note = await x.events.get("before_agent_start")({ systemPrompt: "base" });
+    assert.match(note.systemPrompt, /wait_device to block until it is ready/);
+  } finally { await x.quit(); }
+});
+
+test("omni-mcp: wait_device gives up at its timeout instead of hanging forever", async () => {
+  // The device never leaves "booting" (boot polls effectively infinite); the wait must return not ready.
+  const x = await load({ command: process.execPath, args: [FAKE], env: { FAKE_MCP: "1", FAKE_MCP_LIFECYCLE: "1", FAKE_MCP_BOOT_POLLS: "9999" }, waitPollMs: 20 });
+  try {
+    const r = await x.run("omnidroid_wait_device", { device: 2, timeout: 1 });
+    assert.equal(r.details.ready, false);
+    assert.match(r.content[0].text, /still not ready after/);
+  } finally { await x.quit(); }
+});
+
 test("omni-mcp: a missing binary registers nothing and says why; enabled:false does nothing at all", async () => {
   const x = await load({ command: join(tmpdir(), "no-such-omni-mcp.exe") });
   assert.equal(x.tools.size, 0);

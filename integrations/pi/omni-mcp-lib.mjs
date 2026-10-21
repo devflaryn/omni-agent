@@ -43,6 +43,83 @@ export function parseToolResult(result) {
 	return { text: texts.join("\n"), images, isError: !!result?.isError };
 }
 
+/**
+ * omnidroid's lifecycle tools whose only-plausible failure — the target has already ended — means the
+ * state the caller asked for (stopped) already holds. The model was told to stop the previous instance
+ * before each launch, so it hits this on every cleanup; omnidroid answers `#N ended already`, pi marks it
+ * an error, and the model reacts to a non-problem (46 such errors across the measured runs). A stop is
+ * idempotent, so this smooths the error into a plain no-op success.
+ */
+const STOP_TOOLS = new Set(["stop_instance", "stop_app", "stop_device"]);
+const ALREADY_STOPPED = /\bended already\b|\bno instance #\d+\b|already (?:ended|closed|stopped|gone|down)\b/i;
+
+/** For a failed stop-like call, the no-op success note to return when the target was already stopped (else null). */
+export function idempotentStopNote(toolName, errorText) {
+	if (!STOP_TOOLS.has(toolName)) return null;
+	const text = String(errorText ?? "");
+	if (!ALREADY_STOPPED.test(text)) return null;
+	return `${toolName}: the target was already stopped (${text.trim()}). Nothing to do — it is already in the state you asked for.`;
+}
+
+/** A list_instances result bigger than this (pretty-printed) is trimmed; smaller ones are left exactly as they are. */
+export const INSTANCE_TRIM_CHARS = 4000;
+/** How many ended instances to keep in full (newest first) before the rest are summarized. */
+export const KEEP_ENDED = 4;
+const isEndedInstance = (i) => typeof i?.state === "string" && i.state.startsWith("ended");
+
+/**
+ * Trim a `list_instances` result that is mostly ended instances: keep every live one and the newest few
+ * ended ones in full, and replace the rest with a compact `omittedEnded` summary that still names their
+ * ids and states. The measured runs overflow the 12 000-char clip (losing the JSON tail) on lists that are
+ * dozens of ended instances the model does not need in full. Returns a replacement JSON string, or null to
+ * leave the result untouched (not this shape, or small enough, or too few ended to bother).
+ */
+export function trimInstanceList(text) {
+	let data;
+	try { data = JSON.parse(text); } catch { return null; }
+	const list = data?.instances;
+	if (!Array.isArray(list) || list.length === 0) return null;
+	const ended = list.filter(isEndedInstance);
+	if (ended.length <= KEEP_ENDED) return null;
+	if (JSON.stringify(data, null, 1).length <= INSTANCE_TRIM_CHARS) return null;
+	const byIdDesc = (a, b) => (Number(b?.instance_id) || 0) - (Number(a?.instance_id) || 0);
+	const keptEnded = new Set([...ended].sort(byIdDesc).slice(0, KEEP_ENDED));
+	const dropped = ended.filter((i) => !keptEnded.has(i)).sort(byIdDesc);
+	const instances = list.filter((i) => !isEndedInstance(i) || keptEnded.has(i)); // live ones + newest ended, original order
+	const out = {
+		...data,
+		instances,
+		omittedEnded: {
+			count: dropped.length,
+			note: `${dropped.length} older ended instance(s) summarized to save context; their ids and states are below. Re-run list_instances for full detail if you need it.`,
+			instances: dropped.map((i) => ({ instance_id: i.instance_id, package: i.package, state: i.state, up_s: i.up_s })),
+		},
+	};
+	return JSON.stringify(out, null, 1);
+}
+
+/**
+ * omnidroid has no blocking wait for a *device* to finish booting — only `wait_instance` blocks, and
+ * that is for instances. `warm_device` returns at once ("booting; list_devices shows when it is ready"),
+ * so the model watches a boot by polling `list_devices` by hand: across the measured runs it did so 232
+ * times back-to-back (216 of them returning a changed result — real boot progress, not a dumb loop).
+ * The wrapper turns that into one blocking `wait_device` call; this is the predicate that ends the wait.
+ *
+ * @returns {{ done: boolean, ready: number[], booting: number[], devices: any[] }}
+ */
+export function waitDeviceVerdict(text, targetId = null) {
+	let d;
+	try { d = JSON.parse(text); } catch { return { done: false, ready: [], booting: [], devices: [] }; }
+	const devices = Array.isArray(d?.devices) ? d.devices : [];
+	const want = (id) => targetId == null || Number(id) === Number(targetId);
+	const sel = devices.filter((x) => want(x?.id));
+	const ready = sel.filter((x) => x?.state === "ready").map((x) => x.id);
+	const booting = sel.filter((x) => x?.state === "booting" || x?.state === "closing").map((x) => x.id);
+	// A named device: done once it is ready. No target: done once at least one device exists and none is still coming up.
+	const done = targetId != null ? ready.length > 0 : sel.length > 0 && booting.length === 0;
+	return { done, ready, booting, devices };
+}
+
 /** What a client answers a request the *server* sends (ping is required; the rest are capabilities we do not offer). */
 function answerServerRequest(msg) {
 	if (msg.method === "ping") return { jsonrpc: "2.0", id: msg.id, result: {} };
