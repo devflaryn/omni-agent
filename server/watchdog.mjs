@@ -18,7 +18,15 @@ export function nextRestartState(state = {}, { now = Date.now(), healthyAfterMs 
   return state;
 }
 
-/** True when pi claims to be streaming but has produced no event within stallMs. */
-export function stalled({ streaming, lastEventAt, now = Date.now(), stallMs = 360000 }) {
-  return !!streaming && now - (lastEventAt || 0) > stallMs;
+/** How long a tool call may run without any pi event before it counts as a stall (CONFIG.toolStallMs). */
+export const DEFAULT_TOOL_STALL_MS = 4 * 3600000;
+
+/** The silence allowed before a stall: `toolStallMs` while a tool call is open (never less than `stallMs`). */
+export function stallLimit({ openTools = 0, stallMs = 360000, toolStallMs = DEFAULT_TOOL_STALL_MS } = {}) {
+  return openTools > 0 ? Math.max(stallMs, Number(toolStallMs) || DEFAULT_TOOL_STALL_MS) : stallMs;
+}
+
+/** True when pi claims to be streaming but has produced no event within the limit (see stallLimit). */
+export function stalled({ streaming, lastEventAt, now = Date.now(), stallMs = 360000, openTools = 0, toolStallMs = DEFAULT_TOOL_STALL_MS }) {
+  return !!streaming && now - (lastEventAt || 0) > stallLimit({ openTools, stallMs, toolStallMs });
 }

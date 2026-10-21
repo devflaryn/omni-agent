@@ -2,8 +2,9 @@
 /**
  * Wire Omni Agent into the harnesses.
  *
- *   node scripts/install.mjs                 install the pi extensions (memory tools, the planner, claude_task, graph tools,
- *                                            model fallback, omnidroid's MCP tools, any MCP server in mcpServers), the omnidroid skills
+ *   node scripts/install.mjs                 install the pi extensions (memory tools, the planner, claude_task, background
+ *                                            agents + jobs, context guidance, graph tools, model fallback, omnidroid's MCP
+ *                                            tools, any MCP server in mcpServers), the omnidroid skills
  *                                            (skills/ -> ~/.pi/agent/skills/) + config
  *   node scripts/install.mjs --claude-hook   also register the Claude Code SessionStart hook (user settings)
  *   node scripts/install.mjs --claude-skills also copy the skills to ~/.claude/skills/ (Claude Code)
@@ -28,7 +29,9 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const HOME = process.env.OMNI_HOME || homedir();
 const piAgent = join(HOME, ".pi", "agent");
 const extDir = join(piAgent, "extensions");
-const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-fallback.ts", "omni-fallback-lib.mjs", "omni-mcp.ts", "omni-mcp-lib.mjs", "omni-mcp-servers.ts", "omni-run.ts", "omni-run-lib.mjs", "omni-plan.ts", "omni-plan-lib.mjs"];
+const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-fallback.ts", "omni-fallback-lib.mjs", "omni-mcp.ts", "omni-mcp-lib.mjs", "omni-mcp-servers.ts", "omni-run.ts", "omni-run-lib.mjs", "omni-plan.ts", "omni-plan-lib.mjs",
+  // Background agents/jobs (omni-agents.ts) and claude_task (omni-claude.ts) share omni-agents-lib.mjs.
+  "omni-agents.ts", "omni-agents-lib.mjs", "omni-context.ts", "omni-context-lib.mjs"];
 /** Extension files whose installed copy comes from elsewhere in the repo (the planner's state machine is shared with the server and UI). */
 const EXT_SOURCE = { "omni-plan-lib.mjs": join("ui", "plan.js") };
 const SKILLS = ["omnidroid", "omnidroid-frida", "omnidroid-qemu", "omnidroid-input"];

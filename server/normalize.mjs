@@ -146,6 +146,9 @@ export function normalizePiEntry(entry, ctx) {
       return entry.name ? [base(ctx, "session", ts, { title: cleanTitle(entry.name) || entry.name })] : [];
     case "message":
       return piMessageToMsg(entry.message, ctx, { id: entry.id, ts: entry.timestamp, live: false });
+    case "custom_message":
+      // pi.sendMessage notices (background agent reports, fallback switches): the same shape the live message_end gives.
+      return entry.display === false ? [] : piMessageToMsg({ role: "custom", customType: entry.customType, content: entry.content, timestamp: entry.timestamp }, ctx, { id: entry.id, ts: entry.timestamp, live: false });
     case "compaction":
       return [base(ctx, "compaction", ts, { id: entry.id, summary: entry.summary || "" })];
     default:

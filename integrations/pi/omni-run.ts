@@ -4,8 +4,9 @@
  *   - session_before_compact: distills the compacted span INTO ledger.md with a model
  *     (thinking OFF, the configured summary model if set), PERSISTS ledger.md, and returns
  *     a bounded render of the updated ledger. Fails open to pi's own compaction on any error.
- *   - context: prepends the verbatim goal + a budgeted ledger slice to every LLM call, so the
- *     goal and critical facts (paths/symbols/addresses) survive any number of compactions.
+ *   - context: appends the verbatim goal + a budgeted ledger slice to the newest message of every
+ *     LLM call, so the goal and critical facts (paths/symbols/addresses) survive any number of
+ *     compactions. A cut-off/failed summary answer never overwrites ledger.md.
  *   - tool_result: offloads oversized tool output (huge .so dumps, big screenshots) to
  *     artifacts/ and leaves a short reference inline, so one result can't blow the window.
  * Installed by: node scripts/install.mjs
@@ -14,7 +15,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { renderContextBlock, renderCompactionSummary, shouldOffload, offloadReference, sha256Hex, imageBlockData, extForMediaType } from "./omni-run-lib.mjs";
+import { renderContextBlock, renderCompactionSummary, shouldOffload, offloadReference, sha256Hex, imageBlockData, extForMediaType, appendToNewest, summaryUsable } from "./omni-run-lib.mjs";
 
 function runDir(): string | null {
 	const d = process.env.OMNI_RUN_DIR;
@@ -114,12 +115,15 @@ export default function omniRun(pi: ExtensionAPI) {
 		renameSync(tmp, ledgerFile);
 	};
 
-	// 1) Re-inject goal + ledger every LLM call (not persisted; pi's context semantics).
+	// 1) Re-inject goal + ledger every LLM call (not persisted; pi's context semantics). pi's convertToLlm
+	//    drops a `role: "system"` message, so the block rides on the newest user/toolResult/custom message
+	//    instead (as omni-plan's reminder does): earlier messages stay byte-identical and the prompt cache is kept.
 	pi.on("context", (ev: any) => {
 		try {
-			const block = renderContextBlock({ goal: goal(), ledgerMd: readText(ledgerFile) }, { budget: 4000 });
-			const sys = { role: "system", content: [{ type: "text", text: block }] };
-			return { messages: [sys, ...ev.messages] };
+			const g = goal(), ledgerMd = readText(ledgerFile);
+			if (!g.trim() && !ledgerMd.trim()) return undefined;
+			const messages = appendToNewest(ev?.messages, renderContextBlock({ goal: g, ledgerMd }, { budget: 4000 }));
+			return messages ? { messages } : undefined;
 		} catch {
 			return undefined; // no-op: keep the original messages
 		}
@@ -146,6 +150,8 @@ export default function omniRun(pi: ExtensionAPI) {
 				{ messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }] },
 				{ maxTokens: 8192, signal: ev?.signal ?? ctx?.signal, reasoning: "off", cacheRetention: "none" },
 			);
+			// A cut-off (length), failed or aborted answer is a partial ledger: never let it replace the good one.
+			if (!summaryUsable(response)) return undefined; // fall back to pi
 			const text = (response?.content ?? [])
 				.filter((c: any): c is { type: "text"; text: string } => c?.type === "text")
 				.map((c: any) => c.text)

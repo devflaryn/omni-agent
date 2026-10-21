@@ -63,6 +63,11 @@ test("plan: done needs evidence; milestones and the whole plan complete from ste
   assert.deepEqual(d3.events, ["step_skipped", "milestone_done", "plan_done"]);
   assert.equal(planPhase(d3.plan), "complete");
   assert.match(d3.text, /success criteria \(npm test passes; a 503 is retried 3 times\)/);
+  // A finished plan is not a finished goal: the hint sends it to the user's goal before any final answer.
+  assert.match(d3.text, /and against the user's overall goal\. If any part of that goal is still not done, create the next plan for it \(plan action "create"\) and continue working\. Only when the whole goal is done, give the user a short final answer\.$/);
+  const next = applyPlanAction(d3.plan, { action: "create", milestones: [{ title: "Next part", steps: [{ title: "retry uploads", done_when: "upload test passes" }] }] }, { now: 2000 });
+  assert.ok(next.ok, "the next plan can be created on a finished one, as the hint says");
+  assert.equal(currentStep(next.plan).id, "3.1");
   assert.equal(planReminder(d3.plan), "", "a finished plan is not pushed into the context any more");
   assert.equal(applyPlanAction(d3.plan, { action: "done", step: "2.1", evidence: "x" }).ok, false, "a finished step stays finished");
 });

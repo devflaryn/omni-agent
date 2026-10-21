@@ -8,9 +8,11 @@ import { resolve } from "node:path";
 import { createLineSplitter } from "./jsonl.mjs";
 import { normalizePiRpcEvent } from "./normalize.mjs";
 import { cleanTitle } from "../ui/lib.js";
-import { restartDelay, nextRestartState, stalled } from "./watchdog.mjs";
+import { restartDelay, nextRestartState, stalled, DEFAULT_TOOL_STALL_MS } from "./watchdog.mjs";
 
 const normPath = (p) => (p ? resolve(String(p)).toLowerCase() : "");
+/** An argument cmd.exe passes through unchanged (no spaces, quotes, newlines, %, ^, &, |, <, >, !). */
+const CMD_SAFE_ARG = /^[\w@+=:,./\\-]+$/;
 
 /**
  * Thinking levels `set_thinking_level` accepts. pi has no RPC to enumerate them
@@ -26,11 +28,16 @@ const ok = (r, what) => {
   return r;
 };
 
+/**
+ * Emits "pi" (every raw RPC event) and "exit" (code) when the child process ends, before the
+ * auto-restart decision: a listener that calls stop() there keeps the child from being relaunched.
+ */
 export class PiRpc extends EventEmitter {
-  constructor({ cli, bin = "pi", cwd, model = "", provider = "", thinking = "", env = {}, bus }) {
+  constructor({ cli, bin = "pi", cwd, model = "", provider = "", thinking = "", env = {}, bus, extraArgs = [], meta = {}, platform = process.platform }) {
     super();
     this.cli = cli;
     this.bin = bin;
+    this.platform = platform;
     this.cwd = cwd;
     /** Extra environment for the child (provider API keys read from key files). */
     this.env = env;
@@ -38,6 +45,12 @@ export class PiRpc extends EventEmitter {
     this.provider = provider;
     this.thinking = thinking;
     this.bus = bus;
+    /** Appended after the launch flags (a background agent's persona: --append-system-prompt, --tools). */
+    this.extraArgs = Array.isArray(extraArgs) ? extraArgs : [];
+    /** Spread into every `session` event (a background agent's parentSid, agentId, agentKind). */
+    this.meta = meta && typeof meta === "object" ? meta : {};
+    /** toolCallIds of tool executions that started and have not ended: a long tool is not a stall. */
+    this.openTools = new Set();
     this.proc = null;
     this.pending = new Map();
     this.nextId = 1;
@@ -65,17 +78,29 @@ export class PiRpc extends EventEmitter {
     return !!this.state?.sessionFile && normPath(this.state.sessionFile) === normPath(file);
   }
 
-  start() {
-    this.stopped = false;
+  /** pi's argv after the cli/bin: the launch flags, then `extraArgs`. */
+  launchArgs() {
     const args = ["--mode", "rpc"];
     if (this.provider) args.push("--provider", this.provider);
     if (this.model) args.push("--model", this.model);
     if (this.thinking) args.push("--thinking", this.thinking);
+    return [...args, ...this.extraArgs];
+  }
+
+  start() {
+    this.stopped = false;
+    const args = this.launchArgs();
     const useNode = !!this.cli;
+    const win = this.platform === "win32";
+    // The Windows fallback runs pi.cmd through cmd.exe, which joins the argv unquoted: a persona body
+    // (spaces, newlines) would arrive split into words and cut at its first line. Refuse instead.
+    if (!useNode && win && this.extraArgs.some((a) => !CMD_SAFE_ARG.test(String(a)))) {
+      throw new Error("pi's cli.js was not found (set piCli in Omni's config): the pi.cmd fallback runs through cmd.exe, which cannot pass a background agent's system prompt");
+    }
     const env = { ...process.env, ...this.env };
     this.proc = useNode
       ? spawn(process.execPath, [this.cli, ...args], { cwd: this.cwd, env, windowsHide: true })
-      : spawn(process.platform === "win32" ? `${this.bin}.cmd` : this.bin, args, { cwd: this.cwd, env, shell: process.platform === "win32", windowsHide: true });
+      : spawn(win ? `${this.bin}.cmd` : this.bin, args, { cwd: this.cwd, env, shell: win, windowsHide: true });
     this.attachPipeGuards();
 
     const splitter = createLineSplitter((line) => this.onLine(line));
@@ -108,6 +133,8 @@ export class PiRpc extends EventEmitter {
     this.pending.clear();
     this.proc = null;
     this.streaming = false;
+    this.openTools.clear();
+    this.emit("exit", code);
     if (this.stopped) return;
     // Capture the session the crashed child had BEFORE a fresh child opens an empty one, and latch
     // `restoring` so the empty session's `session` event can't clobber this anchor (C1).
@@ -133,16 +160,19 @@ export class PiRpc extends EventEmitter {
     }
   }
 
-  startWatchdog({ stallMs = 360000, intervalMs = 30000 } = {}) {
+  /** `toolStallMs` applies instead of `stallMs` while a tool call is open (a build or a device boot emits nothing for long). */
+  startWatchdog({ stallMs = 360000, toolStallMs = DEFAULT_TOOL_STALL_MS, intervalMs = 30000 } = {}) {
     this.stopWatchdog();
-    this.watchdogTimer = setInterval(() => this.checkStall({ stallMs }), intervalMs);
+    this.watchdogTimer = setInterval(() => this.checkStall({ stallMs, toolStallMs }), intervalMs);
     this.watchdogTimer.unref?.();
   }
   stopWatchdog() { if (this.watchdogTimer) clearInterval(this.watchdogTimer); this.watchdogTimer = null; }
 
-  checkStall({ now = Date.now(), stallMs = 360000 } = {}) {
-    if (!stalled({ streaming: this.streaming, lastEventAt: this.lastEventAt, now, stallMs })) return;
-    this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi stream stalled ${Math.round((now - this.lastEventAt) / 1000)}s — aborting + restarting` });
+  checkStall({ now = Date.now(), stallMs = 360000, toolStallMs = DEFAULT_TOOL_STALL_MS } = {}) {
+    const openTools = this.openTools.size;
+    if (!stalled({ streaming: this.streaming, lastEventAt: this.lastEventAt, now, stallMs, openTools, toolStallMs })) return;
+    const tools = openTools ? ` with ${openTools} tool call${openTools === 1 ? "" : "s"} open` : "";
+    this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi stream stalled ${Math.round((now - this.lastEventAt) / 1000)}s${tools} — aborting + restarting` });
     this.abort?.().catch(() => {});
     try { this.proc?.kill(); } catch { /* exit handler restarts */ }
   }
@@ -157,7 +187,9 @@ export class PiRpc extends EventEmitter {
       return;
     }
     if (ev.type === "agent_start" || ev.type === "turn_start") { this.streaming = true; this.lastHealthyAt = Date.now(); }
-    if (ev.type === "agent_settled") this.streaming = false;
+    if (ev.type === "agent_settled") { this.streaming = false; this.openTools.clear(); }
+    if (ev.type === "tool_execution_start" && ev.toolCallId) this.openTools.add(ev.toolCallId);
+    if (ev.type === "tool_execution_end" && ev.toolCallId) this.openTools.delete(ev.toolCallId);
     // The omni-fallback extension switched models inside pi: re-read state so the session's model label follows.
     if (ev.type === "message_end" && ev.message?.customType === "omni-fallback") this.refreshState().catch(() => {});
     for (const out of normalizePiRpcEvent(ev, this.ctx)) this.bus.emit(out);
@@ -180,16 +212,20 @@ export class PiRpc extends EventEmitter {
     this.state = r.data;
     const newSid = `pi:${r.data.sessionId}`;
     this.sid = newSid;
-    this.bus.emit({ ...this.ctx, kind: "session", ts: Date.now(), owned: true, cwd: this.cwd, file: r.data.sessionFile, sessionId: r.data.sessionId, model: r.data.model?.id, provider: r.data.model?.provider, thinkingLevel: r.data.thinkingLevel, title: cleanTitle(r.data.sessionName) || undefined });
+    this.bus.emit({ ...this.meta, ...this.ctx, kind: "session", ts: Date.now(), owned: true, cwd: this.cwd, file: r.data.sessionFile, sessionId: r.data.sessionId, model: r.data.model?.id, provider: r.data.model?.provider, thinkingLevel: r.data.thinkingLevel, title: cleanTitle(r.data.sessionName) || undefined });
     this.bus.emit({ ...this.ctx, kind: "status", ts: Date.now(), streaming: !!r.data.isStreaming });
     return r.data;
   }
 
-  /** `echo: false` for prompts the user did not type (hooks): no user bubble is broadcast. */
-  async prompt(message, { images, echo = true } = {}) {
+  /**
+   * `echo: false` for prompts the user did not type (hooks): no user bubble is broadcast.
+   * `behavior` while pi is streaming: "steer" (default: delivered after the current tool call) or
+   * "followUp" (queued until the agent would stop).
+   */
+  async prompt(message, { images, echo = true, behavior } = {}) {
     const cmd = { type: "prompt", message };
     if (images?.length) cmd.images = images;
-    if (this.streaming) cmd.streamingBehavior = "steer";
+    if (this.streaming) cmd.streamingBehavior = behavior || "steer";
     // Echo the user's prompt as a live message so every viewer sees it at once.
     if (echo) this.bus.emit({ ...this.ctx, kind: "msg", ts: Date.now(), id: `u-${Date.now()}`, role: "user", live: true, blocks: [{ type: "text", text: message }] });
     return this.send(cmd);

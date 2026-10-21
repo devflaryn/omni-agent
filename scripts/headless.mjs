@@ -51,7 +51,7 @@ export function logWorthKeeping(ev) {
 
 export async function runHeadless({ cwd, task, provider, model, thinking, maxSeconds = 0, memory = false, log, port = 4491, out = console.log, cfg = {} }) {
   const started = Date.now();
-  const app = await createApp({ port, host: "127.0.0.1", lan: false, cwd, autoStartPi: false, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}), ...cfg });
+  const app = await createApp({ port, host: "127.0.0.1", lan: false, relay: { host: "" }, cwd, autoStartPi: false, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}), ...cfg });
   await app.listen();
   const tools = new Map();
   let tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, cost = 0, last = "", settled = false, sawStream = false;

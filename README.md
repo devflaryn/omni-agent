@@ -37,13 +37,64 @@ on PATH (a symlink on macOS/Linux npm installs), `%APPDATA%\npm` on Windows, or 
 `node_modules` prefixes. Set `piCli` in `omni.config.json` to override, or `piBin` to run a `pi` launcher
 directly.
 
-### Use it from other devices on the network
+### Use it from another device or another network
 
-1. Start with `--lan` (or `"lan": true` in `omni.config.json`); the desktop launcher already does.
-2. The window prints the LAN address, e.g. `http://192.168.0.15:4400/`. Open it on any device on the
-   network. There is no login: anyone with the link can use Omni exactly like the local user, including
-   browsing folders and driving pi, so keep it on a network you trust. If the firewall blocks it run
-   `scripts/allow-lan.sh` (or `scripts\allow-lan.cmd`) once.
+Omni then runs as a small server: this computer is **the host**, everything else is **a remote browser**.
+
+| | the host (this computer's window, `http://127.0.0.1:4400`) | a remote browser (`https://<address>:4443`) |
+|---|---|---|
+| login | none | the host's password |
+| reading chats, files, memory, graphs | yes | yes (files only inside the chats' folders and the vault) |
+| sending a message, any change | runs at once | **waits for Approve/Deny on the host**, then runs or is refused |
+| Settings → Remote, shutdown | yes | never |
+
+1. Start with `--remote` (or `"remote": true` in `omni.config.json`; `--lan` means the same); the desktop
+   launcher already does. Omni keeps its own window on `127.0.0.1:4400` and adds a second listener on
+   every interface, port `4443` (`remotePort`).
+2. In the host's window open **Settings → Remote** and set a password (12+ characters). It is stored as a
+   scrypt hash in `~/.omni-agent/remote-auth.json`.
+3. On the same network, open the address Settings → Remote shows, e.g. `https://192.168.0.15:4443/`.
+   From a different network, forward TCP 4443 on your router to this computer and open
+   `https://<your public IP>:4443/`. If the firewall blocks it run `scripts\allow-lan.cmd` (or
+   `scripts/allow-lan.sh`) once.
+4. The remote listener speaks HTTPS with a self-signed certificate made by openssl on first start
+   (`~/.omni-agent/tls/`; set `tlsCert`/`tlsKey` for your own). The browser warns once: check that it
+   shows the SHA-256 fingerprint from Settings → Remote before typing the password. Without openssl it
+   falls back to plain HTTP and says so.
+5. Each message or change a remote browser sends appears in the host's window as a card saying what it
+   asks for (the message text, the command an MCP server would run; secrets hidden) with **Approve** and
+   **Deny**. It waits up to `remoteApprovalTimeoutSec` (300 s), then is refused.
+
+#### From anywhere, without touching the router (VPS relay)
+
+With `"relay": { "host": "<vps>" }` in `omni.config.json`, this PC keeps an outgoing SSH connection to
+the VPS (`server/tunnel.mjs`), and `https://<vps>:4443/` reaches Omni from anywhere:
+
+    browser ──TLS──▶ VPS :4443 omni-relay ──PROXY line + same TLS bytes──▶ ssh -R ──▶ PC 127.0.0.1:4444 (HTTPS)
+
+- **The VPS cannot read the traffic.** The relay (`relay/omni-relay.mjs`) holds no certificate; TLS ends on
+  this PC. The certificate a browser sees through the VPS has the same fingerprint as Settings → Remote shows.
+- **The tunnel key can do one thing.** User `omni-tunnel` has no password and no shell; its key may only open
+  the remote forward on the VPS's `127.0.0.1:14443`, enforced in `authorized_keys` and an sshd `Match` block
+  (`relay/setup-vps.sh`). The VPS host key is pinned in `~/.omni-agent/relay/known_hosts`.
+- **The relay drops** anything that does not start with a TLS handshake, more than 32 connections at once or
+  120 a minute from one address, and idle connections after 15 minutes. It runs as a throwaway systemd
+  `DynamicUser` with a read-only system; it logs counts only.
+- **The visitor's real address** travels in the PROXY line, so the lockout below and the approval cards
+  name the real address, not the tunnel. The local listener that reads PROXY lines is loopback-only.
+- Setup: `ssh-keygen -t ed25519 -f ~/.omni-agent/relay/id_ed25519`, pin the VPS key in
+  `~/.omni-agent/relay/known_hosts`, copy `relay/` to `/opt/omni-relay/` on the VPS, run
+  `bash /opt/omni-relay/setup-vps.sh "<public key>"`, install `omni-relay.service`, and
+  `systemctl enable --now omni-relay`.
+
+**A new device needs your Approve once,** even with the right password (`remoteDeviceApproval`, on by
+default): its sign-in waits as a card in the host's window, and once approved the device is remembered for
+180 days (Settings → Remote lists and removes them). A leaked password alone therefore reads nothing.
+
+Five wrong passwords from one address lock it out for 15 minutes; thirty from anywhere lock every remote
+sign-in for 15 minutes. Remote sessions last `remoteSessionDays` (7) and end when the server restarts or
+the password changes. A request that reaches the host's port through a local tunnel or reverse proxy, or
+names a non-loopback `Host`, counts as remote too.
 
 ### Repo graphs (Graph tab)
 
@@ -76,6 +127,56 @@ restarts the child. Keep it strictly BELOW Omni's `stallMs` (default 900000) —
 has had its chance. Also make sure each
 model's `contextWindow` in `~/.pi/agent/models.json` matches reality (DeepSeek V4 Flash is
 1.3M; the chat-dated DeepSeek is 128k — a wrong value makes pi compact too late or too often).
+
+### Long runs: compaction, auto-continue, goals that survive a restart
+
+What used to end long runs early (measured over every pi chat on this machine): with a model declared at 1M
+tokens pi only compacts past ~975k, but the model itself started ending its turns at 375k–900k claiming its
+"context is nearly exhausted" and writing handoffs for a fresh session. Nothing compacted, nothing continued.
+
+- **Compaction point** (`context.compactAt`, default 256000; Settings → Long runs). pi compacts when a chat's prompt
+  passes `contextWindow − compaction.reserveTokens`, so Omni caps each model's *effective* window in
+  `~/.pi/agent/models.json` `providers.<P>.modelOverrides[<id>].contextWindow` = compactAt + reserveTokens before
+  every pi start. The declared model entry is untouched; overrides you write by hand are never touched; Omni's
+  own are tracked in `~/.omni-agent/context-caps.json`; `0` removes them. Floor 100k (a compacted chat still holds
+  the system prompt, the kept recent turns and the summary, ~60k). pi compacts between turns and keeps working.
+- **Context is managed for the model**: the `omni-context` extension adds a static system-prompt block ("context
+  size is never a reason to stop or hand off") and, above 70% of the budget, a one-line note on the newest message.
+- **Auto-continue** (`context.autoContinue`, default on, even with the goal hook off): a turn that ends because the
+  model *believes* its context or session is used up (`integrations/pi/omni-context-lib.mjs` `classifyStop`, also
+  reading the model's reasoning) is compacted and re-engaged, up to `maxContextNudges` (3) in a row without
+  progress. So are output-limit stops that pi cannot recover (all output spent on reasoning) and transient
+  provider errors after pi's own retries (409, connection resets, timeouts, 5xx — with a growing back-off).
+  A handoff the user asked for, a real question to the user, and a finished answer are left alone.
+- **Stop** halts the run and pauses that goal; it no longer switches the goal hook off for every later run.
+- **Explicit goals** (`/goal`) are saved to `~/.omni-agent/goals.json` with their chat; after an Omni restart the
+  newest unfinished one (active in the last 72 h, not stopped) is reopened and continued.
+- The watchdog no longer kills a pi whose tool call runs long and silent (`toolStallMs`, default 4 h).
+- `node scripts/replay-stops.mjs [--hook on|off]` replays every recorded pi session through the real normalizer and
+  goal keeper (fake pi, nothing executed) and counts what Omni now does at each point the original run stopped.
+
+### Background agents, Claude Code agents and background jobs
+
+The pi agent can delegate while it keeps working (`integrations/pi/omni-agents.ts`, run by the server's
+`AgentManager` in `server/agents.mjs`):
+
+| tool | what it does |
+|---|---|
+| `agent_start {task, kind: "pi"\|"claude", agent?, title?, cwd?, model?}` | starts a background pi agent (optionally a persona from `~/.pi/agent/agents/*.md`) or a Claude Code session, and returns at once |
+| `agent_status`, `agent_wait`, `agent_message`, `agent_cancel` | watch, wait for, steer or stop them |
+| `job_start {command}`, `job_wait {id, until}`, `job_output`, `job_kill` | a shell command in the background (builds, device boots, waiting for a log line) instead of `sleep` loops |
+
+When an agent or job finishes, its report arrives in the parent chat by itself as an `[omni-agent-result]` message
+(it wakes an idle chat). A pi agent is a pi child of its own with a *managed* goal: the goal keeper continues it after
+context stops, errors and length stops, exactly like the main chat. A Claude agent runs
+`claude -p --input-format stream-json --output-format stream-json` unattended (`--permission-prompts none`), can be
+steered mid-run (`agent_message`) and resumed after it finished. Every agent shows up live in the UI as a child chat
+nested under its parent, with a strip above the composer (status, Open, Stop). Limits in `omni.config.json`
+`agents`: `maxConcurrent` (6, more queue), `maxDepth` (2), `maxMinutes` (360), `claudeModel`, `claudeMaxTurns`.
+The registry lives in `~/.omni-agent/agents.json`; agents that were running when Omni stopped come back as
+`interrupted` (their finished, undelivered reports are still delivered). `claude_task` is now built on the same
+path: it waits up to `timeoutMinutes` and leaves Claude running in the background after that, instead of dying at
+pi's 10-minute HTTP timeout. The blocking `subagent` tool still exists for quick parallel lookups.
 
 ## What you get
 

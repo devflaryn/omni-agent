@@ -206,10 +206,29 @@ export function md(src) {
 
 // ------------------------------------------------------- tool labels
 const one = (s, n = 120) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n)}…` : t; };
+/** The omni-agents extension's tools: background agents (agent_*) and long shell jobs (job_*). */
+const AGENT_TOOLS = /^(agent_(start|wait|status|message|cancel)|job_(start|wait|output|kill))$/i;
+function agentToolLabel(name, a) {
+  const id = one(a.id || (Array.isArray(a.ids) ? a.ids.join(", ") : ""), 60);
+  const sp = id ? ` ${id}` : "";
+  const what = (s) => (s ? `: ${one(s, 90)}` : "");
+  switch (String(name).toLowerCase()) {
+    case "agent_start": return `Started ${a.kind === "claude" ? "a Claude agent" : "an agent"}${what(a.title || a.task)}`;
+    case "agent_wait": return `Waited for ${id ? `agent${sp}` : "agents"}`;
+    case "agent_status": return id ? `Checked agent${sp}` : "Checked agents";
+    case "agent_message": return `Messaged agent${sp}`;
+    case "agent_cancel": return `Stopped agent${sp}`;
+    case "job_start": return `Started a job${what(a.title || a.command)}`;
+    case "job_wait": return `Waited for job${sp}${a.until ? ` until /${one(a.until, 40)}/` : ""}`;
+    case "job_output": return `Read the output of job${sp}`;
+    default: return `Stopped job${sp}`;
+  }
+}
 export function toolKind(name) {
   const n = String(name || "");
   if (/^mcp__claude-in-chrome__/i.test(n)) return "browser";
   if (/^plan$/i.test(n)) return "plan";
+  if (AGENT_TOOLS.test(n)) return /^job_/i.test(n) ? "shell" : "agent";
   if (/^(bash|powershell|shell|sh|cmd|exec)$/i.test(n)) return "shell";
   if (EDIT_TOOLS.test(n)) return "edit";
   if (/^(read|cat|view)$/i.test(n)) return "read";
@@ -221,6 +240,7 @@ export function toolKind(name) {
 }
 export function toolLabel(name, args, cwd) {
   const kind = toolKind(name), a = args && typeof args === "object" ? args : {};
+  if (AGENT_TOOLS.test(String(name || ""))) return { kind, text: agentToolLabel(name, a) };
   const file = a.file_path || a.path || a.notebook_path || a.file;
   switch (kind) {
     case "shell": { const c = one(a.command || a.cmd); return { kind, text: c ? `Ran ${c}` : "Ran a command" }; }
@@ -257,4 +277,185 @@ export function workSummary(kinds, live = false) {
 export function isDuplicateUserMessage(prev, text, ts, windowMs = 15000) {
   if (!prev || prev.text !== text) return false;
   return Math.abs((ts || 0) - (prev.ts || 0)) <= windowMs;
+}
+
+// ---------------------------------------------------- background agents
+/** Agent statuses that still hold (or wait for) a slot: the strip pulses and offers Stop. */
+export const AGENT_ACTIVE = new Set(["queued", "starting", "running"]);
+/** Dot tone for an agent status: run (active) | ok (done) | err (failed) | off (cancelled) | "" (unknown). */
+export function agentTone(status) {
+  if (AGENT_ACTIVE.has(status)) return "run";
+  if (status === "done") return "ok";
+  if (status === "cancelled") return "off";
+  return /^(error|timeout|stalled|interrupted)$/.test(status || "") ? "err" : "";
+}
+export const agentKindLabel = (kind) => ({ pi: "pi agent", claude: "Claude agent", shell: "shell job" })[kind] || "agent";
+export const agentTitle = (a) => one(a?.title || a?.task || a?.command || a?.id || "agent", 90);
+/** One chat's agents, newest first (a queued one has no start time yet and counts as newest). */
+export function agentsFor(agents, parentSid) {
+  const key = (a) => a.startedAt || (AGENT_ACTIVE.has(a.status) ? Number.MAX_SAFE_INTEGER : 0);
+  return [...(agents || [])].filter((a) => a && parentSid && a.parentSid === parentSid).sort((a, b) => key(b) - key(a) || String(b.id).localeCompare(String(a.id)));
+}
+/** "3 agents · 2 running · 1 done": the strip's one-line summary when it is folded. */
+export function agentSummary(list) {
+  const n = list?.length || 0;
+  const c = { running: 0, queued: 0, failed: 0, done: 0, stopped: 0 };
+  for (const a of list || []) {
+    const t = agentTone(a.status);
+    if (a.status === "queued") c.queued++;
+    else if (t === "run") c.running++;
+    else if (t === "err") c.failed++;
+    else if (t === "ok") c.done++;
+    else if (t === "off") c.stopped++;
+  }
+  return [`${n} agent${n === 1 ? "" : "s"}`, ...Object.entries(c).filter(([, v]) => v).map(([k, v]) => `${v} ${k}`)].join(" · ");
+}
+/** The strip row's second line: what a running agent is doing now, else its status (with the error once it failed). */
+export function agentSubline(a) {
+  const last = Array.isArray(a?.activity) && a.activity.length ? String(a.activity[a.activity.length - 1]) : "";
+  if (AGENT_ACTIVE.has(a?.status)) return a.status === "running" && last ? last : a.status;
+  return a?.error ? `${a.status}: ${a.error}` : a?.status || "";
+}
+/** Run time so far (or in total once finished); "" before it started. */
+export function agentElapsed(a, now = Date.now()) { return a?.startedAt ? fmtDuration((a.endedAt || now) - a.startedAt) : ""; }
+/** The history drawer's tag for a background agent's chat ("agent" / "Claude agent"), null for an ordinary chat. */
+export function agentTag(s, rec) {
+  if (!s || !(s.parentSid || s.agentId || rec)) return null;
+  return (s.agentKind || rec?.kind) === "claude" || s.harness === "claude" ? "Claude agent" : "agent";
+}
+/**
+ * History rows in display order, `[{ s, depth }]`: a chat whose parent (`parentOf(s)`, the agent's
+ * parentSid) is in the list sits right under it, one level deeper, whatever its own date; a chat
+ * whose parent is not listed stays at the top level. Roots and siblings keep the input order.
+ */
+export function nestSessions(list, parentOf = (s) => s?.parentSid) {
+  const items = [...(list || [])];
+  const bySid = new Map(items.map((s) => [s.sid, s]));
+  const kids = new Map(), roots = [];
+  for (const s of items) {
+    const p = parentOf(s);
+    if (p && p !== s.sid && bySid.has(p)) { if (!kids.has(p)) kids.set(p, []); kids.get(p).push(s); } else roots.push(s);
+  }
+  const out = [], seen = new Set();
+  const walk = (s, depth) => { if (seen.has(s.sid)) return; seen.add(s.sid); out.push({ s, depth }); for (const k of kids.get(s.sid) || []) walk(k, depth + 1); };
+  for (const s of roots) walk(s, 0);
+  // Parents that point at each other leave rows no root reaches: show them rather than lose them.
+  for (const s of items) walk(s, 0);
+  return out;
+}
+
+const AGENT_RESULT_RE = /^\s*\[omni-agent-result\]\s*/;
+const AGENT_KEYS = /^(id|agent|kind|title|status|elapsed|duration|time)\s*:\s*(.+)$/i;
+const STATUS_WORDS = /\b(done|completed|finished|succeeded|error|errored|failed|cancell?ed|canceled|stopped|timeout|timed out|interrupted|stalled)\b/i;
+const STATUS_NORM = { completed: "done", finished: "done", succeeded: "done", errored: "error", failed: "error", canceled: "cancelled", stopped: "cancelled", "timed out": "timeout" };
+const DURATION_RE = /\b\d+h\s?\d{1,2}m\b|\b\d+m\s?\d{1,2}s\b|\b\d+(?:\.\d+)?\s?(?:s|secs?|seconds?|min|mins|minutes?|h|hours?)\b/i;
+// The header omni-agents-lib.mjs `agentReport` writes, one line:
+//   Background <pi agent|Claude agent|job> <id> "<title>" finished: <status>[ (exit N)][ after <1m00s|1h05m|5s>].
+// The title is free text (quotes included), so it is matched greedily up to the LAST `" finished:`.
+const REPORT_HEAD = /^Background (pi agent|Claude agent|job) (\S+) "(.*)" finished: ([a-z]+)(?: \(exit -?\d+\))?(?: after (\S+?))?\.$/i;
+const QUOTED = /[“"][^”"]*[”"]/g;
+/** "1m00s" / "1h05m" (the agents lib's format) or "4m 12s" → the strip's own format ("1m 0s", "1h 05m"); other text as written. */
+function normDuration(s) {
+  const t = String(s || "").trim();
+  const m = /^(?:(\d+)h\s?)?(?:(\d+)m\s?)?(?:(\d+)s)?$/.exec(t);
+  if (!m || !(m[1] || m[2] || m[3])) return t;
+  return fmtDuration(((Number(m[1]) || 0) * 3600 + (Number(m[2]) || 0) * 60 + (Number(m[3]) || 0)) * 1000);
+}
+/**
+ * A report the omni-agents extension delivered into the parent chat (pi custom message
+ * `omni-agent-result`, shown as `[omni-agent-result] …`) → `{ id, kind, title, status, elapsed, body }`,
+ * else null. The agents lib's own header line (REPORT_HEAD) is read exactly; anything else leniently:
+ * one summary line and/or `key: value` lines (title, status, kind, id, elapsed), then the report itself.
+ * The lenient path never reads a status or kind out of the quoted title.
+ */
+export function agentResultInfo(text) {
+  const raw = String(text ?? "");
+  const m = AGENT_RESULT_RE.exec(raw);
+  if (!m) return null;
+  const rest = raw.slice(m[0].length).replace(/\r\n?/g, "\n").trim();
+  const lines = rest.split("\n");
+  const kv = {};
+  let head = "", i = 0;
+  for (; i < lines.length && i < 12; i++) {
+    const l = lines[i].trim();
+    const k = AGENT_KEYS.exec(l);
+    if (k) { kv[k[1].toLowerCase()] = k[2].trim(); continue; }
+    if (i === 0 && l) { head = l; continue; }
+    break;
+  }
+  const body = lines.slice(i).join("\n").trim() || rest;
+  const idOf = (s) => /\ba-[0-9a-f]{8}\b/.exec(s || "")?.[0];
+  const kindOf = (s) => (/\bclaude\b/i.test(s) ? "claude" : /\b(shell|job)\b/i.test(s) ? "shell" : /\bpi\b/i.test(s) ? "pi" : "");
+  const exact = REPORT_HEAD.exec(head);
+  // Lenient: the head without its quoted title; after `finished:` comes the status itself.
+  const bare = head.replace(QUOTED, " ");
+  const st = (kv.status ? STATUS_WORDS.exec(kv.status)?.[1] || kv.status : exact ? exact[4]
+    : /\bfinished:\s*(timed out|[a-z]+)/i.exec(bare)?.[1] || STATUS_WORDS.exec(bare)?.[1] || "").toLowerCase();
+  return {
+    id: idOf(kv.id) || idOf(kv.agent) || idOf(exact?.[2]) || idOf(bare) || idOf(rest.slice(0, 600)) || "",
+    kind: kindOf(kv.kind || (exact ? exact[1] : head.split(/[“"]/)[0])),
+    title: one(kv.title || exact?.[3] || /[“"]([^”"]{1,200})[”"]/.exec(head)?.[1] || head || "Background agent", 140),
+    status: STATUS_NORM[st] || st,
+    elapsed: normDuration(kv.elapsed || kv.duration || kv.time || (exact ? exact[5] : DURATION_RE.exec(bare)?.[0]) || ""),
+    body,
+  };
+}
+/** An agent report `msg` event's text (what tells a live copy and the history's copy apart), else "". */
+export function agentReportKey(ev) {
+  if (ev?.kind !== "msg" || ev.role !== "system") return "";
+  const text = (ev.blocks || []).map((b) => b.text || "").join("\n");
+  return AGENT_RESULT_RE.test(text) ? text.trim() : "";
+}
+/**
+ * A reopened chat's history plus the agent reports only a buffered live event has, each placed by
+ * its time. A report reaches the parent chat as a live event, and the history may not carry it (it
+ * is a pi custom message); being older than the history fetch, it would otherwise be taken to be in
+ * the file and dropped. A report the history does carry is never doubled.
+ */
+export function withLiveReports(events, buffer) {
+  const have = new Set((events || []).map(agentReportKey).filter(Boolean));
+  const late = [];
+  for (const ev of buffer || []) { const k = agentReportKey(ev); if (k && !have.has(k)) { have.add(k); late.push(ev); } }
+  if (!late.length) return events || [];
+  late.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  const out = [];
+  for (const ev of events || []) { while (late.length && (late[0].ts || 0) <= (ev.ts || 0)) out.push(late.shift()); out.push(ev); }
+  return out.concat(late);
+}
+/**
+ * The agent records after a `/api/state` snapshot: the snapshot's, except where a live `agent` event
+ * arrived since the request went out (`liveSince`: id → the `rev` it was put at, `rev`: the counter
+ * when the request was sent) — that one is at least as new as the snapshot, which an event emitted
+ * while the snapshot was in flight would otherwise overwrite for good (a finished agent left
+ * "running"). Agents the snapshot lacks are dropped unless they too are that recent.
+ */
+export function mergeAgentSnapshot(current, snapshot, liveSince, rev) {
+  const out = new Map();
+  const fresh = (id) => (liveSince?.get(id) ?? -1) > rev && current.has(id);
+  for (const a of Array.isArray(snapshot) ? snapshot : Object.values(snapshot || {})) if (a?.id) out.set(a.id, fresh(a.id) ? current.get(a.id) : a);
+  for (const [id, a] of current) if (!out.has(id) && fresh(id)) out.set(id, a);
+  return out;
+}
+
+// ------------------------------------------------------------ long runs
+/** Settings → Long runs: thousands of tokens as typed → `{ compactAt }` in tokens (0 = off), or `{ error }`. */
+export function parseCompactAt(k) {
+  const s = String(k ?? "").trim();
+  const n = Number(s);
+  if (!s || !Number.isFinite(n) || n < 0) return { error: "Type how many thousand tokens a chat may grow to before pi compacts it (0 = off)" };
+  // After a compaction pi still holds the system prompt and tools (~25k), the recent turns it keeps (32k) and the summary.
+  if (n > 0 && n < 100) return { error: "Too small: below 100k tokens pi would compact almost every turn (a compacted chat still holds ~60k). Use 0 to turn the cap off." };
+  if (n > 10000) return { error: "Too large: use at most 10000k tokens, or 0 to turn the cap off." };
+  return { compactAt: Math.round(n * 1000) };
+}
+/** compactAt in tokens → the k figure the field shows. */
+export const compactAtK = (tokens) => (Number(tokens) > 0 ? Math.round(Number(tokens) / 100) / 10 : 0);
+/**
+ * The Long runs field on Save → `{ compactAt }` / `{ error }`. While the field still shows the saved
+ * value, that exact token count goes back: 262144 shows as 262.1, and re-reading 262.1 would save
+ * 262100, a cap change (and a pi restart) nobody asked for.
+ */
+export function compactAtFromField(k, saved) {
+  const n = Number(saved);
+  return Number.isFinite(n) && n >= 0 && String(k ?? "").trim() === String(compactAtK(n)) ? { compactAt: n } : parseCompactAt(k);
 }

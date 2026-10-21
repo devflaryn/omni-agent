@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -73,6 +73,26 @@ test("installer copies omni-run and its lib siblings into pi's extensions", () =
     }
     // The planner's lib is the shared state machine itself (ui/plan.js), not the repo's re-export shim.
     assert.equal(readFileSync(join(home, ".pi", "agent", "extensions", "omni-plan-lib.mjs"), "utf8"), readFileSync(join(process.cwd(), "ui", "plan.js"), "utf8"));
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("installer ships the background-agents and context extensions with their shared libs, uninstall removes them", () => {
+  const home = mkdtempSync(join(tmpdir(), "omni-home-"));
+  try {
+    const r = run(home);
+    assert.equal(r.status, 0, r.stderr);
+    const ext = join(home, ".pi", "agent", "extensions");
+    for (const f of ["omni-agents.ts", "omni-agents-lib.mjs", "omni-context.ts", "omni-context-lib.mjs", "omni-claude.ts"]) {
+      assert.ok(existsSync(join(ext, f)), `${f} should be installed`);
+      assert.equal(readFileSync(join(ext, f), "utf8"), readFileSync(join(process.cwd(), "integrations", "pi", f), "utf8"), `${f} is the repo's copy`);
+    }
+    // Every relative import of every installed extension resolves inside the installed folder.
+    for (const f of readdirSync(ext).filter((n) => n.endsWith(".ts"))) {
+      for (const [, dep] of readFileSync(join(ext, f), "utf8").matchAll(/from\s+"(\.\/[^"]+)"/g)) assert.ok(existsSync(join(ext, dep)), `${f} imports ${dep}, which must be installed beside it`);
+    }
+    const u = run(home, "--uninstall");
+    assert.equal(u.status, 0, u.stderr);
+    for (const f of ["omni-agents.ts", "omni-agents-lib.mjs", "omni-context.ts", "omni-context-lib.mjs"]) assert.ok(!existsSync(join(ext, f)), `${f} removed on uninstall`);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 

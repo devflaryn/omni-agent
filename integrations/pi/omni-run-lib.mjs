@@ -27,6 +27,26 @@ export function renderContextBlock({ goal, ledgerMd = "" }, { budget = 4000 } = 
   return `<omni-run-goal>\n${goal}\n</omni-run-goal>\n<omni-run-ledger>\n${body.trim()}\n</omni-run-ledger>`;
 }
 
+/**
+ * `messages` with `text` appended as a text part to the newest message, when that is a user, toolResult or
+ * custom message (a background agent's report; pi's convertToLlm sends it as a user message) — pi's
+ * convertToLlm drops `role: "system"` messages, so a prepended system block never reached the model. Only
+ * that message and its content array are copied; the earlier messages are the same objects, so the cached
+ * prompt prefix survives. Null when there is nothing to append to.
+ */
+export function appendToNewest(messages, text) {
+  if (!Array.isArray(messages) || !messages.length || !text) return null;
+  const last = messages[messages.length - 1];
+  if (last?.role !== "user" && last?.role !== "toolResult" && last?.role !== "custom") return null;
+  const content = typeof last.content === "string" ? [{ type: "text", text: last.content }] : [...(last.content || [])];
+  content.push({ type: "text", text: `\n${text}` });
+  return [...messages.slice(0, -1), { ...last, content }];
+}
+
+/** Whether a summary-model answer may replace ledger.md: not cut off (length), failed or aborted, and no
+ *  tool call — the answers pi's own compaction rejects too (getSummarizationFailure). */
+export const summaryUsable = (response) => !!response && !["length", "error", "aborted"].includes(response.stopReason) && !(response.content || []).some((c) => c?.type === "toolCall");
+
 /** A fixed-budget summary: the goal, then the ledger's forward-looking sections, hard-capped.
  *  It does NOT fold in the full span verbatim, so it cannot grow pass-over-pass. */
 export function renderCompactionSummary({ goal, ledgerMd = "", serializedSpan = "" }, { budget = 6000 } = {}) {

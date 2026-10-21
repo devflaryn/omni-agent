@@ -10,7 +10,7 @@
  *   node scripts/run.mjs --cwd <dir> --goal "…" [--goal-file f] [--resume <run-id>]
  *        [--provider p] [--model id] [--thinking lvl] [--max-seconds N] [--port N]
  */
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApp as realCreateApp } from "../server/index.mjs";
@@ -26,13 +26,18 @@ export async function runUnattended({ cwd, goal, provider, model, thinking, runI
   ledger.writeControl({ status: "running" });
   out(`run ${ledger.runId} · ledger ${ledger.dir}`);
 
-  const app = await createApp({ port, host: "127.0.0.1", lan: false, cwd, autoStartPi: false, runLedger: ledger, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}) });
+  // --resume: the run's own chat (its plan and progress live there). Read it BEFORE pi starts: the fresh child
+  // announces its new, empty session right away and that announcement overwrites the ledger's sessionFile.
+  const resumeFile = runId ? ledger.readControl().sessionFile : "";
+  const app = await createApp({ port, host: "127.0.0.1", lan: false, relay: { host: "" }, cwd, autoStartPi: false, runLedger: ledger, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}) });
   await app.listen();
   const pi = app.startPi(cwd);
   // Mirror pi's session file into the ledger so a restart resumes it.
-  app.bus.on("event", (ev) => { if (ev.kind === "session" && ev.harness === "pi" && ev.owned && ev.file && !app.pi?.restoring) { ledger.writeControl({ sessionFile: ev.file }); if (app.pi) app.pi.resumeFile = ev.file; } });
+  // A background agent's session is owned too, but it is never the run's own chat.
+  app.bus.on("event", (ev) => { if (ev.kind === "session" && ev.harness === "pi" && ev.owned && ev.file && !ev.agentId && !app.pi?.restoring) { ledger.writeControl({ sessionFile: ev.file }); if (app.pi) app.pi.resumeFile = ev.file; } });
 
   await pi.waitReady();
+  if (resumeFile && existsSync(resumeFile)) await pi.switchSession(resumeFile).catch((e) => out(`could not resume ${resumeFile}: ${e.message}`));
   if (thinking) await pi.setThinking(thinking).catch(() => {});
   const goalText = ledger.goalText() || goal || "";
   if (goalText) {

@@ -1,7 +1,7 @@
 // test/run-cli.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runUnattended } from "../scripts/run.mjs";
@@ -39,4 +39,30 @@ test("sets OMNI_RUN_DIR, creates a ledger, sets the explicit goal, and does NOT 
   RunLedger.open(process.env.OMNI_RUN_DIR).writeControl({ status: "done" });
   const out = await p;
   assert.equal(out.status, "done");
+});
+
+test("--resume puts pi back on the run's own chat even though the fresh pi announces its new session first", async () => {
+  const runsRoot = mkdtempSync(join(tmpdir(), "runs-resume-"));
+  const oldChat = join(runsRoot, "old-chat.jsonl");
+  writeFileSync(oldChat, "{}\n");
+  const ledger = RunLedger.create({ runsRoot, goalText: "port it", sessionFile: oldChat });
+  ledger.writeControl({ sessionFile: oldChat, status: "running" });
+  const listeners = [];
+  const bus = { on: (_e, f) => listeners.push(f), off() {}, emit(ev) { for (const f of listeners) f(ev); } };
+  const fresh = join(runsRoot, "fresh-not-yet-written.jsonl"); // pi names the file at once and writes it lazily
+  const switched = [];
+  const pi = {
+    sid: "pi:fresh", proc: {}, streaming: false, state: { sessionFile: fresh },
+    // what PiRpc.refreshState() does before the ready promise resolves
+    waitReady: async () => { bus.emit({ sid: "pi:fresh", harness: "pi", kind: "session", owned: true, file: fresh }); },
+    switchSession: async (f) => { switched.push(f); pi.state.sessionFile = f; },
+    prompt: async () => {}, setThinking: async () => {}, stop() {},
+  };
+  const keeper = { setExplicitGoal() {}, setConfig() {}, startHeartbeat() {}, goal: () => null, config: { enabled: true } };
+  const app = { async listen() {}, close() {}, bus, keeper, startPi: () => pi, get pi() { return pi; }, cfg: {} };
+  const p = runUnattended({ cwd: process.cwd(), runId: ledger.runId, runsRoot, createApp: async () => app, pollMs: 10, out: () => {} });
+  await new Promise((r) => setTimeout(r, 80));
+  RunLedger.open(ledger.dir).writeControl({ status: "done" });
+  await p;
+  assert.deepEqual(switched, [oldChat]);
 });

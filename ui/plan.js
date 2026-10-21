@@ -241,7 +241,8 @@ export function clearWaiting(plan) {
 function nextHint(plan, events) {
   const ph = planPhase(plan);
   if (ph === "plan") return '\n\nNext: call plan with action "create" — milestones built from the chosen approach, each with small concrete steps that have a done_when check.';
-  if (ph === "complete") return `\n\nAll steps are done. Check the result against the success criteria${plan.brainstorm?.successCriteria?.length ? ` (${plan.brainstorm.successCriteria.join("; ")})` : ""}, then give the user a short final answer. If something is still missing, revise the plan instead.`;
+  // A finished plan is not a finished goal: the plan may have covered only part of what the user asked for.
+  if (ph === "complete") return `\n\nAll steps are done. First check the result against the success criteria${plan.brainstorm?.successCriteria?.length ? ` (${plan.brainstorm.successCriteria.join("; ")})` : ""} and against the user's overall goal. If any part of that goal is still not done, create the next plan for it (plan action "create") and continue working. Only when the whole goal is done, give the user a short final answer.`;
   if (ph === "waiting") return "\n\nStop now and ask the user that question in your reply.";
   const cur = currentStep(plan);
   if (!cur) return "";

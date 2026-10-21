@@ -70,7 +70,8 @@ export function lanAddresses() {
     for (const a of list || []) {
       if (a.family !== "IPv4" || a.internal) continue;
       if (a.address.startsWith("169.254.")) continue;
-      if (/vmware|vmnet|vethernet|wsl|hyper-v|virtualbox|docker/i.test(name)) continue;
+      // Virtual switches, and VPN clients whose address no other device can reach (Cloudflare WARP).
+      if (/vmware|vmnet|vethernet|wsl|hyper-v|virtualbox|docker|cloudflare|warp/i.test(name)) continue;
       out.push({ name, address: a.address });
     }
   }
@@ -78,13 +79,32 @@ export function lanAddresses() {
 }
 
 const fc = readConfigFile();
-const lan = process.argv.includes("--lan") || fc.lan === true;
+/** `--lan`/`--remote` (or {"lan":true}/{"remote":true}) also serves other devices — on the LAN or, with a port
+ *  forward, the internet — from a second, password-protected, read-only listener (see server/access.mjs). */
+const lan = process.argv.includes("--lan") || process.argv.includes("--remote") || fc.lan === true || fc.remote === true;
 
 export const CONFIG = {
   port: Number(argVal("--port", process.env.OMNI_PORT || fc.port || 4400)),
-  /** `--lan` (or {"lan":true}) listens on every interface. No token: anyone with the link can use it. */
-  host: lan ? "0.0.0.0" : "127.0.0.1",
+  /** The host's own listener: loopback only, full access, no login. */
+  host: "127.0.0.1",
   lan,
+  /** The listener other devices use (every interface). Forward this port on the router to reach it from another network. */
+  remotePort: Number(argVal("--remote-port", process.env.OMNI_REMOTE_PORT || fc.remotePort || 4443)),
+  /** HTTPS on the remote listener (a self-signed certificate is made once unless tlsCert/tlsKey are given). */
+  remoteTls: fc.remoteTls !== false,
+  tlsCert: fc.tlsCert || "",
+  tlsKey: fc.tlsKey || "",
+  tlsDir: fc.tlsDir || join(HOME, ".omni-agent", "tls"),
+  /** The remote password's scrypt hash. Outside the repo on purpose. */
+  remoteAuthFile: fc.remoteAuthFile || join(HOME, ".omni-agent", "remote-auth.json"),
+  /** How long a remote change waits for the host's Approve/Deny before it is refused. */
+  remoteApprovalTimeoutSec: Number(fc.remoteApprovalTimeoutSec) || 300,
+  remoteSessionDays: Number(fc.remoteSessionDays) || 7,
+  /** A browser on a device the host has not approved before must wait for the host's Approve to sign in,
+   *  even with the right password. Each approved device is remembered (180 days). */
+  remoteDeviceApproval: fc.remoteDeviceApproval !== false,
+  /** The internet way in without a router port forward: an SSH tunnel to a VPS (server/tunnel.mjs). Off until relay.host is set. */
+  relay: relayConfig(fc.relay),
   vaultDir: process.env.OMNI_VAULT || fc.vaultDir || join(ROOT, "vault"),
   /** Deleted chats are moved here (recoverable), never hard-unlinked. */
   trashDir: fc.trashDir || join(HOME, ".omni-agent", "trash"),
@@ -131,6 +151,21 @@ export const CONFIG = {
   stallMs: Number(fc.stallMs) || 900000,
   /** Restart counter resets after the child streamed healthily this long. */
   restartHealthyMs: Number(fc.restartHealthyMs) || 120000,
+  /** A tool that runs this long without any pi event is still not a stall (builds, device boots, waits);
+   *  the watchdog uses this limit instead of `stallMs` while a tool call is open. */
+  toolStallMs: Number(fc.toolStallMs) || 4 * 3600000,
+  /** Context policy for long runs (compaction point, auto-continue after a "my context is full" stop). */
+  context: contextConfig(fc.context),
+  /** pi's own settings file (compaction.reserveTokens is read from it). */
+  piSettingsFile: fc.piSettingsFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "settings.json"),
+  /** Background agents (pi subagents, Claude Code sessions, shell jobs) the agents start: registry + logs. */
+  agents: agentsConfig(fc.agents),
+  agentsFile: fc.agentsFile || join(HOME, ".omni-agent", "agents.json"),
+  agentsDir: fc.agentsDir || join(HOME, ".omni-agent", "agents"),
+  /** Explicit goals survive an Omni restart: the goal, its chat's session file and cwd. */
+  goalsFile: fc.goalsFile || join(HOME, ".omni-agent", "goals.json"),
+  /** Which models.json contextWindow overrides Omni wrote itself (server/context-policy.mjs), so hand-written ones are never touched. */
+  contextCapsFile: fc.contextCapsFile || join(HOME, ".omni-agent", "context-caps.json"),
   /** Where unattended run ledgers live. */
   /** The status-box summarizer's own side conversations (one pi session per goal), apart from the chats. */
   statusSessionsDir: fc.statusSessionsDir || join(HOME, ".omni-agent", "status-sessions"),
@@ -140,6 +175,22 @@ export const CONFIG = {
    *  re-downloading them from GitHub or launching a GUI. Provisioned by `node scripts/install-tools.mjs`. */
   toolsBinDir: fc.toolsBinDir || join(HOME, ".omni-agent", "tools", "bin"),
 };
+
+/** VPS relay settings: `host` turns it on. The public port is the relay's on the VPS; the tunnel forwards
+ *  the VPS's loopback `remotePort` to this PC's loopback `localPort`, the listener that reads PROXY headers. */
+export function relayConfig(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const dir = join(HOME, ".omni-agent", "relay");
+  return {
+    host: String(r.host || "").trim(),
+    user: String(r.user || "omni-tunnel"),
+    publicPort: Number(r.publicPort) || 4443,
+    remotePort: Number(r.remotePort) || 14443,
+    localPort: Number(r.localPort) || 4444,
+    key: r.key || join(dir, "id_ed25519"),
+    knownHosts: r.knownHosts || join(dir, "known_hosts"),
+  };
+}
 
 /** Normalized goal-hook settings. Empty provider/model = the (opt-in) judge uses the chat's current model. */
 export function hookConfig(raw = {}) {
@@ -174,6 +225,45 @@ export function hookConfig(raw = {}) {
   };
 }
 
+/**
+ * Context policy. `compactAt`: pi compacts a chat once its prompt passes this many tokens (Omni caps each
+ * model's effective window in models.json `modelOverrides`, see server/context-policy.mjs); 0 = leave pi's
+ * windows alone. `autoContinue`: a run that stops because the model believes its context is used up is
+ * compacted and continued even with the goal hook off. Pure.
+ */
+export function contextConfig(raw = {}) {
+  const c = raw && typeof raw === "object" ? raw : {};
+  const int = (v, dflt, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : dflt; };
+  return {
+    // Floor 100k: a compacted chat still holds the system prompt + tools, keepRecentTokens and the summary (~60k),
+    // so a lower point would compact on almost every turn.
+    compactAt: c.compactAt === 0 ? 0 : int(c.compactAt, 256000, 100000, 10000000),
+    autoContinue: c.autoContinue !== false,
+    /** Above this share of the budget the model gets a one-line context note on its newest message. */
+    statusFromPercent: int(c.statusFromPercent, 70, 1, 100),
+    /** Context stops in a row (no tool call between them) that are continued before the run is left alone. */
+    maxContextNudges: int(c.maxContextNudges, 3, 1, 20),
+  };
+}
+
+/** Limits for the background agents the agents start (server/agents.mjs). Pure. */
+export function agentsConfig(raw = {}) {
+  const a = raw && typeof raw === "object" ? raw : {};
+  const int = (v, dflt, min, max) => { const n = Number(v); return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : dflt; };
+  return {
+    /** Agents of all kinds running at once (more wait in a queue). */
+    maxConcurrent: int(a.maxConcurrent, 6, 1, 64),
+    /** How deep agents may nest: 1 = only the user's chat starts agents; 2 = its agents may start their own. */
+    maxDepth: int(a.maxDepth, 2, 1, 5),
+    /** A running agent is stopped after this long (a shell job uses its own timeout). */
+    maxMinutes: int(a.maxMinutes, 360, 1, 7 * 24 * 60),
+    /** Claude Code agents run unattended: nothing may block on a permission prompt. */
+    claudePermissionMode: String(a.claudePermissionMode || "bypassPermissions"),
+    claudeMaxTurns: int(a.claudeMaxTurns, 300, 1, 10000),
+    claudeModel: String(a.claudeModel || "").trim(),
+  };
+}
+
 /** Environment handed to the pi child: provider API keys (from key files), the emulator display
  *  override (so omnidroid launched by the model uses the higher default resolution), and
  *  OMNI_MEMORY=server, which tells the omni-memory extension that this child is Omni's own:
@@ -188,5 +278,7 @@ export function piChildEnv(cfg = CONFIG, { path = process.env.PATH || "", exists
   // agent finds working headless commands instead of re-downloading them or launching a GUI.
   const bin = cfg.toolsBinDir;
   if (bin && exists(bin)) env.PATH = `${bin}${delimiter}${path}`;
+  // The omni-agents / claude_task extensions call back into this server (background agents), whatever port it runs on.
+  if (cfg.port) env.OMNI_AGENT_URL = `http://127.0.0.1:${cfg.port}`;
   return env;
 }

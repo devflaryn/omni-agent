@@ -7,9 +7,9 @@ import { PiRpc } from "../server/pi-rpc.mjs";
  * Mirrors what pi does on `new_session`: the runtime is rebuilt from the launch-time model, so a model or
  * thinking level set later through `set_model` / `set_thinking_level` is reset to the launch default.
  */
-function fakePi({ model = "", provider = "", thinking = "", launch = { provider: "modal", id: "Qwen/Qwen3.8-27B", thinkingLevel: "high" }, rejectModel = null } = {}) {
+function fakePi({ model = "", provider = "", thinking = "", launch = { provider: "modal", id: "Qwen/Qwen3.8-27B", thinkingLevel: "high" }, rejectModel = null, ...opts } = {}) {
   const logs = [];
-  const pi = new PiRpc({ bus: { emit(ev) { logs.push(ev); } }, model, provider, thinking });
+  const pi = new PiRpc({ bus: { emit(ev) { logs.push(ev); } }, model, provider, thinking, ...opts });
   const state = { sessionId: "s1", sessionFile: "/tmp/s1.jsonl", model: { provider: launch.provider, id: launch.id }, thinkingLevel: launch.thinkingLevel, isStreaming: false };
   const cmds = [];
   let n = 1;
@@ -174,4 +174,94 @@ test("a stdin 'error' event does not throw out of PiRpc", async () => {
   pi.proc = Object.assign(new EventEmitter(), { stdin, stdout, stderr, kill() {} });
   pi.attachPipeGuards(); // new method under test
   assert.doesNotThrow(() => stdin.emit("error", Object.assign(new Error("EPIPE"), { code: "EPIPE" })));
+});
+
+test("extraArgs go after the launch flags; without them the argv is unchanged", () => {
+  const bus = { emit() {} };
+  const plain = new PiRpc({ bus, provider: "modal", model: "m1", thinking: "low" });
+  assert.deepEqual(plain.launchArgs(), ["--mode", "rpc", "--provider", "modal", "--model", "m1", "--thinking", "low"]);
+  const agent = new PiRpc({ bus, model: "m1", extraArgs: ["--append-system-prompt", "You are a scout.\nRead only.", "--tools", "read,grep"] });
+  assert.deepEqual(agent.launchArgs(), ["--mode", "rpc", "--model", "m1", "--append-system-prompt", "You are a scout.\nRead only.", "--tools", "read,grep"]);
+});
+
+test("the Windows pi.cmd fallback (no cli) refuses extraArgs that cmd.exe would split, instead of launching a broken argv", () => {
+  const bus = { emit() {} };
+  const agent = new PiRpc({ bus, cli: null, bin: "pi-that-must-not-run", platform: "win32", extraArgs: ["--append-system-prompt", "You are a scout.\nRead only.", "--tools", "read,grep"] });
+  assert.throws(() => agent.start(), /cli\.js was not found.*cannot pass a background agent's system prompt/);
+  assert.equal(agent.proc, null, "nothing was spawned");
+});
+
+test("meta is spread into every session event, and cannot override the sid", async () => {
+  const { pi, logs } = fakePi({ meta: { parentSid: "pi:parent-1", agentId: "a-0123abcd", agentKind: "pi", sid: "pi:evil" } });
+  await pi.refreshState();
+  const sess = logs.find((e) => e.kind === "session");
+  assert.equal(sess.parentSid, "pi:parent-1");
+  assert.equal(sess.agentId, "a-0123abcd");
+  assert.equal(sess.agentKind, "pi");
+  assert.equal(sess.sid, "pi:s1", "the real sid wins over a meta key");
+  const plain = fakePi();
+  await plain.pi.refreshState();
+  assert.equal("parentSid" in plain.logs.find((e) => e.kind === "session"), false, "no meta, no extra keys");
+});
+
+test("prompt while streaming: steer by default, followUp when asked; idle prompts carry no streamingBehavior", async () => {
+  const { pi, cmds } = fakePi();
+  await pi.refreshState();
+  pi.streaming = true;
+  await pi.prompt("a", { echo: false });
+  await pi.prompt("b", { echo: false, behavior: "followUp" });
+  pi.streaming = false;
+  await pi.prompt("c", { echo: false, behavior: "followUp" });
+  const prompts = cmds.filter((c) => c.type === "prompt");
+  assert.deepEqual(prompts.map((c) => [c.message, c.streamingBehavior]), [["a", "steer"], ["b", "followUp"], ["c", undefined]]);
+});
+
+test("tool-aware watchdog: an open tool call gets toolStallMs, a closed one falls back to stallMs", () => {
+  const bus = { emit() {} };
+  const pi = new PiRpc({ bus });
+  let aborts = 0;
+  pi.abort = async () => { aborts++; };
+  pi.onLine(JSON.stringify({ type: "agent_start" }));
+  pi.onLine(JSON.stringify({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "gradle build" } }));
+  assert.equal(pi.openTools.size, 1);
+  const t0 = pi.lastEventAt;
+  pi.checkStall({ now: t0 + 2 * 3600000, stallMs: 900000, toolStallMs: 4 * 3600000 });
+  assert.equal(aborts, 0, "a 2-hour build is not a stall");
+  pi.checkStall({ now: t0 + 5 * 3600000, stallMs: 900000, toolStallMs: 4 * 3600000 });
+  assert.equal(aborts, 1, "5 hours of silence is, even inside a tool");
+  pi.onLine(JSON.stringify({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash", result: { content: [] } }));
+  assert.equal(pi.openTools.size, 0);
+  const t1 = pi.lastEventAt;
+  pi.checkStall({ now: t1 + 1_000_000, stallMs: 900000 });
+  assert.equal(aborts, 2, "no tool open: back to stallMs");
+  pi.onLine(JSON.stringify({ type: "tool_execution_start", toolCallId: "t2", toolName: "bash" }));
+  pi.onLine(JSON.stringify({ type: "agent_settled" }));
+  assert.equal(pi.openTools.size, 0, "agent_settled forgets tools that never reported an end");
+});
+
+test("the stall log says how many tool calls were open", () => {
+  const logs = [];
+  const pi = new PiRpc({ bus: { emit(ev) { logs.push(ev); } } });
+  pi.abort = async () => {};
+  pi.streaming = true; pi.lastEventAt = 1;
+  pi.openTools.add("t1");
+  pi.checkStall({ now: 5 * 3600000, stallMs: 900000 });
+  assert.match(logs.find((e) => e.kind === "log").text, /stalled \d+s with 1 tool call open/);
+});
+
+test("exit event: a listener that calls stop() keeps the child from being restarted", async () => {
+  const bus = { emit() {} };
+  const pi = new PiRpc({ bus });
+  pi.state = { sessionFile: "/s/agent.jsonl" };
+  pi.openTools.add("t1");
+  let starts = 0;
+  pi.start = () => { starts++; return pi; };
+  const codes = [];
+  pi.on("exit", (code) => { codes.push(code); pi.stop(); });
+  await pi.handleExit(3);
+  assert.deepEqual(codes, [3]);
+  assert.equal(pi.restoring, false, "no restart was armed");
+  assert.equal(pi.openTools.size, 0);
+  await new Promise((r) => setTimeout(r, 1100)); // past the first restart delay (≤ 960 ms)
+  assert.equal(starts, 0);
 });

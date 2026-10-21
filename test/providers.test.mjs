@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PRESETS, PI_APIS, readModelsFile, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels, normalizeModels, validateProvider } from "../server/providers.mjs";
@@ -87,6 +87,83 @@ test("removeProvider drops the entry and leaves the rest", () => {
   const j = JSON.parse(readFileSync(file, "utf8"));
   assert.deepEqual(Object.keys(j.providers), ["openrouter"]);
   assert.equal(removeProvider(file, "missing"), false);
+});
+
+// The provider keys the form does not edit: Omni's context caps (server/context-policy.mjs) live in modelOverrides.
+const extras = () => ({
+  modelOverrides: { "deepseek/deepseek-v4.1-flash-1017:floor": { contextWindow: 280576 }, "catalog/model": { maxTokens: 65536, name: "Mine" } },
+  headers: { "X-Title": "omni" }, authHeader: true, compat: { supportsDeveloperRole: false }, someFutureKey: [1, 2],
+});
+
+test("upsertProvider preserves modelOverrides and the provider's other unknown keys", () => {
+  const f = join(base, "overrides.json");
+  writeFileSync(f, JSON.stringify({ providers: { openrouter: { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "k", models: [{ id: "deepseek/deepseek-v4.1-flash-1017:floor", contextWindow: 1000000 }], ...extras() } } }));
+  upsertProvider(f, "openrouter", { baseUrl: "https://openrouter.ai/api/v2", api: "openai-completions", models: [{ id: "deepseek/deepseek-v4.1-flash-1017:floor", contextWindow: 900000 }, { id: "z/new" }] });
+  const p = JSON.parse(readFileSync(f, "utf8")).providers.openrouter;
+  for (const [k, v] of Object.entries(extras())) assert.deepEqual(p[k], v, k);
+  assert.equal(p.baseUrl, "https://openrouter.ai/api/v2");
+  assert.equal(p.apiKey, "k");
+  assert.deepEqual(p.models.map((m) => [m.id, m.contextWindow]), [["deepseek/deepseek-v4.1-flash-1017:floor", 900000], ["z/new", 128000]], "the form still owns the declared windows");
+  // a brand-new provider gets no modelOverrides of its own
+  upsertProvider(f, "fresh", { baseUrl: "https://x/v1", api: "openai-completions", models: ["m"] });
+  assert.equal("modelOverrides" in JSON.parse(readFileSync(f, "utf8")).providers.fresh, false);
+});
+
+test("removeProvider and reorderProviders keep the other providers' modelOverrides and unknown keys", () => {
+  const f = join(base, "overrides2.json");
+  const prov = (id) => ({ baseUrl: `https://${id}/v1`, api: "openai-completions", models: [{ id }], ...extras() });
+  writeFileSync(f, JSON.stringify({ providers: { a: prov("a"), b: prov("b"), c: prov("c") }, top: 1 }));
+  reorderProviders(f, ["c", "a"]);
+  let j = JSON.parse(readFileSync(f, "utf8"));
+  assert.deepEqual(Object.keys(j.providers), ["c", "a", "b"]);
+  for (const n of ["a", "b", "c"]) assert.deepEqual(j.providers[n], prov(n), n);
+  removeProvider(f, "a");
+  j = JSON.parse(readFileSync(f, "utf8"));
+  assert.deepEqual(j, { providers: { c: prov("c"), b: prov("b") }, top: 1 });
+});
+
+test("models.json writes are 2-space JSON + newline, atomic (no temp file left), and a BOM-prefixed file is read", () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-prov-bom-"));
+  const f = join(dir, "models.json");
+  writeFileSync(f, `﻿${JSON.stringify({ providers: { orca: { baseUrl: "https://orca/v1", api: "openai-completions", models: [{ id: "q" }], modelOverrides: { q: { contextWindow: 100000 } } } } })}`);
+  assert.equal(readModelsFile(f).providers.orca.models[0].id, "q", "PowerShell's BOM does not hide the providers");
+  upsertProvider(f, "openrouter", { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", models: ["a"] });
+  const text = readFileSync(f, "utf8");
+  const j = JSON.parse(text);
+  assert.equal(text, `${JSON.stringify(j, null, 2)}\n`);
+  assert.deepEqual(Object.keys(j.providers), ["orca", "openrouter"], "the BOM file was merged into, not replaced");
+  assert.deepEqual(j.providers.orca.modelOverrides, { q: { contextWindow: 100000 } });
+  assert.deepEqual(readdirSync(dir), ["models.json"]);
+  // a models.json that does not exist yet (nor its folder) is created
+  const g = join(dir, "sub", "models.json");
+  upsertProvider(g, "x", { baseUrl: "https://x/v1", api: "openai-completions", models: ["m"] });
+  assert.equal(readModelsFile(g).providers.x.models[0].id, "m");
+});
+
+test("the write paths refuse a models.json they cannot read instead of replacing it (pi accepts comments there)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-prov-strict-"));
+  const f = join(dir, "models.json");
+  const body = { baseUrl: "https://api.groq.com/openai/v1", api: "openai-completions", models: ["m"] };
+  const commented = `// my providers\n${JSON.stringify({ providers: { openrouter: { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", models: [{ id: "a" }] } } }, null, 2)}\n`;
+  for (const text of [commented, "{ broken", "[]", JSON.stringify({ providers: "x" }), JSON.stringify({ providers: [] })]) {
+    writeFileSync(f, text);
+    for (const write of [() => upsertProvider(f, "groq", body), () => removeProvider(f, "openrouter"), () => reorderProviders(f, ["openrouter"])]) {
+      assert.throws(write, (e) => e.status === 409 && /models\.json was not changed/.test(e.message), text);
+      assert.equal(readFileSync(f, "utf8"), text, "the file is left as it was");
+    }
+    assert.deepEqual(listProviders(f), [], "readers stay lenient");
+  }
+  assert.deepEqual(readdirSync(dir), ["models.json"]);
+  // an empty file or one without providers holds nothing to lose: written as usual
+  for (const text of ["", "  \n", JSON.stringify({ top: 1 }), JSON.stringify({ providers: null })]) {
+    writeFileSync(f, text);
+    upsertProvider(f, "groq", body);
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(f, "utf8")).providers), ["groq"], JSON.stringify(text));
+  }
+  writeFileSync(f, JSON.stringify({ top: 1 }));
+  upsertProvider(f, "groq", body);
+  assert.equal(JSON.parse(readFileSync(f, "utf8")).top, 1, "top-level keys are kept");
+  assert.equal(removeProvider(f, "constructor"), false, "only own provider names count");
 });
 
 test("reorderProviders rewrites the provider order (the fallback chain); unknown names are ignored, unlisted ones trail", () => {

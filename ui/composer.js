@@ -17,7 +17,7 @@ export function createComposer(root, h) {
         </div>
       </div>
       <span class="attach-pills"></span>
-      <div class="menu-wrap">
+      <div class="menu-wrap model-wrap">
         <button class="cbtn" data-role="model" title="Model and thinking level"><span class="lbl">Model</span><span class="chev"><svg viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></svg></span></button>
         <div class="menu up model-menu" data-role="modelMenu" hidden></div>
       </div>

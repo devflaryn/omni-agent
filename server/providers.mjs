@@ -2,9 +2,10 @@
  * Omni's provider config for pi. The single source of truth is pi's own `~/.pi/agent/models.json`
  * (see pi's docs/models.md): `{ providers: { <name>: { baseUrl, api, apiKey, models: [...] } } }`.
  * Omni edits only `providers.<name>` and preserves everything else in the file (unknown top-level
- * keys, `compat`, `headers`), so hand-written entries survive.
+ * keys, `compat`, `headers`, and the provider's own unknown keys such as `modelOverrides`, where
+ * server/context-policy.mjs caps each model's effective window), so hand-written entries survive.
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
 /** Request protocols pi's model runtime implements. */
@@ -31,20 +32,51 @@ export const PRESETS = [
 const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const DEFAULTS = { contextWindow: 128000, maxTokens: 16384 };
 
-export function readModelsFile(file) {
+/** A file saved by PowerShell starts with a BOM, which JSON.parse rejects (pi strips it too). */
+export const stripBom = (s) => (s.charCodeAt(0) === 0xfeff ? s.slice(1) : s);
+
+const isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+
+/**
+ * models.json with `providers` always an object. Lenient for readers: missing or unreadable → empty.
+ * `strict` is for the write paths: a file that is there but is not plain JSON (pi also accepts comments) or
+ * whose root/`providers` is not an object throws a 409, because rewriting it would drop every provider in it.
+ */
+export function readModelsFile(file, { strict = false } = {}) {
   if (!file || !existsSync(file)) return { providers: {} };
+  const refuse = (why) => {
+    if (!strict) return { providers: {} };
+    throw Object.assign(new Error(`models.json was not changed: ${why}. Fix ${file} by hand (Omni rewrites the whole file, so it would lose what is in it).`), { status: 409 });
+  };
+  let j;
   try {
-    const j = JSON.parse(readFileSync(file, "utf8"));
-    if (!j || typeof j !== "object") return { providers: {} };
-    if (!j.providers || typeof j.providers !== "object") j.providers = {};
-    return j;
-  } catch { return { providers: {} }; }
+    const text = stripBom(readFileSync(file, "utf8"));
+    j = text.trim() ? JSON.parse(text) : {};
+  } catch (e) { return refuse(`it could not be read as JSON (${e.message}; comments are not supported)`); }
+  if (!isObj(j)) return refuse("it is not a JSON object");
+  if (j.providers == null) j.providers = {};
+  else if (!isObj(j.providers)) return refuse("its `providers` is not an object");
+  return j;
 }
 
-function writeModelsFile(file, json) {
-  mkdirSync(dirname(file), { recursive: true });
-  writeFileSync(file, `${JSON.stringify(json, null, 2)}\n`);
-  try { chmodSync(file, 0o600); } catch { /* windows */ }
+/**
+ * 2-space JSON + newline, mode 600 (it holds API keys). Atomic (tmp + rename) so a pi starting at the same
+ * moment never reads half a file; a symlinked models.json is written through to its target. When the rename
+ * is refused (Windows: the target held open without delete sharing) it falls back to a plain write.
+ */
+export function writeModelsFile(file, json) {
+  let target = file;
+  try { target = realpathSync(file); } catch { /* not there yet */ }
+  mkdirSync(dirname(target), { recursive: true });
+  const text = `${JSON.stringify(json, null, 2)}\n`, tmp = `${target}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, text, { mode: 0o600 });
+    renameSync(tmp, target);
+  } catch {
+    try { unlinkSync(tmp); } catch { /* never written */ }
+    writeFileSync(target, text);
+  }
+  try { chmodSync(target, 0o600); } catch { /* windows */ }
 }
 
 const num = (v, dflt) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n) : dflt; };
@@ -82,7 +114,7 @@ export function validateProvider(name, body) {
 export function upsertProvider(file, name, body) {
   const err = validateProvider(name, body);
   if (err) throw Object.assign(new Error(err), { status: 400 });
-  const json = readModelsFile(file);
+  const json = readModelsFile(file, { strict: true });
   const prev = json.providers[name] || {};
   // Per model id, keep what the file already had (image input, costs, compat) and let the form override.
   const prevById = new Map((Array.isArray(prev.models) ? prev.models : []).map((m) => [m?.id, m]));
@@ -97,6 +129,7 @@ export function upsertProvider(file, name, body) {
     for (const k of ["name", "reasoning", "input", "contextWindow", "maxTokens", "cost"]) if (given[k] === undefined && old[k] !== undefined) merged[k] = old[k];
     models.push(merged);
   }
+  // `...prev` keeps the provider's keys the form does not edit: modelOverrides (Omni's context caps), headers, compat, authHeader.
   const next = { ...prev, baseUrl: String(body.baseUrl).trim(), api: body.api, models };
   if (body.apiKey === undefined) { if (prev.apiKey) next.apiKey = prev.apiKey; }
   else if (String(body.apiKey).trim()) next.apiKey = String(body.apiKey).trim();
@@ -113,8 +146,8 @@ export function upsertProvider(file, name, body) {
  * @returns {string[]} the resulting order
  */
 export function reorderProviders(file, names) {
-  const json = readModelsFile(file);
-  const wanted = (Array.isArray(names) ? names : []).map(String).filter((n, i, a) => n in json.providers && a.indexOf(n) === i);
+  const json = readModelsFile(file, { strict: true });
+  const wanted = (Array.isArray(names) ? names : []).map(String).filter((n, i, a) => Object.hasOwn(json.providers, n) && a.indexOf(n) === i);
   const rest = Object.keys(json.providers).filter((n) => !wanted.includes(n));
   const order = [...wanted, ...rest];
   json.providers = Object.fromEntries(order.map((n) => [n, json.providers[n]]));
@@ -123,8 +156,8 @@ export function reorderProviders(file, names) {
 }
 
 export function removeProvider(file, name) {
-  const json = readModelsFile(file);
-  if (!(name in json.providers)) return false;
+  const json = readModelsFile(file, { strict: true });
+  if (!Object.hasOwn(json.providers, name)) return false;
   delete json.providers[name];
   writeModelsFile(file, json);
   return true;

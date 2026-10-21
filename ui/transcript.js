@@ -1,5 +1,5 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
-import { el, md, fmtN, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, workSummary, isDuplicateUserMessage } from "./lib.js";
+import { el, md, fmtN, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
 
 const active = { view: null, timer: null };
 const THINK_KEY = "omni.thinking.open";
@@ -26,9 +26,10 @@ const ICONS = {
 };
 const icon = (kind, cls = "ico") => `<span class="${cls}">${ICONS[kind] || ICONS.other}</span>`;
 
-export function newView(root, wrap, sid, { cwd } = {}) {
+/** `openAgent(id)`: what an agent report card's Open button does (the app opens that agent's chat or log). */
+export function newView(root, wrap, sid, { cwd, openAgent } = {}) {
   root.innerHTML = "";
-  const view = { sid, root, wrap, cwd: cwd || "", harness: sid.split(":")[0], tools: new Map(), turn: null, stream: null, lastTs: 0, empty: null, lastUser: null };
+  const view = { sid, root, wrap, cwd: cwd || "", harness: sid.split(":")[0], tools: new Map(), turn: null, stream: null, lastTs: 0, empty: null, lastUser: null, openAgent: openAgent || null };
   active.view = view;
   if (!active.timer) active.timer = setInterval(() => {
     const v = active.view, t = v?.turn;
@@ -44,6 +45,12 @@ export function emptyNote(view, text) { view.empty = el("div", "divider"); view.
 export function forkNote(view, { fromTitle, onOpen }) {
   const n = el("div", "fork-note");
   n.append("Forked from ", Object.assign(el("button", null, fromTitle || "the original chat"), { onclick: onOpen }), ". The history above was copied; the original stays untouched.");
+  view.root.prepend(n);
+}
+/** Top of a background agent's chat: who started it, with a way back when that chat is known. */
+export function agentNote(view, { kind, parentTitle, onOpen }) {
+  const n = el("div", "fork-note");
+  n.append(`Background ${agentKindLabel(kind)} started by `, onOpen ? Object.assign(el("button", null, parentTitle || "its parent chat"), { onclick: onOpen }) : "another chat", ". It works on its own; its report goes back to that chat.");
   view.root.prepend(n);
 }
 
@@ -280,6 +287,27 @@ function eventLine(view, kind, text) {
   d.lastChild.textContent = text;
   view.root.appendChild(d);
 }
+/** A background agent's report, delivered into this chat: a title line, the report folded under it. */
+function agentResultCard(view, info, animate) {
+  const tone = agentTone(info.status);
+  const d = el("details", `ar-card${tone ? ` ${tone}` : ""}${animate ? " appear" : ""}`);
+  const sum = el("summary");
+  sum.innerHTML = icon("agent");
+  sum.append(el("span", "ar-tag", "Agent report"), el("span", "ar-title", info.title));
+  const meta = [info.kind ? agentKindLabel(info.kind) : "", info.status, info.elapsed].filter(Boolean).join(" · ");
+  if (meta) sum.appendChild(el("span", "ar-meta", meta));
+  if (info.id && view.openAgent) {
+    const b = el("button", "ar-open", info.kind === "shell" ? "Log" : "Open");
+    b.title = info.kind === "shell" ? `Show the log of job ${info.id}` : `Open the chat of agent ${info.id}`;
+    b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); view.openAgent(info.id); };
+    sum.appendChild(b);
+  }
+  sum.insertAdjacentHTML("beforeend", icon("chev", "chev"));
+  const body = el("div", "ar-body text");
+  body.innerHTML = md(info.body);
+  d.append(sum, body);
+  view.root.appendChild(d);
+}
 
 // -------------------------------------------------------------- events
 export function applyEvent(view, ev) {
@@ -349,8 +377,12 @@ export function applyEvent(view, ev) {
         view.root.appendChild(m);
         openTurn(view, ev.ts, !!ev.live);
       } else {
+        const text = ev.blocks.map((b) => b.text || "").join("\n");
+        // An agent's report starts the parent's next turn (it is delivered as a follow-up), like a hook notice.
+        const report = agentResultInfo(text);
+        if (report) { closeTurn(view); agentResultCard(view, report, animate); openTurn(view, ev.ts, !!ev.live); scrollBottom(view); break; }
         const m = el("div", `msg system${animate ? " appear" : ""}`);
-        m.textContent = ev.blocks.map((b) => b.text || "").join("\n");
+        m.textContent = text;
         (view.turn?.body || view.root).appendChild(m);
       }
       scrollBottom(view);

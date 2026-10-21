@@ -40,7 +40,7 @@ const fakeSpawn = (bin, args, opts) => {
 };
 // liveWindowMs: 0 — the fixture files were written a moment ago and would otherwise count as "open in a terminal".
 // `hook` is pinned so the developer's own omni.config.json (where the goal hook may be on) never leaks into the assertions.
-const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
+const app = await createApp({ port: 0, relay: { host: "" }, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
 await app.listen();
 const port = app.server.address().port;
 const api = async (path, opts) => {
@@ -188,7 +188,7 @@ function makeFakePi({ cwd, model, provider, thinking }) {
   };
   return fakePi;
 }
-const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false });
+const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false });
 await app2.listen();
 const port2 = app2.server.address().port;
 after(() => app2.close());
@@ -420,7 +420,7 @@ function makeGoalPi({ cwd, model, provider, thinking } = {}) {
   };
   return goalPi;
 }
-const app3 = await createApp({ port: 0, vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeGoalPi, persistHook: false, persistPiModel: false, hook: { enabled: false } });
+const app3 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeGoalPi, persistHook: false, persistPiModel: false, hook: { enabled: false } });
 await app3.listen();
 const port3 = app3.server.address().port;
 after(() => app3.close());
@@ -440,15 +440,17 @@ test("goal kickoff: POST /api/goal sends the goal as a prompt and arms the keepe
   assert.equal(app3.keeper.config.enabled, true, "setting a goal arms the keeper");
 });
 
-test("full halt: POST /api/pi/abort aborts pi and turns the goal hook off", async () => {
+test("full halt: POST /api/pi/abort aborts pi and pauses that goal, but leaves the hook armed for later runs", async () => {
   app3.startPi(base);
   await fetch(`http://127.0.0.1:${port3}/api/hook`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true }) });
   assert.equal(app3.keeper.config.enabled, true);
+  app3.keeper.setGoal(goalPi.sid, "the running job");
   goalPi.calls.length = 0;
   const r = await post3("/api/pi/abort", {});
   assert.equal(r.status, 200);
   assert.ok(goalPi.calls.some((c) => c[0] === "abort"), "pi.abort() was called");
-  assert.equal(app3.keeper.config.enabled, false, "a full-halt stop turns the goal hook off");
+  assert.equal(app3.keeper.goal(goalPi.sid).paused, true, "the stopped goal is not re-engaged");
+  assert.equal(app3.keeper.config.enabled, true, "Stop no longer switches the hook off for every later run");
 });
 
 // --------------------------------------------------------- watchdog wiring
@@ -462,7 +464,7 @@ function fakePiFactory() {
 }
 
 test("startPi starts the stall watchdog", async () => {
-  const app = await createApp({ autoStartPi: false, createPi: fakePiFactory(), port: 0 });
+  const app = await createApp({ relay: { host: "" }, autoStartPi: false, createPi: fakePiFactory(), port: 0 });
   const pi = app.startPi(process.cwd());
   assert.ok(pi.watchdogTimer || pi._watchdogStarted, "watchdog should be armed");
   app.close();

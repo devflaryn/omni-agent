@@ -3,9 +3,8 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="color-scheme" content="light dark" />
-<meta name="theme-color" media="(prefers-color-scheme: light)" content="#fbfbfa" />
-<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#141414" />
+<meta name="color-scheme" content="dark" />
+<meta name="theme-color" content="#212121" />
 <title>Omni Agent</title>
 <link rel="stylesheet" href="/styles.css" />
 </head>
@@ -15,6 +14,7 @@
   <div class="top-title" id="topTitle"></div>
   <div class="menu-wrap"><button class="icon-btn" id="btnChatMenu" title="Chat actions" hidden><svg viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="0.9"/><circle cx="8" cy="8" r="0.9"/><circle cx="12.5" cy="8" r="0.9"/></svg></button><div class="menu" id="chatMenu" hidden></div></div>
   <span class="grow"></span>
+  <div class="access-chip" id="accessChip" hidden></div>
   <div class="pi-status" id="piStatus" title="Omni's pi child">pi: starting</div>
   <div class="top-model" id="topModel"></div>
   <button class="icon-btn" id="btnExplorer" title="Files (working directory)" hidden><svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg></button>
@@ -66,6 +66,7 @@
     <section class="view" id="view-chat">
       <div id="summaryBox" class="summary-box" hidden></div>
       <div id="transcriptWrap"><div id="transcript"></div></div>
+      <div id="agentStrip" class="agents-strip" aria-label="Background agents of this chat" hidden></div>
       <div id="chatComposer"></div>
     </section>
   </div>
@@ -149,13 +150,17 @@
   <div class="dialog">
     <div class="dlg-head">
       <div>
-        <b>Providers</b>
+        <b>Settings</b>
         <div class="dlg-tabs" role="tablist">
           <button class="seg-btn active" role="tab" id="tabModels" aria-selected="true" aria-controls="provBody">Models</button>
           <button class="seg-btn" role="tab" id="tabMcp" aria-selected="false" aria-controls="mcpBody">MCP servers</button>
+          <button class="seg-btn" role="tab" id="tabRemote" aria-selected="false" aria-controls="remoteBody">Remote</button>
+          <button class="seg-btn" role="tab" id="tabLong" aria-selected="false" aria-controls="longBody">Long runs</button>
         </div>
         <span class="dlg-sub" id="subModels">Which LLMs pi can use. Only the model ids you type here show up in the picker. The list is also the fallback order: when a model errors, pi moves to the next model below it (drag the dots to reorder).</span>
         <span class="dlg-sub" id="subMcp" hidden>Tool servers pi connects to. Each tool shows up as mcp__&lt;server&gt;__&lt;tool&gt;. Saving restarts pi so it connects.</span>
+        <span class="dlg-sub" id="subRemote" hidden>Use Omni from another device or network. Remote browsers sign in with this password and see everything read-only; each message or change they send waits for your Approve here.</span>
+        <span class="dlg-sub" id="subLong" hidden>How Omni keeps long, unattended runs going: when pi compacts a growing chat, and what happens when a model stops early because it thinks its context is full. Changing the compaction size restarts pi so it takes effect.</span>
       </div>
       <button class="icon-btn" id="settingsClose" title="Close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
@@ -219,9 +224,12 @@
         </div>
       </form>
     </div>
+    <div class="dlg-body remote-body" id="remoteBody" role="tabpanel" hidden></div>
+    <div class="dlg-body long-body" id="longBody" role="tabpanel" hidden></div>
   </div>
 </div>
 
+<div id="approvals" hidden></div>
 <div id="toasts"></div>
 <script type="module" src="/app.js"></script>
 </body>

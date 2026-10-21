@@ -1,6 +1,6 @@
 /* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only. */
-import { el, baseName, cleanTitle } from "./lib.js";
-import { newView, applyEvent, finish, forkNote, emptyNote } from "./transcript.js";
+import { el, baseName, cleanTitle, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
+import { newView, applyEvent, finish, forkNote, agentNote, emptyNote } from "./transcript.js";
 import { createComposer } from "./composer.js";
 import { createHistory } from "./sidebar.js";
 import { createPanel } from "./panel.js";
@@ -8,20 +8,30 @@ import { createExplorer } from "./explorer.js";
 import { createSettings } from "./settings.js";
 import { initResizers } from "./resizer.js";
 import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
+import { createRemote } from "./remote.js";
 
 const $ = (s) => document.querySelector(s);
-const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, followFork: null, forceFork: false, desktop: new URLSearchParams(location.search).get("desktop") === "1" };
+// agents: background agents by id (/api/state + live `agent` events); agentSids: an agent chat's sid → agent id;
+// agentsOpen: chats whose folded agents strip the user expanded.
+const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, followFork: null, forceFork: false, agents: new Map(), agentSids: new Map(), agentsOpen: new Set(), desktop: new URLSearchParams(location.search).get("desktop") === "1" };
 const liveWindowMs = () => S.config?.liveWindowMs || 30000;
 /** Events replayed by the SSE stream at connect time predate this; their system toasts are stale. */
 const BOOT_TS = Date.now();
 
+/** What a remote browser may do without the host's approval (mirrors server/access.mjs READ). */
+const REMOTE_FREE = /^\/api\/(graph\/(query|explain)|remote\/(login|logout))$/;
 async function api(path, body, method) {
-  const r = await fetch(path, body || (method && method !== "GET") ? { method: method || "POST", headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined } : { method: "GET" });
+  const verb = body || (method && method !== "GET") ? method || "POST" : "GET";
+  // A remote change is held open by the server until the host decides: say so while it waits.
+  if (remote.role === "remote" && verb !== "GET" && !REMOTE_FREE.test(path)) toast("Waiting for the host to approve…");
+  const r = await fetch(path, verb !== "GET" ? { method: verb, headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined } : { method: "GET" });
   const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && j.login) { location.reload(); throw new Error("signed out"); }
   if (!r.ok || j.error) throw new Error(j.error || `${r.status}`);
   return j;
 }
 function toast(text, err) { const t = el("div", `toast${err ? " err" : ""}`, text); $("#toasts").appendChild(t); setTimeout(() => t.remove(), err ? 7000 : 3500); }
+const remote = createRemote({ api, toast });
 const homeCwd = () => $("#homeCwd").value.trim() || S.config?.cwd || "";
 const currentDir = () => (S.page === "chat" && S.sessions.get(S.selected)?.cwd) || homeCwd() || null;
 
@@ -38,15 +48,41 @@ async function deleteChat(sid) {
   } catch (e) { toast(e.message, true); }
 }
 
+// ------------------------------------------------------------- agents
+/** The agent record behind a chat (pi or Claude agent), or null for an ordinary chat. */
+const agentFor = (sid) => (sid && S.agentSids.has(sid) ? S.agents.get(S.agentSids.get(sid)) || null : null);
+/** A background agent's chat: its own pi process (never Omni's main pi) or a Claude Code run another chat started. */
+const isAgentChat = (s) => !!(s && (s.parentSid || s.agentId || S.agentSids.has(s.sid)));
+function putAgent(a) {
+  if (!a?.id) return;
+  S.agents.set(a.id, a);
+  if (!a.sid) return;
+  S.agentSids.set(a.sid, a.id);
+  const s = S.sessions.get(a.sid);
+  if (s) { s.parentSid = s.parentSid || a.parentSid || undefined; s.agentId = s.agentId || a.id; s.agentKind = s.agentKind || a.kind; }
+}
+// agentRev counts the agent records that came in live (SSE, a Stop's answer); agentLiveAt: id → its rev then.
+let agentRev = 0;
+const agentLiveAt = new Map();
+function liveAgent(a) { if (!a?.id) return; agentLiveAt.set(a.id, ++agentRev); putAgent(a); }
+/** A `/api/state` snapshot of the agents; `rev` is agentRev when it was requested (live records since then win). */
+function loadAgents(list, rev = agentRev) {
+  const merged = mergeAgentSnapshot(S.agents, list, agentLiveAt, rev);
+  S.agents.clear();
+  for (const a of merged.values()) putAgent(a);
+}
+
 // ------------------------------------------------------------- modules
 const openChat = (sid) => { selectSession(sid); showView("chat"); if (window.innerWidth < 1100) panel.setOpen(false); };
-const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat });
+const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat, agentFor });
 const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => history.render() });
 const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat") });
-const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices(); refreshState(); } });
+const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices(); refreshState(); }, loadRemote: () => remote.loadSettings(), getContext: () => S.config?.context, onContext: (context) => { S.config = { ...(S.config || {}), context }; } });
 const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => settings.open(), onHook: setHook };
 const home = createComposer($("#homeComposer"), { ...composerHooks, onSend: homeSend });
-const chat = createComposer($("#chatComposer"), { ...composerHooks, onSend: chatSend, onStop: chatStop });
+// In a background agent's chat the picker shows the agent's model; picking there would change Omni's own pi.
+const notForAgents = (fn) => (...args) => { if (target().kind !== "agent") return fn(...args); toast("A background agent keeps the model it started with; this picker sets Omni's own pi. Pick it from one of its chats.", true); updateComposer(); };
+const chat = createComposer($("#chatComposer"), { ...composerHooks, onPiModel: notForAgents(setPiModel), onPiThinking: notForAgents(setPiThinking), onHook: notForAgents(setHook), onSend: chatSend, onStop: chatStop });
 
 /** Choices made before pi runs are saved on the server and applied when it starts, so the picker never "forgets". */
 async function setPiModel(provider, id) {
@@ -81,7 +117,7 @@ function piModelState() {
   const piThinking = (S.pi.running ? S.pi.state?.thinkingLevel : "") || c.piThinking || "";
   return { piModel, piThinking, hook: S.hook };
 }
-async function refreshState() { try { const st = await api("/api/state"); S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || S.hook; if (st.config) S.config = st.config; updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
+async function refreshState() { try { const rev = agentRev; const st = await api("/api/state"); S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || S.hook; if (st.config) S.config = st.config; if (st.agents) { loadAgents(st.agents, rev); renderAgents(); } updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
 /** Goal hook settings live in omni.config.json through the server; the menu reflects the saved state. */
 async function setHook(patch) {
   try {
@@ -185,11 +221,156 @@ function showView(name) {
   if (name === "home") { setExplorer(false); home.reloadOptions(); renderHome(); home.focus(); }
   if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth > 760 && explorerPreferred()); chat.reloadOptions(); updateHeader(); updateComposer(); }
   renderSummary();
+  renderAgents();
   updateTitle();
+}
+
+// The agents strip above the composer: the background agents (pi, Claude Code, shell jobs) this chat started,
+// live from `agent` events. Open selects an agent's chat (a shell job shows its log here); Stop cancels it.
+const CHEV = `<span class="chev"><svg viewBox="0 0 16 16"><path d="m6 4 4 4-4 4"/></svg></span>`;
+const logOpen = new Set(), logText = new Map(), logBusy = new Set();
+let agentTick = null, agentTimer = null, tickN = 0, stripSig = "";
+function scheduleAgents() { if (!agentTimer) agentTimer = setTimeout(() => { agentTimer = null; renderAgents(); }, 200); }
+function renderAgents() {
+  const box = $("#agentStrip");
+  if (!box) return;
+  const list = S.page === "chat" && S.selected ? agentsFor(S.agents.values(), S.selected) : [];
+  if (!list.length) { box.textContent = ""; box.hidden = true; stripSig = ""; setAgentTick(false); return; }
+  const fold = list.length > 3, open = !fold || S.agentsOpen.has(S.selected);
+  setAgentTick(list.some((a) => AGENT_ACTIVE.has(a.status)));
+  // A busy agent sends an event per tool call: when only its activity changed, patch the rows in place so a
+  // button under the pointer is never swapped out mid-click. Anything structural rebuilds the strip.
+  const sig = `${S.selected}|${open}|${list.map((a) => `${a.id}:${a.status}:${a.sid ? 1 : 0}:${logOpen.has(a.id) ? 1 : 0}`).join(",")}`;
+  if (sig === stripSig && !box.hidden) {
+    for (const row of box.querySelectorAll(".ag-row")) {
+      const a = S.agents.get(row.dataset.id); if (!a) continue;
+      const sub = row.querySelector(".ag-sub"), t = agentSubline(a);
+      if (sub.textContent !== t) { sub.textContent = t; sub.title = t; }
+      row.querySelector(".ag-title").textContent = agentTitle(a);
+    }
+    return;
+  }
+  stripSig = sig;
+  box.textContent = "";
+  box.hidden = false;
+  if (fold) {
+    const tones = list.map((a) => agentTone(a.status));
+    const sum = el("button", `ag-sum${open ? " open" : ""}`);
+    sum.append(el("span", `ag-dot ${tones.includes("run") ? "run" : tones.includes("err") ? "err" : "ok"}`), el("span", "ag-sum-t", agentSummary(list)));
+    sum.insertAdjacentHTML("beforeend", CHEV);
+    sum.setAttribute("aria-expanded", String(open));
+    sum.title = open ? "Fold the agents into one line" : "Show every agent";
+    sum.onclick = () => { if (S.agentsOpen.has(S.selected)) S.agentsOpen.delete(S.selected); else S.agentsOpen.add(S.selected); renderAgents(); };
+    box.appendChild(sum);
+  }
+  if (open) {
+    const rows = el("div", "ag-rows");
+    for (const a of list) rows.append(...agentRow(a));
+    box.appendChild(rows);
+  }
+}
+function agentRow(a) {
+  const active = AGENT_ACTIVE.has(a.status), tone = agentTone(a.status);
+  const row = el("div", `ag-row${tone ? ` ${tone}` : ""}${a.status === "queued" ? " queued" : ""}`);
+  row.dataset.id = a.id;
+  const dot = el("span", "ag-dot"); dot.title = a.status || "";
+  const main = el("div", "ag-main");
+  const line = el("div", "ag-line");
+  const title = el("span", "ag-title", agentTitle(a)); title.title = a.task || a.command || "";
+  line.append(title, el("span", "ag-kind", agentKindLabel(a.kind)));
+  const sub = el("div", "ag-sub", agentSubline(a));
+  sub.title = sub.textContent;
+  main.append(line, sub);
+  const time = el("span", "ag-time", agentElapsed(a)); time.dataset.id = a.id;
+  const acts = el("div", "ag-acts");
+  if (a.kind === "shell") {
+    const b = el("button", "btn quiet small", logOpen.has(a.id) ? "Hide log" : "Log");
+    b.title = "The last lines of this job's output";
+    b.onclick = () => toggleLog(a.id);
+    acts.appendChild(b);
+  } else {
+    const b = el("button", "btn quiet small", "Open");
+    b.disabled = !a.sid;
+    b.title = a.sid ? "Open this agent's chat" : "The agent has no chat yet";
+    b.onclick = () => openChat(a.sid);
+    acts.appendChild(b);
+  }
+  if (active) {
+    const x = el("button", "btn quiet small ag-stop", "Stop");
+    x.title = "Cancel this agent";
+    x.onclick = () => stopAgent(a.id, x);
+    acts.appendChild(x);
+  }
+  row.append(dot, main, time, acts);
+  if (!logOpen.has(a.id)) return [row];
+  const pre = el("pre", "ag-log", logText.get(a.id) || "Loading…");
+  pre.dataset.id = a.id;
+  return [row, pre];
+}
+function setAgentTick(on) {
+  if (on && !agentTick) {
+    agentTick = setInterval(() => {
+      const box = $("#agentStrip");
+      if (box.hidden) { setAgentTick(false); return; }
+      const now = Date.now();
+      for (const t of box.querySelectorAll(".ag-time")) { const a = S.agents.get(t.dataset.id); if (a) t.textContent = agentElapsed(a, now); }
+      // An open log of a running job follows its output.
+      if (++tickN % 3 === 0) for (const id of logOpen) if (AGENT_ACTIVE.has(S.agents.get(id)?.status)) fetchLog(id);
+    }, 1000);
+  } else if (!on && agentTick) { clearInterval(agentTick); agentTick = null; }
+}
+function toggleLog(id) {
+  if (logOpen.has(id)) logOpen.delete(id); else { logOpen.add(id); fetchLog(id); }
+  renderAgents();
+}
+async function fetchLog(id) {
+  if (logBusy.has(id)) return;
+  logBusy.add(id);
+  try { const r = await api(`/api/agents/${encodeURIComponent(id)}/log?tail=60`); logText.set(id, r.text || "(no output yet)"); }
+  catch (e) { logText.set(id, `Could not read the log: ${e.message}`); }
+  finally { logBusy.delete(id); }
+  for (const pre of $("#agentStrip").querySelectorAll("pre.ag-log")) {
+    if (pre.dataset.id !== id) continue;
+    const stick = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+    pre.textContent = logText.get(id);
+    if (stick) pre.scrollTop = pre.scrollHeight;
+  }
+}
+async function stopAgent(id, btn) {
+  const a = S.agents.get(id);
+  if (!window.confirm(`Stop “${agentTitle(a || { id })}”?\nWhat it did so far stays in its chat.`)) return;
+  if (btn) btn.disabled = true;
+  try { const r = await api(`/api/agents/${encodeURIComponent(id)}/cancel`, {}); if (r.agent) liveAgent(r.agent); toast("Agent stopped"); }
+  catch (e) { toast(e.message, true); if (btn) btn.disabled = false; }
+  renderAgents(); updateComposer();
+}
+/** An agent report card's Open: the agent's chat, or for a shell job its log in the strip. */
+function openAgent(id) {
+  const a = S.agents.get(id);
+  if (a?.sid) { openChat(a.sid); return; }
+  if (a?.kind === "shell" && a.parentSid === S.selected) {
+    // Unfold the strip too: an already-open log in a folded strip is otherwise a click with no effect.
+    S.agentsOpen.add(S.selected);
+    if (logOpen.has(id)) renderAgents(); else toggleLog(id);
+    $("#agentStrip").scrollIntoView?.({ block: "nearest" });
+    return;
+  }
+  toast(a ? "That agent has no chat" : "That agent is no longer known here", true);
+}
+function onAgent(a) {
+  if (!a?.id) return;
+  const prev = S.agents.get(a.id);
+  liveAgent(a);
+  if (a.parentSid === S.selected || prev?.parentSid === S.selected) scheduleAgents();
+  // A finished job's log gets its last lines once more.
+  if (logOpen.has(a.id) && AGENT_ACTIVE.has(prev?.status) && !AGENT_ACTIVE.has(a.status)) fetchLog(a.id);
+  if (a.sid && a.sid === S.selected) updateComposer();
+  if (a.sid && prev?.sid !== a.sid && document.body.classList.contains("panel-open")) history.render();
 }
 function updateTitle() {
   const s = S.sessions.get(S.selected);
-  const title = S.page === "chat" && s?.title ? s.title : "";
+  // An agent's chat goes by the title its parent gave the job, not the first line of its task prompt.
+  const title = S.page === "chat" && s ? agentFor(s.sid)?.title || s.title || "" : "";
   $("#topTitle").textContent = title;
   document.title = title ? `${title} · Omni Agent` : "Omni Agent";
 }
@@ -235,8 +416,18 @@ async function homeSend(text, o) {
   if (await goalCommand(text, home)) return;
   const cwd = homeCwd();
   if (!cwd) return toast("Set a working directory first", true);
-  home.setState({ disabled: true, caption: "Starting pi…" });
+  home.setState({ disabled: true, caption: remote.role === "remote" ? "Waiting for the host to approve…" : "Starting pi…" });
   try {
+    if (remote.role === "remote") {
+      // One request, one approval: the server starts pi (or a new session) and sends the message.
+      const r = await api("/api/pi/send", { cwd, message: text, memory: o.memory, graph: o.graph });
+      const st = await api("/api/state");
+      S.pi = st.pi;
+      S.sessions.set(r.sid, { ...(S.sessions.get(r.sid) || {}), sid: r.sid, harness: "pi", owned: true, cwd, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
+      openChat(r.sid);
+      home.clear();
+      return;
+    }
     if (!S.pi.running || (S.pi.cwd || "").toLowerCase() !== cwd.toLowerCase()) await api("/api/pi/start", { cwd }); else await api("/api/pi/new", {});
     const st = await api("/api/state");
     S.pi = st.pi;
@@ -259,6 +450,8 @@ $("#brand").onclick = () => showView("home");
 function target() {
   const s = S.sessions.get(S.selected);
   if (!s) return { kind: "none" };
+  // A background agent's chat talks to that agent (steer / follow up / resume), never to Omni's main pi.
+  if (isAgentChat(s)) { const a = agentFor(s.sid) || S.agents.get(s.agentId) || null; return { kind: "agent", s, a, id: a?.id || s.agentId || "", active: AGENT_ACTIVE.has(a?.status) }; }
   if (s.harness === "claude") return { kind: "claude", s };
   if (s.owned && S.pi.running && S.pi.sid === s.sid) return { kind: "owned-pi", s, streaming: !!s.streaming };
   const live = !s.owned && (s.streaming || Date.now() - Math.max(s.lastActivity || 0, s.mtime || 0) < liveWindowMs());
@@ -268,19 +461,37 @@ function updateComposer() {
   const t = target();
   const st = { streaming: false, disabled: false, caption: "", ...piModelState() };
   if (t.kind === "none") { st.caption = "Pick a chat"; st.disabled = true; }
+  else if (t.kind === "agent") {
+    // The agent's own model (its chat's, else what it was started with), never Omni's pi or its goal hook.
+    const model = t.s.model || t.a?.model || "";
+    Object.assign(st, { piModel: { provider: t.a?.provider || "", id: model || "agent's model" }, piThinking: t.a?.thinking || "", hook: null });
+    st.disabled = !t.id;
+    st.streaming = t.active;
+    st.caption = !t.id ? "Background agent · view only" : t.active ? `${agentKindLabel(t.a?.kind || t.s.agentKind)} at work · a message steers it, empty send stops it` : `${agentKindLabel(t.a?.kind || t.s.agentKind)} · ${t.a?.status || "finished"} · a message picks it up again`;
+  }
   else if (t.kind === "claude") { st.caption = "Claude Code chat · view only in Omni"; st.disabled = true; }
   else if (t.kind === "owned-pi") { st.streaming = t.streaming; st.caption = t.streaming ? "pi is working · a message steers it, empty send stops it" : "Omni's pi"; }
   else {
     const fork = S.forceFork || t.live;
     st.caption = fork ? `Forks ${t.live ? "the running " : "this "}pi chat into Omni` : "Continues this chat in Omni's pi";
   }
+  $("#chatComposer").classList.toggle("for-agent", t.kind === "agent");
   chat.setState(st);
 }
 async function chatSend(text, o) {
-  if (await goalCommand(text, chat)) return;
   const t = target();
+  // `/goal` drives Omni's own pi (the keeper); here it would quietly set that goal from an agent's chat.
+  if (t.kind === "agent" && /^\/goal\b/.test(text.trim())) { toast("/goal sets the goal of Omni's own pi. Type it in one of its chats; here, just tell the agent.", true); return; }
+  if (await goalCommand(text, chat)) return;
   try {
     if (t.kind === "owned-pi") { await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph }); chat.clear(); return; }
+    if (t.kind === "agent") {
+      if (!t.id) return;
+      const r = await api(`/api/agents/${encodeURIComponent(t.id)}/message`, { text });
+      chat.clear();
+      if (r.how === "resumed" || r.how === "restarted") toast(`Agent ${r.how} with your message`);
+      return;
+    }
     if (t.kind !== "continue") return;
     chat.setState({ disabled: true, caption: "Starting…" });
     const r = await api(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, fork: S.forceFork });
@@ -292,6 +503,7 @@ async function chatSend(text, o) {
 }
 async function chatStop() {
   const t = target();
+  if (t.kind === "agent") { if (t.id) await stopAgent(t.id); return; }
   try { if (t.kind === "owned-pi") await api("/api/pi/abort", {}); } catch (e) { toast(e.message, true); }
 }
 async function selectSession(sid) {
@@ -300,9 +512,9 @@ async function selectSession(sid) {
   S.forceFork = false;
   history.render();
   const s0 = S.sessions.get(sid);
-  const view = newView($("#transcript"), $("#transcriptWrap"), sid, { cwd: s0?.cwd });
+  const view = newView($("#transcript"), $("#transcriptWrap"), sid, { cwd: s0?.cwd, openAgent });
   S.view = view;
-  updateHeader(); updateComposer();
+  updateHeader(); updateComposer(); renderAgents();
   if (s0?.cwd) explorer.setRoot(s0.cwd);
   try {
     const fetchedAt = Date.now();
@@ -313,7 +525,9 @@ async function selectSession(sid) {
     view.cwd = s?.cwd || view.cwd;
     if (s?.cwd) explorer.setRoot(s.cwd);
     const seen = new Set();
-    for (const ev of h.events) { applyEvent(view, ev); if (ev.kind === "msg" && ev.id) seen.add(ev.id); }
+    // Agent reports the history lacks come from the buffered live copies, in their place (withLiveReports).
+    const events = withLiveReports(h.events, S.buffers.get(sid));
+    for (const ev of events) { applyEvent(view, ev); if (ev.kind === "msg" && ev.id) seen.add(ev.id); }
     // A reopened chat gets its plan back from the plan tool's results in the file (live events keep it current after).
     const histPlan = planFromEvents(h.events);
     if (histPlan && s && !((s.goalBox?.plan?.updatedAt || 0) > (histPlan.updatedAt || 0))) { goalBox(s).plan = histPlan; renderSummary(); }
@@ -322,14 +536,18 @@ async function selectSession(sid) {
     // partial text that is not written yet, so its stream parts (newer than the last file message) are replayed.
     const streaming = !!s?.streaming;
     for (const ev of S.buffers.get(sid) || []) {
-      if (ev.kind === "msg" && ev.id && seen.has(ev.id)) continue;
+      if ((ev.kind === "msg" && ev.id && seen.has(ev.id)) || agentReportKey(ev)) continue;
       if (ev.ts > fetchedAt) applyEvent(view, ev);
       else if (streaming && (ev.kind === "delta" || ev.kind === "block") && ev.ts > view.lastTs) applyEvent(view, ev);
     }
     if (!s?.streaming) finish(view);
     if (s?.forkedFrom) forkNote(view, { fromTitle: S.sessions.get(s.forkedFrom)?.title, onOpen: () => { selectSession(s.forkedFrom); } });
+    if (isAgentChat(s)) {
+      const parent = s.parentSid || agentFor(sid)?.parentSid;
+      agentNote(view, { kind: s.agentKind || agentFor(sid)?.kind, parentTitle: S.sessions.get(parent)?.title, onOpen: parent && S.sessions.has(parent) ? () => openChat(parent) : null });
+    }
     $("#transcriptWrap").scrollTop = $("#transcriptWrap").scrollHeight;
-    if (!h.events.length) emptyNote(view, "nothing here yet");
+    if (!events.length) emptyNote(view, "nothing here yet");
   } catch (e) { toast(`Could not load history: ${e.message}`, true); }
   updateHeader(); updateComposer();
   if (document.body.classList.contains("panel-open")) panel.renderStats();
@@ -356,6 +574,8 @@ function renderChatMenu() {
   item("Copy session id", () => navigator.clipboard?.writeText(s.sid.split(":").slice(1).join(":")).then(() => toast("Session id copied")).catch(() => {}));
   item("Tokens for this chat", () => panel.open("tokens"));
   if (s.forkedFrom) item("Open the original chat", () => selectSession(s.forkedFrom));
+  const parent = s.parentSid || agentFor(s.sid)?.parentSid;
+  if (parent && S.sessions.has(parent)) item("Open the chat that started this agent", () => openChat(parent));
   item("Delete this chat", () => deleteChat(s.sid));
   m.appendChild(el("div", "mh", `${s.harness} · ${s.cwd || ""}`));
 }
@@ -369,15 +589,24 @@ $("#btnSettings").onclick = () => settings.open();
 function connect() {
   const es = new EventSource(`/events?since=${S.seq}`);
   es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch { return; } handle(ev); };
+  // Only the host's own window receives these: remote changes waiting for Approve/Deny.
+  es.addEventListener("approvals", (m) => { try { remote.setApprovals(JSON.parse(m.data)); } catch { /* */ } });
   es.onerror = () => { $("#piStatus").textContent = "reconnecting"; es.close(); setTimeout(connect, 1500); };
 }
 let railTimer = null;
 function handle(ev) {
   S.seq = Math.max(S.seq, ev.seq || 0);
+  // A background agent's record changed (`sid` is its parent chat, or "agents"): no chat of its own to update.
+  if (ev.kind === "agent") { onAgent(ev.agent); return; }
   if (ev.kind === "removed") { S.sessions.delete(ev.sid); S.buffers.delete(ev.sid); if (S.selected === ev.sid) { S.selected = null; S.view = null; showView("home"); } history.render(); return; }
   if (ev.kind === "log") { if (ev.level === "system" && (ev.ts || 0) >= BOOT_TS) toast(ev.text); else if (ev.level === "graphify" && ev.text) panel.graphLine(ev.text.split("\n").pop()); else if (ev.level === "hook" && ev.text && (ev.ts || 0) >= BOOT_TS && /failed|gave up|not JSON/.test(ev.text)) toast(ev.text, true); return; }
   const s = S.sessions.get(ev.sid) || { sid: ev.sid, harness: ev.harness, lastActivity: 0, tally: null };
-  if (ev.kind === "session") Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title ? cleanTitle(ev.title) || undefined : undefined, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
+  if (ev.kind === "session") {
+    Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title ? cleanTitle(ev.title) || undefined : undefined, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
+    // A background agent's chat names the chat that started it and its agent (PiRpc / ClaudeRunner `meta`).
+    for (const k of ["parentSid", "agentId", "agentKind"]) if (ev[k]) s[k] = ev[k];
+    if (ev.agentId) S.agentSids.set(ev.sid, ev.agentId);
+  }
   if (ev.kind === "status") s.streaming = !!ev.streaming;
   if (ev.kind === "msg" && ev.role === "user" && !s.title) s.title = cleanTitle(ev.blocks?.[0]?.text || "");
   if (ev.kind === "msg" && ev.usage) { const t = s.tally || (s.tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, messages: 0, cost: 0, context: 0 }); if (!ev.groupId || t.lastGroup !== ev.groupId) { t.lastGroup = ev.groupId; t.input += ev.usage.input; t.output += ev.usage.output; t.cacheRead += ev.usage.cacheRead; t.cacheWrite += ev.usage.cacheWrite; t.total += ev.usage.total; t.messages++; t.context = ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite; t.cost += ev.cost || 0; } }
@@ -388,7 +617,8 @@ function handle(ev) {
   if (ev.kind === "goal") { Object.assign(goalBox(s), { goal: ev.goal || goalBox(s).goal, explicit: !!ev.explicit, done: !!ev.done, nudges: ev.nudges || 0, plan: ev.plan || goalBox(s).plan }); if (ev.sid === S.selected) renderSummary(); }
   if (ev.kind === "hook" && ev.attempt) { goalBox(s).nudges = ev.attempt; if (ev.sid === S.selected) renderSummary(); }
   S.sessions.set(ev.sid, s);
-  if (ev.harness === "pi" && s.owned) {
+  // A background pi agent is owned too, but it is its own pi process: it must not pass for Omni's main pi.
+  if (ev.harness === "pi" && s.owned && !isAgentChat(s)) {
     S.pi.running = true;
     if (ev.kind === "status") S.pi.streaming = !!ev.streaming;
     if (ev.kind === "session") { if (ev.cwd) S.pi.cwd = ev.cwd; if (ev.sessionId) S.pi.sid = ev.sid; if (ev.model) S.pi.state = { ...(S.pi.state || {}), model: { ...(S.pi.state?.model || {}), id: ev.model, provider: ev.provider || S.pi.state?.model?.provider }, thinkingLevel: ev.thinkingLevel || S.pi.state?.thinkingLevel }; loadPiChoices(); }
@@ -406,10 +636,12 @@ async function init() {
   initResizers();
   const st = await api("/api/state");
   S.config = st.config; S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || null;
-  for (const s of st.sessions) S.sessions.set(s.sid, s);
+  for (const s of st.sessions) { S.sessions.set(s.sid, s); if (s.agentId) S.agentSids.set(s.sid, s.agentId); }
+  loadAgents(st.agents);
   // The goal Omni's pi is working on right now (plan, status, re-engages) survives a page reload.
   if (st.goal && st.pi?.sid && S.sessions.get(st.pi.sid)) Object.assign(goalBox(S.sessions.get(st.pi.sid)), { goal: st.goal.goal, explicit: st.goal.explicit, plan: st.goal.plan, summary: st.goal.summary, summaryAt: st.goal.summaryAt, nudges: st.goal.nudges, done: st.goal.done });
-  if (st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0].replace(/\?token=.*/, ""); $("#lanInfo").title = "Open this on any device on your network; no login needed"; }
+  remote.init(st.access);
+  if (st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
   history.render();
   showView("home");

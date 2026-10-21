@@ -1,9 +1,9 @@
 @echo off
-REM Opens TCP 4400 in Windows Firewall so other devices on your network can reach Omni Agent.
+REM Opens TCP 4443 (the remote listener) in Windows Firewall so other devices, and a router port forward, can reach Omni Agent.
 REM Asks for administrator rights once (UAC), then adds/refreshes the rule.
 setlocal
 set "PORT=%~1"
-if "%PORT%"=="" set "PORT=4400"
+if "%PORT%"=="" set "PORT=4443"
 net session >nul 2>&1
 if %errorlevel% neq 0 (
   echo Requesting administrator rights to add the firewall rule for port %PORT%...

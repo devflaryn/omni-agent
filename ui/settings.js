@@ -1,8 +1,10 @@
-/* Providers dialog: pick a preset, paste a key, type the model ids. Writes pi's models.json through the server. */
-import { el, esc } from "./lib.js";
+/* Providers dialog: pick a preset, paste a key, type the model ids. Writes pi's models.json through the server.
+   Its Long runs tab holds the context policy (compaction cap, keep going on context stops): PUT /api/context. */
+import { el, esc, compactAtFromField, compactAtK } from "./lib.js";
 import { createMcpSettings } from "./mcp-settings.js";
 
-export function createSettings({ api, toast, onChanged }) {
+/** `getContext()` → the saved context policy (`/api/state.config.context`); `onContext(policy)` after a save. */
+export function createSettings({ api, toast, onChanged, loadRemote, getContext = () => null, onContext }) {
   const $ = (s) => document.querySelector(s);
   const modal = $("#settings"), list = $("#provList"), form = $("#provForm");
   const f = {
@@ -13,8 +15,8 @@ export function createSettings({ api, toast, onChanged }) {
   let editing = null; // provider name being edited, or null for a new one
 
   const mcp = createMcpSettings({ api, toast, onChanged });
-  // Two tabs in one dialog: the models pi can use, and the MCP servers it connects to.
-  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody"), sub: $("#subModels") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody"), sub: $("#subMcp") } };
+  // Four tabs in one dialog: the models pi can use, the MCP servers it connects to, remote access (host only) and long runs.
+  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody"), sub: $("#subModels") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody"), sub: $("#subMcp") }, remote: { btn: $("#tabRemote"), body: $("#remoteBody"), sub: $("#subRemote") }, long: { btn: $("#tabLong"), body: $("#longBody"), sub: $("#subLong") } };
   let tab = "models";
   function showTab(name) {
     tab = name;
@@ -23,10 +25,54 @@ export function createSettings({ api, toast, onChanged }) {
       t.btn.classList.toggle("active", on); t.btn.setAttribute("aria-selected", String(on));
       t.body.hidden = !on; t.sub.hidden = !on;
     }
-    if (name === "mcp") mcp.load(); else load();
+    if (name === "mcp") mcp.load(); else if (name === "remote") loadRemote?.(); else if (name === "long") renderLong(); else load();
   }
   tabs.models.btn.onclick = () => showTab("models");
   tabs.mcp.btn.onclick = () => showTab("mcp");
+  tabs.remote.btn.onclick = () => showTab("remote");
+  tabs.long.btn.onclick = () => showTab("long");
+
+  // ------------------------------------------------------------ long runs
+  function renderLong() {
+    const body = tabs.long.body;
+    const ctx = { compactAt: 256000, autoContinue: true, ...(getContext?.() || {}) };
+    body.innerHTML = "";
+    const wrap = el("div", "rm-wrap");
+    const sec = el("section", "rm-sec");
+    sec.appendChild(el("h3", null, "Context"));
+    const row = el("label", "lr-row");
+    const k = el("input");
+    k.type = "number"; k.min = "0"; k.step = "1"; k.id = "lrCompact"; k.value = String(compactAtK(ctx.compactAt));
+    row.append("Compact chats at", k, "k tokens", el("span", "pf-note", "0 = off"));
+    sec.appendChild(row);
+    sec.appendChild(el("p", "rm-note", "pi summarizes the older part of a chat once its prompt reaches this size, so a long run keeps a sharp model instead of filling the model's whole window. It applies to every model with a larger window; smaller ones keep pi's own limit."));
+    const chk = el("label", "lr-check");
+    const cb = el("input");
+    cb.type = "checkbox"; cb.id = "lrAuto"; cb.checked = ctx.autoContinue !== false;
+    chk.append(cb, "Keep going when the model stops for context");
+    sec.appendChild(chk);
+    sec.appendChild(el("p", "rm-note", "Models sometimes stop mid-task to say their context is nearly full. Omni then compacts if it needs to and tells the model to carry on, even with the goal hook off. A question to you, a finished answer or your Stop is left alone."));
+    const save = el("button", "btn primary", "Save");
+    save.onclick = async () => {
+      const p = compactAtFromField(k.value, ctx.compactAt);
+      if (p.error) { toast(p.error, true); k.focus(); return; }
+      const patch = { compactAt: p.compactAt, autoContinue: cb.checked };
+      save.disabled = true;
+      try {
+        const r = await api("/api/context", patch, "PUT");
+        const saved = r.context || { ...ctx, ...patch };
+        onContext?.(saved);
+        ctx.compactAt = saved.compactAt;
+        k.value = String(compactAtK(saved.compactAt));
+        toast(`${saved.compactAt ? `Chats compact at ${compactAtK(saved.compactAt)}k tokens` : "Compaction cap off"} · ${saved.autoContinue ? "keeps going on context stops" : "context stops are left alone"}${r.restarted ? " · pi restarted" : ""}`);
+      } catch (e) { toast(e.message, true); }
+      finally { save.disabled = false; }
+    };
+    k.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save.click(); } });
+    sec.appendChild(save);
+    wrap.appendChild(sec);
+    body.appendChild(wrap);
+  }
 
   function open(which = tab) { modal.hidden = false; showTab(which); }
   function close() { modal.hidden = true; }

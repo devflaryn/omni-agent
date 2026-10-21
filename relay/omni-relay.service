@@ -1,0 +1,37 @@
+[Unit]
+Description=Omni relay: public port -> Omni PC's SSH tunnel (TLS passed through untouched)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PUBLIC_PORT=4443 TUNNEL_PORT=14443
+ExecStart=/usr/bin/node /opt/omni-relay/omni-relay.mjs
+Restart=always
+RestartSec=2
+# A throwaway unprivileged user and a read-only view of the system: the relay needs nothing else.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

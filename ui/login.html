@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="dark" />
+<meta name="theme-color" content="#212121" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Sign in · Omni Agent</title>
+<style>
+  :root { --ground: #212121; --field: #2f2f2f; --line: #464646; --ink: #ececec; --muted: #b4b4b4; --dim: #8f8f8f; --err: #f87171; --link: #7ab7ff;
+    --font: ui-sans-serif, -apple-system, system-ui, "Segoe UI Variable", "Segoe UI", Helvetica, Arial, sans-serif; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--ground); color: var(--ink); font: 15px/1.5 var(--font); display: grid; place-items: center; padding: 24px 16px; -webkit-font-smoothing: antialiased; }
+  main { width: min(360px, 100%); text-align: center; }
+  .mark { width: 14px; height: 14px; border-radius: 50%; background: var(--ink); margin: 0 auto 28px; }
+  h1 { font-size: 28px; font-weight: 500; letter-spacing: -0.015em; margin: 0 0 8px; }
+  p { color: var(--muted); margin: 0 0 28px; font-size: 14px; }
+  form { display: grid; gap: 12px; }
+  input { width: 100%; background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 999px; padding: 14px 20px; font: inherit; font-size: 16px; outline: none; transition: border-color 0.12s; }
+  input:focus { border-color: var(--link); }
+  input::placeholder { color: var(--dim); }
+  button { background: var(--ink); color: #0d0d0d; border: 0; border-radius: 999px; padding: 14px 20px; font: inherit; font-size: 16px; font-weight: 500; cursor: pointer; transition: opacity 0.12s; }
+  button:hover { opacity: 0.88; }
+  button[disabled] { opacity: 0.5; cursor: default; }
+  button:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+  .err { color: var(--err); font-size: 13.5px; min-height: 1.5em; margin: 2px 0 0; }
+  .note { color: var(--dim); font-size: 12.5px; margin: 28px 0 0; line-height: 1.55; }
+</style>
+</head>
+<body>
+<main>
+  <div class="mark" aria-hidden="true"></div>
+  <h1>Omni Agent</h1>
+  <p>Enter the password set on the host computer.</p>
+  <form id="f">
+    <input id="pw" type="password" autocomplete="current-password" placeholder="Password" aria-label="Password" required autofocus />
+    <button id="go" type="submit">Continue</button>
+    <div class="err" id="err" role="alert"></div>
+  </form>
+  <div class="note" id="note">You'll see everything read-only. Anything you send or change waits until the host approves it on that computer.</div>
+</main>
+<script>
+  const f = document.getElementById("f"), pw = document.getElementById("pw"), go = document.getElementById("go"), err = document.getElementById("err"), note = document.getElementById("note");
+  f.onsubmit = async (e) => {
+    e.preventDefault();
+    go.disabled = true; err.textContent = "";
+    // A device the host has not approved before waits here until they press Approve on that computer.
+    const slow = setTimeout(() => { go.textContent = "Waiting for the host…"; note.textContent = "This device is new. The host has to approve it once on that computer; it is remembered after that."; }, 1500);
+    try {
+      const r = await fetch("/api/remote/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ password: pw.value }) });
+      clearTimeout(slow); go.textContent = "Continue";
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.ok) { location.replace("/"); return; }
+      err.textContent = j.error ? j.error.charAt(0).toUpperCase() + j.error.slice(1) + "." : `Sign-in failed (${r.status}).`;
+      pw.select();
+    } catch { clearTimeout(slow); go.textContent = "Continue"; err.textContent = "Could not reach the host."; }
+    go.disabled = false;
+  };
+</script>
+</body>
+</html>
