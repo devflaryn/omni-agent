@@ -243,6 +243,26 @@ test("provider saved → opencode.json provider entry", () => {
   assert.equal(listProviders(f)[2].keyHint, "$ENVY_KEY");
 });
 
+test("migration: a key pi had for a built-in provider OpenCode is not connected to is pointed out (never logged)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-ocmig-key-"));
+  const from = join(dir, "pi", "models.json"), to = join(dir, "omni", "opencode-providers.json");
+  mkdirSync(join(dir, "pi"), { recursive: true });
+  writeFileSync(from, JSON.stringify({ providers: {
+    openrouter: { baseUrl: "https://openrouter.ai/api/v1", apiKey: "sk-or-SECRET1", models: [{ id: "known/one" }] }, // nothing to add, not connected
+    groq: { baseUrl: "https://api.groq.com/openai/v1", apiKey: "gsk-SECRET2", models: [{ id: "new/model" }] }, // extended, not connected
+    deepseek: { baseUrl: "https://api.deepseek.com/v1", apiKey: "ds-SECRET3", models: [{ id: "c" }] }, // connected: OpenCode has its key
+    mistral: { baseUrl: "https://api.mistral.ai/v1", models: [{ id: "m" }] }, // pi had no key
+  } }));
+  const catalog = { all: [
+    { id: "openrouter", models: { "known/one": { id: "known/one" } } }, { id: "groq", models: {} },
+    { id: "deepseek", models: { c: { id: "c" } } }, { id: "mistral", models: { m: { id: "m" } } },
+  ], connected: ["deepseek"] };
+  const r = migratePiProviders({ from, to, catalog });
+  const keyLines = r.lines.filter((l) => /pi had a key for/.test(l));
+  assert.deepEqual(keyLines, ["Providers: pi had a key for openrouter; set it in Providers.", "Providers: pi had a key for groq; set it in Providers."]);
+  assert.ok(!r.lines.some((l) => /SECRET/.test(l)), "no key is ever logged");
+});
+
 test("migration copies models.json once", () => {
   const dir = mkdtempSync(join(tmpdir(), "omni-ocmig-"));
   const from = join(dir, "pi", "models.json"), to = join(dir, "omni", "opencode-providers.json");

@@ -385,6 +385,8 @@ export function migratePiProviders({ from, to, catalog = null }) {
     let why = null;
     if (Object.hasOwn(store.providers, name)) why = `Omni already has a provider named ${name}`;
     else if (known.has(name)) {
+      // OpenCode's own provider keeps its own key (its auth store): one pi had is not carried over, only pointed out.
+      if (String(p.apiKey || "").trim() && !connected.has(name)) lines.push(`Providers: pi had a key for ${name}; set it in Providers.`);
       const lacks = new Set(ids.filter((id) => !Object.hasOwn(known.get(name)?.models || {}, id)));
       if (!lacks.size) why = `OpenCode already has a provider named ${name}${connected.has(name) ? " (connected)" : ""} with every model pi listed for it`;
       else {
