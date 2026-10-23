@@ -290,11 +290,14 @@ test("on Windows spawns opencode.cmd through the shell with fixed args and stop(
   let password = null;
   const oc = await fakeOpencode({ password: () => password });
   const fake = fakeSpawn(() => oc.url);
-  const server = new OpencodeServer({ spawn: fake.spawn, platform: "win32", configDir: "C:\\cfg", password: "given", backoff });
+  const server = new OpencodeServer({ spawn: fake.spawn, platform: "win32", configDir: "C:\\cfg", password: "given", backoff, env: { OPENCODE_SERVER_USERNAME: "from-config" } });
   password = "given";
+  const inherited = process.env.OPENCODE_SERVER_USERNAME;
+  process.env.OPENCODE_SERVER_USERNAME = "admin"; // the user's own shell may set one for their opencode
   try {
     await server.start();
     const [launch] = fake.launches();
+    assert.ok(!("OPENCODE_SERVER_USERNAME" in launch.opts.env), "no username but the basic-auth one Omni sends (opencode)");
     assert.equal(launch.cmd, `opencode.cmd ${SERVE_ARGS.join(" ")}`, "one fixed command line");
     assert.deepEqual(launch.args, [], "no args array with shell:true (DEP0190)");
     assert.equal(launch.opts.shell, true);
@@ -304,6 +307,7 @@ test("on Windows spawns opencode.cmd through the shell with fixed args and stop(
     assert.deepEqual(kill.args, ["/pid", String(fake.children[0].pid), "/T", "/F"]);
     await waitFor(() => fake.children[0].exited);
   } finally {
+    if (inherited === undefined) delete process.env.OPENCODE_SERVER_USERNAME; else process.env.OPENCODE_SERVER_USERNAME = inherited;
     server.stop();
     await oc.close();
   }

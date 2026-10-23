@@ -152,6 +152,8 @@ export class OpencodeServer extends EventEmitter {
     let cmd = win && !/\.(cmd|bat|exe)$/i.test(this.bin) ? `${this.bin}.cmd` : this.bin;
     if (win && /\s/.test(cmd)) cmd = `"${cmd}"`;
     const env = { ...process.env, ...this.env, OPENCODE_SERVER_PASSWORD: this.password };
+    // Basic auth is sent as user "opencode" (authHeader), OpenCode's default: an inherited username would not match it.
+    delete env.OPENCODE_SERVER_USERNAME;
     if (this.configDir) env.OPENCODE_CONFIG_DIR = this.configDir;
     // Through the shell the argv is one fixed command line (an args array with shell:true is deprecated, DEP0190).
     const child = win
