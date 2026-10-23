@@ -7,6 +7,7 @@ import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from "node:child_proce
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
+import { constants as osConstants } from "node:os";
 import { createLineSplitter } from "./jsonl.mjs";
 import { restartDelay, nextRestartState } from "./watchdog.mjs";
 
@@ -120,16 +121,13 @@ export class OpencodeServer extends EventEmitter {
   }
 
   /**
-   * For Omni's process `exit` handler, where nothing asynchronous runs any more: ends the child's tree before
-   * returning (a spawned taskkill would not outlive the wait), so no `opencode serve` outlives Omni. Never relaunches.
+   * stop(), but the child's tree is ended before this returns (a spawned taskkill may never run when the process
+   * exits right after): for Omni's close() and its process `exit` handler, so no `opencode serve` outlives Omni.
    */
   killSync() {
-    this.stopped = true;
-    clearTimeout(this.restartTimer);
-    this.restartTimer = null;
-    this.closeEvents();
     const child = this.child;
     this.child = null;
+    this.stop();
     if (!child) return;
     if (this.platform === "win32" && child.pid) {
       try { this.spawnSyncFn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore", timeout: 10000 }); return; } catch { /* fall through */ }
@@ -355,4 +353,29 @@ export class OpencodeServer extends EventEmitter {
       req.end(payload ?? undefined);
     });
   }
+}
+
+const EXIT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+/**
+ * Makes sure `server`'s child dies with this process, whatever the entry point (index.mjs, scripts/run.mjs,
+ * scripts/headless.mjs): its `exit` ends the child synchronously, and a terminating signal nobody else handles
+ * ends the child, then the process (128 + signal number, as the default action would). When an entry point
+ * handles the signal itself (index.mjs: close(), then exit), it is left to that handler. `release()` drops the
+ * signal handlers (the `exit` one stays: the child must still die with the process).
+ */
+export function guardOpencodeExit(server, { proc = process, platform = process.platform, exit = (code) => proc.exit(code) } = {}) {
+  const kill = () => { try { server.killSync?.(); } catch { /* exiting anyway */ } };
+  proc.on("exit", kill);
+  const handlers = new Map();
+  for (const sig of platform === "win32" ? [...EXIT_SIGNALS, "SIGBREAK"] : EXIT_SIGNALS) {
+    const fn = () => {
+      if (proc.listenerCount(sig) > 1) return;
+      kill();
+      exit(128 + (osConstants.signals[sig] || 0));
+    };
+    handlers.set(sig, fn);
+    proc.on(sig, fn);
+  }
+  return { release() { for (const [sig, fn] of handlers) proc.off(sig, fn); handlers.clear(); } };
 }

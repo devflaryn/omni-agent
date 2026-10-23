@@ -18,7 +18,7 @@ import { handleAgentRoutes } from "./agent-routes.mjs";
 import { applyContextCaps } from "./context-policy.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
-import { OpencodeServer } from "./opencode-server.mjs";
+import { OpencodeServer, guardOpencodeExit } from "./opencode-server.mjs";
 import { OpencodeRpc, allowTools, findModel, inCatalog, modelPick, modelThinking, pickerModels, runOnce } from "./opencode-rpc.mjs";
 import { writeOpencodeConfig } from "./opencode-config.mjs";
 import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM } from "./hook.mjs";
@@ -108,11 +108,22 @@ export async function createApp(overrides = {}) {
     },
   });
   const noRealOpencode = underTest && !cfg.opencodeServer && !("opencodeBin" in overrides);
+  /**
+   * The process whose exit (and unhandled terminating signals) must take Omni's own `opencode serve` along, whatever
+   * entry point runs this app: the real process for a server Omni spawns (never under node --test); a test passes
+   * its own stand-in as `cfg.exitGuardProcess`.
+   */
+  const exitGuardProc = cfg.exitGuardProcess || (cfg.opencodeServer || underTest ? null : process);
+  let exitGuard = null;
   let opencodeStart = null;
+  /** The server was asked for (a chat, an agent, a side call): a config change may start it again after a failed start. */
+  let opencodeWanted = false;
   /** Starts the shared server once (its config written first); a failed start is tried again by the next call. */
   function ensureOpencode() {
     if (opencodeStart) return opencodeStart;
     if (noRealOpencode) return Promise.reject(new Error("no opencode server under node --test (pass cfg.opencodeServer)"));
+    opencodeWanted = true;
+    if (exitGuardProc && !exitGuard) exitGuard = guardOpencodeExit(opencode, { proc: exitGuardProc });
     opencodeStart = (async () => {
       writeConfig();
       await opencode.start();
@@ -185,7 +196,13 @@ export async function createApp(overrides = {}) {
    */
   async function reloadOpencode() {
     writeConfig();
-    if (!opencode.up) return { restarted: false, pending: false };
+    if (!opencode.up) {
+      // Its first start failed (a bad config, say): the fixed config is worth another start. A server that is only
+      // relaunching after a crash reads the new config by itself; one nobody asked for yet reads it at its start.
+      if (!opencodeWanted || opencodeStart) return { restarted: false, pending: false };
+      ensureOpencode().catch(() => {});
+      return { restarted: true, pending: false };
+    }
     if (opencodeBusy()) { reloadPending = true; return { restarted: false, pending: true }; }
     await disposeOpencode();
     return { restarted: true, pending: false };
@@ -294,8 +311,7 @@ export async function createApp(overrides = {}) {
     // A pi agent is a chat of its own on the shared server: its persona goes with each prompt (system + tool allowlist).
     // Its OMNI_AGENT_* env cannot reach a shared server; the plugin derives an agent's identity server-side (Task 6).
     createPi: cfg.createAgentPi || ((o) => {
-      ensureOpencode().catch(() => {});
-      const child = new OpencodeRpc({ server: opencode, bus, cwd: o.cwd, provider: o.model ? o.provider : cfg.piProvider, model: o.model || cfg.piModel, thinking: o.thinking || cfg.piThinking, system: o.system || "", tools: allowTools(o.tools), meta: o.meta, mirrorDir: cfg.opencodeMirrorDir, compactAt: cfg.context?.compactAt });
+      const child = new OpencodeRpc({ server: opencode, ensureServer: ensureOpencode, bus, cwd: o.cwd, provider: o.model ? o.provider : cfg.piProvider, model: o.model || cfg.piModel, thinking: o.thinking || cfg.piThinking, system: o.system || "", tools: allowTools(o.tools), meta: o.meta, mirrorDir: cfg.opencodeMirrorDir, compactAt: cfg.context?.compactAt });
       child.startWatchdog({ stallMs: cfg.stallMs, toolStallMs: cfg.toolStallMs });
       return child;
     }),
@@ -367,10 +383,9 @@ export async function createApp(overrides = {}) {
   function startPi(cwd = cfg.cwd, { current = true } = {}) {
     let c;
     if (cfg.createPi) c = cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking });
-    else {
-      ensureOpencode().catch(() => {});
-      c = new OpencodeRpc({ server: opencode, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, bus, mirrorDir: cfg.opencodeMirrorDir, compactAt: cfg.context?.compactAt });
-    }
+    // The chat starts the shared server itself whenever it needs it and it is not running (ensureServer): its first
+    // session, and every prompt after a failed start.
+    else c = new OpencodeRpc({ server: opencode, ensureServer: ensureOpencode, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, bus, mirrorDir: cfg.opencodeMirrorDir, compactAt: cfg.context?.compactAt });
     // A new child is claimed for the chat it is started for: no other chat takes it before its first prompt.
     c.lastUsedAt = c.claimedAt = Date.now();
     // The auto-restart path re-attaches the goal: crashedSid is this child's sid before the crash, c.sid the resumed one (C1).
@@ -1228,8 +1243,10 @@ export async function createApp(overrides = {}) {
     for (const c of [...pis]) c.stop();
     agents.stopAll();
     agents.dispose();
-    // The shared `opencode serve` never outlives Omni (an injected one is stopped too).
-    try { opencode.stop(); } catch (e) { log("could not stop opencode", e.message); }
+    // The shared `opencode serve` never outlives Omni (an injected one is stopped too): its tree is ended before this
+    // returns, since scripts exit right after close(). The exit hook stays (a later process.exit still kills).
+    try { if (typeof opencode.killSync === "function") opencode.killSync(); else opencode.stop(); } catch (e) { log("could not stop opencode", e.message); }
+    exitGuard?.release();
     claude.stopAll();
     approvals.dispose();
     for (const res of hostStreams) { try { res.end(); } catch { /* */ } }
@@ -1245,8 +1262,6 @@ export async function createApp(overrides = {}) {
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || process.argv[1]?.endsWith("index.mjs")) {
   const app = await createApp();
-  // Whatever ends Omni's process (a signal, /api/shutdown, a fatal error), its `opencode serve` ends with it.
-  process.on("exit", () => app.opencode.killSync?.());
   await app.listen();
   const bye = () => { app.close(); process.exit(0); };
   process.on("SIGINT", bye);

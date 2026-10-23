@@ -704,7 +704,75 @@ test("opencode: a provider or MCP change rewrites opencode.json and disposes the
   assert.equal(app4.pis.find((c) => c.sid === ocSid), chat, "the chat keeps going on the same server");
 });
 
-test("opencode: close() stops the opencode server", async () => {
+test("opencode: close() ends the opencode server synchronously (a script exits right after it)", async () => {
   app4.close();
   assert.equal(oc.stops, 1);
+  assert.equal(oc.killSyncs, 1);
+});
+
+test("opencode: an injected server gets no process exit hooks unless asked", () => {
+  // app4 opened chats on its injected server above: under test, nothing touched the real process.
+  assert.equal(process.listeners("exit").some((f) => /killSync/.test(String(f))), false);
+});
+
+// ---------------------------------------------- a failed first start, and the exit guard
+const failBase = mkdtempSync(join(tmpdir(), "omni-oc-fail-"));
+const failOpts = (dir, extra) => ({ relay: { host: "" }, port: 0, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi-sessions"), claudeProjectsDir: join(dir, "claude"), autoStartPi: false, cwd: dir, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeConfigDir: join(dir, "oc-config"), piExtConfigFile: join(dir, "pi-agent", "omni-agent.json"), piModelsFile: join(dir, "pi-agent", "models.json"), piProvider: "opencode", piModel: "big-pickle", ...extra });
+
+test("opencode: a failed first start is tried again when a chat is used, and the guard is set up once", async () => {
+  const proc = new EventEmitter();
+  const srv = new FakeServer({ up: false, failStarts: 1 });
+  const app = await createApp(failOpts(failBase, { opencodeServer: srv, exitGuardProcess: proc }));
+  await app.listen();
+  const port = app.server.address().port;
+  const post = async (path, body) => { const r = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); return { status: r.status, json: await r.json().catch(() => ({})) }; };
+  try {
+    const first = await post("/api/pi/open", { cwd: failBase });
+    assert.notEqual(first.status, 200, "the server could not start");
+    assert.equal(srv.starts, 1);
+    const chat = app.pis[0];
+    assert.ok(chat && !chat.proc, "the chat exists but has no session");
+    // The chat's next prompt starts the server again and goes through.
+    const r = await Promise.race([chat.prompt("again", { echo: false }), sleep(3000).then(() => "the prompt hung waiting for a server nobody starts")]);
+    assert.deepEqual(r, { success: true });
+    assert.equal(srv.starts, 2);
+    assert.ok(srv.calls.some((c) => /prompt_async$/.test(c.path)));
+    const second = await post("/api/pi/open", { cwd: failBase });
+    assert.equal(second.status, 200);
+    assert.equal(proc.listenerCount("exit"), 1, "one exit hook, however often the server is ensured");
+    assert.equal(proc.listenerCount("SIGINT"), 1);
+    proc.emit("exit", 0);
+    assert.equal(srv.killSyncs, 1, "Omni's process exit ends the server");
+  } finally { app.close(); }
+  assert.equal(proc.listenerCount("SIGINT"), 0, "close() drops the signal handlers");
+  assert.equal(proc.listenerCount("exit"), 1, "the exit kill stays");
+});
+
+test("opencode: a config change starts a server whose first start failed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-oc-fail2-"));
+  const srv = new FakeServer({ up: false, failStarts: 1 });
+  const app = await createApp(failOpts(dir, { opencodeServer: srv }));
+  await app.listen();
+  const port = app.server.address().port;
+  try {
+    const open = await fetch(`http://127.0.0.1:${port}/api/pi/open`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cwd: dir }) });
+    assert.notEqual(open.status, 200);
+    assert.equal(srv.up, false);
+    const r = await fetch(`http://127.0.0.1:${port}/api/mcp/fixed`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: "node" }) });
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).restarted, true);
+    for (let i = 0; i < 50 && !srv.up; i++) await sleep(10);
+    assert.equal(srv.up, true, "started with the fixed config");
+    assert.equal(srv.starts, 2);
+    const conf = JSON.parse(readFileSync(join(dir, "oc-config", "opencode.json"), "utf8"));
+    assert.deepEqual(conf.mcp.fixed, { type: "local", command: ["node"] });
+    // A server that was never wanted is not started by a config change.
+    const idle = new FakeServer({ up: false });
+    const app2b = await createApp(failOpts(mkdtempSync(join(tmpdir(), "omni-oc-idle-")), { opencodeServer: idle }));
+    await app2b.listen();
+    const r2 = await fetch(`http://127.0.0.1:${app2b.server.address().port}/api/mcp/x`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: "node" }) });
+    assert.equal((await r2.json()).restarted, false);
+    assert.equal(idle.starts, 0);
+    app2b.close();
+  } finally { app.close(); }
 });

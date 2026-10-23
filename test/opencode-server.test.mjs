@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { EventEmitter, once } from "node:events";
 import { PassThrough } from "node:stream";
-import { OpencodeServer, sessionIdOf } from "../server/opencode-server.mjs";
+import { OpencodeServer, guardOpencodeExit, sessionIdOf } from "../server/opencode-server.mjs";
 
 const SERVE_ARGS = ["serve", "--port", "0", "--hostname", "127.0.0.1"];
 /** Fast back-off so reconnects and restarts happen within a test. */
@@ -334,6 +334,41 @@ test("killSync() ends the child before Omni's process exits: taskkill /T synchro
   lin.killSync();
   assert.deepEqual(killed, ["SIGTERM"]);
   assert.equal(lin.child, null);
+});
+
+test("guardOpencodeExit: the process's exit kills the child; an unhandled signal kills it and exits; a handled one is left to its handler", () => {
+  const proc = new EventEmitter();
+  const kills = [], exits = [];
+  const g = guardOpencodeExit({ killSync: () => kills.push(1) }, { proc, platform: "linux", exit: (c) => exits.push(c) });
+  assert.equal(proc.listenerCount("exit"), 1);
+  proc.emit("exit", 0);
+  assert.equal(kills.length, 1);
+  proc.emit("SIGINT", "SIGINT");
+  assert.deepEqual([kills.length, exits], [2, [130]], "nobody else handles SIGINT: kill, then exit like the default action");
+  const bye = [];
+  proc.on("SIGTERM", () => bye.push("close+exit"));
+  proc.emit("SIGTERM", "SIGTERM");
+  assert.deepEqual([kills.length, exits, bye], [2, [130], ["close+exit"]], "the entry point's own handler does it");
+  assert.equal(proc.listenerCount("SIGBREAK"), 0, "SIGBREAK only on Windows");
+  g.release();
+  assert.equal(proc.listenerCount("SIGINT"), 0);
+  assert.equal(proc.listenerCount("exit"), 1, "the exit kill stays after release");
+  const win = new EventEmitter();
+  guardOpencodeExit({ killSync() {} }, { proc: win, platform: "win32", exit() {} });
+  assert.equal(win.listenerCount("SIGBREAK"), 1);
+});
+
+test("killSync() also does stop()'s bookkeeping: down, waiters rejected, no restart", async () => {
+  const s = new OpencodeServer({ platform: "linux" });
+  s.stopped = false;
+  const killed = [];
+  s.child = { pid: 5, kill: (sig) => killed.push(sig) };
+  const waiter = s.waitUp(); // a chat waiting for the server to come up
+  let down = 0; s.on("down", () => down++);
+  s.up = true; // as if the event stream were connected
+  s.killSync();
+  await assert.rejects(waiter, /stopped/);
+  assert.deepEqual([killed, s.up, s.stopped, down], [["SIGTERM"], false, true, 1]);
 });
 
 test("start() rejects when the child exits before listening, without a restart loop", async () => {

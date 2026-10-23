@@ -21,7 +21,7 @@ export const CATALOG = {
  * `catalog` replaces the `GET /provider` answer; `start`/`stop` are counted.
  */
 export class FakeServer extends EventEmitter {
-  constructor({ reply, catalog = CATALOG, up = true } = {}) {
+  constructor({ reply, catalog = CATALOG, up = true, failStarts = 0 } = {}) {
     super();
     this.calls = [];
     this.fns = new Map();
@@ -34,15 +34,32 @@ export class FakeServer extends EventEmitter {
     this.catalog = catalog;
     this.starts = 0;
     this.stops = 0;
+    this.killSyncs = 0;
+    /** The next this-many start() calls fail like a bad config does. */
+    this.failStarts = failStarts;
     this.reply = reply || (() => undefined);
   }
 
   async start() {
     this.starts++;
+    if (this.failStarts > 0) {
+      // Like OpencodeServer: a failed start() stops the server, which rejects whoever waits for it to come up.
+      this.failStarts--;
+      this.emit("stopped");
+      throw new Error("opencode serve exited (code 1) before listening: bad config");
+    }
     if (!this.up) { this.up = true; this.proc = { pid: 4242 }; this.emit("up"); }
   }
-  stop() { this.stops++; if (this.up) { this.up = false; this.proc = null; this.emit("down"); } }
-  waitUp() { return this.up ? Promise.resolve() : new Promise((r) => this.once("up", r)); }
+  stop() { this.stops++; if (this.up) { this.up = false; this.proc = null; this.emit("down"); } this.emit("stopped"); }
+  killSync() { this.killSyncs++; this.stop(); }
+  waitUp() {
+    if (this.up) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const up = () => { this.off("stopped", stopped); resolve(); };
+      const stopped = () => { this.off("up", up); reject(new Error("opencode server stopped")); };
+      this.once("up", up).once("stopped", stopped);
+    });
+  }
 
   async request(method, path, opts = {}) {
     this.calls.push({ method, path, ...opts });

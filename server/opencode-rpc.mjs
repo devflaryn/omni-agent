@@ -175,12 +175,15 @@ export function piTranscript(entries) {
 /**
  * Emits "pi" (every pi RPC event, as PiRpc does) and "exit" (null) when stop() ends the chat. `env` is accepted for
  * PiRpc parity only: the shared server's environment applies. `system`/`tools` are sent with every prompt (a
- * background agent's persona; `tools` is OpenCode's `{name: boolean}` map, see allowTools). `compactAt` > 0 compacts before a prompt once the last turn's context exceeded it.
+ * background agent's persona; `tools` is OpenCode's `{name: boolean}` map, see allowTools). `ensureServer()` (a
+ * promise) starts the shared server when the chat needs it and it is not running. `compactAt` > 0 compacts before a prompt once the last turn's context exceeded it.
  */
 export class OpencodeRpc extends EventEmitter {
-  constructor({ server, cwd, model = "", provider = "", thinking = "", env = {}, bus, meta = {}, system = "", tools = null, mirrorDir, compactAt = 0 }) {
+  constructor({ server, cwd, model = "", provider = "", thinking = "", env = {}, bus, meta = {}, system = "", tools = null, mirrorDir, compactAt = 0, ensureServer = null }) {
     super();
     this.server = server;
+    /** Starts the shared server when it is not running (index.mjs ensureOpencode): a failed start is tried again by the next prompt. */
+    this.ensureServer = typeof ensureServer === "function" ? ensureServer : null;
     this.cwd = cwd;
     this.model = model;
     this.provider = provider;
@@ -270,7 +273,8 @@ export class OpencodeRpc extends EventEmitter {
     this.booting = true;
     this.ready = (async () => {
       try {
-        if (!this.alive && typeof this.server.waitUp === "function") await this.server.waitUp();
+        if (!this.alive && this.ensureServer) await this.ensureServer();
+        if (!this.alive && !this.server.up && typeof this.server.waitUp === "function") await this.server.waitUp();
         await this.createSession(gen);
         return this.state;
       } catch (e) {
