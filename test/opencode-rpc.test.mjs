@@ -1,77 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { OpencodeRpc } from "../server/opencode-rpc.mjs";
+import { OpencodeRpc, RUN_ONCE_TOOLS, allowTools, modelThinking, runOnce } from "../server/opencode-rpc.mjs";
+import { FakeServer } from "./helpers/fake-opencode.mjs";
 import { normalizePiEntry } from "../server/normalize.mjs";
 import { latestPlan } from "../ui/plan.js";
 
 const fx = JSON.parse(readFileSync(new URL("./fixtures/opencode-turn.json", import.meta.url), "utf8"));
-
-const CATALOG = {
-  all: [
-    { id: "opencode", name: "OpenCode Zen", models: {
-      "big-pickle": { id: "big-pickle", name: "Big Pickle", limit: { context: 200000, output: 32000 }, reasoning: true, variants: { none: {}, low: {}, high: {}, medium: {} }, cost: { input: 0, output: 0 }, status: "active" },
-      plain: { id: "plain", name: "Plain", limit: { context: 8000, output: 1000 }, reasoning: false, cost: { input: 1, output: 2 } },
-      think: { id: "think", name: "Thinker", limit: { context: 8000, output: 1000 }, reasoning: true, variants: { high: {}, max: {} } },
-      old: { id: "old", name: "Old", limit: { context: 1, output: 1 }, status: "deprecated" },
-    } },
-    { id: "anthropic", name: "Anthropic", models: { x: { id: "x", name: "X", limit: { context: 1, output: 1 } } } },
-  ],
-  connected: ["opencode"],
-  default: { opencode: "big-pickle" },
-};
-
-/**
- * Stands in for OpencodeServer: `request` records every call and answers from small defaults (`reply` overrides
- * them), `listen` keeps the session's listener so `push` can feed it payloads; emits "down"/"up" when told to.
- */
-class FakeServer extends EventEmitter {
-  constructor({ reply } = {}) {
-    super();
-    this.calls = [];
-    this.fns = new Map();
-    this.up = true;
-    this.proc = { pid: 4242 };
-    this.url = "http://127.0.0.1:1";
-    this.n = 0;
-    this.history = new Map();
-    this.status = {};
-    this.reply = reply || (() => undefined);
-  }
-
-  async request(method, path, opts = {}) {
-    this.calls.push({ method, path, ...opts });
-    if (!this.up) throw new Error("opencode server is not running");
-    const own = await this.reply(method, path, opts);
-    if (own !== undefined) { if (own instanceof Error) throw own; return own; }
-    let m;
-    if (method === "POST" && path === "/session") return { id: `ses_fake${++this.n}`, title: "New session - 2026-10-23T00:00:00.000Z" };
-    if (method === "GET" && path === "/provider") return CATALOG;
-    if (method === "GET" && path === "/session/status") return this.status;
-    if (method === "POST" && (m = /^\/session\/([^/]+)\/fork$/.exec(path))) return { id: `ses_fork${++this.n}`, title: "fork" };
-    if (method === "GET" && (m = /^\/session\/([^/]+)\/message$/.exec(path))) return this.history.get(m[1]) || [];
-    if (method === "GET" && (m = /^\/session\/([^/]+)$/.exec(path))) return { id: m[1], title: m[1] === "ses_titled" ? "Fix the build" : "New session - 2026-10-23T00:00:00.000Z" };
-    if (/prompt_async$/.test(path)) return null;
-    return true;
-  }
-
-  listen(sessionID, fn) {
-    if (!this.fns.has(sessionID)) this.fns.set(sessionID, new Set());
-    this.fns.get(sessionID).add(fn);
-    return () => this.fns.get(sessionID)?.delete(fn);
-  }
-
-  push(payload) {
-    const p = payload.properties || {};
-    const sid = p.sessionID || p.info?.sessionID || p.part?.sessionID;
-    for (const fn of [...(this.fns.get(sid) || [])]) fn(payload);
-  }
-
-  listeners_(sid) { return this.fns.get(sid)?.size || 0; }
-}
 
 const tick = () => new Promise((r) => setImmediate(r));
 async function waitFor(cond, what = "condition") {
@@ -744,4 +681,48 @@ test("newSession opens a fresh session and mirror", async () => {
   assert.notEqual(rpc.state.sessionFile, first);
   assert.ok(existsSync(first), "a used session is kept");
   assert.equal(lines(rpc.state.sessionFile).length, 1);
+});
+
+test("modelThinking: variants as levels, else off (auto for a reasoning model, from capabilities too)", () => {
+  assert.deepEqual(modelThinking({ variants: { none: {}, high: {}, low: {} } }), { levels: ["off", "low", "high"], labels: {} });
+  assert.deepEqual(modelThinking({ variants: {} }), { levels: ["off"], labels: { off: "off" } });
+  assert.deepEqual(modelThinking({ capabilities: { reasoning: true } }), { levels: ["off"], labels: { off: "auto" } });
+  assert.deepEqual(modelThinking({ reasoning: true }), { levels: ["off"], labels: { off: "auto" } });
+});
+
+test("a catalog model's reasoning flag is read from capabilities (OpenCode's real shape)", async () => {
+  const catalog = { all: [{ id: "opencode", models: { r: { id: "r", name: "R", limit: { context: 10, output: 5 }, capabilities: { reasoning: true } } } }], connected: ["opencode"] };
+  const { rpc } = setup({ model: "r" });
+  rpc.server.catalog = catalog;
+  rpc.start();
+  await rpc.waitReady();
+  assert.equal(rpc.state.model.reasoning, true);
+});
+
+test("allowTools: a persona's pi tool names as an OpenCode allowlist (everything else off)", () => {
+  assert.deepEqual(allowTools(["read", "grep", "find", "ls", "bash", "plan", "omnidroid_shell"]), { "*": false, read: true, grep: true, glob: true, list: true, bash: true, plan: true, omnidroid_shell: true });
+  assert.equal(allowTools([]), null);
+  assert.equal(allowTools(null), null);
+});
+
+test("runOnce: a throw-away session, one message with system and only the read tool, joined text, session deleted", async () => {
+  const server = new FakeServer({ reply: (m, p) => (m === "POST" && /\/message$/.test(p) ? { info: { id: "msg_1", role: "assistant" }, parts: [{ type: "step-start" }, { type: "reasoning", text: "hmm" }, { type: "text", text: "{\"done\": true," }, { type: "text", text: "\"reason\": \"ok\"}" }] } : undefined) });
+  const out = await runOnce({ server, provider: "opencode", model: "big-pickle", system: "Judge.", input: "is it done?", cwd: "C:\\w", timeoutMs: 5000 });
+  assert.equal(out, "{\"done\": true,\n\"reason\": \"ok\"}");
+  const [create, msg, del] = server.calls;
+  assert.deepEqual([create.method, create.path, create.directory], ["POST", "/session", "C:\\w"]);
+  assert.deepEqual([msg.method, msg.path, msg.timeoutMs], ["POST", "/session/ses_fake1/message", 5000]);
+  assert.deepEqual(msg.body, { parts: [{ type: "text", text: "is it done?" }], system: "Judge.", tools: RUN_ONCE_TOOLS, model: { providerID: "opencode", modelID: "big-pickle" } });
+  assert.deepEqual(RUN_ONCE_TOOLS, { "*": false, read: true }, "every tool off but read: OpenCode's free tier refuses a request with no tools at all");
+  assert.deepEqual([del.method, del.path], ["DELETE", "/session/ses_fake1"]);
+});
+
+test("runOnce: a given session is reused and kept; a model error rejects and still deletes a throw-away session", async () => {
+  const server = new FakeServer({ reply: (m, p) => (m === "POST" && /\/message$/.test(p) ? { info: { id: "msg_1" }, parts: [{ type: "text", text: "status" }] } : undefined) });
+  assert.equal(await runOnce({ server, provider: "", model: "", system: "S", input: "i", cwd: "C:\\w", session: "ses_box" }), "status");
+  assert.deepEqual(server.calls.map((c) => `${c.method} ${c.path}`), ["POST /session/ses_box/message"]);
+  assert.ok(!("model" in server.calls[0].body), "no model given: none sent");
+  const bad = new FakeServer({ reply: (m, p) => (m === "POST" && /\/message$/.test(p) ? { info: { id: "msg_2", error: { name: "APIError", data: { message: "403 FreeTierError" } } }, parts: [] } : undefined) });
+  await assert.rejects(runOnce({ server: bad, provider: "opencode", model: "x", system: "S", input: "i", cwd: "C:\\w" }), /403 FreeTierError/);
+  assert.equal(bad.calls.at(-1).method, "DELETE");
 });

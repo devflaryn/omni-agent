@@ -309,6 +309,33 @@ test("on Windows spawns opencode.cmd through the shell with fixed args and stop(
   }
 });
 
+test("killSync() ends the child before Omni's process exits: taskkill /T synchronously on Windows, kill() elsewhere; no restart", async () => {
+  const oc = await fakeOpencode({ password: () => "pw" });
+  const fake = fakeSpawn(() => oc.url);
+  const sync = [];
+  const server = new OpencodeServer({ spawn: fake.spawn, spawnSync: (cmd, args, opts) => { sync.push({ cmd, args, opts }); return { status: 0 }; }, platform: "win32", password: "pw", backoff });
+  try {
+    await server.start();
+    const pid = fake.children[0].pid;
+    server.killSync();
+    assert.deepEqual(sync.map((s) => [s.cmd, s.args]), [["taskkill", ["/pid", String(pid), "/T", "/F"]]]);
+    assert.equal(sync[0].opts.windowsHide, true);
+    assert.equal(server.stopped, true, "an exit kill never relaunches");
+    server.killSync();
+    assert.equal(sync.length, 1, "nothing left to kill");
+  } finally {
+    server.stop();
+    await oc.close();
+  }
+  const killed = [];
+  const lin = new OpencodeServer({ platform: "linux" });
+  lin.child = { pid: 9, kill: (sig) => killed.push(sig) };
+  lin.stopped = false;
+  lin.killSync();
+  assert.deepEqual(killed, ["SIGTERM"]);
+  assert.equal(lin.child, null);
+});
+
 test("start() rejects when the child exits before listening, without a restart loop", async () => {
   const calls = [];
   const spawn = (cmd, args, opts) => {

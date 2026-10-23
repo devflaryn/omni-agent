@@ -66,7 +66,7 @@ function setup({ config = {}, keeper = null, claude, opts = {}, bus = new Bus() 
   writeFileSync(join(piAgentDir, "agents", "re.md"), "---\nname: re-analyst\ndescription: RE.\ntools: [read, bash]\n---\nYou analyse binaries.\n");
   const m = new AgentManager({
     bus, config: { maxConcurrent: 6, maxDepth: 2, maxMinutes: 360, claudeModel: "", claudeMaxTurns: 300, claudePermissionMode: "bypassPermissions", ...config },
-    file: join(dir, "agents.json"), dir: join(dir, "logs"), piAgentDir, createPi: pis.createPi, claude, keeper, cwd: dir, piEnv: { OPENROUTER_API_KEY: "k" },
+    file: join(dir, "agents.json"), dir: join(dir, "logs"), personasDir: join(piAgentDir, "agents"), createPi: pis.createPi, claude, keeper, cwd: dir, piEnv: { OPENROUTER_API_KEY: "k" },
     killTree: (pid) => { killed.push(pid); }, idleDoneMs: 30, graceMs: 5, saveDelayMs: 10, pollMs: 15, ...opts,
   });
   return { m, bus, dir, killed, pis, piAgentDir };
@@ -125,7 +125,7 @@ test("depth: the chat (0) and its agents (1) may start agents; an agent at depth
 });
 
 // ------------------------------------------------------------------ pi agents
-test("pi agent: persona → --append-system-prompt + --tools, persona model, env identity, meta, managed goal, prompt with the footer", async () => {
+test("pi agent: persona → system prompt + tool allowlist, persona model, env identity, meta, managed goal, prompt with the footer", async () => {
   const keeper = fakeKeeper();
   const { m, pis, dir } = setup({ keeper });
   const rec = m.start({ task: "Find where the parser lives.", agent: "scout", parentSid: "pi:parent", parentSessionId: "parent", depth: 0, title: "Find the parser" });
@@ -133,8 +133,10 @@ test("pi agent: persona → --append-system-prompt + --tools, persona model, env
   assert.match(rec.id, /^a-[0-9a-f]{8}$/);
   await until(() => m.get(rec.id).status === "running");
   const pi = pis.made[0];
-  // --tools is an allowlist over extension tools too, so the keeper's plan tool is always kept.
-  assert.deepEqual(pi.opts.extraArgs, ["--append-system-prompt", "You are a reconnaissance agent.\nReport file:line references.", "--tools", "read,grep,find,plan"]);
+  // The tools are an allowlist over plugin tools too, so the keeper's plan tool is always kept.
+  assert.equal(pi.opts.system, "You are a reconnaissance agent.\nReport file:line references.");
+  assert.deepEqual(pi.opts.tools, ["read", "grep", "find", "plan"]);
+  assert.equal("extraArgs" in pi.opts, false);
   assert.equal(pi.opts.model, "openrouter/qwen-fast", "the persona's model applies when the spec names none");
   assert.equal(pi.opts.provider, "");
   assert.equal(pi.opts.cwd, dir);
@@ -155,7 +157,11 @@ test("pi agent: persona → --append-system-prompt + --tools, persona model, env
   await until(() => pis.made.length === 2);
   assert.equal(pis.made[1].opts.model, "deepseek/v4");
   assert.equal(pis.made[1].opts.provider, "openrouter");
-  assert.deepEqual(pis.made[1].opts.extraArgs, ["--append-system-prompt", "You analyse binaries.", "--tools", "read,bash,plan"], "found by its frontmatter name");
+  assert.deepEqual([pis.made[1].opts.system, pis.made[1].opts.tools], ["You analyse binaries.", ["read", "bash", "plan"]], "found by its frontmatter name");
+  // without a persona: no system prompt, every tool
+  m.start({ task: "plain" });
+  await until(() => pis.made.length === 3);
+  assert.deepEqual([pis.made[2].opts.system, pis.made[2].opts.tools], ["", null]);
   await m.stopAll();
   m.dispose();
 });

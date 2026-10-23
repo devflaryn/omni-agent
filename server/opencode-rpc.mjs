@@ -35,13 +35,97 @@ function variantLevels(variants) {
 }
 
 /** The raw model `id` of `providerID` in a `GET /provider` catalog, or null. */
-function findModel(catalog, providerID, id) {
+export function findModel(catalog, providerID, id) {
   const p = catalog?.all?.find((x) => x.id === providerID);
   return p?.models?.[id] || Object.values(p?.models || {}).find((m) => m.id === id) || null;
 }
 
+/** OpenCode puts the flag under `capabilities` (older catalogs and tests at the top). */
+const reasoningOf = (m) => !!(m?.capabilities?.reasoning ?? m?.reasoning);
+
 /** `state.model` of a catalog model. */
-const modelOf = (provider, m) => ({ provider, id: m.id, name: m.name || m.id, contextWindow: num(m.limit?.context), maxTokens: num(m.limit?.output), reasoning: !!m.reasoning, variants: variantLevels(m.variants) });
+const modelOf = (provider, m) => ({ provider, id: m.id, name: m.name || m.id, contextWindow: num(m.limit?.context), maxTokens: num(m.limit?.output), reasoning: reasoningOf(m), variants: variantLevels(m.variants) });
+
+/**
+ * The thinking levels a catalog model offers ({levels, labels}, ui/thinking.js shape): its variants; without any,
+ * only "off" — labelled "auto" for a reasoning model, which then thinks as its provider decides.
+ */
+export function modelThinking(m) {
+  const levels = variantLevels(m?.variants);
+  if (levels.length) return { levels, labels: {} };
+  return { levels: ["off"], labels: { off: reasoningOf(m) ? "auto" : "off" } };
+}
+
+/** The model picker's list: connected providers' models, deprecated ones left out. */
+export function pickerModels(catalog) {
+  const connected = Array.isArray(catalog?.connected) ? new Set(catalog.connected) : null;
+  const out = [];
+  for (const p of catalog?.all || []) {
+    if (connected && !connected.has(p.id)) continue;
+    for (const m of Object.values(p.models || {})) {
+      if (!m?.id || m.status === "deprecated") continue;
+      const t = modelThinking(m);
+      out.push({ provider: p.id, id: m.id, name: m.name || m.id, contextWindow: num(m.limit?.context) || null, thinking: t.levels, thinkingLabels: t.labels, free: m.cost?.input === 0 && m.cost?.output === 0 });
+    }
+  }
+  return out;
+}
+
+/** Whether a connected provider of the catalog offers provider/id (not deprecated). */
+export function inCatalog(catalog, provider, id) {
+  if (Array.isArray(catalog?.connected) && !catalog.connected.includes(provider)) return false;
+  const m = findModel(catalog, provider, id);
+  return !!m && m.status !== "deprecated";
+}
+
+/** A pick as OpenCode's `{providerID, modelID}` (a bare "provider/model" id is split), or null for OpenCode's default. */
+export function modelPick(provider, model) {
+  if (!model) return null;
+  if (provider) return { providerID: provider, modelID: model };
+  const i = model.indexOf("/");
+  return i > 0 ? { providerID: model.slice(0, i), modelID: model.slice(i + 1) } : null;
+}
+
+/** pi tool names a persona lists that OpenCode calls differently. */
+const PI_TOOL_NAMES = { find: "glob", ls: "list" };
+
+/**
+ * A persona's tool allowlist (pi names) as OpenCode's per-prompt `tools` map: every tool off ("*") but the listed
+ * ones; null (every tool) for an empty list.
+ */
+export function allowTools(names) {
+  if (!Array.isArray(names) || !names.length) return null;
+  const out = { "*": false };
+  for (const n of names) { const k = PI_TOOL_NAMES[n] || String(n); if (k) out[k] = true; }
+  return out;
+}
+
+/**
+ * The tools of a one-off side call. Every tool off but `read`: OpenCode's free tier answers a request carrying no
+ * tools at all with a 403 FreeTierError (verified live on OpenCode 1.18.32), and `read` is harmless.
+ */
+export const RUN_ONCE_TOOLS = Object.freeze({ "*": false, read: true });
+
+/**
+ * One question to a model on the shared server, outside every chat (the goal judge, the status box): one
+ * `POST /session/:id/message` with `system`, resolving the reply's joined text parts. `session` continues that
+ * session (a status box's side conversation, kept); without it a session is made for the call and deleted after.
+ * A model error rejects with its message.
+ */
+export async function runOnce({ server, provider = "", model = "", system = "", input, cwd, session = null, timeoutMs = 120000 }) {
+  const id = session || (await server.request("POST", "/session", { directory: cwd, body: {} })).id;
+  try {
+    const body = { parts: [{ type: "text", text: String(input ?? "") }], system, tools: { ...RUN_ONCE_TOOLS } };
+    const pick = modelPick(provider, model);
+    if (pick) body.model = pick;
+    const r = await server.request("POST", `/session/${id}/message`, { directory: cwd, body, timeoutMs });
+    const err = r?.info?.error;
+    if (err) throw new Error(err.data?.message || err.message || err.name || "the model call failed");
+    return (r?.parts || []).filter((p) => p?.type === "text" && !p.synthetic && !p.ignored && p.text).map((p) => p.text).join("\n");
+  } finally {
+    if (!session) server.request("DELETE", `/session/${id}`, { directory: cwd }).catch(() => {});
+  }
+}
 
 /** The mirror's entries (header excluded); a missing or unreadable file has none. */
 function readMirror(file) {
@@ -91,7 +175,7 @@ export function piTranscript(entries) {
 /**
  * Emits "pi" (every pi RPC event, as PiRpc does) and "exit" (null) when stop() ends the chat. `env` is accepted for
  * PiRpc parity only: the shared server's environment applies. `system`/`tools` are sent with every prompt (a
- * background agent's persona). `compactAt` > 0 compacts before a prompt once the last turn's context exceeded it.
+ * background agent's persona; `tools` is OpenCode's `{name: boolean}` map, see allowTools). `compactAt` > 0 compacts before a prompt once the last turn's context exceeded it.
  */
 export class OpencodeRpc extends EventEmitter {
   constructor({ server, cwd, model = "", provider = "", thinking = "", env = {}, bus, meta = {}, system = "", tools = null, mirrorDir, compactAt = 0 }) {
@@ -412,12 +496,7 @@ export class OpencodeRpc extends EventEmitter {
   get catalogValue() { return this.catalog?.value || null; }
 
   /** The picked model as OpenCode's `{providerID, modelID}` (a bare "provider/model" id is split), or null for OpenCode's default. */
-  pick() {
-    if (!this.model) return null;
-    if (this.provider) return { providerID: this.provider, modelID: this.model };
-    const i = this.model.indexOf("/");
-    return i > 0 ? { providerID: this.model.slice(0, i), modelID: this.model.slice(i + 1) } : null;
-  }
+  pick() { return modelPick(this.provider, this.model); }
 
   /** The variant for the thinking level: "off" is the model's "none" variant when it has one, else nothing is sent. */
   variant() {
@@ -474,9 +553,7 @@ export class OpencodeRpc extends EventEmitter {
   thinkingLevels(model) {
     if (!model?.id) return { success: true, data: { levels: THINKING_LEVELS, labels: {} } };
     const known = findModel(this.catalogValue, model.provider, model.id);
-    const levels = variantLevels(model.variants ?? known?.variants);
-    if (levels.length) return { success: true, data: { levels, labels: {} } };
-    return { success: true, data: { levels: ["off"], labels: { off: (model.reasoning ?? known?.reasoning) ? "auto" : "off" } } };
+    return { success: true, data: modelThinking({ variants: model.variants ?? known?.variants, reasoning: model.reasoning ?? reasoningOf(known) }) };
   }
 
   /** A model the catalog does not have is refused, like pi's set_model; the pick applies to the next prompt. */

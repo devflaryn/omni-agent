@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { createApp } from "../server/index.mjs";
 import { sidForFile } from "../server/watchers.mjs";
+import { FakeServer } from "./helpers/fake-opencode.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -227,7 +228,9 @@ function makeFakePi({ cwd, model, provider, thinking }) {
   };
   return fakePi;
 }
-const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false });
+const oc2 = new FakeServer();
+const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false, opencodeServer: oc2, opencodeConfigDir: join(base, "oc2-config") });
+const disposes = () => oc2.calls.filter((c) => c.method === "POST" && c.path === "/global/dispose").length;
 await app2.listen();
 const port2 = app2.server.address().port;
 after(() => app2.close());
@@ -299,21 +302,21 @@ test("claude task: empty prompt → 400", async () => {
 });
 
 // ------------------------------------------------------------ providers
-test("providers: empty at first, PUT validates, writes models.json and restarts pi back onto its session", async () => {
+test("providers: empty at first, PUT validates, writes models.json and reloads opencode (the chats keep their sessions)", async () => {
   const empty = await (await fetch(`http://127.0.0.1:${port2}/api/providers`)).json();
   assert.deepEqual(empty.providers, []);
   assert.ok(empty.presets.some((p) => p.key === "openrouter"));
   const bad = await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "nope", api: "openai-completions", models: ["a"] }) });
   assert.equal(bad.status, 400);
-  // start the fake pi so the restart path is exercised
   app2.startPi(base);
   const before = fakePi;
+  const disposed = disposes();
   const put = await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "sk-or-abcd1234", models: ["deepseek/deepseek-v4-flash-0731", { id: "moonshotai/kimi-k2.5", name: "Kimi" }] }) });
   const pj = await put.json();
   assert.equal(put.status, 200);
   assert.equal(pj.restarted, true);
-  assert.notEqual(fakePi, before, "a new pi child was created");
-  assert.deepEqual(fakePi.calls[0], ["switch", "C:\\fake.jsonl"]);
+  assert.equal(disposes(), disposed + 1, "opencode re-reads its config");
+  assert.equal(fakePi, before, "no chat is relaunched");
   assert.equal(pj.providers[0].name, "openrouter");
   assert.equal(pj.providers[0].hasKey, true); assert.equal(pj.providers[0].keyHint, "1234"); assert.equal("apiKey" in pj.providers[0], false);
   const onDisk = JSON.parse(readFileSync(join(base, "pi-agent", "models.json"), "utf8"));
@@ -321,15 +324,15 @@ test("providers: empty at first, PUT validates, writes models.json and restarts 
   assert.equal(onDisk.providers.openrouter.models[1].name, "Kimi");
 });
 
-test("pi models: the picker lists only the models from models.json once providers exist", async () => {
+test("pi models: the picker lists OpenCode's connected catalog, not models.json", async () => {
   const r = await (await fetch(`http://127.0.0.1:${port2}/api/pi/models`)).json();
-  assert.equal(r.data.source, "providers");
-  assert.deepEqual(r.data.models.map((m) => `${m.provider}/${m.id}`), ["openrouter/deepseek/deepseek-v4-flash-0731", "openrouter/moonshotai/kimi-k2.5"]);
+  assert.deepEqual(r.data.models.map((m) => `${m.provider}/${m.id}`), ["opencode/big-pickle", "opencode/plain", "opencode/think"]);
 });
 
 test("providers-order: POST rewrites the provider order in models.json without restarting pi", async () => {
   await fetch(`http://127.0.0.1:${port2}/api/providers/modal`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "https://modal.example/v1", api: "openai-completions", apiKey: "k", models: ["Qwen/Qwen3.8-27B"] }) });
   const before = fakePi;
+  const disposed = disposes();
   const bad = await fetch(`http://127.0.0.1:${port2}/api/providers-order`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ order: "modal" }) });
   assert.equal(bad.status, 400);
   const r = await fetch(`http://127.0.0.1:${port2}/api/providers-order`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ order: ["modal", "openrouter"] }) });
@@ -338,10 +341,9 @@ test("providers-order: POST rewrites the provider order in models.json without r
   assert.deepEqual(j.order, ["modal", "openrouter"]);
   assert.deepEqual(j.providers.map((p) => p.name), ["modal", "openrouter"]);
   assert.equal(fakePi, before, "reordering does not relaunch pi");
+  assert.equal(disposes(), disposed, "nor reload opencode");
   const onDisk = JSON.parse(readFileSync(join(base, "pi-agent", "models.json"), "utf8"));
   assert.deepEqual(Object.keys(onDisk.providers), ["modal", "openrouter"]);
-  const models = await (await fetch(`http://127.0.0.1:${port2}/api/pi/models`)).json();
-  assert.equal(models.data.models[0].provider, "modal", "the picker follows the new order");
   await fetch(`http://127.0.0.1:${port2}/api/providers/modal`, { method: "DELETE" });
 });
 
@@ -353,7 +355,7 @@ test("providers: DELETE removes the entry; unknown → 404", async () => {
 });
 
 // ------------------------------------------------------------ MCP servers
-test("mcp servers: PUT validates, writes mcpServers beside the other keys, masks secrets, keeps them on re-save, restarts pi", async () => {
+test("mcp servers: PUT validates, writes mcpServers beside the other keys, masks secrets, keeps them on re-save, reloads opencode with them", async () => {
   const file = join(base, "pi-agent", "omni-agent.json");
   writeFileSync(file, JSON.stringify({ autoRecall: true, omniMcp: { command: "/x/omni-mcp" } }));
   const put = (name, body) => fetch(`http://127.0.0.1:${port2}/api/mcp/${name}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -362,12 +364,15 @@ test("mcp servers: PUT validates, writes mcpServers beside the other keys, masks
   assert.equal((await put("fs", { type: "stdio" })).status, 400, "stdio needs a command");
   assert.equal((await put("gh", { type: "http", url: "ftp://x" })).status, 400, "http needs an http(s) url");
   app2.startPi(base);
-  const before = fakePi;
+  const disposed = disposes();
   const r = await put("gh", { type: "http", url: "https://api.example.com/mcp", headers: { Authorization: "Bearer secret-token-9876", "X-Ref": "${GH_TOKEN}" }, timeoutSec: 60 });
   const j = await r.json();
   assert.equal(r.status, 200);
   assert.equal(j.restarted, true);
-  assert.notEqual(fakePi, before, "pi restarts so it connects");
+  assert.equal(disposes(), disposed + 1, "opencode reloads so it connects");
+  const oc = JSON.parse(readFileSync(join(base, "oc2-config", "opencode.json"), "utf8"));
+  assert.deepEqual(oc.mcp.gh, { type: "remote", url: "https://api.example.com/mcp", headers: { Authorization: "Bearer secret-token-9876", "X-Ref": "{env:GH_TOKEN}" } });
+  assert.deepEqual(oc.mcp.omnidroid, { type: "local", command: ["/x/omni-mcp"] }, "omnidroid from omniMcp");
   assert.equal(j.servers[0].headers.Authorization, "••••••••9876", "a secret is masked");
   assert.equal(j.servers[0].headers["X-Ref"], "${GH_TOKEN}", "an env reference is shown as-is");
   let disk = JSON.parse(readFileSync(file, "utf8"));
@@ -557,4 +562,149 @@ test("sid for an opencode mirror file", () => {
   assert.equal(sidForFile("pi", "/x/opencode/2026-10-23T00-00-00.000Z_ses_e99eaa6e3fferGKykKmPKDLWNM.jsonl"), "pi:ses_e99eaa6e3fferGKykKmPKDLWNM");
   assert.equal(sidForFile("pi", "/x/2026-10-23T00-00-00.000Z_0b1c0b1c-0b1c-4b1c-8b1c-0b1c0b1c0b1c.jsonl"), "pi:0b1c0b1c-0b1c-4b1c-8b1c-0b1c0b1c0b1c");
   assert.equal(sidForFile("claude", "/x/abc.jsonl"), "claude:abc");
+});
+
+// ------------------------------------------------------------ chats on the shared opencode server (fake)
+const OC_CATALOG = {
+  all: [
+    { id: "opencode", name: "OpenCode Zen", models: {
+      "big-pickle": { id: "big-pickle", name: "Big Pickle", limit: { context: 200000, output: 32000 }, capabilities: { reasoning: true }, variants: {}, cost: { input: 0, output: 0 }, status: "active" },
+      think: { id: "think", name: "Thinker", limit: { context: 8000, output: 1000 }, variants: { low: {}, high: {}, max: {} }, cost: { input: 1, output: 2 } },
+      old: { id: "old", name: "Old", limit: { context: 1, output: 1 }, status: "deprecated", cost: { input: 0, output: 0 } },
+    } },
+    { id: "anthropic", name: "Anthropic", models: {
+      x: { id: "x", name: "X", limit: { context: 100, output: 10 }, variants: { high: {} }, cost: { input: 3, output: 15 } },
+      y: { id: "y", name: "Y", limit: { context: 100, output: 10 }, cost: { input: 3, output: 15 } },
+    } },
+    { id: "google", name: "Google", models: { g: { id: "g", name: "G" } } },
+  ],
+  connected: ["opencode", "anthropic"],
+};
+const ocBase = mkdtempSync(join(tmpdir(), "omni-oc-srv-"));
+const personasDir = join(ocBase, "personas");
+mkdirSync(personasDir, { recursive: true });
+writeFileSync(join(personasDir, "scout.md"), "---\nname: scout\ndescription: Recon.\ntools: read, find\n---\nYou scout.\n");
+const oc = new FakeServer({ catalog: OC_CATALOG, up: false, reply: (m, p) => (m === "POST" && /^\/session\/[^/]+\/message$/.test(p) ? { info: { id: "msg_side" }, parts: [{ type: "text", text: "side answer" }] } : undefined) });
+const ocLogs = [];
+const app4 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(ocBase, "vault"), piSessionsDir: join(ocBase, "pi-sessions"), claudeProjectsDir: join(ocBase, "claude-projects"), autoStartPi: false, cwd: ocBase, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeServer: oc, opencodeConfigDir: join(ocBase, "oc-config"), piExtConfigFile: join(ocBase, "pi-agent", "omni-agent.json"), piModelsFile: join(ocBase, "pi-agent", "models.json"), statusSessionsDir: join(ocBase, "status"), personasDir, piModels: ["anthropic/x"], piProvider: "opencode", piModel: "gone", piThinking: "high", context: { compactAt: 300000 } });
+app4.bus.on("event", (ev) => { if (ev.kind === "log") ocLogs.push(ev); });
+await app4.listen();
+const port4 = app4.server.address().port;
+const post4 = async (path, body) => { const r = await fetch(`http://127.0.0.1:${port4}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }); return { status: r.status, json: await r.json().catch(() => ({})) }; };
+const get4 = async (path) => (await fetch(`http://127.0.0.1:${port4}${path}`)).json();
+let ocSid = null;
+
+test("opencode: /api/pi/open starts the shared server, writes its config and opens an OpencodeRpc chat with compactAt", async () => {
+  const r = await post4("/api/pi/open", { cwd: ocBase });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  ocSid = r.json.sid;
+  assert.equal(ocSid, "pi:ses_fake1");
+  assert.equal(oc.starts, 1, "the server is started for the first chat");
+  const create = oc.calls.find((c) => c.method === "POST" && c.path === "/session");
+  assert.equal(create.directory, ocBase);
+  const chat = app4.pis.find((c) => c.sid === ocSid);
+  assert.equal(chat.constructor.name, "OpencodeRpc");
+  assert.equal(chat.compactAt, 300000, "compactAt comes from the context policy");
+  assert.match(chat.state.sessionFile, /pi-sessions[\\/]opencode[\\/].*_ses_fake1\.jsonl$/);
+  const conf = JSON.parse(readFileSync(join(ocBase, "oc-config", "opencode.json"), "utf8"));
+  assert.equal(conf.permission.bash, "allow");
+  assert.deepEqual(conf.tools, { question: false });
+});
+
+test("opencode: a saved model missing from the connected catalog is reported once, the config left alone", async () => {
+  for (let i = 0; i < 50 && !ocLogs.some((e) => /opencode\/gone/.test(e.text)); i++) await sleep(10);
+  const lines = ocLogs.filter((e) => /opencode\/gone/.test(e.text));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].level, "system");
+  assert.match(lines[0].text, /pick another model/i);
+  assert.equal(app4.cfg.piModel, "gone");
+});
+
+test("opencode: /api/pi/models lists connected providers from GET /provider (deprecated skipped, piModels filter, opencode in full)", async () => {
+  const r = await get4("/api/pi/models");
+  assert.deepEqual(r.data.models.map((m) => `${m.provider}/${m.id}`), ["opencode/big-pickle", "opencode/think", "anthropic/x"]);
+  assert.deepEqual(r.data.models[0], { provider: "opencode", id: "big-pickle", name: "Big Pickle", contextWindow: 200000, thinking: ["off"], thinkingLabels: { off: "auto" }, free: true });
+  assert.deepEqual(r.data.models[1].thinking, ["low", "high", "max"]);
+  assert.equal(r.data.models[1].free, false);
+  const levels = await get4("/api/pi/thinking-levels?provider=opencode&model=think");
+  assert.deepEqual(levels.data.levels, ["low", "high", "max"]);
+});
+
+test("opencode: /api/pi/model and /api/pi/thinking pick the model and clamp the level to its variants; /api/pi/prompt posts prompt_async with them", async () => {
+  const m = await post4("/api/pi/model", { sid: ocSid, provider: "opencode", modelId: "think" });
+  assert.equal(m.status, 200);
+  assert.equal(m.json.success, true);
+  assert.deepEqual([app4.cfg.piProvider, app4.cfg.piModel, m.json.level], ["opencode", "think", "high"]);
+  const bad = await post4("/api/pi/model", { sid: ocSid, provider: "opencode", modelId: "nope" });
+  assert.equal(bad.json.success, false, "a model OpenCode does not have is refused");
+  assert.equal(app4.cfg.piModel, "think");
+  const t = await post4("/api/pi/thinking", { sid: ocSid, level: "minimal" });
+  assert.equal(t.json.level, "low", "clamped to the nearest variant the model has");
+  const p = await post4("/api/pi/prompt", { sid: ocSid, message: "say hi", memory: false });
+  assert.equal(p.status, 200);
+  const call = oc.calls.filter((c) => c.method === "POST" && /prompt_async$/.test(c.path)).at(-1);
+  assert.equal(call.path, "/session/ses_fake1/prompt_async");
+  assert.deepEqual(call.body.model, { providerID: "opencode", modelID: "think" });
+  assert.equal(call.body.variant, "low");
+  assert.deepEqual(call.body.parts, [{ type: "text", text: "say hi" }]);
+});
+
+test("opencode: /api/pi/abort aborts the session and cancels the chat's goal", async () => {
+  app4.keeper.setGoal(ocSid, "the running job");
+  const r = await post4("/api/pi/abort", { sid: ocSid });
+  assert.equal(r.status, 200);
+  assert.ok(oc.calls.some((c) => c.method === "POST" && c.path === "/session/ses_fake1/abort"));
+  assert.equal(app4.keeper.goal(ocSid).paused, true);
+});
+
+test("opencode: the status box keeps one OpenCode session per goal conversation; the judge's session is deleted", async () => {
+  const before = oc.calls.length;
+  assert.equal(await app4.keeper.summarizeFn("plan moved", { provider: "", model: "", conversation: "conv-1" }), "side answer");
+  assert.equal(await app4.keeper.summarizeFn("plan moved again", { provider: "", model: "", conversation: "conv-1" }), "side answer");
+  const calls = oc.calls.slice(before);
+  const creates = calls.filter((c) => c.method === "POST" && c.path === "/session");
+  assert.equal(creates.length, 1, "one session for the conversation");
+  assert.equal(creates[0].directory, join(ocBase, "status"));
+  const msgs = calls.filter((c) => /\/message$/.test(c.path));
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0].path, msgs[1].path, "the second call continues the same session");
+  assert.deepEqual(msgs[0].body.model, { providerID: "opencode", modelID: "think" }, "the chat's saved model when the hook names none");
+  assert.match(msgs[0].body.system, /status/i);
+  assert.ok(!calls.some((c) => c.method === "DELETE"), "a status conversation is kept");
+  const saved = JSON.parse(readFileSync(join(ocBase, "status", "opencode-sessions.json"), "utf8"));
+  assert.equal(saved["conv-1"].id, msgs[0].path.split("/")[2], "kept across an Omni restart");
+  const mark = oc.calls.length;
+  assert.equal(await app4.keeper.judge("done?", { provider: "anthropic", model: "x" }), "side answer");
+  const j = oc.calls.slice(mark);
+  assert.deepEqual(j.map((c) => c.method), ["POST", "POST", "DELETE"]);
+  assert.deepEqual(j[1].body.model, { providerID: "anthropic", modelID: "x" });
+});
+
+test("opencode: a background agent is an OpencodeRpc with its persona's system prompt and tool allowlist (plan kept)", async () => {
+  const r = await post4("/api/agents", { task: "look around", agent: "scout", parentSid: ocSid, depth: 0 });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  let call = null;
+  for (let i = 0; i < 100 && !call; i++) { await sleep(10); call = oc.calls.find((c) => /prompt_async$/.test(c.path) && c.body.system); }
+  assert.ok(call, "the agent prompted its session");
+  assert.equal(call.body.system, "You scout.");
+  assert.deepEqual(call.body.tools, { "*": false, read: true, glob: true, plan: true });
+  await post4(`/api/agents/${r.json.agent.id}/cancel`, {});
+});
+
+test("opencode: a provider or MCP change rewrites opencode.json and disposes the server's instances (no chat relaunch)", async () => {
+  const chat = app4.pis.find((c) => c.sid === ocSid);
+  chat.streaming = false; chat.inFlight = 0;
+  const before = oc.calls.length;
+  const r = await fetch(`http://127.0.0.1:${port4}/api/mcp/gh`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "http", url: "https://api.example.com/mcp" }) });
+  // MCP writes go to the pi extension config (Task 7 moves them); the route still reloads OpenCode.
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.restarted, true);
+  assert.ok(oc.calls.slice(before).some((c) => c.method === "POST" && c.path === "/global/dispose"));
+  assert.equal(app4.pis.find((c) => c.sid === ocSid), chat, "the chat keeps going on the same server");
+});
+
+test("opencode: close() stops the opencode server", async () => {
+  app4.close();
+  assert.equal(oc.stops, 1);
 });

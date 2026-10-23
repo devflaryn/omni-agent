@@ -2,6 +2,9 @@
  * Omni Agent server. Node built-ins only.
  *
  *   node server/index.mjs [--port 4400] [--cwd <dir>] [--model <id>] [--provider <p>] [--no-pi]
+ *
+ * Chats and background agents run on one shared `opencode serve` (server/opencode-server.mjs), each as an
+ * OpencodeRpc (server/opencode-rpc.mjs) that keeps pi's RPC contract: the internal harness key stays "pi".
  */
 import { createServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
@@ -15,13 +18,15 @@ import { handleAgentRoutes } from "./agent-routes.mjs";
 import { applyContextCaps } from "./context-policy.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
-import { PiRpc } from "./pi-rpc.mjs";
-import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM, runJudge } from "./hook.mjs";
+import { OpencodeServer } from "./opencode-server.mjs";
+import { OpencodeRpc, allowTools, findModel, inCatalog, modelPick, modelThinking, pickerModels, runOnce } from "./opencode-rpc.mjs";
+import { writeOpencodeConfig } from "./opencode-config.mjs";
+import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM } from "./hook.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
 import { listMcpServers, upsertMcpServer, removeMcpServer, testMcpServer } from "./mcp.mjs";
-import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels, modelEntry, applyThinkingMaps } from "./providers.mjs";
+import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, reorderProviders, modelEntry, applyThinkingMaps } from "./providers.mjs";
 import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.js";
 import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
@@ -37,8 +42,9 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 export async function createApp(overrides = {}) {
   const cfg = { ...CONFIG, ...overrides };
-  // Under `node --test`, Omni's own state files never default to the real ~/.omni-agent, and the context cap
-  // never rewrites the real ~/.pi/agent/models.json: a test that wants them passes its own paths.
+  // Under `node --test`, Omni's own state files never default to the real ~/.omni-agent, the context cap
+  // never rewrites the real ~/.pi/agent/models.json, and no real `opencode serve` is started (a test passes
+  // cfg.opencodeServer): a test that wants them passes its own paths.
   // node --test sets NODE_TEST_CONTEXT only with per-file isolation; also catch --test-isolation=none and a test file run directly.
   const underTest = !!process.env.NODE_TEST_CONTEXT || process.execArgv.includes("--test") || /\.test\.m?js$/i.test(process.argv[1] || "");
   if (underTest) {
@@ -47,7 +53,9 @@ export async function createApp(overrides = {}) {
     if (!("agentsDir" in overrides)) cfg.agentsDir = join(tmp, "agents");
     if (!("piModelsFile" in overrides)) cfg.contextCaps = false;
     if (!("persistContext" in overrides)) cfg.persistContext = false;
+    for (const k of ["opencodeConfigDir", "statusSessionsDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
   }
+  cfg.opencodeMirrorDir ||= join(cfg.piSessionsDir, "opencode");
   // Another Omni on another port (headless.mjs, a scratch instance) keeps its own registry and goals: each server
   // rewrites those files whole from its own memory, so sharing them lets the last one to exit erase the other's.
   if (cfg.port && cfg.port !== CONFIG.port) {
@@ -83,8 +91,143 @@ export async function createApp(overrides = {}) {
   let runLedger = cfg.runLedger || null;
   /** Background agents the agents start (pi subagents, Claude Code sessions, shell jobs); created after the keeper. */
   let agents = null;
-  /** Children that were working when pi's models.json or MCP servers changed: each restarts at its next settle. */
-  const restartPending = new Set();
+
+  // ---------------------------------------------------------------- opencode
+  /**
+   * The one `opencode serve` every chat, background agent and side call shares. It is only spawned by the first
+   * chat (or a route that needs its catalog); `cfg.opencodeServer` injects one (tests). Under `node --test` without
+   * one, nothing real is ever started.
+   */
+  const opencode = cfg.opencodeServer || new OpencodeServer({
+    bin: cfg.opencodeBin, configDir: cfg.opencodeConfigDir, env: piChildEnv(cfg),
+    log: (level, text) => {
+      const t = String(text ?? "").trim();
+      if (!t || level === "stdout" || level === "raw") return;
+      log(`opencode ${level}:`, t.slice(0, 500));
+      if (level === "system") bus.emit({ sid: "omni", harness: "omni", kind: "log", ts: Date.now(), level: "system", text: `OpenCode: ${t}` });
+    },
+  });
+  const noRealOpencode = underTest && !cfg.opencodeServer && !("opencodeBin" in overrides);
+  let opencodeStart = null;
+  /** Starts the shared server once (its config written first); a failed start is tried again by the next call. */
+  function ensureOpencode() {
+    if (opencodeStart) return opencodeStart;
+    if (noRealOpencode) return Promise.reject(new Error("no opencode server under node --test (pass cfg.opencodeServer)"));
+    opencodeStart = (async () => {
+      writeConfig();
+      await opencode.start();
+      checkSavedModel().catch((e) => log("could not check the saved model against opencode's catalog", e.message));
+      return opencode;
+    })();
+    opencodeStart.catch((e) => {
+      opencodeStart = null;
+      log("opencode could not start:", e.message);
+      bus.emit({ sid: "omni", harness: "omni", kind: "log", ts: Date.now(), level: "system", text: `OpenCode could not start: ${e.message}` });
+    });
+    return opencodeStart;
+  }
+  /** The server, started and connected. */
+  async function opencodeUp() {
+    await ensureOpencode();
+    if (!opencode.up) await opencode.waitUp();
+    return opencode;
+  }
+  const readJson = (file) => { try { return JSON.parse(readFileSync(file, "utf8")) || {}; } catch { return {}; } };
+  /** opencode.json from Omni's MCP list and omnidroid's omni-mcp (still in pi's omni-agent.json; Task 7 moves them and adds providers). */
+  function writeConfig() {
+    const ext = readJson(cfg.piExtConfigFile);
+    try { writeOpencodeConfig({ dir: cfg.opencodeConfigDir, root: ROOT, mcpServers: ext.mcpServers, omniMcp: ext.omniMcp }); }
+    catch (e) { log("could not write the opencode config", e.message); }
+  }
+  let catalogCache = null;
+  /** OpenCode's `GET /provider` catalog, cached a minute (`fresh` re-reads it); starts the server when needed. */
+  async function catalog(fresh = false) {
+    if (!fresh && catalogCache && Date.now() - catalogCache.at < 60000) return catalogCache.value;
+    const server = await opencodeUp();
+    const value = await server.request("GET", "/provider", { directory: cfg.cwd });
+    catalogCache = { at: Date.now(), value };
+    return value;
+  }
+  /** provider/id in the catalog while the server runs (this never starts it), else null. */
+  async function knownModel(provider, id) {
+    if (!opencode.up || !id) return null;
+    return findModel(await catalog().catch(() => null), provider, id);
+  }
+  /**
+   * The saved pick must be one OpenCode can run: without a model OpenCode would fall back to the user's own global
+   * default. A pick no connected provider offers is reported once (the config is left as it is).
+   */
+  let warnedPick = "";
+  async function checkSavedModel() {
+    const p = modelPick(cfg.piProvider, cfg.piModel);
+    if (!p) return;
+    const key = `${p.providerID}/${p.modelID}`;
+    if (warnedPick === key || inCatalog(await catalog(true), p.providerID, p.modelID)) return;
+    warnedPick = key;
+    const text = `The saved model ${key} is not available in OpenCode (no connected provider offers it): pick another model in the model picker.`;
+    log(text);
+    bus.emit({ sid: "omni", harness: "omni", kind: "log", ts: Date.now(), level: "system", text });
+  }
+  /** A chat (or background agent) whose turn is running or about to: OpenCode's reload would cut it short. */
+  const opencodeBusy = () => [...pis].some((c) => c.streaming || c.inFlight > 0)
+    || (agents?.list({ active: true }) || []).some((a) => { const c = a.kind === "pi" && agents.piFor(a.sid); return !!c && (c.streaming || c.inFlight > 0); });
+  let reloadPending = false;
+  async function disposeOpencode() {
+    reloadPending = false;
+    catalogCache = null;
+    for (const c of pis) if ("catalog" in c) c.catalog = null;
+    await opencode.request("POST", "/global/dispose").catch((e) => log("opencode reload failed", e.message));
+  }
+  /**
+   * Omni's MCP servers or providers changed: rewrite opencode.json and let OpenCode re-read it (its instances are
+   * disposed; sessions persist and every chat keeps its own). A reload would cut a running turn short, so while any
+   * chat works it waits for the moment none does.
+   */
+  async function reloadOpencode() {
+    writeConfig();
+    if (!opencode.up) return { restarted: false, pending: false };
+    if (opencodeBusy()) { reloadPending = true; return { restarted: false, pending: true }; }
+    await disposeOpencode();
+    return { restarted: true, pending: false };
+  }
+
+  // ---------------------------------------------------------------- side calls (judge, status box)
+  /** Status-box conversation id (one per goal) → `{id, at}` of its OpenCode session, kept across Omni restarts. */
+  let statusSessions = null;
+  const statusFile = () => join(cfg.statusSessionsDir, "opencode-sessions.json");
+  function statusSessionMap() {
+    if (!statusSessions) statusSessions = new Map(Object.entries(readJson(statusFile())).filter(([, v]) => v?.id));
+    return statusSessions;
+  }
+  function saveStatusSessions() {
+    const keep = [...statusSessionMap().entries()].sort((a, b) => (b[1].at || 0) - (a[1].at || 0)).slice(0, 200);
+    try { mkdirSync(cfg.statusSessionsDir, { recursive: true }); writeFileSync(statusFile(), `${JSON.stringify(Object.fromEntries(keep), null, 2)}\n`); }
+    catch (e) { log("could not save the status-box sessions", e.message); }
+  }
+  /**
+   * A model call outside every chat (the opt-in judge, the status box) on the shared server, in its own directory:
+   * `pick` is the hook's model, else the saved chat model. A `conversation` (the status box of one goal) keeps one
+   * OpenCode session; a call without one gets a throw-away session.
+   */
+  async function sideCall(system, input, pick, conversation = null) {
+    const server = await opencodeUp();
+    const use = pick?.model ? pick : { provider: cfg.piProvider, model: cfg.piModel };
+    const cwd = cfg.statusSessionsDir;
+    mkdirSync(cwd, { recursive: true });
+    const o = { server, provider: use.provider || "", model: use.model || "", system, input, cwd, timeoutMs: keeper.config.judgeTimeoutMs };
+    if (!conversation) return runOnce(o);
+    const map = statusSessionMap();
+    for (let attempt = 0; ; attempt++) {
+      let s = map.get(conversation);
+      if (!s) {
+        s = { id: (await server.request("POST", "/session", { directory: cwd, body: { title: "Omni status box" } })).id, at: Date.now() };
+        map.set(conversation, s);
+        saveStatusSessions();
+      }
+      try { return await runOnce({ ...o, session: s.id }); }
+      catch (e) { if (e.status !== 404 || attempt) throw e; map.delete(conversation); } // its session is gone: open another
+    }
+  }
 
   const piOwns = (file) => [...pis].some((c) => c.owns?.(file));
   const isOwned = (file) => piOwns(file) || claude.owns(file) || (agents?.owns(file) ?? false);
@@ -101,9 +244,9 @@ export async function createApp(overrides = {}) {
     // Only agents count: a long-lived shell job (a dev server, logcat) must not hold every recovery back until it exits.
     activeChildren: (sid) => agents?.activeChildren(sid, { kinds: ["pi", "claude"] }) || 0,
     // Opt-in only (hook.judgeFallback): a judge model for work the agent did without a plan.
-    judge: cfg.judge || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn, timeoutMs: keeper.config.judgeTimeoutMs }, { system: JUDGE_SYSTEM, input })),
-    // The status box: a side conversation of its own per goal (its own pi session file), chat model by default.
-    summarize: cfg.summarize || ((input, pick) => runJudge({ cli: cfg.piCli, bin: cfg.piBin, provider: pick.provider, model: pick.model, env: piChildEnv(cfg), cwd: pi?.cwd || cfg.cwd, spawn: cfg.judgeSpawn, timeoutMs: keeper.config.judgeTimeoutMs, conversation: pick.conversation && cfg.statusSessionsDir ? { dir: cfg.statusSessionsDir, id: pick.conversation } : null }, { system: SUMMARY_SYSTEM, input })),
+    judge: cfg.judge || ((input, pick) => sideCall(JUDGE_SYSTEM, input, pick)),
+    // The status box: a side conversation of its own per goal (an OpenCode session of its own), chat model by default.
+    summarize: cfg.summarize || ((input, pick) => sideCall(SUMMARY_SYSTEM, input, pick, pick?.conversation || null)),
     config: hookConfig(cfg.hook),
     ledger: ledgerProxy,
     onEscalate: async (sid, g) => { runLedger?.appendEvent?.({ kind: "escalate", sid, nudges: g.nudges, fingerprint: g.lastFingerprint }); },
@@ -115,10 +258,17 @@ export async function createApp(overrides = {}) {
     if (m?.id) return { provider: m.provider, id: m.id };
     return cfg.piModel ? { provider: cfg.piProvider || "", id: cfg.piModel } : null;
   }
-  /** The thinking levels provider/id has: its models.json entry (reasoning, a written map), else its name. */
-  function levelsOf(provider, id) {
-    return thinkingProfile(modelEntry(cfg.piModelsFile, provider, id) || { provider, id }).levels;
+  /**
+   * The thinking levels provider/id has: its OpenCode variants (what a prompt can send) when the running server's
+   * catalog has it, else a guess from its models.json entry or its name (ui/thinking.js).
+   */
+  async function thinkingOf(provider, id, live = null) {
+    const m = await knownModel(provider, id);
+    if (m) return modelThinking(m);
+    const t = thinkingProfile(modelEntry(cfg.piModelsFile, provider, id) || (live?.id === id ? { ...live, provider } : { provider, id }));
+    return { levels: t.levels, labels: t.labels, family: t.family };
   }
+  const levelsOf = async (provider, id) => (await thinkingOf(provider, id)).levels;
 
   /** Cap each model's effective window in models.json so pi compacts at cfg.context.compactAt (server/context-policy.mjs). */
   function applyCaps(compactAt = cfg.context?.compactAt ?? 0) {
@@ -136,20 +286,16 @@ export async function createApp(overrides = {}) {
     return r;
   }
 
-  // OMNI_MEMORY=server tells omni-memory that the server attaches the vault pack per prompt; nobody does that for
-  // a background agent, so its own omni-memory does the recall.
-  const agentEnv = () => { const { OMNI_MEMORY: _serverPack, ...e } = piChildEnv(cfg); return e; };
-  const agentPiEnv = agentEnv();
   agents = cfg.agentManager || new AgentManager({
-    bus, config: cfg.agents, file: cfg.agentsFile, dir: cfg.agentsDir, piAgentDir: cfg.piAgentDir,
-    claude, keeper, piEnv: agentPiEnv, shellPath: cfg.agentShell || "", cwd: cfg.cwd, log,
+    bus, config: cfg.agents, file: cfg.agentsFile, dir: cfg.agentsDir, personasDir: cfg.personasDir,
+    claude, keeper, shellPath: cfg.agentShell || "", cwd: cfg.cwd, log,
     // A Claude agent asked for memory gets the vault pack (and repo graph) the old /api/claude/task gave it.
     composeSystem: async (rec, text) => (await composePrompt("claude", text, { memory: rec.memory, graph: rec.graph, dir: rec.cwd })).system,
+    // A pi agent is a chat of its own on the shared server: its persona goes with each prompt (system + tool allowlist).
+    // Its OMNI_AGENT_* env cannot reach a shared server; the plugin derives an agent's identity server-side (Task 6).
     createPi: cfg.createAgentPi || ((o) => {
-      applyCaps();
-      // Always node + cli.js: the pi.cmd fallback would let cmd.exe split a persona's multi-line system prompt.
-      // Key files are re-read per launch (a key changed after Omni started still reaches a new agent); OMNI_AGENT_* stay.
-      const child = new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, bus, cwd: o.cwd, provider: o.model ? o.provider : cfg.piProvider, model: o.model || cfg.piModel, thinking: o.thinking || cfg.piThinking, env: { ...o.env, ...agentEnv() }, extraArgs: o.extraArgs, meta: o.meta });
+      ensureOpencode().catch(() => {});
+      const child = new OpencodeRpc({ server: opencode, bus, cwd: o.cwd, provider: o.model ? o.provider : cfg.piProvider, model: o.model || cfg.piModel, thinking: o.thinking || cfg.piThinking, system: o.system || "", tools: allowTools(o.tools), meta: o.meta, mirrorDir: cfg.opencodeMirrorDir, compactAt: cfg.context?.compactAt });
       child.startWatchdog({ stallMs: cfg.stallMs, toolStallMs: cfg.toolStallMs });
       return child;
     }),
@@ -192,17 +338,9 @@ export async function createApp(overrides = {}) {
       announcePis();
     }
     if (ev.kind === "status") applyStatus(s, ev);
-    // pi's models.json or MCP servers changed while this child was working: it reads them only at boot, so restart it at this settle.
-    if (ev.kind === "status" && ev.streaming === false && restartPending.size) {
-      const c = piFor(ev.sid);
-      if (c && restartPending.has(c)) {
-        setTimeout(() => {
-          if (!pis.has(c) || !c.proc) return restartPending.delete(c);
-          if (c.streaming) return;
-          restartPending.delete(c);
-          restartPi(c).catch((e) => log("pi restart for the new settings failed", e.message));
-        }, 0);
-      }
+    // OpenCode's config changed while a chat was working: it is reloaded once no chat works any more.
+    if (ev.kind === "status" && ev.streaming === false && reloadPending) {
+      setTimeout(() => { if (reloadPending && opencode.up && !opencodeBusy()) disposeOpencode(); }, 0);
     }
     // A background agent's report is delivered once it is IN the parent chat (pi only queues it while the chat is busy,
     // and that queue is lost on Stop or a crash) — the extension acks on message_end too; this is the backstop.
@@ -221,10 +359,18 @@ export async function createApp(overrides = {}) {
     if (ev.kind === "msg" || ev.kind === "run") watcher.dirty.set(ev.sid, Date.now());
   });
 
-  /** Starts another pi child in `cwd` (the ones already running keep going); it becomes the current one unless `current` is false. */
+  /**
+   * Starts another chat in `cwd` (the ones already running keep going): an OpencodeRpc on the shared server, with the
+   * saved model pick (always one: without it OpenCode would use the user's own global default). It becomes the
+   * current one unless `current` is false.
+   */
   function startPi(cwd = cfg.cwd, { current = true } = {}) {
-    applyCaps();
-    const c = cfg.createPi ? cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, env: piChildEnv(cfg), bus });
+    let c;
+    if (cfg.createPi) c = cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking });
+    else {
+      ensureOpencode().catch(() => {});
+      c = new OpencodeRpc({ server: opencode, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, bus, mirrorDir: cfg.opencodeMirrorDir, compactAt: cfg.context?.compactAt });
+    }
     // A new child is claimed for the chat it is started for: no other chat takes it before its first prompt.
     c.lastUsedAt = c.claimedAt = Date.now();
     // The auto-restart path re-attaches the goal: crashedSid is this child's sid before the crash, c.sid the resumed one (C1).
@@ -242,7 +388,6 @@ export async function createApp(overrides = {}) {
     if (!c) return;
     c.stop();
     pis.delete(c);
-    restartPending.delete(c);
     if (pi === c) pi = [...pis].sort((a, b) => lastUsed(b) - lastUsed(a))[0] || null;
     announcePis();
   }
@@ -288,34 +433,6 @@ export async function createApp(overrides = {}) {
   }
   const trimTimer = setInterval(() => trimPis(), 60000);
   trimTimer.unref?.();
-  /** pi reads models.json only at boot: after a provider change, relaunch the child and put it back on the session it had open. */
-  async function restartPi(c = pi) {
-    if (!c?.proc) return false;
-    const { cwd } = c;
-    const file = c.state?.sessionFile;
-    const prevSid = c.sid;
-    const current = c === pi;
-    stopPi(c);
-    const n = startPi(cwd, { current });
-    n.claimedAt = 0;
-    try { await n.waitReady(); if (file) await n.switchSession(file); }
-    catch (e) { log("pi restart: could not restore the session", e.message); }
-    // Move the keeper's goal + counters onto pi's new session id so a restart never drops the goal.
-    keeper.attachToSid(prevSid, n.sid);
-    n.resumeFile = n.state?.sessionFile || file;
-    if (n === pi) runLedger?.writeControl({ sessionFile: n.resumeFile });
-    return true;
-  }
-  /** Restart every child for a settings change: an idle one now, a working one at its next settle. */
-  async function restartPis() {
-    let restarted = false, pending = false;
-    for (const c of [...pis]) {
-      if (!c.proc) continue;
-      if (c.streaming || c.inFlight > 0) { restartPending.add(c); pending = true; continue; }
-      restarted = (await restartPi(c)) || restarted;
-    }
-    return { restarted, pending };
-  }
 
   // ---------------------------------------------------------------- digests
   const digestTimer = setInterval(async () => {
@@ -697,7 +814,7 @@ export async function createApp(overrides = {}) {
           return send(res, 200, { hook: next });
         }
       }
-      // long-run settings: where pi compacts (Omni caps each model's effective window) and auto-continue after a context stop
+      // long-run settings: where a chat compacts (OpencodeRpc's compactAt) and auto-continue after a context stop
       if (p === "/api/context") {
         if (req.method === "GET") return send(res, 200, { context: cfg.context });
         if (req.method === "PUT" || req.method === "POST") {
@@ -708,11 +825,11 @@ export async function createApp(overrides = {}) {
           cfg.context = contextConfig({ ...cfg.context, ...patch });
           keeper.setContextPolicy(cfg.context);
           if (cfg.persistContext !== false) writeConfigFile({ context: cfg.context });
+          // Every running chat compacts at the new point from its next prompt on (nothing restarts). The models.json
+          // caps are pi's way of doing the same, kept until pi is removed.
+          for (const c of pis) if ("compactAt" in c) c.compactAt = Number(cfg.context.compactAt) || 0;
           const caps = applyCaps(cfg.context.compactAt);
-          // pi reads models.json only at boot: an idle child restarts now, a busy one at its next settle.
-          let restarted = false, pending = false;
-          if (caps?.changed) ({ restarted, pending } = await restartPis());
-          return send(res, 200, { ok: true, context: cfg.context, caps: caps && { changed: caps.changed, changes: caps.changes, error: caps.error }, restarted, restartPending: pending });
+          return send(res, 200, { ok: true, context: cfg.context, caps: caps && { changed: caps.changed, changes: caps.changes, error: caps.error }, restarted: false, restartPending: false });
         }
       }
       // explicit goal (the /goal command): set a persistent goal and arm the keeper
@@ -749,10 +866,10 @@ export async function createApp(overrides = {}) {
         const name = decodeURIComponent(m[1]);
         if (req.method === "PUT") upsertProvider(cfg.piModelsFile, name, await readBody(req));
         else if (!removeProvider(cfg.piModelsFile, name)) return send(res, 404, { error: "unknown provider" });
-        const { restarted, pending } = await restartPis();
+        const { restarted, pending } = await reloadOpencode();
         return send(res, 200, { ok: true, restarted, restartPending: pending, providers: listProviders(cfg.piModelsFile) });
       }
-      // MCP servers (pi's omni-agent.json → mcpServers). pi loads them at boot, so a change restarts it.
+      // MCP servers (pi's omni-agent.json → mcpServers, rendered into opencode.json). A change reloads OpenCode.
       if (req.method === "GET" && p === "/api/mcp") {
         return send(res, 200, { servers: listMcpServers(cfg.piExtConfigFile), file: cfg.piExtConfigFile });
       }
@@ -764,7 +881,7 @@ export async function createApp(overrides = {}) {
         const name = decodeURIComponent(m[1]);
         if (req.method === "PUT") { const body = await readBody(req); upsertMcpServer(cfg.piExtConfigFile, name, body, { rename: body.rename }); }
         else if (!removeMcpServer(cfg.piExtConfigFile, name)) return send(res, 404, { error: "unknown MCP server" });
-        const { restarted, pending } = await restartPis();
+        const { restarted, pending } = await reloadOpencode();
         return send(res, 200, { ok: true, restarted, restartPending: pending, servers: listMcpServers(cfg.piExtConfigFile) });
       }
       // pi
@@ -832,16 +949,22 @@ export async function createApp(overrides = {}) {
             const r = await usePi(c).switchSession(body.file);
             return send(res, 200, { ...r, sid: c.sid });
           }
-          // Model and thinking level are remembered even when pi is not running yet: the next pi child starts with them.
+          // Model and thinking level are remembered even when no chat runs yet: the next chat starts with them. A live
+          // chat refuses a model OpenCode's catalog does not have (nothing is saved then).
           // A model only has some of the levels (ui/thinking.js): the saved level follows a model switch to the nearest one it has.
           // `sid` applies the pick to that chat's child (the others keep theirs); without one, to the current child.
           case "/api/pi/model": {
             if (!body.provider || !body.modelId) return send(res, 400, { error: "provider and modelId are required" });
             const c = sid ? piFor(sid) : pi;
-            const r = c?.proc ? await c.setModel(body.provider, body.modelId) : { success: true, pending: true };
+            let r;
+            if (c?.proc) r = await c.setModel(body.provider, body.modelId);
+            else {
+              const cat = opencode.up ? await catalog().catch(() => null) : null;
+              r = cat && !inCatalog(cat, body.provider, body.modelId) ? { success: false, error: `Model not found: ${body.provider}/${body.modelId}` } : { success: true, pending: true };
+            }
             if (r?.success !== false) {
               cfg.piProvider = body.provider; cfg.piModel = body.modelId;
-              const level = cfg.piThinking && clampThinking(cfg.piThinking, levelsOf(body.provider, body.modelId));
+              const level = cfg.piThinking && clampThinking(cfg.piThinking, await levelsOf(body.provider, body.modelId));
               if (level && level !== cfg.piThinking) { cfg.piThinking = level; if (c?.proc) await c.setThinking(level).catch(() => {}); }
               if (cfg.persistPiModel !== false) writeConfigFile({ piProvider: body.provider, piModel: body.modelId, ...(level ? { piThinking: level } : {}) });
             }
@@ -851,7 +974,8 @@ export async function createApp(overrides = {}) {
             if (!THINKING_LEVELS.includes(body.level)) return send(res, 400, { error: `level must be one of ${THINKING_LEVELS.join(", ")}` });
             const c = sid ? piFor(sid) : pi;
             const cur = currentModel(c);
-            const level = cur ? clampThinking(body.level, levelsOf(cur.provider, cur.id)) : body.level;
+            // Clamped to the levels the model has (its OpenCode variants): a level it lacks would not be sent at all.
+            const level = cur ? clampThinking(body.level, await levelsOf(cur.provider, cur.id)) : body.level;
             const r = c?.proc ? await c.setThinking(level) : { success: true, pending: true };
             if (r?.success !== false) { cfg.piThinking = level; if (cfg.persistPiModel !== false) writeConfigFile({ piThinking: level }); }
             return send(res, 200, { ...r, level: cfg.piThinking });
@@ -859,18 +983,19 @@ export async function createApp(overrides = {}) {
           case "/api/pi/compact": return send(res, 200, await requirePi(sid).compact());
           case "/api/pi/stats": return send(res, 200, await requirePi(sid).stats());
           case "/api/pi/models": {
-            // Omni's own provider config wins: only the models the user typed are listed. Without one, fall back to pi's catalogue.
-            const own = flatModels(cfg.piModelsFile);
-            if (own.length) return send(res, 200, { success: true, data: { models: own, source: "providers" } });
-            const r = await requirePi().models(); if (r?.data?.models) r.data.models = filterPiModels(r.data.models, cfg.piModels); return send(res, 200, r);
+            // OpenCode's connected providers (its free `opencode` models and every provider with a key). The
+            // piModels allowlist narrows the others; the `opencode` provider is always listed in full.
+            const models = pickerModels(await catalog(true));
+            const shown = cfg.piModels?.length ? models.filter((x) => x.provider === "opencode" || filterPiModels([x], cfg.piModels).length) : models;
+            return send(res, 200, { success: true, data: { models: shown } });
           }
           // ?provider=&model= for a model in the picker; without them the chat's current model (running or saved).
           case "/api/pi/thinking-levels": {
             const c = sid ? piFor(sid) : pi;
             const cur = q.get("model") ? { provider: q.get("provider") || "", id: q.get("model") } : currentModel(c);
-            const m = cur && (modelEntry(cfg.piModelsFile, cur.provider, cur.id) || (c?.state?.model?.id === cur.id ? { ...c.state.model, provider: cur.provider } : cur));
-            const t = m ? thinkingProfile(m) : null;
-            return send(res, 200, { success: true, data: t ? { levels: t.levels, labels: t.labels, family: t.family, provider: cur.provider, model: cur.id } : { levels: THINKING_LEVELS, labels: {} } });
+            if (!cur) return send(res, 200, { success: true, data: { levels: THINKING_LEVELS, labels: {} } });
+            const t = await thinkingOf(cur.provider, cur.id, c?.state?.model);
+            return send(res, 200, { success: true, data: { levels: t.levels, labels: t.labels, ...(t.family ? { family: t.family } : {}), provider: cur.provider, model: cur.id } });
           }
           case "/api/pi/state": return send(res, 200, await requirePi(sid).refreshState());
           default: return send(res, 404, { error: "unknown pi route" });
@@ -1070,7 +1195,7 @@ export async function createApp(overrides = {}) {
     log(`watching ${watcher.tails.size} session files (${registry.list().length} known sessions)`);
     // Agent chats keep their place under their parent (only chats the watcher found: a deleted one is not recreated blank).
     for (const a of agents.list()) if (a.sid && a.parentSid && registry.get(a.sid)) registry.upsert(a.sid, { parentSid: a.parentSid, agentId: a.id, agentKind: a.kind });
-    applyCaps();
+    applyCaps(); // pi's models.json caps (pi only; OpenCode chats compact through their compactAt)
     if (cfg.autoStartPi) {
       startPi(cfg.cwd);
       restoreGoal().catch((e) => log("could not restore the saved goal", e.message));
@@ -1103,6 +1228,8 @@ export async function createApp(overrides = {}) {
     for (const c of [...pis]) c.stop();
     agents.stopAll();
     agents.dispose();
+    // The shared `opencode serve` never outlives Omni (an injected one is stopped too).
+    try { opencode.stop(); } catch (e) { log("could not stop opencode", e.message); }
     claude.stopAll();
     approvals.dispose();
     for (const res of hostStreams) { try { res.end(); } catch { /* */ } }
@@ -1113,15 +1240,20 @@ export async function createApp(overrides = {}) {
     relay.server?.closeAllConnections?.();
   }
 
-  return { server, remote, relay, get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, cfg };
+  return { server, remote, relay, get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, opencode, cfg };
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || process.argv[1]?.endsWith("index.mjs")) {
   const app = await createApp();
+  // Whatever ends Omni's process (a signal, /api/shutdown, a fatal error), its `opencode serve` ends with it.
+  process.on("exit", () => app.opencode.killSync?.());
   await app.listen();
   const bye = () => { app.close(); process.exit(0); };
   process.on("SIGINT", bye);
   process.on("SIGTERM", bye);
+  // Closing the console window on Windows (SIGHUP) and Ctrl+Break (SIGBREAK).
+  process.on("SIGHUP", bye);
+  if (process.platform === "win32") process.on("SIGBREAK", bye);
   // A multi-day unattended run must survive a stray error: log and keep the process up.
   process.on("uncaughtException", (e) => log("uncaughtException", e?.stack || e));
   process.on("unhandledRejection", (e) => log("unhandledRejection", e?.stack || e));

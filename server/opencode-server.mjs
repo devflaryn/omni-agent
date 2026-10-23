@@ -3,7 +3,7 @@
  * (basic auth, `?directory=`), `listen()` delivers the `/global/event` SSE stream per session. The child is
  * relaunched after an unexpected exit and the stream reconnects with back-off; listeners survive both.
  */
-import { spawn as nodeSpawn } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
@@ -49,16 +49,17 @@ function errorMessage(text, status) {
 /**
  * Emits "up" each time the event stream (re)connects and "down" once when it is lost or the child exits.
  * `log(level, text)` gets the child's output and lifecycle notes. `url` attaches to a running server without
- * spawning. `platform`, `backoff` ({base, cap} for restartDelay) and `startTimeoutMs` are for tests.
+ * spawning. `platform`, `backoff` ({base, cap} for restartDelay), `startTimeoutMs` and `spawnSync` are for tests.
  */
 export class OpencodeServer extends EventEmitter {
-  constructor({ bin = "opencode", configDir, env = {}, log, spawn = nodeSpawn, url = null, password = null, platform = process.platform, backoff = {}, startTimeoutMs = 60000 } = {}) {
+  constructor({ bin = "opencode", configDir, env = {}, log, spawn = nodeSpawn, spawnSync = nodeSpawnSync, url = null, password = null, platform = process.platform, backoff = {}, startTimeoutMs = 60000 } = {}) {
     super();
     this.bin = bin;
     this.configDir = configDir;
     this.env = env;
     this.log = typeof log === "function" ? log : () => {};
     this.spawnFn = spawn;
+    this.spawnSyncFn = spawnSync;
     this.fixedUrl = url;
     this.givenPassword = password;
     this.password = password;
@@ -116,6 +117,24 @@ export class OpencodeServer extends EventEmitter {
     this.upWaiters.clear();
     const child = this.child;
     if (child) this.killTree(child);
+  }
+
+  /**
+   * For Omni's process `exit` handler, where nothing asynchronous runs any more: ends the child's tree before
+   * returning (a spawned taskkill would not outlive the wait), so no `opencode serve` outlives Omni. Never relaunches.
+   */
+  killSync() {
+    this.stopped = true;
+    clearTimeout(this.restartTimer);
+    this.restartTimer = null;
+    this.closeEvents();
+    const child = this.child;
+    this.child = null;
+    if (!child) return;
+    if (this.platform === "win32" && child.pid) {
+      try { this.spawnSyncFn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore", timeout: 10000 }); return; } catch { /* fall through */ }
+    }
+    try { child.kill("SIGTERM"); } catch { /* gone */ }
   }
 
   /** `shell:true` on Windows makes the child cmd.exe: killing it alone would orphan the real server. */

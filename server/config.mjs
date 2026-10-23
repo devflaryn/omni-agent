@@ -116,6 +116,14 @@ export const CONFIG = {
   piAgentDir: fc.piAgentDir || join(HOME, ".pi", "agent"),
   piModelsFile: fc.piModelsFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "models.json"),
   piBin: fc.piBin || "pi",
+  /** The `opencode` launcher: Omni runs one `opencode serve` that every chat and background agent shares. */
+  opencodeBin: fc.opencodeBin || "opencode",
+  /** Omni's own OpenCode config dir (`OPENCODE_CONFIG_DIR`): opencode.json written by Omni, layered over the user's global config. */
+  opencodeConfigDir: fc.opencodeConfigDir || join(HOME, ".omni-agent", "opencode"),
+  /** The chats' pi-format mirror files; empty = `<piSessionsDir>/opencode` (createApp fills it in). */
+  opencodeMirrorDir: fc.opencodeMirrorDir || "",
+  /** Background-agent personas (`<name>.md`: frontmatter + system prompt), kept out of OpenCode's config dir. */
+  personasDir: fc.personasDir || join(ROOT, "integrations", "pi", "agents"),
   /** pi's Omni extension config; its `mcpServers` block is what the Providers dialog's MCP servers tab edits. */
   piExtConfigFile: fc.piExtConfigFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "omni-agent.json"),
   /** Key files handed to the pi child as environment variables (one line each, gitignored). */
@@ -167,7 +175,7 @@ export const CONFIG = {
   /** Which models.json contextWindow overrides Omni wrote itself (server/context-policy.mjs), so hand-written ones are never touched. */
   contextCapsFile: fc.contextCapsFile || join(HOME, ".omni-agent", "context-caps.json"),
   /** Where unattended run ledgers live. */
-  /** The status-box summarizer's own side conversations (one pi session per goal), apart from the chats. */
+  /** The status-box summarizer's own side conversations (one OpenCode session per goal, ids kept in opencode-sessions.json; the judge's and the summarizer's sessions run in this directory), apart from the chats. */
   statusSessionsDir: fc.statusSessionsDir || join(HOME, ".omni-agent", "status-sessions"),
   runsDir: fc.runsDir || join(fc.vaultDir || join(ROOT, "vault"), "Runs"),
   /** CLI reverse-engineering tools (jadx/apktool/baksmali/smali) are pre-installed here and this
@@ -264,7 +272,8 @@ export function agentsConfig(raw = {}) {
   };
 }
 
-/** Environment handed to the pi child: provider API keys (from key files), the emulator display
+/** Environment handed to the pi child — and to Omni's `opencode serve`, which every chat shares, so it carries
+ *  only server-wide values (a background agent's identity cannot reach it): provider API keys (from key files), the emulator display
  *  override (so omnidroid launched by the model uses the higher default resolution), and
  *  OMNI_MEMORY=server, which tells the omni-memory extension that this child is Omni's own:
  *  the server attaches the vault pack per prompt (composer checkbox), so the extension must not

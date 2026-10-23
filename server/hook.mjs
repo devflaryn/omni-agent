@@ -32,12 +32,11 @@
  * and its end (done or paused) is announced as a `goal` event. While a chat's background agents are
  * running it is never re-engaged: their reports wake it up.
  *
- * Status box: written by a separate summarizer — its own side conversation (`pi -p` on a dedicated
- * session per goal), never the agent's chat — and only when the plan moves: plan written or revised, a
- * milestone reached, the plan finished. The plan itself is broadcast on every change (`plan` event) so
- * the box's checklist is always current without any model call.
+ * Status box: written by a separate summarizer — its own side conversation (an OpenCode session of its
+ * own per goal, through runOnce in server/opencode-rpc.mjs), never the agent's chat — and only when the
+ * plan moves: plan written or revised, a milestone reached, the plan finished. The plan itself is
+ * broadcast on every change (`plan` event) so the box's checklist is always current without any model call.
  */
-import { spawn as nodeSpawn } from "node:child_process";
 import { classifyStop, contextContinueMessage, contextSkipReason } from "../integrations/pi/omni-context-lib.mjs";
 import { hookInfo, hookMessage } from "../ui/lib.js";
 import { PLAN_TOOL, allSteps, asPlan, clearWaiting, currentStep, latestPlan, planNudge, planProgress, renderPlan } from "../ui/plan.js";
@@ -140,33 +139,6 @@ export function tailLine(ev) {
     return (ev.blocks || []).filter((b) => b.type === "tool_result").map((b) => `${b.isError ? "tool error" : "tool result"} ${b.name || ""}: ${clip((b.text || "").trim(), 400)}${b.images?.length ? ` [${b.images.length} image(s)]` : ""}`).join("\n") || null;
   }
   return null;
-}
-
-/**
- * Ask a model through `pi -p` (no tools, no extensions) and resolve with its text. With `conversation`
- * ({ dir, id }) the call continues that side conversation's own session file, so a summarizer keeps its
- * memory across calls; without it the call is ephemeral (`--no-session`).
- * `cli` is pi's dist/cli.js (run with the current node); `bin` is the fallback launcher.
- */
-export function runJudge({ cli, bin = "pi", provider, model, env = {}, cwd, spawn = nodeSpawn, timeoutMs = 120000, conversation = null }, { system, input }) {
-  return new Promise((resolve, reject) => {
-    const session = conversation?.dir && conversation?.id ? ["--session-dir", conversation.dir, "--session-id", conversation.id] : ["--no-session"];
-    const args = ["-p", "--no-tools", "--no-extensions", "--no-skills", ...session, "--no-context-files", "--no-prompt-templates", "--thinking", "off", "--system-prompt", system];
-    if (provider) args.push("--provider", provider);
-    if (model) args.push("--model", model);
-    const full = { ...process.env, ...env };
-    const proc = cli
-      ? spawn(process.execPath, [cli, ...args], { cwd, env: full, windowsHide: true })
-      : spawn(process.platform === "win32" ? `${bin}.cmd` : bin, args, { cwd, env: full, shell: process.platform === "win32", windowsHide: true });
-    let out = "", err = "";
-    const timer = setTimeout(() => { try { proc.kill(); } catch { /* */ } reject(new Error("judge timed out")); }, timeoutMs);
-    proc.stdout.setEncoding("utf8"); proc.stdout.on("data", (c) => { out += c; });
-    proc.stderr.setEncoding("utf8"); proc.stderr.on("data", (c) => { err += c; });
-    proc.on("error", (e) => { clearTimeout(timer); reject(e); });
-    proc.on("exit", (code) => { clearTimeout(timer); if (code === 0 || out.trim()) resolve(out); else reject(new Error(err.trim().split("\n").pop() || `judge exited with code ${code}`)); });
-    proc.stdin.on("error", () => {});
-    proc.stdin.end(input);
-  });
 }
 
 /**

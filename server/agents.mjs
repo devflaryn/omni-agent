@@ -3,7 +3,7 @@
  * agents) starts and keeps working beside. Each one is a plain record in a small registry
  * (agents.json, written atomically) and every change is broadcast as a bus `agent` event.
  *
- *   pi      a PiRpc child of its own (persona from ~/.pi/agent/agents/<name>.md) with a managed goal:
+ *   pi      a chat of its own on the shared OpenCode server (persona from `<personasDir>/<name>.md`) with a managed goal:
  *           the goal keeper re-engages it until its goal event says done (or paused → "stalled").
  *   claude  an interactive ClaudeRunner run (stream-json in and out), steerable while it works,
  *           resumed with --resume once it has exited.
@@ -91,18 +91,20 @@ function tailLines(file, n) {
 export class AgentManager extends EventEmitter {
   /**
    * `createPi(opts)` → a PiRpc-like child (start, waitReady, prompt, abort, stop, switchSession, owns, sid,
-   * state, streaming, proc; "exit" events). `claude` → a ClaudeRunner ("exit" events, runs, run, send, abort).
+   * state, streaming, proc; "exit" events); `opts` = {cwd, model, provider, thinking, env, system, tools, meta}, with
+   * a persona's prompt as `system` and its tool allowlist (pi names, plus the plan tool) as `tools`, else "" / null.
+   * `personasDir` holds the persona files. `claude` → a ClaudeRunner ("exit" events, runs, run, send, abort).
    * `keeper` → the GoalKeeper (setManagedGoal); without one a pi agent is done 3 s (`idleDoneMs`) after it
    * stops streaming; with one, its goal event decides, and `keeperIdleMs` of silence is only the backstop.
    */
-  constructor({ bus, config = {}, file = "", dir = "", piAgentDir = "", createPi, claude, keeper = null, composeSystem = null, piEnv = {}, shellPath = "", shellArgs = ["-lc"], cwd = process.cwd(),
+  constructor({ bus, config = {}, file = "", dir = "", personasDir = "", createPi, claude, keeper = null, composeSystem = null, piEnv = {}, shellPath = "", shellArgs = ["-lc"], cwd = process.cwd(),
     now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, killTree, spawn = nodeSpawn, log = () => {},
     idleDoneMs = 3000, keeperIdleMs = 30 * 60000, graceMs = 1500, saveDelayMs = 150, pollMs = 500 } = {}) {
     super();
     this.setMaxListeners(500);
     this.bus = bus;
     this.config = { maxConcurrent: 6, maxDepth: 2, maxMinutes: 360, claudePermissionMode: "bypassPermissions", claudeMaxTurns: 300, claudeModel: "", ...config };
-    this.file = file; this.dir = dir; this.piAgentDir = piAgentDir;
+    this.file = file; this.dir = dir; this.personasDir = personasDir;
     this.createPi = createPi; this.claude = claude; this.keeper = keeper; this.composeSystem = composeSystem;
     this.piEnv = piEnv; this.shellPath = shellPath; this.shellArgs = shellArgs; this.cwd = cwd;
     this.now = now; this.setTimer = setTimer; this.clearTimer = clearTimer; this.spawn = spawn; this.log = log;
@@ -149,13 +151,13 @@ export class AgentManager extends EventEmitter {
   owns(file) { for (const rt of this.rt.values()) if (rt.pi?.owns?.(file)) return true; return false; }
   activeCount() { let n = 0; for (const r of this.records.values()) if (r.status === "starting" || r.status === "running") n++; return n; }
 
-  /** Persona `<piAgentDir>/agents/<name>.md` (or the file whose frontmatter has that name). Throws a 400 when unknown. */
+  /** Persona `<personasDir>/<name>.md` (or the file whose frontmatter has that name). Throws a 400 when unknown. */
   persona(name) {
     const n = String(name ?? "").trim();
     if (!/^[\w.-]+$/.test(n)) throw bad(`bad agent persona name "${n}"`);
-    const dir = join(this.piAgentDir || "", "agents");
+    const dir = this.personasDir || "";
     let text = null;
-    try { text = readFileSync(join(dir, `${n}.md`), "utf8"); } catch { /* look it up by its frontmatter name */ }
+    if (dir) { try { text = readFileSync(join(dir, `${n}.md`), "utf8"); } catch { /* look it up by its frontmatter name */ } }
     if (text == null) for (const p of this.personas()) if (p.name === n) { text = readFileSync(p.file, "utf8"); break; }
     if (text == null) {
       const known = this.personas().map((p) => p.name);
@@ -165,7 +167,8 @@ export class AgentManager extends EventEmitter {
     return { ...p, name: p.name || n };
   }
   personas() {
-    const dir = join(this.piAgentDir || "", "agents");
+    const dir = this.personasDir || "";
+    if (!dir) return [];
     let files = [];
     try { files = readdirSync(dir).filter((f) => f.endsWith(".md")); } catch { return []; }
     const out = [];
@@ -260,17 +263,16 @@ export class AgentManager extends EventEmitter {
   async launchPi(rec, rt, gen) {
     if (typeof this.createPi !== "function") throw new Error("pi agents are not available (no createPi)");
     const persona = rec.agent ? this.persona(rec.agent) : null;
-    const extraArgs = [];
-    if (persona?.body) extraArgs.push("--append-system-prompt", persona.body);
-    // pi's --tools is an allowlist over extension tools too: keep the plan tool the goal keeper works with
-    // (an unknown name is ignored by pi). agent_* is not added: it would let a restricted persona start an
-    // unrestricted agent, so a persona that should delegate lists agent_start itself.
-    if (persona?.tools.length) extraArgs.push("--tools", [...new Set([...persona.tools, PLAN_TOOL])].join(","));
-    // The spec's model wins; else the persona's (pi resolves "provider/id" itself); else the caller's provider default.
+    const system = persona?.body || "";
+    // The tools are an allowlist over plugin tools too: keep the plan tool the goal keeper works with. agent_* is
+    // not added: it would let a restricted persona start an unrestricted agent, so a persona that should delegate
+    // lists agent_start itself.
+    const tools = persona?.tools.length ? [...new Set([...persona.tools, PLAN_TOOL])] : null;
+    // The spec's model wins; else the persona's ("provider/id"); else the caller's provider default.
     const model = rec.model || persona?.model || "";
     const provider = rec.model ? rec.provider : persona?.model ? "" : rec.provider;
     const env = { ...this.piEnv, OMNI_AGENT_ID: rec.id, OMNI_AGENT_DEPTH: String(rec.depth), OMNI_PARENT_SID: rec.parentSid || "" };
-    const pi = this.createPi({ cwd: rec.cwd, model, provider, thinking: rec.thinking, env, extraArgs, meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "pi" } });
+    const pi = this.createPi({ cwd: rec.cwd, model, provider, thinking: rec.thinking, env, system, tools, meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "pi" } });
     rt.pi = pi;
     pi.on?.("exit", (code) => this.onPiExit(rec.id, gen, pi, code));
     pi.start();
