@@ -1,6 +1,6 @@
 ---
 name: omnidroid
-description: Use when running any APK on omnidroid (the native ARM64-Android engine in "Omni Apps/omnidroid", no VM) through the omnidroid app's MCP server — start_instance {apk, count, options, auto_restart} / wait_instance / list_instances / screenshot / input / stop_instance; recovering a crash (restart_instance, auto_restart, an end's `details`); the warm Androids (list_devices, warm_device, stop_device, shell, settings, pool_log, pi's wait_device); WebViews (web_pages, web_dom, web_click, web_type, web_eval); and the roblox plugin (a roblox account, a place) — options "--cookie <file or saved name> --place <id>" sign each instance in and join the place, followed in pool_log. Trigger on "run/launch this APK", "N instances", "sign in with this cookie", "join place", "restart the instance", "screenshot/tap the app", or any omnidroid_* / mcp__omnidroid__* instance or device tool. Hooking a .so — omnidroid-frida. Old QEMU manager — omnidroid-qemu.
+description: Use when running any APK on omnidroid (the native ARM64-Android engine in "Omni Apps/omnidroid", no VM) through the omnidroid app's MCP server — start_instance {apk, count, options, auto_restart} / wait_instance / list_instances / screenshot / input / stop_instance; recovering a crash (restart_instance, auto_restart, an end's `details`); the warm Androids (list_devices, warm_device, stop_device, shell, settings, pool_log, Omni Agent's wait_device); WebViews (web_pages, web_dom, web_click, web_type, web_eval); and the roblox plugin (a roblox account, a place) — options "--cookie <file or saved name> --place <id>" sign each instance in and join the place, followed in pool_log. Trigger on "run/launch this APK", "N instances", "sign in with this cookie", "join place", "restart the instance", "screenshot/tap the app", or any omnidroid_* / mcp__omnidroid__* instance or device tool. Hooking a .so — omnidroid-frida. Old QEMU manager — omnidroid-qemu.
 ---
 
 # Driving omnidroid
@@ -26,8 +26,8 @@ person launches you see in `list_instances`, and the reverse.
 
 - **Claude Code**: tools `mcp__omnidroid__<tool>` (registered by `mcp on`: `claude mcp add
   --transport http --scope user omnidroid <url>`).
-- **pi (Omni Agent)**: tools `omnidroid_<tool>`, through `omni-mcp --connect <url>` (a stdio
-  bridge); plus pi's own `omnidroid_wait_device` and smoothing — see "pi" below.
+- **Omni Agent (OpenCode)**: tools `omnidroid_<tool>`, through `omni-mcp --connect <url>` (a stdio
+  bridge); plus Omni's own `omnidroid_wait_device` — see "Omni Agent" below.
 - **Any other agent**: the URL (MCP over HTTP), or `omni-mcp --connect <url>` as a stdio server.
 
 **No tools, or "the omnidroid app's MCP server is not reachable"?** No pool is open, or MCP is off:
@@ -88,7 +88,7 @@ a new Android ~1-2 min. Androids idle `idle_close_minutes` are closed; `keep_war
 3. `screenshot {instance_id: 7}` and look at the PNG; `input` to drive it.
 4. Done: `stop_instance {instance_id: 7}`. Don't stop instances the person started.
 
-Need a device first (nothing to launch yet)? `warm_device`, then wait for `ready` (pi:
+Need a device first (nothing to launch yet)? `warm_device`, then wait for `ready` (Omni Agent:
 `omnidroid_wait_device`; Claude Code: `list_devices` every ~15-30 s — booting takes minutes, so
 don't hammer it). `start_instance` does not need this: it boots one itself.
 
@@ -157,32 +157,29 @@ The instance must be `running`. `page` (an id or its prefix) defaults to the vis
 Errors: `the instance shows no web page (no WebView, or its app has not made one yet)`, `no page X
 (web_pages lists them)`, `#N is not running`.
 
-## pi (Omni Agent)
+## Omni Agent (OpenCode)
 
-pi's `omni-mcp.ts` wraps the same tools as `omnidroid_<tool>` and changes a few things:
+Omni Agent runs on OpenCode, which serves omnidroid's `omni-mcp` as the MCP server `omnidroid`: the
+tools are `omnidroid_<tool>` and answer **the omnidroid MCP server's own results**, unchanged —
+nothing is trimmed, retried or rewritten. Omni adds one tool:
 
-- **`omnidroid_wait_device {timeout?}`** (default 300 s) — pi's own tool, not the server's: it
-  polls `list_devices` every 3 s and returns once at least one Android exists and none is
-  `booting`/`closing` (`ready after Ns: …` or `still not ready after Ns …`). Use it after
-  `warm_device` instead of calling `omnidroid_list_devices` in a loop. **Call it without
-  `device`**: its per-device filter reads an `id` field the server does not send (the server says
-  `device`), so with `device` it waits the full timeout. With no Android at all it also waits the
-  timeout — `warm_device` first.
-- **`stop_instance` / `stop_app` / `stop_device` on something already gone** (`#N ended already`,
-  `no instance #N`) answer a no-op success: "the target was already stopped … Nothing to do". Take
-  it as done.
-- **`list_instances` is trimmed** when it holds more than 4 ended instances and is over 4000
-  chars: every live instance and the 4 newest ended ones stay in full; the rest become
-  `omittedEnded: {count, note, instances: [{instance_id, package, state, up_s}]}`. Those are old
-  ended instances — ignore them unless you need one; then read its id there.
-- **Repeat nudge**: an identical `list_devices` / `device_status` / `list_instances` /
-  `list_maps` / `list_symbols` result twice in a row gets "(identical to your previous … call —
-  nothing has changed …)" prepended: stop polling; wait (`wait_instance`, `wait_device`) or act.
-- **Slow calls**: past `omniMcp.timeoutSec` (600 s) a call answers "⏱ … has run Ns without
-  returning … still alive"; the server is not killed (labs survive) and a late result arrives as a
-  follow-up message. Don't re-issue a long `wait_instance` blindly.
-- Results over 12 000 chars are cut. `screenshot` attaches the PNG for image-capable models.
-- Number args may be given as `"0x…"`/decimal strings; they are coerced to the schema's type.
+- **`omnidroid_wait_device {device?, timeout?}`** (default 300 s) — Omni's own tool, not the
+  server's: it polls `list_devices` every 3 s and returns once the named `device` is `ready`, or,
+  without `device`, once at least one Android exists and none is `booting`/`closing` (`ready after
+  Ns: …` or `still not ready after Ns …`). Use it after `warm_device` instead of calling
+  `omnidroid_list_devices` in a loop. With no Android at all it waits the full timeout —
+  `warm_device` first.
+
+What that means in practice:
+
+- **`stop_instance` / `stop_app` / `stop_device` on something already gone** return the server's
+  error (`#N ended already`, `no instance #N`): it was already stopped — take it as done, don't
+  retry it.
+- **`list_instances` lists every instance**, ended ones included, in full. A long list is mostly
+  old ended instances: look at the live ones (and the newest ended ones) unless you need an older id.
+- Polling the same `list_devices` / `list_instances` again and again changes nothing: wait
+  (`wait_instance`, `omnidroid_wait_device`) or act instead.
+- Number args are the schema's types: pass numbers as numbers (addresses are strings, `"0x…"`).
 
 ## Looking inside a running app (no adb, no ptrace)
 
