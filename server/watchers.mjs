@@ -36,10 +36,10 @@ export class SessionRegistry {
   remove(sid) { const s = this.sessions.get(sid); this.sessions.delete(sid); return s || null; }
 }
 
-function sidForFile(harness, file) {
+export function sidForFile(harness, file) {
   const id = basename(file, ".jsonl");
   if (harness === "claude") return `claude:${id}`;
-  const m = /_([0-9a-f-]{20,})$/i.exec(id);
+  const m = /_(ses_[A-Za-z0-9]+|[0-9a-f-]{20,})$/i.exec(id);
   return `pi:${m ? m[1] : id}`;
 }
 

@@ -55,6 +55,39 @@ function readMirror(file) {
   return out;
 }
 
+const TRANSCRIPT_MAX = 48000;
+const LINE_MAX = 2000;
+const clip = (s) => { s = String(s ?? "").trim(); return s.length > LINE_MAX ? `${s.slice(0, LINE_MAX)}…` : s; };
+
+/** The imported-chat transcript: user/assistant text and short tool lines (thinking skipped), the tail within TRANSCRIPT_MAX chars. */
+export function piTranscript(entries) {
+  const out = [];
+  for (const e of entries) {
+    const m = e?.type === "message" ? e.message : null;
+    if (!m) continue;
+    const parts = typeof m.content === "string" ? [{ type: "text", text: m.content }] : Array.isArray(m.content) ? m.content : [];
+    if (m.role === "user" || m.role === "assistant") {
+      const who = m.role === "user" ? "User" : "Assistant";
+      for (const c of parts) {
+        if (c?.type === "text" && c.text?.trim()) out.push(`${who}: ${clip(c.text)}`);
+        else if (c?.type === "toolCall") out.push(`Tool call ${c.name}: ${clip(JSON.stringify(c.arguments ?? {}))}`);
+      }
+    } else if (m.role === "toolResult") {
+      const t = parts.filter((c) => c?.type === "text").map((c) => c.text).join("\n");
+      out.push(`Tool result${m.toolName ? ` (${m.toolName})` : ""}${m.isError ? " [error]" : ""}: ${clip(t)}`);
+    }
+  }
+  if (!out.length) return "";
+  const kept = [];
+  let size = 0;
+  for (let i = out.length - 1; i >= 0; i--) {
+    size += out[i].length + 1;
+    if (size > TRANSCRIPT_MAX) break;
+    kept.unshift(out[i]);
+  }
+  return `Earlier conversation, imported from pi (most recent last):\n${kept.join("\n")}`;
+}
+
 /**
  * Emits "pi" (every pi RPC event, as PiRpc does) and "exit" (null) when stop() ends the chat. `env` is accepted for
  * PiRpc parity only: the shared server's environment applies. `system`/`tools` are sent with every prompt (a
@@ -542,11 +575,46 @@ export class OpencodeRpc extends EventEmitter {
     return { success: true, data: { cancelled: false } };
   }
 
-  /** Attaches to the OpenCode session of an opencode mirror file. */
+  /**
+   * A native pi chat continued on OpenCode: a new session whose mirror starts with the pi entries (history stays
+   * visible), and whose model context is a `noReply` transcript message. That message is listed as known in the mirror
+   * before anything can reconcile, or it would come back as a visible user message.
+   */
+  async importPi(sessionPath) {
+    await this.ready?.catch(() => {});
+    const gen = this.gen;
+    const copied = readMirror(sessionPath);
+    const text = piTranscript(copied);
+    const info = await this.server.request("POST", "/session", { directory: this.cwd, body: {} });
+    let seeded = null;
+    try {
+      this.current(gen);
+      if (text) {
+        const r = await this.server.request("POST", `/session/${info.id}/message`, { directory: this.cwd, body: { noReply: true, parts: [{ type: "text", text }] } });
+        seeded = r?.info?.id || null;
+        this.current(gen);
+      }
+    } catch (e) {
+      this.discard(info.id, null);
+      if (gen === this.gen) this.log("system", `could not continue the pi chat: ${e.message}`);
+      throw e;
+    }
+    const out = [this.header(info.id), ...copied.map((e) => JSON.stringify(e))];
+    if (seeded) out.push(JSON.stringify({ type: "custom", customType: KNOWN, id: `known_${info.id}`, parentId: copied.at(-1)?.id ?? null, timestamp: new Date().toISOString(), data: { messageIDs: [seeded] } }));
+    const file = this.newMirrorPath(info.id);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, out.join("\n") + "\n");
+    this.dropUnused(this.attach(info.id, file));
+    await this.announce(info);
+    return { success: true, data: { cancelled: false } };
+  }
+
+  /** Attaches to the OpenCode session of an opencode mirror file; a native pi chat file is imported into a new session. */
   async switchSession(sessionPath) {
     let head = null;
-    try { head = JSON.parse(readFileSync(sessionPath, "utf8").split("\n", 1)[0]); } catch { /* not a mirror */ }
-    if (head?.type !== "session" || head.harness !== "opencode" || !head.id) throw new Error("not an opencode chat file");
+    try { head = JSON.parse(readFileSync(sessionPath, "utf8").split("\n", 1)[0]); } catch { /* not a session file */ }
+    if (head?.type !== "session" || !head.id) throw new Error("not a chat file");
+    if (head.harness !== "opencode") return this.importPi(sessionPath);
     await this.ready?.catch(() => {});
     const gen = this.gen;
     const info = await this.server.request("GET", `/session/${head.id}`, { directory: this.cwd });

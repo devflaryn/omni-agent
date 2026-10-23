@@ -541,10 +541,69 @@ test("switchSession(opencode mirror) attaches to that session", async () => {
   assert.equal(all.at(-1).parentId, "msg_old", "continues the existing chain");
   assert.equal(rpc.streaming, false);
 
-  const pi = join(mirrorDir, "pi.jsonl");
-  writeFileSync(pi, `${JSON.stringify({ type: "session", version: 3, id: "0b1c", cwd, timestamp: "2026-10-20T10:00:00.000Z" })}\n`);
-  await assert.rejects(rpc.switchSession(pi), /not an opencode chat file/);
+  const junk = join(mirrorDir, "junk.jsonl");
+  writeFileSync(junk, "not json\n");
+  await assert.rejects(rpc.switchSession(junk), /not a chat file/);
   assert.equal(rpc.sid, "pi:ses_titled", "a refused switch keeps the chat where it was");
+});
+
+test("continuing a pi chat seeds a noReply transcript and copies history", async () => {
+  const seedId = "msg_seed1";
+  const { server, rpc, mirrorDir, cwd, events } = setup({
+    reply: (m, p, o) => (m === "POST" && /^\/session\/[^/]+\/message$/.test(p) ? { info: { id: seedId, role: "user" }, parts: [] } : undefined),
+  });
+  rpc.start();
+  await rpc.waitReady();
+  const empty = rpc.state.sessionFile;
+  const msg = (id, parentId, message) => ({ type: "message", id, parentId, timestamp: "2026-10-20T10:00:00.000Z", message });
+  const entries = [
+    msg("p1", null, { role: "user", content: [{ type: "text", text: "make a plan" }] }),
+    msg("p2", "p1", { role: "assistant", content: [{ type: "thinking", thinking: "SECRET-THOUGHT" }, { type: "text", text: "on it" }, { type: "toolCall", id: "t1", name: "plan", arguments: { action: "create" } }] }),
+    msg("p3", "p2", { role: "toolResult", toolCallId: "t1", toolName: "plan", content: [{ type: "text", text: "plan created" }], details: { plan, events: [], ok: true } }),
+  ];
+  const pi = join(mirrorDir, "2026-10-20T10-00-00.000Z_0b1c0b1c-0b1c-0b1c-0b1c-0b1c0b1c0b1c.jsonl");
+  writeFileSync(pi, [{ type: "session", version: 3, id: "0b1c", cwd, timestamp: "2026-10-20T10:00:00.000Z" }, ...entries].map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const before = readFileSync(pi, "utf8");
+  const r = await rpc.switchSession(pi);
+  assert.equal(r.success, true);
+  assert.equal(readFileSync(pi, "utf8"), before, "the pi file is untouched");
+  assert.equal(rpc.sid, "pi:ses_fake2");
+  assert.notEqual(rpc.state.sessionFile, pi);
+  assert.ok(!existsSync(empty));
+  const seed = posts(server, /^\/session\/ses_fake2\/message$/);
+  assert.equal(seed.length, 1);
+  assert.equal(seed[0].body.noReply, true);
+  const text = seed[0].body.parts[0].text;
+  assert.ok(text.startsWith("Earlier conversation, imported from pi (most recent last):\n"));
+  assert.match(text, /User: make a plan/);
+  assert.match(text, /Assistant: on it/);
+  assert.match(text, /plan/);
+  assert.match(text, /plan created/);
+  assert.ok(!text.includes("SECRET-THOUGHT"));
+
+  const all = lines(rpc.state.sessionFile);
+  assert.equal(all[0].harness, "opencode");
+  assert.equal(all[0].id, "ses_fake2");
+  assert.deepEqual(all.slice(1, 4), entries, "the pi entries are copied verbatim");
+  const known = all[4];
+  assert.equal(known.customType, "opencode-known");
+  assert.deepEqual(known.data.messageIDs, [seedId]);
+  assert.equal(known.parentId, "p3");
+
+  // The transcript message never shows up as a visible user message, and the chain continues from the old tail.
+  server.history.set("ses_fake2", [{ info: { id: seedId, sessionID: "ses_fake2", role: "user", time: { created: 1 } }, parts: [{ id: "prt_s", messageID: seedId, type: "text", text }] }]);
+  events.length = 0;
+  await rpc.reconcile();
+  assert.equal(lines(rpc.state.sessionFile).length, all.length, "nothing back-filled");
+  assert.ok(!events.some((e) => e.kind === "msg"));
+  server.push({ type: "message.updated", properties: { sessionID: "ses_fake2", info: { id: "msg_n", sessionID: "ses_fake2", role: "user", time: { created: 9000 } } } });
+  server.push({ type: "message.part.updated", properties: { sessionID: "ses_fake2", part: { id: "prt_n", sessionID: "ses_fake2", messageID: "msg_n", type: "text", text: "next" } } });
+  server.push({ type: "session.idle", properties: { sessionID: "ses_fake2" } });
+  const last = lines(rpc.state.sessionFile).at(-1);
+  assert.equal(last.id, "msg_n");
+  assert.equal(last.parentId, known.id, "chains onto the known entry, which chains onto the old tail");
+  const entriesNow = lines(rpc.state.sessionFile).slice(1);
+  assert.ok(latestPlan(entriesNow, entriesNow.at(-1).id), "the old chat's plan is still found");
 });
 
 test("server down → streaming false, up → reattach and onRestart", async () => {

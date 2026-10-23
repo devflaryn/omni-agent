@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { createApp } from "../server/index.mjs";
+import { sidForFile } from "../server/watchers.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -550,4 +551,10 @@ test("thinking levels follow the model: its family's levels, and a switch moves 
   const r = await post2("/api/pi/model", { provider: "openai", modelId: "gpt-5.2" });
   assert.equal(r.json.level, "xhigh");
   assert.deepEqual(fakePi.calls.slice(-2), [["model", "openai", "gpt-5.2"], ["thinking", "xhigh"]]);
+});
+
+test("sid for an opencode mirror file", () => {
+  assert.equal(sidForFile("pi", "/x/opencode/2026-10-23T00-00-00.000Z_ses_e99eaa6e3fferGKykKmPKDLWNM.jsonl"), "pi:ses_e99eaa6e3fferGKykKmPKDLWNM");
+  assert.equal(sidForFile("pi", "/x/2026-10-23T00-00-00.000Z_0b1c0b1c-0b1c-4b1c-8b1c-0b1c0b1c0b1c.jsonl"), "pi:0b1c0b1c-0b1c-4b1c-8b1c-0b1c0b1c0b1c");
+  assert.equal(sidForFile("claude", "/x/abc.jsonl"), "claude:abc");
 });
