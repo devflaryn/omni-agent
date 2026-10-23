@@ -46,6 +46,14 @@ dialog (gear icon); MCP servers go in its **MCP servers** tab. Providers you had
 The agent personas (`integrations/pi/agents/*.md`, or `personasDir`) are read from the repo, not from the
 OpenCode config folder.
 
+Omni ends its `opencode serve` when it exits (also on Ctrl+C, a closed console window or `/api/shutdown`). A
+**hard kill** of Omni's node process (Task Manager's End task, `taskkill /F`, `kill -9`, a crash) cannot, and
+leaves that `opencode serve` running on a random `127.0.0.1` port. It does no harm beyond memory (a new Omni
+starts its own), but to end it: on Windows, in PowerShell,
+`Get-CimInstance Win32_Process -Filter "name='opencode.exe'" | ? CommandLine -like '*serve --port 0*' | select ProcessId, CommandLine`
+(Omni's runs with `serve --port 0 --hostname 127.0.0.1`), then `taskkill /PID <pid> /T /F`; on macOS/Linux `pgrep -af "opencode serve"` and `kill <pid>`. Don't end an
+`opencode serve` you started yourself.
+
 ### Use it from another device or another network
 
 Omni then runs as a small server: this computer is **the host**, everything else is **a remote browser**.
@@ -333,6 +341,11 @@ or Anthropic/Google-style providers (a base URL, an API type, a key and the mode
 custom providers are stored in `~/.omni-agent/opencode-providers.json` and rendered into `opencode.json`
 (`~/.omni-agent/opencode/`); saving reloads OpenCode. The dialog's second tab, **MCP servers**, edits the
 tool servers OpenCode connects to (see `mcpServers` above).
+
+A key you set for one of **OpenCode's own providers** (Anthropic, OpenAI, OpenRouter, …) is not kept by Omni: it
+goes to your user's global OpenCode auth store (`~/.local/share/opencode/auth.json`), the same one your `opencode`
+CLI uses. Setting or removing it in Omni sets or removes it for the CLI too, and a key you added with
+`opencode auth login` shows up in Omni as connected. Only custom providers' keys live in Omni's own files.
 
 Picking a model in the composer sets the chat's model and writes `piProvider` / `piModel` to
 `omni.config.json` (the names are historical), so the next chat starts on it.
