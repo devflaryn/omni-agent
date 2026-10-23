@@ -235,10 +235,48 @@ export function normalizeCustomModels(list) {
     const m = typeof raw === "string" ? { id: raw } : raw && typeof raw === "object" ? raw : null;
     const id = String(m?.id ?? "").trim();
     if (!id) continue;
-    out.push({ id, name: String(m.name || "").trim() || id, contextWindow: num(m.contextWindow, DEFAULTS.contextWindow), maxTokens: num(m.maxTokens, DEFAULTS.maxTokens), reasoning: m.reasoning === true });
+    const e = { id, name: String(m.name || "").trim() || id, contextWindow: num(m.contextWindow, DEFAULTS.contextWindow), maxTokens: num(m.maxTokens, DEFAULTS.maxTokens), reasoning: m.reasoning === true };
+    const cost = opencodeCost(m.cost);
+    if (cost) e.cost = cost;
+    if (isObj(m.variants) && Object.keys(m.variants).length) e.variants = m.variants;
+    out.push(e);
   }
   return out;
 }
+
+/**
+ * A price per million tokens as OpenCode's model `cost` (`{input, output, cache_read, cache_write}`), from pi's shape
+ * (`cacheRead`/`cacheWrite`), OpenCode's catalog shape (`cache: {read, write}`) or its config shape. All zero → null:
+ * pi writes zeros when it knows no price, and a model with no price is not free.
+ */
+export function opencodeCost(c) {
+  if (!isObj(c)) return null;
+  const n = (v) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? x : 0; };
+  const out = { input: n(c.input), output: n(c.output), cache_read: n(c.cache_read ?? c.cacheRead ?? c.cache?.read), cache_write: n(c.cache_write ?? c.cacheWrite ?? c.cache?.write) };
+  return Object.values(out).some((v) => v > 0) ? out : null;
+}
+
+const leaves = (o) => (isObj(o) ? Object.values(o).flatMap(leaves) : [o]);
+/**
+ * pi's `thinkingLevelMap` (pi level → the value sent, null = the model lacks that level) as OpenCode model `variants`:
+ * null → `{disabled: true}` (OpenCode drops the variant it would generate); a value → the options of an OpenCode variant
+ * that sends that value (`templates`: OpenCode's own variants for the same provider SDK), else `shape(value)`, else it is
+ * left out (`unmapped`). OpenCode still generates its default variants for a reasoning model; these adjust them.
+ */
+export function piVariants(map, { templates = [], shape = null } = {}) {
+  const variants = {}, unmapped = [];
+  for (const [level, v] of Object.entries(isObj(map) ? map : {})) {
+    if (v === null) { variants[level] = { disabled: true }; continue; }
+    if (typeof v !== "string" || !v) continue;
+    const t = templates.find((o) => isObj(o) && !o.disabled && leaves(o).includes(v));
+    if (t) variants[level] = structuredClone(t);
+    else if (shape) variants[level] = shape(v);
+    else unmapped.push(level);
+  }
+  return { variants: Object.keys(variants).length ? variants : null, unmapped };
+}
+/** How an OpenAI-compatible provider (`@ai-sdk/openai-compatible`) is told a reasoning effort (checked against OpenCode's own variants). */
+const openaiCompatibleEffort = (v) => ({ reasoningEffort: v });
 
 /**
  * @param {boolean} [builtIn] the entry only adds models to one of OpenCode's own providers (no base URL of its own)
@@ -271,7 +309,7 @@ export function saveCustomProvider(file, name, body) {
     const [m] = normalizeCustomModels([given]);
     if (!m) continue;
     const old = prevById.get(m.id);
-    if (old) for (const k of ["name", "contextWindow", "maxTokens", "reasoning"]) if (given[k] === undefined && old[k] !== undefined) m[k] = old[k];
+    if (old) for (const k of ["name", "contextWindow", "maxTokens", "reasoning", "cost", "variants"]) if (given[k] === undefined && old[k] !== undefined) m[k] = old[k];
     models.push(m);
   }
   if (builtIn) {
@@ -304,7 +342,11 @@ export function customProviderConfig(file) {
     const models = {};
     for (const m of Array.isArray(p.models) ? p.models : []) {
       if (!m?.id) continue;
-      models[m.id] = { name: m.name || m.id, limit: { context: num(m.contextWindow, DEFAULTS.contextWindow), output: num(m.maxTokens, DEFAULTS.maxTokens) }, ...(m.reasoning === true && p.builtIn !== true ? { reasoning: true } : {}) };
+      const cost = opencodeCost(m.cost);
+      models[m.id] = {
+        name: m.name || m.id, limit: { context: num(m.contextWindow, DEFAULTS.contextWindow), output: num(m.maxTokens, DEFAULTS.maxTokens) },
+        ...(m.reasoning === true ? { reasoning: true } : {}), ...(cost ? { cost } : {}), ...(isObj(m.variants) && Object.keys(m.variants).length ? { variants: m.variants } : {}),
+      };
     }
     if (p.builtIn === true) { if (Object.keys(models).length) out[name] = { models }; continue; }
     const options = { baseURL: String(p.baseUrl) };
@@ -346,7 +388,18 @@ export function migratePiProviders({ from, to, catalog = null }) {
       const lacks = new Set(ids.filter((id) => !Object.hasOwn(known.get(name)?.models || {}, id)));
       if (!lacks.size) why = `OpenCode already has a provider named ${name}${connected.has(name) ? " (connected)" : ""} with every model pi listed for it`;
       else {
-        const models = normalizeCustomModels(p.models.filter((m) => lacks.has(m?.id)));
+        // What pi knew about each model that OpenCode's model config takes: reasoning, price, thinking levels. Its
+        // variants' options are copied from OpenCode's own variants for this provider (the same SDK), the model it is a
+        // routing variant of (`<id>:floor` → `<id>`) first; with no price in pi, that model's price is the estimate.
+        const own = known.get(name)?.models || {};
+        const siblings = Object.values(own);
+        const models = normalizeCustomModels(p.models.filter((m) => lacks.has(m?.id)).map((m) => {
+          const base = own[String(m.id).replace(/:[^/:]+$/, "")];
+          const templates = [base, ...siblings].flatMap((x) => Object.values(isObj(x?.variants) ? x.variants : {}));
+          const { variants, unmapped } = piVariants(m.thinkingLevelMap, { templates });
+          for (const level of unmapped) lines.push(`Providers: pi's thinking level ${level} of ${name}/${m.id} has no OpenCode equivalent; OpenCode's own levels apply.`);
+          return { ...m, cost: opencodeCost(m.cost) || opencodeCost(base?.cost) || undefined, variants: variants || undefined };
+        }));
         store.providers[name] = { builtIn: true, models };
         extended.push({ name, models: models.map((m) => m.id) });
         for (const m of models) lines.push(`Providers: added pi's model ${m.id} to OpenCode's ${name} (OpenCode's own provider and its key stay as they are).`);
@@ -355,7 +408,7 @@ export function migratePiProviders({ from, to, catalog = null }) {
     } else if ((p.api || "openai-completions") !== "openai-completions") why = `it uses ${p.api}, and Omni's custom providers are OpenAI-compatible only (OpenCode's own provider for it takes just a key)`;
     else if (!p.baseUrl || !ids.length) why = "it has no base URL or no models";
     if (why) { skipped.push({ name, why }); lines.push(`Providers: pi's ${name} was not copied: ${why}.`); continue; }
-    const entry = { baseUrl: String(p.baseUrl), models: normalizeCustomModels(p.models) };
+    const entry = { baseUrl: String(p.baseUrl), models: normalizeCustomModels(p.models.map((m) => (isObj(m) ? { ...m, variants: piVariants(m.thinkingLevelMap, { shape: openaiCompatibleEffort }).variants || undefined } : m))) };
     const key = String(p.apiKey || "").trim();
     if (key.startsWith("!")) lines.push(`Providers: pi's ${name} gets its key by running a command, which OpenCode cannot do: set its key in Providers.`);
     else if (key) entry.apiKey = key;

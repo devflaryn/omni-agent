@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFil
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PRESETS, readModelsFile, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels, normalizeModels, validateProvider } from "../server/providers.mjs";
-import { saveCustomProvider, customProviderConfig, migratePiProviders, migrationMarker, normalizeCustomModels } from "../server/providers.mjs";
+import { saveCustomProvider, customProviderConfig, migratePiProviders, migrationMarker, normalizeCustomModels, opencodeCost, piVariants } from "../server/providers.mjs";
 import { writeOpencodeConfig } from "../server/opencode-config.mjs";
 
 const base = mkdtempSync(join(tmpdir(), "omni-prov-"));
@@ -188,6 +188,23 @@ test("normalizeCustomModels: the store's model shape (reasoning only when asked 
   ]);
 });
 
+test("a model's price and thinking levels: OpenCode's cost keys, zeros mean unknown, pi's thinking map as variants; a re-save keeps them", () => {
+  assert.deepEqual(opencodeCost({ input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }), { input: 0.3, output: 1.2, cache_read: 0.006, cache_write: 0 });
+  assert.deepEqual(opencodeCost({ input: 1, output: 2, cache: { read: 0.5, write: 0.25 } }), { input: 1, output: 2, cache_read: 0.5, cache_write: 0.25 });
+  assert.equal(opencodeCost({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }), null);
+  assert.deepEqual(normalizeCustomModels([{ id: "m", cost: { input: 0, output: 0 } }])[0].cost, undefined);
+  const tpl = [{ reasoning: { effort: "high" } }, { reasoning: { effort: "max" } }];
+  assert.deepEqual(piVariants({ minimal: null, high: "high", max: "max", xhigh: "ultra" }, { templates: tpl }), { variants: { minimal: { disabled: true }, high: { reasoning: { effort: "high" } }, max: { reasoning: { effort: "max" } } }, unmapped: ["xhigh"] });
+  assert.deepEqual(piVariants({ low: null, xhigh: "xhigh" }, { shape: (v) => ({ reasoningEffort: v }) }).variants, { low: { disabled: true }, xhigh: { reasoningEffort: "xhigh" } });
+  assert.deepEqual(piVariants(undefined), { variants: null, unmapped: [] });
+  const f = join(mkdtempSync(join(tmpdir(), "omni-ocprice-")), "p.json");
+  writeFileSync(f, JSON.stringify({ providers: { x: { baseUrl: "https://x/v1", models: [{ id: "m", name: "M", contextWindow: 1000, maxTokens: 100, reasoning: true, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 }, variants: { low: { disabled: true } } }] } } }));
+  saveCustomProvider(f, "x", { baseUrl: "https://x/v1", models: [{ id: "m" }] });
+  const m = JSON.parse(readFileSync(f, "utf8")).providers.x.models[0];
+  assert.deepEqual([m.cost, m.variants], [{ input: 1, output: 2, cache_read: 0, cache_write: 0 }, { low: { disabled: true } }], "the dialog does not edit them, so a re-save keeps them");
+  assert.deepEqual(customProviderConfig(f).x.models.m, { name: "M", limit: { context: 1000, output: 100 }, reasoning: true, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 }, variants: { low: { disabled: true } } });
+});
+
 test("provider saved → opencode.json provider entry", () => {
   const dir = mkdtempSync(join(tmpdir(), "omni-ocprov-"));
   const f = join(dir, "opencode-providers.json");
@@ -233,7 +250,12 @@ test("migration copies models.json once", () => {
   mkdirSync(join(dir, "pi"), { recursive: true });
   writeFileSync(from, `﻿${JSON.stringify({ providers: {
     modal: { baseUrl: "https://modal.example/v1", api: "openai-completions", apiKey: "sk-modal-9999", modelOverrides: { a: { contextWindow: 1 } }, models: [model("qwen/q"), model("plain", { reasoning: false })] },
-    openrouter: { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "sk-or", models: [model("deepseek/deepseek-v4.1-flash-1017:floor"), model("known/one")] },
+    openrouter: { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "sk-or", models: [
+      // the user's real entry: pi wrote zeros for its price and a thinking map (only high and max)
+      model("deepseek/deepseek-v4.1-flash-1017:floor", { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { minimal: null, low: null, medium: null, max: "max" } }),
+      model("known/one"),
+      model("odd/one", { thinkingLevelMap: { xhigh: "ultra" } }),
+    ] },
     lmstudio: { baseUrl: "http://localhost:1234/v1", api: "openai-completions", models: [model("q")] },
     envy: { baseUrl: "https://envy.example/v1", apiKey: "$ENVY_KEY", models: [{ id: "m" }] },
     cmd: { baseUrl: "https://cmd.example/v1", api: "openai-completions", apiKey: "!op read secret", models: [{ id: "c" }] },
@@ -242,11 +264,15 @@ test("migration copies models.json once", () => {
   } })}`);
   saveCustomProvider(to, "mine", { baseUrl: "https://omni-version.example/v1", models: ["kept"] });
   // OpenCode's catalog (GET /provider): openrouter is built in, lmstudio comes from the user's global config.
-  const catalog = { all: [{ id: "openrouter", name: "OpenRouter", models: { "known/one": { id: "known/one" } } }, { id: "lmstudio", name: "LM Studio", models: { q: { id: "q" } } }, { id: "mine", name: "mine", models: {} }], connected: ["openrouter", "lmstudio"] };
+  const catalog = { all: [{ id: "openrouter", name: "OpenRouter", models: {
+    "known/one": { id: "known/one" },
+    // the model the :floor id is a routing variant of, as OpenCode's catalog has it
+    "deepseek/deepseek-v4.1-flash-1017": { id: "deepseek/deepseek-v4.1-flash-1017", cost: { input: 0.3, output: 1.2, cache: { read: 0.006, write: 0 } }, variants: { none: { reasoning: { effort: "none" } }, low: { reasoning: { effort: "low" } }, high: { reasoning: { effort: "high" } }, max: { reasoning: { effort: "max" } } } },
+  } }, { id: "lmstudio", name: "LM Studio", models: { q: { id: "q" } } }, { id: "mine", name: "mine", models: {} }], connected: ["openrouter", "lmstudio"] };
   const r = migratePiProviders({ from, to, catalog });
   assert.deepEqual(r.copied, ["modal", "envy", "cmd"]);
   // a provider OpenCode already has keeps OpenCode's definition and key; only the models it lacks are added to it
-  assert.deepEqual(r.extended, [{ name: "openrouter", models: ["deepseek/deepseek-v4.1-flash-1017:floor"] }]);
+  assert.deepEqual(r.extended, [{ name: "openrouter", models: ["deepseek/deepseek-v4.1-flash-1017:floor", "odd/one"] }]);
   assert.deepEqual(r.skipped.map((s) => s.name), ["lmstudio", "anth", "mine"]);
   const why = Object.fromEntries(r.skipped.map((s) => [s.name, s.why]));
   assert.match(why.lmstudio, /OpenCode already has a provider named lmstudio/);
@@ -257,13 +283,23 @@ test("migration copies models.json once", () => {
   assert.ok(!r.lines.some((l) => /known\/one/.test(l)), "a model OpenCode already lists is left alone");
   const store = JSON.parse(readFileSync(to, "utf8")).providers;
   assert.deepEqual(Object.keys(store), ["mine", "modal", "openrouter", "envy", "cmd"]);
-  assert.deepEqual(store.openrouter, { builtIn: true, models: [{ id: "deepseek/deepseek-v4.1-flash-1017:floor", name: "DEEPSEEK/DEEPSEEK-V4.1-FLASH-1017:FLOOR", contextWindow: 200000, maxTokens: 8192, reasoning: true }] }, "no base URL or key: OpenCode's own provider and stored key apply");
-  assert.deepEqual(customProviderConfig(to).openrouter, { models: { "deepseek/deepseek-v4.1-flash-1017:floor": { name: "DEEPSEEK/DEEPSEEK-V4.1-FLASH-1017:FLOOR", limit: { context: 200000, output: 8192 } } } }, "rendered as extra models only: no npm, options or apiKey");
+  const floorVariants = { minimal: { disabled: true }, low: { disabled: true }, medium: { disabled: true }, max: { reasoning: { effort: "max" } } };
+  assert.deepEqual(store.openrouter.models[0], {
+    id: "deepseek/deepseek-v4.1-flash-1017:floor", name: "DEEPSEEK/DEEPSEEK-V4.1-FLASH-1017:FLOOR", contextWindow: 200000, maxTokens: 8192, reasoning: true,
+    cost: { input: 0.3, output: 1.2, cache_read: 0.006, cache_write: 0 }, // pi had no price (zeros): the base model's, from OpenCode's catalog
+    variants: floorVariants, // pi's missing levels off; max with the options OpenCode itself sends for it
+  }, "reasoning, price and thinking levels carried; no base URL or key: OpenCode's own provider and stored key apply");
+  assert.equal(store.openrouter.builtIn, true);
+  assert.deepEqual(store.openrouter.models[1].cost, { input: 1, output: 2, cache_read: 0, cache_write: 0 }, "a price pi knew is kept as it is");
+  assert.equal(store.openrouter.models[1].variants, undefined, "a level with no OpenCode equivalent is left out");
+  assert.ok(r.lines.some((l) => /xhigh/.test(l) && l.includes("openrouter/odd/one")), "and that is said");
+  assert.deepEqual(customProviderConfig(to).openrouter.models["deepseek/deepseek-v4.1-flash-1017:floor"], { name: "DEEPSEEK/DEEPSEEK-V4.1-FLASH-1017:FLOOR", limit: { context: 200000, output: 8192 }, reasoning: true, cost: { input: 0.3, output: 1.2, cache_read: 0.006, cache_write: 0 }, variants: floorVariants }, "rendered as extra models only: no npm, options or apiKey");
+  assert.deepEqual(Object.keys(customProviderConfig(to).openrouter), ["models"]);
   assert.equal(listProviders(to).find((p) => p.name === "openrouter").builtIn, true, "the dialog shows them as Omni-added models of OpenCode's provider");
   removeProvider(to, "openrouter");
   assert.deepEqual(store.modal, { baseUrl: "https://modal.example/v1", apiKey: "sk-modal-9999", models: [
-    { id: "qwen/q", name: "QWEN/Q", contextWindow: 200000, maxTokens: 8192, reasoning: true },
-    { id: "plain", name: "PLAIN", contextWindow: 200000, maxTokens: 8192, reasoning: false },
+    { id: "qwen/q", name: "QWEN/Q", contextWindow: 200000, maxTokens: 8192, reasoning: true, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 }, variants: { low: { reasoningEffort: "low" } } },
+    { id: "plain", name: "PLAIN", contextWindow: 200000, maxTokens: 8192, reasoning: false, cost: { input: 1, output: 2, cache_read: 0, cache_write: 0 }, variants: { low: { reasoningEffort: "low" } } },
   ] });
   assert.equal(store.envy.apiKey, "$ENVY_KEY");
   assert.equal("apiKey" in store.cmd, false);
