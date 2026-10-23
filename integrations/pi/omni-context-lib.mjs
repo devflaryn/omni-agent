@@ -258,6 +258,38 @@ export function repairToolCallIds(messages) {
 }
 
 /**
+ * A tool call whose run was cut off before it returned (Omni restarted, pi was killed) is saved with no result. pi
+ * fills the gap with "No result provided", and the model, seeing a fresh prompt right after it, has read its own
+ * earlier work as the user's. Inserts a result that says what happened, after the results the call did get and
+ * before the message that interrupted it (a user prompt or a background report). The newest calls, still running,
+ * and an aborted or failed turn (pi drops those) are left alone. Null when nothing is cut off.
+ */
+export const UNFINISHED_TOOL_NOTE = "Not finished: this tool call was cut off before it returned (Omni restarted or the run was stopped), so its effect is unknown; check before relying on it. The messages after this are new; everything before them is your own earlier work.";
+export function explainUnfinishedToolCalls(messages) {
+  if (!Array.isArray(messages)) return null;
+  let out = null, pending = [];
+  const flush = (at) => {
+    if (!pending.length) return;
+    if (!out) out = messages.slice(0, at);
+    for (const c of pending) out.push({ role: "toolResult", toolCallId: c.id, toolName: c.name, content: [{ type: "text", text: UNFINISHED_TOOL_NOTE }], isError: true, timestamp: 0 });
+    pending = [];
+  };
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role === "assistant") {
+      flush(i);
+      pending = m.stopReason === "error" || m.stopReason === "aborted" || !Array.isArray(m.content) ? [] : m.content.filter((c) => c?.type === "toolCall" && c.id);
+    } else if (m?.role === "toolResult") {
+      pending = pending.filter((c) => c.id !== m.toolCallId);
+    } else if (m?.role === "user" || m?.role === "custom") {
+      flush(i);
+    }
+    if (out) out.push(m);
+  }
+  return out;
+}
+
+/**
  * The context window pi should see for a model so it compacts at `compactAt` prompt tokens:
  * pi compacts when tokens > contextWindow − reserveTokens. Never larger than the model's real window;
  * null when no cap is needed (the real window already triggers at or below compactAt).

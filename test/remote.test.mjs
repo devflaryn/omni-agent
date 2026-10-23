@@ -363,6 +363,26 @@ test("SshTunnel: up on the forward's success line, reconnects after an exit, sto
   assert.match(missing.status().lastError, /no SSH key/);
 });
 
+test("SshTunnel: a failed spawn (an 'error' with no 'exit', as Node reports it) still dials again", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-tun-"));
+  writeFileSync(join(dir, "k"), "x"); writeFileSync(join(dir, "kh"), "x");
+  const procs = [];
+  const spawnFn = () => { const p = new EventEmitter(); p.stderr = new PassThrough(); p.kill = () => {}; procs.push(p); return p; };
+  const t = new SshTunnel({ host: "h", key: join(dir, "k"), knownHosts: join(dir, "kh"), localPort: 1, spawn: spawnFn, minBackoffMs: 10 });
+  t.start();
+  procs[0].emit("error", Object.assign(new Error("spawn EAGAIN"), { code: "EAGAIN" }));
+  procs[0].emit("close", -11);
+  assert.equal(t.status().state, "down");
+  assert.match(t.status().lastError, /EAGAIN/);
+  await sleep(40);
+  assert.equal(procs.length, 2, "it dialled again");
+  procs[1].emit("exit", 255);
+  procs[1].emit("close", 255);
+  await sleep(40);
+  assert.equal(procs.length, 3, "one exit, one retry: an exit and a close are not two failures");
+  t.stop();
+});
+
 test("relay listener: loopback only, HTTPS only, needs the PROXY line, and the visitor's address reaches the host", { skip: !loadOrCreateCert({ dir: join(base, "tls-probe") }).cert && "no openssl" }, async () => {
   const rauth = new RemoteAuth({ failDelayMs: 0 });
   await rauth.setPassword("relay password!");

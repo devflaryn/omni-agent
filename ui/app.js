@@ -1,5 +1,5 @@
 /* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only. */
-import { el, baseName, cleanTitle, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
+import { el, baseName, cleanTitle, applyStatus, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
 import { newView, applyEvent, finish, forkNote, agentNote, emptyNote } from "./transcript.js";
 import { createComposer } from "./composer.js";
 import { createHistory } from "./sidebar.js";
@@ -9,11 +9,12 @@ import { createSettings } from "./settings.js";
 import { initResizers } from "./resizer.js";
 import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
 import { createRemote } from "./remote.js";
+import { createStream } from "./stream.js";
 
 const $ = (s) => document.querySelector(s);
 // agents: background agents by id (/api/state + live `agent` events); agentSids: an agent chat's sid → agent id;
 // agentsOpen: chats whose folded agents strip the user expanded.
-const S = { sessions: new Map(), selected: null, pi: { running: false }, runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, followFork: null, forceFork: false, agents: new Map(), agentSids: new Map(), agentsOpen: new Set(), desktop: new URLSearchParams(location.search).get("desktop") === "1" };
+const S = { sessions: new Map(), selected: null, pi: { running: false }, piChats: new Map(), runs: [], seq: 0, buffers: new Map(), view: null, page: "home", config: null, followFork: null, forceFork: false, agents: new Map(), agentSids: new Map(), agentsOpen: new Set(), desktop: new URLSearchParams(location.search).get("desktop") === "1" };
 const liveWindowMs = () => S.config?.liveWindowMs || 30000;
 /** Events replayed by the SSE stream at connect time predate this; their system toasts are stale. */
 const BOOT_TS = Date.now();
@@ -85,18 +86,26 @@ const notForAgents = (fn) => (...args) => { if (target().kind !== "agent") retur
 const chat = createComposer($("#chatComposer"), { ...composerHooks, onPiModel: notForAgents(setPiModel), onPiThinking: notForAgents(setPiThinking), onHook: notForAgents(setHook), onSend: chatSend, onStop: chatStop });
 
 /** Choices made before pi runs are saved on the server and applied when it starts, so the picker never "forgets". */
+/** The open chat when it has a pi child of its own: a model, thinking or goal change is for that chat. */
+const piChatSid = () => (S.page === "chat" && S.piChats.has(S.selected) ? S.selected : undefined);
 async function setPiModel(provider, id) {
   try {
-    const r = await api("/api/pi/model", { provider, modelId: id });
-    S.config = { ...(S.config || {}), piProvider: provider, piModel: id };
+    const sid = piChatSid();
+    const r = await api("/api/pi/model", { provider, modelId: id, sid });
+    if (sid) { const c = S.piChats.get(sid); if (c) c.model = { provider, id }; }
+    // The server moves the thinking level to the nearest one the new model has.
+    S.config = { ...(S.config || {}), piProvider: provider, piModel: id, ...(r.level ? { piThinking: r.level } : {}) };
+    loadPiChoices();
     toast(r.pending ? `pi model: ${id} (applies when pi starts)` : `pi model: ${id}`);
     if (S.page === "home") renderHome(); else updateComposer();
   } catch (e) { toast(e.message, true); }
 }
 async function setPiThinking(level) {
   try {
-    await api("/api/pi/thinking", { level });
-    S.config = { ...(S.config || {}), piThinking: level };
+    const sid = piChatSid();
+    const r = await api("/api/pi/thinking", { level, sid });
+    S.config = { ...(S.config || {}), piThinking: r.level || level };
+    if (sid) { const c = S.piChats.get(sid); if (c) c.thinkingLevel = r.level || level; }
     if (S.page === "home") renderHome(); else updateComposer();
   } catch (e) { toast(e.message, true); }
 }
@@ -106,18 +115,24 @@ async function loadPiChoices() {
   const models = m.status === "fulfilled" ? (m.value.data?.models || []) : [];
   const levels = l.status === "fulfilled" ? (l.value.data?.levels || []) : [];
   if (m.status === "fulfilled") choices.models = models;
-  if (levels.length) choices.levels = levels;
+  if (levels.length) { choices.levels = levels; choices.labels = l.value.data?.labels || {}; }
   if (Object.keys(choices).length) { home.setPiChoices(choices); chat.setPiChoices(choices); }
 }
-/** What the picker shows: pi's live state when it runs, else the saved choice the next pi child will start with. */
+/** What the picker shows: the open chat's pi child when it has one, else the saved choice the next pi child will start with. */
 function piModelState() {
-  const mdl = S.pi.running ? S.pi.state?.model : null;
+  const own = S.page === "chat" ? S.piChats.get(S.selected) : null;
+  const mdl = own?.model?.id ? own.model : null;
   const c = S.config || {};
   const piModel = mdl ? { provider: mdl.provider, id: mdl.id } : c.piModel ? { provider: c.piProvider, id: c.piModel } : null;
-  const piThinking = (S.pi.running ? S.pi.state?.thinkingLevel : "") || c.piThinking || "";
+  const piThinking = own?.thinkingLevel || c.piThinking || "";
   return { piModel, piThinking, hook: S.hook };
 }
-async function refreshState() { try { const rev = agentRev; const st = await api("/api/state"); S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || S.hook; if (st.config) S.config = st.config; if (st.agents) { loadAgents(st.agents, rev); renderAgents(); } updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
+/** The chats with a pi child right now (server `pis`): a message there goes straight to that chat's own pi. */
+function setPiChats(list) {
+  if (!Array.isArray(list)) return;
+  S.piChats = new Map(list.filter((c) => c?.sid && c.sid !== "pi:pending").map((c) => [c.sid, c]));
+}
+async function refreshState() { try { const rev = agentRev; const st = await api("/api/state"); for (const s of st.sessions || []) { S.sessions.set(s.sid, { ...(S.sessions.get(s.sid) || {}), ...s }); if (s.agentId) S.agentSids.set(s.sid, s.agentId); } if (st.boot) S.boot = st.boot; S.pi = st.pi; setPiChats(st.pis); S.runs = st.runs || []; S.hook = st.hook || S.hook; if (st.config) S.config = st.config; if (st.agents) { loadAgents(st.agents, rev); renderAgents(); } updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
 /** Goal hook settings live in omni.config.json through the server; the menu reflects the saved state. */
 async function setHook(patch) {
   try {
@@ -386,7 +401,7 @@ function renderHome() {
   if (!cwdInput.value) cwdInput.value = S.pi.cwd || S.config?.cwd || "";
   const chips = $("#dirChips"); chips.innerHTML = "";
   for (const d of recentDirs()) { const c = el("button", `chip${d === cwdInput.value ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; browseHome(); renderHome(); }; chips.appendChild(c); }
-  home.setState({ ...piModelState(), caption: S.pi.running ? `pi in ${baseName(S.pi.cwd || "")}` : "" });
+  home.setState({ ...piModelState(), caption: "" });
   updateHeader();
 }
 // `/goal <text>` sets a persistent goal: the agent brainstorms and plans it, and the keeper re-engages
@@ -398,14 +413,14 @@ async function goalCommand(text, composer) {
   const arg = m[1].trim();
   try {
     if (!arg || arg === "show") {
-      const g = await api("/api/goal");
+      const g = await api(`/api/goal${piChatSid() ? `?sid=${encodeURIComponent(piChatSid())}` : ""}`);
       const pg = g.progress ? ` · ${g.progress.complete ? "plan complete" : g.progress.steps ? `${g.progress.done + g.progress.skipped}/${g.progress.steps} steps` : g.progress.phase}` : g.goal ? " · no plan yet" : "";
       toast(g.goal ? `Goal: ${g.goal}${pg}${g.nudges ? ` · re-engaged ${g.nudges}×` : ""}` : "No goal set — type /goal <text> to set one");
     } else if (arg === "clear") {
-      await api("/api/goal", { goal: "" }, "POST");
+      await api("/api/goal", { goal: "", sid: piChatSid() }, "POST");
       toast("Goal cleared");
     } else {
-      await api("/api/goal", { goal: arg }, "POST");
+      await api("/api/goal", { goal: arg, sid: piChatSid() }, "POST");
       toast("Goal set — the agent plans it first, then works until every step is done.");
     }
     composer?.clear?.();
@@ -416,7 +431,7 @@ async function homeSend(text, o) {
   if (await goalCommand(text, home)) return;
   const cwd = homeCwd();
   if (!cwd) return toast("Set a working directory first", true);
-  home.setState({ disabled: true, caption: remote.role === "remote" ? "Waiting for the host to approve…" : "Starting pi…" });
+  home.setState({ disabled: true, caption: remote.role === "remote" ? "Waiting for the host to approve…" : "Starting…" });
   try {
     if (remote.role === "remote") {
       // One request, one approval: the server starts pi (or a new session) and sends the message.
@@ -428,13 +443,13 @@ async function homeSend(text, o) {
       home.clear();
       return;
     }
-    if (!S.pi.running || (S.pi.cwd || "").toLowerCase() !== cwd.toLowerCase()) await api("/api/pi/start", { cwd }); else await api("/api/pi/new", {});
-    const st = await api("/api/state");
-    S.pi = st.pi;
-    if (!st.pi.sid) throw new Error("pi did not report a session");
-    S.sessions.set(st.pi.sid, { ...(S.sessions.get(st.pi.sid) || {}), sid: st.pi.sid, harness: "pi", owned: true, cwd, model: st.pi.state?.model?.id, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
-    openChat(st.pi.sid);
-    await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph });
+    // A chat of its own: a free pi child in that folder opens it, else another one starts. Chats already working keep going.
+    const r = await api("/api/pi/open", { cwd });
+    if (!r.sid || r.sid === "pi:pending") throw new Error("pi did not report a session");
+    S.piChats.set(r.sid, { sid: r.sid, cwd, model: r.state?.model?.id ? { provider: r.state.model.provider, id: r.state.model.id } : null, thinkingLevel: r.state?.thinkingLevel || "" });
+    S.sessions.set(r.sid, { ...(S.sessions.get(r.sid) || {}), sid: r.sid, harness: "pi", owned: true, cwd, model: r.state?.model?.id, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
+    openChat(r.sid);
+    await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph, sid: r.sid });
     home.clear();
   } catch (e) { toast(e.message, true); }
   finally { home.setState({ disabled: false, caption: "" }); }
@@ -453,7 +468,8 @@ function target() {
   // A background agent's chat talks to that agent (steer / follow up / resume), never to Omni's main pi.
   if (isAgentChat(s)) { const a = agentFor(s.sid) || S.agents.get(s.agentId) || null; return { kind: "agent", s, a, id: a?.id || s.agentId || "", active: AGENT_ACTIVE.has(a?.status) }; }
   if (s.harness === "claude") return { kind: "claude", s };
-  if (s.owned && S.pi.running && S.pi.sid === s.sid) return { kind: "owned-pi", s, streaming: !!s.streaming };
+  // Each chat Omni runs has a pi child of its own: a message goes straight to it, whatever the other chats are doing.
+  if (S.piChats.has(s.sid)) return { kind: "owned-pi", s, streaming: !!s.streaming };
   const live = !s.owned && (s.streaming || Date.now() - Math.max(s.lastActivity || 0, s.mtime || 0) < liveWindowMs());
   return { kind: "continue", s, live };
 }
@@ -470,13 +486,28 @@ function updateComposer() {
     st.caption = !t.id ? "Background agent · view only" : t.active ? `${agentKindLabel(t.a?.kind || t.s.agentKind)} at work · a message steers it, empty send stops it` : `${agentKindLabel(t.a?.kind || t.s.agentKind)} · ${t.a?.status || "finished"} · a message picks it up again`;
   }
   else if (t.kind === "claude") { st.caption = "Claude Code chat · view only in Omni"; st.disabled = true; }
-  else if (t.kind === "owned-pi") { st.streaming = t.streaming; st.caption = t.streaming ? "pi is working · a message steers it, empty send stops it" : "Omni's pi"; }
+  else if (t.kind === "owned-pi") {
+    // pi is idle while the goal hook waits to retry or check, but the chat is not: Stop must reach the hook too.
+    const armed = !t.streaming && !!t.s.hookArmed;
+    const retry = (t.s.hookRetryAt || 0) > Date.now() ? new Date(t.s.hookRetryAt).toLocaleTimeString() : "";
+    st.streaming = t.streaming || armed;
+    st.caption = t.streaming ? "Working · a message steers it, empty send stops it" : armed ? `${retry ? `Goal hook retries at ${retry} after a model error` : "Goal hook is about to continue"} · empty send stops it` : "";
+  }
   else {
     const fork = S.forceFork || t.live;
-    st.caption = fork ? `Forks ${t.live ? "the running " : "this "}pi chat into Omni` : "Continues this chat in Omni's pi";
+    st.caption = fork ? `Forks ${t.live ? "the running " : "this "}pi chat into Omni` : "Continues this chat in Omni";
   }
+  if (t.s?.compacting) st.caption = "Compacting the context (a long chat is summarized first; this can take minutes)…";
   $("#chatComposer").classList.toggle("for-agent", t.kind === "agent");
   chat.setState(st);
+}
+/**
+ * Empty the box as the message goes: its bubble is in the chat already, and pi answers only once it has started the
+ * run, which can take minutes (it compacts a long session first). The text comes back if the send fails.
+ */
+async function sendClearing(composer, text, send) {
+  composer.clear();
+  try { return await send(); } catch (e) { if (!composer.value.trim()) composer.insert(text); throw e; }
 }
 async function chatSend(text, o) {
   const t = target();
@@ -484,18 +515,21 @@ async function chatSend(text, o) {
   if (t.kind === "agent" && /^\/goal\b/.test(text.trim())) { toast("/goal sets the goal of Omni's own pi. Type it in one of its chats; here, just tell the agent.", true); return; }
   if (await goalCommand(text, chat)) return;
   try {
-    if (t.kind === "owned-pi") { await api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph }); chat.clear(); return; }
+    if (t.kind === "owned-pi") {
+      const r = await sendClearing(chat, text, () => api("/api/pi/prompt", { message: text, memory: o.memory, graph: o.graph, sid: t.s.sid }));
+      // The chat's child had closed meanwhile: the server picked the chat up again (a fork lands in a new chat).
+      if (r?.sid && r.sid !== S.selected) selectSession(r.sid);
+      return;
+    }
     if (t.kind === "agent") {
       if (!t.id) return;
-      const r = await api(`/api/agents/${encodeURIComponent(t.id)}/message`, { text });
-      chat.clear();
+      const r = await sendClearing(chat, text, () => api(`/api/agents/${encodeURIComponent(t.id)}/message`, { text }));
       if (r.how === "resumed" || r.how === "restarted") toast(`Agent ${r.how} with your message`);
       return;
     }
     if (t.kind !== "continue") return;
     chat.setState({ disabled: true, caption: "Starting…" });
-    const r = await api(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, fork: S.forceFork });
-    chat.clear();
+    const r = await sendClearing(chat, text, () => api(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, fork: S.forceFork }));
     S.forceFork = false;
     if (r.sid !== S.selected) { if (r.forked) toast("Forked into a new pi session"); selectSession(r.sid); }
   } catch (e) { toast(e.message, true); }
@@ -504,7 +538,7 @@ async function chatSend(text, o) {
 async function chatStop() {
   const t = target();
   if (t.kind === "agent") { if (t.id) await stopAgent(t.id); return; }
-  try { if (t.kind === "owned-pi") await api("/api/pi/abort", {}); } catch (e) { toast(e.message, true); }
+  try { if (t.kind === "owned-pi") await api("/api/pi/abort", { sid: t.s.sid }); } catch (e) { toast(e.message, true); }
 }
 async function selectSession(sid) {
   if (S.view) finish(S.view);
@@ -555,15 +589,11 @@ async function selectSession(sid) {
 function updateHeader() {
   const s = S.page === "chat" ? S.sessions.get(S.selected) : null;
   updateTitle();
-  const model = s?.model || S.pi.state?.model?.id || "";
+  const model = s?.model || (s ? "" : S.config?.piModel) || "";
   // A foreign chat's model is labelled with its harness so the slot never implies pi is running it.
   $("#topModel").textContent = s && s.harness !== "pi" && model ? `${s.harness} · ${model}` : model;
   $("#topModel").hidden = !model;
   $("#topModel").title = s ? `${s.harness} · ${s.cwd || ""}` : S.pi.cwd || "";
-  const ps = $("#piStatus");
-  ps.textContent = S.pi.running ? `pi${S.pi.streaming ? " · working" : ""}` : "pi: off";
-  ps.classList.toggle("on", !!S.pi.running && !!S.pi.streaming);
-  ps.classList.toggle("off", !S.pi.running);
 }
 function renderChatMenu() {
   const m = $("#chatMenu"); m.innerHTML = "";
@@ -586,18 +616,42 @@ $("#btnSummary").onclick = () => { try { localStorage.setItem("omni.summary", su
 $("#btnSettings").onclick = () => settings.open();
 
 // ------------------------------------------------------------------ SSE
-function connect() {
-  const es = new EventSource(`/events?since=${S.seq}`);
-  es.onmessage = (m) => { let ev; try { ev = JSON.parse(m.data); } catch { return; } handle(ev); };
-  // Only the host's own window receives these: remote changes waiting for Approve/Deny.
-  es.addEventListener("approvals", (m) => { try { remote.setApprovals(JSON.parse(m.data)); } catch { /* */ } });
-  es.onerror = () => { $("#piStatus").textContent = "reconnecting"; es.close(); setTimeout(connect, 1500); };
+// seq + boot let a reconnect ask for exactly what it missed (server/bus.mjs addClient).
+const stream = createStream({
+  url: () => `/events?since=${S.seq}${S.boot ? `&boot=${encodeURIComponent(S.boot)}` : ""}`,
+  onMessage: (m) => { let ev; try { ev = JSON.parse(m.data); } catch { return; } handle(ev); },
+  on: {
+    // Only the host's own window receives these: remote changes waiting for Approve/Deny.
+    approvals: (m) => { try { remote.setApprovals(JSON.parse(m.data)); } catch { /* */ } },
+    // What this page missed is gone (the ring wrapped, or the server restarted and its seq began again): count
+    // from the replay that follows this, and reload the state and the open chat.
+    resync: (m) => { let r = {}; try { r = JSON.parse(m.data); } catch { /* */ } S.boot = r.boot || ""; S.seq = 0; resync(); },
+  },
+  onUp: () => { $("#connStatus").hidden = true; updateHeader(); },
+  onDown: () => { $("#connStatus").hidden = false; checkSignedIn(); },
+});
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") stream.poke(); });
+window.addEventListener("online", () => stream.poke());
+/** EventSource cannot see a 401, so a remote browser whose session ended (the server restarted, the password
+ *  changed, it expired) retried "reconnecting" forever. After a drop, ask once; api() reloads to the sign-in page. */
+let probing = false;
+function checkSignedIn() {
+  if (remote.role !== "remote" || probing) return;
+  probing = true;
+  api("/api/remote/me").catch(() => {}).finally(() => { probing = false; });
+}
+async function resync() {
+  await refreshState();
+  history.render();
+  if (S.page === "chat" && S.selected) selectSession(S.selected);
 }
 let railTimer = null;
 function handle(ev) {
   S.seq = Math.max(S.seq, ev.seq || 0);
   // A background agent's record changed (`sid` is its parent chat, or "agents"): no chat of its own to update.
   if (ev.kind === "agent") { onAgent(ev.agent); return; }
+  // Which chats have a pi child right now (one per chat that runs at once).
+  if (ev.kind === "pis") { setPiChats(ev.pis); if (S.page === "chat") updateComposer(); return; }
   if (ev.kind === "removed") { S.sessions.delete(ev.sid); S.buffers.delete(ev.sid); if (S.selected === ev.sid) { S.selected = null; S.view = null; showView("home"); } history.render(); return; }
   if (ev.kind === "log") { if (ev.level === "system" && (ev.ts || 0) >= BOOT_TS) toast(ev.text); else if (ev.level === "graphify" && ev.text) panel.graphLine(ev.text.split("\n").pop()); else if (ev.level === "hook" && ev.text && (ev.ts || 0) >= BOOT_TS && /failed|gave up|not JSON/.test(ev.text)) toast(ev.text, true); return; }
   const s = S.sessions.get(ev.sid) || { sid: ev.sid, harness: ev.harness, lastActivity: 0, tally: null };
@@ -607,7 +661,7 @@ function handle(ev) {
     for (const k of ["parentSid", "agentId", "agentKind"]) if (ev[k]) s[k] = ev[k];
     if (ev.agentId) S.agentSids.set(ev.sid, ev.agentId);
   }
-  if (ev.kind === "status") s.streaming = !!ev.streaming;
+  if (ev.kind === "status") applyStatus(s, ev);
   if (ev.kind === "msg" && ev.role === "user" && !s.title) s.title = cleanTitle(ev.blocks?.[0]?.text || "");
   if (ev.kind === "msg" && ev.usage) { const t = s.tally || (s.tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, messages: 0, cost: 0, context: 0 }); if (!ev.groupId || t.lastGroup !== ev.groupId) { t.lastGroup = ev.groupId; t.input += ev.usage.input; t.output += ev.usage.output; t.cacheRead += ev.usage.cacheRead; t.cacheWrite += ev.usage.cacheWrite; t.total += ev.usage.total; t.messages++; t.context = ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite; t.cost += ev.cost || 0; } }
   if (ev.kind !== "session") s.lastActivity = Math.max(s.lastActivity || 0, ev.ts || 0);
@@ -615,13 +669,20 @@ function handle(ev) {
   if (ev.kind === "summary") { Object.assign(goalBox(s), { summary: ev.text || "", summaryAt: ev.ts, goal: ev.goal || goalBox(s).goal, explicit: !!ev.explicit, nudges: ev.nudges || 0, done: !!ev.done }); if (ev.sid === S.selected) renderSummary(); }
   if (ev.kind === "plan") { Object.assign(goalBox(s), { plan: ev.plan, goal: ev.goal || goalBox(s).goal }); if (ev.sid === S.selected) renderSummary(); }
   if (ev.kind === "goal") { Object.assign(goalBox(s), { goal: ev.goal || goalBox(s).goal, explicit: !!ev.explicit, done: !!ev.done, nudges: ev.nudges || 0, plan: ev.plan || goalBox(s).plan }); if (ev.sid === S.selected) renderSummary(); }
+  if (ev.kind === "keeper") { s.hookArmed = !!ev.armed; s.hookRetryAt = ev.retryAt || 0; if (ev.sid === S.selected) updateComposer(); }
   if (ev.kind === "hook" && ev.attempt) { goalBox(s).nudges = ev.attempt; if (ev.sid === S.selected) renderSummary(); }
   S.sessions.set(ev.sid, s);
   // A background pi agent is owned too, but it is its own pi process: it must not pass for Omni's main pi.
   if (ev.harness === "pi" && s.owned && !isAgentChat(s)) {
     S.pi.running = true;
-    if (ev.kind === "status") S.pi.streaming = !!ev.streaming;
-    if (ev.kind === "session") { if (ev.cwd) S.pi.cwd = ev.cwd; if (ev.sessionId) S.pi.sid = ev.sid; if (ev.model) S.pi.state = { ...(S.pi.state || {}), model: { ...(S.pi.state?.model || {}), id: ev.model, provider: ev.provider || S.pi.state?.model?.provider }, thinkingLevel: ev.thinkingLevel || S.pi.state?.thinkingLevel }; loadPiChoices(); }
+    if (ev.kind === "session") {
+      if (ev.cwd) S.pi.cwd = ev.cwd;
+      if (ev.sessionId) S.pi.sid = ev.sid;
+      if (ev.model) S.pi.state = { ...(S.pi.state || {}), model: { ...(S.pi.state?.model || {}), id: ev.model, provider: ev.provider || S.pi.state?.model?.provider }, thinkingLevel: ev.thinkingLevel || S.pi.state?.thinkingLevel };
+      // The chat's own child (a model switch, a new session): the `pis` event that follows carries the full list.
+      if (ev.sessionId) S.piChats.set(ev.sid, { ...(S.piChats.get(ev.sid) || {}), sid: ev.sid, cwd: ev.cwd || S.piChats.get(ev.sid)?.cwd, ...(ev.model ? { model: { provider: ev.provider || "", id: ev.model } } : {}), ...(ev.thinkingLevel ? { thinkingLevel: ev.thinkingLevel } : {}) });
+      loadPiChoices();
+    }
     updateHeader();
   }
   const buf = S.buffers.get(ev.sid) || []; buf.push(ev); if (buf.length > 800) buf.splice(0, buf.length - 800); S.buffers.set(ev.sid, buf);
@@ -635,17 +696,24 @@ async function init() {
   if (S.desktop) document.body.classList.add("desktop");
   initResizers();
   const st = await api("/api/state");
-  S.config = st.config; S.pi = st.pi; S.runs = st.runs || []; S.hook = st.hook || null;
+  S.config = st.config; S.pi = st.pi; setPiChats(st.pis); S.runs = st.runs || []; S.hook = st.hook || null; S.boot = st.boot || "";
   for (const s of st.sessions) { S.sessions.set(s.sid, s); if (s.agentId) S.agentSids.set(s.sid, s.agentId); }
   loadAgents(st.agents);
-  // The goal Omni's pi is working on right now (plan, status, re-engages) survives a page reload.
-  if (st.goal && st.pi?.sid && S.sessions.get(st.pi.sid)) Object.assign(goalBox(S.sessions.get(st.pi.sid)), { goal: st.goal.goal, explicit: st.goal.explicit, plan: st.goal.plan, summary: st.goal.summary, summaryAt: st.goal.summaryAt, nudges: st.goal.nudges, done: st.goal.done });
+  // The goal each running chat is working on right now (plan, status, re-engages) survives a page reload.
+  const goals = (st.pis || []).filter((c) => c.goal?.goal).map((c) => [c.sid, c.goal]);
+  if (!goals.length && st.goal && st.pi?.sid) goals.push([st.pi.sid, st.goal]);
+  for (const [sid, g] of goals) {
+    const s = S.sessions.get(sid);
+    if (!s) continue;
+    Object.assign(goalBox(s), { goal: g.goal, explicit: g.explicit, plan: g.plan, summary: g.summary, summaryAt: g.summaryAt, nudges: g.nudges, done: g.done });
+    Object.assign(s, { hookArmed: !!g.armed, hookRetryAt: g.retryAt || 0 });
+  }
   remote.init(st.access);
   if (st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
   history.render();
   showView("home");
-  connect();
+  stream.start();
   setInterval(() => { if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "chat") updateComposer(); }, 15000);
 }
 init().catch((e) => toast(`Omni Agent failed to start: ${e.message}`, true));

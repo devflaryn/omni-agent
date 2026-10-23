@@ -20,7 +20,7 @@ import { compact, convertToLlm, generateSummaryWithUsage, serializeConversation 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { CONTEXT_GUIDANCE, chunkBySize, contextStatusNote, foldIntoSummary, repairToolCallIds, summaryInputBudget, tokensOfChars } from "./omni-context-lib.mjs";
+import { CONTEXT_GUIDANCE, chunkBySize, contextStatusNote, explainUnfinishedToolCalls, foldIntoSummary, repairToolCallIds, summaryInputBudget, tokensOfChars } from "./omni-context-lib.mjs";
 
 /** pi's own default for compaction.reserveTokens. */
 const PI_RESERVE_TOKENS = 16384;
@@ -34,11 +34,13 @@ function piSettingsFile(): string {
 }
 
 export default function omniContext(pi: ExtensionAPI) {
-	// A tool call saved without an id would 400 every later request; repaired on the way out (the saved session is
-	// left as it is). Independent of the context policy below, so it stays on when that is turned off.
+	// A tool call saved without an id would 400 every later request, and one cut off by a restart reads as a bare
+	// "No result provided"; both repaired on the way out (the saved session is left as it is). Independent of the
+	// context policy below, so it stays on when that is turned off.
 	pi.on("context", async (ev: any) => {
 		try {
-			const messages = repairToolCallIds(ev?.messages);
+			const ids = repairToolCallIds(ev?.messages);
+			const messages = explainUnfinishedToolCalls(ids || ev?.messages) || ids;
 			return messages ? { messages } : undefined;
 		} catch {
 			return undefined;

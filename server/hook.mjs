@@ -232,6 +232,15 @@ export function asksToGoOn(text) {
   return ASKS_TO_GO_ON.test(t) && !OFFERS_CHOICE.test(t);
 }
 
+/**
+ * The user asked to talk it over (brainstorm, "what do you think", "your thoughts"), not for work: the answer is the
+ * result, so it is not asked to confirm or plan the rest, unless it stopped asking permission to go on.
+ */
+const ASKS_FOR_DISCUSSION = /\b(?:brainstorm\w*|let'?s (?:discuss|talk)|discuss (?:it|this|the|what|how|options?)|(?:what|how) do you think|do you think\b|your (?:thoughts|opinion|take|view)s?\b|thoughts on\b)/i;
+export function asksForDiscussion(text) {
+  return ASKS_FOR_DISCUSSION.test(String(text ?? "").replace(/[‘’ʼ]/g, "'").replace(/<omni-memory>[\s\S]*?<\/omni-memory>/g, ""));
+}
+
 /** A number from an injected callback (activeChildren, maxTokensFor); 0 when it is missing or throws. */
 const countOf = (fn, sid) => { try { return Math.max(0, Number(fn?.(sid)) || 0); } catch { return 0; } };
 
@@ -295,7 +304,7 @@ export class GoalKeeper {
   setContextPolicy(patch) { this.contextPolicy = { ...this.contextPolicy, ...patch }; if (!this.config.enabled) this.parkUnhandled(); return this.contextPolicy; }
   /** The hook is off: drop pending checks of goals nothing handles any more, and the heartbeat while no goal needs it. */
   parkUnhandled() {
-    for (const g of this.goals.values()) if (!this.mode(g)) { this.clearTimer(g.timer); g.timer = null; }
+    for (const [sid, g] of this.goals) if (!this.mode(g)) { this.clearTimer(g.timer); g.timer = null; g.retryAt = 0; this.signal(sid, g); }
     if (this.contextPolicy.autoContinue || [...this.goals.values()].some((g) => g.managed)) { if (!this.heartbeatTimer) this.startHeartbeat(); }
     else this.stopHeartbeat();
   }
@@ -312,7 +321,7 @@ export class GoalKeeper {
     const prev = this.goals.get(sid);
     if (prev) this.clearTimer(prev.timer);
     const g = {
-      text, explicit, managed, locked: managed, seq: (prev?.seq || 0) + 1, startedAt: Date.now(), timer: null,
+      text, explicit, managed, locked: managed, seq: (prev?.seq || 0) + 1, startedAt: Date.now(), timer: null, retryAt: 0, armedSent: !!prev?.armedSent,
       nudges: 0, idleNudges: 0, nudged: false, progress: false, planMoved: false, ran: false, paused: false, done: false, checking: false, recheck: false, restate: false,
       sameFailCount: 0, lastFingerprint: "", stopReason: "", lastError: "", errorStops: 0, compactedForError: false, planlessNudges: 0,
       // The newest assistant message (what classifyStop reads) and the user's own latest words (raw: memory packs included).
@@ -386,10 +395,22 @@ export class GoalKeeper {
   resume(sid) { const g = this.goals.get(sid); if (!g) return; g.paused = false; }
   /** Stop re-engaging a goal until a user message resumes it, and say so with a `goal` event (`paused`, `reason`). */
   pause(sid, g, reason, text = "") {
-    this.clearTimer(g.timer); g.timer = null;
+    this.clearTimer(g.timer); g.timer = null; g.retryAt = 0;
     g.paused = true;
+    this.signal(sid, g);
     if (text) this.emitLog(sid, text);
     this.bus.emit({ sid, harness: "pi", kind: "goal", ts: Date.now(), ...this.status(sid), paused: true, reason });
+  }
+
+  /** Whether the keeper is about to act on its own (a pending check, a retry after an error): pi is idle, yet the chat is not. */
+  armedState(g) { const armed = !!(g && (g.timer || g.checking) && !g.paused && !g.done); return { armed, retryAt: armed ? g.retryAt || 0 : 0 }; }
+  /** Announce a change of armedState (a `keeper` event): the UI keeps its Stop button live while the hook is armed. */
+  signal(sid, g) {
+    if (!g || this.goals.get(sid) !== g) return;
+    const st = this.armedState(g);
+    if (st.armed === g.armedSent && st.retryAt === (g.retryAtSent || 0)) return;
+    g.armedSent = st.armed; g.retryAtSent = st.retryAt;
+    this.bus.emit({ sid, harness: "pi", kind: "keeper", ts: Date.now(), ...st });
   }
 
   /** The plan that applies to the goal: the session's plan, unless it is a finished plan from before this goal began. */
@@ -418,7 +439,7 @@ export class GoalKeeper {
   status(sid) {
     const g = this.goals.get(sid);
     const p = this.plan(sid);
-    return { goal: g?.text || "", explicit: !!g?.explicit, managed: !!g?.managed, nudges: g?.nudges || 0, done: !!g?.done, paused: !!g?.paused, enabled: !!this.config.enabled, plan: p, progress: p ? planProgress(p) : null, summary: g?.lastSummary || "", summaryAt: g?.lastSummaryAt || 0 };
+    return { goal: g?.text || "", explicit: !!g?.explicit, managed: !!g?.managed, nudges: g?.nudges || 0, done: !!g?.done, paused: !!g?.paused, ...this.armedState(g), enabled: !!this.config.enabled, plan: p, progress: p ? planProgress(p) : null, summary: g?.lastSummary || "", summaryAt: g?.lastSummaryAt || 0 };
   }
 
   onEvent(ev) {
@@ -473,7 +494,8 @@ export class GoalKeeper {
       if (ev.streaming === true) {
         // A new run: what the previous run's last message said no longer describes the next stop.
         if (!g.ran) { g.lastText = ""; g.lastThinking = ""; g.lastUsage = null; }
-        g.ran = true; this.clearTimer(g.timer); g.timer = null;
+        g.ran = true; this.clearTimer(g.timer); g.timer = null; g.retryAt = 0;
+        this.signal(ev.sid, g);
       }
       else if (g.ran) this.onSettled(ev.sid);
     }
@@ -519,7 +541,9 @@ export class GoalKeeper {
     g.recheck = false; // this settle's own check supersedes a pending heartbeat retry
     this.clearTimer(g.timer);
     const seq = g.seq;
-    g.timer = this.setTimer(() => { g.timer = null; this.check(sid, seq).catch((e) => this.log("goal hook failed", e.message)); }, this.config.graceMs);
+    g.retryAt = 0;
+    g.timer = this.setTimer(() => { g.timer = null; this.check(sid, seq).catch((e) => this.log("goal hook failed", e.message)).finally(() => this.signal(sid, g)); }, this.config.graceMs);
+    this.signal(sid, g);
   }
 
   /**
@@ -624,6 +648,7 @@ export class GoalKeeper {
     if (g.explicit) return this.nudge(sid, g, pi, { reason: "this goal needs a plan first", body: [lengthNote, PLAN_FIRST], fp: "noplan" });
     if (stoppedAbnormally(g.stopReason)) return this.nudge(sid, g, pi, { reason: `it stopped abnormally (${g.stopReason})`, body: [lengthNote, nudgeBody({ goal: g.text, restate: this.restateNow(g) })], fp: fingerprint(g.tail) });
     if (!g.toolCalls) return this.finish(sid, g, "answered without needing any tools", { quiet: true });
+    if (!g.explicit && !g.managed && asksForDiscussion(g.lastUserText) && !asksToGoOn(g.lastText)) return this.finish(sid, g, "it answered what the user asked to discuss", { quiet: true });
     if (c.judgeFallback && this.judge) return this.judgeCheck(sid, g, pi, seq);
     if (g.planlessNudges < c.planlessNudges) {
       g.planlessNudges++;
@@ -745,12 +770,14 @@ export class GoalKeeper {
       this.emitLog(sid, `goal hook: provider error (${clip(err, 160)}); retrying in ${Math.round(wait / 1000)}s`);
       const seq = g.seq;
       this.clearTimer(g.timer);
+      g.retryAt = Date.now() + wait;
       g.timer = this.setTimer(() => {
-        g.timer = null;
+        g.timer = null; g.retryAt = 0;
         const p = this.getPi(sid);
-        if (!p || g.seq !== seq || g.paused || g.done || p.streaming || !this.mode(g)) return;
-        this.nudge(sid, g, p, { reason: `retrying after a provider error`, body: ["The model provider failed on your last turn; this is a retry. Continue exactly where you left off."], fp: "" }).catch((e) => this.log("retry failed", e.message));
+        if (!p || g.seq !== seq || g.paused || g.done || p.streaming || !this.mode(g)) { this.signal(sid, g); return; }
+        this.nudge(sid, g, p, { reason: `retrying after a provider error`, body: ["The model provider failed on your last turn; this is a retry. Continue exactly where you left off."], fp: "" }).catch((e) => this.log("retry failed", e.message)).finally(() => this.signal(sid, g));
       }, wait);
+      this.signal(sid, g);
       return { action: "retry-later", reason: err, waitMs: wait };
     }
     // The provider refuses the request itself (typically a context that grew too long or a malformed tail):
@@ -864,7 +891,7 @@ export class GoalKeeper {
       for (const [sid, g] of this.goals) {
         const pi = this.getPi(sid);
         if (!g.recheck || !this.mode(g) || !pi || pi.streaming || g.paused || g.checking || g.done) continue;
-        this.check(sid, g.seq).catch((e) => this.log("heartbeat check failed", e.message));
+        this.check(sid, g.seq).catch((e) => this.log("heartbeat check failed", e.message)).finally(() => this.signal(sid, g));
       }
     }, this.config.heartbeatMs);
     this.heartbeatTimer.unref?.();

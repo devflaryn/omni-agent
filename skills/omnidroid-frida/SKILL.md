@@ -1,6 +1,6 @@
 ---
 name: omnidroid-frida
-description: Use when hooking, tracing, calling, patching or dumping native arm64 Android code (.so) with omnidroid's Frida-style lab debugger over its MCP server — lab_load a library, call_function with crafted inputs, intercept (record or replace_return), set_breakpoint/run_until_stop/resume, read_mem/write_mem, load_code, trace_syscalls, dump_module. Trigger on "frida", "hook this function", "intercept", "call this native function", "what does this .so return for X", "patch the check", "dump the decrypted/unpacked .so", "breakpoint in the lib", or any omnidroid_lab_* / mcp__omnidroid__* debug tool. It runs one library in an isolated emulated arm64 address space; it does NOT attach to a running game (for booting the game use the omnidroid skill; for the old QEMU frida-server use omnidroid-qemu).
+description: Use when hooking, tracing, calling, patching or dumping native arm64 Android code (.so) with omnidroid's Frida-style lab over its MCP server — lab_load, call_function, intercept (record or replace_return), set_breakpoint/run_until_stop/resume, read_mem/write_mem, alloc_data, load_code, trace_syscalls, dump_module; and the RE workbench — lab_load_apk, lab_trace, lab_corpus, lab_diff, lab_build (rebuild a .so in C and prove it matches). Trigger on "frida", "hook/intercept this function", "call this native function", "patch the check", "dump the unpacked .so", "breakpoint in the lib", "reconstruct this .so", or any omnidroid_lab_* / lab debug tool. It runs one library in an isolated emulated address space, NOT attached to a running app (booting apps — omnidroid skill; old QEMU frida-server — omnidroid-qemu).
 ---
 
 # omnidroid's Frida-style lab debugger
@@ -13,34 +13,46 @@ arm64). It is the Frida toolkit re-done at the emulation layer — `Interceptor.
 `NativeFunction(...)()` → `call_function`, `Memory.read/write*` → `read_mem`/`write_mem`,
 `Process.enumerateRanges` → `list_maps`, `Module.enumerateExports` → `list_symbols`.
 
-**What it is not**: it is not attached to a live instance. `lab_load` puts ONE `.so` into a fresh,
+**What it is not**: it does NOT attach to a live instance. `lab_load` puts ONE `.so` into a fresh,
 empty address space with nothing else: no Android, no libc, no JVM, no game loop. You drive it by
 calling its functions yourself.
 
 Tool names: pi `omnidroid_<tool>`, Claude Code `mcp__omnidroid__<tool>`. Below they are written
-bare. None present? See the omnidroid skill ("The MCP tools").
+bare. None present? See the omnidroid skill ("Reaching the tools").
+
+**Where it runs**: the omnidroid app forwards lab calls, one at a time, to an `omni-mcp --lab`
+process started at the first lab call. If that process dies it is started once more and **every
+session and corpus is gone**: the next call answers `no lab session "default"; call
+lab_load/lab_load_apk first`. Load again; never assume an earlier load survived an error.
+
+**Sessions**: a lab holds named sessions. `lab_load` / `lab_load_apk` take `session` (default
+`"default"`); loading replaces **that session only**. Every single-session tool below
+(`list_symbols` ... `dump_module`) acts on `"default"` alone; only `lab_trace` and `lab_diff` take a
+session name. So: probe in `"default"`, diff with `"original"` / `"candidate"`.
 
 ## The tools
 
 | tool | args | returns / notes |
 |---|---|---|
-| `lab_load` | `path`, `name?` | `{module, base, start, end, exported_symbols}`. **Replaces the whole lab** — every earlier module, buffer, breakpoint and intercept is gone. One library per lab |
-| `list_symbols` | `module?`, `limit?` (200) | exports: `name`, `address`, `kind` (`FUNC`/`OBJECT`), `size` |
-| `resolve_symbol` | `name` | `{address, size, kind, module}` — exported symbols only |
-| `list_maps` | — | `/proc/self/maps`-shaped rows: `start`, `end`, `perms`, `committed`, `what` |
-| `read_mem` | `address`, `len` (≤ 1 MiB) | `{hex}` |
-| `write_mem` | `address`, `hex` | writes anywhere mapped, **including read-only code** (copy-on-write + the translation cache invalidated) |
-| `alloc_data` | `hex` or `len` | a fresh read-write buffer: `{address}` — how you hand a function its input |
-| `load_code` | `words` (32-bit A64 encodings) | a fresh executable snippet: `{address}` |
-| `call_function` | `symbol` or `address`, `args?` (≤ 8 → X0..X7) | `{ret (X0), ret1 (X1), instructions, events}`. Runs to the return; breakpoints are stepped over, intercepts fire |
-| `set_breakpoint` | `symbol` or `address` | for `run_until_stop` / `resume` |
-| `run_until_stop` | `symbol`/`address`, `args?` | `{stopped: "breakpoint", address}` or `{stopped: "returned", ret}` |
-| `resume` | — | continue from a breakpoint stop |
-| `get_registers` | — | `x[0..30]`, `sp`, `pc`, `nzcv`, `tpidr_el0` (at a stop, or after the last call) |
-| `backtrace` | — | return addresses up the X29 frame chain |
-| `intercept` | `symbol`/`address`, `record_entry?`, `record_exit?`, `replace_return?` | entry events carry X0..X7; with `replace_return` the body never runs and X0 is forced |
-| `trace_syscalls` | `on?` | record every `SVC` in the next calls as `syscall` events (there is no kernel: the guest just carries on) |
-| `dump_module` | `name?`, `out_path?` | the module's bytes as they sit in memory `[start, end)` (headers, relocations applied, holes zero) |
+| `lab_load` | `path` (a `.so`), `name?` (default the file name), `session?` (accepted, not in the schema) | `{module, session, base, start, end, exported_symbols}`. Replaces that session: its modules, buffers, breakpoints, intercepts |
+| `list_symbols` | `module?` (default the session's first), `limit?` (200) | `{module, symbols: [{name, address, kind (FUNC/OBJECT), size}]}` — exports only |
+| `resolve_symbol` | `name` | `{name, address, size, kind, module}` — exported symbols only |
+| `list_maps` | — | `{maps: [{start, end, perms, committed, what}]}` (`/proc/self/maps` shape) |
+| `read_mem` | `address`, `len` (≤ 1 MiB) | `{address, len, hex}` |
+| `write_mem` | `address`, `hex` | `{address, written}`; anywhere mapped, **including read-only code** (copy-on-write + translation cache invalidated) |
+| `alloc_data` | `hex` or `len` | `{address, len}`: a fresh read-write buffer — how you hand a function its input |
+| `load_code` | `words` (32-bit A64 encodings, numbers or hex strings) | `{address}`: a fresh executable snippet |
+| `call_function` | `symbol` or `address`, `args?` (≤ 8 → X0..X7) | `{ret (X0), ret_u64, ret1 (X1), instructions, events}`. Runs to the return; breakpoints stepped over, intercepts fire |
+| `set_breakpoint` | `symbol` or `address` | `{breakpoint}` — for `run_until_stop` / `resume` |
+| `run_until_stop` | `symbol`/`address`, `args?` | `{stopped: "breakpoint", address, events}` or `{stopped: "returned", ret, instructions, events}` |
+| `resume` | — | the same two shapes |
+| `get_registers` | — | `{x: [x0..x30], sp, pc, nzcv, tpidr_el0}` (at a stop, or after the last call) |
+| `backtrace` | — | `{frames: [return addresses]}` up the X29 chain |
+| `intercept` | `symbol`/`address`, `record_entry?` (true), `record_exit?` (true), `replace_return?` (string) | `{intercept}`. Entry events carry X0..X7; with `replace_return` the body never runs and X0 is forced |
+| `trace_syscalls` | `on?` (true) | `{trace_syscalls}`; every `SVC` in later calls becomes a `syscall` event (no kernel answers: the guest carries on) |
+| `dump_module` | `name?` (default the session's first module), `out_path?` | `{module, bytes, out_path?}`: the image as it sits in memory `[start, end)` (headers, relocations applied, holes zero) |
+
+Events: `{kind: enter|exit|syscall|replaced, address, regs: [hex...], syscall_nr}`.
 
 **Numbers**: pass addresses and 64-bit values as strings, `"0x1a5369bc388"` or decimal; read
 results from the hex strings (`ret`), not `ret_u64` (a JSON number loses precision above 2^53).
@@ -72,8 +84,9 @@ Addresses change on every `lab_load` — re-resolve, never reuse one from an ear
    (`b`, not `bl`): its return goes straight to the lab's sentinel.
 6. There is no "clear" for breakpoints or intercepts: `lab_load` again to start clean.
 7. Only integer/pointer arguments (X0..X7) and results (X0, X1). No floats, no stack arguments.
-8. In pi, a call that exceeds `omniMcp.timeoutSec` (600 s) restarts omni-mcp — the lab is gone,
-   `lab_load` again.
+8. In pi, a call past `omniMcp.timeoutSec` (600 s) is **not** killed: pi answers "has run Ns
+   without returning ... still alive" and posts the late result as a follow-up. Lab calls are
+   serialized, so the next lab call waits behind the slow one.
 
 ## Recipes
 
@@ -134,38 +147,37 @@ library is packed.
 There is no frida-server for an app running on omnidroid's real-AOSP path: the guest kernel has no
 `ptrace`, so nothing attaches to or injects into a live process. To hook what a running app runs,
 take its library into the lab: the warm device's installed APKs are host files
-(`<device dir>/data/app/*/<package>-*/base.apk`; `device_status` gives the device dir, or `shell
+(`<device dir>/data/app/*/<package>-*/base.apk`; `list_devices` gives each Android's `dir`, `shell
 {command: "pm path <package>"}` the guest path), so unzip `lib/arm64-v8a/<lib>.so` from there and
 `lab_load` it. Watch the live app itself through the omnidroid skill: its log in the device's host log file,
 `shell` (dumpsys, its files as root) and `screenshot`. (The retired QEMU manager had a real frida-server: omnidroid-qemu.)
 
 ## The dynamic RE workbench
 
-To reverse-engineer a `.so` and prove a **rebuilt** one behaves the same, the MCP server carries a
-loop on top of the lab (see `crates/omni-mcp/README.md` in the omnidroid repo):
+Reverse-engineer a `.so` and prove a **rebuilt** one behaves the same (`crates/omni-mcp/README.md`):
 
-- `lab_load_apk {apk, target?, session?}` — load a target `.so` (from an APK, or a bare `.so`) into a
-  named session, resolving imports against its co-loaded `lib/arm64-v8a` siblings; returns the
-  loaded modules and every import still **unresolved** (stub those with `intercept`). For an APK,
-  `target` names the `.so` to reconstruct.
-- `lab_trace {symbol|address, arg_spec, session?}` — call via an **arg_spec**
-  (`{scalar}` / `{in_buffer:hex}` / `{out_buffer:len}` / `{inout_buffer:hex}`): buffers are
-  allocated and output buffers read back. Returns `ret`, `ret1`, instruction count, out-buffer bytes.
-- `lab_corpus {templates, seed?, count?}` — a **reproducible** input corpus (`{kind:scalar}` /
-  `{kind:buffer,len}` / `{kind:out_buffer,len}` / `{kind:const,value}`), stored by `corpus_id`;
-  the same `seed` reproduces it.
-- `lab_diff {symbol, corpus_id, original?, candidate?}` — differential-test the `original` session
-  against the `candidate` over the corpus; returns `total`, `matched`, and the first divergence
-  (`ret` / `out_buffers` / `fault`). **Equivalence is relative to the corpus**, never universal.
-- `lab_build {sources:[{name,text}], flags?, soname?}` — compile candidate C into an arm64 `.so` the
-  lab can load. Needs an arm64 clang on the host (`OMNI_NDK` / `ANDROID_NDK_HOME`, or a `clang` on
-  `PATH` with an `aarch64` target); without one it returns `{error:"toolchain missing", looked_for}`
-  rather than a wrong-arch artifact.
+| tool | args | returns / notes |
+|---|---|---|
+| `lab_load_apk` | `apk` (an `.apk`, or a bare `.so`), `target?` (the `.so` file name; **required** for an APK), `session?` | `{session, target, modules, unresolved: [{name, kind, weak, library}]}`. Extracts every `lib/arm64-v8a/*.so`, co-loads the siblings first (one that fails to load is skipped silently) so the target's imports resolve against them; what stays `unresolved` you stub with `intercept`. Errors: `the APK has no lib/arm64-v8a/*.so`, `"x.so" is not in the APK's arm64 libs` |
+| `lab_trace` | `symbol` or `address`, `arg_spec?`, `session?` | `{ret, ret_u64, ret1, instructions, out_buffers: [{index, hex}]}` — no `events`. `arg_spec` items: `{scalar: n}`, `{in_buffer: "hex"}`, `{out_buffer: len}`, `{inout_buffer: "hex"}`; buffers are allocated and their addresses passed in register order; out/inout buffers are read back. A zero-length out/inout buffer is refused |
+| `lab_corpus` | `templates` (required), `seed?` (0), `count?` (16) | `{corpus_id: "corpus-N", count}`. Templates: `{kind: "scalar"}` (first inputs 0, 1, 2^64-1, then random), `{kind: "buffer", len}` (random input bytes), `{kind: "out_buffer", len}`, `{kind: "const", value}`. Same seed, same corpus |
+| `lab_diff` | `symbol`, `corpus_id` (required), `original?` (`"original"`), `candidate?` (`"candidate"`) | `{total, matched, first_divergence: null or {index, observable, expected, got}}`; observable `ret` / `out_buffers` / `fault` / `symbol` (it does not resolve in one of them). Compares X0 and output buffers, **not X1**. An input on which **both** fault counts as matched |
+| `lab_build` | `sources: [{name, text}]` (required), `flags?` (clang flags), `soname?` (`candidate.so`) | `{so_path, target}`, or, as a normal result rather than an error, `{error: "toolchain missing", looked_for}` (no arm64 clang: set `OMNI_NDK` / `ANDROID_NDK_HOME`, or put a `clang` with an `aarch64` target on `PATH`) or `{error: "compile", diagnostics}`. Check for `error` before using `so_path` |
 
-Set `session` to `"original"` / `"candidate"` on the loads so `lab_diff` has two sessions to compare.
-A self-decrypting/packed `.so` is handled the lab way: `call_function` (or `lab_trace`) its unpacker,
-then `dump_module` the now-decrypted image. Functions that need real libc/JNI/global state do not run
-in isolation yet — resolve what you can, `intercept` the rest, and reconstruct the parts that do run.
+The loop: `lab_load_apk {apk, target, session: "original"}` → write C → `lab_build` →
+`lab_load {path: so_path, session: "candidate"}` → `lab_corpus` → `lab_diff {symbol, corpus_id}` →
+fix the first divergence, repeat. **Equivalence is relative to the corpus**, never universal; and
+since both-fault inputs match, `matched == total` where the original faults everywhere proves
+nothing: `lab_trace` a few corpus-like inputs on `"original"` first and see real `ret`s. To use
+the single-session tools on the original too (intercept, read_mem...), also load it into
+`"default"`.
+
+`lab_trace`'s schema types `address` as a number (the other tools: a string). Prefer `symbol`;
+otherwise a number or a hex/decimal string both work (pi converts `"0x..."`).
+
+A self-decrypting/packed `.so`: `call_function` (or `lab_trace`) its unpacker, then `dump_module`.
+Functions that need real libc/JNI/global state do not run in isolation yet: resolve what you can,
+`intercept` the rest, reconstruct the parts that do run.
 
 ## Reporting
 

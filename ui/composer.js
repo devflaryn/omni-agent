@@ -30,7 +30,7 @@ export function createComposer(root, h) {
   const ta = q("textarea"), plus = q('[data-role="plus"]'), plusMenu = q('[data-role="plusMenu"]'), pills = q(".attach-pills");
   const modelBtn = q('[data-role="model"]'), modelMenu = q('[data-role="modelMenu"]');
   const caption = q(".caption"), send = q('[data-role="send"]');
-  const st = { streaming: false, disabled: false, caption: "", piModel: null, piThinking: "", models: [], levels: [], hook: null };
+  const st = { streaming: false, disabled: false, caption: "", piModel: null, piThinking: "", models: [], levels: [], levelLabels: {}, hook: null };
   let menuDirty = true;
 
   const autosize = () => { ta.style.height = "auto"; ta.style.height = `${Math.min(ta.scrollHeight, 260)}px`; };
@@ -55,10 +55,11 @@ export function createComposer(root, h) {
   }
   function renderModelMenu() {
     modelMenu.innerHTML = "";
-    if (st.levels.length) {
+    const { levels, labels } = modelThinking();
+    if (levels.length) {
       modelMenu.appendChild(el("div", "mh", "Thinking"));
       const row = el("div", "seg-row");
-      for (const lv of st.levels) { const b = el("button", `seg-btn${lv === st.piThinking ? " active" : ""}`, lv); b.onclick = () => { st.piThinking = lv; h.onPiThinking?.(lv); render(); closeMenus(); }; row.appendChild(b); }
+      for (const lv of levels) { const b = el("button", `seg-btn${lv === st.piThinking ? " active" : ""}`, labels[lv] || lv); b.title = lv; b.onclick = () => { st.piThinking = lv; h.onPiThinking?.(lv); render(); closeMenus(); }; row.appendChild(b); }
       modelMenu.appendChild(row);
     }
     modelMenu.appendChild(el("div", "mh", "Model"));
@@ -102,9 +103,15 @@ export function createComposer(root, h) {
       modelMenu.appendChild(b);
     }
   }
+  /** The picked model's own thinking levels (ui/thinking.js, from the model list), else the server's list. */
+  function modelThinking() {
+    const m = st.piModel && st.models.find((x) => x.provider === st.piModel.provider && x.id === st.piModel.id);
+    return m?.thinking?.length ? { levels: m.thinking, labels: m.thinkingLabels || {} } : { levels: st.levels, labels: st.levelLabels || {} };
+  }
   function render() {
     const lbl = modelBtn.querySelector(".lbl");
-    lbl.innerHTML = `<b>${esc(st.piModel?.id || "Pick a model")}</b>${st.piThinking ? ` <span>${esc(st.piThinking)}</span>` : ""}${st.hook?.enabled ? ` <span title="Goal hook on">hook</span>` : ""}`;
+    const think = st.piThinking && (modelThinking().labels[st.piThinking] ? `thinking ${modelThinking().labels[st.piThinking]}` : st.piThinking);
+    lbl.innerHTML = `<b>${esc(st.piModel?.id || "Pick a model")}</b>${think ? ` <span>${esc(think)}</span>` : ""}${st.hook?.enabled ? ` <span title="Goal hook on">hook</span>` : ""}`;
     caption.textContent = st.caption;
     caption.title = st.caption;
     send.disabled = st.disabled;
@@ -148,7 +155,7 @@ export function createComposer(root, h) {
       if (menuRelevant) menuDirty = true;
       render();
     },
-    setPiChoices({ models, levels }) { if (models) st.models = models; if (levels) st.levels = levels; menuDirty = true; render(); },
+    setPiChoices({ models, levels, labels }) { if (models) st.models = models; if (levels) { st.levels = levels; st.levelLabels = labels || {}; } menuDirty = true; render(); },
     getOptions,
     reloadOptions() { loadOptions(); renderPills(); },
     insert(text) { ta.value += `${ta.value && !/\s$/.test(ta.value) ? " " : ""}${text}`; autosize(); ta.focus(); },

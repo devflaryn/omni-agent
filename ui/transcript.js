@@ -312,7 +312,7 @@ function agentResultCard(view, info, animate) {
 // -------------------------------------------------------------- events
 export function applyEvent(view, ev) {
   const animate = !!ev.live;
-  if (view.empty && !["session", "status", "usage"].includes(ev.kind)) { view.empty.remove(); view.empty = null; }
+  if (view.empty && !["session", "status", "usage", "keeper"].includes(ev.kind)) { view.empty.remove(); view.empty = null; }
   switch (ev.kind) {
     case "block": {
       if (ev.phase === "message_start") { const t = turnOf(view, Date.now(), true); closeStream(view); openStream(view, t); markStarted(t); }

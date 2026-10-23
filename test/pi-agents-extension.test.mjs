@@ -377,6 +377,57 @@ test("lib: a report pi only queued and then lost (Stop, crash) is posted again o
   lib.confirmDelivered(rec.id);
 });
 
+test("lib: a wake-up triggers a turn only when no prompt is starting and the user did not stop the chat", () => {
+  lib.resetTurn();
+  const wake = { triggerTurn: true, deliverAs: "followUp" }, quiet = { triggerTurn: false };
+  assert.deepEqual(lib.wakeOptions(), wake, "an idle chat is woken");
+  // pi's prompt() checks it is idle, then awaits auth/compaction/before_agent_start before it claims the run: a
+  // triggerTurn in that window is the second run whose cleanup clears pi's busy flag mid-run.
+  lib.onTurnEvent("input", {}, {}, 1000);
+  assert.deepEqual(lib.wakeOptions(1500), quiet, "a prompt is starting: the report joins that turn instead");
+  lib.onTurnEvent("agent_start", {}, {}, 1600);
+  assert.deepEqual(lib.wakeOptions(1700), wake, "the run streams: pi queues it as a follow-up");
+  lib.onTurnEvent("agent_settled", {}, {}, 1800);
+  assert.deepEqual(lib.wakeOptions(1900), wake);
+  lib.onTurnEvent("input", {}, {}, 2000);
+  assert.deepEqual(lib.wakeOptions(2000 + lib.PROMPT_START_MAX_MS), wake, "a prompt that never ran (a command, a failed preflight) stops counting");
+  lib.onTurnEvent("agent_settled", {}, {}, 2100);
+  // Stop: pi aborts the run's signal before it releases any tool (a waiting job_wait lets the poller go at once).
+  const ac = new AbortController();
+  lib.onTurnEvent("agent_start", {}, { signal: ac.signal }, 3000);
+  ac.abort();
+  assert.deepEqual(lib.wakeOptions(3001), quiet, "aborted mid-run: a report must not be queued as a follow-up, pi would run it");
+  lib.onTurnEvent("agent_settled", {}, {}, 3002);
+  assert.deepEqual(lib.wakeOptions(3003), quiet, "a stopped chat stays stopped: reports go in without waking it");
+  lib.onTurnEvent("input", {}, {}, 4000);
+  lib.onTurnEvent("agent_start", {}, {}, 4001);
+  lib.onTurnEvent("agent_settled", {}, {}, 4002);
+  assert.deepEqual(lib.wakeOptions(4003), wake, "the next prompt (the user's or the keeper's) un-stops it");
+  // An aborted last message also counts (a context with no signal).
+  lib.onTurnEvent("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] }, {}, 5000);
+  lib.onTurnEvent("agent_settled", {}, {}, 5001);
+  assert.deepEqual(lib.wakeOptions(5002), quiet);
+  lib.onTurnEvent("session_start", {}, {}, 6000);
+  assert.deepEqual(lib.wakeOptions(6001), wake, "a new or switched session starts clean");
+  lib.resetTurn();
+});
+
+test("lib: the poller posts with the wake options of the moment it delivers", async () => {
+  lib.resetTurn();
+  const rec = { id: "a-0000ab02", kind: "shell", title: "t", status: "done", endedAt: 31, resultText: "r" };
+  let rounds = 0;
+  const out = [];
+  lib.onTurnEvent("input", {}, {}, Date.now());
+  const p = lib.ensurePoller({
+    client: { wait: async () => (++rounds === 1 ? { finished: [rec], pending: [] } : { finished: [], pending: [] }), delivered: async () => true },
+    parentSessionId: "lib-wake", pi: { sendMessage: (m, o) => out.push(o) }, sleep: async () => {},
+  });
+  await p.done;
+  assert.deepEqual(out, [{ triggerTurn: false }], "a prompt was starting: no second run");
+  lib.confirmDelivered(rec.id);
+  lib.resetTurn();
+});
+
 test("lib: a report that cannot be posted (a stale pi) stays unclaimed and undelivered for the next poller", async () => {
   const rec = { id: "a-0000000b", kind: "pi", title: "t", status: "done", endedAt: 11, resultText: "r" };
   const acks = [];
@@ -500,6 +551,30 @@ test("omni-agents: agent_start returns at once with the chat's identity; the pol
     await tick(50);
     assert.equal(x.sent.length, 1, "delivered once");
   } finally { delete process.env.OMNI_AGENT_DEPTH; x.shutdown(); await fake.close(); }
+});
+
+test("omni-agents: after Stop a finished job's report goes into the chat without starting a turn; the next prompt wakes again", ext, async () => {
+  lib.resetTurn();
+  const fake = await fakeOmni();
+  const x = await loadExt(AGENTS_EXT, fake.port);
+  const sid = "s-stop-wake";
+  try {
+    for (const name of ["input", "agent_start", "agent_end", "agent_settled"]) assert.ok(x.events.has(name), `tracks ${name}`);
+    const ac = new AbortController();
+    await x.events.get("input")({ type: "input", text: "go", source: "rpc" }, ctxFor(sid));
+    await x.events.get("agent_start")({ type: "agent_start" }, { ...ctxFor(sid), signal: ac.signal });
+    const r = await x.run("job_start", { command: "make", title: "build" }, { ctx: ctxFor(sid) });
+    await until(() => fake.to("/api/agents/wait").length >= 1, "the poller's wait");
+    ac.abort(); // the user's Stop
+    fake.finish(r.details.id, { resultText: "built" });
+    await until(() => x.sent.length === 1, "the report message");
+    assert.deepEqual(x.sent[0].options, { triggerTurn: false }, "in the chat, but it does not restart the stopped run");
+    await x.events.get("agent_settled")({ type: "agent_settled" }, ctxFor(sid));
+    await x.events.get("input")({ type: "input", text: "continue", source: "interactive" }, ctxFor(sid));
+    await x.events.get("agent_start")({ type: "agent_start" }, ctxFor(sid));
+    await x.events.get("agent_settled")({ type: "agent_settled" }, ctxFor(sid));
+    assert.deepEqual(lib.wakeOptions(), { triggerTurn: true, deliverAs: "followUp" });
+  } finally { x.shutdown(); await fake.close(); lib.resetTurn(); }
 });
 
 test("omni-agents: a claude agent or a persona does not inherit the chat's model; the depth limit is the server's error", ext, async () => {

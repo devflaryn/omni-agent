@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CONTEXT_GUIDANCE, UNNAMED_TOOL, classifyStop, contextContinueMessage, contextSkipReason, contextStatusNote, effectiveContextWindow, repairToolCallIds, userAskedForHandoff } from "../integrations/pi/omni-context-lib.mjs";
+import { CONTEXT_GUIDANCE, UNNAMED_TOOL, classifyStop, contextContinueMessage, contextSkipReason, contextStatusNote, effectiveContextWindow, explainUnfinishedToolCalls, repairToolCallIds, userAskedForHandoff, UNFINISHED_TOOL_NOTE } from "../integrations/pi/omni-context-lib.mjs";
 
 const stop = (text, extra = {}) => classifyStop({ text, stopReason: "stop", ...extra });
 const NEUTRAL = "Summary: the loader resolves both imports now and the unit tests pass. Steps 4 and 5 of the plan are still open.";
@@ -288,4 +288,30 @@ test("repairToolCallIds: a tool call saved without an id (or name) gets a stable
   const named = repairToolCallIds([{ role: "assistant", content: [{ type: "toolCall", id: "z9", name: "", arguments: {} }], timestamp: 4 }, { ...okResult, toolCallId: "z9", toolName: "" }]);
   assert.deepEqual([named[0].content[0].id, named[0].content[0].name], ["z9", UNNAMED_TOOL]);
   assert.equal(named[1].toolCallId, "z9", "its result already points at it");
+});
+
+test("explainUnfinishedToolCalls: a call cut off before its result (Omni restarted mid-tool) says so instead of pi's bare \"No result provided\"", () => {
+  // Seen live: a bash call killed by a server restart had no result; on the next prompt the model read its own
+  // earlier work as the user's and answered a different question.
+  const user = { role: "user", content: [{ type: "text", text: "go" }], timestamp: 1 };
+  const call = { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t1", name: "bash", arguments: {} }, { type: "toolCall", id: "t2", name: "read", arguments: {} }], timestamp: 2 };
+  const r1 = { role: "toolResult", toolCallId: "t1", toolName: "bash", content: [], isError: false, timestamp: 3 };
+  const next = { role: "user", content: [{ type: "text", text: "next" }], timestamp: 9 };
+  assert.equal(explainUnfinishedToolCalls([user, call, r1, { ...r1, toolCallId: "t2" }, next]), null, "every call answered: byte-identical");
+  assert.equal(explainUnfinishedToolCalls([user, call]), null, "the newest calls are still running: not cut off");
+  assert.equal(explainUnfinishedToolCalls(undefined), null);
+  const input = [user, call, r1, next];
+  const snapshot = JSON.stringify(input);
+  const out = explainUnfinishedToolCalls(input);
+  assert.equal(JSON.stringify(input), snapshot, "the input is not mutated");
+  assert.equal(out.length, 5);
+  assert.deepEqual(out.slice(0, 3), [user, call, r1]);
+  assert.equal(out[4], next);
+  assert.deepEqual([out[3].role, out[3].toolCallId, out[3].toolName, out[3].isError], ["toolResult", "t2", "read", true]);
+  assert.equal(out[3].content[0].text, UNFINISHED_TOOL_NOTE);
+  assert.deepEqual(explainUnfinishedToolCalls(input), out, "deterministic: the cached prefix stays the same");
+  // A background report (custom) cuts the flow the same way; an aborted or failed turn is dropped by pi, so left alone.
+  assert.equal(explainUnfinishedToolCalls([user, call, { role: "custom", customType: "omni-agent-result", content: "r", timestamp: 5 }]).length, 5);
+  assert.equal(explainUnfinishedToolCalls([user, { ...call, stopReason: "aborted" }, next]), null);
+  assert.equal(explainUnfinishedToolCalls([user, { ...call, stopReason: "error" }, next]), null);
 });

@@ -111,10 +111,12 @@ export function waitDeviceVerdict(text, targetId = null) {
 	let d;
 	try { d = JSON.parse(text); } catch { return { done: false, ready: [], booting: [], devices: [] }; }
 	const devices = Array.isArray(d?.devices) ? d.devices : [];
+	// The app names each one `device`; an older server used `id`.
+	const idOf = (x) => x?.device ?? x?.id;
 	const want = (id) => targetId == null || Number(id) === Number(targetId);
-	const sel = devices.filter((x) => want(x?.id));
-	const ready = sel.filter((x) => x?.state === "ready").map((x) => x.id);
-	const booting = sel.filter((x) => x?.state === "booting" || x?.state === "closing").map((x) => x.id);
+	const sel = devices.filter((x) => want(idOf(x)));
+	const ready = sel.filter((x) => x?.state === "ready").map(idOf);
+	const booting = sel.filter((x) => x?.state === "booting" || x?.state === "closing").map(idOf);
 	// A named device: done once it is ready. No target: done once at least one device exists and none is still coming up.
 	const done = targetId != null ? ready.length > 0 : sel.length > 0 && booting.length === 0;
 	return { done, ready, booting, devices };

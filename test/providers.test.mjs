@@ -76,9 +76,10 @@ test("listProviders hides the key and reports a hint; flatModels lists provider/
   assert.equal(list[1].hasKey, false); assert.equal(list[1].keyHint, "");
   assert.deepEqual(list[0].models[0], { id: "Qwen/Qwen3.8-27B", name: "Qwen", reasoning: false, contextWindow: 32768, maxTokens: null });
   assert.deepEqual(flatModels(file), [
-    { provider: "orca", id: "Qwen/Qwen3.8-27B", name: "Qwen", contextWindow: 32768 },
-    { provider: "openrouter", id: "a", name: "a", contextWindow: null },
-    { provider: "openrouter", id: "b", name: "B", contextWindow: null },
+    // each with the thinking levels its family has (ui/thinking.js): Qwen only switches it on or off
+    { provider: "orca", id: "Qwen/Qwen3.8-27B", name: "Qwen", contextWindow: 32768, thinking: ["off", "high"], thinkingLabels: { high: "on" } },
+    { provider: "openrouter", id: "a", name: "a", contextWindow: null, thinking: ["off", "minimal", "low", "medium", "high"], thinkingLabels: {} },
+    { provider: "openrouter", id: "b", name: "B", contextWindow: null, thinking: ["off", "minimal", "low", "medium", "high"], thinkingLabels: {} },
   ]);
 });
 

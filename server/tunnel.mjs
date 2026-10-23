@@ -63,17 +63,22 @@ export class SshTunnel {
       tail = (tail + d).slice(-4000);
       if (/remote forward success/i.test(tail) && this.state !== "up") { this.backoff = this.minBackoff; this.set("up"); }
     });
-    p.on("error", (e) => this.set("down", e.message));
-    p.on("exit", (code) => {
+    const ended = (why) => {
       if (this.proc !== p) return;
       this.proc = null;
-      const why = (tail.match(/(Permission denied[^\n]*|Host key verification failed[^\n]*|remote port forwarding failed[^\n]*|Connection (?:refused|timed out)[^\n]*|Could not resolve[^\n]*)/i) || [])[1];
-      this.set("down", why || `ssh exited (${code})`);
+      this.set("down", why);
       if (this.stopped) return;
       this.timer = setTimeout(() => this.start(), this.backoff);
       // Short cap: the usual failure is the VPS still holding the port for a dead session, which it
       // frees within ~30 s; a long wait after that only extends the outage. A retry costs one handshake.
       this.backoff = Math.min(this.backoff * 2, 20_000);
+    };
+    // A spawn that fails (no pid) reports only 'error', never 'exit': without this the tunnel stayed down
+    // until Omni restarted. An 'error' from a child that did start (a failed kill) is not an end.
+    p.on("error", (e) => { if (p.pid === undefined) ended(e.message); else this.set(this.state, e.message); });
+    p.on("exit", (code) => {
+      const why = (tail.match(/(Permission denied[^\n]*|Host key verification failed[^\n]*|remote port forwarding failed[^\n]*|Connection (?:refused|timed out)[^\n]*|Could not resolve[^\n]*)/i) || [])[1];
+      ended(why || `ssh exited (${code})`);
     });
   }
 

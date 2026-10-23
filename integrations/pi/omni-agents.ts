@@ -23,7 +23,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
 	AgentsClient, MAX_RESULT, agentReport, chunkSecFor, claim, clip, confirmDelivered, describeAgent, elapsedOf, ensurePoller, fmtDuration, identity, isFinished,
-	kindLabel, omniBase, oneLine, pausePoller, piHttpTimeoutMs, resumeDelivery, statusLine, stopPollers, titleFor, waitAgents, waitJob,
+	kindLabel, omniBase, onTurnEvent, oneLine, pausePoller, piHttpTimeoutMs, resumeDelivery, statusLine, stopPollers, titleFor, waitAgents, waitJob,
 } from "./omni-agents-lib.mjs";
 
 const MAX_WAIT_SEC = 3600;
@@ -87,6 +87,11 @@ export default function omniAgents(pi: ExtensionAPI) {
 		try { await client.delivered(id); } catch { /* the server also acks it when it sees the report in the chat */ }
 	});
 	pi.on("session_shutdown", async () => { stopPollers(pi); });
+	// Where the turn is decides whether a report may wake the chat (wakeOptions in the lib).
+	pi.on("input", async (event: any, ctx: any) => { onTurnEvent("input", event, ctx); });
+	pi.on("agent_start", async (event: any, ctx: any) => { onTurnEvent("agent_start", event, ctx); });
+	pi.on("agent_end", async (event: any, ctx: any) => { onTurnEvent("agent_end", event, ctx); });
+	pi.on("agent_settled", async (event: any, ctx: any) => { onTurnEvent("agent_settled", event, ctx); });
 
 	pi.registerTool({
 		name: "agent_start",
@@ -114,7 +119,7 @@ export default function omniAgents(pi: ExtensionAPI) {
 			title: Type.Optional(Type.String({ description: "Short title for the agent's chat (default: the start of the task)" })),
 			cwd: Type.Optional(Type.String({ description: "Working directory (default: the current one)" })),
 			model: Type.Optional(Type.String({ description: "Model id (default: this chat's model for pi, Claude Code's default for claude)" })),
-			thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"], { description: "pi thinking level (kind pi)" })),
+			thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"], { description: "pi thinking level (kind pi); pi moves it to the nearest one the model has" })),
 		}),
 		async execute(_id: string, params: any, _signal: AbortSignal | undefined, _update: unknown, ctx: any) {
 			const me = identity(ctx);

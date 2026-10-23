@@ -10,5 +10,6 @@ test("PiRpc.thinkingLevels returns the fixed level set, not the removed RPC comm
   assert.equal(r.success, true);
   assert.ok(Array.isArray(r.data?.levels) && r.data.levels.length, "levels present");
   assert.deepEqual(r.data.levels, PI_THINKING_LEVELS);
-  assert.ok(r.data.levels.includes("off") && r.data.levels.includes("high"), "off + high offered");
+  assert.ok(r.data.levels.includes("off") && r.data.levels.includes("max"), "the whole ladder without a model");
+  assert.deepEqual(pi.thinkingLevels({ provider: "openrouter", id: "deepseek/deepseek-v4.1-flash" }).data.levels, ["off", "high", "max"]);
 });

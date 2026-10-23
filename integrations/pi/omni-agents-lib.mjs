@@ -247,6 +247,53 @@ const S = (globalThis.__omniAgents ??= { pollers: new Map(), pauses: new Map(), 
  */
 S.pendingAck ??= new Map();
 
+/**
+ * Where this pi's turn is, from its extension events: what a wake-up message (an agent's report, a late MCP result)
+ * may do. pi's prompt() checks it is idle, then awaits auth, compaction and every before_agent_start hook before it
+ * claims the run; a sendMessage(triggerTurn) in that window starts a second run, and the loser's cleanup clears pi's
+ * busy flag while the winner streams. From then on every wake-up throws "Agent is already processing a prompt", each
+ * throw emits a false agent_settled (Omni's keeper reads it as "the turn ended" and prompts again) and queued
+ * messages are dropped. And a report queued as a follow-up after Stop is run by pi as soon as the aborted run ends.
+ * So a wake-up triggers a turn only when no prompt is starting and the user has not stopped the chat; otherwise it
+ * goes into the chat quietly (the starting turn, or the user's next one, sees it).
+ */
+export const PROMPT_START_MAX_MS = 10 * 60 * 1000;
+const T = (globalThis.__omniTurn ??= {});
+/** Forget everything (a new session; tests). */
+export function resetTurn() { Object.assign(T, { running: false, startingAt: 0, stopped: false }); }
+if (T.running === undefined) resetTurn();
+
+/** Feed one pi extension event (input, agent_start, agent_end, agent_settled, session_start). */
+export function onTurnEvent(type, event, ctx, now = Date.now()) {
+  switch (type) {
+    case "input": T.startingAt = now; T.stopped = false; break;
+    case "agent_start": {
+      T.running = true; T.startingAt = 0;
+      // Stop aborts this signal before pi releases any tool, so a poller let go by an aborted job_wait already sees it.
+      const signal = ctx?.signal;
+      if (signal?.aborted) T.stopped = true;
+      else signal?.addEventListener?.("abort", () => { T.stopped = true; }, { once: true });
+      break;
+    }
+    case "agent_end": {
+      const last = [...(event?.messages || [])].reverse().find((m) => m?.role === "assistant");
+      if (last?.stopReason === "aborted") T.stopped = true;
+      break;
+    }
+    case "agent_settled": T.running = false; T.startingAt = 0; break;
+    case "session_start": resetTurn(); break;
+  }
+}
+
+/** sendMessage options for a wake-up message right now. */
+export function wakeOptions(now = Date.now()) {
+  const starting = T.startingAt > 0 && now - T.startingAt < PROMPT_START_MAX_MS;
+  if (T.stopped || (starting && !T.running)) return { triggerTurn: false };
+  return { triggerTurn: true, deliverAs: "followUp" };
+}
+// omni-mcp.ts posts late tool results too; it reads this without importing the lib.
+T.wakeOptions = wakeOptions;
+
 /** The report's message_end arrived (it is in the session now): forget the pending entry. → true if it was pending. */
 export function confirmDelivered(id) { return S.pendingAck.delete(id); }
 export const pendingAck = (id) => S.pendingAck.get(id) || null;
@@ -381,7 +428,7 @@ export class DeliveryPoller {
   }
 }
 
-/** The session's poller, started if none runs. `pi` posts the reports (followUp + triggerTurn wakes an idle chat). */
+/** The session's poller, started if none runs. `pi` posts the reports (wakeOptions: followUp + triggerTurn wakes an idle chat). */
 export function ensurePoller({ client, parentSessionId, pi, owner = pi, log, isIdle, ...opts }) {
   if (!parentSessionId) return null;
   const have = S.pollers.get(parentSessionId);
@@ -390,7 +437,7 @@ export function ensurePoller({ client, parentSessionId, pi, owner = pi, log, isI
     client, parentSessionId, owner, log, ...opts, ...(isIdle ? { isIdle } : {}),
     deliver: (rec) => pi.sendMessage(
       { customType: "omni-agent-result", content: agentReport(rec, { max: MAX_REPORT }), display: true, details: { id: rec.id, status: rec.status } },
-      { triggerTurn: true, deliverAs: "followUp" },
+      wakeOptions(),
     ),
   });
   S.pollers.set(parentSessionId, p);

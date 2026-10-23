@@ -7,7 +7,8 @@
  *                                            tools, any MCP server in mcpServers), the omnidroid skills
  *                                            (skills/ -> ~/.pi/agent/skills/) + config
  *   node scripts/install.mjs --claude-hook   also register the Claude Code SessionStart hook (user settings)
- *   node scripts/install.mjs --claude-skills also copy the skills to ~/.claude/skills/ (Claude Code)
+ *   node scripts/install.mjs --claude-skills also copy the omnidroid skill to ~/.claude/skills/ (Claude Code); the
+ *                                            other skills are pi only
  *   node scripts/install.mjs --claude-mcp    also register the omnidroid app's MCP server with Claude Code (user
  *                                            scope, HTTP: the app serves it once `mcp on` is set in it)
  *   node scripts/install.mjs --openrouter    also wire OpenRouter into pi from openrouter.txt (auth.json +
@@ -34,7 +35,9 @@ const EXTENSIONS = ["omni-memory.ts", "omni-claude.ts", "omni-graph.ts", "omni-f
   "omni-agents.ts", "omni-agents-lib.mjs", "omni-context.ts", "omni-context-lib.mjs"];
 /** Extension files whose installed copy comes from elsewhere in the repo (the planner's state machine is shared with the server and UI). */
 const EXT_SOURCE = { "omni-plan-lib.mjs": join("ui", "plan.js") };
-const SKILLS = ["omnidroid", "omnidroid-frida", "omnidroid-qemu", "omnidroid-input"];
+const SKILLS = ["omnidroid", "omnidroid-frida", "omnidroid-qemu", "omnidroid-input", "subagent-driven-implementation"];
+/** The skills Claude Code gets too (--claude-skills); the rest are for pi only. */
+const CLAUDE_SKILLS = ["omnidroid"];
 const AGENTS = ["scout.md", "re-analyst.md", "droid-operator.md"];
 const piSkillsDir = join(piAgent, "skills");
 const claudeSkillsDir = join(HOME, ".claude", "skills");
@@ -66,8 +69,8 @@ const args = new Set(process.argv.slice(2));
 
 function readJson(p, dflt) { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return dflt; } }
 
-function installSkills(dir) {
-  for (const s of SKILLS) { const t = join(dir, s); cpSync(join(ROOT, "skills", s), t, { recursive: true }); console.log("skill installed:", t); }
+function installSkills(dir, skills = SKILLS) {
+  for (const s of skills) { const t = join(dir, s); cpSync(join(ROOT, "skills", s), t, { recursive: true }); console.log("skill installed:", t); }
 }
 
 /** OpenRouter as pi's "other" OpenAI-compatible provider: the key goes to auth.json (0600) and
@@ -165,7 +168,7 @@ console.log("pi extensions installed:", EXTENSIONS.map((f) => join(extDir, f)).j
 console.log("pi config written:", piCfg);
 if (!existsSync(cfg.omniMcp.command)) console.log(`omni-mcp not built yet (${cfg.omniMcp.command}): in ${omnidroidDir} run \`cargo build --release -p omni-mcp\`; the omnidroid_* tools appear once it exists.`);
 installSkills(piSkillsDir);
-if (args.has("--claude-skills")) installSkills(claudeSkillsDir);
+if (args.has("--claude-skills")) installSkills(claudeSkillsDir, CLAUDE_SKILLS);
 if (args.has("--openrouter")) installOpenRouter();
 if (args.has("--claude-mcp")) claudeMcp(true, cfg.omniMcp);
 

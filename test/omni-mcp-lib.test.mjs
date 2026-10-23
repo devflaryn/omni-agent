@@ -49,15 +49,18 @@ test("trimInstanceList: leaves small or not-ended-heavy lists exactly alone", ()
 });
 
 test("waitDeviceVerdict: a named device is done when it is ready; otherwise it keeps waiting", () => {
-  const two = (s) => JSON.stringify({ devices: [{ id: 2, state: s }] });
+  // The app's list_devices names each one `device` (an older shape used `id`): with `id` only, a named wait ran to its timeout.
+  const two = (s) => JSON.stringify({ devices: [{ device: 2, state: s }] });
   assert.equal(waitDeviceVerdict(two("booting"), 2).done, false);
+  assert.deepEqual(waitDeviceVerdict(two("ready"), 2).ready, [2]);
+  assert.equal(waitDeviceVerdict(JSON.stringify({ devices: [{ id: 2, state: "ready" }] }), 2).done, true, "the old shape still works");
   assert.equal(waitDeviceVerdict(two("ready"), 2).done, true);
   assert.equal(waitDeviceVerdict(two("ready"), 9).done, false, "a device that is not the target does not end the wait");
   assert.equal(waitDeviceVerdict("not json", 2).done, false);
 });
 
 test("waitDeviceVerdict: no target → done once a device exists and none is still coming up", () => {
-  const mix = (a, b) => JSON.stringify({ devices: [{ id: 1, state: a }, { id: 2, state: b }] });
+  const mix = (a, b) => JSON.stringify({ devices: [{ device: 1, state: a }, { device: 2, state: b }] });
   assert.equal(waitDeviceVerdict(mix("ready", "booting")).done, false, "one still booting");
   assert.equal(waitDeviceVerdict(mix("ready", "ready")).done, true);
   assert.equal(waitDeviceVerdict(JSON.stringify({ devices: [] })).done, false, "no devices at all");

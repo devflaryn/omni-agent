@@ -122,11 +122,12 @@ export function describe(method, path, body = {}, { titleOf = () => "" } = {}) {
   const chat = (sid) => { const t = titleOf(sid); return t ? `“${clip(t, 60)}”` : "a chat"; };
   if ((m = /^\/api\/sessions\/([^/]+)\/continue$/.exec(path))) return { title: `Send a message to ${chat(decodeURIComponent(m[1]))}${body.fork ? " (as a fork)" : ""}`, text: body.message || "" };
   if (method === "DELETE" && (m = /^\/api\/sessions\/([^/]+)$/.exec(path))) return { title: `Delete ${chat(decodeURIComponent(m[1]))}` };
-  if (path === "/api/pi/prompt") return { title: "Send a message to pi", text: body.message || "" };
+  if (path === "/api/pi/prompt") return { title: body.sid ? `Send a message to ${chat(body.sid)}` : "Send a message to pi", text: body.message || "" };
+  if (path === "/api/pi/open") return { title: `Open a new pi chat${body.cwd ? ` in ${body.cwd}` : ""}` };
   if (path === "/api/pi/send") return { title: `Start a new pi chat${body.cwd ? ` in ${body.cwd}` : ""}`, text: body.message || "" };
   if (path === "/api/pi/start") return { title: `Start pi${body.cwd ? ` in ${body.cwd}` : ""}` };
-  if (path === "/api/pi/stop") return { title: "Stop pi" };
-  if (path === "/api/pi/abort") return { title: "Stop pi's current turn and turn the goal hook off" };
+  if (path === "/api/pi/stop") return { title: body.sid ? `Close the pi of ${chat(body.sid)}` : "Stop every pi chat" };
+  if (path === "/api/pi/abort") return { title: body.sid ? `Stop ${chat(body.sid)} and its goal` : "Stop pi's current turn and its goal" };
   if (path === "/api/pi/new") return { title: "Start a new pi chat" };
   if (path === "/api/pi/switch") return { title: "Switch pi to another chat" };
   if (path === "/api/pi/model") return { title: `Switch pi's model to ${body.provider || "?"}/${body.modelId || "?"}` };

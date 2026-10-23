@@ -93,6 +93,16 @@ export function rollingRate(samples, now = Date.now(), { windowMs = 5000, staleM
   return Math.round(chars / 4 / (span / 1000));
 }
 
+/**
+ * Fold a `status` event into a session: only the fields it carries. A compaction status (`compacting`) says nothing
+ * about the run, and a run ending ends any compaction.
+ */
+export function applyStatus(s, ev) {
+  if ("streaming" in ev) { s.streaming = !!ev.streaming; if (!ev.streaming) s.compacting = false; }
+  if ("compacting" in ev) s.compacting = !!ev.compacting;
+  return s;
+}
+
 /** First user text → list title, without a leading memory/graph pack. */
 export function cleanTitle(text) { return splitAttachments(String(text || "")).text.replace(/\s+/g, " ").trim().slice(0, 80); }
 

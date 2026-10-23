@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Bus } from "../server/bus.mjs";
-import { GoalKeeper, LENGTH_NOTE, asksToGoOn, buildJudgeInput, buildSummaryInput, errorBackoff, parseVerdict, tailLine, transientError } from "../server/hook.mjs";
+import { GoalKeeper, LENGTH_NOTE, asksForDiscussion, asksToGoOn, buildJudgeInput, buildSummaryInput, errorBackoff, parseVerdict, tailLine, transientError } from "../server/hook.mjs";
 import { hookInfo, hookMessage } from "../ui/lib.js";
 import { applyPlanAction, emptyPlan } from "../ui/plan.js";
 
@@ -195,6 +195,36 @@ test("a provider outage (503) is retried after a back-off instead of nudging at 
   await sleep(1050);
   assert.equal(s.pi.prompts.length, 1);
   assert.match(s.last().body, /this is a retry/);
+  s.keeper.dispose();
+});
+
+test("a pending retry is announced as armed (the UI keeps Stop live) and cancel disarms it", async () => {
+  const s = setup({ config: { errorBackoffMs: 1000 } });
+  s.user("Build it");
+  await s.turn(() => { s.plan(BRAIN); s.plan(PLAN); s.error('503 "no upstreams available"'); });
+  const armed = s.events.filter((e) => e.kind === "keeper");
+  assert.ok(armed.length, "the keeper says it is about to act");
+  const last = armed.at(-1);
+  assert.equal(last.armed, true);
+  assert.ok(last.retryAt > Date.now() + 500, "with when the retry fires");
+  assert.equal(s.keeper.status(SID).armed, true, "a page reload sees it too");
+  s.keeper.cancel(SID);
+  const after = s.events.filter((e) => e.kind === "keeper").at(-1);
+  assert.equal(after.armed, false);
+  assert.equal(after.retryAt, 0);
+  assert.equal(s.keeper.status(SID).armed, false);
+  await sleep(1050);
+  assert.equal(s.pi.prompts.length, 0, "stopped: the retry never fires");
+  s.keeper.dispose();
+});
+
+test("a grace check that ends quietly disarms", async () => {
+  const s = setup();
+  s.user("What is 2+2?");
+  await s.turn(() => s.assistant("4"));
+  const k = s.events.filter((e) => e.kind === "keeper");
+  assert.ok(k.some((e) => e.armed), "armed during the grace period");
+  assert.equal(k.at(-1).armed, false, "nothing to do: disarmed");
   s.keeper.dispose();
 });
 
@@ -867,4 +897,23 @@ test("handoff wording in a /goal or an agent's task never turns its later contex
   await r.turn(() => r.say({ text: "Here is the handoff prompt for a fresh session: continue with the importer tests." }));
   assert.equal(r.pi.prompts.length, 0, "the user's own request is honoured");
   r.keeper.dispose();
+});
+
+test("a plain prompt that asks for discussion (brainstorm, what do you think) is answered, not re-engaged to plan", async () => {
+  // Seen live: "now lets brainstorm what to do…" got a long answer after a few reads, then "You stopped after working
+  // without a plan… call the plan tool now", which the user had to Stop.
+  for (const t of ["change of plan. now lets brainstorm what to do for now, without giving a prompt for the new agent", "What do you think about splitting the loader?", "Give me your thoughts on the hook layer before we start", "Let's discuss the options first"]) assert.ok(asksForDiscussion(t), t);
+  for (const t of ["Convert every .cfg in conf/ to JSON", "Fix the header parsing and explain the change"]) assert.ok(!asksForDiscussion(t), t);
+  const s = setup();
+  s.user("now lets brainstorm what to do for now");
+  await s.turn(() => { s.tool("read"); s.say({ text: "Here is my read: the loader is the risk. I would archive the old work first, then start from the clean build." }); });
+  assert.equal(s.pi.prompts.length, 0, "no nudge");
+  assert.equal(s.keeper.goal(SID).done, true);
+  s.keeper.dispose();
+  // Stopping part-way still gets the one nudge, even in a discussion.
+  const f = setup();
+  f.user("What do you think, and then port the first file?");
+  await f.turn(() => { f.tool("read"); f.say({ text: "Looks fine.\n\nShall I go ahead and port it?" }); });
+  assert.equal(f.pi.prompts.length, 1);
+  f.keeper.dispose();
 });

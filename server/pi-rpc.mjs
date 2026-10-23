@@ -2,6 +2,7 @@
  * Owns one long-lived `pi --mode rpc` child and turns its JSONL stream into
  * omni events. Commands get an id so responses can be awaited.
  */
+import { THINKING_LEVELS, thinkingProfile } from "../ui/thinking.js";
 import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { resolve } from "node:path";
@@ -15,12 +16,12 @@ const normPath = (p) => (p ? resolve(String(p)).toLowerCase() : "");
 const CMD_SAFE_ARG = /^[\w@+=:,./\\-]+$/;
 
 /**
- * Thinking levels `set_thinking_level` accepts. pi has no RPC to enumerate them
- * (the old `get_available_thinking_levels` was removed), so the picker uses this
- * fixed set. "off" turns thinking off; the rest turn it on at a level. xhigh/max
- * exist only on a few models and are omitted here.
+ * Every thinking level `set_thinking_level` accepts. pi has no RPC to enumerate a model's own (the old
+ * `get_available_thinking_levels` was removed), so they are guessed from the model's family (ui/thinking.js).
  */
-export const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high"];
+export const PI_THINKING_LEVELS = THINKING_LEVELS;
+/** How long pi may take to answer a prompt: it answers after its preflight, which may compact the session. */
+export const PROMPT_TIMEOUT_MS = 30 * 60 * 1000;
 /** Throws when an RPC response failed or was cancelled, so callers can't silently proceed. */
 const ok = (r, what) => {
   if (!r?.success) throw new Error(r?.error || `${what} failed`);
@@ -68,6 +69,10 @@ export class PiRpc extends EventEmitter {
     this.lastEventAt = 0;
     this.lastHealthyAt = 0;
     this.watchdogTimer = null;
+    /** Prompts sent and not yet answered: a child with one is not free for another chat (server/index.mjs). */
+    this.inFlight = 0;
+    /** The sid the child had when it crashed, so the supervisor can carry that chat's goal onto the resumed one. */
+    this.crashedSid = null;
   }
 
   get ctx() {
@@ -128,7 +133,8 @@ export class PiRpc extends EventEmitter {
   }
 
   async handleExit(code) {
-    this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: "system", text: `pi exited (code ${code})` });
+    // A child stopped on purpose (a spare chat's pi closed, a restart) is not news: only a crash is toasted.
+    this.bus.emit({ ...this.ctx, kind: "log", ts: Date.now(), level: this.stopped ? "info" : "system", text: `pi exited (code ${code})` });
     for (const [, p] of this.pending) p.reject(new Error("pi exited"));
     this.pending.clear();
     this.proc = null;
@@ -139,6 +145,7 @@ export class PiRpc extends EventEmitter {
     // Capture the session the crashed child had BEFORE a fresh child opens an empty one, and latch
     // `restoring` so the empty session's `session` event can't clobber this anchor (C1).
     this.resumeFile = this.state?.sessionFile || this.resumeFile;
+    this.crashedSid = this.sid;
     this.restoring = true;
     const reset = nextRestartState({ restarts: this.restarts, lastHealthyAt: this.lastHealthyAt });
     this.restarts = reset.restarts;
@@ -220,15 +227,27 @@ export class PiRpc extends EventEmitter {
   /**
    * `echo: false` for prompts the user did not type (hooks): no user bubble is broadcast.
    * `behavior` while pi is streaming: "steer" (default: delivered after the current tool call) or
-   * "followUp" (queued until the agent would stop).
+   * "followUp" (queued until the agent would stop). It is always sent, as pi reads it only while it streams,
+   * and a run an extension's wake-up just started is one Omni has not seen begin yet.
+   *
+   * One prompt at a time: pi's prompt() checks it is idle, then awaits (auth, compaction, every
+   * before_agent_start hook) before it claims the run, so two in that window both start one; the loser clears
+   * pi's busy flag mid-run and emits a false agent_settled. pi answers a prompt as it claims the run, so the
+   * next one is sent after that answer and gets queued.
+   *
+   * That answer can take minutes: a long session is compacted first (a model call per chunk). Timing it out at
+   * send()'s default failed a message pi then ran anyway, and let the next prompt in mid-compaction, which pi rejects.
    */
-  async prompt(message, { images, echo = true, behavior } = {}) {
-    const cmd = { type: "prompt", message };
+  prompt(message, { images, echo = true, behavior } = {}) {
+    const cmd = { type: "prompt", message, streamingBehavior: behavior || "steer" };
     if (images?.length) cmd.images = images;
-    if (this.streaming) cmd.streamingBehavior = behavior || "steer";
     // Echo the user's prompt as a live message so every viewer sees it at once.
     if (echo) this.bus.emit({ ...this.ctx, kind: "msg", ts: Date.now(), id: `u-${Date.now()}`, role: "user", live: true, blocks: [{ type: "text", text: message }] });
-    return this.send(cmd);
+    this.inFlight++;
+    const sent = (this.promptChain || Promise.resolve()).then(() => this.send(cmd, { timeoutMs: PROMPT_TIMEOUT_MS }));
+    this.promptChain = sent.catch(() => {});
+    sent.then(() => { this.inFlight--; }, () => { this.inFlight--; });
+    return sent;
   }
 
   async abort() {
@@ -281,7 +300,12 @@ export class PiRpc extends EventEmitter {
     await this.refreshState();
     return r;
   }
-  thinkingLevels() { return { success: true, data: { levels: PI_THINKING_LEVELS } }; }
+  /** The levels `model` ({provider, id, name, reasoning, thinkingLevelMap}) has; the full ladder without one. */
+  thinkingLevels(model) {
+    if (!model?.id) return { success: true, data: { levels: PI_THINKING_LEVELS, labels: {} } };
+    const t = thinkingProfile(model);
+    return { success: true, data: { levels: t.levels, labels: t.labels, family: t.family, guessed: t.guessed } };
+  }
   compact() { return this.send({ type: "compact" }, { timeoutMs: 600000 }); }
   messages() { return this.send({ type: "get_messages" }); }
   /** Every session entry incl. pre-compaction history, plus the active leaf (the goal hook recovers the plan from it). */

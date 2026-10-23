@@ -1,153 +1,233 @@
 ---
 name: omnidroid
-description: Use when running any APK on omnidroid, the native ARM64-Android engine in "Omni Apps/omnidroid" (Rust, no VM), through the omnidroid app's MCP server — launching any APK as one or many instances (start_instance {apk, count, options} / wait_instance / list_instances / screenshot / input / stop_instance), a plugin's options on a launch (the roblox plugin's `--cookie <account> --place <id>`: each instance signed in as that account, then joining the place), managing the app's warm Androids (list_devices / warm_device / stop_device / shell / settings / pool_log), an app's WebViews (web_pages / web_dom / web_click / web_type / web_eval / web_screenshot), looking inside a running app (its log, files, screen), and what to tell the person when the tools are missing (open `omnidroid`, or `omnidroid serve`). Trigger on "run this APK", "launch 3 instances of", "install/launch/start this app", "sign in with this cookie", "join place <id>", "start an instance", "take a screenshot of the instance", "tap/type in the app", "is the app running", or any omnidroid_* / mcp__omnidroid__* tool. For hooking, calling or dumping a .so use the omnidroid-frida skill; for the old QEMU manager (offsets, `omnidroid su`, frida-server) use omnidroid-qemu.
+description: Use when running any APK on omnidroid (the native ARM64-Android engine in "Omni Apps/omnidroid", no VM) through the omnidroid app's MCP server — start_instance {apk, count, options, auto_restart} / wait_instance / list_instances / screenshot / input / stop_instance; recovering a crash (restart_instance, auto_restart, an end's `details`); the warm Androids (list_devices, warm_device, stop_device, shell, settings, pool_log, pi's wait_device); WebViews (web_pages, web_dom, web_click, web_type, web_eval); and the roblox plugin (a roblox account, a place) — options "--cookie <file or saved name> --place <id>" sign each instance in and join the place, followed in pool_log. Trigger on "run/launch this APK", "N instances", "sign in with this cookie", "join place", "restart the instance", "screenshot/tap the app", or any omnidroid_* / mcp__omnidroid__* instance or device tool. Hooking a .so — omnidroid-frida. Old QEMU manager — omnidroid-qemu.
 ---
 
 # Driving omnidroid
 
 `omnidroid` (the checkout at `Desktop/Omni Apps/omnidroid`) runs Android apps as native desktop
 processes: real Android userspace (system_server, SurfaceFlinger, ART…) on omnidroid's own Linux
-ABI layer, the APK's arm64 code run by dynarmic, with graphics, audio, input and networking on the
-host. **There is no VM, no QEMU, no adb, no frida-server.** Commands such as
+ABI layer, the APK's arm64 code run by dynarmic, graphics/audio/input/network on the host. **There
+is no VM, no QEMU, no adb, no frida-server.**
 `omnidroid start/offset/session/debug-info/su/frida` belong to the old QEMU manager
 (`omnidroid-qemu` skill) and do not exist here.
 
-**Any APK runs.** The launcher knows no app: the APK's package and launcher Activity come from its
-own manifest, it is installed with `pm install` and started from its launcher, as a device does.
+**Any APK runs.** The launcher knows no app: package and launcher Activity come from the APK's own
+manifest; it is `pm install`ed and started from its launcher, as a device does.
 
-| path | what boots | how |
-|---|---|---|
-| **real Android** (default, any APK) | real Android on omnidroid's Linux ABI layer; the APK `pm install`ed and started from its launcher | MCP `start_instance {apk, count, options}`, or `run <apk>` in the omnidroid app |
-| **fast path** (opt-in) | the APK's native code alone, no Java runtime — only apps whose Java side the engine answers itself | `omnidroid play` |
+## Reaching the tools
 
-## The MCP tools (how an agent drives omnidroid)
+omnidroid is **an app**: `omnidroid` (no arguments) opens a terminal app that keeps warm Androids
+and runs APKs on them, each instance in a window of its own. Agents use **the app's MCP server**
+(the person turns it on with `mcp on` at the app's prompt: `http://127.0.0.1:7457/mcp`, this
+computer only, kept on at every start). **One pool per computer**: every `omnidroid` window and
+`omnidroid serve` are views of one pool — same Androids, instances, log, MCP server. What the
+person launches you see in `list_instances`, and the reverse.
 
-omnidroid is **an app** now: `omnidroid` (no arguments) opens a full-screen terminal app that keeps
-warm Androids and runs any APK on them, each instance in a window of its own. Agents do not run
-`omnidroid` commands in a terminal; they use **the app's MCP server**, which the person turns on in
-the app (`mcp on`: `http://127.0.0.1:7457/mcp`, this computer only, from then on at every start).
-
-**One pool per computer.** Every `omnidroid` window open, and `omnidroid serve`, is a view of one
-pool (a host process found through `pool.host` beside `app.conf`): the same Androids, instances, log
-and MCP server. What the person launches in their window, you see in `list_instances`, and the
-reverse; a second window boots no Android. The pool ends when the last window quits (or `serve`'s
-stdin closes), stopping the Androids as `stop_on_exit` says.
-
-- **Claude Code**: `mcp on` in the app registers it (`claude mcp add --transport http --scope user
-  omnidroid <url>`); tools `mcp__omnidroid__<tool>`.
-- **pi (Omni Agent)**: `omni-mcp.ts` runs `omni-mcp --connect <url>` (the stdio bridge to the app;
-  `node scripts/install.mjs` sets it up); tools `omnidroid_<tool>`.
+- **Claude Code**: tools `mcp__omnidroid__<tool>` (registered by `mcp on`: `claude mcp add
+  --transport http --scope user omnidroid <url>`).
+- **pi (Omni Agent)**: tools `omnidroid_<tool>`, through `omni-mcp --connect <url>` (a stdio
+  bridge); plus pi's own `omnidroid_wait_device` and smoothing — see "pi" below.
 - **Any other agent**: the URL (MCP over HTTP), or `omni-mcp --connect <url>` as a stdio server.
 
-**No tools, or "the omnidroid app's MCP server is not reachable"?** No pool is open, or MCP is off
-in it: ask the person to open `omnidroid` and type `mcp on` (or to run `omnidroid serve --port 7457`
-for the pool without a screen). Never start the app or devices from a shell yourself unless the
-person asks you to; then start `omnidroid serve --port 7457` detached with its stdin held open (it
-ends when stdin closes) and reconnect the MCP server (`/mcp` in Claude Code).
+**No tools, or "the omnidroid app's MCP server is not reachable"?** No pool is open, or MCP is off:
+ask the person to open `omnidroid` and type `mcp on` (or run `omnidroid serve --port 7457` for the
+pool without a screen). Don't start the app or devices from a shell unless asked; if asked, start
+`omnidroid serve --port 7457` detached with stdin held open (it ends when stdin closes), then
+reconnect (`/mcp` in Claude Code).
 
-| tool | does |
-|---|---|
-| `start_instance {apk, count?, options?}` | launch any APK (an absolute host path) as `count` instances (1-64); answers their ids **at once**. `options`: the installed plugins' options as on the command line (below) |
-| `wait_instance {instance_id, timeout?}` | wait until it runs (its launcher Activity displayed) or ends; answers its state and screenshot path |
-| `list_instances` | each: package, `device` (the Android), `user`, `display`, `state` (`waiting`, `installing`, `starting`, `running`, `closing`, `ended: <why>`), `screenshot` |
-| `screenshot {instance_id}` | its display as a PNG (written every second): path, width, height |
-| `input {instance_id, action, ...}` | `tap {x,y}`, `swipe {x,y,x2,y2,ms}`, `text {text}`, `key {key: KEYCODE_BACK}` on its display |
-| `stop_instance {instance_id}` | close it: the app stopped, its window gone; the Android stays warm |
-| `shell {command, device?, uid?}` | adb-shell style on an Android (`uid: 0` root); default the first ready one |
-| `list_devices` / `warm_device` / `stop_device {device}` | the warm Androids: state, idle time, builds installed, instances |
-| `settings {key?, value?}` / `pool_log {lines?}` | the app's settings (idle_close_minutes, keep_warm, ...) / its log |
-| `web_pages` / `web_dom` / `web_click` / `web_tap` / `web_type` / `web_eval` / `web_screenshot` | an instance's WebViews (sign-in pages, captchas): list, read the elements of every frame, click, type, run JS, capture |
+## The tools
 
-**Where an instance goes**: an APK is known by its bytes, not its package and version. The same APK
-file again runs on the Android that has it (each instance is an Android user of its own on a display
-of its own); another package goes into a warm Android beside the others; another build of a package
-that is **running** gets an Android of its own, while a build installed but not running is replaced.
-A first launch on a fresh Android takes ~1-2 min (install, a user, the start); the next ones less.
-Androids idle (no app) for `idle_close_minutes` are closed, `keep_warm` stay up.
+Instance ids and device ids are **numbers** (`#3` → `3`, `D5` → `5`; the server also strips a
+leading `#`/`D` from a string). Errors come back as JSON-RPC errors carrying the message quoted.
+Pool calls run concurrently (a `wait_instance` does not hold others up).
 
-## A plugin's options on a launch (sign in as an account, open a link)
+| tool | args | blocks? | answers |
+|---|---|---|---|
+| `start_instance {apk, count?, options?}` | `apk` (absolute host path; required), `count` (1-64, default 1; out of range is clamped), `options` (string: installed plugins' options as on the command line, quotes allowed), `auto_restart` (bool, each new instance's own), `package` (bundle of several packages only — see note) | **no**: answers at once | `{instances: [ids], note}`. Errors at once for: unreadable/missing file, no launcher Activity, `max_devices` reached, an option no plugin adds, a plugin's refusal |
+| `wait_instance` | `instance_id` (required), `timeout` s (default 300, max 3600) | **yes**, until `running` or `ended: …` (waits through `restarting`) | `{instance_id, state, waited_s, screenshot, auto_restart, restarts, restart_in?, details?/last_end?}`. On timeout it answers the current state — not an error |
+| `list_instances` | — | no | `{instances: [{instance_id, package, apk, sha256, device, user, display, state, up_s, screenshot, auto_restart, restarts, restart_in?, details?, last_end?}]}` — every instance the pool has had, ended ones included |
+| `screenshot` | `instance_id` (required) | ≤ 3 s (a fresh frame is written on request) | `{path, width, height}` — read the PNG at `path`. Error `#N has no display yet (<state>)` before it starts / after its window is gone |
+| `input {instance_id, action, ...}` | `instance_id`, `action` (`tap`\|`swipe`\|`text`\|`key`), `x`,`y` (tap, swipe), `x2`,`y2`,`ms` (swipe; ms default 300), `text`, `key` (`KEYCODE_BACK` or a number) | until the shell `input` returns | `{exit, output}`. Display pixels (`instance_size`, default 1280x720). Error `#N is <state> (not running)` |
+| `stop_instance` | `instance_id` | no (closes in the background) | `{instance_id, closing: true}`: app stopped, window gone, no card, no auto restart; its Android stays warm. One ended whose card is still shown: closes the card. One ended with its window gone: error `#N ended already` |
+| `restart_instance` | `instance_id`, `delay` s (default 5; 0 = now) | no | the instance as `list_instances` shows it (state `restarting`). Same id, same window; works on running, ended (even closed) or restarting ones. Errors: `#N is still starting`, `#N is closing`, `no instance #N` |
+| `auto_restart` | `on` (bool, required), `instance_id` (optional) | no | with id: that instance (its own setting). Without: the **pool's** setting (saved; for every instance without its own) → `{auto_restart, instances: [{instance_id, auto_restart}]}` |
+| `shell` | `command` (required), `device` (default: first `ready`), `uid` (0 root, 1000 system, default 2000 shell), `timeout` s (default 120; accepted though not in the schema) | yes | `{device, exit, output}`. Error `no Android is ready (warm_device boots one)` |
+| `list_devices` = `device_status` | — | no | `{devices: [{device, state (booting\|ready\|closing), up_s, idle_s, instances, installed: ["pkg (sha256[:12])"], dir, log}]}` — `log` is the Android's whole logcat as a host file |
+| `warm_device` | — | **no** | `{device, note: "booting; list_devices shows when it is ready"}` |
+| `stop_device` | `device` (required) | no | `{device, stopping: true}`; its instances end. Stopping the last one leaves none warm until a launch or `warm_device` |
+| `settings` | `key`, `value` (both strings, both or neither) | no | every setting as strings: `idle_close_minutes`, `keep_warm`, `warm_on_start`, `stop_on_exit`, `max_devices`, `instance_size`, `gpu`, `device_ram_mb`, `auto_restart`, `mcp_enabled`, `mcp_port` (the `mcp_*` ones cannot be changed here) |
+| `pool_log` | `lines` (default 60) | no | `{lines: ["HH:MM:SS text", …]}` newest last: launches, installs, boots, starts, a plugin's progress, ends |
+| `web_*` | see "WebViews" | — | — |
 
-The launcher knows no app; what one app needs beyond install-and-start (an account's sign-in, a link
-to open) is an installed plugin's, as options (`plugins` in the app lists them; `omnidroid help`
-too). The `roblox` plugin in the repo's `plugins/` adds `--cookie` and `--place`:
+Bundles: the current source reads `.apkm`/`.xapk`/`.apks`/a zip of APKs (base + splits + OBBs
+installed together) and adds `apk_info {apk}` (what a file holds, no launch) and
+`start_instance.package`. **If `apk_info` is not in your tool list, the running app predates
+that**: pass a plain `.apk` (pick `base.apk` out of the bundle) and tell the person the app needs
+rebuilding/reopening for bundles.
+
+**States** (`list_instances`, `wait_instance`): `waiting` (its Android boots) → `installing` →
+`starting` → `running` (its launcher Activity displayed) → `closing` → `ended: <why>`;
+`restarting` while a restart counts down. `ended: closed` = closed on purpose (stop_instance, the
+window closed, force-stopped, the person quit it): no card. Any other `ended: …` (`native crash:
+SIGSEGV …`, `Java exception: …`, `its device D5 is gone: …`, `its display: …`) leaves a card in
+its window, and `details` holds what the Android's log says (exception and frames, signal and
+library, ANR). Once restarted, that becomes `last_end`.
+
+**Where an instance goes**: an APK is known by its bytes (SHA-256), not package/version. The same
+APK again runs on the Android that has it (each extra instance is an Android user of its own, on a
+display of its own); another package goes into a warm Android beside the others; another build of
+a package that is **running** gets an Android of its own (booted: minutes); a build installed but
+not running is replaced. A first start on an Android takes seconds (install, a user, `am start`);
+a new Android ~1-2 min. Androids idle `idle_close_minutes` are closed; `keep_warm` stay up.
+
+## The normal sequence
+
+1. `start_instance {apk: "C:/abs/app.apk"}` → `{instances: [7]}`.
+2. `wait_instance {instance_id: 7}` → `running` (or `ended: …` with `details`).
+3. `screenshot {instance_id: 7}` and look at the PNG; `input` to drive it.
+4. Done: `stop_instance {instance_id: 7}`. Don't stop instances the person started.
+
+Need a device first (nothing to launch yet)? `warm_device`, then wait for `ready` (pi:
+`omnidroid_wait_device`; Claude Code: `list_devices` every ~15-30 s — booting takes minutes, so
+don't hammer it). `start_instance` does not need this: it boots one itself.
+
+## Crashes and recovery
+
+- `ended: native crash …` / `Java exception …`: quote `details` (that *is* the log's verdict); read
+  more in the Android's log (`list_devices` → `log`, grep `FATAL EXCEPTION|Fatal signal|has died`).
+- `restart_instance {instance_id, delay: 0}` starts it again on the same window, same id;
+  `wait_instance` then waits for `running`. A plugin's work is redone (cookie re-planted, link
+  followed again).
+- `auto_restart {on: true, instance_id}` (or `start_instance {…, auto_restart: true}`) restarts it
+  5 s after a crash. After **3 ends in a row within a minute of starting** it stops ("Not restarted
+  automatically: …" in `details`) — a crash on start is not cured by restarting; investigate.
+  Without `instance_id` it changes the pool's saved setting for everyone: ask the person first.
+- An instance stuck `waiting`/`installing`: its Android is booting or busy — check `pool_log`.
+
+## A plugin's options on a launch (the roblox plugin: an account's sign-in, a place)
+
+The launcher knows no app; what one app needs beyond install-and-start (an account's sign-in, a
+link to open) is an installed plugin's, passed as `start_instance`'s `options` string, exactly as on
+the command line (`plugins` at the app's prompt lists the installed ones). The repo's `roblox`
+plugin adds `--cookie <file or saved name>` and `--place <id>`:
 
 ```text
-start_instance {apk: "/abs/game.apk", count: 2, options: "--cookie <account> --place <id>"}
+start_instance {apk: "C:/abs/game.apk", count: 1, options: "--cookie C:/abs/acct1.txt --place <placeId>"}
+wait_instance  {instance_id: <id>}           # running = the app is up, not yet signed in or joined
+pool_log       {lines: 40}                   # the sign-in and join progress (below)
+screenshot     {instance_id: <id>}           # the proof: in the place, or still on the sign-in screen
 ```
 
-- `--cookie <file or name>`: a file holding the account's session cookie (the bare value, `NAME=…`
-  or a Netscape `cookies.txt`), or a name `omnidroid login` saved (`<app-data>/../cookies/<name>.txt`).
-  Pass the file's **absolute path** (the pool's working directory is not yours). Never read the
-  cookie into the conversation.
-- `--place <id>`: once the app is ready (its main Activity started, or it signed in), the place's link
-  is opened on the instance's display, again every 60 s (4 tries) until the app logs it joined. What
-  "ready", "signed in" and "joined" look like in the log is the plugin's, not the pool's.
-- Each instance is an Android user of its own: its copy of the app's data is emptied and the cookie
-  planted there before its start, so **several accounts run side by side on one Android**. One app's
-  instances on an Android take turns joining (the log cannot tell their lines apart otherwise).
-- Follow it in `pool_log`: `#N: signed in with the cookie (never shown)` (the cookie planted),
-  `#N: link sent`, `#N: signed in`, `#N: the link was taken`, or `#N: the link was never taken`.
-  Then `screenshot` and look: in the game, or still on Sign In.
-- Not applied on a pool launch: the device's language (`OMNI_R_LOCALE`) -- the Android booted already.
+- `--cookie`: a cookie **file** (absolute path) or a name `omnidroid login` saved
+  (`<app-data>/../cookies/<name>.txt`) — never the cookie's value (a pool launch refuses it), and
+  never read or print the file. The cookie is planted in the instance's own Android user, so
+  several accounts run side by side on one Android. `count: N` = N instances of the **same**
+  account; one `start_instance` per account for different ones.
+- `--place <id>` (integer ≥ 1): the place link, opened on the instance's display once the app is
+  ready or signed in, re-sent every 60 s (4 tries) until the app logs that it is joining.
+- Option errors come back from `start_instance` at once, prefixed `[roblox]` (no such file, not
+  for this APK, `--join-delay` is `play`-only) or `the cookie store: …`.
+- **Follow it in `pool_log`** (`list_instances` only says `running`): `#N: signed in with the
+  cookie (never shown)` (store **planted**, not yet a sign-in) → `#N: signed in` → `#N: link sent`
+  → `#N: the link was taken` (joining). Bad ends: `#N: the cookie store was not planted`, `#N: the
+  link was never taken`. Then `screenshot` and look.
+- On the sign-in screen with no `#N: signed in`: expired/rotated cookie or the host's network —
+  ask the person for a fresh cookie file. Link never taken: `screenshot`, then `restart_instance`
+  (a restart asks the plugin again: cookie re-planted, link followed again).
 
-The same options work at the app's prompt (`run <apk> [xN] --cookie … --place …`) and on its command
-line (`omnidroid <apk> [xN] --cookie … --place …`). `omnidroid aosp --apk … --cookie … --place …`
-still runs one session on an Android of its own, outside the pool.
+Every log marker, failure message and what to do: `reference/roblox-plugin.md`. The same options
+work at the app's prompt (`run <apk> [xN] --cookie … --place …`) and as `omnidroid <apk> [xN]
+--cookie … --place …`.
 
-## Proof an app is up
+## WebViews (sign-in pages, captchas, store pages)
 
- `wait_instance` answering `running` means Android displayed its launcher
-Activity. Then `screenshot` it and look. `ended: the app stopped` means its Activity left its display
-(a crash, the app closed itself, or the person closed its window): read the Android's log (`list_devices` → `log`) for
-`FATAL EXCEPTION` / `Fatal signal` / `has died` and quote the line.
+The instance must be `running`. `page` (an id or its prefix) defaults to the visible page.
 
-**Looking inside a running app** (no adb, no frida-server -- the guest kernel has no `ptrace`):
+| tool | args | answers |
+|---|---|---|
+| `web_pages` | `instance_id` | `{pages: [{page, url, title, visible, screen: [x,y,w,h]}]}` |
+| `web_dom` | `instance_id`, `page?`, `selector?` (CSS, every frame), `html?` (with selector: outerHTML ≤ 4000 chars), `limit?` (200, max 2000) | `{page, url, viewport, device_px_per_css_px, count, elements: [{ref, tag, attrs…, text, frame, box (CSS px), tap (display point)}]}` |
+| `web_eval` | `instance_id`, `expression`, `page?`, `frame?` (part of a frame's url) | `{value}` (promises awaited, runs as a user gesture), or `{frames: [{frame, value\|error}]}`; a throw → `the script threw: …` |
+| `web_click` | `instance_id`, one of `ref` / `selector` (+`index`) / `text` (shown text, case-insensitive substring), `via` (`touch` default, `cdp`), `page?` | `{clicked, ref, box, tap, via}` |
+| `web_tap` | `instance_id`, `x`, `y`, `space` (`css` default, `screen`), `via?`, `page?` | `{css, tap, via}` |
+| `web_type` | `instance_id`, `text` (what is typed), `ref` or `selector` (+`index`) to click first, `submit?` (Enter after), `page?` | `{typed, into}` — `text` is always the text typed; name the field by `ref`/`selector`, not by text |
+| `web_screenshot` | `instance_id`, `page?` | `{path, width, height}` |
+
+Errors: `the instance shows no web page (no WebView, or its app has not made one yet)`, `no page X
+(web_pages lists them)`, `#N is not running`.
+
+## pi (Omni Agent)
+
+pi's `omni-mcp.ts` wraps the same tools as `omnidroid_<tool>` and changes a few things:
+
+- **`omnidroid_wait_device {timeout?}`** (default 300 s) — pi's own tool, not the server's: it
+  polls `list_devices` every 3 s and returns once at least one Android exists and none is
+  `booting`/`closing` (`ready after Ns: …` or `still not ready after Ns …`). Use it after
+  `warm_device` instead of calling `omnidroid_list_devices` in a loop. **Call it without
+  `device`**: its per-device filter reads an `id` field the server does not send (the server says
+  `device`), so with `device` it waits the full timeout. With no Android at all it also waits the
+  timeout — `warm_device` first.
+- **`stop_instance` / `stop_app` / `stop_device` on something already gone** (`#N ended already`,
+  `no instance #N`) answer a no-op success: "the target was already stopped … Nothing to do". Take
+  it as done.
+- **`list_instances` is trimmed** when it holds more than 4 ended instances and is over 4000
+  chars: every live instance and the 4 newest ended ones stay in full; the rest become
+  `omittedEnded: {count, note, instances: [{instance_id, package, state, up_s}]}`. Those are old
+  ended instances — ignore them unless you need one; then read its id there.
+- **Repeat nudge**: an identical `list_devices` / `device_status` / `list_instances` /
+  `list_maps` / `list_symbols` result twice in a row gets "(identical to your previous … call —
+  nothing has changed …)" prepended: stop polling; wait (`wait_instance`, `wait_device`) or act.
+- **Slow calls**: past `omniMcp.timeoutSec` (600 s) a call answers "⏱ … has run Ns without
+  returning … still alive"; the server is not killed (labs survive) and a late result arrives as a
+  follow-up message. Don't re-issue a long `wait_instance` blindly.
+- Results over 12 000 chars are cut. `screenshot` attaches the PNG for image-capable models.
+- Number args may be given as `"0x…"`/decimal strings; they are coerced to the schema's type.
+
+## Looking inside a running app (no adb, no ptrace)
 
 | want | how |
 |---|---|
-| its log | `list_devices` → `log`: every Android log line of that Android (`I/Tag(pid): ...`); grep it with your file tools |
-| what is on screen | `screenshot {instance_id}`; `shell "dumpsys activity activities | grep -E 'Display #|ActivityRecord'"` |
-| its files | `shell {command: "ls -R /data/user/<user>/com.example.app", uid: 0}` (each instance is its own user) |
-| its native code, hooked | the installed APK is on the host under the Android's dir (`data/app/*/<package>-*/base.apk`); unzip `lib/arm64-v8a/*.so` and use the **omnidroid-frida** lab |
+| its log | `list_devices` → `log` (host file: every logcat line of that Android, `I/Tag(pid): …`); grep it with your file tools |
+| what is on screen | `screenshot`; `shell {command: "dumpsys activity activities \| grep -E 'Display #\|ActivityRecord'"}` |
+| its files | `shell {command: "ls -R /data/user/<user>/com.example.app", uid: 0}` (`user` from `list_instances`) |
+| its native code, hooked | the installed APK is a host file under the Android's `dir` (`data/app/*/<package>-*/base.apk`); unzip `lib/arm64-v8a/*.so` into the **omnidroid-frida** lab |
 
 ## The app (for the person, not the agent)
 
 ```text
-omnidroid                       open the app (it warms an Android)
-omnidroid <app.apk> [xN]        open it and launch N instances
-omnidroid serve [--port <n>]    the app without its screen: the pool and MCP, until stdin closes
+omnidroid                         open the app (it warms an Android)
+omnidroid <app.apk> [xN] [opts]   open it and launch N instances
+omnidroid serve [--port <n>]      the pool and MCP without a screen, until stdin closes
+omnidroid restart <id>…|all       restart instances of the running pool (bare ids: 3, not #3)
+omnidroid autorestart on|off <id>…|all
 ```
 
-At its prompt: `run <apk> [xN]`, `close <#id>|all`, `warm`, `kill <D#>|all`, `shell <D#> <cmd>`,
-`plugins ...`, `settings`, `set <key> <value>`, `mcp on|off|register|status`, `help`, `quit`.
-Settings live in `<app-data>/../app.conf`. The one-shot commands scripts used (`omnidroid aosp`,
-`play`, `which`) still exist (`omnidroid help commands`) but are not how an agent runs apps; full
-flags: `reference/omni-cli.md`.
+At its prompt: `run <apk> [xN] [opts]`, `close <#id>…|all`, `restart <#id>…|all`,
+`autorestart on|off [#id…|all]`, `warm`, `kill <D#>…|all`, `shell <D#> <cmd>`, `plugins …`,
+`settings`, `set <key> <value>`, `mcp on|off|register|status`, `help`, `quit`. Settings live in
+`<app-data>/../app.conf`. Full flags: `reference/omni-cli.md`.
 
 ## Things that will bite you
 
-- **Credentials**: never print, log, or copy a cookie value or password; pass cookie *files* or
-  saved names to a plugin's option.
+- **Credentials**: never print, log or copy a cookie value or password; pass cookie *files* or
+  saved names.
 - **Never build on Windows while an app is being run** — a build exhausted the commit limit once
-  and killed guest threads. One live device per host at a time; builds may run in parallel.
+  and killed guest threads. Builds may run in parallel with each other.
 - A full `C:` shows up as `ENOMEM` in every spawn: prune `target/*/incremental`.
 - From Git Bash, `export MSYS_NO_PATHCONV=1` before anything that takes guest paths.
-- **An app's own "Unable to contact server / check your internet connection"**, or an instance on its
-  sign-in screen although its cookie is valid, is usually the host's network, not omnidroid: apps give
-  up on a request after ~10-15 s, and the Mac's WARP tunnel has had TCP connects of 3-10 s while it
-  said "healthy". Check `nc -z -G 20 8.8.8.8 443` on the host (well under a second when well); the
-  fix is the network's (`warp-cli disconnect && warp-cli connect`, or waiting). An app's own log
-  files (under `/data/user/<user>/<package>/files`) show it as connection timeouts.
-- Graphics buffers (`omni-shm-*` in the temp dir) of processes that are gone are cleaned at an
-  Android's boot; a running Android's are left alone.
-- An APK whose native libraries are only for another ABI (armeabi-v7a, x86) has no arm64 code to
-  run; split APKs / `.xapk` / `.apks` bundles need their base APK picked out first.
+- **An app's "Unable to contact server / check your internet connection"**, or Sign In although
+  the cookie is valid, is usually the host's network: apps give up after ~10-15 s. Check a TCP
+  connect from the host (well under a second when healthy); the app's own files under
+  `/data/user/<user>/<package>/files` show connection timeouts.
+- An APK whose native libraries are only for another ABI (armeabi-v7a, x86) has no arm64 code.
+- `list_instances` keeps every ended instance for the pool's life; filter by `state`.
 
 ## Related
 
-- `omnidroid-frida` skill — the lab debugger over the same MCP server: load a `.so`, call its
-  functions with crafted inputs, intercept, patch, dump.
-- `reference/omni-cli.md` — every flag, switch and log marker.
-- The omnidroid repo: `docs/HANDOFF.md` (current state, "Running"), `docs/STATUS.md`,
-  `crates/omni-mcp/README.md`, `plugins/README.md`.
-- `omnidroid-qemu` / `omnidroid-input` skills — the retired QEMU manager (`Omni Apps/omnidroid-old`).
+- `omnidroid-frida` skill — the lab debugger and RE workbench over the same MCP server.
+- `reference/roblox-plugin.md` — the roblox plugin on a pool launch: options, markers, failures.
+- `reference/omni-cli.md` — the CLI, settings, the standalone `omni-mcp`, log markers, switches.
+- omnidroid repo: `docs/HANDOFF.md` ("Running"), `crates/omni-mcp/README.md`, `plugins/README.md`,
+  `crates/omnidroid/src/app/live.rs` + `web.rs` (the pool's tools).
+- `omnidroid-qemu` / `omnidroid-input` — the retired QEMU manager (`Omni Apps/omnidroid-old`).

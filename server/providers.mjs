@@ -7,6 +7,7 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
+import { thinkingProfile } from "../ui/thinking.js";
 
 /** Request protocols pi's model runtime implements. */
 export const PI_APIS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
@@ -135,6 +136,7 @@ export function upsertProvider(file, name, body) {
   else if (String(body.apiKey).trim()) next.apiKey = String(body.apiKey).trim();
   else delete next.apiKey;
   json.providers[name] = next;
+  fillThinkingMaps(json);
   writeModelsFile(file, json);
   return next;
 }
@@ -178,9 +180,49 @@ export function listProviders(file) {
   }));
 }
 
-/** Flat model list for the picker, in file order. */
+/** Flat model list for the picker, in file order, each with the thinking levels it has (ui/thinking.js). */
 export function flatModels(file) {
   const out = [];
-  for (const p of listProviders(file)) for (const m of p.models) out.push({ provider: p.name, id: m.id, name: m.name, contextWindow: m.contextWindow });
+  for (const [provider, p] of Object.entries(readModelsFile(file).providers)) {
+    for (const m of Array.isArray(p?.models) ? p.models : []) {
+      if (!m?.id) continue;
+      const t = thinkingProfile({ provider, ...m });
+      out.push({ provider, id: m.id, name: m.name || m.id, contextWindow: m.contextWindow ?? null, thinking: t.levels, thinkingLabels: t.labels });
+    }
+  }
   return out;
+}
+
+/** The models.json entry for provider/id (null: not one of the file's own models, e.g. pi's built-in catalogue). */
+export function modelEntry(file, provider, id) {
+  const m = (readModelsFile(file).providers[provider]?.models || []).find?.((x) => x?.id === id);
+  return m ? { provider, ...m } : null;
+}
+
+/**
+ * Give each model with no `thinkingLevelMap` the one its family needs (thinkingProfile), so pi offers and sends only
+ * the levels the model has. A map already there (the user's, or one written earlier) is never changed: a wrong guess
+ * is fixed by editing it in models.json. Mutates `json`; → the "provider/id" keys it filled.
+ */
+export function fillThinkingMaps(json) {
+  const filled = [];
+  for (const [provider, p] of Object.entries(json?.providers || {})) {
+    for (const m of Array.isArray(p?.models) ? p.models : []) {
+      if (!isObj(m) || !m.id || m.thinkingLevelMap !== undefined || m.reasoning === false) continue;
+      const { map } = thinkingProfile({ provider, ...m });
+      if (map) { m.thinkingLevelMap = map; filled.push(`${provider}/${m.id}`); }
+    }
+  }
+  return filled;
+}
+
+/** fillThinkingMaps on the file (call before a pi starts: pi reads models.json only at boot). Never throws. */
+export function applyThinkingMaps(file) {
+  try {
+    if (!file || !existsSync(file)) return { filled: [] };
+    const json = readModelsFile(file, { strict: true });
+    const filled = fillThinkingMaps(json);
+    if (filled.length) writeModelsFile(file, json);
+    return { filled };
+  } catch (e) { return { filled: [], error: e.message }; }
 }

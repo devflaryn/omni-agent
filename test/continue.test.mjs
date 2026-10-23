@@ -35,21 +35,17 @@ test("Omni-owned Claude session that ended resumes in place (never forks)", () =
   assert.equal(planContinue(owned, { now }).fork, false);
 });
 
-test("pi: Omni's pi already on this session just prompts", () => {
-  assert.deepEqual(planContinue(piClosed, { now, piAlive: true, piSid: "pi:111" }), { action: "pi-prompt" });
+test("pi: a pi child already on this session just prompts; a fork still clones", () => {
+  assert.deepEqual(planContinue(piClosed, { now, piOwned: true }), { action: "pi-prompt" });
+  assert.equal(planContinue(piClosed, { now, piOwned: true, forceFork: true }).action, "pi-switch");
 });
 
-test("pi: closed session switches without clone; starts pi when it is not running", () => {
-  assert.deepEqual(planContinue(piClosed, { now, piAlive: false }), { action: "pi-switch", file: "C:\\s\\x_111.jsonl", clone: false, cwd: "C:\\p", start: true });
-  assert.equal(planContinue(piClosed, { now, piAlive: true, piSid: "pi:999" }).start, false);
+test("pi: closed session switches without clone (the server picks a free child or starts one)", () => {
+  assert.deepEqual(planContinue(piClosed, { now }), { action: "pi-switch", file: "C:\\s\\x_111.jsonl", clone: false, cwd: "C:\\p" });
 });
 
 test("pi: session live in a terminal is cloned", () => {
-  assert.equal(planContinue(piLive, { now, piAlive: true, piSid: "pi:999" }).clone, true);
-});
-
-test("pi: busy Omni pi is a 409", () => {
-  assert.equal(planContinue(piClosed, { now, piAlive: true, piSid: "pi:999", piStreaming: true }).status, 409);
+  assert.equal(planContinue(piLive, { now }).clone, true);
 });
 
 test("pi: no file is a 400", () => {

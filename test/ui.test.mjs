@@ -1,7 +1,7 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, isDuplicateUserMessage, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, isDuplicateUserMessage, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage, applyStatus } from "../ui/lib.js";
 import { parsePairs, formatPairs, parsePastedServer } from "../ui/mcp-settings.js";
 import { titleFrom } from "../server/watchers.mjs";
 
@@ -216,4 +216,19 @@ test("plan tool calls read as plan moves in the transcript", () => {
   assert.equal(toolLabel("plan", { action: "done", step: "1.2" }).text, "Finished step 1.2");
   assert.equal(toolLabel("plan", { action: "show" }).text, "Checked the plan");
   assert.equal(workSummary(["plan", "shell"]), "Updated the plan, ran commands");
+});
+
+test("applyStatus: a compaction status says nothing about streaming, so it leaves it as it was", () => {
+  // pi compacts before it starts the run a prompt asked for: marking the chat idle then hid that it was busy.
+  const s = { streaming: true };
+  applyStatus(s, { kind: "status", compacting: true });
+  assert.deepEqual(s, { streaming: true, compacting: true });
+  applyStatus(s, { kind: "status", compacting: false });
+  assert.deepEqual(s, { streaming: true, compacting: false });
+  applyStatus(s, { kind: "status", streaming: false });
+  assert.deepEqual(s, { streaming: false, compacting: false });
+  // A run ending ends any compaction pi reported without an end.
+  applyStatus(s, { kind: "status", compacting: true });
+  applyStatus(s, { kind: "status", streaming: false });
+  assert.equal(s.compacting, false);
 });

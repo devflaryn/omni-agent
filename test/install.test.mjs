@@ -25,7 +25,10 @@ test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid", "SKILL.md")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid", "reference", "omni-cli.md")));
     assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid-input", "SKILL.md")));
+    assert.ok(existsSync(join(home, ".pi", "agent", "skills", "subagent-driven-implementation", "SKILL.md")));
     assert.ok(existsSync(join(home, ".claude", "skills", "omnidroid", "SKILL.md")));
+    // omnidroid is the only skill Claude Code shares; the rest are pi only.
+    for (const s of ["omnidroid-frida", "omnidroid-qemu", "omnidroid-input", "subagent-driven-implementation"]) assert.ok(!existsSync(join(home, ".claude", "skills", s)), `${s} is pi only`);
     const cfg = JSON.parse(readFileSync(join(home, ".pi", "agent", "omni-agent.json"), "utf8"));
     assert.equal(cfg.autoRecall, true);
     assert.match(cfg.omniMcp.command, /omnidroid[\\/]target[\\/]release[\\/]omni-mcp(\.exe)?$/, "omni-mcp points at the sibling omnidroid build");

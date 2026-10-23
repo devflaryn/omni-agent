@@ -204,7 +204,9 @@ test("meta is spread into every session event, and cannot override the sid", asy
   assert.equal("parentSid" in plain.logs.find((e) => e.kind === "session"), false, "no meta, no extra keys");
 });
 
-test("prompt while streaming: steer by default, followUp when asked; idle prompts carry no streamingBehavior", async () => {
+test("every prompt carries a streamingBehavior (steer by default, followUp when asked): pi may already be running one Omni has not seen start", async () => {
+  // pi reads it only while it streams; a run an extension's wake-up started a moment ago would otherwise reject the
+  // prompt ("Specify streamingBehavior") and the keeper's nudge or the user's message would be lost.
   const { pi, cmds } = fakePi();
   await pi.refreshState();
   pi.streaming = true;
@@ -212,8 +214,66 @@ test("prompt while streaming: steer by default, followUp when asked; idle prompt
   await pi.prompt("b", { echo: false, behavior: "followUp" });
   pi.streaming = false;
   await pi.prompt("c", { echo: false, behavior: "followUp" });
+  await pi.prompt("d", { echo: false });
   const prompts = cmds.filter((c) => c.type === "prompt");
-  assert.deepEqual(prompts.map((c) => [c.message, c.streamingBehavior]), [["a", "steer"], ["b", "followUp"], ["c", undefined]]);
+  assert.deepEqual(prompts.map((c) => [c.message, c.streamingBehavior]), [["a", "steer"], ["b", "followUp"], ["c", "followUp"], ["d", "steer"]]);
+});
+
+test("a prompt sent while another is still starting waits for pi's answer to it: two starts at once is pi's run-flag race", async () => {
+  // pi's prompt() checks it is idle, then awaits before it claims the run; a second prompt in that window starts a
+  // second run, the loser clears pi's busy flag mid-run and emits a false agent_settled. pi answers a prompt right
+  // as it claims the run, so after that answer the next prompt is safely queued.
+  const { pi, cmds } = fakePi();
+  await pi.refreshState();
+  const held = [];
+  const write = pi.proc.stdin.write;
+  pi.proc.stdin.write = (line) => {
+    const cmd = JSON.parse(line);
+    if (cmd.type !== "prompt") return write(line);
+    cmds.push(cmd);
+    held.push(() => pi.onLine(JSON.stringify({ type: "response", id: cmd.id, command: "prompt", success: true })));
+    return true;
+  };
+  const first = pi.prompt("keeper nudge", { echo: false });
+  const second = pi.prompt("user message", { echo: false });
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(cmds.filter((c) => c.type === "prompt").map((c) => c.message), ["keeper nudge"], "the second waits");
+  held.shift()();
+  await first;
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(cmds.filter((c) => c.type === "prompt").map((c) => c.message), ["keeper nudge", "user message"]);
+  held.shift()();
+  await second;
+  // A prompt pi rejects does not wedge the ones after it.
+  pi.proc.stdin.write = (line) => {
+    const cmd = JSON.parse(line);
+    cmds.push(cmd);
+    setImmediate(() => pi.onLine(JSON.stringify({ type: "response", id: cmd.id, command: cmd.type, success: false, error: "no model" })));
+    return true;
+  };
+  const r = await pi.prompt("x", { echo: false });
+  assert.equal(r.success, false);
+  assert.equal((await pi.prompt("y", { echo: false })).success, false, "still sends");
+});
+
+test("pi may hold its answer to a prompt for minutes (it compacts a long session first): the prompt is not timed out at 2 minutes", async (t) => {
+  // A 6-minute preflight compaction used to fail the user's send with "pi timeout on prompt" while pi then ran it,
+  // and the chained prompt behind it went in mid-compaction, which pi rejects.
+  const { pi, cmds } = fakePi();
+  await pi.refreshState();
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  pi.proc.stdin.write = (line) => { cmds.push(JSON.parse(line)); return true; };
+  let settled = null;
+  const sent = pi.prompt("after a long run", { echo: false }).then((r) => { settled = r; }, (e) => { settled = e; });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(cmds.filter((c) => c.type === "prompt").length, 1, "the prompt went out");
+  t.mock.timers.tick(10 * 60 * 1000);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(settled, null, "still waiting for pi's answer");
+  const cmd = cmds.find((c) => c.type === "prompt");
+  pi.onLine(JSON.stringify({ type: "response", id: cmd.id, command: "prompt", success: true }));
+  await sent;
+  assert.equal(settled.success, true);
 });
 
 test("tool-aware watchdog: an open tool call gets toolStallMs, a closed one falls back to stallMs", () => {

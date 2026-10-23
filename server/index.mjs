@@ -15,15 +15,17 @@ import { handleAgentRoutes } from "./agent-routes.mjs";
 import { applyContextCaps } from "./context-policy.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
-import { PiRpc, PI_THINKING_LEVELS } from "./pi-rpc.mjs";
+import { PiRpc } from "./pi-rpc.mjs";
 import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM, runJudge } from "./hook.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
 import { listMcpServers, upsertMcpServer, removeMcpServer, testMcpServer } from "./mcp.mjs";
-import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels } from "./providers.mjs";
+import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels, modelEntry, applyThinkingMaps } from "./providers.mjs";
+import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.js";
 import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
+import { applyStatus } from "../ui/lib.js";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
 import { createServer as createNetServer } from "node:net";
@@ -67,16 +69,25 @@ export async function createApp(overrides = {}) {
   /** Host browsers' event streams: only they hear about pending approvals. */
   const hostStreams = new Set();
   approvals.on("change", (list) => { const line = `event: approvals\ndata: ${JSON.stringify(list)}\n\n`; for (const res of hostStreams) { try { res.write(line); } catch { hostStreams.delete(res); } } });
+  /**
+   * Omni's own pi children, one per chat that runs at once: a busy chat never blocks another (each child can
+   * start background agents of its own). `pi` is the one used last; routes without a `sid` talk to it.
+   */
+  const pis = new Set();
   let pi = null;
+  const sameDir = (a, b) => String(a || "").toLowerCase() === String(b || "").toLowerCase();
+  /** The child that has chat `sid` open right now, else null. */
+  const piFor = (sid) => { if (!sid) return null; for (const c of pis) if (c.proc && c.sid === sid) return c; return null; };
   // The durable run ledger. Null in normal GUI use; the unattended runner (scripts/run.mjs) opens one
   // via cfg so the goal + counters persist and survive a pi restart. Every use is guarded with `?.`.
   let runLedger = cfg.runLedger || null;
   /** Background agents the agents start (pi subagents, Claude Code sessions, shell jobs); created after the keeper. */
   let agents = null;
-  /** The compaction point changed while pi was busy: restart it at its next settle. */
-  let capsRestartPending = false;
+  /** Children that were working when pi's models.json or MCP servers changed: each restarts at its next settle. */
+  const restartPending = new Set();
 
-  const isOwned = (file) => (pi?.owns(file) ?? false) || claude.owns(file) || (agents?.owns(file) ?? false);
+  const piOwns = (file) => [...pis].some((c) => c.owns?.(file));
+  const isOwned = (file) => piOwns(file) || claude.owns(file) || (agents?.owns(file) ?? false);
   const watcher = new SessionWatcher({ piSessionsDir: cfg.piSessionsDir, claudeProjectsDir: cfg.claudeProjectsDir, bus, tally, registry, isOwned, recentHours: cfg.tailRecentHours, log });
   // A thin proxy so the keeper always reads the *current* runLedger (which may be set/replaced later).
   const ledgerProxy = { writeControl: (p) => runLedger?.writeControl(p), goalText: () => runLedger?.goalText() || "" };
@@ -84,7 +95,7 @@ export async function createApp(overrides = {}) {
   const keeper = new GoalKeeper({
     bus, log,
     // Background pi agents have a PiRpc of their own: the keeper watches and re-engages them too.
-    getPi: (sid) => (pi?.proc && pi.sid === sid ? pi : null) || agents?.piFor(sid) || null,
+    getPi: (sid) => piFor(sid) || agents?.piFor(sid) || null,
     contextPolicy: cfg.context,
     maxTokensFor: (sid) => Number(keeper.getPi(sid)?.state?.model?.maxTokens) || 0,
     // Only agents count: a long-lived shell job (a dev server, logcat) must not hold every recovery back until it exits.
@@ -98,8 +109,26 @@ export async function createApp(overrides = {}) {
     onEscalate: async (sid, g) => { runLedger?.appendEvent?.({ kind: "escalate", sid, nudges: g.nudges, fingerprint: g.lastFingerprint }); },
   });
 
+  /** The chat's model: its pi child's live one when it runs, else the saved pick the next pi starts with. */
+  function currentModel(c = pi) {
+    const m = c?.proc ? c.state?.model : null;
+    if (m?.id) return { provider: m.provider, id: m.id };
+    return cfg.piModel ? { provider: cfg.piProvider || "", id: cfg.piModel } : null;
+  }
+  /** The thinking levels provider/id has: its models.json entry (reasoning, a written map), else its name. */
+  function levelsOf(provider, id) {
+    return thinkingProfile(modelEntry(cfg.piModelsFile, provider, id) || { provider, id }).levels;
+  }
+
   /** Cap each model's effective window in models.json so pi compacts at cfg.context.compactAt (server/context-policy.mjs). */
   function applyCaps(compactAt = cfg.context?.compactAt ?? 0) {
+    // Each model's thinking levels (ui/thinking.js), so pi offers and sends only the ones it has. A test's fake pi
+    // never touches the real models.json.
+    if (!(cfg.createPi && !overrides.piModelsFile)) {
+      const tm = applyThinkingMaps(cfg.piModelsFile);
+      if (tm.error) log("thinking levels:", tm.error);
+      for (const k of tm.filled) log(`thinking levels for ${k}: set from its model family`);
+    }
     if (cfg.contextCaps === false || (cfg.createPi && !overrides.contextCapsFile)) return null;
     const r = applyContextCaps({ modelsFile: cfg.piModelsFile, settingsFile: cfg.piSettingsFile, stateFile: cfg.contextCapsFile, compactAt });
     if (r.error) log("context caps:", r.error);
@@ -131,7 +160,7 @@ export async function createApp(overrides = {}) {
     // An unattended run (scripts/run.mjs) keeps its goal in its own ledger; it must never be reopened by the GUI.
     if (cfg.runLedger) return;
     // savedAt = the chat's last activity (not the save time), so re-saving on every shutdown never makes a stale goal look live.
-    const mine = keeper.exportGoals().filter((d) => !d.managed).map((d) => ({ ...d, hookEnabled: !!keeper.config.enabled, savedAt: registry.get(d.sid)?.lastActivity || d.startedAt || Date.now(), file: registry.get(d.sid)?.file || (pi?.sid === d.sid ? pi.state?.sessionFile : "") || "", cwd: registry.get(d.sid)?.cwd || pi?.cwd || cfg.cwd }));
+    const mine = keeper.exportGoals().filter((d) => !d.managed).map((d) => ({ ...d, hookEnabled: !!keeper.config.enabled, savedAt: registry.get(d.sid)?.lastActivity || d.startedAt || Date.now(), file: registry.get(d.sid)?.file || piFor(d.sid)?.state?.sessionFile || "", cwd: registry.get(d.sid)?.cwd || piFor(d.sid)?.cwd || pi?.cwd || cfg.cwd }));
     // Saved goals this process never loaded (a stopped one, an older one) are kept for a week, not erased by this save.
     const kept = loadGoals().filter((x) => x?.sid && !keeper.goal(x.sid) && !mine.some((d) => d.sid === x.sid || (d.file && d.file === x.file)) && Date.now() - (x.savedAt || 0) < 7 * 86400000);
     const goals = [...mine, ...kept];
@@ -147,22 +176,33 @@ export async function createApp(overrides = {}) {
 
   // Owned sessions also need registry + tally bookkeeping from their live events.
   bus.on("event", (ev) => {
-    if (ev.kind === "log" || ev.kind === "removed" || ev.kind === "agent") return;
+    if (ev.kind === "log" || ev.kind === "removed" || ev.kind === "agent" || ev.kind === "pis") return;
     const s = registry.upsert(ev.sid, {});
     if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom, ...(ev.parentSid ? { parentSid: ev.parentSid, agentId: ev.agentId, agentKind: ev.agentKind } : {}) });
-    // Invariant: run.json.sessionFile always names pi's current session file, and pi.resumeFile mirrors it.
-    // Gated on !pi.restoring so the transient empty session a fresh child opens during a crash restart
+    // Invariant: run.json.sessionFile always names pi's current session file, and the child's resumeFile mirrors it.
+    // Gated on !restoring so the transient empty session a fresh child opens during a crash restart
     // cannot clobber the resume anchor before resumeSession() reads it (C1).
     // A background pi agent announces an owned session too; it must never become the main chat's resume anchor.
-    if (ev.kind === "session" && ev.owned && ev.harness === "pi" && ev.file && !ev.agentId && !pi?.restoring) {
-      runLedger?.writeControl({ sessionFile: ev.file });
-      if (pi) pi.resumeFile = ev.file;
+    if (ev.kind === "session" && ev.owned && ev.harness === "pi" && !ev.agentId) {
+      const c = piFor(ev.sid);
+      if (ev.file && !c?.restoring) {
+        if (c) c.resumeFile = ev.file;
+        if (!c || c === pi) runLedger?.writeControl({ sessionFile: ev.file });
+      }
+      announcePis();
     }
-    if (ev.kind === "status") s.streaming = !!ev.streaming;
-    // A compaction point changed while the main pi was busy: it reads models.json only at boot, so restart it at this settle.
-    if (ev.kind === "status" && ev.streaming === false && capsRestartPending && pi?.sid === ev.sid) {
-      capsRestartPending = false;
-      setTimeout(() => { if (pi?.proc && !pi.streaming) restartPi().catch((e) => log("pi restart for the new compaction point failed", e.message)); else capsRestartPending = true; }, 0);
+    if (ev.kind === "status") applyStatus(s, ev);
+    // pi's models.json or MCP servers changed while this child was working: it reads them only at boot, so restart it at this settle.
+    if (ev.kind === "status" && ev.streaming === false && restartPending.size) {
+      const c = piFor(ev.sid);
+      if (c && restartPending.has(c)) {
+        setTimeout(() => {
+          if (!pis.has(c) || !c.proc) return restartPending.delete(c);
+          if (c.streaming) return;
+          restartPending.delete(c);
+          restartPi(c).catch((e) => log("pi restart for the new settings failed", e.message));
+        }, 0);
+      }
     }
     // A background agent's report is delivered once it is IN the parent chat (pi only queues it while the chat is busy,
     // and that queue is lost on Stop or a crash) — the extension acks on message_end too; this is the backstop.
@@ -181,30 +221,100 @@ export async function createApp(overrides = {}) {
     if (ev.kind === "msg" || ev.kind === "run") watcher.dirty.set(ev.sid, Date.now());
   });
 
-  function startPi(cwd = cfg.cwd) {
-    if (pi) pi.stop();
+  /** Starts another pi child in `cwd` (the ones already running keep going); it becomes the current one unless `current` is false. */
+  function startPi(cwd = cfg.cwd, { current = true } = {}) {
     applyCaps();
-    pi = cfg.createPi ? cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, env: piChildEnv(cfg), bus });
-    // The auto-restart path re-attaches the goal: keeper._lastSid holds the pre-restart sid, pi.sid the new one (C1).
+    const c = cfg.createPi ? cfg.createPi({ cwd, bus, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking }) : new PiRpc({ cli: cfg.piCli, bin: cfg.piBin, cwd, model: cfg.piModel, provider: cfg.piProvider, thinking: cfg.piThinking, env: piChildEnv(cfg), bus });
+    // A new child is claimed for the chat it is started for: no other chat takes it before its first prompt.
+    c.lastUsedAt = c.claimedAt = Date.now();
+    // The auto-restart path re-attaches the goal: crashedSid is this child's sid before the crash, c.sid the resumed one (C1).
     // The killed run never reported a settle of its own, so the heartbeat re-checks the goal instead of relying on one.
-    pi.onRestart = async () => { keeper.attachToSid(keeper._lastSid, pi.sid); const g = keeper.goal(pi.sid); if (g && !g.done && !g.paused) g.recheck = true; };
-    pi.start();
-    pi.startWatchdog?.({ stallMs: cfg.stallMs, toolStallMs: cfg.toolStallMs });
-    return pi;
+    c.onRestart = async () => { keeper.attachToSid(c.crashedSid || c.sid, c.sid); c.crashedSid = null; const g = keeper.goal(c.sid); if (g && !g.done && !g.paused) g.recheck = true; };
+    pis.add(c);
+    if (current || !pi) pi = c;
+    c.start();
+    c.startWatchdog?.({ stallMs: cfg.stallMs, toolStallMs: cfg.toolStallMs });
+    announcePis();
+    return c;
   }
+  const lastUsed = (c) => Math.max(c.lastUsedAt || 0, c.lastEventAt || 0);
+  function stopPi(c) {
+    if (!c) return;
+    c.stop();
+    pis.delete(c);
+    restartPending.delete(c);
+    if (pi === c) pi = [...pis].sort((a, b) => lastUsed(b) - lastUsed(a))[0] || null;
+    announcePis();
+  }
+  /** How long a child handed to a chat stays reserved for it before that chat's first prompt reaches it. */
+  const CLAIM_MS = 60000;
+  /**
+   * A child no chat needs right now, so another chat may open in it: not working or about to (a prompt in flight, just
+   * claimed), no unfinished goal (the keeper re-engages it), no background agent of its chat still running (their
+   * reports are delivered into that chat).
+   */
+  function piFree(c, now = Date.now()) {
+    if (!c?.proc || c.streaming || c.restoring || c.inFlight > 0) return false;
+    if (c.claimedAt && now - c.claimedAt < CLAIM_MS) return false;
+    const g = keeper.goal(c.sid);
+    if (g && !g.done && !g.paused) return false;
+    return !((agents?.activeChildren(c.sid, { kinds: ["pi", "claude"] }) || 0) > 0);
+  }
+  /** A child to open a chat in, in `cwd`: a free one already there (the current one first), else a new one. */
+  async function acquirePi(cwd) {
+    const free = [...pis].filter((c) => sameDir(c.cwd, cwd) && piFree(c)).sort((a, b) => (b === pi) - (a === pi) || lastUsed(b) - lastUsed(a))[0];
+    if (free) { free.lastUsedAt = free.claimedAt = Date.now(); pi = free; return { child: free, fresh: false }; }
+    const c = startPi(cwd);
+    await c.waitReady();
+    return { child: c, fresh: true };
+  }
+  /** A message is going to this child's chat now: it is the current one, and no longer just claimed. */
+  function usePi(c) { c.lastUsedAt = Date.now(); c.claimedAt = 0; pi = c; return c; }
+  /** Every live child, for /api/state and the `pis` event: which chats a message goes straight to. */
+  const piList = () => [...pis].filter((c) => c.proc).map((c) => ({ sid: c.sid, cwd: c.cwd, streaming: !!c.streaming, current: c === pi, model: c.state?.model?.id ? { provider: c.state.model.provider, id: c.state.model.id } : null, thinkingLevel: c.state?.thinkingLevel || "" }));
+  let pisTimer = null;
+  function announcePis() {
+    if (pisTimer) return;
+    pisTimer = setTimeout(() => { pisTimer = null; bus.emit({ sid: "omni", harness: "omni", kind: "pis", ts: Date.now(), pis: piList() }); }, 0);
+  }
+  /**
+   * Free children past a few spares are closed (each runs its own extensions and MCP servers), and any free one
+   * idle for long; the current one stays. A chat whose child was closed starts one again with its next message.
+   */
+  function trimPis(now = Date.now()) {
+    const spare = cfg.piSpareChildren ?? 2, idleMs = (cfg.piIdleMinutes ?? 30) * 60000;
+    const free = [...pis].filter((c) => c !== pi && piFree(c, now)).sort((a, b) => lastUsed(b) - lastUsed(a));
+    free.forEach((c, i) => { const idle = now - lastUsed(c); if ((i >= spare && idle > 60000) || idle > idleMs) stopPi(c); });
+  }
+  const trimTimer = setInterval(() => trimPis(), 60000);
+  trimTimer.unref?.();
   /** pi reads models.json only at boot: after a provider change, relaunch the child and put it back on the session it had open. */
-  async function restartPi() {
-    if (!pi?.proc) return false;
-    const { cwd } = pi;
-    const file = pi.state?.sessionFile;
-    const prevSid = pi.sid;
-    startPi(cwd);
-    try { await pi.waitReady(); if (file) await pi.switchSession(file); }
+  async function restartPi(c = pi) {
+    if (!c?.proc) return false;
+    const { cwd } = c;
+    const file = c.state?.sessionFile;
+    const prevSid = c.sid;
+    const current = c === pi;
+    stopPi(c);
+    const n = startPi(cwd, { current });
+    n.claimedAt = 0;
+    try { await n.waitReady(); if (file) await n.switchSession(file); }
     catch (e) { log("pi restart: could not restore the session", e.message); }
     // Move the keeper's goal + counters onto pi's new session id so a restart never drops the goal.
-    keeper.attachToSid(prevSid, pi.sid);
-    if (pi) { pi.resumeFile = pi.state?.sessionFile || file; runLedger?.writeControl({ sessionFile: pi.resumeFile }); }
+    keeper.attachToSid(prevSid, n.sid);
+    n.resumeFile = n.state?.sessionFile || file;
+    if (n === pi) runLedger?.writeControl({ sessionFile: n.resumeFile });
     return true;
+  }
+  /** Restart every child for a settings change: an idle one now, a working one at its next settle. */
+  async function restartPis() {
+    let restarted = false, pending = false;
+    for (const c of [...pis]) {
+      if (!c.proc) continue;
+      if (c.streaming || c.inFlight > 0) { restartPending.add(c); pending = true; continue; }
+      restarted = (await restartPi(c)) || restarted;
+    }
+    return { restarted, pending };
   }
 
   // ---------------------------------------------------------------- digests
@@ -238,7 +348,7 @@ export async function createApp(overrides = {}) {
   function fsRootAllowed(req, root) {
     if (!String(root || "").trim()) return false;
     if (req.omniHost) return true;
-    const allowed = new Set([cfg.cwd, cfg.vaultDir, pi?.cwd, ...registry.list().map((s) => s.cwd)].filter(Boolean).map(normDir));
+    const allowed = new Set([cfg.cwd, cfg.vaultDir, ...[...pis].map((c) => c.cwd), ...registry.list().map((s) => s.cwd)].filter(Boolean).map(normDir));
     return allowed.has(normDir(root));
   }
   const TEXT_EXT = new Set([".txt", ".md", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".py", ".sh", ".bash", ".ps1", ".cmd", ".bat", ".html", ".css", ".xml", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log", ".java", ".kt", ".c", ".h", ".cpp", ".rs", ".go", ".rb", ".php", ".sql", ".smali", ".gradle", ".properties", ".env", ".gitignore", ".csv", ".jsonl"]);
@@ -309,7 +419,12 @@ export async function createApp(overrides = {}) {
     req.omniBody = s ? JSON.parse(s) : {};
     return req.omniBody;
   }
-  const requirePi = () => { if (!pi?.proc) throw new Error("pi is not running (POST /api/pi/start)"); return pi; };
+  /** Chat `sid`'s pi child, or the current one without a sid. */
+  const requirePi = (sid = "") => {
+    const c = sid ? piFor(sid) : pi;
+    if (!c?.proc) throw Object.assign(new Error(sid ? "that chat has no pi running right now; send it a message to continue it" : "pi is not running (POST /api/pi/start)"), { status: 409 });
+    return c;
+  };
 
   function graphDirFor(sid) {
     const s = registry.get(sid);
@@ -354,7 +469,7 @@ export async function createApp(overrides = {}) {
     // Omni's main pi must never open a session file a running agent's own pi is still writing.
     const busy = activeAgentIn(sid, s.file);
     if (busy) throw agentBusyError(busy);
-    const plan = planContinue(s, { liveWindowMs: cfg.liveWindowMs, piAlive: !!pi?.proc, piSid: pi?.sid, piStreaming: !!pi?.streaming, claudeAlive: !!claude.runs.get(sid)?.alive, forceFork: !!body.fork });
+    const plan = planContinue(s, { liveWindowMs: cfg.liveWindowMs, piOwned: !!piFor(sid), claudeAlive: !!claude.runs.get(sid)?.alive, forceFork: !!body.fork });
     if (plan.action === "error") throw Object.assign(new Error(plan.error), { status: plan.status });
     const dir = s.cwd || cfg.cwd;
     if (plan.action === "claude") {
@@ -363,17 +478,18 @@ export async function createApp(overrides = {}) {
       return { sid: r.sid, pending: r.pending, forked: plan.fork, forkedFrom: plan.fork ? sid : null };
     }
     const p = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir });
-    if (plan.action === "pi-prompt") { await pi.prompt(p.text, { images: body.images }); return { sid: pi.sid, pending: false, forked: false, forkedFrom: null }; }
-    if (plan.start) { startPi(plan.cwd || cfg.cwd); await pi.waitReady(); }
+    if (plan.action === "pi-prompt") { const c = usePi(piFor(sid)); await c.prompt(p.text, { images: body.images }); return { sid: c.sid, pending: false, forked: false, forkedFrom: null }; }
+    // Any other chat's child keeps working: this one opens in a free child in its folder, or a new one.
+    const { child: c } = await acquirePi(plan.cwd || dir);
     try {
-      await pi.switchSession(plan.file);
+      await c.switchSession(plan.file);
       if (plan.clone) {
-        await pi.clone();
-        bus.emit({ sid: pi.sid, harness: "pi", kind: "session", ts: Date.now(), owned: true, forkedFrom: sid, cwd: pi.cwd, file: pi.state?.sessionFile });
+        await c.clone();
+        bus.emit({ sid: c.sid, harness: "pi", kind: "session", ts: Date.now(), owned: true, forkedFrom: sid, cwd: c.cwd, file: c.state?.sessionFile });
       }
-    } catch (e) { throw Object.assign(e, { status: e.status || 409 }); }
-    await pi.prompt(p.text, { images: body.images });
-    return { sid: pi.sid, pending: false, forked: !!plan.clone, forkedFrom: plan.clone ? sid : null };
+    } catch (e) { c.claimedAt = 0; throw Object.assign(e, { status: e.status || 409 }); }
+    await usePi(c).prompt(p.text, { images: body.images });
+    return { sid: c.sid, pending: false, forked: !!plan.clone, forkedFrom: plan.clone ? sid : null };
   }
 
   /** Resolve when a Claude run ends (its `run` event), or after `ms` with whatever exists. */
@@ -520,9 +636,11 @@ export async function createApp(overrides = {}) {
       if (req.method === "GET" && p === "/events") {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         res.write(": omni\n\n");
-        bus.addClient(res, Number(q.get("since") || 0));
+        bus.addClient(res, Number(q.get("since") || 0), q.get("boot") || "");
         if (req.omniHost) { hostStreams.add(res); res.write(`event: approvals\ndata: ${JSON.stringify(approvals.list())}\n\n`); }
-        const ka = setInterval(() => { try { res.write(": ka\n\n"); } catch { /* */ } }, 20000);
+        // A real event, not an SSE comment: page code never sees a comment, and the page needs this beat to
+        // notice a stream that died without a FIN (a phone switching networks, the relay's far side gone).
+        const ka = setInterval(() => { try { res.write("event: ka\ndata: 1\n\n"); } catch { /* */ } }, cfg.sseKeepAliveMs || 20000);
         req.on("close", () => { clearInterval(ka); bus.removeClient(res); hostStreams.delete(res); });
         return;
       }
@@ -532,6 +650,8 @@ export async function createApp(overrides = {}) {
           config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: remoteStatus().urls, piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking, context: cfg.context },
           access: { role: req.omniHost ? "host" : "remote", ...(req.omniHost ? { remote: remoteStatus() } : {}) },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
+          // Every chat with a pi child right now (`pi` is the one used last), and each one's goal.
+          pis: piList().map((x) => ({ ...x, goal: keeper.goal(x.sid) ? keeper.status(x.sid) : null })),
           hook: keeper.config,
           goal: pi?.sid ? keeper.status(pi.sid) : null,
           runs: claude.list(),
@@ -539,6 +659,7 @@ export async function createApp(overrides = {}) {
           agents: agents.list().slice(0, 200).map((a) => ({ ...a, resultText: (a.resultText || "").length > 2000 ? `${a.resultText.slice(0, 2000)}…` : a.resultText })),
           sessions: registry.list().map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
           seq: bus.seq,
+          boot: bus.boot,
         });
       }
       let m;
@@ -554,7 +675,7 @@ export async function createApp(overrides = {}) {
         const sid = decodeURIComponent(m[1]);
         const s = registry.get(sid);
         if (!s) return send(res, 404, { error: "unknown session" });
-        const live = s.owned || (pi?.owns(s.file) ?? false) || claude.owns(s.file || "") || (s.streaming && Date.now() - (s.lastActivity || 0) < cfg.liveWindowMs);
+        const live = s.owned || piOwns(s.file) || claude.owns(s.file || "") || (s.streaming && Date.now() - (s.lastActivity || 0) < cfg.liveWindowMs);
         if (live) return send(res, 409, { error: "that chat is still live \u2014 stop it before deleting" });
         const out = await watcher.deleteSession(sid, { trashDir: cfg.trashDir });
         bus.emit({ sid, harness: s.harness, kind: "removed", ts: Date.now() });
@@ -588,9 +709,9 @@ export async function createApp(overrides = {}) {
           keeper.setContextPolicy(cfg.context);
           if (cfg.persistContext !== false) writeConfigFile({ context: cfg.context });
           const caps = applyCaps(cfg.context.compactAt);
-          // pi reads models.json only at boot: an idle pi restarts now, a busy one picks the cap up at its next restart.
+          // pi reads models.json only at boot: an idle child restarts now, a busy one at its next settle.
           let restarted = false, pending = false;
-          if (caps?.changed && pi?.proc) { if (!pi.streaming) restarted = await restartPi(); else pending = capsRestartPending = true; }
+          if (caps?.changed) ({ restarted, pending } = await restartPis());
           return send(res, 200, { ok: true, context: cfg.context, caps: caps && { changed: caps.changed, changes: caps.changes, error: caps.error }, restarted, restartPending: pending });
         }
       }
@@ -598,14 +719,17 @@ export async function createApp(overrides = {}) {
       if (p === "/api/goal") {
         if (req.method === "GET") return send(res, 200, keeper.status(q.get("sid") || pi?.sid));
         if (req.method === "POST" || req.method === "PUT") {
-          if (!pi?.sid) return send(res, 400, { error: "no active pi session; start a chat first" });
-          const goal = String((await readBody(req)).goal ?? "").trim();
-          keeper.setExplicitGoal(pi.sid, goal);
+          const b = await readBody(req);
+          // The chat it was typed in (`sid`); without one, the chat used last.
+          const c = b.sid ? piFor(b.sid) : pi;
+          if (!c?.sid) return send(res, 400, { error: b.sid ? "that chat has no pi running right now; send it a message first, then set the goal" : "no active pi session; start a chat first" });
+          const goal = String(b.goal ?? "").trim();
+          keeper.setExplicitGoal(c.sid, goal);
           saveGoals();
           // Setting a goal arms the keeper so the agent is re-engaged until the goal is done.
           if (goal && !keeper.config.enabled) { keeper.setConfig({ ...keeper.config, enabled: true }); if (cfg.persistHook !== false) writeConfigFile({ hook: keeper.config }); }
           // The kickoff says up front that this goal is tracked by its plan (the keeper insists on one anyway).
-          if (goal) { try { await pi.prompt(`${goal}\n\n(Tracked goal: first brainstorm and plan it with the plan tool, then work through the plan until every step is done.)`); } catch { /* goal is set + hook armed; the keeper will re-engage */ } }
+          if (goal) { try { await usePi(c).prompt(`${goal}\n\n(Tracked goal: first brainstorm and plan it with the plan tool, then work through the plan until every step is done.)`); } catch { /* goal is set + hook armed; the keeper will re-engage */ } }
           return send(res, 200, { goal, explicit: !!goal, enabled: keeper.config.enabled, started: !!goal });
         }
       }
@@ -625,8 +749,8 @@ export async function createApp(overrides = {}) {
         const name = decodeURIComponent(m[1]);
         if (req.method === "PUT") upsertProvider(cfg.piModelsFile, name, await readBody(req));
         else if (!removeProvider(cfg.piModelsFile, name)) return send(res, 404, { error: "unknown provider" });
-        const restarted = await restartPi();
-        return send(res, 200, { ok: true, restarted, providers: listProviders(cfg.piModelsFile) });
+        const { restarted, pending } = await restartPis();
+        return send(res, 200, { ok: true, restarted, restartPending: pending, providers: listProviders(cfg.piModelsFile) });
       }
       // MCP servers (pi's omni-agent.json → mcpServers). pi loads them at boot, so a change restarts it.
       if (req.method === "GET" && p === "/api/mcp") {
@@ -640,36 +764,47 @@ export async function createApp(overrides = {}) {
         const name = decodeURIComponent(m[1]);
         if (req.method === "PUT") { const body = await readBody(req); upsertMcpServer(cfg.piExtConfigFile, name, body, { rename: body.rename }); }
         else if (!removeMcpServer(cfg.piExtConfigFile, name)) return send(res, 404, { error: "unknown MCP server" });
-        const restarted = await restartPi();
-        return send(res, 200, { ok: true, restarted, servers: listMcpServers(cfg.piExtConfigFile) });
+        const { restarted, pending } = await restartPis();
+        return send(res, 200, { ok: true, restarted, restartPending: pending, servers: listMcpServers(cfg.piExtConfigFile) });
       }
       // pi
       if (p.startsWith("/api/pi/")) {
         const body = req.method === "POST" ? await readBody(req) : {};
+        // The chat a request is for: its own pi child. Without one, the child used last.
+        const sid = String(body.sid || q.get("sid") || "");
         switch (p) {
-          case "/api/pi/start": { startPi(body.cwd || cfg.cwd); try { await pi.waitReady(); } catch { /* the UI polls /api/state */ } return send(res, 200, { ok: true, sid: pi.sid }); }
-          case "/api/pi/stop": pi?.stop(); pi = null; return send(res, 200, { ok: true });
-          // A new chat in one step (start pi there or open a new session, then prompt): what a remote
-          // browser's Home sends, so the host approves one request instead of three.
+          // Another pi child; any already running keep going.
+          case "/api/pi/start": { const c = startPi(body.cwd || cfg.cwd); try { await c.waitReady(); } catch { /* the UI polls /api/state */ } return send(res, 200, { ok: true, sid: c.sid }); }
+          // `sid` stops that chat's child; without one, every chat's.
+          case "/api/pi/stop": { for (const c of sid ? [piFor(sid)].filter(Boolean) : [...pis]) stopPi(c); return send(res, 200, { ok: true }); }
+          // A new chat in `cwd`, without a prompt yet: a free child opens a new session, else a new child starts.
+          case "/api/pi/open": {
+            const { child: c, fresh } = await acquirePi(body.cwd || cfg.cwd);
+            if (!fresh) await c.newSession();
+            return send(res, 200, { ok: true, sid: c.sid, cwd: c.cwd, state: c.state });
+          }
+          // A new chat in one step (open it, then prompt): what a remote browser's Home sends, so the host
+          // approves one request instead of three.
           case "/api/pi/send": {
             if (!body.message?.trim()) return send(res, 400, { error: "empty" });
-            const cwd = body.cwd || cfg.cwd;
-            if (!pi?.proc || (pi.cwd || "").toLowerCase() !== String(cwd).toLowerCase()) { startPi(cwd); await pi.waitReady(); }
-            else await pi.newSession();
-            const c = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(pi.sid) });
-            await pi.prompt(c.text, { images: body.images });
-            return send(res, 200, { ok: true, sid: pi.sid });
+            const { child: c, fresh } = await acquirePi(body.cwd || cfg.cwd);
+            if (!fresh) await c.newSession();
+            const composed = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(c.sid) });
+            await usePi(c).prompt(composed.text, { images: body.images });
+            return send(res, 200, { ok: true, sid: c.sid });
           }
           case "/api/pi/prompt": {
-            const p0 = requirePi();
             if (!body.message?.trim()) return send(res, 400, { error: "empty" });
+            // The chat's child was closed (idle too long, or it opened another chat): pick the chat up again.
+            if (sid && !piFor(sid) && registry.get(sid)) return send(res, 200, await continueSession(sid, body));
+            const p0 = usePi(requirePi(sid));
             const c = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(p0.sid) });
             return send(res, 200, await p0.prompt(c.text, { images: body.images }));
           }
           case "/api/pi/abort": {
             // Stop halts this run and its goal (no re-engage until the user writes again). It used to also switch
             // the hook off globally and persist that, which silently left every later overnight run without one.
-            const p0 = requirePi();
+            const p0 = requirePi(sid);
             keeper.cancel(p0.sid);
             // A full halt includes the chat's background agents: their reports would otherwise wake the stopped chat
             // and start new, unsupervised turns in it.
@@ -677,36 +812,67 @@ export async function createApp(overrides = {}) {
             for (const a of halted) agents.cancel(a.id).catch((e) => log("could not stop agent", a.id, e.message));
             return send(res, 200, { ...(await p0.abort()), agentsStopped: halted.map((a) => a.id) });
           }
-          case "/api/pi/new": return send(res, 200, await requirePi().newSession());
+          // A new chat: in `sid`'s child when it is free, else (and without a sid) like /api/pi/open in its folder.
+          case "/api/pi/new": {
+            const own = sid ? requirePi(sid) : null;
+            if (own && piFree(own)) { const r = await usePi(own).newSession(); own.claimedAt = Date.now(); return send(res, 200, { ...r, sid: own.sid }); }
+            const { child: c, fresh } = await acquirePi(body.cwd || own?.cwd || pi?.cwd || cfg.cwd);
+            const r = fresh ? { success: true } : await c.newSession();
+            return send(res, 200, { ...r, sid: c.sid });
+          }
           case "/api/pi/switch": {
             const owner = registry.list().find((x) => x.file && body.file && resolve(x.file).toLowerCase() === resolve(body.file).toLowerCase());
             const busy = body.file && agents.owns(body.file) ? activeAgentIn(owner?.sid || "", body.file) || { id: "?" } : owner ? activeAgentIn(owner.sid, body.file) : null;
             if (busy) throw agentBusyError(busy);
-            return send(res, 200, await requirePi().switchSession(body.file));
+            // Already open in a child: that one. A working child is never moved off its chat.
+            const has = [...pis].find((c) => c.proc && c.owns?.(body.file));
+            if (has) { usePi(has); return send(res, 200, { success: true, sid: has.sid }); }
+            const c0 = requirePi(sid);
+            const c = c0.streaming || c0.inFlight > 0 ? (await acquirePi(c0.cwd)).child : c0;
+            const r = await usePi(c).switchSession(body.file);
+            return send(res, 200, { ...r, sid: c.sid });
           }
           // Model and thinking level are remembered even when pi is not running yet: the next pi child starts with them.
+          // A model only has some of the levels (ui/thinking.js): the saved level follows a model switch to the nearest one it has.
+          // `sid` applies the pick to that chat's child (the others keep theirs); without one, to the current child.
           case "/api/pi/model": {
             if (!body.provider || !body.modelId) return send(res, 400, { error: "provider and modelId are required" });
-            const r = pi?.proc ? await pi.setModel(body.provider, body.modelId) : { success: true, pending: true };
-            if (r?.success !== false) { cfg.piProvider = body.provider; cfg.piModel = body.modelId; if (cfg.persistPiModel !== false) writeConfigFile({ piProvider: body.provider, piModel: body.modelId }); }
-            return send(res, 200, { ...r, provider: cfg.piProvider, modelId: cfg.piModel });
+            const c = sid ? piFor(sid) : pi;
+            const r = c?.proc ? await c.setModel(body.provider, body.modelId) : { success: true, pending: true };
+            if (r?.success !== false) {
+              cfg.piProvider = body.provider; cfg.piModel = body.modelId;
+              const level = cfg.piThinking && clampThinking(cfg.piThinking, levelsOf(body.provider, body.modelId));
+              if (level && level !== cfg.piThinking) { cfg.piThinking = level; if (c?.proc) await c.setThinking(level).catch(() => {}); }
+              if (cfg.persistPiModel !== false) writeConfigFile({ piProvider: body.provider, piModel: body.modelId, ...(level ? { piThinking: level } : {}) });
+            }
+            return send(res, 200, { ...r, provider: cfg.piProvider, modelId: cfg.piModel, level: cfg.piThinking });
           }
           case "/api/pi/thinking": {
-            if (!PI_THINKING_LEVELS.includes(body.level)) return send(res, 400, { error: `level must be one of ${PI_THINKING_LEVELS.join(", ")}` });
-            const r = pi?.proc ? await pi.setThinking(body.level) : { success: true, pending: true };
-            if (r?.success !== false) { cfg.piThinking = body.level; if (cfg.persistPiModel !== false) writeConfigFile({ piThinking: body.level }); }
+            if (!THINKING_LEVELS.includes(body.level)) return send(res, 400, { error: `level must be one of ${THINKING_LEVELS.join(", ")}` });
+            const c = sid ? piFor(sid) : pi;
+            const cur = currentModel(c);
+            const level = cur ? clampThinking(body.level, levelsOf(cur.provider, cur.id)) : body.level;
+            const r = c?.proc ? await c.setThinking(level) : { success: true, pending: true };
+            if (r?.success !== false) { cfg.piThinking = level; if (cfg.persistPiModel !== false) writeConfigFile({ piThinking: level }); }
             return send(res, 200, { ...r, level: cfg.piThinking });
           }
-          case "/api/pi/compact": return send(res, 200, await requirePi().compact());
-          case "/api/pi/stats": return send(res, 200, await requirePi().stats());
+          case "/api/pi/compact": return send(res, 200, await requirePi(sid).compact());
+          case "/api/pi/stats": return send(res, 200, await requirePi(sid).stats());
           case "/api/pi/models": {
             // Omni's own provider config wins: only the models the user typed are listed. Without one, fall back to pi's catalogue.
             const own = flatModels(cfg.piModelsFile);
             if (own.length) return send(res, 200, { success: true, data: { models: own, source: "providers" } });
             const r = await requirePi().models(); if (r?.data?.models) r.data.models = filterPiModels(r.data.models, cfg.piModels); return send(res, 200, r);
           }
-          case "/api/pi/thinking-levels": return send(res, 200, await requirePi().thinkingLevels());
-          case "/api/pi/state": return send(res, 200, await requirePi().refreshState());
+          // ?provider=&model= for a model in the picker; without them the chat's current model (running or saved).
+          case "/api/pi/thinking-levels": {
+            const c = sid ? piFor(sid) : pi;
+            const cur = q.get("model") ? { provider: q.get("provider") || "", id: q.get("model") } : currentModel(c);
+            const m = cur && (modelEntry(cfg.piModelsFile, cur.provider, cur.id) || (c?.state?.model?.id === cur.id ? { ...c.state.model, provider: cur.provider } : cur));
+            const t = m ? thinkingProfile(m) : null;
+            return send(res, 200, { success: true, data: t ? { levels: t.levels, labels: t.labels, family: t.family, provider: cur.provider, model: cur.id } : { levels: THINKING_LEVELS, labels: {} } });
+          }
+          case "/api/pi/state": return send(res, 200, await requirePi(sid).refreshState());
           default: return send(res, 404, { error: "unknown pi route" });
         }
       }
@@ -919,7 +1085,7 @@ export async function createApp(overrides = {}) {
     const d = loadGoals().filter((x) => x.file && existsSync(x.file) && !x.paused && !x.done && Date.now() - (x.savedAt || 0) < 72 * 3600000).sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0))[0];
     if (!d || !pi) return;
     await pi.waitReady();
-    if ((pi.cwd || "").toLowerCase() !== String(d.cwd || "").toLowerCase() && d.cwd && existsSync(d.cwd)) { startPi(d.cwd); await pi.waitReady(); }
+    if (!sameDir(pi.cwd, d.cwd) && d.cwd && existsSync(d.cwd)) { stopPi(pi); startPi(d.cwd); await pi.waitReady(); }
     await pi.switchSession(d.file);
     keeper.importGoal(pi.sid, d, { resume: true });
     // Re-arm the hook only if it was on when the goal was saved (a user who runs with it off keeps context-only mode).
@@ -932,7 +1098,9 @@ export async function createApp(overrides = {}) {
     saveGoals(); // before keeper.dispose(), which forgets every goal
     keeper.dispose();
     watcher.stop();
-    pi?.stop();
+    clearInterval(trimTimer);
+    clearTimeout(pisTimer);
+    for (const c of [...pis]) c.stop();
     agents.stopAll();
     agents.dispose();
     claude.stopAll();
@@ -945,7 +1113,7 @@ export async function createApp(overrides = {}) {
     relay.server?.closeAllConnections?.();
   }
 
-  return { server, remote, relay, get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, auth, approvals, get pi() { return pi; }, startPi, cfg };
+  return { server, remote, relay, get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, cfg };
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || process.argv[1]?.endsWith("index.mjs")) {

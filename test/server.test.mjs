@@ -40,7 +40,7 @@ const fakeSpawn = (bin, args, opts) => {
 };
 // liveWindowMs: 0 — the fixture files were written a moment ago and would otherwise count as "open in a terminal".
 // `hook` is pinned so the developer's own omni.config.json (where the goal hook may be on) never leaks into the assertions.
-const app = await createApp({ port: 0, relay: { host: "" }, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
+const app = await createApp({ port: 0, relay: { host: "" }, sseKeepAliveMs: 100, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
 await app.listen();
 const port = app.server.address().port;
 const api = async (path, opts) => {
@@ -93,6 +93,44 @@ test("appended lines are tailed and broadcast over SSE (observed session => whol
   assert.ok(ev, `tool result broadcast; got ${JSON.stringify(got.map((g) => g.kind))}`);
   assert.equal(ev.live, false);
   assert.equal(ev.blocks[0].text, "a.apk");
+});
+
+/** The raw text of an event stream until `until` matches or ms pass. */
+async function streamText(path, until, ms = 2000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  let text = "";
+  try {
+    const reader = (await fetch(`http://127.0.0.1:${port}${path}`, { signal: ac.signal })).body.getReader();
+    const dec = new TextDecoder();
+    while (!until.test(text)) { const { value, done } = await reader.read(); if (done) break; text += dec.decode(value); }
+  } catch { /* aborted */ }
+  clearTimeout(timer);
+  ac.abort();
+  return text;
+}
+
+test("the stream's keepalive is an event a page can see, so it can tell a silently dead stream from a quiet one", async () => {
+  // An SSE comment (": ka") never reaches page code: a stream cut without a FIN (a phone changing networks, a NAT
+  // forgetting it, the relay's far side gone) looked exactly like a quiet one, forever.
+  const text = await streamText(`/events?since=${app.bus.seq}`, /event: ka\ndata: \S/);
+  assert.match(text, /event: ka\ndata: \S/);
+});
+
+test("a page that goes away leaves no stream behind on the server", async () => {
+  const before = app.bus.clients.size;
+  await streamText(`/events?since=${app.bus.seq}`, /: omni/);
+  for (let i = 0; i < 50 && app.bus.clients.size > before; i++) await sleep(10);
+  assert.equal(app.bus.clients.size, before);
+});
+
+test("a page reconnecting to a restarted server is told to resync; /api/state names the server run", async () => {
+  const st = await api("/api/state");
+  assert.equal(st.boot, app.bus.boot);
+  const text = await streamText(`/events?since=${st.seq || 1}&boot=an-earlier-run`, /event: resync/);
+  assert.match(text, /event: resync\ndata: \{"boot":"[0-9a-f]+"/);
+  const same = await streamText(`/events?since=${st.seq}&boot=${st.boot}`, /event: ka/);
+  assert.ok(!same.includes("event: resync"), "the same run catches up from its seq");
 });
 
 test("memory routes: save, search, pack, note read, digest", async () => {
@@ -478,12 +516,14 @@ test("model and thinking choices made before pi runs are remembered and handed t
   assert.equal(mj.pending, true);
   assert.equal(mj.modelId, "deepseek/x");
   const t = await fetch(`http://127.0.0.1:${port}/api/pi/thinking`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ level: "low" }) });
-  assert.equal((await t.json()).pending, true);
+  const tj = await t.json();
+  assert.equal(tj.pending, true);
+  assert.equal(tj.level, "high", "a DeepSeek V3-style model only switches thinking on or off: low is on");
   const bad = await fetch(`http://127.0.0.1:${port}/api/pi/thinking`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ level: "turbo" }) });
   assert.equal(bad.status, 400);
   const st = await api("/api/state");
   assert.equal(st.pi.running, false);
-  assert.deepEqual([st.config.piProvider, st.config.piModel, st.config.piThinking], ["openrouter", "deepseek/x", "low"]);
+  assert.deepEqual([st.config.piProvider, st.config.piModel, st.config.piThinking], ["openrouter", "deepseek/x", "high"]);
   // the stubbed-pi app: a live child gets the change at once, and the next child is created with the saved choices
   fakePi.calls.length = 0;
   const r = await post2("/api/pi/model", { provider: "orca", modelId: "qwen" });
@@ -492,4 +532,22 @@ test("model and thinking choices made before pi runs are remembered and handed t
   assert.deepEqual(fakePi.calls, [["model", "orca", "qwen"], ["thinking", "high"]]);
   await post2("/api/pi/start", { cwd: base });
   assert.deepEqual([fakePi.model, fakePi.provider, fakePi.thinking], ["qwen", "orca", "high"]);
+});
+
+test("thinking levels follow the model: its family's levels, and a switch moves the saved level to the nearest it has", async () => {
+  const levels = async (q) => (await api(`/api/pi/thinking-levels${q}`)).data;
+  assert.deepEqual((await levels("?provider=openrouter&model=deepseek/deepseek-v4.1-flash")).levels, ["off", "high", "max"]);
+  assert.deepEqual((await levels("?provider=x&model=gpt-5.2")).levels, ["off", "low", "medium", "high", "xhigh"]);
+  const qwen = await levels("?provider=orca&model=Qwen/Qwen3.8-27B");
+  assert.deepEqual([qwen.levels, qwen.labels], [["off", "high"], { high: "on" }]);
+  assert.deepEqual((await levels("?provider=x&model=some-unknown-model")).levels, ["off", "minimal", "low", "medium", "high"]);
+  // the current model when none is named (`app` saved openrouter/deepseek/x above)
+  assert.equal((await levels("")).model, "deepseek/x");
+  // claude-opus-5-5 has max; GPT-5.2 does not: a switch moves max down to xhigh, and a live pi gets it at once
+  fakePi.calls.length = 0;
+  await post2("/api/pi/model", { provider: "anthropic", modelId: "claude-opus-5-5" });
+  assert.equal((await post2("/api/pi/thinking", { level: "max" })).json.level, "max");
+  const r = await post2("/api/pi/model", { provider: "openai", modelId: "gpt-5.2" });
+  assert.equal(r.json.level, "xhigh");
+  assert.deepEqual(fakePi.calls.slice(-2), [["model", "openai", "gpt-5.2"], ["thinking", "xhigh"]]);
 });
