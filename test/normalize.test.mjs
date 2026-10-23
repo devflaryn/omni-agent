@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   normalizePiEntry,
-  normalizePiRpcEvent,
+  normalizeRpcEvent,
   normalizeClaudeEntry,
   normalizeClaudeStream,
   usageFromPi,
@@ -61,20 +61,20 @@ test("pi user message with string content", () => {
 });
 
 test("pi rpc deltas -> delta events; message_end -> live msg; status + tool events", () => {
-  const d = normalizePiRpcEvent({ type: "message_update", usage: { input: 1 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "He" } }, ctx);
+  const d = normalizeRpcEvent({ type: "message_update", usage: { input: 1 }, assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "He" } }, ctx);
   assert.equal(d[0].kind, "delta");
   assert.equal(d[0].part, "text");
   assert.equal(d[0].delta, "He");
-  const tc = normalizePiRpcEvent({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, id: "c9", toolName: "bash" } }, ctx);
+  const tc = normalizeRpcEvent({ type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 1, id: "c9", toolName: "bash" } }, ctx);
   assert.equal(tc[0].kind, "block");
   assert.equal(tc[0].toolId, "c9");
-  const end = normalizePiRpcEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hello" }], usage: { input: 5, output: 1 } } }, ctx);
+  const end = normalizeRpcEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Hello" }], usage: { input: 5, output: 1 } } }, ctx);
   assert.equal(end[0].kind, "msg");
   assert.equal(end[0].live, true);
-  const st = normalizePiRpcEvent({ type: "agent_start" }, ctx);
+  const st = normalizeRpcEvent({ type: "agent_start" }, ctx);
   assert.equal(st[0].kind, "status");
   assert.equal(st[0].streaming, true);
-  const te = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false }, ctx);
+  const te = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false }, ctx);
   assert.equal(te[0].kind, "tool");
   assert.equal(te[0].phase, "end");
 });
@@ -144,31 +144,31 @@ test("tool results keep the images the read tool returned (pi file, pi rpc, clau
   const [ev] = normalizePiEntry({ type: "message", id: "m9", timestamp: "t", message: { role: "toolResult", toolCallId: "c9", toolName: "read", content: [{ type: "text", text: "Read image file [image/png]" }, { type: "image", data: png, mimeType: "image/png" }], isError: false } }, ctx);
   assert.equal(ev.blocks[0].text, "Read image file [image/png]\n[image]");
   assert.deepEqual(ev.blocks[0].images, [{ mimeType: "image/png", data: png }]);
-  const [rpc] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "read", result: { content: [{ type: "text", text: "x" }, { type: "image", data: png, mimeType: "image/jpeg" }] }, isError: false }, ctx);
+  const [rpc] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "read", result: { content: [{ type: "text", text: "x" }, { type: "image", data: png, mimeType: "image/jpeg" }] }, isError: false }, ctx);
   assert.deepEqual(rpc.images, [{ mimeType: "image/jpeg", data: png }]);
-  const [plain] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash", result: { content: [{ type: "text", text: "x" }] } }, ctx);
+  const [plain] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "bash", result: { content: [{ type: "text", text: "x" }] } }, ctx);
   assert.equal("images" in plain, false, "text-only results carry no images key");
   const [cl] = normalizeClaudeEntry({ type: "user", uuid: "u9", timestamp: "t", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_9", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: png } }] }] } }, { sid: "claude:x", harness: "claude" });
   assert.deepEqual(cl.blocks[0].images, [{ mimeType: "image/png", data: png }]);
-  const [big] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "read", result: { content: [{ type: "image", data: "a".repeat(9 * 1024 * 1024), mimeType: "image/png" }] } }, ctx);
+  const [big] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c9", toolName: "read", result: { content: [{ type: "image", data: "a".repeat(9 * 1024 * 1024), mimeType: "image/png" }] } }, ctx);
   assert.equal("images" in big, false, "oversized images are dropped from the event");
 });
 
 test("pi custom omni-fallback message -> plain system line flagged as a fallback (other custom types keep their tag)", () => {
-  const fb = normalizePiRpcEvent({ type: "message_end", message: { role: "custom", customType: "omni-fallback", content: "model error on a/x → switched to b/y", display: true } }, ctx);
+  const fb = normalizeRpcEvent({ type: "message_end", message: { role: "custom", customType: "omni-fallback", content: "model error on a/x → switched to b/y", display: true } }, ctx);
   assert.equal(fb[0].role, "system");
   assert.equal(fb[0].fallback, true);
   assert.equal(fb[0].blocks[0].text, "model error on a/x → switched to b/y");
-  const other = normalizePiRpcEvent({ type: "message_end", message: { role: "custom", customType: "note", content: "hi" } }, ctx);
+  const other = normalizeRpcEvent({ type: "message_end", message: { role: "custom", customType: "note", content: "hi" } }, ctx);
   assert.equal(other[0].blocks[0].text, "[note] hi");
   assert.equal(other[0].fallback, undefined);
 });
 
 test("the plan tool's state rides on its result (live tool event and tool-result message); other tools' details are dropped", () => {
   const plan = { v: 1, milestones: [{ id: "1", title: "M", steps: [] }], brainstorm: null };
-  const [live] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "plan", result: { content: [{ type: "text", text: "Plan created" }], details: { plan, events: ["created"], ok: true } } }, ctx);
+  const [live] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "plan", result: { content: [{ type: "text", text: "Plan created" }], details: { plan, events: ["created"], ok: true } } }, ctx);
   assert.deepEqual(live.details, { plan, events: ["created"], ok: true });
-  const [other] = normalizePiRpcEvent({ type: "tool_execution_end", toolCallId: "c2", toolName: "bash", result: { content: [], details: { truncation: null } } }, ctx);
+  const [other] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c2", toolName: "bash", result: { content: [], details: { truncation: null } } }, ctx);
   assert.equal(other.details, undefined);
   const [msg] = normalizePiEntry({ type: "message", id: "e1", timestamp: 1, message: { role: "toolResult", toolCallId: "c1", toolName: "plan", content: [{ type: "text", text: "ok" }], details: { plan, events: ["created"] } } }, ctx);
   assert.deepEqual(msg.blocks[0].details, { plan, events: ["created"], ok: true });

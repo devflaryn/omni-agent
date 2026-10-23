@@ -1,5 +1,5 @@
 /**
- * Omni Agent's OpenCode plugin: what the pi extensions (integrations/pi/omni-*.ts) gave a pi chat, for the chats Omni
+ * Omni Agent's OpenCode plugin: what the pi extensions (the old integrations/pi/omni-*.ts) gave a pi chat, for the chats Omni
  * runs on its own `opencode serve`.
  *
  *   plan                                  the planner (ui/plan.js): brainstorm → create → start/done …; its state
@@ -307,7 +307,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       ].join(" "),
       args: {
         task: z.string().describe("The complete, self-contained task: goal, context (paths, findings, ids), constraints, what to report back"),
-        kind: z.enum(["pi", "claude"]).optional().describe("pi (default): another agent like you; claude: Claude Code"),
+        kind: z.enum(["pi", "claude"]).optional().describe("pi (default): another OpenCode agent like you; claude: Claude Code"),
         agent: z.string().optional().describe("Agent persona name (kind pi), e.g. scout"),
         title: z.string().optional().describe("Short title for the agent's chat (default: the start of the task)"),
         cwd: z.string().optional().describe("Working directory (default: the current one)"),
@@ -330,7 +330,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         deliverTo(me.parentSessionId);
         const queued = rec.status === "queued" ? " It is queued until a slot frees (the agent limit is reached)." : "";
         return reply(
-          `Started ${kind} agent ${rec.id} "${rec.title || titleFor(args.task)}" — it runs in the background; its report arrives as a message when it finishes.${queued} Keep working. agent_wait / agent_status to check, agent_message to steer it, agent_cancel to stop it.`,
+          `Started ${kindLabel(kind)} ${rec.id} "${rec.title || titleFor(args.task)}" — it runs in the background; its report arrives as a message when it finishes.${queued} Keep working. agent_wait / agent_status to check, agent_message to steer it, agent_cancel to stop it.`,
           { id: rec.id, kind, status: rec.status },
         );
       },

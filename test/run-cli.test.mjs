@@ -53,7 +53,7 @@ test("--resume puts pi back on the run's own chat even though the fresh pi annou
   const switched = [];
   const pi = {
     sid: "pi:fresh", proc: {}, streaming: false, state: { sessionFile: fresh },
-    // what PiRpc.refreshState() does before the ready promise resolves
+    // what OpencodeRpc announces before the ready promise resolves
     waitReady: async () => { bus.emit({ sid: "pi:fresh", harness: "pi", kind: "session", owned: true, file: fresh }); },
     switchSession: async (f) => { switched.push(f); pi.state.sessionFile = f; },
     prompt: async () => {}, setThinking: async () => {}, stop() {},

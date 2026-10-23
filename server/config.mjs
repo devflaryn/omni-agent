@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, networkInterfaces } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,37 +6,6 @@ import { fileURLToPath } from "node:url";
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const HOME = homedir();
 export const CONFIG_FILE = join(ROOT, "omni.config.json");
-const APPDATA = process.env.APPDATA || join(HOME, "AppData", "Roaming");
-const PI_CLI_REL = join("@earendil-works", "pi-coding-agent", "dist", "cli.js");
-
-/**
- * Locate pi's `dist/cli.js` so the child can be spawned as `node cli.js --mode rpc`
- * (no shell, no `.cmd` shim, no PATH surprises inside a GUI launcher).
- * Order: the `pi` launcher on PATH (a symlink to cli.js on macOS/Linux npm installs),
- * `%APPDATA%\npm` on Windows, then the usual global `node_modules` prefixes.
- */
-export function findPiCli({ home = HOME, platform = process.platform, pathEnv = process.env.PATH || "", appdata = process.env.APPDATA, prefixes } = {}) {
-  const isFile = (p) => { try { return !!p && existsSync(p); } catch { return false; } };
-  for (const dir of pathEnv.split(delimiter).filter(Boolean)) {
-    const bin = join(dir, "pi");
-    if (!isFile(bin)) continue;
-    let real;
-    try { real = realpathSync(bin); } catch { continue; }
-    if (/\.(m?js)$/i.test(real)) return real;
-  }
-  const candidates = [];
-  if (platform === "win32") candidates.push(join(appdata || join(home, "AppData", "Roaming"), "npm", "node_modules"));
-  candidates.push(...(prefixes ?? [
-    join(home, ".local", "lib", "node_modules"),
-    join(home, ".npm-global", "lib", "node_modules"),
-    "/opt/homebrew/lib/node_modules",
-    "/usr/local/lib/node_modules",
-    "/usr/lib/node_modules",
-    join(home, ".bun", "install", "global", "node_modules"),
-  ]));
-  for (const prefix of candidates) { const p = join(prefix, PI_CLI_REL); if (isFile(p)) return p; }
-  return null;
-}
 
 /** { ENV_NAME: "/path/to/key.txt" } → { ENV_NAME: "<first line>" } for the files that exist. */
 export function apiKeyEnv(files) {
@@ -110,12 +79,9 @@ export const CONFIG = {
   trashDir: fc.trashDir || join(HOME, ".omni-agent", "trash"),
   piSessionsDir: fc.piSessionsDir || join(HOME, ".pi", "agent", "sessions"),
   claudeProjectsDir: fc.claudeProjectsDir || join(HOME, ".claude", "projects"),
-  /** pi is launched as `node cli.js --mode rpc` (no shell, no quoting issues). */
-  piCli: fc.piCli || findPiCli(),
   /** pi's config folder; its `models.json` holds pi's providers (copied once into opencodeProvidersFile). */
   piAgentDir: fc.piAgentDir || join(HOME, ".pi", "agent"),
   piModelsFile: fc.piModelsFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "models.json"),
-  piBin: fc.piBin || "pi",
   /** The `opencode` launcher: Omni runs one `opencode serve` that every chat and background agent shares. */
   opencodeBin: fc.opencodeBin || "opencode",
   /** Omni's own OpenCode config dir (`OPENCODE_CONFIG_DIR`): opencode.json written by Omni, layered over the user's global config. */
@@ -134,9 +100,9 @@ export const CONFIG = {
    * into opencode.json's `mcp`); scripts/install.mjs writes omnidroid's `omniMcp` there.
    */
   piExtConfigFile: fc.piExtConfigFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "omni-agent.json"),
-  /** Key files handed to the pi child as environment variables (one line each, gitignored). */
+  /** Key files handed to Omni's `opencode serve` as environment variables (one line each, gitignored). */
   apiKeyFiles: { OPENROUTER_API_KEY: join(ROOT, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },
-  /** Guest resolution (WxH[@DPI]) exported as OMNI_DISPLAY to the pi child, so any omnidroid
+  /** Guest resolution (WxH[@DPI]) exported as OMNI_DISPLAY to Omni's `opencode serve`, so any omnidroid
    *  the model launches boots at a higher default resolution. Empty string / "native" = off. */
   emulatorDisplay: fc.emulatorDisplay ?? "1600x1000",
   claudeBin: process.env.OMNI_CLAUDE_BIN || fc.claudeBin || "claude",
@@ -144,13 +110,13 @@ export const CONFIG = {
   cwd: argVal("--cwd", process.env.OMNI_CWD || fc.cwd || join(HOME, "Desktop")),
   piModel: argVal("--model", fc.piModel || ""),
   piProvider: argVal("--provider", fc.piProvider || ""),
-  /** Thinking level pi starts with (off|minimal|low|medium|high); "" = pi's own default. The picker persists it. */
+  /** Thinking level a new chat starts with (off|minimal|low|medium|high); "" = the model's own default. The picker persists it. */
   piThinking: argVal("--thinking", fc.piThinking || ""),
-  /** Model picker allowlist, "provider/id" patterns with `*` (e.g. ["orca/*"]). Unset → every model pi knows. */
+  /** Model picker allowlist, "provider/id" patterns with `*` (e.g. ["orca/*"]). Unset → every model OpenCode offers. */
   piModels: Array.isArray(fc.piModels) ? fc.piModels : null,
-  /** Longest a `POST /api/claude/task` (pi → Claude delegation) waits before returning what it has. */
+  /** Longest a `POST /api/claude/task` (chat → Claude delegation) waits before returning what it has. */
   claudeTaskTimeoutSec: fc.claudeTaskTimeoutSec || 900,
-  /** Start the pi child at boot. `--no-pi` or {"autoStartPi":false} disables it. */
+  /** Open a chat on OpenCode at boot. `--no-pi` or {"autoStartPi":false} disables it. */
   autoStartPi: !process.argv.includes("--no-pi") && fc.autoStartPi !== false,
   /** Seconds of quiet after which a session digest is written to the vault. */
   digestIdleSec: fc.digestIdleSec || 90,
@@ -160,34 +126,28 @@ export const CONFIG = {
   graphBudgetTokens: fc.graphBudgetTokens || 900,
   /** A non-owned session file touched within this window counts as "still open in a terminal" → fork instead of resume. */
   liveWindowMs: fc.liveWindowMs || 30000,
-  /** Goal hook: when Omni's pi stops before its plan is finished, it is re-engaged (see server/hook.mjs). */
+  /** Goal hook: when an Omni chat stops before its plan is finished, it is re-engaged (see server/hook.mjs). */
   hook: hookConfig(fc.hook),
-  /** Watchdog: pi claims to be streaming but produced no event for this long → abort+restart.
-   *  Must stay ABOVE pi's own `httpIdleTimeoutMs` so pi's in-process HTTP retry runs first (I3). */
+  /** Watchdog: a chat claims to be streaming but produced no event for this long → abort and reattach
+   *  (server/opencode-rpc.mjs). Long enough for the provider's own HTTP retries to run first. */
   stallMs: Number(fc.stallMs) || 900000,
-  /** Restart counter resets after the child streamed healthily this long. */
-  restartHealthyMs: Number(fc.restartHealthyMs) || 120000,
-  /** A tool that runs this long without any pi event is still not a stall (builds, device boots, waits);
+  /** A tool that runs this long without any event is still not a stall (builds, device boots, waits);
    *  the watchdog uses this limit instead of `stallMs` while a tool call is open. */
   toolStallMs: Number(fc.toolStallMs) || 4 * 3600000,
   /** Context policy for long runs (compaction point, auto-continue after a "my context is full" stop). */
   context: contextConfig(fc.context),
-  /** pi's own settings file (compaction.reserveTokens is read from it). */
-  piSettingsFile: fc.piSettingsFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "settings.json"),
-  /** Background agents (pi subagents, Claude Code sessions, shell jobs) the agents start: registry + logs. */
+  /** Background agents (OpenCode agents, Claude Code sessions, shell jobs) the agents start: registry + logs. */
   agents: agentsConfig(fc.agents),
   agentsFile: fc.agentsFile || join(HOME, ".omni-agent", "agents.json"),
   agentsDir: fc.agentsDir || join(HOME, ".omni-agent", "agents"),
   /** Explicit goals survive an Omni restart: the goal, its chat's session file and cwd. */
   goalsFile: fc.goalsFile || join(HOME, ".omni-agent", "goals.json"),
-  /** Which models.json contextWindow overrides Omni wrote itself (server/context-policy.mjs), so hand-written ones are never touched. */
-  contextCapsFile: fc.contextCapsFile || join(HOME, ".omni-agent", "context-caps.json"),
   /** Where unattended run ledgers live. */
   /** The status-box summarizer's own side conversations (one OpenCode session per goal, ids kept in opencode-sessions.json; the judge's and the summarizer's sessions run in this directory), apart from the chats. */
   statusSessionsDir: fc.statusSessionsDir || join(HOME, ".omni-agent", "status-sessions"),
   runsDir: fc.runsDir || join(fc.vaultDir || join(ROOT, "vault"), "Runs"),
   /** CLI reverse-engineering tools (jadx/apktool/baksmali/smali) are pre-installed here and this
-   *  bin dir is put on the pi child's PATH, so the agent finds working headless CLIs instead of
+   *  bin dir is put on the PATH of Omni's `opencode serve`, so the agent finds working headless CLIs instead of
    *  re-downloading them from GitHub or launching a GUI. Provisioned by `node scripts/install-tools.mjs`. */
   toolsBinDir: fc.toolsBinDir || join(HOME, ".omni-agent", "tools", "bin"),
 };
@@ -219,7 +179,7 @@ export function hookConfig(raw = {}) {
     /** Consecutive re-engagements without a single tool call before the keeper gives up; otherwise it never stops. */
     maxIdleNudges: int(h.maxIdleNudges, 5, 1, 50),
     graceMs: int(h.graceMs, 2000, 0, 600000),
-    /** Whether the separate summarizer conversation writes the status box (default on) — never into pi's context.
+    /** Whether the separate summarizer conversation writes the status box (default on) — never into the chat's context.
      *  Paced by the plan, not by time or tool calls: when the plan is written or revised, at each milestone, at the end. */
     summaries: h.summaries !== false,
     /** Re-engages restate the goal verbatim only every N times (and after a compaction); 0 = only after a compaction. */
@@ -242,9 +202,8 @@ export function hookConfig(raw = {}) {
 }
 
 /**
- * Context policy. `compactAt`: pi compacts a chat once its prompt passes this many tokens (Omni caps each
- * model's effective window in models.json `modelOverrides`, see server/context-policy.mjs); 0 = leave pi's
- * windows alone. `autoContinue`: a run that stops because the model believes its context is used up is
+ * Context policy. `compactAt`: a chat is compacted before its next prompt once its context passes this many tokens
+ * (OpencodeRpc's `compactAt`); 0 = only OpenCode's own compaction. `autoContinue`: a run that stops because the model believes its context is used up is
  * compacted and continued even with the goal hook off. Pure.
  */
 export function contextConfig(raw = {}) {
@@ -280,12 +239,12 @@ export function agentsConfig(raw = {}) {
   };
 }
 
-/** Environment handed to the pi child — and to Omni's `opencode serve`, which every chat shares, so it carries
+/** Environment handed to Omni's `opencode serve`, which every chat shares, so it carries
  *  only server-wide values (a background agent's identity cannot reach it): provider API keys (from key files), the emulator display
  *  override (so omnidroid launched by the model uses the higher default resolution), and
- *  OMNI_MEMORY=server, which tells the omni-memory extension that this child is Omni's own:
- *  the server attaches the vault pack per prompt (composer checkbox), so the extension must not
- *  add its own on every turn. Pure so it is unit-testable. */
+ *  OMNI_MEMORY=server, which says the memory tools run in Omni's own chats:
+ *  the server attaches the vault pack per prompt (composer checkbox), so no tool adds
+ *  its own on every turn. Pure so it is unit-testable. */
 export function piChildEnv(cfg = CONFIG, { path = process.env.PATH || "", exists = existsSync } = {}) {
   const env = { ...apiKeyEnv(cfg.apiKeyFiles || {}) };
   const disp = String(cfg.emulatorDisplay || "").trim();

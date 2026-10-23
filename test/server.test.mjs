@@ -516,7 +516,7 @@ test("goal: /api/goal reports an empty goal and rejects a set without a pi sessi
   const empty = await api("/api/goal");
   assert.equal(empty.goal, "");
   const r = await api("/api/goal", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ goal: "Do the thing" }) });
-  assert.match(r.error, /no active pi session/);
+  assert.match(r.error, /no active chat session/);
 });
 
 // ---------------------------------------------- goal kickoff + full-halt stop

@@ -1,7 +1,7 @@
 {
   "name": "omni-agent",
   "version": "0.1.0",
-  "description": "Omni Agent — local agentic OS: live pi + Claude Code transcripts, Obsidian-vault memory manager, token accounting.",
+  "description": "Omni Agent — local agentic OS: live OpenCode + Claude Code transcripts, Obsidian-vault memory manager, token accounting.",
   "type": "module",
   "private": true,
   "engines": { "node": ">=22" },

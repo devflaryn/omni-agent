@@ -421,14 +421,3 @@ export function migratePiProviders({ from, to, catalog = null }) {
   writeFileSync(marker, `${JSON.stringify({ at: new Date().toISOString(), from, copied, extended, skipped }, null, 2)}\n`);
   return { copied, extended, skipped, lines };
 }
-
-/** fillThinkingMaps on the file (call before a pi starts: pi reads models.json only at boot). Never throws. */
-export function applyThinkingMaps(file) {
-  try {
-    if (!file || !existsSync(file)) return { filled: [] };
-    const json = readModelsFile(file, { strict: true });
-    const filled = fillThinkingMaps(json);
-    if (filled.length) writeModelsFile(file, json);
-    return { filled };
-  } catch (e) { return { filled: [], error: e.message }; }
-}

@@ -23,7 +23,7 @@ test("per-token delta events are not written to the long-run log", () => {
   assert.equal(logWorthKeeping({ kind: "status", streaming: false }), true);
 });
 
-test("runHeadless prompts the pi child, streams its events and settles with a summary", async () => {
+test("runHeadless prompts the chat, streams its events and settles with a summary", async () => {
   const base = mkdtempSync(join(tmpdir(), "omni-headless-"));
   const lines = [];
   let fake;
@@ -52,7 +52,7 @@ test("runHeadless prompts the pi child, streams its events and settles with a su
     assert.equal(code, 0);
     assert.deepEqual(fake.calls, [["thinking", "low"], ["prompt", "check the emulator"]]);
     const joined = lines.join("\n");
-    assert.match(joined, /pi ready · session \/s\/fake\.jsonl · model openrouter\/deepseek\/deepseek-v4-flash-0731/);
+    assert.match(joined, /OpenCode ready · session \/s\/fake\.jsonl · model openrouter\/deepseek\/deepseek-v4-flash-0731/);
     assert.match(joined, /▶ bash: omnidroid list/);
     assert.match(joined, /✓ nothing running/);
     assert.match(joined, /🤖 Done: nothing was running\./);

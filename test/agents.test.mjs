@@ -16,7 +16,7 @@ after(() => { try { rmSync(base, { recursive: true, force: true }); } catch { /*
 let dirs = 0;
 const fresh = () => { const d = join(base, `t${++dirs}`); mkdirSync(d, { recursive: true }); return d; };
 
-/** PiRpc stand-ins: they record what the manager asks and emit bus events under their sid like the real one. */
+/** OpencodeRpc stand-ins: they record what the manager asks and emit bus events under their sid like the real one. */
 function piFactory(bus) {
   const made = [];
   const createPi = (opts) => {
@@ -231,7 +231,7 @@ test("pi agent: live events fill resultText, toolCalls, activity, turns, cost; i
   assert.equal(m.activeChildren("pi:parent"), 0);
   assert.deepEqual(killed, [1001], "the child's process tree is killed to free its memory");
   await sleep(20);
-  assert.equal(pi.stops, 1, "then PiRpc.stop() as the backstop");
+  assert.equal(pi.stops, 1, "then OpencodeRpc.stop() as the backstop");
   assert.equal(m.piFor("pi:sess1"), null);
   assert.ok(agentEvents.length >= 4);
   assert.ok(agentEvents.every((e) => e.sid === "pi:parent" && e.harness === "omni" && e.agent.id === rec.id));
@@ -319,7 +319,7 @@ test("pi agent: a child that dies is reported as an error and not relaunched", a
   assert.equal(r.status, "error");
   assert.match(r.error, /exited unexpectedly \(code 3\)/);
   assert.equal(r.exitCode, 3);
-  assert.equal(pis.made[0].stops, 1, "stop() inside the exit event keeps PiRpc from restarting it");
+  assert.equal(pis.made[0].stops, 1, "stop() inside the exit event keeps OpencodeRpc from reattaching it");
   m.dispose();
 });
 

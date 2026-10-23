@@ -5,7 +5,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CONTEXT_GUIDANCE, UNNAMED_TOOL, classifyStop, contextContinueMessage, contextSkipReason, contextStatusNote, effectiveContextWindow, explainUnfinishedToolCalls, repairToolCallIds, userAskedForHandoff, UNFINISHED_TOOL_NOTE } from "../integrations/pi/omni-context-lib.mjs";
+import { CONTEXT_GUIDANCE, UNNAMED_TOOL, classifyStop, contextContinueMessage, contextSkipReason, contextStatusNote, explainUnfinishedToolCalls, repairToolCallIds, userAskedForHandoff, UNFINISHED_TOOL_NOTE } from "../integrations/pi/omni-context-lib.mjs";
 
 const stop = (text, extra = {}) => classifyStop({ text, stopReason: "stop", ...extra });
 const NEUTRAL = "Summary: the loader resolves both imports now and the unit tests pass. Steps 4 and 5 of the plan are still open.";
@@ -176,19 +176,6 @@ test("error, aborted and toolUse stops win over any wording", () => {
   assert.equal(classifyStop({ text: claim, stopReason: "toolUse" }).kind, "tool-use");
   assert.deepEqual(classifyStop({ text: "  ", stopReason: "stop" }), { kind: "normal", reason: "empty reply" });
   assert.equal(classifyStop().kind, "normal");
-});
-
-test("effectiveContextWindow: compactAt + reserve, only when below the real window", () => {
-  assert.equal(effectiveContextWindow({ contextWindow: 1048576, compactAt: 256000, reserveTokens: 24576 }), 280576);
-  assert.equal(effectiveContextWindow({ contextWindow: 1000000, compactAt: 256000 }), 272384, "pi's default reserve 16384");
-  assert.equal(effectiveContextWindow({ contextWindow: 262144, compactAt: 256000, reserveTokens: 16384 }), null, "the real window already compacts sooner");
-  assert.equal(effectiveContextWindow({ contextWindow: 272384, compactAt: 256000, reserveTokens: 16384 }), null, "equal is not below");
-  assert.equal(effectiveContextWindow({ contextWindow: 272385, compactAt: 256000, reserveTokens: 16384 }), 272384);
-  assert.equal(effectiveContextWindow({ contextWindow: 1048576, compactAt: 0 }), null, "compactAt 0 = off");
-  assert.equal(effectiveContextWindow({ contextWindow: 0, compactAt: 256000 }), null);
-  assert.equal(effectiveContextWindow({ compactAt: 256000 }), null);
-  assert.equal(effectiveContextWindow({ contextWindow: 1000000, compactAt: 256000, reserveTokens: -5 }), 256000, "a negative reserve counts as 0");
-  assert.equal(effectiveContextWindow({ contextWindow: "1048576", compactAt: "256000", reserveTokens: "24576" }), 280576);
 });
 
 test("contextSkipReason: skipping because of context/budget/another session, not 'GL context'", () => {

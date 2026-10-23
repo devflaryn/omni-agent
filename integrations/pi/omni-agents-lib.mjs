@@ -1,8 +1,8 @@
 /**
- * Background agents and jobs for pi, the client side: the HTTP client for the Omni server's
+ * Background agents and jobs, the client side: the HTTP client for the Omni server's
  * `/api/agents` routes, the chunked wait loops, the report text, and the delivery poller that
- * wakes the chat when a background agent finishes. Shared by omni-agents.ts (agent_* / job_* tools)
- * and omni-claude.ts (claude_task). Plain ESM, no pi imports, so the tests drive it directly.
+ * wakes the chat when a background agent finishes. Used by the OpenCode plugin (integrations/opencode/omni-plugin.mjs:
+ * agent_* / job_* tools and claude_task). Plain ESM, so the tests drive it directly.
  *
  * Every blocking request stays ≤ 240 s (CHUNK_SEC), and under pi's own `httpIdleTimeoutMs`
  * (chunkSecFor): pi's HTTP client gives up on a response whose headers take longer, which is what
@@ -82,7 +82,7 @@ export function elapsedOf(rec, now = Date.now()) {
   return fmtDuration((Number.isFinite(end) ? end : now) - start);
 }
 
-export const kindLabel = (kind) => (kind === "claude" ? "Claude agent" : kind === "shell" ? "job" : "pi agent");
+export const kindLabel = (kind) => (kind === "claude" ? "Claude agent" : kind === "shell" ? "job" : "OpenCode agent");
 const statusText = (rec) => `${rec.status}${rec.kind === "shell" && rec.exitCode != null ? ` (exit ${rec.exitCode})` : ""}`;
 
 /** One line per agent: id · kind · status · elapsed · title — last activity. */

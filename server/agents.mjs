@@ -1,5 +1,5 @@
 /**
- * Background agents: pi subagents, Claude Code sessions and shell jobs that a chat (or one of its
+ * Background agents: OpenCode agents (internal kind "pi"), Claude Code sessions and shell jobs that a chat (or one of its
  * agents) starts and keeps working beside. Each one is a plain record in a small registry
  * (agents.json, written atomically) and every change is broadcast as a bus `agent` event.
  *
@@ -90,7 +90,7 @@ function tailLines(file, n) {
 
 export class AgentManager extends EventEmitter {
   /**
-   * `createPi(opts)` → a PiRpc-like child (start, waitReady, prompt, abort, stop, switchSession, owns, sid,
+   * `createPi(opts)` → an OpencodeRpc-like chat (start, waitReady, prompt, abort, stop, switchSession, owns, sid,
    * state, streaming, proc; "exit" events); `opts` = {cwd, model, provider, thinking, env, system, tools, meta}, with
    * a persona's prompt as `system` and its tool allowlist (pi names, plus the plan tool) as `tools`, else "" / null.
    * `personasDir` holds the persona files. `claude` → a ClaudeRunner ("exit" events, runs, run, send, abort).
@@ -145,8 +145,10 @@ export class AgentManager extends EventEmitter {
   /** Agents still queued, starting or running under that chat (the goal keeper waits for them). */
   /** Active agents under a chat; `kinds` narrows it (the goal keeper waits for pi/claude agents, not for a long-lived shell job). */
   activeChildren(parentSid, { kinds = null } = {}) { let n = 0; for (const r of this.records.values()) if (parentSid && r.parentSid === parentSid && isActive(r) && (!kinds || kinds.includes(r.kind))) n++; return n; }
-  /** The live PiRpc of a pi agent's chat (the keeper's getPi), else null. */
+  /** The live OpencodeRpc of a pi agent's chat (the keeper's getPi), else null. */
   piFor(sid) { const id = this.bySid.get(sid); const rt = id && this.rt.get(id); return rt?.pi?.proc && this.records.get(id)?.kind === "pi" ? rt.pi : null; }
+  /** Every pi agent's live chat (a context-policy change reaches them without a restart). */
+  liveChildren() { const out = []; for (const rt of this.rt.values()) if (rt.pi?.proc) out.push(rt.pi); return out; }
   /** True when a live pi agent writes that session file (the watcher must not tail it twice). */
   owns(file) { for (const rt of this.rt.values()) if (rt.pi?.owns?.(file)) return true; return false; }
   /** The agent whose own chat is `sid` (its current or an earlier one), else null. */
@@ -272,7 +274,7 @@ export class AgentManager extends EventEmitter {
 
   // ------------------------------------------------------------------ pi
   async launchPi(rec, rt, gen) {
-    if (typeof this.createPi !== "function") throw new Error("pi agents are not available (no createPi)");
+    if (typeof this.createPi !== "function") throw new Error("OpenCode agents are not available (no createPi)");
     const persona = rec.agent ? this.persona(rec.agent) : null;
     // The vault memory pack (and repo graph) when asked for, as a Claude agent gets it: the shared server's chats have
     // no recall of their own (OMNI_MEMORY=server), so it rides in the agent's system prompt after its persona.
@@ -309,21 +311,21 @@ export class AgentManager extends EventEmitter {
     this.touch(rec);
     rt.prompted = true;
     const r = await pi.prompt(text + AGENT_FOOTER, { echo: true });
-    if (r && r.success === false) throw new Error(r.error || "pi refused the prompt");
+    if (r && r.success === false) throw new Error(r.error || "OpenCode refused the prompt");
   }
 
   onPiExit(id, gen, pi, code) {
     const rec = this.records.get(id), rt = this.rt.get(id);
     if (!rec || !rt || rt.gen !== gen || rt.pi !== pi) return;
     rt.pi = null;
-    // An agent whose process dies is reported, not relaunched: stop() keeps PiRpc from restarting it.
+    // An agent whose chat dies is reported, not relaunched: stop() keeps OpencodeRpc from reattaching it.
     try { pi.stop(); } catch { /* gone */ }
     if (rt.stopping || !isActive(rec)) return;
     rec.exitCode = code ?? null;
-    this.finish(rec, "error", { error: `pi exited unexpectedly (code ${code})` });
+    this.finish(rec, "error", { error: `the agent's OpenCode chat exited unexpectedly (code ${code})` });
   }
 
-  /** Free the child: tree-kill (its bash tools and their children), then PiRpc.stop() as the backstop. */
+  /** Free the child: tree-kill (its bash tools and their children), then OpencodeRpc.stop() as the backstop. */
   stopPi(pi) {
     const proc = pi?.proc, pid = proc?.pid;
     try { pi.stopped = true; pi.stopWatchdog?.(); } catch { /* fake */ }
@@ -625,7 +627,7 @@ export class AgentManager extends EventEmitter {
         const streaming = !!pi.streaming;
         const behavior = (steer ?? rec.steer) ? "steer" : "followUp";
         const r = await pi.prompt(t, { echo: true, behavior });
-        if (r && r.success === false) throw httpError(409, r.error || "pi refused the message");
+        if (r && r.success === false) throw httpError(409, r.error || "OpenCode refused the message");
         if (!streaming) { this.clear(rt, "idle"); rec.status = "running"; }
         rec.delivered = false;
         this.touch(rec);

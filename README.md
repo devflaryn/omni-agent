@@ -120,90 +120,85 @@ Tests: `npm test`.
 ### Unattended multi-day runs
 
 `node scripts/run.mjs --cwd <project> --goal "…"` starts a durable run: it keeps one
-pi session alive for days, re-engaging it toward the goal, surviving crashes (it resumes
-the same session), compacting without losing the goal, and offloading huge tool output.
+Omni chat on OpenCode going for days, re-engaging it toward the goal (the goal hook below) and reattaching
+it when `opencode serve` crashes and is restarted (the chat resumes the same OpenCode session).
 State lives in `vault/Runs/<run-id>/` (`run.json`, `ledger.md`, `events.jsonl`, `artifacts/`).
 Resume after a reboot with `--resume <run-id>`. The desktop/browser GUI is a read-only
 observer — open `http://127.0.0.1:4400` to watch; closing it never stops the run.
 
-Run `node scripts/install.mjs` once first so pi loads the `omni-run` extension
-(context re-injection + durable compaction) and the recovering model fallback.
-
-For weak small-context models, set in `~/.pi/agent/settings.json` a longer
-`httpIdleTimeoutMs` (e.g. 600000) so pi's own HTTP retry runs before Omni's watchdog kills and
-restarts the child. Keep it strictly BELOW Omni's `stallMs` (default 900000) — i.e.
-`httpIdleTimeoutMs` 600000 < `stallMs` 900000 — so the watchdog only fires after pi's own retry
-has had its chance. Also make sure each
-model's `contextWindow` in `~/.pi/agent/models.json` matches reality (DeepSeek V4 Flash is
-1.3M; the chat-dated DeepSeek is 128k — a wrong value makes pi compact too late or too often).
+Omni's watchdog aborts the run of a chat that claims to be streaming but has produced no event for
+`stallMs` (900000, 15 min; `toolStallMs`, 4 h, while a tool call is open). Make sure each model's context
+window is right (OpenCode's catalog has it; for a custom provider, the Providers dialog), or compaction comes
+too late or too often.
 
 ### Long runs: compaction, auto-continue, goals that survive a restart
 
-What used to end long runs early (measured over every pi chat on this machine): with a model declared at 1M
-tokens pi only compacts past ~975k, but the model itself started ending its turns at 375k–900k claiming its
-"context is nearly exhausted" and writing handoffs for a fresh session. Nothing compacted, nothing continued.
+What used to end long runs early (measured over every pi chat on this machine, before the switch to OpenCode):
+with a model declared at 1M tokens compaction only came past ~975k, but the model itself started ending its turns
+at 375k–900k claiming its "context is nearly exhausted" and writing handoffs for a fresh session. Nothing compacted,
+nothing continued.
 
-- **Compaction point** (`context.compactAt`, default 256000; Settings → Long runs). pi compacts when a chat's prompt
-  passes `contextWindow − compaction.reserveTokens`, so Omni caps each model's *effective* window in
-  `~/.pi/agent/models.json` `providers.<P>.modelOverrides[<id>].contextWindow` = compactAt + reserveTokens before
-  every pi start. The declared model entry is untouched; overrides you write by hand are never touched; Omni's
-  own are tracked in `~/.omni-agent/context-caps.json`; `0` removes them. Floor 100k (a compacted chat still holds
-  the system prompt, the kept recent turns and the summary, ~60k). pi compacts between turns and keeps working.
-- **Context is managed for the model**: the `omni-context` extension adds a static system-prompt block ("context
-  size is never a reason to stop or hand off") and, above 70% of the budget, a one-line note on the newest message.
+- **Compaction point** (`context.compactAt`, default 256000; Settings → Long runs). Once a chat's last turn used more
+  context than this, Omni has OpenCode summarize the chat before its next prompt (`OpencodeRpc` `compactAt`; the
+  same for background agents). A change applies to the running chats from their next prompt on, nothing restarts.
+  Floor 100k (a compacted chat still holds the system prompt, the kept recent turns and the summary, ~60k); `0`
+  leaves compaction to OpenCode alone (it compacts when the model's window is full).
+- **Context is managed for the model**: the Omni plugin adds a static system-prompt block ("context size is never a
+  reason to stop or hand off").
 - **Auto-continue** (`context.autoContinue`, default on, even with the goal hook off): a turn that ends because the
   model *believes* its context or session is used up (`integrations/pi/omni-context-lib.mjs` `classifyStop`, also
   reading the model's reasoning) is compacted and re-engaged, up to `maxContextNudges` (3) in a row without
-  progress. So are output-limit stops that pi cannot recover (all output spent on reasoning) and transient
-  provider errors after pi's own retries (409, connection resets, timeouts, 5xx — with a growing back-off).
+  progress. So are output-limit stops that cannot recover by themselves (all output spent on reasoning) and transient
+  provider errors after the provider's own retries (409, connection resets, timeouts, 5xx — with a growing back-off).
   A handoff the user asked for, a real question to the user, and a finished answer are left alone.
 - **Stop** halts the run and pauses that goal; it no longer switches the goal hook off for every later run.
 - **Explicit goals** (`/goal`) are saved to `~/.omni-agent/goals.json` with their chat; after an Omni restart the
   newest unfinished one (active in the last 72 h, not stopped) is reopened and continued.
-- The watchdog no longer kills a pi whose tool call runs long and silent (`toolStallMs`, default 4 h).
-- `node scripts/replay-stops.mjs [--hook on|off]` replays every recorded pi session through the real normalizer and
-  goal keeper (fake pi, nothing executed) and counts what Omni now does at each point the original run stopped.
+- The watchdog does not abort a chat whose tool call runs long and silent (`toolStallMs`, default 4 h).
+- `node scripts/replay-stops.mjs [--hook on|off]` replays every recorded chat through the real normalizer and
+  goal keeper (a fake chat, nothing executed) and counts what Omni now does at each point the original run stopped.
 
 ### Background agents, Claude Code agents and background jobs
 
-The pi agent can delegate while it keeps working (`integrations/pi/omni-agents.ts`, run by the server's
+An Omni chat can delegate while it keeps working (the Omni plugin's tools, run by the server's
 `AgentManager` in `server/agents.mjs`):
 
 | tool | what it does |
 |---|---|
-| `agent_start {task, kind: "pi"\|"claude", agent?, title?, cwd?, model?}` | starts a background pi agent (optionally a persona from `~/.pi/agent/agents/*.md`) or a Claude Code session, and returns at once |
+| `agent_start {task, kind: "pi"\|"claude", agent?, title?, cwd?, model?}` | starts a background OpenCode agent (`kind: "pi"`, the internal name; optionally a persona from `integrations/pi/agents/*.md`, `personasDir`) or a Claude Code session, and returns at once |
 | `agent_status`, `agent_wait`, `agent_message`, `agent_cancel` | watch, wait for, steer or stop them |
 | `job_start {command}`, `job_wait {id, until}`, `job_output`, `job_kill` | a shell command in the background (builds, device boots, waiting for a log line) instead of `sleep` loops |
 
 When an agent or job finishes, its report arrives in the parent chat by itself as an `[omni-agent-result]` message
-(it wakes an idle chat). A pi agent is a pi child of its own with a *managed* goal: the goal keeper continues it after
-context stops, errors and length stops, exactly like the main chat. A Claude agent runs
+(it wakes an idle chat). An OpenCode agent is a chat of its own on the same shared `opencode serve`, with its
+persona's system prompt and tool allowlist sent with each prompt and a *managed* goal: the goal keeper continues it
+after context stops, errors and length stops, exactly like the main chat. A Claude agent runs
 `claude -p --input-format stream-json --output-format stream-json` unattended (`--permission-prompts none`), can be
 steered mid-run (`agent_message`) and resumed after it finished. Every agent shows up live in the UI as a child chat
 nested under its parent, with a strip above the composer (status, Open, Stop). Limits in `omni.config.json`
 `agents`: `maxConcurrent` (6, more queue), `maxDepth` (2), `maxMinutes` (360), `claudeModel`, `claudeMaxTurns`.
 The registry lives in `~/.omni-agent/agents.json`; agents that were running when Omni stopped come back as
-`interrupted` (their finished, undelivered reports are still delivered). `claude_task` is now built on the same
-path: it waits up to `timeoutMinutes` and leaves Claude running in the background after that, instead of dying at
-pi's 10-minute HTTP timeout. The blocking `subagent` tool still exists for quick parallel lookups.
+`interrupted` (their finished, undelivered reports are still delivered). `claude_task` is built on the same
+path: it waits up to `timeoutMinutes` and leaves Claude running in the background after that. For quick parallel
+lookups OpenCode's own `task` tool (its subagents) is there too.
 
 ## What you get
 
 - **Home**: one container. "What should we work on?", the composer, the working directory (recent
-  folders as chips). Sending starts Omni's pi in that folder and opens the chat.
+  folders as chips). Sending opens a chat on OpenCode in that folder.
 - **Chat**: a **file explorer** on the left rooted at the chat's folder, the transcript in the middle.
   Click a file and a preview column opens beside the tree: text files as text, `.md` rendered (with a
   Raw toggle), images as images, and `.zip` / `.apk` / `.jar` as the list of entries inside, where a
   text or image entry opens in place. **Reference** drops `@path` into the prompt. The folder button
   in the top bar hides or shows the explorer.
-- **Transcript**: pi streams token by token; chats run in a terminal appear whole. Each run of tool
+- **Transcript**: Omni's chats stream token by token; chats run in a terminal appear whole. Each run of tool
   calls folds into one line such as "Edited files, ran commands"; open it for a row per tool and a
   row for its arguments and output. Images the model reads (a `read` of a PNG) appear as small boxes
   under that line; click one for a large preview overlay. The status line
   `Thinking… 11m 20s · 15k tokens · 86 tok/sec` sits below the turn; the rate covers only the last
   five seconds of streamed output and disappears while the model waits on a tool. Click the line for
   the model's reasoning.
-- **Planner** (the `plan` tool, `omni-plan.ts`): for any task bigger than a few tool calls the agent
+- **Planner** (the `plan` tool, from the Omni plugin): for any task bigger than a few tool calls the agent
   works the way the superpowers brainstorm → write-plan → execute flow does. **brainstorm** first:
   the goal in its own words and its scope, assumptions to check, at least two approaches with their
   trade-offs, the chosen one and why, and success criteria. The tool refuses a plan without this.
@@ -211,15 +206,14 @@ pi's 10-minute HTTP timeout. The blocking `subagent` tool still exists for quick
   time, marking it **done** only with evidence. **revise** (with a reason) keeps the finished steps and
   replaces the rest. **ask_user** parks the plan until you answer. While a plan is open, a short
   reminder of it (current milestone, current step, its check) is added to the newest message of each
-  model call, so it survives compactions and does not break the prompt cache. `/plan` in a terminal pi
-  prints it.
+  model call, so it survives compactions and does not break the prompt cache.
 - **Goal hook** (model menu in the composer → *Goal hook*): the same idea as Claude Code's Stop hook,
-  driven by the plan instead of a judge model. It acts only when pi has really stopped (nothing
-  running or queued). Every plan change reaches the server on the RPC stream, so the hook knows without
-  asking any model: unfinished steps → pi is re-engaged at once on the current step and its check;
+  driven by the plan instead of a judge model. It acts only when the chat has really stopped (nothing
+  running or queued). Every plan change reaches the server on the chat's event stream, so the hook knows without
+  asking any model: unfinished steps → the agent is re-engaged at once on the current step and its check;
   every step done → the goal is closed for good; waiting on `ask_user` → it stays quiet until you
-  reply. A `/goal` must be planned: until there is a plan, pi is re-engaged to brainstorm and plan it.
-  Work without a plan just ends when pi stops; if pi used tools, it is first asked once to confirm it
+  reply. A `/goal` must be planned: until there is a plan, the agent is re-engaged to brainstorm and plan it.
+  Work without a plan just ends when the agent stops; if it used tools, it is first asked once to confirm it
   is finished or plan the rest (`planlessNudges`, 1). The old judge is opt-in for that case only
   (`judgeFallback`). The chat shows one line, `Goal hook re-engaged the agent (#1): plan step 2.1 is
   not done (3/7)`, never the hook's message.
@@ -238,31 +232,30 @@ pi's 10-minute HTTP timeout. The blocking `subagent` tool still exists for quick
   **Goal box** (pinned above the chat): the goal, the phase and `x/y steps`, a progress bar with one
   segment per milestone, the current step with its check, and *Show plan* for the whole checklist.
   This updates live from the plan with no model call. Its status text comes from a separate
-  summarizer in a side conversation of its own: one pi session per goal under
-  `~/.omni-agent/status-sessions/`, never the agent's chat. It writes only when the plan moves (plan
+  summarizer in a side conversation of its own: one OpenCode session per goal (run in
+  `~/.omni-agent/status-sessions/`), never the agent's chat. It writes only when the plan moves (plan
   written or revised, a milestone reached, the plan finished), never on timers or tool counts. It uses
   the chat's model unless *Status box model* (or `summaryProvider`/`summaryModel`) says otherwise.
   Re-engages restate the goal verbatim only every `restateEvery` (10) times and after a compaction.
   All of these are `hook` keys in `omni.config.json`.
-- **History drawer** (☰ in the top bar): every pi and Claude Code chat on this machine, grouped by
+- **History drawer** (☰ in the top bar): every Omni (OpenCode), older pi and Claude Code chat on this machine, grouped by
   day, with a pulsing dot for a chat working right now. Hover for ✕ to delete (moves to
-  `~/.omni-agent/trash/`). Claude Code chats open read-only; pi chats continue in Omni's pi, or fork
-  when the chat is still open in a terminal (the composer caption says which). The drawer's other
+  `~/.omni-agent/trash/`). Claude Code chats open read-only; Omni's chats continue on OpenCode (an old pi chat
+  continues in a new OpenCode session that gets its history), or fork when the chat is still open in a terminal
+  (the composer caption says which). The drawer's other
   tabs are Memory (search, edit, import, digest), Graph (build and query a repo graph) and Tokens.
 - **Providers** (⚙ in the top bar): pick a preset (OpenRouter, OpenAI, Anthropic, Google, DeepSeek,
   Groq, xAI, Mistral, Together, Fireworks, Ollama, LM Studio, or any OpenAI/Anthropic-compatible
   URL), paste the key, type the model ids one per line. The model picker lists only those models.
-  The list is also the **fallback order**: drag the six-dot grip under a provider (or focus it and
-  use the arrow keys) to move it. When a model returns any error, pi switches to the next model
-  below it and continues the turn — the failed model's error is never sent to the new model.
+  Drag the six-dot grip under a provider (or focus it and use the arrow keys) to set the order they are
+  listed in. There is no automatic fallback: when a model returns an error, pick another one.
 - **Composer**: "Do anything", + for a file reference, memory and repo-graph attachments, and the
   model / thinking picker. The attachment choices are remembered across reloads and shared by Home
-  and Chat; a model or thinking level picked before pi runs is saved in `omni.config.json` and the
-  next pi child starts with it. pi only: Claude Code is never launched from the UI.
-- **Graph tools for the model**: pi has `graph_build`, `graph_query` and `graph_explain` (the
-  `omni-graph.ts` extension). Every turn the system prompt says whether the chat's folder already has
-  a graph, so the model builds one on its own when a task spans several files and asks the graph
-  instead of reading the whole tree. Reinstall with `node scripts/install.mjs` after updating.
+  and Chat; a model or thinking level picked is saved in `omni.config.json` and the next chat starts
+  with it. Omni's own chats only: Claude Code is never launched from the UI.
+- **Graph tools for the model**: the Omni plugin adds `graph_build`, `graph_query` and `graph_explain`.
+  The system prompt says whether the chat's folder already has a graph, so the model builds one on its
+  own when a task spans several files and asks the graph instead of reading the whole tree.
 
 ## The vault (`vault/`)
 
@@ -344,7 +337,7 @@ tool servers OpenCode connects to (see `mcpServers` above).
 Picking a model in the composer sets the chat's model and writes `piProvider` / `piModel` to
 `omni.config.json` (the names are historical), so the next chat starts on it.
 
-**Fallback.** The pi-era model fallback chain (`omni-fallback.ts`) is not installed any more; when a model
+**Fallback.** There is no model fallback chain (pi's `omni-fallback` extension is gone); when a model
 returns an error, pick another model in the picker.
 
 OpenRouter is one more provider: add it (and its key) in the Providers dialog. `install.mjs --openrouter` is gone.
@@ -358,7 +351,8 @@ node scripts/headless.mjs --cwd workspace/deepseek-e2e --task-file workspace/dee
 node scripts/headless.mjs --cwd ~/proj --task "boot admn1b12farm9 with --no-window and report debug-info" --max-seconds 600
 ```
 
-Drives the same pi child the window uses (tools, extensions, skills, memory with `--memory`) with no GUI:
+Drives an Omni chat on OpenCode the way the window does (tools, the Omni plugin, skills, memory with `--memory`)
+with no GUI:
 one line per tool call and result, the assistant's text, then a summary (tools used, tokens, cost) and the
 full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at `--max-seconds` (0 = no cap).
 
@@ -366,8 +360,10 @@ full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at 
 
 `omni.config.json` in this folder (all optional): `port`, `cwd`, `vaultDir`, `piModel`,
 `piProvider`, `autoStartPi`, `digestIdleSec`, `tailRecentHours`, `memoryBudgetTokens`,
-`claudeBin`, `piCli`, `piBin`, `piAgentDir` / `piModelsFile` (where the Providers dialog writes; default
-`~/.pi/agent/models.json`), `piModels` (fallback allowlist when `models.json` has no providers), `apiKeyFiles` (`{ "ENV_NAME": "/path/key.txt" }` handed to pi as env; default
+`claudeBin`, `opencodeBin`, `opencodeConfigDir`, `opencodeProvidersFile` (the Providers dialog's custom providers),
+`piAgentDir` / `piModelsFile` (pi's old `models.json`, copied into OpenCode once), `piModels` (model picker allowlist,
+`provider/id` patterns), `stallMs` / `toolStallMs` (the watchdog), `context` (Settings → Long runs), `apiKeyFiles`
+(`{ "ENV_NAME": "/path/key.txt" }` handed to Omni's `opencode serve` as env; default
 `OPENROUTER_API_KEY` ← `openrouter.txt`), `claudeTaskTimeoutSec`, `hook` (`{ "enabled", "provider",
 "model", "maxIdleNudges": 5, "graceMs": 2000 }`; the model menu writes it).
 
@@ -375,10 +371,10 @@ full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at 
 
 ```
 server/index.mjs      HTTP + SSE + routes           server/continue.mjs      resume-vs-fork decision
-server/pi-rpc.mjs     pi --mode rpc child           server/claude-runner.mjs claude -p stream-json runs
+server/opencode-*.mjs opencode serve, chats, config server/claude-runner.mjs claude -p stream-json runs
 server/watchers.mjs   discovery, tailing, digests   server/normalize.mjs     four sources -> one event
 server/memory.mjs     the vault                     server/tokens.mjs        tally + prices
-server/providers.mjs  presets + models.json edits    server/zip.mjs           .zip/.apk listing + entry read
+server/providers.mjs  presets + custom providers     server/zip.mjs           .zip/.apk listing + entry read
 ui/                   index.html, styles.css, app.js + lib/transcript/composer/explorer/settings/sidebar/panel
-desktop/              pywebview launcher            integrations/            pi extension, Claude Code hook
+desktop/              pywebview launcher            integrations/            OpenCode plugin, Claude Code hook, personas
 ```

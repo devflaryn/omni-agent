@@ -1,5 +1,5 @@
 /* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only. */
-import { el, baseName, cleanTitle, applyStatus, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
+import { el, baseName, cleanTitle, applyStatus, AGENT_ACTIVE, agentTone, agentKindLabel, harnessLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
 import { newView, applyEvent, finish, forkNote, agentNote, emptyNote } from "./transcript.js";
 import { createComposer } from "./composer.js";
 import { createHistory } from "./sidebar.js";
@@ -593,7 +593,7 @@ function updateHeader() {
   // A foreign chat's model is labelled with its harness so the slot never implies pi is running it.
   $("#topModel").textContent = s && s.harness !== "pi" && model ? `${s.harness} · ${model}` : model;
   $("#topModel").hidden = !model;
-  $("#topModel").title = s ? `${s.harness} · ${s.cwd || ""}` : S.pi.cwd || "";
+  $("#topModel").title = s ? `${harnessLabel(s.harness)} · ${s.cwd || ""}` : S.pi.cwd || "";
 }
 function renderChatMenu() {
   const m = $("#chatMenu"); m.innerHTML = "";
@@ -607,7 +607,7 @@ function renderChatMenu() {
   const parent = s.parentSid || agentFor(s.sid)?.parentSid;
   if (parent && S.sessions.has(parent)) item("Open the chat that started this agent", () => openChat(parent));
   item("Delete this chat", () => deleteChat(s.sid));
-  m.appendChild(el("div", "mh", `${s.harness} · ${s.cwd || ""}`));
+  m.appendChild(el("div", "mh", `${harnessLabel(s.harness)} · ${s.cwd || ""}`));
 }
 $("#btnChatMenu").onclick = (e) => { e.stopPropagation(); const m = $("#chatMenu"); if (m.hidden) renderChatMenu(); m.hidden = !m.hidden; };
 document.addEventListener("click", (e) => { if (!e.target.closest("#chatMenu, #btnChatMenu")) $("#chatMenu").hidden = true; });
@@ -657,7 +657,7 @@ function handle(ev) {
   const s = S.sessions.get(ev.sid) || { sid: ev.sid, harness: ev.harness, lastActivity: 0, tally: null };
   if (ev.kind === "session") {
     Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title ? cleanTitle(ev.title) || undefined : undefined, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
-    // A background agent's chat names the chat that started it and its agent (PiRpc / ClaudeRunner `meta`).
+    // A background agent's chat names the chat that started it and its agent (OpencodeRpc / ClaudeRunner `meta`).
     for (const k of ["parentSid", "agentId", "agentKind"]) if (ev[k]) s[k] = ev[k];
     if (ev.agentId) S.agentSids.set(ev.sid, ev.agentId);
   }

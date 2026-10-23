@@ -1,6 +1,6 @@
 /**
  * OpenCode → pi translation. `opencode serve` streams `{type, properties}` payloads over SSE; the rest of Omni
- * speaks pi: live events go through `normalizePiRpcEvent` and history is pi session JSONL read by `normalizePiEntry`.
+ * speaks pi: live events go through `normalizeRpcEvent` and history is pi session JSONL read by `normalizePiEntry`.
  * `OpencodeTranslator` turns one session's payloads into both — the pi RPC event objects (`agent_start`,
  * `message_update`, `message_end`, `tool_execution_*`, `compaction_*`, `agent_settled`) and the pi JSONL entries
  * (`message`, `compaction`, `custom_message`, `model_change`) for the chat's mirror file. `historyEntries` does the

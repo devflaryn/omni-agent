@@ -1,6 +1,6 @@
 /**
- * Pure decision helpers for keeping the pi child alive over days. No timers, no I/O,
- * so the policy is unit-tested directly; pi-rpc wires these to real setTimeout/clocks.
+ * Pure decision helpers for keeping Omni's chats alive over days. No timers, no I/O,
+ * so the policy is unit-tested directly; opencode-server.mjs and opencode-rpc.mjs wire these to real timers/clocks.
  */
 export function restartDelay(restarts, { base = 800, cap = 30000 } = {}) {
   const raw = Math.min(cap, base * 2 ** Math.max(0, restarts));

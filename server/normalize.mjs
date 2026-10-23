@@ -156,8 +156,8 @@ export function normalizePiEntry(entry, ctx) {
   }
 }
 
-/** `pi --mode rpc` stdout events (see docs/rpc.md). */
-export function normalizePiRpcEvent(ev, ctx) {
+/** Live events in pi's RPC shape (`pi --mode rpc` stdout, see docs/rpc.md), which OpencodeTranslator emits for OpenCode chats. */
+export function normalizeRpcEvent(ev, ctx) {
   if (!ev || typeof ev !== "object") return [];
   const now = Date.now();
   switch (ev.type) {

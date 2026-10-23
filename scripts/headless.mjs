@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Headless runner: drive Omni's pi child through one task with no GUI and stream a compact log.
- * The same AgentApi loop the window uses (pi --mode rpc, its tools, extensions and skills), just
+ * Headless runner: drive one Omni chat on OpenCode through one task with no GUI and stream a compact log.
+ * The same chat the window uses (Omni's `opencode serve`, its tools, the Omni plugin and skills), just
  * observed from the terminal. Exit code 0 when the agent settles, 2 on --max-seconds, 1 on error.
  *
  *   node scripts/headless.mjs --cwd <project> --task "…" [--task-file f] [--provider p] [--model id]
@@ -34,7 +34,7 @@ export function formatEvent(ev, { started = Date.now(), width = 160 } = {}) {
     return text.trim() ? `${t} 🤖 ${one(text, width * 8)}` : null;
   }
   if (ev.kind === "msg" && ev.role === "system") return `${t} ⚠ ${one((ev.blocks || []).map((b) => b.text).join(" "))}`;
-  if (ev.kind === "log" && (ev.level === "error" || ev.level === "stderr")) return `${t} [pi ${ev.level}] ${one(ev.text)}`;
+  if (ev.kind === "log" && (ev.level === "error" || ev.level === "stderr")) return `${t} [opencode ${ev.level}] ${one(ev.text)}`;
   if (ev.kind === "compaction") return `${t} … context compacted`;
   return null;
 }
@@ -90,7 +90,7 @@ export async function runHeadless({ cwd, task, provider, model, thinking, maxSec
     (async () => {
       await pi.waitReady();
       const st = pi.state || {};
-      out(`pi ready · session ${st.sessionFile || pi.sid} · model ${st.model?.provider || "?"}/${st.model?.id || "?"} · thinking ${st.thinkingLevel || "?"} · cwd ${cwd}`);
+      out(`OpenCode ready · session ${st.sessionFile || pi.sid} · model ${st.model?.provider || "?"}/${st.model?.id || "?"} · thinking ${st.thinkingLevel || "?"} · cwd ${cwd}`);
       if (thinking) { await pi.setThinking(thinking); out(`thinking → ${thinking}`); }
       let text = task;
       if (memory) { const pack = await app.vault.pack(task, { budgetTokens: app.cfg.memoryBudgetTokens }); if (pack) text = `${pack}\n\n${task}`; }

@@ -1,6 +1,6 @@
 /* Chat history list inside the right drawer: grouped by day, harness dot, live pulse, hover delete.
    A background agent's chat sits indented under the chat that started it (nestSessions). */
-import { el, groupLabel, nestSessions, agentTag } from "./lib.js";
+import { el, groupLabel, nestSessions, agentTag, harnessLabel } from "./lib.js";
 
 export function createHistory({ S, onSelect, onNew, onDelete, agentFor = () => null }) {
   const wrap = document.querySelector("#history"), filter = document.querySelector("#sessionFilter");
@@ -10,7 +10,7 @@ export function createHistory({ S, onSelect, onNew, onDelete, agentFor = () => n
   function render() {
     const f = filter.value.trim().toLowerCase();
     const list = [...S.sessions.values()]
-      .filter((s) => titleOf(s) && (!f || `${titleOf(s)} ${s.cwd || ""} ${s.model || ""} ${s.harness}`.toLowerCase().includes(f)))
+      .filter((s) => titleOf(s) && (!f || `${titleOf(s)} ${s.cwd || ""} ${s.model || ""} ${s.harness} ${harnessLabel(s.harness)}`.toLowerCase().includes(f)))
       .sort((a, b) => (b.lastActivity || b.mtime || 0) - (a.lastActivity || a.mtime || 0));
     const rows = nestSessions(list, (s) => s.parentSid || agentFor(s.sid)?.parentSid).slice(0, 200);
     wrap.innerHTML = "";
@@ -23,7 +23,7 @@ export function createHistory({ S, onSelect, onNew, onDelete, agentFor = () => n
       if (depth) row.style.setProperty("--depth", String(Math.min(depth, 4)));
       const b = el("button", `hist${s.sid === S.selected ? " active" : ""}${isLive(s) ? " live" : ""}`);
       b.dataset.h = s.harness;
-      b.title = `${tag ? `${tag} · ` : ""}${s.harness} · ${s.cwd || ""}${s.forkedFrom ? " · forked" : ""}`;
+      b.title = `${tag ? `${tag} · ` : ""}${harnessLabel(s.harness)} · ${s.cwd || ""}${s.forkedFrom ? " · forked" : ""}`;
       b.textContent = titleOf(s);
       if (tag) b.appendChild(el("span", "own agent", tag));
       else if (s.harness === "claude") b.appendChild(el("span", "own", "Claude Code"));

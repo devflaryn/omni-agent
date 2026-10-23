@@ -299,7 +299,9 @@ export function agentTone(status) {
   if (status === "cancelled") return "off";
   return /^(error|timeout|stalled|interrupted)$/.test(status || "") ? "err" : "";
 }
-export const agentKindLabel = (kind) => ({ pi: "pi agent", claude: "Claude agent", shell: "shell job" })[kind] || "agent";
+export const agentKindLabel = (kind) => ({ pi: "OpenCode agent", claude: "Claude agent", shell: "shell job" })[kind] || "agent";
+/** A chat's harness as shown to the user: "pi" is the internal key of Omni's own chats, which run on OpenCode. */
+export const harnessLabel = (harness) => (harness === "pi" ? "OpenCode" : String(harness || ""));
 export const agentTitle = (a) => one(a?.title || a?.task || a?.command || a?.id || "agent", 90);
 /** One chat's agents, newest first (a queued one has no start time yet and counts as newest). */
 export function agentsFor(agents, parentSid) {
@@ -360,9 +362,10 @@ const STATUS_WORDS = /\b(done|completed|finished|succeeded|error|errored|failed|
 const STATUS_NORM = { completed: "done", finished: "done", succeeded: "done", errored: "error", failed: "error", canceled: "cancelled", stopped: "cancelled", "timed out": "timeout" };
 const DURATION_RE = /\b\d+h\s?\d{1,2}m\b|\b\d+m\s?\d{1,2}s\b|\b\d+(?:\.\d+)?\s?(?:s|secs?|seconds?|min|mins|minutes?|h|hours?)\b/i;
 // The header omni-agents-lib.mjs `agentReport` writes, one line:
-//   Background <pi agent|Claude agent|job> <id> "<title>" finished: <status>[ (exit N)][ after <1m00s|1h05m|5s>].
+//   Background <OpenCode agent|Claude agent|job> <id> "<title>" finished: <status>[ (exit N)][ after <1m00s|1h05m|5s>].
+// Chats from before the OpenCode switch say "pi agent" there: both are read (kind "pi").
 // The title is free text (quotes included), so it is matched greedily up to the LAST `" finished:`.
-const REPORT_HEAD = /^Background (pi agent|Claude agent|job) (\S+) "(.*)" finished: ([a-z]+)(?: \(exit -?\d+\))?(?: after (\S+?))?\.$/i;
+const REPORT_HEAD = /^Background (OpenCode agent|pi agent|Claude agent|job) (\S+) "(.*)" finished: ([a-z]+)(?: \(exit -?\d+\))?(?: after (\S+?))?\.$/i;
 const QUOTED = /[“"][^”"]*[”"]/g;
 /** "1m00s" / "1h05m" (the agents lib's format) or "4m 12s" → the strip's own format ("1m 0s", "1h 05m"); other text as written. */
 function normDuration(s) {
@@ -395,7 +398,7 @@ export function agentResultInfo(text) {
   }
   const body = lines.slice(i).join("\n").trim() || rest;
   const idOf = (s) => /\ba-[0-9a-f]{8}\b/.exec(s || "")?.[0];
-  const kindOf = (s) => (/\bclaude\b/i.test(s) ? "claude" : /\b(shell|job)\b/i.test(s) ? "shell" : /\bpi\b/i.test(s) ? "pi" : "");
+  const kindOf = (s) => (/\bclaude\b/i.test(s) ? "claude" : /\b(shell|job)\b/i.test(s) ? "shell" : /\b(pi|opencode)\b/i.test(s) ? "pi" : "");
   const exact = REPORT_HEAD.exec(head);
   // Lenient: the head without its quoted title; after `finished:` comes the status itself.
   const bare = head.replace(QUOTED, " ");

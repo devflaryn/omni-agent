@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * The durable unattended runner. A standalone CLI that owns one multi-day pi run:
- * it creates (or --resume's) a run ledger, points the pi omni-run extension at it via
- * OMNI_RUN_DIR, sets the explicit goal, enables the goal keeper, and then BLOCKS until the
- * run's status becomes "done" (or it is stopped) — it never exits on a mere settle. The GUI
+ * The durable unattended runner. A standalone CLI that owns one multi-day run of an Omni chat on OpenCode:
+ * it creates (or --resume's) a run ledger (its directory exported as OMNI_RUN_DIR), sets the explicit
+ * goal, enables the goal keeper, and then BLOCKS until the run's status becomes "done" (or it is stopped) —
+ * it never exits on a mere settle. The GUI
  * (desktop or browser) is a separate, read-only observer of the same server; it does not own
  * this process.
  *

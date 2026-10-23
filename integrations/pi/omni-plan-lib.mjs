@@ -1,3 +1,3 @@
-// In the repo the planner's state machine lives in ui/plan.js (the server and the UI use it too).
-// scripts/install.mjs copies ui/plan.js itself to ~/.pi/agent/extensions/omni-plan-lib.mjs, not this file.
+// The planner's state machine lives in ui/plan.js (the server, the UI and the OpenCode plugin use it); this re-export
+// is kept for anything that still imports it from here.
 export * from "../../ui/plan.js";

@@ -288,15 +288,3 @@ export function explainUnfinishedToolCalls(messages) {
   }
   return out;
 }
-
-/**
- * The context window pi should see for a model so it compacts at `compactAt` prompt tokens:
- * pi compacts when tokens > contextWindow − reserveTokens. Never larger than the model's real window;
- * null when no cap is needed (the real window already triggers at or below compactAt).
- */
-export function effectiveContextWindow({ contextWindow, compactAt, reserveTokens = 16384 }) {
-  const real = Number(contextWindow) || 0, cap = Number(compactAt) || 0, reserve = Math.max(0, Number(reserveTokens) || 0);
-  if (!real || !cap) return null;
-  const want = cap + reserve;
-  return want < real ? want : null;
-}

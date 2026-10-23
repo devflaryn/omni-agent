@@ -1,5 +1,5 @@
 /* Right drawer: tab strip + Chats (history), Memory, Graph and Tokens. */
-import { el, esc, fmtN } from "./lib.js";
+import { el, esc, fmtN, harnessLabel } from "./lib.js";
 
 export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextWindow, onShowChats }) {
   const $ = (s) => document.querySelector(s);
@@ -52,7 +52,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
     a.append(tile("sessions", all.n), tile("input", fmtN(all.input)), tile("output", fmtN(all.output)), tile("cache read", fmtN(all.cacheRead)), tile("cost", `$${all.cost.toFixed(2)}`), tile("cache hit", all.input + all.cacheRead ? `${Math.round((all.cacheRead / (all.input + all.cacheRead)) * 100)}%` : "–"));
     const top = $("#statTop"); top.innerHTML = "";
     for (const x of ranked.sort((p, q) => q.tally.cost - p.tally.cost || q.tally.total - p.tally.total).slice(0, 10)) {
-      const r = el("div", "row"); r.append(el("span", null, `${x.harness} · ${(x.title || x.sid).slice(0, 60)}`), el("span", null, `${fmtN(x.tally.total)} tok  $${x.tally.cost.toFixed(2)}`));
+      const r = el("div", "row"); r.append(el("span", null, `${harnessLabel(x.harness)} · ${(x.title || x.sid).slice(0, 60)}`), el("span", null, `${fmtN(x.tally.total)} tok  $${x.tally.cost.toFixed(2)}`));
       r.onclick = () => onSelect(x.sid);
       top.appendChild(r);
     }

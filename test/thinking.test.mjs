@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.js";
-import { applyThinkingMaps, fillThinkingMaps, flatModels, upsertProvider } from "../server/providers.mjs";
+import { fillThinkingMaps, flatModels, upsertProvider } from "../server/providers.mjs";
 
 const levels = (id, extra = {}) => thinkingProfile({ provider: "p", id, ...extra }).levels;
 const STANDARD = ["off", "minimal", "low", "medium", "high"];
@@ -66,13 +66,14 @@ test("clampThinking: the nearest level the model has, and a level that thinks ne
 test("models.json: each model gets its family's thinkingLevelMap once; a map already there is never changed", () => {
   const dir = mkdtempSync(join(tmpdir(), "omni-thinking-"));
   const file = join(dir, "models.json");
+  const fillFile = () => { const j = JSON.parse(readFileSync(file, "utf8")); const filled = fillThinkingMaps(j); writeFileSync(file, JSON.stringify(j)); return filled; };
   writeFileSync(file, JSON.stringify({ other: 1, providers: { openrouter: { baseUrl: "https://x", api: "openai-completions", apiKey: "k", models: [
     { id: "deepseek/deepseek-v4.1-flash" },
     { id: "z-ai/glm-4.6", thinkingLevelMap: { off: null } },
     { id: "meta/llama-3", reasoning: true },
     { id: "gpt-4o", reasoning: false },
   ] } } }));
-  assert.deepEqual(applyThinkingMaps(file).filled, ["openrouter/deepseek/deepseek-v4.1-flash"]);
+  assert.deepEqual(fillFile(), ["openrouter/deepseek/deepseek-v4.1-flash"]);
   const j = JSON.parse(readFileSync(file, "utf8"));
   assert.equal(j.other, 1);
   assert.equal(j.providers.openrouter.apiKey, "k");
@@ -81,7 +82,7 @@ test("models.json: each model gets its family's thinkingLevelMap once; a map alr
   assert.deepEqual(glm.thinkingLevelMap, { off: null }, "the user's own");
   assert.equal(llama.thinkingLevelMap, undefined, "unknown family: pi's own mapping");
   assert.equal(gpt4.thinkingLevelMap, undefined, "no reasoning: nothing to map");
-  assert.deepEqual(applyThinkingMaps(file).filled, [], "idempotent");
+  assert.deepEqual(fillFile(), [], "idempotent");
   // The picker list carries each model's levels.
   const flat = flatModels(file);
   assert.deepEqual(flat.find((m) => m.id === "z-ai/glm-4.6").thinking, ["minimal", "low", "medium", "high"]);
@@ -91,6 +92,5 @@ test("models.json: each model gets its family's thinkingLevelMap once; a map alr
   const m2 = JSON.parse(readFileSync(file, "utf8")).providers.openrouter.models;
   assert.deepEqual(m2[1].thinkingLevelMap, { off: null }, "kept");
   assert.deepEqual(m2[2].thinkingLevelMap, { minimal: null, low: null, medium: null }, "a new model is filled when saved");
-  assert.deepEqual(applyThinkingMaps(join(dir, "missing.json")).filled, []);
   assert.deepEqual(fillThinkingMaps({}), []);
 });

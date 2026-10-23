@@ -15,7 +15,6 @@ import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { CONFIG, ROOT, contextConfig, hookConfig, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
 import { AgentManager } from "./agents.mjs";
 import { handleAgentRoutes } from "./agent-routes.mjs";
-import { applyContextCaps } from "./context-policy.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
 import { OpencodeServer, guardOpencodeExit } from "./opencode-server.mjs";
@@ -26,7 +25,7 @@ import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
 import { listMcpServers, upsertMcpServer, removeMcpServer, testMcpServer } from "./mcp.mjs";
-import { PRESETS, readModelsFile, listProviders, saveCustomProvider, removeProvider, reorderProviders, customProviderConfig, migratePiProviders, migrationMarker, modelEntry, applyThinkingMaps } from "./providers.mjs";
+import { PRESETS, readModelsFile, listProviders, saveCustomProvider, removeProvider, reorderProviders, customProviderConfig, migratePiProviders, migrationMarker, modelEntry } from "./providers.mjs";
 import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.js";
 import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
@@ -42,17 +41,17 @@ const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 export async function createApp(overrides = {}) {
   const cfg = { ...CONFIG, ...overrides };
-  // Under `node --test`, Omni's own state files never default to the real ~/.omni-agent, the context cap
-  // never rewrites the real ~/.pi/agent/models.json, and no real `opencode serve` is started (a test passes
+  // Under `node --test`, Omni's own state files never default to the real ~/.omni-agent, the real
+  // ~/.pi/agent/models.json is never read, and no real `opencode serve` is started (a test passes
   // cfg.opencodeServer): a test that wants them passes its own paths.
   // node --test sets NODE_TEST_CONTEXT only with per-file isolation; also catch --test-isolation=none and a test file run directly.
   const underTest = !!process.env.NODE_TEST_CONTEXT || process.execArgv.includes("--test") || /\.test\.m?js$/i.test(process.argv[1] || "");
   if (underTest) {
     const tmp = mkdtempSync(join(tmpdir(), "omni-state-"));
-    for (const k of ["agentsFile", "goalsFile", "contextCapsFile", "opencodeProvidersFile"]) if (!(k in overrides)) cfg[k] = join(tmp, `${k}.json`);
+    for (const k of ["agentsFile", "goalsFile", "opencodeProvidersFile"]) if (!(k in overrides)) cfg[k] = join(tmp, `${k}.json`);
     if (!("agentsDir" in overrides)) cfg.agentsDir = join(tmp, "agents");
     // Nor is the real ~/.pi/agent/models.json (and its keys) copied into a test's provider store.
-    if (!("piModelsFile" in overrides)) { cfg.contextCaps = false; cfg.migratePiProviders = false; }
+    if (!("piModelsFile" in overrides)) cfg.migratePiProviders = false;
     if (!("persistContext" in overrides)) cfg.persistContext = false;
     for (const k of ["opencodeConfigDir", "statusSessionsDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
   }
@@ -274,10 +273,10 @@ export async function createApp(overrides = {}) {
   const watcher = new SessionWatcher({ piSessionsDir: cfg.piSessionsDir, claudeProjectsDir: cfg.claudeProjectsDir, bus, tally, registry, isOwned, recentHours: cfg.tailRecentHours, log });
   // A thin proxy so the keeper always reads the *current* runLedger (which may be set/replaced later).
   const ledgerProxy = { writeControl: (p) => runLedger?.writeControl(p), goalText: () => runLedger?.goalText() || "" };
-  // Goal hook: re-engages pi while its plan (the `plan` tool) has unfinished steps — no model decides that.
+  // Goal hook: re-engages a chat while its plan (the `plan` tool) has unfinished steps — no model decides that.
   const keeper = new GoalKeeper({
     bus, log,
-    // Background pi agents have a PiRpc of their own: the keeper watches and re-engages them too.
+    // Background agents are chats of their own (an OpencodeRpc each): the keeper watches and re-engages them too.
     getPi: (sid) => piFor(sid) || agents?.piFor(sid) || null,
     contextPolicy: cfg.context,
     maxTokensFor: (sid) => Number(keeper.getPi(sid)?.state?.model?.maxTokens) || 0,
@@ -309,22 +308,6 @@ export async function createApp(overrides = {}) {
     return { levels: t.levels, labels: t.labels, family: t.family };
   }
   const levelsOf = async (provider, id) => (await thinkingOf(provider, id)).levels;
-
-  /** Cap each model's effective window in models.json so pi compacts at cfg.context.compactAt (server/context-policy.mjs). */
-  function applyCaps(compactAt = cfg.context?.compactAt ?? 0) {
-    // Each model's thinking levels (ui/thinking.js), so pi offers and sends only the ones it has. A test's fake pi
-    // never touches the real models.json.
-    if (!(cfg.createPi && !overrides.piModelsFile)) {
-      const tm = applyThinkingMaps(cfg.piModelsFile);
-      if (tm.error) log("thinking levels:", tm.error);
-      for (const k of tm.filled) log(`thinking levels for ${k}: set from its model family`);
-    }
-    if (cfg.contextCaps === false || (cfg.createPi && !overrides.contextCapsFile)) return null;
-    const r = applyContextCaps({ modelsFile: cfg.piModelsFile, settingsFile: cfg.piSettingsFile, stateFile: cfg.contextCapsFile, compactAt });
-    if (r.error) log("context caps:", r.error);
-    for (const c of r.changes || []) log(`context cap ${c.key}: ${c.from ?? "none"} -> ${c.to ?? "none"}`);
-    return r;
-  }
 
   agents = cfg.agentManager || new AgentManager({
     bus, config: cfg.agents, file: cfg.agentsFile, dir: cfg.agentsDir, personasDir: cfg.personasDir,
@@ -577,7 +560,7 @@ export async function createApp(overrides = {}) {
   /** Chat `sid`'s pi child, or the current one without a sid. */
   const requirePi = (sid = "") => {
     const c = sid ? piFor(sid) : pi;
-    if (!c?.proc) throw Object.assign(new Error(sid ? "that chat has no pi running right now; send it a message to continue it" : "pi is not running (POST /api/pi/start)"), { status: 409 });
+    if (!c?.proc) throw Object.assign(new Error(sid ? "that chat is not open on OpenCode right now; send it a message to continue it" : "no chat is open on OpenCode (POST /api/pi/start)"), { status: 409 });
     return c;
   };
 
@@ -802,7 +785,7 @@ export async function createApp(overrides = {}) {
       // state
       if (req.method === "GET" && p === "/api/state") {
         return send(res, 200, {
-          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piCli: cfg.piCli, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: remoteStatus().urls, piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking, context: cfg.context },
+          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: remoteStatus().urls, piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking, context: cfg.context },
           access: { role: req.omniHost ? "host" : "remote", ...(req.omniHost ? { remote: remoteStatus() } : {}) },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
           // Every chat with a pi child right now (`pi` is the one used last), and each one's goal.
@@ -863,11 +846,10 @@ export async function createApp(overrides = {}) {
           cfg.context = contextConfig({ ...cfg.context, ...patch });
           keeper.setContextPolicy(cfg.context);
           if (cfg.persistContext !== false) writeConfigFile({ context: cfg.context });
-          // Every running chat compacts at the new point from its next prompt on (nothing restarts). The models.json
-          // caps are pi's way of doing the same, kept until pi is removed.
-          for (const c of pis) if ("compactAt" in c) c.compactAt = Number(cfg.context.compactAt) || 0;
-          const caps = applyCaps(cfg.context.compactAt);
-          return send(res, 200, { ok: true, context: cfg.context, caps: caps && { changed: caps.changed, changes: caps.changes, error: caps.error }, restarted: false, restartPending: false });
+          // Every running chat and background agent compacts at the new point from its next prompt on (nothing restarts).
+          const at = Number(cfg.context.compactAt) || 0;
+          for (const c of [...pis, ...(agents?.liveChildren?.() || [])]) if ("compactAt" in c) c.compactAt = at;
+          return send(res, 200, { ok: true, context: cfg.context, restarted: false, restartPending: false });
         }
       }
       // explicit goal (the /goal command): set a persistent goal and arm the keeper
@@ -877,7 +859,7 @@ export async function createApp(overrides = {}) {
           const b = await readBody(req);
           // The chat it was typed in (`sid`); without one, the chat used last.
           const c = b.sid ? piFor(b.sid) : pi;
-          if (!c?.sid) return send(res, 400, { error: b.sid ? "that chat has no pi running right now; send it a message first, then set the goal" : "no active pi session; start a chat first" });
+          if (!c?.sid) return send(res, 400, { error: b.sid ? "that chat is not open on OpenCode right now; send it a message first, then set the goal" : "no active chat session; start a chat first" });
           const goal = String(b.goal ?? "").trim();
           keeper.setExplicitGoal(c.sid, goal);
           saveGoals();
@@ -1075,7 +1057,7 @@ export async function createApp(overrides = {}) {
             return send(res, 200, { success: true, data: { levels: t.levels, labels: t.labels, ...(t.family ? { family: t.family } : {}), provider: cur.provider, model: cur.id } });
           }
           case "/api/pi/state": return send(res, 200, await requirePi(sid).refreshState());
-          default: return send(res, 404, { error: "unknown pi route" });
+          default: return send(res, 404, { error: "unknown /api/pi route" });
         }
       }
       // background agents (pi subagents, Claude Code sessions, shell jobs) started by the agents
@@ -1272,7 +1254,6 @@ export async function createApp(overrides = {}) {
     log(`watching ${watcher.tails.size} session files (${registry.list().length} known sessions)`);
     // Agent chats keep their place under their parent (only chats the watcher found: a deleted one is not recreated blank).
     for (const a of agents.list()) if (a.sid && a.parentSid && registry.get(a.sid)) registry.upsert(a.sid, { parentSid: a.parentSid, agentId: a.id, agentKind: a.kind });
-    applyCaps(); // pi's models.json caps (pi only; OpenCode chats compact through their compactAt)
     if (cfg.autoStartPi) {
       startPi(cfg.cwd);
       restoreGoal().catch((e) => log("could not restore the saved goal", e.message));

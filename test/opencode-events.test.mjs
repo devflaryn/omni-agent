@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { OpencodeTranslator, stopReasonOf, errorText, piUsage, historyEntries } from "../server/opencode-events.mjs";
-import { normalizePiRpcEvent, normalizePiEntry } from "../server/normalize.mjs";
+import { normalizeRpcEvent, normalizePiEntry } from "../server/normalize.mjs";
 
 const fx = JSON.parse(readFileSync(new URL("./fixtures/opencode-turn.json", import.meta.url), "utf8"));
 const ctx = { sid: "pi:x", harness: "pi" };
@@ -15,7 +15,7 @@ function run(c, opts = {}) {
   return { t, rpc, entries };
 }
 const kind = (e) => e.type === "message_update" ? e.assistantMessageEvent.type : e.type === "message_end" ? `message_end:${e.message.role}` : e.type;
-const normalized = (rpc) => rpc.flatMap((e) => normalizePiRpcEvent(e, ctx));
+const normalized = (rpc) => rpc.flatMap((e) => normalizeRpcEvent(e, ctx));
 const msgEnds = (rpc, role) => rpc.filter((e) => e.type === "message_end" && e.message.role === role);
 
 // Small hand-built payload helpers for the cases no capture covers.

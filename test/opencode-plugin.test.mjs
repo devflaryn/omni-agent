@@ -272,7 +272,7 @@ test("agent_start posts to /api/agents with parentSid pi:<sessionID>", async () 
     assert.ok(hooks.tool[name], `${name} is registered`);
   }
   const r = await hooks.tool.agent_start.execute({ task: "Count the lines of x.js and report the number" }, ctxFor("ses_ag"));
-  assert.match(r.output, /Started pi agent a-00000001/);
+  assert.match(r.output, /Started OpenCode agent a-00000001/);
   assert.equal(r.metadata.id, "a-00000001");
   const post = omni.calls.find((c) => c.method === "POST" && c.path === "/api/agents");
   assert.equal(post.body.parentSid, "pi:ses_ag");
@@ -299,7 +299,7 @@ test("delivery prompts the session with [omni-agent-result]", async () => {
   const p = client.prompts[0];
   assert.equal(p.path.id, sid);
   assert.equal(p.body.parts.length, 1);
-  assert.match(p.body.parts[0].text, /^\[omni-agent-result\] Background pi agent a-00000001 "Look" finished: done/);
+  assert.match(p.body.parts[0].text, /^\[omni-agent-result\] Background OpenCode agent a-00000001 "Look" finished: done/);
   assert.match(p.body.parts[0].text, /report of a-00000001/);
   assert.deepEqual(p.body.model, { providerID: "opencode", modelID: "big-pickle" }, "the chat's own model, not OpenCode's global default");
   assert.equal(p.body.agent, "build");

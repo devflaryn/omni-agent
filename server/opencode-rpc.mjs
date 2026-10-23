@@ -1,7 +1,7 @@
 /**
- * One Omni chat on the shared `opencode serve` (OpencodeServer), behind PiRpc's contract so the rest of the server
- * drives it like a pi child. Its session's SSE payloads go through OpencodeTranslator: the pi RPC events feed the bus
- * (via normalizePiRpcEvent) and the pi JSONL entries are appended to the chat's mirror file, which the watcher,
+ * One Omni chat on the shared `opencode serve` (OpencodeServer), behind the pi RPC contract (the harness Omni used before OpenCode) so the
+ * rest of the server drives it like the pi child it replaced. Its session's SSE payloads go through OpencodeTranslator: the pi RPC events feed the bus
+ * (via normalizeRpcEvent) and the pi JSONL entries are appended to the chat's mirror file, which the watcher,
  * reload, continue and the goal hook read like any pi session file.
  */
 import { EventEmitter } from "node:events";
@@ -10,7 +10,7 @@ import { dirname, join, resolve } from "node:path";
 import { THINKING_LEVELS } from "../ui/thinking.js";
 import { cleanTitle } from "../ui/lib.js";
 import { OpencodeTranslator, historyEntries } from "./opencode-events.mjs";
-import { normalizePiEntry, normalizePiRpcEvent } from "./normalize.mjs";
+import { normalizePiEntry, normalizeRpcEvent } from "./normalize.mjs";
 import { stalled, DEFAULT_TOOL_STALL_MS } from "./watchdog.mjs";
 
 const normPath = (p) => (p ? resolve(String(p)).toLowerCase() : "");
@@ -173,8 +173,8 @@ export function piTranscript(entries) {
 }
 
 /**
- * Emits "pi" (every pi RPC event, as PiRpc does) and "exit" (null) when stop() ends the chat. `env` is accepted for
- * PiRpc parity only: the shared server's environment applies. `system`/`tools` are sent with every prompt (a
+ * Emits "pi" (every event in pi's RPC shape) and "exit" (null) when stop() ends the chat. `env` is accepted for
+ * the old pi child's signature only: the shared server's environment applies. `system`/`tools` are sent with every prompt (a
  * background agent's persona; `tools` is OpenCode's `{name: boolean}` map, see allowTools). `ensureServer()` (a
  * promise) starts the shared server when the chat needs it and it is not running. `compactAt` > 0 compacts before a prompt once the last turn's context exceeded it.
  */
@@ -204,7 +204,7 @@ export class OpencodeRpc extends EventEmitter {
     this.stopped = false;
     this.resumeFile = null;
     this.onRestart = null;
-    /** True from the server going down until the chat is reattached and onRestart ran (see PiRpc). */
+    /** True from the server going down until the chat is reattached and onRestart ran. */
     this.restoring = false;
     this.crashedSid = null;
     this.lastEventAt = 0;
@@ -484,7 +484,7 @@ export class OpencodeRpc extends EventEmitter {
       if (u && !ev.message.errorMessage) this.lastContext = num(u.input) + num(u.cacheRead);
       if (ev.message.provider && ev.message.model) this.lastModel = { providerID: ev.message.provider, modelID: ev.message.model };
     }
-    for (const out of normalizePiRpcEvent(ev, this.ctx)) this.bus.emit(out);
+    for (const out of normalizeRpcEvent(ev, this.ctx)) this.bus.emit(out);
     this.emit("pi", ev);
   }
 

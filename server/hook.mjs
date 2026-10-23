@@ -1,7 +1,7 @@
 /**
  * Goal hook: keeps Omni's pi chat going the way Claude Code's Stop hook does — driven by the agent's own plan.
  *
- * The agent plans with the `plan` tool (integrations/pi/omni-plan.ts, state machine in ui/plan.js):
+ * The agent plans with the `plan` tool (the OpenCode plugin, integrations/opencode/omni-plugin.mjs; state machine in ui/plan.js):
  * brainstorm → milestones of steps with "done when" checks → execute step by step. Every plan change
  * arrives on the RPC stream as the tool result's details, so when pi really stops (`agent_settled`) the
  * keeper knows without asking any model whether the work is finished:
@@ -717,7 +717,7 @@ export class GoalKeeper {
     if (typeof pi?.compact !== "function") return false;
     try {
       const r = await pi.compact();
-      if (r && r.success === false) throw new Error(r.error || "pi refused to compact");
+      if (r && r.success === false) throw new Error(r.error || "OpenCode refused to compact");
       const g = this.goals.get(sid);
       if (g) g.restate = true; // the summary may have dropped the original prompt
       return true;

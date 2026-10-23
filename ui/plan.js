@@ -1,6 +1,6 @@
 /**
- * The agent's plan: one pure state machine shared by the pi `plan` tool (integrations/pi/omni-plan.ts,
- * installed beside it as omni-plan-lib.mjs), the goal hook (server/hook.mjs) and the status box (ui/app.js).
+ * The agent's plan: one pure state machine shared by the `plan` tool (the OpenCode plugin,
+ * integrations/opencode/omni-plugin.mjs), the goal hook (server/hook.mjs) and the status box (ui/app.js).
  *
  * The plan is worked in phases, the way the superpowers brainstorm → write-plan → execute flow works:
  *   brainstorm  understand the goal, list assumptions/unknowns, weigh 2-3 approaches, pick one, and say how

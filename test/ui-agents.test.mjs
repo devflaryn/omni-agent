@@ -1,7 +1,7 @@
 // test/ui-agents.test.mjs — background agents in the UI: nested history, the agents strip, report cards, Long runs.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { nestSessions, agentTag, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentResultInfo, agentReportKey, withLiveReports, mergeAgentSnapshot, parseCompactAt, compactAtK, compactAtFromField, toolKind, toolLabel, AGENT_ACTIVE } from "../ui/lib.js";
+import { nestSessions, agentTag, agentTone, agentKindLabel, harnessLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentResultInfo, agentReportKey, withLiveReports, mergeAgentSnapshot, parseCompactAt, compactAtK, compactAtFromField, toolKind, toolLabel, AGENT_ACTIVE } from "../ui/lib.js";
 
 // A DOM just big enough for sidebar.js and transcript.js's system-message path.
 class FakeEl {
@@ -151,10 +151,12 @@ test("agentElapsed counts up while running and stops at the end", () => {
 });
 
 test("agent labels and titles", () => {
-  assert.equal(agentKindLabel("pi"), "pi agent");
+  assert.equal(agentKindLabel("pi"), "OpenCode agent");
   assert.equal(agentKindLabel("claude"), "Claude agent");
   assert.equal(agentKindLabel("shell"), "shell job");
   assert.equal(agentKindLabel(undefined), "agent");
+  assert.equal(harnessLabel("pi"), "OpenCode", "Omni's own chats run on OpenCode");
+  assert.equal(harnessLabel("claude"), "claude");
   assert.equal(agentTitle({ title: "Fix it", task: "long" }), "Fix it");
   assert.equal(agentTitle({ task: "Investigate\n  the   build" }), "Investigate the build");
   assert.equal(agentTitle({ command: "npm test" }), "npm test");
@@ -241,6 +243,10 @@ test("agentResultInfo round-trips every report agentReport writes", async () => 
   const job = card({ ...base, kind: "shell", title: "Run tests", command: "npm test", status: "error", exitCode: 1, resultText: "1 failing" });
   assert.deepEqual([job.kind, job.status, job.title], ["shell", "error", "Run tests"]);
   assert.match(job.body, /Log tail:\n1 failing/);
+  // Chats from the pi harness carry the old header; they still read exactly (kind "pi").
+  const old = agentResultInfo('[omni-agent-result] Background pi agent a-1a2b3c4d "Find the flaky test" finished: error after 1m00s.\n\nboom');
+  assert.deepEqual([old.kind, old.status, old.title, old.elapsed, old.id], ["pi", "error", "Find the flaky test", "1m 0s", "a-1a2b3c4d"]);
+  assert.match(agentReport({ ...base, status: "done" }, { now: base.endedAt }), /^Background OpenCode agent a-1a2b3c4d /);
 });
 
 test("transcript renders a report as a card with Open, and other notices as plain system lines", async () => {
@@ -255,7 +261,7 @@ test("transcript renders a report as a card with Open, and other notices as plai
     assert.equal(card.tagName, "DETAILS");
     assert.ok(hasClass("ok")(card), "done reads as ok");
     assert.equal(card.find(hasClass("ar-title")).text, "Find the flaky test");
-    assert.equal(card.find(hasClass("ar-meta")).text, "pi agent · done · 2m 0s");
+    assert.equal(card.find(hasClass("ar-meta")).text, "OpenCode agent · done · 2m 0s");
     assert.match(card.find(hasClass("ar-body")).innerHTML, /<b>fix<\/b>/);
     const open = card.find(hasClass("ar-open"));
     open.onclick({ preventDefault() {}, stopPropagation() {} });

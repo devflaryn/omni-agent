@@ -1,6 +1,6 @@
 /**
  * Server wiring for long runs: background agents mounted in createApp (a pi agent runs as a managed child of the chat,
- * shows under it, reports back), the long-run settings route (context caps in models.json), explicit goals that survive
+ * shows under it, reports back), the long-run settings route (compactAt of the live chats), explicit goals that survive
  * a restart, a "my context is full" stop continued with the hook off, and agent reports replayed from a session file.
  * Fake pi children only — no real pi, claude or network.
  */
@@ -58,8 +58,8 @@ function agentPiFactory(bus, answer = "The file has 42 lines.") {
 const opts = (dir, extra = {}) => ({
   port: 0, relay: { host: "" }, autoStartPi: false, cwd: base, liveWindowMs: 0,
   vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"),
-  agentsFile: join(dir, "agents.json"), agentsDir: join(dir, "agents"), goalsFile: join(dir, "goals.json"), contextCapsFile: join(dir, "caps.json"),
-  piModelsFile: join(dir, "pi-agent", "models.json"), piSettingsFile: join(dir, "pi-agent", "settings.json"),
+  agentsFile: join(dir, "agents.json"), agentsDir: join(dir, "agents"), goalsFile: join(dir, "goals.json"),
+  piModelsFile: join(dir, "pi-agent", "models.json"),
   persistHook: false, persistPiModel: false, persistContext: false, hook: { enabled: false, graceMs: 10 }, ...extra,
 });
 
@@ -105,29 +105,31 @@ test("the goal keeper waits while a chat has running background agents", async (
   } finally { delete appA.agents.activeChildren; appA.keeper.config.enabled = false; }
 });
 
-// ----------------------------------------------------------------- long-run settings → models.json caps
-test("PUT /api/context caps the declared 1M window in models.json modelOverrides, and compactAt 0 removes the cap", async () => {
+// ----------------------------------------------------------------- long-run settings → live chats
+test("PUT /api/context moves every live chat and background agent to the new compactAt and leaves models.json alone", async () => {
   const dir = join(base, "ctx"); mkdirSync(join(dir, "pi-agent"), { recursive: true });
-  const models = { providers: { openrouter: { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "k", models: [{ id: "deepseek/x", contextWindow: 1000000, maxTokens: 65536 }] } } };
-  writeFileSync(join(dir, "pi-agent", "models.json"), JSON.stringify(models));
-  writeFileSync(join(dir, "pi-agent", "settings.json"), JSON.stringify({ compaction: { enabled: true, reserveTokens: 32768 } }));
-  const app = await createApp(opts(dir, { context: { compactAt: 0 } }));
+  const models = JSON.stringify({ providers: { openrouter: { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "k", models: [{ id: "deepseek/x", contextWindow: 1000000, maxTokens: 65536 }] } } });
+  writeFileSync(join(dir, "pi-agent", "models.json"), models);
+  let chat = null;
+  const app = await createApp(opts(dir, { context: { compactAt: 0 }, createPi: (o) => (chat = { ...mainPi(o.bus, { sid: "pi:ctx" }), compactAt: 0 }) }));
   await app.listen();
   try {
     const port = app.server.address().port;
+    app.startPi(base);
+    const agent = { proc: {}, compactAt: 0 };
+    app.agents.liveChildren = () => [agent];
     const r = await http(port, "/api/context", { compactAt: 256000, autoContinue: true }, "PUT");
     assert.equal(r.status, 200);
     assert.equal(r.json.context.compactAt, 256000);
-    const j = JSON.parse(readFileSync(join(dir, "pi-agent", "models.json"), "utf8"));
-    assert.equal(j.providers.openrouter.modelOverrides["deepseek/x"].contextWindow, 256000 + 32768, "pi now compacts at 256k");
-    assert.equal(j.providers.openrouter.models[0].contextWindow, 1000000, "the declared window is untouched");
-    assert.equal(app.keeper.contextPolicy?.compactAt ?? app.keeper.context?.compactAt ?? 256000, 256000);
+    assert.equal(chat.compactAt, 256000, "the running chat compacts at the new point from its next prompt");
+    assert.equal(agent.compactAt, 256000, "so does a running background agent");
+    assert.equal(readFileSync(join(dir, "pi-agent", "models.json"), "utf8"), models, "pi's models.json is never rewritten");
+    assert.equal(app.keeper.contextPolicy?.compactAt, 256000);
     assert.equal((await http(port, "/api/state")).json.config.context.compactAt, 256000);
     assert.equal((await http(port, "/api/context", { compactAt: -5 }, "PUT")).status, 400);
     await http(port, "/api/context", { compactAt: 0 }, "PUT");
-    const k = JSON.parse(readFileSync(join(dir, "pi-agent", "models.json"), "utf8"));
-    assert.equal(k.providers.openrouter.modelOverrides, undefined, "compactAt 0 takes Omni's cap out again");
-  } finally { app.close(); }
+    assert.deepEqual([chat.compactAt, agent.compactAt], [0, 0], "0 turns Omni's compaction point off again");
+  } finally { delete app.agents.liveChildren; app.close(); }
 });
 
 // ----------------------------------------------------------------- explicit goals survive a restart
