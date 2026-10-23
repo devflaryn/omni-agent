@@ -428,17 +428,20 @@ export class DeliveryPoller {
   }
 }
 
-/** The session's poller, started if none runs. `pi` posts the reports (wakeOptions: followUp + triggerTurn wakes an idle chat). */
-export function ensurePoller({ client, parentSessionId, pi, owner = pi, log, isIdle, ...opts }) {
+/**
+ * The session's poller, started if none runs. `pi` posts the reports (wakeOptions: followUp + triggerTurn wakes an idle
+ * chat), unless `deliver(rec)` is given (the OpenCode plugin prompts the session itself).
+ */
+export function ensurePoller({ client, parentSessionId, pi, owner = pi, log, isIdle, deliver, ...opts }) {
   if (!parentSessionId) return null;
   const have = S.pollers.get(parentSessionId);
   if (have && !have.stopped) return have;
   const p = new DeliveryPoller({
     client, parentSessionId, owner, log, ...opts, ...(isIdle ? { isIdle } : {}),
-    deliver: (rec) => pi.sendMessage(
+    deliver: deliver || ((rec) => pi.sendMessage(
       { customType: "omni-agent-result", content: agentReport(rec, { max: MAX_REPORT }), display: true, details: { id: rec.id, status: rec.status } },
       wakeOptions(),
-    ),
+    )),
   });
   S.pollers.set(parentSessionId, p);
   return p.start();

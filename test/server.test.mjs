@@ -609,6 +609,8 @@ test("opencode: /api/pi/open starts the shared server, writes its config and ope
   const conf = JSON.parse(readFileSync(join(ocBase, "oc-config", "opencode.json"), "utf8"));
   assert.equal(conf.permission.bash, "allow");
   assert.deepEqual(conf.tools, { question: false });
+  const shim = readFileSync(join(ocBase, "oc-config", "plugin", "omni.js"), "utf8");
+  assert.match(shim, /integrations\/opencode\/omni-plugin\.mjs";/, "the Omni plugin shim is written with the config");
 });
 
 test("opencode: a saved model missing from the connected catalog is reported once, the config left alone", async () => {

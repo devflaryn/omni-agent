@@ -289,5 +289,7 @@ export function piChildEnv(cfg = CONFIG, { path = process.env.PATH || "", exists
   if (bin && exists(bin)) env.PATH = `${bin}${delimiter}${path}`;
   // The omni-agents / claude_task extensions call back into this server (background agents), whatever port it runs on.
   if (cfg.port) env.OMNI_AGENT_URL = `http://127.0.0.1:${cfg.port}`;
+  // The OpenCode plugin's memory_* tools use the server's vault.
+  if (cfg.vaultDir) env.OMNI_VAULT = cfg.vaultDir;
   return env;
 }

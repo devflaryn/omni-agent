@@ -20,7 +20,7 @@ import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
 import { OpencodeServer, guardOpencodeExit } from "./opencode-server.mjs";
 import { OpencodeRpc, allowTools, findModel, inCatalog, modelPick, modelThinking, pickerModels, runOnce } from "./opencode-rpc.mjs";
-import { writeOpencodeConfig } from "./opencode-config.mjs";
+import { omniShim, writeOpencodeConfig } from "./opencode-config.mjs";
 import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM } from "./hook.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
@@ -144,10 +144,13 @@ export async function createApp(overrides = {}) {
     return opencode;
   }
   const readJson = (file) => { try { return JSON.parse(readFileSync(file, "utf8")) || {}; } catch { return {}; } };
-  /** opencode.json from Omni's MCP list and omnidroid's omni-mcp (still in pi's omni-agent.json; Task 7 moves them and adds providers). */
+  /**
+   * opencode.json from Omni's MCP list and omnidroid's omni-mcp (still in pi's omni-agent.json; Task 7 moves them and
+   * adds providers), plus the shim that loads Omni's plugin (integrations/opencode/omni-plugin.mjs) into OpenCode.
+   */
   function writeConfig() {
     const ext = readJson(cfg.piExtConfigFile);
-    try { writeOpencodeConfig({ dir: cfg.opencodeConfigDir, root: ROOT, mcpServers: ext.mcpServers, omniMcp: ext.omniMcp }); }
+    try { writeOpencodeConfig({ dir: cfg.opencodeConfigDir, mcpServers: ext.mcpServers, omniMcp: ext.omniMcp, shim: omniShim(ROOT) }); }
     catch (e) { log("could not write the opencode config", e.message); }
   }
   let catalogCache = null;

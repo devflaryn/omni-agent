@@ -149,6 +149,14 @@ export class AgentManager extends EventEmitter {
   piFor(sid) { const id = this.bySid.get(sid); const rt = id && this.rt.get(id); return rt?.pi?.proc && this.records.get(id)?.kind === "pi" ? rt.pi : null; }
   /** True when a live pi agent writes that session file (the watcher must not tail it twice). */
   owns(file) { for (const rt of this.rt.values()) if (rt.pi?.owns?.(file)) return true; return false; }
+  /** The agent whose own chat is `sid` (its current or an earlier one), else null. */
+  agentBySid(sid) {
+    if (!sid) return null;
+    const id = this.bySid.get(sid);
+    if (id && this.records.has(id)) return this.records.get(id);
+    for (const r of this.records.values()) if (r.sid === sid) return r;
+    return null;
+  }
   activeCount() { let n = 0; for (const r of this.records.values()) if (r.status === "starting" || r.status === "running") n++; return n; }
 
   /** Persona `<personasDir>/<name>.md` (or the file whose frontmatter has that name). Throws a 400 when unknown. */
@@ -184,7 +192,10 @@ export class AgentManager extends EventEmitter {
     if (!AGENT_KINDS.includes(kind)) throw bad(`unknown agent kind "${kind}" (pi, claude or shell)`);
     const task = String(s.task ?? "").trim(), command = String(s.command ?? "").trim();
     if (kind === "shell" ? !command : !task) throw bad(kind === "shell" ? "a shell job needs a command" : "an agent needs a task");
-    const callerDepth = Math.max(0, Math.floor(Number(s.depth) || 0));
+    // A shared `opencode serve` cannot hand each chat its own OMNI_AGENT_DEPTH, so a caller that gives none (the
+    // OpenCode plugin) is placed by its chat: an agent's own chat is at that agent's depth, any other chat at 0.
+    const given = s.depth !== undefined && s.depth !== null && s.depth !== "";
+    const callerDepth = Math.max(0, Math.floor(Number(given ? s.depth : this.agentBySid(s.parentSid)?.depth) || 0));
     // A shell job cannot start anything itself, so the nesting limit only applies to agents.
     if (kind !== "shell" && callerDepth + 1 > this.config.maxDepth) throw bad(`agents nest at most ${this.config.maxDepth} deep and this caller is already at depth ${callerDepth}: do this work yourself instead of starting another agent`);
     let persona = null;
@@ -263,7 +274,11 @@ export class AgentManager extends EventEmitter {
   async launchPi(rec, rt, gen) {
     if (typeof this.createPi !== "function") throw new Error("pi agents are not available (no createPi)");
     const persona = rec.agent ? this.persona(rec.agent) : null;
-    const system = persona?.body || "";
+    // The vault memory pack (and repo graph) when asked for, as a Claude agent gets it: the shared server's chats have
+    // no recall of their own (OMNI_MEMORY=server), so it rides in the agent's system prompt after its persona.
+    const extra = (rec.memory || rec.graph) && this.composeSystem ? await Promise.resolve(this.composeSystem(rec, rt.followup ?? rt.task)).catch(() => "") : "";
+    if (rt.gen !== gen || rt.stopping) return;
+    const system = [persona?.body, extra].filter(Boolean).join("\n\n");
     // The tools are an allowlist over plugin tools too: keep the plan tool the goal keeper works with. agent_* is
     // not added: it would let a restricted persona start an unrestricted agent, so a persona that should delegate
     // lists agent_start itself.

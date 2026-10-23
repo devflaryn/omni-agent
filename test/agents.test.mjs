@@ -124,6 +124,42 @@ test("depth: the chat (0) and its agents (1) may start agents; an agent at depth
   m.dispose();
 });
 
+test("depth: without one in the spec, the caller's depth comes from its parent agent's record (an agent's own chat → its depth; any other chat → 0)", async () => {
+  const { m } = setup({ opts: nodeShell });
+  const a = m.start({ task: "look around", parentSid: "pi:main" });
+  assert.equal(a.depth, 1, "started by a chat that is not an agent");
+  await until(() => m.get(a.id).status === "running");
+  const aSid = m.get(a.id).sid;
+  const b = m.start({ task: "look deeper", parentSid: aSid });
+  assert.equal(b.depth, 2, "started by agent a (depth 1)");
+  await until(() => m.get(b.id).status === "running");
+  const bSid = m.get(b.id).sid;
+  assert.throws(() => m.start({ task: "even deeper", parentSid: bSid }), (e) => e.status === 400 && /nest at most 2 deep/.test(e.message));
+  assert.equal(m.start({ kind: "shell", command: "1", parentSid: bSid, timeoutMinutes: 1 }).depth, 2, "a job sits at its caller's level");
+  assert.equal(m.start({ task: "explicit", parentSid: aSid, depth: 0 }).depth, 1, "a depth in the spec still wins");
+  await m.stopAll();
+  m.dispose();
+});
+
+test("pi agent asked for memory gets the vault pack in its system prompt, after its persona (composeSystem, like Claude agents)", async () => {
+  const asked = [];
+  const pack = "Relevant durable memory from the user's Omni vault:\n- the parser lives in src/p.js";
+  const { m, pis } = setup({ opts: { composeSystem: async (rec, text) => { asked.push({ id: rec.id, text }); return pack; } } });
+  const rec = m.start({ task: "Find the parser", agent: "scout", memory: true });
+  await until(() => pis.made.length === 1 && pis.made[0].prompts.length === 1);
+  assert.equal(pis.made[0].opts.system, `You are a reconnaissance agent.\nReport file:line references.\n\n${pack}`);
+  assert.deepEqual(asked, [{ id: rec.id, text: "Find the parser" }]);
+  m.start({ task: "plain", memory: true });
+  await until(() => pis.made.length === 2);
+  assert.equal(pis.made[1].opts.system, pack);
+  m.start({ task: "no memory" });
+  await until(() => pis.made.length === 3);
+  assert.equal(pis.made[2].opts.system, "");
+  assert.equal(asked.length, 2, "asked only when memory was requested");
+  await m.stopAll();
+  m.dispose();
+});
+
 // ------------------------------------------------------------------ pi agents
 test("pi agent: persona → system prompt + tool allowlist, persona model, env identity, meta, managed goal, prompt with the footer", async () => {
   const keeper = fakeKeeper();

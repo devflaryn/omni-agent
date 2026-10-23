@@ -2,8 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { writeOpencodeConfig, opencodeConfig, pluginShimPath } from "../server/opencode-config.mjs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { writeOpencodeConfig, opencodeConfig, omniShim, pluginShimPath } from "../server/opencode-config.mjs";
 
 const fresh = () => mkdtempSync(join(tmpdir(), "omni-occfg-"));
 
@@ -53,4 +54,14 @@ test("writeOpencodeConfig writes the plugin shim when one is given, and replaces
   assert.equal(readFileSync(pluginShimPath(dir), "utf8"), "export const Omni = 1;\n");
   assert.equal(pluginShimPath(dir), join(dir, "plugin", "omni.js"));
   assert.equal(JSON.parse(readFileSync(join(dir, "opencode.json"), "utf8")).stale, undefined);
+});
+
+test("omniShim: the plugin shim imports Omni's plugin from the repo by file URL and passes the repo root", () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+  const shim = omniShim(root);
+  assert.match(shim, /import \{ tool \} from "@opencode-ai\/plugin";/);
+  assert.ok(shim.includes(`from ${JSON.stringify(pathToFileURL(join(root, "integrations", "opencode", "omni-plugin.mjs")).href)};`), shim);
+  assert.ok(shim.includes(`createOmniPlugin({ tool, root: ${JSON.stringify(root)} })`), shim);
+  assert.match(shim, /export const Omni = /);
+  assert.doesNotMatch(shim, /__OMNI_/, "every placeholder is filled");
 });

@@ -4,14 +4,25 @@
  * every permission pre-allowed (nobody is there to answer a prompt; that covers OpenCode's own `task` subagents,
  * whose prompts never reach a chat), no interactive `question` tool — plus Omni's MCP servers and custom providers.
  */
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 /** Allowed without asking. OpenCode's PermissionConfig: a tool name → "allow" | "ask" | "deny" (or per-pattern rules). */
 export const PERMISSIONS = Object.freeze({ edit: "allow", bash: "allow", webfetch: "allow", external_directory: "allow", doom_loop: "allow" });
 
 /** Where Omni's OpenCode plugin shim lives in the config dir (OpenCode loads `<dir>/plugin/*.js`). */
 export const pluginShimPath = (dir) => join(dir, "plugin", "omni.js");
+
+/**
+ * The plugin shim's source for Omni's repo at `root`: integrations/opencode/shim.js with the plugin's file URL and the
+ * root filled in (the shim imports the plugin from the repo, so the logic stays there).
+ */
+export function omniShim(root) {
+  const template = readFileSync(join(root, "integrations", "opencode", "shim.js"), "utf8");
+  const url = pathToFileURL(join(root, "integrations", "opencode", "omni-plugin.mjs")).href;
+  return template.replace('"__OMNI_PLUGIN_URL__"', () => JSON.stringify(url)).replace('"__OMNI_ROOT__"', () => JSON.stringify(root));
+}
 
 /** Omni's `${VAR}` env references in OpenCode's `{env:VAR}` form (OpenCode substitutes those in its config). */
 const envRef = (v) => String(v ?? "").replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, "{env:$1}");
@@ -66,9 +77,8 @@ export function opencodeConfig({ mcpServers = {}, omniMcp = null, providers = nu
 }
 
 /**
- * Writes `<dir>/opencode.json` whole (atomically) and returns its path. Callers also pass `root` (Omni's repo,
- * which the plugin shim imports Omni's plugin from); it is not used here yet. `shim`: the plugin shim's source;
- * when given it is written to `pluginShimPath(dir)` — the hook point Task 6 fills (a template rendered with `root`).
+ * Writes `<dir>/opencode.json` whole (atomically) and returns its path. `shim`: the plugin shim's source
+ * (omniShim(root)); when given it is written to `pluginShimPath(dir)`, where OpenCode loads it as a plugin.
  */
 export function writeOpencodeConfig({ dir, mcpServers = {}, omniMcp = null, providers = null, shim = null } = {}) {
   if (!dir) throw new Error("writeOpencodeConfig needs a dir");
