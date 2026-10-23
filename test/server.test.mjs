@@ -220,7 +220,12 @@ function makeFakePi({ cwd, model, provider, thinking }) {
     proc: {}, sid: "pi:fake", cwd, model, provider, thinking, streaming: false, state: { sessionFile: "C:\\fake.jsonl" }, calls: [], failClone: false,
     start() {}, stop() {}, owns() { return false; },
     waitReady() { return Promise.resolve(this.state); },
-    async switchSession(f) { this.calls.push(["switch", f]); this.sid = "pi:01a086a6-c763-777d-8188-9a868c6a2266"; },
+    async switchSession(f) {
+      this.calls.push(["switch", f]);
+      // OpencodeRpc imports a native pi chat into a new session (already a fork of it).
+      if (this.importNext) { this.sid = "pi:imported"; return { success: true, data: { cancelled: false, imported: true } }; }
+      this.sid = "pi:01a086a6-c763-777d-8188-9a868c6a2266";
+    },
     async clone() { this.calls.push(["clone"]); if (this.failClone) throw new Error("clone was cancelled"); this.sid = "pi:cloned"; },
     async prompt(m) { this.calls.push(["prompt", m]); return { ok: true }; },
     async setModel(p, id) { this.calls.push(["model", p, id]); return { success: true }; },
@@ -265,6 +270,25 @@ test("continue with fork:true and a cancelled clone (stubbed pi): 409, no prompt
   const r = await post2(`/api/sessions/${encodeURIComponent("pi:01a086a6-c763-777d-8188-9a868c6a2266")}/continue`, { message: "branch again", memory: false, fork: true });
   assert.equal(r.status, 409);
   assert.ok(!fakePi.calls.some((c) => c[0] === "prompt"), "prompt must not be called after a cancelled clone");
+});
+
+test("continue with fork:true on an old pi chat: the import is the fork, no clone of it (no ghost copy)", async () => {
+  fakePi.calls.length = 0;
+  fakePi.failClone = false;
+  fakePi.importNext = true;
+  const sessions = [];
+  const onEv = (ev) => { if (ev.kind === "session" && ev.forkedFrom) sessions.push(ev); };
+  app2.bus.on("event", onEv);
+  try {
+    const r = await post2(`/api/sessions/${encodeURIComponent("pi:01a086a6-c763-777d-8188-9a868c6a2266")}/continue`, { message: "branch from pi", memory: false, fork: true });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.ok(!fakePi.calls.some((c) => c[0] === "clone"), "the imported session is not cloned again");
+    assert.equal(r.json.sid, "pi:imported");
+    assert.equal(r.json.forked, true);
+    assert.equal(r.json.forkedFrom, "pi:01a086a6-c763-777d-8188-9a868c6a2266");
+    assert.deepEqual(sessions.map((e) => [e.sid, e.forkedFrom]), [["pi:imported", "pi:01a086a6-c763-777d-8188-9a868c6a2266"]]);
+    assert.deepEqual(fakePi.calls.at(-1), ["prompt", "branch from pi"]);
+  } finally { fakePi.importNext = false; app2.bus.off("event", onEv); }
 });
 
 // ------------------------------------------------------------ claude task (pi → Claude delegation)

@@ -639,9 +639,10 @@ export async function createApp(overrides = {}) {
     // Any other chat's child keeps working: this one opens in a free child in its folder, or a new one.
     const { child: c } = await acquirePi(plan.cwd || dir);
     try {
-      await c.switchSession(plan.file);
+      const switched = await c.switchSession(plan.file);
+      // An old pi chat is imported into a new session: that is the fork already (a clone of it would leave a ghost copy).
       if (plan.clone) {
-        await c.clone();
+        if (!switched?.data?.imported) await c.clone();
         bus.emit({ sid: c.sid, harness: "pi", kind: "session", ts: Date.now(), owned: true, forkedFrom: sid, cwd: c.cwd, file: c.state?.sessionFile });
       }
     } catch (e) { c.claimedAt = 0; throw Object.assign(e, { status: e.status || 409 }); }

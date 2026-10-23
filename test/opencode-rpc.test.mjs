@@ -464,6 +464,7 @@ test("switchSession(opencode mirror) attaches to that session", async () => {
   server.status = { ses_titled: { type: "busy" } };
   const r = await rpc.switchSession(file);
   assert.equal(r.success, true);
+  assert.ok(!r.data.imported);
   assert.equal(rpc.sid, "pi:ses_titled");
   assert.equal(rpc.state.sessionFile, file);
   assert.equal(rpc.state.sessionName, "Fix the build");
@@ -507,6 +508,7 @@ test("continuing a pi chat seeds a noReply transcript and copies history", async
   const before = readFileSync(pi, "utf8");
   const r = await rpc.switchSession(pi);
   assert.equal(r.success, true);
+  assert.equal(r.data.imported, true, "a new session: continue's forced fork needs no clone of it");
   assert.equal(readFileSync(pi, "utf8"), before, "the pi file is untouched");
   assert.equal(rpc.sid, "pi:ses_fake2");
   assert.notEqual(rpc.state.sessionFile, pi);

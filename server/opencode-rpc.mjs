@@ -726,7 +726,8 @@ export class OpencodeRpc extends EventEmitter {
     writeFileSync(file, out.join("\n") + "\n");
     this.dropUnused(this.attach(info.id, file));
     await this.announce(info);
-    return { success: true, data: { cancelled: false } };
+    // `imported`: the chat is on a new session already (the pi chat stays as it was), so a fork needs no clone of it.
+    return { success: true, data: { cancelled: false, imported: true } };
   }
 
   /** Attaches to the OpenCode session of an opencode mirror file; a native pi chat file is imported into a new session. */
