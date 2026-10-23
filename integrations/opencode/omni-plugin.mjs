@@ -11,7 +11,8 @@
  *   omnidroid_wait_device                 a blocking wait on omnidroid's list_devices (when omnidroid is configured)
  *
  * and in front of the model: the context policy, the plan/agents guidelines, the graph and omnidroid notes (system
- * prompt), and the open plan's reminder on the newest user message (never persisted).
+ * prompt), and the open plan's reminder at the tail of the context (never persisted). Agent tools called inside an
+ * OpenCode `task` child session act for the root chat (its identity and its report delivery).
  *
  * Loaded by the shim Omni writes into its OpenCode config dir (integrations/opencode/shim.js → <configDir>/plugin/
  * omni.js), which hands in the plugin package's `tool`: this file imports no package, only Omni's own modules, and
@@ -205,7 +206,27 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         return { rec, ended: fresh && rec.status !== "cancelled" };
       } finally { release(); }
     };
-    const identity = (ctx) => ({ parentSid: `pi:${ctx.sessionID}`, parentSessionId: ctx.sessionID });
+    /**
+     * The chat a session belongs to: OpenCode's `task` tool runs subagents in child sessions (`parentID`), and an agent
+     * started there belongs to the chat the user sees — its depth, its report, the goal keeper's wait. Cached once known.
+     */
+    const roots = new Map();
+    async function rootOf(sid) {
+      if (!sid || roots.has(sid)) return roots.get(sid) || sid;
+      let cur = sid;
+      const walked = new Set([sid]);
+      for (let i = 0; i < 16; i++) {
+        let parent;
+        try { parent = (await sdk(oc.session.get({ path: { id: cur } })))?.parentID || null; } catch { return cur; } // not cached: try again next time
+        if (!parent || walked.has(parent)) break;
+        walked.add(parent);
+        cur = parent;
+      }
+      roots.set(sid, cur);
+      return cur;
+    }
+    /** Who asks Omni: the root chat's sid and session id (the server derives the depth from them). */
+    const identity = async (ctx) => { const root = await rootOf(ctx.sessionID); return { parentSid: `pi:${root}`, parentSessionId: root }; };
     /** The model this tool call runs on, for a pi agent that inherits it. */
     async function currentModel(ctx) {
       try {
@@ -266,7 +287,10 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       },
       async execute(args, ctx) {
         const sid = ctx.sessionID;
-        const r = applyPlanAction(await planFor(sid), args);
+        // Load first, then read, apply and store with no await in between: OpenCode runs a step's tool calls at once,
+        // and two plan calls applied to the same base would lose one of them.
+        await planFor(sid);
+        const r = applyPlanAction(plans.get(sid) || emptyPlan(), args);
         if (r.ok) plans.set(sid, r.plan);
         return { title: `plan ${args.action ?? ""}${args.step ? ` ${args.step}` : ""}`, output: r.text, metadata: { plan: r.plan, events: r.events, ok: r.ok, action: args.action } };
       },
@@ -291,7 +315,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).optional().describe("Thinking level (kind pi); moved to the nearest one the model has"),
       },
       async execute(args, ctx) {
-        const me = identity(ctx);
+        const me = await identity(ctx);
         const kind = args.kind === "claude" ? "claude" : "pi";
         // A pi agent runs on this chat's model unless told otherwise (a persona may pin its own).
         const inherit = kind === "pi" && !args.model && !args.agent ? await currentModel(ctx) : null;
@@ -303,7 +327,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
           memory: kind === "pi" ? true : undefined,
           ...me,
         });
-        deliverTo(ctx.sessionID);
+        deliverTo(me.parentSessionId);
         const queued = rec.status === "queued" ? " It is queued until a slot frees (the agent limit is reached)." : "";
         return reply(
           `Started ${kind} agent ${rec.id} "${rec.title || titleFor(args.task)}" — it runs in the background; its report arrives as a message when it finishes.${queued} Keep working. agent_wait / agent_status to check, agent_message to steer it, agent_cancel to stop it.`,
@@ -320,7 +344,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
           const rec = await agents.get(args.id);
           return reply(describeAgent(rec), { id: rec.id, status: rec.status });
         }
-        const list = await agents.list({ parentSessionId: ctx.sessionID });
+        const list = await agents.list({ parentSessionId: await rootOf(ctx.sessionID) });
         if (!list.length) return reply("No background agents or jobs in this chat.", { agents: [] });
         const now = Date.now();
         const active = list.filter((a) => !isFinished(a)).length;
@@ -339,7 +363,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         timeoutSeconds: z.number().optional().describe("Give up after this many seconds (default 600, max 3600)"),
       },
       async execute(args, ctx) {
-        const sid = ctx.sessionID;
+        const sid = await rootOf(ctx.sessionID);
         const ids = (args.ids || []).map(String).filter(Boolean);
         const timeoutMs = waitMs(args.timeoutSeconds);
         const release = pausePoller(sid);
@@ -380,7 +404,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       async execute(args, ctx) {
         const r = await agents.message(args.id, args.message);
         if (!r.ok) return reply(`Agent ${args.id} did not take the message.`, { ok: false });
-        deliverTo(ctx.sessionID);
+        deliverTo(await rootOf(ctx.sessionID));
         const how = {
           steer: "it receives it in its current run",
           followUp: "it receives it when its current step ends",
@@ -395,7 +419,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       description: "Stop a background agent (and its process tree). Its partial result is kept in Omni.",
       args: { id: z.string().describe("The agent id (a-…)") },
       async execute(args, ctx) {
-        const { rec, ended } = await stop(args.id, ctx.sessionID);
+        const { rec, ended } = await stop(args.id, await rootOf(ctx.sessionID));
         if (ended) return reply(`${kindLabel(rec.kind).replace(/^./, (c) => c.toUpperCase())} ${rec.id} had already ended, so nothing was stopped. Its report:\n\n${agentReport(rec, { resultMax: MAX_RESULT })}`, { id: rec.id, status: rec.status });
         return reply(`Stopped ${kindLabel(rec.kind)} ${rec.id} "${rec.title || ""}" (${rec.status}).`, { id: rec.id, status: rec.status });
       },
@@ -410,11 +434,12 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         timeoutMinutes: z.number().optional().describe("Kill it after this many minutes (default 120)"),
       },
       async execute(args, ctx) {
+        const me = await identity(ctx);
         const rec = await agents.start({
           kind: "shell", command: args.command, cwd: args.cwd || ctx.directory || directory, title: args.title || titleFor(args.command),
-          timeoutMinutes: Math.max(1, Number(args.timeoutMinutes) || 120), ...identity(ctx),
+          timeoutMinutes: Math.max(1, Number(args.timeoutMinutes) || 120), ...me,
         });
-        deliverTo(ctx.sessionID);
+        deliverTo(me.parentSessionId);
         return reply(
           `Started job ${rec.id} "${rec.title || titleFor(args.command)}" in the background. job_wait {id: "${rec.id}", until: "<regex>"} waits for a log line or its exit; job_output shows the log; job_kill stops it. Its exit and log tail arrive as a message when it ends.`,
           { id: rec.id, status: rec.status },
@@ -431,7 +456,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       },
       async execute(args, ctx) {
         const timeoutMs = waitMs(args.timeoutSeconds);
-        const release = pausePoller(ctx.sessionID);
+        const release = pausePoller(await rootOf(ctx.sessionID));
         let r;
         let rec = null;
         try {
@@ -473,7 +498,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       description: "Stop a background job and its whole process tree.",
       args: { id: z.string().describe("The job id (a-…)") },
       async execute(args, ctx) {
-        const { rec, ended } = await stop(args.id, ctx.sessionID);
+        const { rec, ended } = await stop(args.id, await rootOf(ctx.sessionID));
         if (ended) return reply(`Job ${rec.id} had already ended, so nothing was stopped. Its report:\n\n${agentReport(rec, { resultMax: MAX_LOG })}`, { id: rec.id, status: rec.status, exitCode: rec.exitCode ?? null });
         return reply(`Stopped job ${rec.id} "${rec.title || ""}" (${rec.status}).`, { id: rec.id, status: rec.status });
       },
@@ -489,14 +514,15 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         timeoutMinutes: z.number().optional().describe("Stop waiting after this many minutes (default 15); Claude keeps running and its answer arrives as a message"),
       },
       async execute(args, ctx) {
-        const sid = ctx.sessionID;
+        const me = await identity(ctx);
+        const sid = me.parentSessionId;
         const minutes = Number(args.timeoutMinutes) > 0 ? Number(args.timeoutMinutes) : 15;
         let rec;
         try {
           rec = await agents.start({
             kind: "claude", task: args.task, cwd: args.cwd || ctx.directory || directory, model: args.model, resume: args.resume,
             // memory: the vault memory pack in Claude's system prompt (the server composes it).
-            title: `Task from pi: ${args.task.replace(/\s+/g, " ").slice(0, 60)}`, memory: true, ...identity(ctx),
+            title: `Task from pi: ${args.task.replace(/\s+/g, " ").slice(0, 60)}`, memory: true, ...me,
           });
         } catch (e) {
           if (e?.unreachable) return reply(e.message, { error: true });
@@ -675,8 +701,10 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         if (Array.isArray(output?.system)) output.system.push(notes());
       },
 
-      // The open plan's reminder at the end of the newest user message, for this call only: the stored message is not
-      // touched (the array slot gets a copy), so the reminder is never persisted and always current.
+      // The open plan's reminder at the tail of the context, for this call only (as omni-plan.ts did): everything in
+      // front of it stays byte-identical, so the prompt cache is kept. A user message at the end gets it as an extra
+      // part (a copy in the array slot); after an assistant/tool step a synthetic user message carries it. Nothing is
+      // stored, so the reminder is never persisted and always current.
       "experimental.chat.messages.transform": async (_inp, output) => {
         const msgs = output?.messages;
         if (!Array.isArray(msgs) || !msgs.length) return;
@@ -685,12 +713,19 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         try {
           const note = planReminder(await planFor(sid));
           if (!note) return;
-          let i = msgs.length - 1;
-          while (i >= 0 && msgs[i]?.info?.role !== "user") i--;
-          if (i < 0) return;
-          const m = msgs[i];
-          const part = { id: `${m.parts?.at(-1)?.id || "prt"}-omni-plan`, sessionID: sid, messageID: m.info.id, type: "text", text: `\n${note}`, synthetic: true };
-          msgs[i] = { ...m, parts: [...(m.parts || []), part] };
+          const last = msgs[msgs.length - 1];
+          if (last?.info?.role === "user") {
+            const part = { id: `${last.parts?.at(-1)?.id || last.info.id}:plan-reminder`, sessionID: sid, messageID: last.info.id, type: "text", text: `\n${note}`, synthetic: true };
+            msgs[msgs.length - 1] = { ...last, parts: [...(last.parts || []), part] };
+            return;
+          }
+          // The shape of the chat's own user messages (agent, model …), so OpenCode's conversion takes it like one.
+          const user = [...msgs].reverse().find((m) => m?.info?.role === "user")?.info;
+          const id = `${last?.info?.id || "msg"}:plan-reminder`;
+          const model = user?.model || (last?.info?.providerID ? { providerID: last.info.providerID, modelID: last.info.modelID } : undefined);
+          const { summary: _summary, ...shape } = user || { agent: last?.info?.agent || "build" };
+          const info = { ...shape, id, sessionID: sid, role: "user", time: { created: Date.now() }, ...(model ? { model } : {}) };
+          msgs.push({ info, parts: [{ id: `${id}:text`, sessionID: sid, messageID: id, type: "text", text: note, synthetic: true }] });
         } catch (e) { log(`plan reminder: ${e?.message || e}`); }
       },
 

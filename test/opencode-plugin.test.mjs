@@ -21,9 +21,12 @@ const tool = Object.assign((def) => def, { schema });
 function fakeClient() {
   const store = new Map();
   const prompts = [];
+  /** child session id → parent id (OpenCode's `task` subagents run in child sessions). */
+  const parents = new Map();
   return {
-    store, prompts,
+    store, prompts, parents,
     session: {
+      get: async ({ path }) => ({ data: { id: path.id, ...(parents.has(path.id) ? { parentID: parents.get(path.id) } : {}) } }),
       messages: async ({ path }) => ({ data: store.get(path.id) || [] }),
       message: async ({ path }) => ({ data: { info: { id: path.messageID, role: "assistant", providerID: "opencode", modelID: "big-pickle" }, parts: [] } }),
       promptAsync: async (opts) => { prompts.push(opts); return { data: undefined }; },
@@ -109,6 +112,31 @@ test("plan tool applies actions and returns metadata", async () => {
   assert.match(other.output, /No plan yet/, "each session has its own plan");
 });
 
+test("plan calls run at once (one OpenCode step) are all recorded", async () => {
+  const client = fakeClient();
+  const { hooks } = await plugin({ client });
+  await hooks.tool.plan.execute(BRAINSTORM, ctxFor("ses_c"));
+  await hooks.tool.plan.execute(CREATE, ctxFor("ses_c"));
+  const [a, b] = await Promise.all([
+    hooks.tool.plan.execute({ action: "skip", step: "1.1", reason: "not needed" }, ctxFor("ses_c")),
+    hooks.tool.plan.execute({ action: "skip", step: "1.2", reason: "not needed either" }, ctxFor("ses_c")),
+  ]);
+  assert.equal(a.metadata.ok && b.metadata.ok, true);
+  assert.deepEqual(b.metadata.plan.milestones[0].steps.map((s) => s.status), ["skipped", "skipped"], "the second result holds both");
+  // Also on a cold start, when both calls wait for the plan to be rebuilt from the session.
+  const r1 = await hooks.tool.plan.execute(BRAINSTORM, ctxFor("ses_cold"));
+  const r2 = await hooks.tool.plan.execute(CREATE, ctxFor("ses_cold"));
+  const c2 = fakeClient();
+  c2.store.set("ses_cold", sessionWith([r1, r2]));
+  const fresh = (await plugin({ client: c2 })).hooks;
+  const [p, q] = await Promise.all([
+    fresh.tool.plan.execute({ action: "start", step: "1.1" }, ctxFor("ses_cold")),
+    fresh.tool.plan.execute({ action: "skip", step: "1.2", reason: "b" }, ctxFor("ses_cold")),
+  ]);
+  assert.equal(p.metadata.ok && q.metadata.ok, true);
+  assert.deepEqual(q.metadata.plan.milestones[0].steps.map((s) => s.status), ["active", "skipped"]);
+});
+
 test("plan state survives a fresh plugin instance (rebuilt from messages)", async () => {
   const first = await plugin();
   const r1 = await first.hooks.tool.plan.execute(BRAINSTORM, ctxFor("ses_1"));
@@ -178,7 +206,7 @@ test("messages transform appends the plan reminder", async () => {
   const messages = () => [
     { info: { id: "msg_1", role: "user", sessionID: sid }, parts: [{ id: "prt_1", type: "text", text: "first" }] },
     { info: { id: "msg_2", role: "assistant", sessionID: sid }, parts: [{ id: "prt_2", type: "text", text: "ok" }] },
-    { info: { id: "msg_3", role: "user", sessionID: sid }, parts: [{ id: "prt_3", type: "text", text: "go on" }] },
+    { info: { id: "msg_3", role: "user", sessionID: sid, agent: "build", model: { providerID: "opencode", modelID: "big-pickle" }, summary: { diffs: [] } }, parts: [{ id: "prt_3", type: "text", text: "go on" }] },
     { info: { id: "msg_4", role: "assistant", sessionID: sid }, parts: [{ id: "prt_4", type: "tool", tool: "bash", state: { status: "completed" } }] },
   ];
   // No plan yet: nothing is added.
@@ -188,17 +216,53 @@ test("messages transform appends the plan reminder", async () => {
 
   await hooks.tool.plan.execute(BRAINSTORM, ctxFor(sid));
   await hooks.tool.plan.execute(CREATE, ctxFor(sid));
+
+  // Mid-loop (the context ends with an assistant step): a synthetic user message at the tail carries it.
   const out = { messages: messages() };
-  const original = out.messages[2];
+  const before = JSON.stringify(out.messages);
   await hooks["experimental.chat.messages.transform"]({}, out);
-  const last = out.messages[2].parts.at(-1);
-  assert.equal(out.messages[2].parts.length, 2);
-  assert.equal(last.type, "text");
-  assert.match(last.text, /<omni-plan phase="execute" progress="0\/2">/);
-  assert.match(last.text, /Now: step 1\.1/);
-  assert.equal(original.parts.length, 1, "the stored message is not changed (the note is never persisted)");
-  assert.equal(out.messages[0].parts.length, 1, "only the newest user message gets it");
-  assert.equal(out.messages[3].parts.length, 1);
+  assert.equal(out.messages.length, 5);
+  assert.equal(JSON.stringify(out.messages.slice(0, 4)), before, "everything in front of the tail is untouched (prompt cache)");
+  const tail = out.messages[4];
+  assert.equal(tail.info.role, "user");
+  assert.equal(tail.info.id, "msg_4:plan-reminder");
+  assert.equal(tail.info.sessionID, sid);
+  assert.equal(tail.info.agent, "build", "shaped like the chat's own user messages");
+  assert.deepEqual(tail.info.model, { providerID: "opencode", modelID: "big-pickle" });
+  assert.equal(tail.parts.length, 1);
+  assert.equal(tail.parts[0].type, "text");
+  assert.equal(tail.parts[0].messageID, "msg_4:plan-reminder");
+  assert.equal(tail.parts[0].synthetic, true);
+  assert.match(tail.parts[0].text, /<omni-plan phase="execute" progress="0\/2">/);
+  assert.match(tail.parts[0].text, /Now: step 1\.1/);
+
+  // A turn's first call (the context ends with the user's message): the note is an extra part of a copy of it.
+  const msgs2 = messages().slice(0, 3);
+  const out2 = { messages: [...msgs2] };
+  await hooks["experimental.chat.messages.transform"]({}, out2);
+  assert.equal(out2.messages.length, 3);
+  assert.equal(out2.messages[2].parts.length, 2);
+  assert.match(out2.messages[2].parts[1].text, /<omni-plan /);
+  assert.equal(msgs2[2].parts.length, 1, "the stored message is not changed (the note is never persisted)");
+  assert.equal(out2.messages[0].parts.length, 1, "only the tail gets it");
+});
+
+test("agent tools in an OpenCode task child session act for the root chat (identity, delivery)", async () => {
+  const omni = await fakeOmni();
+  const client = fakeClient();
+  client.parents.set("ses_child", "ses_mid");
+  client.parents.set("ses_mid", "ses_root");
+  client.store.set("ses_root", [{ info: { id: "msg_u1", role: "user", sessionID: "ses_root", agent: "build", model: { providerID: "opencode", modelID: "big-pickle" } }, parts: [{ type: "text", text: "go" }] }]);
+  const { hooks } = await plugin({ client, env: { OMNI_AGENT_URL: omni.url } });
+  await hooks.tool.agent_start.execute({ task: "Look around", title: "Look" }, ctxFor("ses_child"));
+  const post = omni.calls.find((c) => c.method === "POST" && c.path === "/api/agents");
+  assert.equal(post.body.parentSid, "pi:ses_root");
+  assert.equal(post.body.parentSessionId, "ses_root");
+  await until(() => client.prompts.length > 0);
+  assert.equal(client.prompts[0].path.id, "ses_root", "the report goes to the chat the user sees, not the finished child session");
+  assert.match(client.prompts[0].body.parts[0].text, /^\[omni-agent-result\] /);
+  assert.ok(omni.calls.some((c) => c.path === "/api/agents/wait" && c.body.parentSessionId === "ses_root"));
+  stopPollers();
 });
 
 test("agent_start posts to /api/agents with parentSid pi:<sessionID>", async () => {
