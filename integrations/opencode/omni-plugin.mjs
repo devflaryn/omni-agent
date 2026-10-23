@@ -184,17 +184,21 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         confirmDelivered(rec.id);
         unclaim(rec);
         pollerFor(sid)?.stop();
+        seen.delete(sid); // the chat's next message resumes delivery (the report is still undelivered)
         log(`could not post agent ${rec.id}'s report into session ${sid}: ${e?.message || e}`);
       });
     }
     const pollerOpts = (sid) => ({ client: agents, parentSessionId: sid, pi: owner, owner, log: (m) => log(m), isIdle: () => true, deliver: (rec) => deliver(sid, rec) });
     const deliverTo = (sid) => ensurePoller(pollerOpts(sid));
-    /** Delivery survives an OpenCode restart: the first time a session shows up, its outstanding agents are picked up again. */
+    /**
+     * Delivery survives an OpenCode restart: the first time a session shows up, its outstanding agents are picked up
+     * again. A session whose resume or delivery failed (Omni not reachable yet) is forgotten, so its next message tries again.
+     */
     const seen = new Set();
     function resume(sid) {
       if (!sid || seen.has(sid)) return;
       seen.add(sid);
-      resumeDelivery(pollerOpts(sid)).catch(() => { /* Omni not reachable: nothing to resume */ });
+      resumeDelivery(pollerOpts(sid)).catch(() => { seen.delete(sid); });
     }
     /** A report the model already sees in a tool result must not arrive again as a message. → false when it already did. */
     const delivered = async (rec) => { const fresh = claim(rec); try { await agents.delivered(rec.id); } catch { /* the poller acks it later */ } return fresh; };

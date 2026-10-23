@@ -286,6 +286,34 @@ test("agent_start posts to /api/agents with parentSid pi:<sessionID>", async () 
   stopPollers();
 });
 
+test("a session whose delivery could not be resumed (Omni not reachable) is tried again on its next message", async () => {
+  let down = true;
+  const lists = [];
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, "http://x");
+    if (url.pathname === "/api/agents" || url.pathname === "/api/agents/undelivered") lists.push(url.search);
+    if (down) return res.destroy();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ agents: [] }));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  after(() => server.close());
+  const { hooks } = await plugin({ env: { OMNI_AGENT_URL: `http://127.0.0.1:${server.address().port}` } });
+  await hooks["chat.message"]({ sessionID: "ses_rs" }, { parts: [] });
+  await until(() => lists.length >= 1);
+  await sleep(50);
+  const first = lists.length;
+  down = false;
+  await hooks["chat.message"]({ sessionID: "ses_rs" }, { parts: [] });
+  await until(() => lists.length > first);
+  const second = lists.length;
+  await sleep(50);
+  await hooks["chat.message"]({ sessionID: "ses_rs" }, { parts: [] });
+  await sleep(100);
+  assert.equal(lists.length, second, "once resumed, the session is not asked about again");
+  stopPollers();
+});
+
 test("delivery prompts the session with [omni-agent-result]", async () => {
   const omni = await fakeOmni();
   const client = fakeClient();
