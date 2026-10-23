@@ -7,6 +7,8 @@ import { OpencodeRpc, RUN_ONCE_TOOLS, allowTools, modelThinking, runOnce } from 
 import { FakeServer } from "./helpers/fake-opencode.mjs";
 import { normalizePiEntry } from "../server/normalize.mjs";
 import { latestPlan } from "../ui/plan.js";
+import { Bus } from "../server/bus.mjs";
+import { GoalKeeper } from "../server/hook.mjs";
 
 const fx = JSON.parse(readFileSync(new URL("./fixtures/opencode-turn.json", import.meta.url), "utf8"));
 
@@ -265,6 +267,7 @@ test("clone forks and switches the mirror", async () => {
   server.push({ type: "message.updated", properties: { sessionID: "ses_fork2", info: { id: "msg_u2", sessionID: "ses_fork2", role: "user", time: { created: 9000 } } } });
   server.push({ type: "message.part.updated", properties: { sessionID: "ses_fork2", part: { id: "prt_u2", sessionID: "ses_fork2", messageID: "msg_u2", type: "text", text: "again" } } });
   server.push({ type: "session.status", properties: { sessionID: "ses_fork2", status: { type: "busy" } } });
+  server.push({ type: "session.idle", properties: { sessionID: "ses_fork2" } });
   const after = lines(file);
   assert.equal(after.at(-1).id, "msg_u2");
   assert.equal(after.at(-1).parentId, known.id);
@@ -427,7 +430,8 @@ test("down emits exit once; a chat stopped then does not reattach on up", async 
   server.emit("up");
   await tick(); await tick();
   assert.equal(restarted, 0);
-  assert.equal(server.calls.length, n, "nothing reattached");
+  // Nothing reattached: the only call is the deferred abort of the run the outage cut off.
+  assert.deepEqual(server.calls.slice(n).map((c) => `${c.method} ${c.path}`), ["POST /session/ses_fake1/abort"]);
 });
 
 test("onRestart failures are logged", async () => {
@@ -725,4 +729,130 @@ test("runOnce: a given session is reused and kept; a model error rejects and sti
   const bad = new FakeServer({ reply: (m, p) => (m === "POST" && /\/message$/.test(p) ? { info: { id: "msg_2", error: { name: "APIError", data: { message: "403 FreeTierError" } } }, parts: [] } : undefined) });
   await assert.rejects(runOnce({ server: bad, provider: "opencode", model: "x", system: "S", input: "i", cwd: "C:\\w" }), /403 FreeTierError/);
   assert.equal(bad.calls.at(-1).method, "DELETE");
+});
+
+// ---- model errors that come only as session.error, after an earlier error or an outage
+const ev = (type, properties) => ({ type, properties: { sessionID: S, ...properties } });
+const busyEv = ev("session.status", { status: { type: "busy" } });
+const idleEv = ev("session.idle", {});
+const asstInfo = (id, extra = {}) => ({ id, sessionID: S, role: "assistant", time: { created: 2000 }, modelID: "big-pickle", providerID: "opencode", ...extra });
+const sessErr = (message) => ev("session.error", { error: { name: "UnknownError", data: { message } } });
+const errorMsgs = (events) => events.filter((e) => e.kind === "msg" && e.role === "assistant" && e.stopReason === "error");
+
+test("a session.error-only failure after an earlier error turn reaches the bus and the goal hook with its own text", async () => {
+  const bus = new Bus();
+  const events = [];
+  bus.on("event", (e) => events.push(e));
+  const server = new FakeServer();
+  const mirrorDir = join(mkdtempSync(join(tmpdir(), "omni-ocrpc-")), "opencode");
+  const rpc = new OpencodeRpc({ server, cwd: mkdtempSync(join(tmpdir(), "omni-ocrpc-cwd-")), provider: "opencode", model: "big-pickle", bus, mirrorDir });
+  const keeper = new GoalKeeper({ bus, getPi: () => rpc, config: { enabled: true }, setTimer: () => 0, clearTimer: () => {} });
+  rpc.start();
+  await rpc.waitReady();
+  keeper.setGoal(rpc.sid, "ship it");
+  // Turn 1: the provider refuses with an assistant message (403), then the session.error that repeats it.
+  await rpc.prompt("one", { echo: false });
+  for (const p of [busyEv, ev("message.updated", { info: asstInfo("msg_x1") }), ev("message.updated", { info: asstInfo("msg_x1", { error: { name: "APIError", data: { statusCode: 403, responseBody: "FreeTierError" } } }) }), sessErr("403"), idleEv]) server.push(p);
+  assert.equal(errorMsgs(events).length, 1);
+  // Turn 2: prompt_async answers before `busy` (OpencodeRpc counts the run itself); the model id is bad: session.error only.
+  await rpc.prompt("two", { echo: false });
+  for (const p of [busyEv, sessErr("Model not found: opencode/no-such-model."), idleEv]) server.push(p);
+  const errs = errorMsgs(events);
+  assert.equal(errs.length, 2, "the second failure is shown too");
+  assert.equal(errs[1].blocks[0].text, "Model error: Model not found: opencode/no-such-model.");
+  const g = keeper.goal(rpc.sid);
+  assert.equal(g.errorStops, 2, "the hook counts both failures (it pauses/escalates instead of retrying a dead model forever)");
+  assert.equal(g.lastError, "Model not found: opencode/no-such-model.");
+  keeper.stop?.();
+  rpc.stop();
+});
+
+test("after the server went away mid-turn, a later run's session.error reaches the bus", async () => {
+  const { server, rpc, events } = setup();
+  rpc.onRestart = async () => {};
+  rpc.start();
+  await rpc.waitReady();
+  await rpc.prompt("work", { echo: false });
+  server.push(busyEv);
+  server.push(ev("message.updated", { info: asstInfo("msg_y1") })); // left open: the server dies before it ends
+  server.up = false;
+  server.emit("down");
+  server.up = true;
+  server.emit("up");
+  await waitFor(() => !rpc.restoring, "reattached");
+  await rpc.prompt("again", { echo: false });
+  for (const p of [busyEv, sessErr("Model not found"), idleEv]) server.push(p);
+  const errs = errorMsgs(events);
+  assert.equal(errs.length, 1);
+  assert.equal(errs[0].blocks[0].text, "Model error: Model not found");
+});
+
+test("a message OpenCode is still writing when the stream comes back is picked up and mirrored whole", async () => {
+  const { server, rpc, events } = setup();
+  rpc.onRestart = async () => {};
+  rpc.start();
+  await rpc.waitReady();
+  await rpc.prompt("work", { echo: false });
+  server.push(busyEv);
+  server.push(ev("message.updated", { info: asstInfo("msg_z1") }));
+  server.up = false;
+  server.emit("down");
+  // Only the stream was lost: OpenCode kept writing the message meanwhile.
+  server.history.set(S, [{ info: asstInfo("msg_z1"), parts: [{ id: "prt_z1", sessionID: S, messageID: "msg_z1", type: "text", text: "written while away" }] }]);
+  server.status = { [S]: { type: "busy" } };
+  server.up = true;
+  events.length = 0;
+  server.emit("up");
+  await waitFor(() => !rpc.restoring, "reattached");
+  assert.equal(rpc.streaming, true);
+  server.push(ev("message.updated", { info: asstInfo("msg_z1", { time: { created: 2000, completed: 3000 }, finish: "stop" }) }));
+  server.push(idleEv);
+  const msg = lines(rpc.state.sessionFile).find((e) => e.id === "msg_z1");
+  assert.deepEqual(msg.message.content, [{ type: "text", text: "written while away" }]);
+  assert.ok(events.some((e) => e.kind === "msg" && e.role === "assistant" && e.blocks?.[0]?.text === "written while away"));
+});
+
+test("stop() after only the event stream dropped still aborts the run OpenCode keeps going", async () => {
+  const { server, rpc } = setup();
+  rpc.start();
+  await rpc.waitReady();
+  await rpc.prompt("work", { echo: false });
+  server.push(busyEv);
+  const exits = [];
+  rpc.on("exit", (c) => exits.push(c));
+  server.emit("down"); // the SSE stream dropped; the process (and its HTTP API) lives on
+  assert.deepEqual(exits, [null]);
+  rpc.stop(); // agents.onPiExit
+  await tick();
+  assert.equal(posts(server, /\/session\/ses_fake1\/abort$/).length, 1, "the run is aborted, not left spending tokens");
+});
+
+test("stop() while the server is down aborts the run once it is back", async () => {
+  const { server, rpc } = setup();
+  rpc.start();
+  await rpc.waitReady();
+  await rpc.prompt("work", { echo: false });
+  server.push(busyEv);
+  server.up = false;
+  server.emit("down");
+  rpc.stop();
+  await tick(); await tick();
+  assert.equal(server.calls.filter((c) => /\/abort$/.test(c.path)).length, 1, "tried at once (and failed: the server is down)");
+  server.up = true;
+  server.emit("up");
+  await waitFor(() => posts(server, /\/abort$/).length === 2, "the abort retried once up");
+  server.emit("up");
+  await tick();
+  assert.equal(posts(server, /\/abort$/).length, 2, "once");
+  assert.equal(server.listenerCount("up"), 0);
+});
+
+test("stop() after an outage with no run in progress aborts nothing", async () => {
+  const { server, rpc } = setup();
+  rpc.start();
+  await rpc.waitReady();
+  server.emit("down");
+  rpc.stop();
+  await tick();
+  assert.equal(posts(server, /\/abort$/).length, 0);
 });

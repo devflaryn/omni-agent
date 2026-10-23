@@ -159,7 +159,8 @@ test("each message_end once even when message.updated repeats", () => {
 
 test("omni-agent-result user text → custom message", () => {
   const report = '[omni-agent-result] Background pi agent a-1a2b3c4d "count" finished: done after 12s.\n\n42';
-  const { rpc, entries } = run({ sessionID: S, payloads: [...user("u1", report), busy] });
+  // Written at the settle (or the next message.updated of another message), once its parts are surely in.
+  const { rpc, entries } = run({ sessionID: S, payloads: [...user("u1", report), busy, idle] });
   const custom = msgEnds(rpc, "custom");
   assert.equal(custom.length, 1);
   assert.equal(custom[0].message.customType, "omni-agent-result");
@@ -172,10 +173,10 @@ test("omni-agent-result user text → custom message", () => {
   assert.equal(entries[0].customType, "omni-agent-result");
   assert.equal(normalizePiEntry(entries[0], ctx)[0].blocks[0].text, msg.blocks[0].text);
   // A plain prompt: a mirror entry but no rpc message (the prompt echo covers the live view).
-  const plain = run({ sessionID: S, payloads: [...user("u2", "hi"), busy] });
-  assert.deepEqual(plain.rpc.map(kind), ["agent_start"]);
+  const plain = run({ sessionID: S, payloads: [...user("u2", "hi"), busy, idle] });
+  assert.deepEqual(plain.rpc.map(kind), ["agent_start", "agent_settled"]);
   assert.deepEqual(plain.entries.map((e) => e.message.content), [[{ type: "text", text: "hi" }]]);
-  assert.deepEqual(run({ sessionID: S, payloads: [...user("u3", "ctx", { synthetic: true }), busy] }).entries, []);
+  assert.deepEqual(run({ sessionID: S, payloads: [...user("u3", "ctx", { synthetic: true }), busy, idle] }).entries, []);
 });
 
 test("compaction: a compaction part starts it, the summary message ends it (no assistant message)", () => {
@@ -232,4 +233,91 @@ test("stopReasonOf / errorText / piUsage", () => {
   assert.equal(errorText({ name: "MessageOutputLengthError", data: {} }), "MessageOutputLengthError");
   assert.deepEqual(piUsage({ total: 30, input: 10, output: 5, reasoning: 3, cache: { read: 7, write: 5 } }, 0.25), { input: 10, output: 8, cacheRead: 7, cacheWrite: 5, totalTokens: 30, cost: { total: 0.25 } });
   assert.deepEqual(piUsage({ input: 1, output: 2, reasoning: 0, cache: { read: 3, write: 4 } }), { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10, cost: { total: 0 } });
+});
+
+// ---- a user message's parts can trail other payloads of its session (a steer or report delivered mid-stream)
+const sessionUpdated = { type: "session.updated", properties: { sessionID: S, info: { id: S, title: "t" } } };
+const busyStatus = { type: "session.status", properties: { sessionID: S, status: { type: "busy" } } };
+
+test("a user message whose text part trails other payloads of the session is still mirrored", () => {
+  const [um, up] = user("u1", "do the thing");
+  const { rpc, entries } = run({ sessionID: S, payloads: [um, sessionUpdated, busyStatus, up, asst("a1"), asst("a1", { time: { created: 2000, completed: 3000 }, finish: "stop" }), idle] });
+  const users = entries.filter((e) => e.message?.role === "user");
+  assert.equal(users.length, 1, entries.map((e) => e.type).join(","));
+  assert.deepEqual(users[0].message.content, [{ type: "text", text: "do the thing" }]);
+  assert.ok(entries.indexOf(users[0]) < entries.findIndex((e) => e.message?.role === "assistant"), "the user entry comes before the answer");
+  assert.deepEqual(rpc.map(kind), ["agent_start", "message_start", "message_end:assistant", "agent_settled"]);
+});
+
+test("an agent report delivered while the chat streams reaches the live view and the mirror", () => {
+  const report = '[omni-agent-result] Background pi agent a-1a2b3c4d "count" finished: done.\n\n42';
+  const [um, up] = user("u2", report);
+  const { rpc, entries } = run({ sessionID: S, payloads: [
+    busy, asst("a1"), part({ id: "t1", messageID: "a1", type: "text", text: "" }),
+    um, sessionUpdated, busyStatus,
+    { type: "message.part.delta", properties: { sessionID: S, messageID: "a1", partID: "t1", delta: "hi" } },
+    up,
+    part({ id: "t1", messageID: "a1", type: "text", text: "hi", time: { start: 1, end: 2 } }),
+    asst("a1", { time: { created: 2000, completed: 3000 }, finish: "stop" }), idle,
+  ] });
+  const custom = msgEnds(rpc, "custom");
+  assert.equal(custom.length, 1, rpc.map(kind).join(","));
+  assert.match(custom[0].message.content, /^Background pi agent a-1a2b3c4d/);
+  assert.deepEqual(entries.filter((e) => e.type === "custom_message").map((e) => e.id), ["u2"]);
+  assert.equal(msgEnds(rpc, "assistant")[0].message.content[0].text, "hi");
+});
+
+test("a user message with no parts yet stays pending past another message, and is written once its part arrives", () => {
+  const [um, up] = user("u3", "late text");
+  const { entries } = run({ sessionID: S, payloads: [um, busy, asst("a1"), up, asst("a1", { time: { created: 2000, completed: 3000 }, finish: "stop" }), idle] });
+  const users = entries.filter((e) => e.message?.role === "user");
+  assert.deepEqual(users.map((e) => e.message.content[0].text), ["late text"]);
+});
+
+// ---- session.error after an earlier failed turn
+const errAsst = (id) => asst(id, { error: { name: "APIError", data: { statusCode: 403, message: "Forbidden", responseBody: "FreeTierError" } } });
+const sessionError = (message) => ({ type: "session.error", properties: { sessionID: S, error: { name: "UnknownError", data: { message } } } });
+
+test("a session.error-only failure shows after an earlier error turn when the prompt began the run (begin)", () => {
+  const t = new OpencodeTranslator({ sessionID: S });
+  for (const p of [busy, asst("x1"), errAsst("x1"), sessionError("403"), idle]) t.push(p);
+  t.begin(); // OpencodeRpc: prompt_async answered before `busy`
+  const out = [busyStatus, sessionError("Model not found: x/y"), idle].flatMap((p) => t.push(p).rpc);
+  const ends = msgEnds(out, "assistant");
+  assert.equal(ends.length, 1, out.map(kind).join(","));
+  assert.equal(ends[0].message.stopReason, "error");
+  assert.equal(ends[0].message.errorMessage, "Model not found: x/y");
+  assert.equal(normalized(ends)[0].blocks[0].text, "Model error: Model not found: x/y");
+});
+
+test("an assistant message left open by an earlier run does not hide a later run's session.error", () => {
+  const t = new OpencodeTranslator({ sessionID: S });
+  for (const p of [busy, asst("y1")]) t.push(p);
+  t.streaming = false; // the server went away mid-turn
+  const out = [busyStatus, sessionError("Model not found"), idle].flatMap((p) => t.push(p).rpc);
+  assert.equal(msgEnds(out, "assistant").length, 1, out.map(kind).join(","));
+  assert.equal(msgEnds(out, "assistant")[0].message.errorMessage, "Model not found");
+});
+
+test("resume() tracks an assistant message already under way, so it finishes whole", () => {
+  const t = new OpencodeTranslator({ sessionID: S });
+  t.begin();
+  const info = { id: "a7", sessionID: S, role: "assistant", time: { created: 2000 }, modelID: "big-pickle", providerID: "opencode" };
+  const r = t.resume(info, [{ id: "t7", sessionID: S, messageID: "a7", type: "text", text: "so far" }]);
+  assert.deepEqual(r.rpc.map(kind), ["message_start", "text_start", "text_delta"]);
+  const out = [
+    { type: "message.part.delta", properties: { sessionID: S, messageID: "a7", partID: "t7", delta: " and more" } },
+    asst("a7", { time: { created: 2000, completed: 3000 }, finish: "stop" }),
+  ].map((p) => t.push(p));
+  assert.deepEqual(out[0].rpc.map(kind), ["text_delta"]);
+  const end = out.flatMap((o) => o.rpc).find((e) => e.type === "message_end");
+  assert.equal(end.message.content[0].text, "so far", "the part's text as last updated");
+  assert.equal(out.flatMap((o) => o.entries).filter((e) => e.type === "message").length, 1);
+  assert.deepEqual(t.resume(info, []).rpc, [], "a message already tracked is not resumed twice");
+  assert.deepEqual(new OpencodeTranslator({ sessionID: S }).resume({ ...info, time: { created: 1, completed: 2 } }, []).rpc, [], "a finished message is not resumed");
+  // A session.error now belongs to the resumed message's run: that open message carries it.
+  const t2 = new OpencodeTranslator({ sessionID: S });
+  t2.begin();
+  t2.resume({ ...info, id: "a8" }, []);
+  assert.deepEqual(t2.push(sessionError("boom")).rpc, []);
 });

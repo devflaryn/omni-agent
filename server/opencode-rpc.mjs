@@ -222,6 +222,7 @@ export class OpencodeRpc extends EventEmitter {
     this.gen = 0; // bumped by start() and stop(): work begun before a stop must not attach or announce after it
     this.booting = false; // the first session is being opened
     this.exited = false; // "exit" was emitted for this outage or stop
+    this.runLost = false; // a run was going when the server (or only its event stream) went away: stop() aborts it
     this.runSeq = 0; // counts agent_start/agent_settled, so a prompt can tell whether its run already began or ended
     this.sessionID = null;
     this.mirror = null;
@@ -291,7 +292,9 @@ export class OpencodeRpc extends EventEmitter {
    * a session nobody used. Emits "exit" unless the server's going down already did.
    */
   stop() {
-    const busy = this.streaming || this.inFlight > 0;
+    // A run the outage cut off from Omni may still go on in OpenCode (only the event stream was lost): abort it too.
+    const busy = this.streaming || this.inFlight > 0 || this.runLost;
+    this.runLost = false;
     const wasLive = this.live;
     this.gen++;
     this.stopped = true;
@@ -301,11 +304,20 @@ export class OpencodeRpc extends EventEmitter {
     this.unlisten?.();
     this.unlisten = null;
     this.server.off("down", this.onDown).off("up", this.onUp);
-    if (busy && this.sessionID) this.server.request("POST", `/session/${this.sessionID}/abort`, { directory: this.cwd }).catch(() => {});
+    if (busy && this.sessionID) this.abortStopped(this.sessionID);
     else if (wasLive && this.sessionID && !this.used) this.discard(this.sessionID, this.mirror);
     this.streaming = false;
     this.openTools.clear();
     if (wasLive && !this.exited) { this.exited = true; this.emit("exit", null); }
+  }
+
+  /** Best effort: the stopped chat's run is aborted now, or — the server being down right now — once it is back. */
+  abortStopped(id) {
+    const send = () => this.server.request("POST", `/session/${id}/abort`, { directory: this.cwd });
+    send().catch(() => {
+      if (this.server.up) send().catch(() => {});
+      else this.server.once("up", () => { send().catch(() => {}); });
+    });
   }
 
   /**
@@ -317,6 +329,8 @@ export class OpencodeRpc extends EventEmitter {
     this.alive = false;
     if (!this.sessionID) return; // nothing to restore: the session is opened once the server is back
     if (this.translator) this.translator.streaming = false;
+    // Remembered for stop(): when only the event stream was lost, OpenCode goes on with the run.
+    this.runLost = this.streaming || this.inFlight > 0;
     this.streaming = false;
     this.openTools.clear();
     this.resumeFile = this.state?.sessionFile || this.resumeFile;
@@ -334,12 +348,14 @@ export class OpencodeRpc extends EventEmitter {
     if (!this.sessionID) { if (!this.booting) this.boot(); return; }
     if (!this.restoring) return;
     const gen = this.gen;
+    // A fresh translator on the mirror's end: a message the outage left open must not stand for a later run's.
+    this.retranslate();
     try {
-      await this.reconcile();
-      await this.syncStatus();
+      await this.catchUp(await this.reconcile());
       await this.refreshState();
     } catch (e) { this.log("system", `opencode reattach failed: ${e.message}`); }
     if (gen !== this.gen) return;
+    this.runLost = false; // `streaming` says again whether OpenCode runs the session
     this.exited = false;
     try { if (this.onRestart) await this.onRestart(); }
     catch (e) { this.log("system", `opencode resume failed: ${e.message}`); }
@@ -441,6 +457,28 @@ export class OpencodeRpc extends EventEmitter {
     const added = this.appendEntries(missed.map((e) => { const out = { ...e, parentId: parent }; parent = e.id; return out; }));
     this.translator.chain.last = this.lastId;
     for (const e of added) for (const ev of normalizePiEntry(e, this.ctx)) this.bus.emit(ev);
+    return fresh;
+  }
+
+  /** A new translator for the session, chained onto the mirror's end (the model it last saw carries over). */
+  retranslate() {
+    const model = this.translator?.chain.model ?? null;
+    this.translator = new OpencodeTranslator({ sessionID: this.sessionID, cwd: this.cwd, parentId: this.lastId });
+    this.translator.chain.model = model;
+  }
+
+  /**
+   * After attaching or reconnecting: whether OpenCode runs the session now, and — when it does — the assistant
+   * messages it is still writing (`msgs`, the session's unmirrored messages), picked up so they finish whole.
+   */
+  async catchUp(msgs = []) {
+    await this.syncStatus();
+    if (!this.streaming) return;
+    for (const m of msgs) {
+      const { rpc, entries } = this.translator.resume(m?.info, Array.isArray(m?.parts) ? m.parts : []);
+      if (entries.length) this.appendEntries(entries);
+      for (const ev of rpc) this.onEvent(ev);
+    }
   }
 
   /** Whether OpenCode is running this session right now (after attaching to it or reconnecting). */
@@ -449,7 +487,8 @@ export class OpencodeRpc extends EventEmitter {
     const t = all?.[this.sessionID]?.type;
     const busy = t === "busy" || t === "retry";
     if (busy === this.streaming) return;
-    this.translator.streaming = busy;
+    if (busy) this.translator.begin();
+    else this.translator.streaming = false;
     this.onEvent({ type: busy ? "agent_start" : "agent_settled" });
   }
 
@@ -622,7 +661,7 @@ export class OpencodeRpc extends EventEmitter {
     // The run counts from the accepted post: its `busy` comes over another socket, maybe later, and until then the chat
     // must not look free (server/index.mjs piFree). Not when OpenCode already started or even settled it meanwhile.
     if (!this.streaming && this.runSeq === seq) {
-      this.translator.streaming = true;
+      this.translator.begin(); // a new run: its session.error must show even after an earlier run's error
       this.lastEventAt = Date.now();
       this.onEvent({ type: "agent_start" });
     }
@@ -702,9 +741,10 @@ export class OpencodeRpc extends EventEmitter {
     this.current(gen);
     this.dropUnused(this.attach(head.id, resolve(sessionPath)));
     // OpenCode may have gone on without Omni (an Omni restart mid-run): mirror what it did meanwhile.
-    try { await this.reconcile(); } catch (e) { this.log("system", `could not bring the chat mirror up to date: ${e.message}`); }
+    let msgs = [];
+    try { msgs = await this.reconcile(); } catch (e) { this.log("system", `could not bring the chat mirror up to date: ${e.message}`); }
     this.current(gen);
-    await this.syncStatus();
+    await this.catchUp(msgs);
     await this.announce(info);
     return { success: true, data: { cancelled: false } };
   }

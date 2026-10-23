@@ -123,9 +123,39 @@ export class OpencodeTranslator {
     this.cwd = cwd;
     this.streaming = false;
     this.chain = new Chain(parentId);
-    this.msgs = new Map(); // message id → { info, parts: Map<partId, part>, live: Map<partId, state>, ended }
-    this.pendingUser = null; // a user message is written once its parts are in (the next unrelated payload)
-    this.errored = false; // this turn already showed its error: a following session.error adds nothing
+    this.msgs = new Map(); // message id → { info, parts: Map<partId, part>, live: Map<partId, state>, ended, run }
+    /**
+     * User messages not written yet: one is written once its parts are in — at the next message.updated of another
+     * message, a settle or a session.error. Other payloads (session.updated, status, a streaming message's deltas) can
+     * come between a user message and its part (a steer or an agent report delivered mid-stream) and write nothing.
+     */
+    this.pendingUsers = new Set();
+    this.errored = false; // this run already showed its error: a following session.error adds nothing
+    this.run = 0; // counts runs (begin): only a message first seen in the current run can carry its session.error
+  }
+
+  /**
+   * A run starts (`busy`, or OpencodeRpc counting it from an accepted prompt before `busy` arrives): streaming, and
+   * no error of it shown yet. No event: OpencodeRpc announces the start itself.
+   */
+  begin() {
+    this.streaming = true;
+    this.errored = false;
+    this.run++;
+  }
+
+  /**
+   * An assistant message already under way when the chat (re)attached (an Omni restart, a lost event stream): tracked
+   * from its current parts as part of the current run, so it finishes whole and its errors are its own. A message
+   * already tracked or finished gives nothing.
+   */
+  resume(info, parts = []) {
+    const out = { rpc: [], entries: [] };
+    if (!info?.id || info.role !== "assistant" || info.summary === true || done(info) || this.msgs.has(info.id)) return out;
+    this.msgs.set(info.id, { info, parts: new Map(), live: new Map(), ended: false, run: this.run });
+    out.rpc.push({ type: "message_start", message: { role: "assistant", model: info.modelID, provider: info.providerID } });
+    for (const p of parts) if (p?.id) this.#part({ ...p, messageID: info.id }, out);
+    return out;
   }
 
   /** @returns {{ rpc: object[], entries: object[] }} */
@@ -135,8 +165,10 @@ export class OpencodeTranslator {
     const p = payload.properties || {};
     const sid = p.sessionID ?? p.info?.sessionID ?? p.part?.sessionID;
     if (sid && sid !== this.sessionID) return out;
-    if (this.pendingUser && (p.info?.id ?? p.part?.messageID ?? p.messageID) !== this.pendingUser) this.#flushUser(out);
-    switch (payload.type) {
+    const t = payload.type;
+    const settles = t === "session.idle" || (t === "session.status" && p.status?.type === "idle");
+    if (this.pendingUsers.size && ((t === "message.updated" && !this.pendingUsers.has(p.info?.id)) || settles || t === "session.error")) this.#flushUsers(out);
+    switch (t) {
       case "session.status":
         if (p.status?.type === "busy") this.#start(out);
         else if (p.status?.type === "idle") this.#settle(out);
@@ -152,8 +184,7 @@ export class OpencodeTranslator {
 
   #start(out) {
     if (this.streaming) return;
-    this.streaming = true;
-    this.errored = false;
+    this.begin();
     out.rpc.push({ type: "agent_start" });
   }
 
@@ -163,12 +194,16 @@ export class OpencodeTranslator {
     out.rpc.push({ type: "agent_settled" });
   }
 
-  #flushUser(out) {
-    const m = this.msgs.get(this.pendingUser);
-    this.pendingUser = null;
-    if (!m || m.ended) return;
-    userOut(m.info, [...m.parts.values()], this.chain, out);
-    this.#close(m);
+  /** Writes the pending user messages whose parts are in; one with no part yet stays pending. */
+  #flushUsers(out) {
+    for (const id of [...this.pendingUsers]) {
+      const m = this.msgs.get(id);
+      if (m && !m.ended && !m.parts.size) continue;
+      this.pendingUsers.delete(id);
+      if (!m || m.ended) continue;
+      userOut(m.info, [...m.parts.values()], this.chain, out);
+      this.#close(m);
+    }
   }
 
   #close(m) { m.ended = true; m.parts = m.live = null; }
@@ -177,10 +212,10 @@ export class OpencodeTranslator {
     if (!info?.id) return;
     let m = this.msgs.get(info.id);
     const first = !m;
-    if (first) this.msgs.set(info.id, (m = { info, parts: new Map(), live: new Map(), ended: false }));
+    if (first) this.msgs.set(info.id, (m = { info, parts: new Map(), live: new Map(), ended: false, run: this.run }));
     if (m.ended) return;
     m.info = info;
-    if (info.role === "user") { this.pendingUser = info.id; return; }
+    if (info.role === "user") { this.pendingUsers.add(info.id); return; }
     if (info.role !== "assistant") return;
     if (info.summary === true) {
       if (done(info)) { summaryOut(info, [...m.parts.values()], this.chain, out); this.#close(m); }
@@ -188,6 +223,7 @@ export class OpencodeTranslator {
     }
     if (first) {
       this.#start(out);
+      m.run = this.run; // the run it belongs to, also when it is what starts one
       out.rpc.push({ type: "message_start", message: { role: "assistant", model: info.modelID, provider: info.providerID } });
     }
     if (!done(info)) return;
@@ -250,9 +286,12 @@ export class OpencodeTranslator {
     out.rpc.push({ type: "message_update", assistantMessageEvent: { type: part.type === "reasoning" ? "thinking_delta" : "text_delta", contentIndex: s.index, delta: p.delta } });
   }
 
-  /** A session.error shows as a failed assistant message unless an open or just-failed message already carries it. */
+  /**
+   * A session.error shows as a failed assistant message unless this run's open or just-failed message already carries
+   * it. A message an earlier run left open (the server went away mid-turn) carries nothing of this run.
+   */
   #error(err, out) {
-    const open = [...this.msgs.values()].some((m) => !m.ended && m.info.role === "assistant" && m.info.summary !== true);
+    const open = [...this.msgs.values()].some((m) => !m.ended && m.run === this.run && m.info.role === "assistant" && m.info.summary !== true);
     const seen = this.errored || open;
     this.errored = true;
     if (seen) return;
