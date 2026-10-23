@@ -139,6 +139,7 @@ export function describe(method, path, body = {}, { titleOf = () => "" } = {}) {
   if (path === "/api/claude/abort") return { title: "Stop a Claude Code run" };
   if ((m = /^\/api\/providers\/([^/]+)$/.exec(path))) return { title: `${method === "DELETE" ? "Remove" : "Change"} the model provider “${decodeURIComponent(m[1])}”` };
   if (path === "/api/providers-order") return { title: "Reorder the model providers" };
+  if ((m = /^\/api\/provider-keys\/([^/]+)$/.exec(path))) return { title: method === "DELETE" ? `Remove OpenCode's key for “${decodeURIComponent(m[1])}”` : `Set OpenCode's API key for “${decodeURIComponent(m[1])}”` };
   if ((m = /^\/api\/mcp\/([^/]+)$/.exec(path))) return { title: method === "DELETE" ? `Remove the MCP server “${decodeURIComponent(m[1])}”` : `Change the MCP server “${decodeURIComponent(m[1])}”${body.command ? ` — it runs: ${clip([body.command, ...(body.args || [])].join(" "), 200)}` : ""}` };
   if (path === "/api/mcp-test") return { title: `Test-connect an MCP server${body.command ? ` — runs: ${clip([body.command, ...(body.args || [])].join(" "), 200)}` : ""}` };
   if (path === "/api/memory/note") return { title: `${method === "DELETE" ? "Delete" : "Write"} the vault note ${body.path || ""}`.trim() };

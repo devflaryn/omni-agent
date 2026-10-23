@@ -112,7 +112,7 @@ export const CONFIG = {
   claudeProjectsDir: fc.claudeProjectsDir || join(HOME, ".claude", "projects"),
   /** pi is launched as `node cli.js --mode rpc` (no shell, no quoting issues). */
   piCli: fc.piCli || findPiCli(),
-  /** pi's config folder; `models.json` in it is where Omni's Providers dialog writes providers, keys and model ids. */
+  /** pi's config folder; its `models.json` holds pi's providers (copied once into opencodeProvidersFile). */
   piAgentDir: fc.piAgentDir || join(HOME, ".pi", "agent"),
   piModelsFile: fc.piModelsFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "models.json"),
   piBin: fc.piBin || "pi",
@@ -120,11 +120,19 @@ export const CONFIG = {
   opencodeBin: fc.opencodeBin || "opencode",
   /** Omni's own OpenCode config dir (`OPENCODE_CONFIG_DIR`): opencode.json written by Omni, layered over the user's global config. */
   opencodeConfigDir: fc.opencodeConfigDir || join(HOME, ".omni-agent", "opencode"),
+  /**
+   * Omni's custom providers (BYOK) for OpenCode — what the Providers dialog edits — rendered into opencode.json's
+   * `provider` block. Its first start copies pi's models.json providers here once (the marker file sits beside it).
+   */
+  opencodeProvidersFile: fc.opencodeProvidersFile || join(HOME, ".omni-agent", "opencode-providers.json"),
   /** The chats' pi-format mirror files; empty = `<piSessionsDir>/opencode` (createApp fills it in). */
   opencodeMirrorDir: fc.opencodeMirrorDir || "",
   /** Background-agent personas (`<name>.md`: frontmatter + system prompt), kept out of OpenCode's config dir. */
   personasDir: fc.personasDir || join(ROOT, "integrations", "pi", "agents"),
-  /** pi's Omni extension config; its `mcpServers` block is what the Providers dialog's MCP servers tab edits. */
+  /**
+   * pi's Omni extension config; its `mcpServers` block is what the Providers dialog's MCP servers tab edits (rendered
+   * into opencode.json's `mcp`); scripts/install.mjs writes omnidroid's `omniMcp` there.
+   */
   piExtConfigFile: fc.piExtConfigFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "omni-agent.json"),
   /** Key files handed to the pi child as environment variables (one line each, gitignored). */
   apiKeyFiles: { OPENROUTER_API_KEY: join(ROOT, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },

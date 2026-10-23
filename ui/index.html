@@ -157,10 +157,10 @@
           <button class="seg-btn" role="tab" id="tabRemote" aria-selected="false" aria-controls="remoteBody">Remote</button>
           <button class="seg-btn" role="tab" id="tabLong" aria-selected="false" aria-controls="longBody">Long runs</button>
         </div>
-        <span class="dlg-sub" id="subModels">Which LLMs pi can use. Only the model ids you type here show up in the picker. The list is also the fallback order: when a model errors, pi moves to the next model below it (drag the dots to reorder).</span>
-        <span class="dlg-sub" id="subMcp" hidden>Tool servers pi connects to. Each tool shows up as mcp__&lt;server&gt;__&lt;tool&gt;. Saving restarts pi so it connects.</span>
+        <span class="dlg-sub" id="subModels">Which LLMs OpenCode can use. Paste a key for one of OpenCode's own providers (OpenRouter, Anthropic, …) and its models show up in the picker; or add your own OpenAI-compatible endpoint with the model ids you type. Saving reloads OpenCode; chats keep going.</span>
+        <span class="dlg-sub" id="subMcp" hidden>Tool servers OpenCode connects to. Each tool shows up as &lt;server&gt;_&lt;tool&gt;. Saving reloads OpenCode so it connects.</span>
         <span class="dlg-sub" id="subRemote" hidden>Use Omni from another device or network. Remote browsers sign in with this password and see everything read-only; each message or change they send waits for your Approve here.</span>
-        <span class="dlg-sub" id="subLong" hidden>How Omni keeps long, unattended runs going: when pi compacts a growing chat, and what happens when a model stops early because it thinks its context is full. Changing the compaction size restarts pi so it takes effect.</span>
+        <span class="dlg-sub" id="subLong" hidden>How Omni keeps long, unattended runs going: when a growing chat is compacted, and what happens when a model stops early because it thinks its context is full. A new compaction size applies from each chat's next prompt.</span>
       </div>
       <button class="icon-btn" id="settingsClose" title="Close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
@@ -170,12 +170,11 @@
         <div class="pf-title" id="pfTitle">New provider</div>
         <label>Preset<select id="pfPreset"></select></label>
         <div class="pf-hint" id="pfHint"></div>
-        <label>Provider name<input id="pfName" placeholder="openrouter" spellcheck="false" autocomplete="off" /></label>
-        <label>Base URL<input id="pfBase" placeholder="https://openrouter.ai/api/v1" spellcheck="false" autocomplete="off" /></label>
-        <label>API<select id="pfApi"></select></label>
+        <label>Provider name<input id="pfName" placeholder="modal" spellcheck="false" autocomplete="off" /></label>
+        <label id="pfBaseRow">Base URL<input id="pfBase" placeholder="https://host/v1" spellcheck="false" autocomplete="off" /></label>
         <label>API key<input id="pfKey" type="password" placeholder="API key" autocomplete="off" /></label>
-        <label>Models <span class="pf-note">one id per line · optional display name after a |</span><textarea id="pfModels" rows="6" placeholder="deepseek/deepseek-v4-flash-0731 | DeepSeek V4 Flash&#10;moonshotai/kimi-k2.5" spellcheck="false"></textarea></label>
-        <div class="pf-row">
+        <label id="pfModelsRow">Models <span class="pf-note">one id per line · optional display name after a |</span><textarea id="pfModels" rows="6" placeholder="deepseek/deepseek-v4-flash-0731 | DeepSeek V4 Flash&#10;moonshotai/kimi-k2.5" spellcheck="false"></textarea></label>
+        <div class="pf-row" id="pfLimits">
           <label>Context window<input id="pfCtx" type="number" placeholder="128000" min="1000" /></label>
           <label>Max output tokens<input id="pfMax" type="number" placeholder="16384" min="256" /></label>
         </div>

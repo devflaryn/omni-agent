@@ -5,6 +5,17 @@ import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupTool
 import { parsePairs, formatPairs, parsePastedServer } from "../ui/mcp-settings.js";
 import { titleFrom } from "../server/watchers.mjs";
 
+test("the Providers dialog speaks of OpenCode, not pi (toasts, confirms, tab subtitles)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const read = (f) => readFileSync(new URL(`../ui/${f}`, import.meta.url), "utf8");
+  const dialog = read("index.html").match(/<div id="settings"[\s\S]*?<div id="approvals"/)[0];
+  for (const [name, text] of [["settings.js", read("settings.js")], ["mcp-settings.js", read("mcp-settings.js")], ["index.html #settings", dialog]]) {
+    assert.doesNotMatch(text, /\bpi (restart|connects|can use|moves|summarizes)|pi's (models\.json|own limit)|pi restarted/, name);
+  }
+  assert.match(read("settings.js"), /OpenCode reloaded/);
+  assert.match(read("mcp-settings.js"), /OpenCode/);
+});
+
 test("fmtDuration", () => {
   assert.equal(fmtDuration(0), "0s");
   assert.equal(fmtDuration(12_400), "12s");

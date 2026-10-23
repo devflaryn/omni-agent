@@ -26,7 +26,7 @@ import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
 import { filterPiModels } from "./pi-models.mjs";
 import { listMcpServers, upsertMcpServer, removeMcpServer, testMcpServer } from "./mcp.mjs";
-import { PRESETS, PI_APIS, listProviders, upsertProvider, removeProvider, reorderProviders, modelEntry, applyThinkingMaps } from "./providers.mjs";
+import { PRESETS, readModelsFile, listProviders, saveCustomProvider, removeProvider, reorderProviders, customProviderConfig, migratePiProviders, migrationMarker, modelEntry, applyThinkingMaps } from "./providers.mjs";
 import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.js";
 import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
@@ -49,9 +49,10 @@ export async function createApp(overrides = {}) {
   const underTest = !!process.env.NODE_TEST_CONTEXT || process.execArgv.includes("--test") || /\.test\.m?js$/i.test(process.argv[1] || "");
   if (underTest) {
     const tmp = mkdtempSync(join(tmpdir(), "omni-state-"));
-    for (const k of ["agentsFile", "goalsFile", "contextCapsFile"]) if (!(k in overrides)) cfg[k] = join(tmp, `${k}.json`);
+    for (const k of ["agentsFile", "goalsFile", "contextCapsFile", "opencodeProvidersFile"]) if (!(k in overrides)) cfg[k] = join(tmp, `${k}.json`);
     if (!("agentsDir" in overrides)) cfg.agentsDir = join(tmp, "agents");
-    if (!("piModelsFile" in overrides)) cfg.contextCaps = false;
+    // Nor is the real ~/.pi/agent/models.json (and its keys) copied into a test's provider store.
+    if (!("piModelsFile" in overrides)) { cfg.contextCaps = false; cfg.migratePiProviders = false; }
     if (!("persistContext" in overrides)) cfg.persistContext = false;
     for (const k of ["opencodeConfigDir", "statusSessionsDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
   }
@@ -127,6 +128,7 @@ export async function createApp(overrides = {}) {
     opencodeStart = (async () => {
       writeConfig();
       await opencode.start();
+      await migrateProviders();
       checkSavedModel().catch((e) => log("could not check the saved model against opencode's catalog", e.message));
       return opencode;
     })();
@@ -145,13 +147,31 @@ export async function createApp(overrides = {}) {
   }
   const readJson = (file) => { try { return JSON.parse(readFileSync(file, "utf8")) || {}; } catch { return {}; } };
   /**
-   * opencode.json from Omni's MCP list and omnidroid's omni-mcp (still in pi's omni-agent.json; Task 7 moves them and
-   * adds providers), plus the shim that loads Omni's plugin (integrations/opencode/omni-plugin.mjs) into OpenCode.
+   * opencode.json from Omni's MCP list and omnidroid's omni-mcp (both in omni-agent.json, cfg.piExtConfigFile, where
+   * the MCP dialog and the installer write them) and Omni's custom providers (cfg.opencodeProvidersFile), plus the shim
+   * that loads Omni's plugin (integrations/opencode/omni-plugin.mjs) into OpenCode.
    */
   function writeConfig() {
     const ext = readJson(cfg.piExtConfigFile);
-    try { writeOpencodeConfig({ dir: cfg.opencodeConfigDir, mcpServers: ext.mcpServers, omniMcp: ext.omniMcp, shim: omniShim(ROOT) }); }
+    try { writeOpencodeConfig({ dir: cfg.opencodeConfigDir, mcpServers: ext.mcpServers, omniMcp: ext.omniMcp, providers: customProviderConfig(cfg.opencodeProvidersFile), shim: omniShim(ROOT) }); }
     catch (e) { log("could not write the opencode config", e.message); }
+  }
+  const systemLog = (text) => { log(text); bus.emit({ sid: "omni", harness: "omni", kind: "log", ts: Date.now(), level: "system", text }); };
+  /**
+   * The first start copies pi's custom providers (pi's models.json) into Omni's store once, so a BYOK setup carries
+   * over. A name OpenCode already has (built in, or in the user's global config) is skipped, and each skip is logged.
+   * Runs on the started server (its catalog says what OpenCode has); copied providers → config rewritten and reloaded.
+   */
+  async function migrateProviders() {
+    if (cfg.migratePiProviders === false || existsSync(migrationMarker(cfg.opencodeProvidersFile))) return;
+    try {
+      const catalog = await opencode.request("GET", "/provider", { directory: cfg.cwd });
+      const r = migratePiProviders({ from: cfg.piModelsFile, to: cfg.opencodeProvidersFile, catalog });
+      if (!r) return;
+      if (r.error) { systemLog(`Providers: pi's models.json was not copied into OpenCode (tried again at the next start): ${r.error}`); return; }
+      for (const line of r.lines) systemLog(line);
+      if (r.copied.length) { writeConfig(); await disposeOpencode(); }
+    } catch (e) { log("could not copy pi's providers:", e.message); }
   }
   let catalogCache = null;
   /** OpenCode's `GET /provider` catalog, cached a minute (`fresh` re-reads it); starts the server when needed. */
@@ -868,24 +888,55 @@ export async function createApp(overrides = {}) {
           return send(res, 200, { goal, explicit: !!goal, enabled: keeper.config.enabled, started: !!goal });
         }
       }
-      // providers (pi's models.json)
+      // providers: Omni's custom (BYOK) providers, rendered into opencode.json; keys for OpenCode's own providers
       if (req.method === "GET" && p === "/api/providers") {
         const mdl = pi?.state?.model;
-        return send(res, 200, { providers: listProviders(cfg.piModelsFile), presets: PRESETS, apis: PI_APIS, file: cfg.piModelsFile, active: mdl ? { provider: mdl.provider, id: mdl.id } : null });
+        // OpenCode's catalog (this starts the server, as the model picker does; its first start copies pi's providers).
+        const cat = await Promise.race([catalog().catch(() => null), new Promise((r) => { setTimeout(r, 15000, null).unref?.(); })]);
+        const providers = listProviders(cfg.opencodeProvidersFile);
+        const own = new Set(providers.map((x) => x.name));
+        const builtIn = (Array.isArray(cat?.connected) ? cat.connected : []).filter((id) => !own.has(id)).map((id) => ({ id, name: cat.all?.find?.((x) => x.id === id)?.name || id }));
+        return send(res, 200, { providers, opencode: builtIn, presets: PRESETS, file: cfg.opencodeProvidersFile, active: mdl ? { provider: mdl.provider, id: mdl.id } : null });
       }
-      // Fallback priority: the provider order in models.json. pi's omni-fallback extension reads the file per switch, so no restart.
+      // The order of Omni's custom providers in opencode.json (read at OpenCode's next reload; nothing restarts).
       if (req.method === "POST" && p === "/api/providers-order") {
         const body = await readBody(req);
         if (!Array.isArray(body.order)) return send(res, 400, { error: "order must be an array of provider names" });
-        const order = reorderProviders(cfg.piModelsFile, body.order);
-        return send(res, 200, { ok: true, order, providers: listProviders(cfg.piModelsFile) });
+        const order = reorderProviders(cfg.opencodeProvidersFile, body.order);
+        writeConfig();
+        return send(res, 200, { ok: true, order, providers: listProviders(cfg.opencodeProvidersFile) });
       }
       if ((req.method === "PUT" || req.method === "DELETE") && (m = /^\/api\/providers\/([^/]+)$/.exec(p))) {
         const name = decodeURIComponent(m[1]);
-        if (req.method === "PUT") upsertProvider(cfg.piModelsFile, name, await readBody(req));
-        else if (!removeProvider(cfg.piModelsFile, name)) return send(res, 404, { error: "unknown provider" });
+        if (req.method === "PUT") {
+          const body = await readBody(req);
+          // A name OpenCode already has (built in, or the user's global config) would be overridden by Omni's entry.
+          if (!Object.hasOwn(readModelsFile(cfg.opencodeProvidersFile).providers, name) && opencode.up) {
+            const cat = await catalog().catch(() => null);
+            if (cat?.all?.some?.((x) => x.id === name)) return send(res, 409, { error: `OpenCode already has a provider named "${name}": set its key with its own preset (OpenCode providers), or give this one another name` });
+          }
+          saveCustomProvider(cfg.opencodeProvidersFile, name, body);
+        } else if (!removeProvider(cfg.opencodeProvidersFile, name)) return send(res, 404, { error: "unknown provider" });
         const { restarted, pending } = await reloadOpencode();
-        return send(res, 200, { ok: true, restarted, restartPending: pending, providers: listProviders(cfg.piModelsFile) });
+        return send(res, 200, { ok: true, restarted, restartPending: pending, providers: listProviders(cfg.opencodeProvidersFile) });
+      }
+      // The API key of one of OpenCode's own providers: OpenCode's auth store (PUT/DELETE /auth/:id), then a reload.
+      if ((req.method === "PUT" || req.method === "DELETE") && (m = /^\/api\/provider-keys\/([^/]+)$/.exec(p))) {
+        const id = decodeURIComponent(m[1]);
+        const body = req.method === "PUT" ? await readBody(req) : {};
+        const key = String(body.key ?? "").trim();
+        if (!/^[a-z0-9][a-z0-9._-]*$/i.test(id)) return send(res, 400, { error: "not a provider id" });
+        if (req.method === "PUT" && !key) return send(res, 400, { error: "paste the API key" });
+        if (Object.hasOwn(readModelsFile(cfg.opencodeProvidersFile).providers, id)) return send(res, 409, { error: `"${id}" is one of your custom providers: its key is saved in its own form` });
+        let server;
+        try { server = await opencodeUp(); } catch (e) { return send(res, 503, { error: `OpenCode is not running: ${e.message}` }); }
+        if (req.method === "PUT") {
+          const cat = await catalog().catch(() => null);
+          if (cat && !cat.all?.some?.((x) => x.id === id)) return send(res, 400, { error: `OpenCode has no provider named "${id}"` });
+          await server.request("PUT", `/auth/${encodeURIComponent(id)}`, { body: { type: "api", key } });
+        } else await server.request("DELETE", `/auth/${encodeURIComponent(id)}`);
+        const { restarted, pending } = await reloadOpencode();
+        return send(res, 200, { ok: true, restarted, restartPending: pending });
       }
       // MCP servers (pi's omni-agent.json → mcpServers, rendered into opencode.json). A change reloads OpenCode.
       if (req.method === "GET" && p === "/api/mcp") {

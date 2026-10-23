@@ -1,4 +1,4 @@
-/* Providers dialog, MCP servers tab: the servers pi connects to (mcpServers in ~/.pi/agent/omni-agent.json), through the server. */
+/* Providers dialog, MCP servers tab: the servers OpenCode connects to (mcpServers in omni-agent.json, rendered into Omni's opencode.json), through the server. */
 import { el } from "./lib.js";
 
 /** KEY=value (env) or Name: value (headers) lines ↔ an object. Blank lines and # comments are skipped. */
@@ -116,7 +116,7 @@ export function createMcpSettings({ api, toast, onChanged }) {
     try {
       const r = await api(`/api/mcp/${encodeURIComponent(name)}`, { ...body(), ...(editing && editing !== name ? { rename: editing } : {}) }, "PUT");
       if (editing && editing !== name) tested.delete(editing);
-      toast(r.restarted ? `Saved ${name} · pi restarted to connect` : `Saved ${name} · pi connects on its next start`);
+      toast(r.restarted ? `Saved ${name} · OpenCode reloaded to connect` : r.restartPending ? `Saved ${name} · OpenCode reloads once the chats are idle` : `Saved ${name} · OpenCode connects on its next start`);
       editing = name;
       await load();
       onChanged?.();
@@ -151,7 +151,7 @@ export function createMcpSettings({ api, toast, onChanged }) {
     finally { f.test.disabled = false; }
   }
   async function remove() {
-    if (!editing || !window.confirm(`Remove MCP server "${editing}"? pi restarts without its tools.`)) return;
+    if (!editing || !window.confirm(`Remove MCP server "${editing}"? OpenCode reloads without its tools.`)) return;
     try { await api(`/api/mcp/${encodeURIComponent(editing)}`, null, "DELETE"); toast(`Removed ${editing}`); tested.delete(editing); editing = null; await load(); onChanged?.(); }
     catch (e) { toast(e.message, true); }
   }

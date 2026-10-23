@@ -1,33 +1,43 @@
 /**
- * Omni's provider config for pi. The single source of truth is pi's own `~/.pi/agent/models.json`
- * (see pi's docs/models.md): `{ providers: { <name>: { baseUrl, api, apiKey, models: [...] } } }`.
- * Omni edits only `providers.<name>` and preserves everything else in the file (unknown top-level
- * keys, `compat`, `headers`, and the provider's own unknown keys such as `modelOverrides`, where
- * server/context-policy.mjs caps each model's effective window), so hand-written entries survive.
+ * Model providers. Two stores share this file's helpers, both `{ providers: { <name>: { baseUrl, apiKey, models: [...] } } }`:
+ *
+ * - Omni's own custom providers for OpenCode (BYOK), `~/.omni-agent/opencode-providers.json` (`cfg.opencodeProvidersFile`):
+ *   OpenAI-compatible endpoints the Providers dialog edits, rendered into Omni's `opencode.json` `provider` block by
+ *   customProviderConfig(). OpenCode's own providers (openrouter, anthropic, its Zen `opencode`, …) are not stored here:
+ *   their key goes to OpenCode's auth store (`PUT /auth/:id`). The first OpenCode start copies pi's custom providers
+ *   over once (migratePiProviders).
+ * - pi's `~/.pi/agent/models.json` (see pi's docs/models.md), which pi-era code (context caps, thinking maps) still
+ *   edits. Omni edits only `providers.<name>` and preserves everything else in the file (unknown top-level keys,
+ *   `compat`, `headers`, and the provider's own unknown keys such as `modelOverrides`), so hand-written entries survive.
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, realpathSync, unlinkSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join, basename } from "node:path";
 import { thinkingProfile } from "../ui/thinking.js";
 
 /** Request protocols pi's model runtime implements. */
 export const PI_APIS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"];
 
-/** Preset base URLs. A preset only prefills the form; the user may rename the provider and edit the URL. */
+/**
+ * The Providers dialog's presets. `kind: "custom"` prefills a custom OpenAI-compatible provider (the user may rename it
+ * and edit the URL); `kind: "key"` is one of OpenCode's own providers (`key` is its OpenCode id): only its API key is
+ * asked for, and it goes to OpenCode's auth store.
+ */
 export const PRESETS = [
-  { key: "openrouter", label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", hint: "model ids look like vendor/model, e.g. deepseek/deepseek-v4-flash-0731" },
-  { key: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", api: "openai-completions", hint: "e.g. gpt-5, gpt-5-mini" },
-  { key: "anthropic", label: "Anthropic", baseUrl: "https://api.anthropic.com", api: "anthropic-messages", hint: "e.g. claude-opus-5, claude-sonnet-5" },
-  { key: "google", label: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta", api: "google-generative-ai", hint: "e.g. gemini-2.5-pro" },
-  { key: "deepseek", label: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", api: "openai-completions", hint: "e.g. deepseek-chat, deepseek-reasoner" },
-  { key: "groq", label: "Groq", baseUrl: "https://api.groq.com/openai/v1", api: "openai-completions", hint: "e.g. llama-3.3-70b-versatile" },
-  { key: "xai", label: "xAI", baseUrl: "https://api.x.ai/v1", api: "openai-completions", hint: "e.g. grok-4" },
-  { key: "mistral", label: "Mistral", baseUrl: "https://api.mistral.ai/v1", api: "openai-completions", hint: "e.g. mistral-large-latest" },
-  { key: "together", label: "Together AI", baseUrl: "https://api.together.xyz/v1", api: "openai-completions", hint: "e.g. Qwen/Qwen3-235B-A22B-Instruct" },
-  { key: "fireworks", label: "Fireworks", baseUrl: "https://api.fireworks.ai/inference/v1", api: "openai-completions", hint: "e.g. accounts/fireworks/models/deepseek-v3" },
-  { key: "ollama", label: "Ollama (local)", baseUrl: "http://localhost:11434/v1", api: "openai-completions", hint: "e.g. llama3.1:8b · key can be anything" },
-  { key: "lmstudio", label: "LM Studio (local)", baseUrl: "http://localhost:1234/v1", api: "openai-completions", hint: "the model name LM Studio shows · key can be anything" },
-  { key: "custom-openai", label: "Custom (OpenAI-compatible)", baseUrl: "", api: "openai-completions", hint: "any /v1 endpoint: vLLM, modal, a proxy" },
-  { key: "custom-anthropic", label: "Custom (Anthropic-compatible)", baseUrl: "", api: "anthropic-messages", hint: "an Anthropic-style /messages endpoint or proxy" },
+  { kind: "key", key: "openrouter", label: "OpenRouter", hint: "OpenCode lists every OpenRouter model once its key is set" },
+  { kind: "key", key: "anthropic", label: "Anthropic", hint: "an Anthropic API key (sk-ant-…)" },
+  { kind: "key", key: "openai", label: "OpenAI", hint: "an OpenAI API key (sk-…)" },
+  { kind: "key", key: "google", label: "Google Gemini", hint: "a Gemini API key from AI Studio" },
+  { kind: "key", key: "opencode", label: "OpenCode Zen", hint: "an OpenCode Zen key (its free models need none)" },
+  { kind: "key", key: "deepseek", label: "DeepSeek", hint: "a DeepSeek API key" },
+  { kind: "key", key: "groq", label: "Groq", hint: "a Groq API key" },
+  { kind: "key", key: "xai", label: "xAI", hint: "an xAI API key" },
+  { kind: "key", key: "mistral", label: "Mistral", hint: "a Mistral API key" },
+  { kind: "key", key: "togetherai", label: "Together AI", hint: "a Together AI API key" },
+  { kind: "key", key: "fireworks-ai", label: "Fireworks", hint: "a Fireworks API key" },
+  { kind: "key", key: "opencode-other", anyId: true, label: "Other OpenCode provider…", hint: "type the id OpenCode uses for it (e.g. moonshotai, nvidia, zai) and paste its key" },
+  { kind: "custom", key: "custom", label: "Custom (OpenAI-compatible)", baseUrl: "", hint: "any /v1 endpoint: vLLM, modal, a proxy" },
+  { kind: "custom", key: "ollama", label: "Ollama (local)", baseUrl: "http://localhost:11434/v1", hint: "e.g. llama3.1:8b · no key needed" },
+  { kind: "custom", key: "lmstudio-local", label: "LM Studio (local)", baseUrl: "http://localhost:1234/v1", hint: "the model name LM Studio shows · no key needed" },
 ];
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
@@ -214,6 +224,123 @@ export function fillThinkingMaps(json) {
     }
   }
   return filled;
+}
+
+// ------------------------------------------------------------------ OpenCode custom providers (Omni's store)
+/** Typed model ids (strings or {id,...}) → the store's model entries. Blank ids are dropped. */
+export function normalizeCustomModels(list) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const m = typeof raw === "string" ? { id: raw } : raw && typeof raw === "object" ? raw : null;
+    const id = String(m?.id ?? "").trim();
+    if (!id) continue;
+    out.push({ id, name: String(m.name || "").trim() || id, contextWindow: num(m.contextWindow, DEFAULTS.contextWindow), maxTokens: num(m.maxTokens, DEFAULTS.maxTokens), reasoning: m.reasoning === true });
+  }
+  return out;
+}
+
+/** @returns {string|null} an error message, or null when the custom provider is valid */
+export function validateCustomProvider(name, body) {
+  if (!NAME_RE.test(String(name || ""))) return "provider name must be lowercase letters, digits, - or _ (e.g. modal)";
+  try { const u = new URL(String(body?.baseUrl || "")); if (!/^https?:$/.test(u.protocol)) throw new Error(); } catch { return "base URL must be a valid http(s) URL"; }
+  if (!normalizeCustomModels(body?.models).length) return "add at least one model id";
+  return null;
+}
+
+/**
+ * Create or replace the custom provider `name` in Omni's store. An omitted apiKey keeps the stored one; "" clears it.
+ * A model re-saved by id alone keeps its stored name, limits and reasoning; keys the form does not edit are kept.
+ */
+export function saveCustomProvider(file, name, body) {
+  const err = validateCustomProvider(name, body);
+  if (err) throw Object.assign(new Error(err), { status: 400 });
+  const json = readModelsFile(file, { strict: true });
+  const prev = isObj(json.providers[name]) ? json.providers[name] : {};
+  const prevById = new Map((Array.isArray(prev.models) ? prev.models : []).map((m) => [m?.id, m]));
+  const models = [];
+  for (const raw of body.models) {
+    const given = typeof raw === "string" ? { id: raw } : raw && typeof raw === "object" ? raw : {};
+    const [m] = normalizeCustomModels([given]);
+    if (!m) continue;
+    const old = prevById.get(m.id);
+    if (old) for (const k of ["name", "contextWindow", "maxTokens", "reasoning"]) if (given[k] === undefined && old[k] !== undefined) m[k] = old[k];
+    models.push(m);
+  }
+  const { apiKey: _k, ...rest } = prev;
+  const next = { ...rest, baseUrl: String(body.baseUrl).trim() };
+  const key = body.apiKey === undefined ? prev.apiKey : String(body.apiKey).trim();
+  if (key) next.apiKey = key;
+  next.models = models;
+  json.providers[name] = next;
+  writeModelsFile(file, json);
+  return next;
+}
+
+/** A stored key as OpenCode config: pi's `$VAR` / `${VAR}` references become OpenCode's `{env:VAR}`. */
+const opencodeKey = (k) => { const m = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(String(k).trim()); return m ? `{env:${m[1]}}` : String(k); };
+
+/** Omni's custom providers as OpenCode's `provider` config block (OpenAI-compatible endpoints), in store order. */
+export function customProviderConfig(file) {
+  const out = {};
+  for (const [name, p] of Object.entries(readModelsFile(file).providers)) {
+    if (!isObj(p) || !p.baseUrl) continue;
+    const models = {};
+    for (const m of Array.isArray(p.models) ? p.models : []) {
+      if (!m?.id) continue;
+      models[m.id] = { name: m.name || m.id, limit: { context: num(m.contextWindow, DEFAULTS.contextWindow), output: num(m.maxTokens, DEFAULTS.maxTokens) }, ...(m.reasoning === true ? { reasoning: true } : {}) };
+    }
+    const options = { baseURL: String(p.baseUrl) };
+    if (p.apiKey) options.apiKey = opencodeKey(p.apiKey);
+    out[name] = { npm: "@ai-sdk/openai-compatible", name, options, models };
+  }
+  return out;
+}
+
+/** The file that records the one-time copy of pi's providers: next to the store. */
+export const migrationMarker = (file) => join(dirname(file), `${basename(file).replace(/\.json$/i, "")}.migrated.json`);
+
+/**
+ * Copies pi's custom providers (`from`, pi's models.json) into Omni's store (`to`) once; the marker file next to the
+ * store makes every later call a no-op (→ null). Skipped, each with a reason in `lines`: a name Omni's store already has,
+ * a name OpenCode already has (`catalog` is its `GET /provider` answer: built-in providers and the user's global
+ * config — copying would override that provider), and a provider that does not speak the OpenAI chat API. A key that
+ * runs a command (pi's `!cmd`) cannot be expressed in OpenCode's config: the provider is copied without it.
+ * A pi file that cannot be read → `{ error }` and no marker, so the next start tries again.
+ * @returns {{copied: string[], skipped: {name: string, why: string}[], lines: string[]} | {error: string} | null}
+ */
+export function migratePiProviders({ from, to, catalog = null }) {
+  const marker = migrationMarker(to);
+  if (existsSync(marker)) return null;
+  let pi;
+  try { pi = readModelsFile(from, { strict: true }); } catch (e) { return { error: e.message }; }
+  const store = readModelsFile(to, { strict: true });
+  const known = new Map((Array.isArray(catalog?.all) ? catalog.all : []).map((p) => [p?.id, p]));
+  const connected = new Set(Array.isArray(catalog?.connected) ? catalog.connected : []);
+  const copied = [], skipped = [], lines = [];
+  for (const [name, p] of Object.entries(pi.providers)) {
+    if (!isObj(p)) continue;
+    const ids = (Array.isArray(p.models) ? p.models : []).map((m) => m?.id).filter(Boolean);
+    let why = null;
+    if (Object.hasOwn(store.providers, name)) why = `Omni already has a provider named ${name}`;
+    else if (known.has(name)) {
+      const lacks = ids.filter((id) => !Object.hasOwn(known.get(name)?.models || {}, id));
+      why = `OpenCode already has a provider named ${name}${connected.has(name) ? " (connected)" : ""}, so it was left as OpenCode has it`
+        + (lacks.length ? `; models of pi's ${name} it does not list: ${lacks.join(", ")} (add them under another provider name to keep them)` : "");
+    } else if ((p.api || "openai-completions") !== "openai-completions") why = `it uses ${p.api}, and Omni's custom providers are OpenAI-compatible only (OpenCode's own provider for it takes just a key)`;
+    else if (!p.baseUrl || !ids.length) why = "it has no base URL or no models";
+    if (why) { skipped.push({ name, why }); lines.push(`Providers: pi's ${name} was not copied: ${why}.`); continue; }
+    const entry = { baseUrl: String(p.baseUrl), models: normalizeCustomModels(p.models) };
+    const key = String(p.apiKey || "").trim();
+    if (key.startsWith("!")) lines.push(`Providers: pi's ${name} gets its key by running a command, which OpenCode cannot do: set its key in Providers.`);
+    else if (key) entry.apiKey = key;
+    store.providers[name] = entry;
+    copied.push(name);
+    lines.push(`Providers: copied pi's ${name} (${entry.models.length} model${entry.models.length === 1 ? "" : "s"}) into OpenCode.`);
+  }
+  if (copied.length) writeModelsFile(to, store);
+  mkdirSync(dirname(marker), { recursive: true });
+  writeFileSync(marker, `${JSON.stringify({ at: new Date().toISOString(), from, copied, skipped }, null, 2)}\n`);
+  return { copied, skipped, lines };
 }
 
 /** fillThinkingMaps on the file (call before a pi starts: pi reads models.json only at boot). Never throws. */

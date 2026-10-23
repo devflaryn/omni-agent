@@ -1,19 +1,22 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PRESETS, PI_APIS, readModelsFile, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels, normalizeModels, validateProvider } from "../server/providers.mjs";
+import { PRESETS, readModelsFile, listProviders, upsertProvider, removeProvider, reorderProviders, flatModels, normalizeModels, validateProvider } from "../server/providers.mjs";
+import { saveCustomProvider, customProviderConfig, migratePiProviders, migrationMarker, normalizeCustomModels } from "../server/providers.mjs";
+import { writeOpencodeConfig } from "../server/opencode-config.mjs";
 
 const base = mkdtempSync(join(tmpdir(), "omni-prov-"));
 const file = join(base, "models.json");
 
-test("presets cover the documented providers with a pi api type each", () => {
-  const keys = PRESETS.map((p) => p.key);
-  for (const k of ["openrouter", "openai", "anthropic", "google", "deepseek", "ollama", "custom-openai", "custom-anthropic"]) assert.ok(keys.includes(k), k);
-  for (const p of PRESETS) assert.ok(PI_APIS.includes(p.api), `${p.key} api ${p.api}`);
-  assert.equal(PRESETS.find((p) => p.key === "anthropic").api, "anthropic-messages");
-  assert.equal(PRESETS.find((p) => p.key === "custom-openai").baseUrl, "");
+test("the dialog's presets: custom OpenAI-compatible endpoints and OpenCode's own providers (key only)", () => {
+  const custom = PRESETS.filter((p) => p.kind === "custom").map((p) => p.key);
+  const keyed = PRESETS.filter((p) => p.kind === "key").map((p) => p.key);
+  for (const k of ["custom", "ollama"]) assert.ok(custom.includes(k), k);
+  for (const k of ["openrouter", "anthropic", "openai", "google", "opencode"]) assert.ok(keyed.includes(k), k);
+  assert.equal(PRESETS.length, custom.length + keyed.length, "every preset is one kind or the other");
+  assert.equal(PRESETS.find((p) => p.key === "custom").baseUrl, "");
 });
 
 test("readModelsFile tolerates a missing or broken file", () => {
@@ -175,4 +178,106 @@ test("reorderProviders rewrites the provider order (the fallback chain); unknown
   assert.deepEqual(Object.keys(j.providers), ["c", "a", "b"]);
   assert.deepEqual(j.compat, { keep: true }, "other top-level keys survive");
   assert.deepEqual(flatModels(f).map((m) => `${m.provider}/${m.id}`), ["c/c1", "a/a1", "a/a2", "b/b1"], "the picker and the fallback chain follow the new order");
+});
+
+// ------------------------------------------------------------ OpenCode custom providers (BYOK)
+test("normalizeCustomModels: the store's model shape (reasoning only when asked for)", () => {
+  assert.deepEqual(normalizeCustomModels([" a ", { id: "b", name: "B", contextWindow: 32000, maxTokens: 4000, reasoning: true }, { id: "" }]), [
+    { id: "a", name: "a", contextWindow: 128000, maxTokens: 16384, reasoning: false },
+    { id: "b", name: "B", contextWindow: 32000, maxTokens: 4000, reasoning: true },
+  ]);
+});
+
+test("provider saved → opencode.json provider entry", () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-ocprov-"));
+  const f = join(dir, "opencode-providers.json");
+  assert.throws(() => saveCustomProvider(f, "Bad Name", { baseUrl: "https://x/v1", models: ["a"] }), (e) => e.status === 400 && /name/.test(e.message));
+  assert.throws(() => saveCustomProvider(f, "x", { baseUrl: "nope", models: ["a"] }), (e) => e.status === 400 && /url/i.test(e.message));
+  assert.throws(() => saveCustomProvider(f, "x", { baseUrl: "https://x/v1", models: [] }), (e) => e.status === 400 && /model/.test(e.message));
+  saveCustomProvider(f, "modal", { baseUrl: "https://modal.example/v1", apiKey: "sk-modal-1234", models: [{ id: "Qwen/Qwen3.8-27B", name: "Qwen", contextWindow: 262144, maxTokens: 32768, reasoning: true }, "vendor/b:floor"] });
+  saveCustomProvider(f, "local", { baseUrl: "http://localhost:11434/v1", models: ["llama3.1:8b"] });
+  saveCustomProvider(f, "envy", { baseUrl: "https://envy.example/v1", apiKey: "$ENVY_KEY", models: ["m"] });
+  const store = JSON.parse(readFileSync(f, "utf8"));
+  assert.deepEqual(store.providers.modal, { baseUrl: "https://modal.example/v1", apiKey: "sk-modal-1234", models: [
+    { id: "Qwen/Qwen3.8-27B", name: "Qwen", contextWindow: 262144, maxTokens: 32768, reasoning: true },
+    { id: "vendor/b:floor", name: "vendor/b:floor", contextWindow: 128000, maxTokens: 16384, reasoning: false },
+  ] });
+  const conf = customProviderConfig(f);
+  assert.deepEqual(Object.keys(conf), ["modal", "local", "envy"]);
+  assert.deepEqual(conf.modal, {
+    npm: "@ai-sdk/openai-compatible", name: "modal", options: { baseURL: "https://modal.example/v1", apiKey: "sk-modal-1234" },
+    models: { "Qwen/Qwen3.8-27B": { name: "Qwen", limit: { context: 262144, output: 32768 }, reasoning: true }, "vendor/b:floor": { name: "vendor/b:floor", limit: { context: 128000, output: 16384 } } },
+  });
+  assert.deepEqual(conf.local.options, { baseURL: "http://localhost:11434/v1" }, "a keyless local server gets no apiKey");
+  assert.equal(conf.envy.options.apiKey, "{env:ENVY_KEY}", "pi's $VAR key reference becomes OpenCode's {env:VAR}");
+  const oc = JSON.parse(readFileSync(writeOpencodeConfig({ dir: join(dir, "oc"), providers: conf }), "utf8"));
+  assert.deepEqual(oc.provider.modal, conf.modal, "rendered into opencode.json's provider block");
+  // a re-save without a key keeps the stored one and each model's own limits; "" clears the key
+  saveCustomProvider(f, "modal", { baseUrl: "https://modal.example/v2", models: [{ id: "Qwen/Qwen3.8-27B" }, "new/one"] });
+  let p = JSON.parse(readFileSync(f, "utf8")).providers.modal;
+  assert.equal(p.apiKey, "sk-modal-1234");
+  assert.equal(p.baseUrl, "https://modal.example/v2");
+  assert.deepEqual(p.models[0], { id: "Qwen/Qwen3.8-27B", name: "Qwen", contextWindow: 262144, maxTokens: 32768, reasoning: true });
+  assert.deepEqual(p.models.map((m) => m.id), ["Qwen/Qwen3.8-27B", "new/one"]);
+  saveCustomProvider(f, "modal", { baseUrl: "https://modal.example/v2", apiKey: "", models: ["a"] });
+  p = JSON.parse(readFileSync(f, "utf8")).providers.modal;
+  assert.equal("apiKey" in p, false);
+  assert.deepEqual(listProviders(f).map((x) => x.name), ["modal", "local", "envy"]);
+  assert.equal(listProviders(f)[2].keyHint, "$ENVY_KEY");
+});
+
+test("migration copies models.json once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-ocmig-"));
+  const from = join(dir, "pi", "models.json"), to = join(dir, "omni", "opencode-providers.json");
+  const model = (id, extra = {}) => ({ id, name: id.toUpperCase(), reasoning: true, input: ["text"], contextWindow: 200000, maxTokens: 8192, cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { low: "low" }, ...extra });
+  mkdirSync(join(dir, "pi"), { recursive: true });
+  writeFileSync(from, `﻿${JSON.stringify({ providers: {
+    modal: { baseUrl: "https://modal.example/v1", api: "openai-completions", apiKey: "sk-modal-9999", modelOverrides: { a: { contextWindow: 1 } }, models: [model("qwen/q"), model("plain", { reasoning: false })] },
+    openrouter: { baseUrl: "https://openrouter.ai/api/v1", api: "openai-completions", apiKey: "sk-or", models: [model("deepseek/deepseek-v4.1-flash-1017:floor"), model("known/one")] },
+    lmstudio: { baseUrl: "http://localhost:1234/v1", api: "openai-completions", models: [model("q")] },
+    envy: { baseUrl: "https://envy.example/v1", apiKey: "$ENVY_KEY", models: [{ id: "m" }] },
+    cmd: { baseUrl: "https://cmd.example/v1", api: "openai-completions", apiKey: "!op read secret", models: [{ id: "c" }] },
+    anth: { baseUrl: "https://proxy.example", api: "anthropic-messages", apiKey: "k", models: [{ id: "claude-x" }] },
+    mine: { baseUrl: "https://pi-version.example/v1", api: "openai-completions", models: [{ id: "old" }] },
+  } })}`);
+  saveCustomProvider(to, "mine", { baseUrl: "https://omni-version.example/v1", models: ["kept"] });
+  // OpenCode's catalog (GET /provider): openrouter is built in, lmstudio comes from the user's global config.
+  const catalog = { all: [{ id: "openrouter", name: "OpenRouter", models: { "known/one": { id: "known/one" } } }, { id: "lmstudio", name: "LM Studio", models: {} }, { id: "mine", name: "mine", models: {} }], connected: ["openrouter", "lmstudio"] };
+  const r = migratePiProviders({ from, to, catalog });
+  assert.deepEqual(r.copied, ["modal", "envy", "cmd"]);
+  assert.deepEqual(r.skipped.map((s) => s.name), ["openrouter", "lmstudio", "anth", "mine"]);
+  const why = Object.fromEntries(r.skipped.map((s) => [s.name, s.why]));
+  assert.match(why.openrouter, /OpenCode already has a provider named openrouter/);
+  assert.match(why.openrouter, /deepseek\/deepseek-v4\.1-flash-1017:floor/, "names the models OpenCode's own provider lacks");
+  assert.doesNotMatch(why.openrouter, /known\/one/);
+  assert.match(why.anth, /anthropic-messages/);
+  assert.match(why.mine, /already/);
+  assert.ok(r.lines.some((l) => /\bcmd\b/.test(l) && /command/.test(l)), "a key that runs a command is not carried over, and that is said");
+  assert.ok(r.lines.some((l) => /openrouter/.test(l)), "each skip is in the log lines");
+  const store = JSON.parse(readFileSync(to, "utf8")).providers;
+  assert.deepEqual(Object.keys(store), ["mine", "modal", "envy", "cmd"]);
+  assert.deepEqual(store.modal, { baseUrl: "https://modal.example/v1", apiKey: "sk-modal-9999", models: [
+    { id: "qwen/q", name: "QWEN/Q", contextWindow: 200000, maxTokens: 8192, reasoning: true },
+    { id: "plain", name: "PLAIN", contextWindow: 200000, maxTokens: 8192, reasoning: false },
+  ] });
+  assert.equal(store.envy.apiKey, "$ENVY_KEY");
+  assert.equal("apiKey" in store.cmd, false);
+  assert.equal(store.mine.baseUrl, "https://omni-version.example/v1", "a provider Omni already has is left alone");
+  assert.ok(existsSync(migrationMarker(to)));
+  assert.equal(JSON.parse(readFileSync(migrationMarker(to), "utf8")).copied.length, 3);
+  // once: a second run (pi's file changed meanwhile, a provider removed in Omni) does nothing
+  writeFileSync(from, JSON.stringify({ providers: { later: { baseUrl: "https://later/v1", api: "openai-completions", models: [{ id: "l" }] } } }));
+  removeProvider(to, "envy");
+  assert.equal(migratePiProviders({ from, to, catalog }), null);
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(to, "utf8")).providers), ["mine", "modal", "cmd"]);
+  // no pi file at all: nothing to copy, and the marker is still written
+  const to2 = join(dir, "omni2", "opencode-providers.json");
+  assert.deepEqual(migratePiProviders({ from: join(dir, "missing.json"), to: to2, catalog }).copied, []);
+  assert.ok(existsSync(migrationMarker(to2)));
+  // a pi file that cannot be read is not marked as done (the next start tries again)
+  const bad = join(dir, "bad.json");
+  writeFileSync(bad, "// comment\n{}");
+  const to3 = join(dir, "omni3", "opencode-providers.json");
+  assert.match(migratePiProviders({ from: bad, to: to3, catalog }).error, /JSON/);
+  assert.equal(existsSync(migrationMarker(to3)), false);
 });

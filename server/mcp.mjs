@@ -1,7 +1,8 @@
 /**
- * The Providers dialog's MCP servers tab: reads and writes the `mcpServers` block of pi's
- * ~/.pi/agent/omni-agent.json (the block the omni-mcp-servers pi extension loads), and tests a server
- * by connecting to it with the same client the extension uses.
+ * The Providers dialog's MCP servers tab: reads and writes the `mcpServers` block of omni-agent.json
+ * (cfg.piExtConfigFile, ~/.pi/agent/omni-agent.json), which server/opencode-config.mjs renders into Omni's
+ * opencode.json `mcp` (each route change rewrites it and reloads OpenCode), and tests a server by connecting
+ * to it with Omni's own MCP client.
  *
  * Secret values (env vars and headers) never go to the UI: each one is sent as a mask, and a mask
  * sent back on save keeps the stored value. A `${VAR}` reference is not a secret and is shown as-is.

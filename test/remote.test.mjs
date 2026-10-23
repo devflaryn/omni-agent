@@ -58,6 +58,9 @@ test("describe + redact: the host reads what is asked, never a secret", () => {
   assert.equal(d.text, "run the build");
   assert.match(describe("PUT", "/api/mcp/fs", { command: "npx", args: ["-y", "srv"] }).title, /runs: npx -y srv/);
   assert.equal(describe("POST", "/api/whatever", {}).title, "POST /api/whatever");
+  assert.equal(describe("PUT", "/api/provider-keys/anthropic", { key: "sk" }).title, "Set OpenCode's API key for “anthropic”");
+  assert.equal(describe("DELETE", "/api/provider-keys/anthropic").title, "Remove OpenCode's key for “anthropic”");
+  assert.equal(redact({ key: "sk-ant" }).key, "(hidden)");
   const r = redact({ apiKey: "sk-123", name: "x", env: { TOKEN: "abc" }, headers: { Authorization: "Bearer z" }, images: [1, 2], nested: { password: "p" }, long: "y".repeat(700) });
   assert.equal(r.apiKey, "(hidden)");
   assert.deepEqual(r.env, ["TOKEN"]);

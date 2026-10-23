@@ -1,6 +1,6 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync } from "node:fs";
 import { buildZip } from "./helpers/zip-fixture.mjs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -229,8 +229,10 @@ function makeFakePi({ cwd, model, provider, thinking }) {
   return fakePi;
 }
 const oc2 = new FakeServer();
-const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false, opencodeServer: oc2, opencodeConfigDir: join(base, "oc2-config") });
+const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false, opencodeServer: oc2, opencodeConfigDir: join(base, "oc2-config"), opencodeProvidersFile: join(base, "omni", "opencode-providers.json") });
 const disposes = () => oc2.calls.filter((c) => c.method === "POST" && c.path === "/global/dispose").length;
+const app2Logs = [];
+app2.bus.on("event", (ev) => { if (ev.kind === "log") app2Logs.push(ev); });
 await app2.listen();
 const port2 = app2.server.address().port;
 after(() => app2.close());
@@ -302,12 +304,41 @@ test("claude task: empty prompt → 400", async () => {
 });
 
 // ------------------------------------------------------------ providers
-test("providers: empty at first, PUT validates, writes models.json and reloads opencode (the chats keep their sessions)", async () => {
+const ocProvidersFile = join(base, "omni", "opencode-providers.json");
+test("providers: OpenCode's first start copies pi's models.json providers once (one OpenCode already has is skipped, and logged)", async () => {
+  mkdirSync(join(base, "pi-agent"), { recursive: true });
+  writeFileSync(join(base, "pi-agent", "models.json"), JSON.stringify({ providers: {
+    legacy: { baseUrl: "https://legacy.example/v1", api: "openai-completions", apiKey: "sk-legacy-5678", models: [{ id: "l/one", name: "L One", contextWindow: 64000, maxTokens: 8000, reasoning: false }] },
+    opencode: { baseUrl: "https://opencode.ai/inference/openai/v1", api: "openai-completions", apiKey: "zen", models: [{ id: "big-pickle" }, { id: "zen-extra" }] },
+  } }));
+  const disposed = disposes();
+  const j = await (await fetch(`http://127.0.0.1:${port2}/api/providers`)).json();
+  assert.deepEqual(j.providers.map((p) => p.name), ["legacy"], "copied into Omni's own store");
+  assert.equal(j.file, ocProvidersFile);
+  assert.deepEqual(j.opencode, [{ id: "opencode", name: "OpenCode Zen" }], "OpenCode's own connected providers are listed apart");
+  const conf = JSON.parse(readFileSync(join(base, "oc2-config", "opencode.json"), "utf8"));
+  assert.deepEqual(conf.provider.legacy, { npm: "@ai-sdk/openai-compatible", name: "legacy", options: { baseURL: "https://legacy.example/v1", apiKey: "sk-legacy-5678" }, models: { "l/one": { name: "L One", limit: { context: 64000, output: 8000 } } } });
+  assert.equal(conf.provider.opencode, undefined, "OpenCode's own provider is never overridden");
+  assert.equal(disposes(), disposed + 1, "OpenCode re-reads its config with the copied providers");
+  const line = app2Logs.find((e) => /opencode/.test(e.text) && /already has/.test(e.text));
+  assert.ok(line, `the skip is logged: ${JSON.stringify(app2Logs.map((e) => e.text))}`);
+  assert.match(line.text, /zen-extra/);
+  assert.ok(existsSync(join(base, "omni", "opencode-providers.migrated.json")), "the marker sits next to the store");
+  // once: the marker stops a second copy
+  await fetch(`http://127.0.0.1:${port2}/api/providers/legacy`, { method: "DELETE" });
+  assert.deepEqual((await (await fetch(`http://127.0.0.1:${port2}/api/providers`)).json()).providers, []);
+});
+
+test("providers: empty at first, PUT validates, writes Omni's provider store and opencode.json, and reloads opencode (the chats keep their sessions)", async () => {
   const empty = await (await fetch(`http://127.0.0.1:${port2}/api/providers`)).json();
   assert.deepEqual(empty.providers, []);
-  assert.ok(empty.presets.some((p) => p.key === "openrouter"));
+  assert.ok(empty.presets.some((p) => p.key === "openrouter" && p.kind === "key"));
   const bad = await fetch(`http://127.0.0.1:${port2}/api/providers/openrouter`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "nope", api: "openai-completions", models: ["a"] }) });
   assert.equal(bad.status, 400);
+  // a name OpenCode already has (here its own anthropic) would override that provider: refused
+  const clash = await fetch(`http://127.0.0.1:${port2}/api/providers/anthropic`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "https://x.example/v1", models: ["a"] }) });
+  assert.equal(clash.status, 409);
+  assert.match((await clash.json()).error, /OpenCode already has a provider named "anthropic"/);
   app2.startPi(base);
   const before = fakePi;
   const disposed = disposes();
@@ -319,9 +350,32 @@ test("providers: empty at first, PUT validates, writes models.json and reloads o
   assert.equal(fakePi, before, "no chat is relaunched");
   assert.equal(pj.providers[0].name, "openrouter");
   assert.equal(pj.providers[0].hasKey, true); assert.equal(pj.providers[0].keyHint, "1234"); assert.equal("apiKey" in pj.providers[0], false);
-  const onDisk = JSON.parse(readFileSync(join(base, "pi-agent", "models.json"), "utf8"));
+  const onDisk = JSON.parse(readFileSync(ocProvidersFile, "utf8"));
   assert.equal(onDisk.providers.openrouter.apiKey, "sk-or-abcd1234");
   assert.equal(onDisk.providers.openrouter.models[1].name, "Kimi");
+  const conf = JSON.parse(readFileSync(join(base, "oc2-config", "opencode.json"), "utf8"));
+  assert.deepEqual(conf.provider.openrouter.options, { baseURL: "https://openrouter.ai/api/v1", apiKey: "sk-or-abcd1234" });
+  assert.deepEqual(Object.keys(conf.provider.openrouter.models), ["deepseek/deepseek-v4-flash-0731", "moonshotai/kimi-k2.5"]);
+  assert.equal(JSON.parse(readFileSync(join(base, "pi-agent", "models.json"), "utf8")).providers.openrouter, undefined, "pi's models.json is not written");
+});
+
+test("providers: a key for one of OpenCode's own providers goes to PUT /auth; DELETE removes it; both reload OpenCode", async () => {
+  const key = (id, method, body) => fetch(`http://127.0.0.1:${port2}/api/provider-keys/${id}`, { method, headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  const before = oc2.calls.length;
+  const disposed = disposes();
+  const r = await key("anthropic", "PUT", { key: " sk-ant-0001 " });
+  assert.equal(r.status, 200, JSON.stringify(await r.clone().json()));
+  assert.equal((await r.json()).restarted, true);
+  const put = oc2.calls.slice(before).find((c) => c.path === "/auth/anthropic");
+  assert.deepEqual([put.method, put.body], ["PUT", { type: "api", key: "sk-ant-0001" }]);
+  assert.equal(disposes(), disposed + 1);
+  assert.equal((await key("anthropic", "PUT", { key: "  " })).status, 400, "an empty key is refused");
+  assert.equal((await key("no-such-provider", "PUT", { key: "k" })).status, 400, "only a provider OpenCode has");
+  assert.equal((await key("openrouter", "PUT", { key: "k" })).status, 409, "one of Omni's custom providers keeps its key in its own form");
+  const del = await key("anthropic", "DELETE");
+  assert.equal(del.status, 200);
+  assert.ok(oc2.calls.slice(before).some((c) => c.method === "DELETE" && c.path === "/auth/anthropic"));
+  assert.equal(disposes(), disposed + 2);
 });
 
 test("pi models: the picker lists OpenCode's connected catalog, not models.json", async () => {
@@ -329,7 +383,7 @@ test("pi models: the picker lists OpenCode's connected catalog, not models.json"
   assert.deepEqual(r.data.models.map((m) => `${m.provider}/${m.id}`), ["opencode/big-pickle", "opencode/plain", "opencode/think"]);
 });
 
-test("providers-order: POST rewrites the provider order in models.json without restarting pi", async () => {
+test("providers-order: POST rewrites the provider order in Omni's store without reloading OpenCode", async () => {
   await fetch(`http://127.0.0.1:${port2}/api/providers/modal`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "https://modal.example/v1", api: "openai-completions", apiKey: "k", models: ["Qwen/Qwen3.8-27B"] }) });
   const before = fakePi;
   const disposed = disposes();
@@ -342,7 +396,7 @@ test("providers-order: POST rewrites the provider order in models.json without r
   assert.deepEqual(j.providers.map((p) => p.name), ["modal", "openrouter"]);
   assert.equal(fakePi, before, "reordering does not relaunch pi");
   assert.equal(disposes(), disposed, "nor reload opencode");
-  const onDisk = JSON.parse(readFileSync(join(base, "pi-agent", "models.json"), "utf8"));
+  const onDisk = JSON.parse(readFileSync(ocProvidersFile, "utf8"));
   assert.deepEqual(Object.keys(onDisk.providers), ["modal", "openrouter"]);
   await fetch(`http://127.0.0.1:${port2}/api/providers/modal`, { method: "DELETE" });
 });
@@ -698,7 +752,7 @@ test("opencode: a provider or MCP change rewrites opencode.json and disposes the
   chat.streaming = false; chat.inFlight = 0;
   const before = oc.calls.length;
   const r = await fetch(`http://127.0.0.1:${port4}/api/mcp/gh`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "http", url: "https://api.example.com/mcp" }) });
-  // MCP writes go to the pi extension config (Task 7 moves them); the route still reloads OpenCode.
+  // The MCP list stays in omni-agent.json (rendered into opencode.json); the route reloads OpenCode.
   assert.equal(r.status, 200);
   const j = await r.json();
   assert.equal(j.restarted, true);

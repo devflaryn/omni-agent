@@ -58,7 +58,7 @@ export function mcpEntry(raw) {
 /**
  * The `opencode.json` object. `mcpServers`: Omni's MCP list; `omniMcp`: omnidroid's `omni-mcp` (`{command, args,
  * env, enabled}`), served as the `omnidroid` MCP server so its tools are `omnidroid_*`; `providers`: OpenCode
- * `provider` entries for Omni's custom providers (Task 7 builds them), passed through as they are.
+ * `provider` entries for Omni's custom providers (server/providers.mjs customProviderConfig), passed through as they are.
  */
 export function opencodeConfig({ mcpServers = {}, omniMcp = null, providers = null } = {}) {
   const mcp = {};
