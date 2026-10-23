@@ -1,101 +1,76 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const script = join(process.cwd(), "scripts", "install.mjs");
-const run = (home, ...args) => spawnSync(process.execPath, [script, ...args], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home } });
-const runEnv = (home, env, ...args) => spawnSync(process.execPath, [script, ...args], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, ...env } });
+// OMNI_OPENCODE_BIN names the launcher for the presence check: a missing path stands for "opencode is not installed".
+const run = (home, ...args) => spawnSync(process.execPath, [script, ...args], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, OMNI_OPENCODE_BIN: join(home, "no-such-opencode") } });
+const runEnv = (home, env, ...args) => spawnSync(process.execPath, [script, ...args], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, OMNI_OPENCODE_BIN: join(home, "no-such-opencode"), ...env } });
+const skillsDir = (home) => join(home, ".omni-agent", "opencode", "skills");
 
-test("install.mjs copies the pi extensions and the omnidroid skills under $OMNI_HOME, uninstall removes them", () => {
+test("install.mjs puts the skills in OpenCode's config dir, writes no pi extensions, uninstall removes the skills", () => {
   const home = mkdtempSync(join(tmpdir(), "omni-home-"));
   try {
     const r = run(home, "--claude-skills");
     assert.equal(r.status, 0, r.stderr);
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-memory.ts")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-claude.ts")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-graph.ts")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-mcp.ts")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-mcp-lib.mjs")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "omni-mcp-servers.ts")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid-frida", "SKILL.md")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid-qemu", "reference", "omni-cli.md")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid", "SKILL.md")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid", "reference", "omni-cli.md")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "skills", "omnidroid-input", "SKILL.md")));
-    assert.ok(existsSync(join(home, ".pi", "agent", "skills", "subagent-driven-implementation", "SKILL.md")));
+    for (const p of [["omnidroid", "SKILL.md"], ["omnidroid", "reference", "omni-cli.md"], ["omnidroid-frida", "SKILL.md"], ["omnidroid-qemu", "reference", "omni-cli.md"], ["omnidroid-input", "SKILL.md"], ["subagent-driven-implementation", "SKILL.md"]]) {
+      assert.ok(existsSync(join(skillsDir(home), ...p)), p.join("/"));
+    }
     assert.ok(existsSync(join(home, ".claude", "skills", "omnidroid", "SKILL.md")));
-    // omnidroid is the only skill Claude Code shares; the rest are pi only.
-    for (const s of ["omnidroid-frida", "omnidroid-qemu", "omnidroid-input", "subagent-driven-implementation"]) assert.ok(!existsSync(join(home, ".claude", "skills", s)), `${s} is pi only`);
+    for (const s of ["omnidroid-frida", "omnidroid-qemu", "omnidroid-input", "subagent-driven-implementation"]) assert.ok(!existsSync(join(home, ".claude", "skills", s)), `${s} is not shared with Claude Code`);
+    // Nothing goes to pi any more: no extensions, no skills, no personas; the personas are read from the repo.
+    assert.ok(!existsSync(join(home, ".pi", "agent", "extensions")), "no pi extensions");
+    assert.ok(!existsSync(join(home, ".pi", "agent", "skills")), "no pi skills");
+    assert.ok(!existsSync(join(home, ".pi", "agent", "agents")), "no persona copies");
+    assert.ok(!existsSync(join(home, ".omni-agent", "opencode", "agents")) && !existsSync(join(home, ".omni-agent", "opencode", "agent")), "personas must not become OpenCode agents");
+    // The server reads omniMcp from omni-agent.json and renders it into opencode.json.
     const cfg = JSON.parse(readFileSync(join(home, ".pi", "agent", "omni-agent.json"), "utf8"));
-    assert.equal(cfg.autoRecall, true);
     assert.match(cfg.omniMcp.command, /omnidroid[\\/]target[\\/]release[\\/]omni-mcp(\.exe)?$/, "omni-mcp points at the sibling omnidroid build");
-    assert.deepEqual(cfg.omniMcp.args, ["--connect", "http://127.0.0.1:7457/mcp"], "pi reaches the omnidroid app's server through the bridge");
+    assert.deepEqual(cfg.omniMcp.args, ["--connect", "http://127.0.0.1:7457/mcp"]);
     assert.ok(!existsSync(join(home, ".claude", "settings.json")), "no Claude hook without --claude-hook");
     const u = run(home, "--uninstall", "--claude-skills");
     assert.equal(u.status, 0, u.stderr);
-    assert.ok(!existsSync(join(home, ".pi", "agent", "skills", "omnidroid")));
+    assert.ok(!existsSync(join(skillsDir(home), "omnidroid")));
     assert.ok(!existsSync(join(home, ".claude", "skills", "omnidroid")));
     assert.ok(!existsSync(join(home, ".pi", "agent", "omni-agent.json")));
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
-test("install.mjs ships the subagent extension and seeds the default agents, uninstall keeps the agents", () => {
+test("install.mjs says how to install OpenCode when it is not on the PATH, and stays quiet when it is", () => {
   const home = mkdtempSync(join(tmpdir(), "omni-home-"));
   try {
-    const r = run(home);
-    assert.equal(r.status, 0, r.stderr);
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "subagent", "index.ts")), "subagent index.ts installed");
-    assert.ok(existsSync(join(home, ".pi", "agent", "extensions", "subagent", "agents.ts")), "subagent agents.ts installed");
-    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "scout.md")), "scout.md seeded");
-    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "re-analyst.md")), "re-analyst.md seeded");
-    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "droid-operator.md")), "droid-operator.md seeded");
-    // A user-edited agent is never clobbered.
-    const edited = join(home, ".pi", "agent", "agents", "scout.md");
-    writeFileSync(edited, "EDITED BY USER");
-    const r2 = run(home);
-    assert.equal(r2.status, 0, r2.stderr);
-    assert.equal(readFileSync(edited, "utf8"), "EDITED BY USER", "existing agent file not overwritten");
-    // Uninstall drops the extension but leaves the (possibly user-edited) agents.
-    const u = run(home, "--uninstall");
-    assert.equal(u.status, 0, u.stderr);
-    assert.ok(!existsSync(join(home, ".pi", "agent", "extensions", "subagent")), "subagent extension removed on uninstall");
-    assert.ok(existsSync(join(home, ".pi", "agent", "agents", "scout.md")), "agents kept on uninstall");
+    const missing = run(home);
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.match(missing.stdout, /opencode.*not found/i);
+    assert.match(missing.stdout, /npm i -g opencode-ai/);
+    const fake = join(home, "fake-opencode.mjs");
+    writeFileSync(fake, 'console.log("1.18.32");');
+    const ok = runEnv(home, { OMNI_OPENCODE_BIN: fake });
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.match(ok.stdout, /opencode 1\.18\.32/);
+    assert.doesNotMatch(ok.stdout, /npm i -g/);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
-test("installer copies omni-run and its lib siblings into pi's extensions", () => {
+test("install.mjs removes what an older pi-harness install left behind, on uninstall only", () => {
   const home = mkdtempSync(join(tmpdir(), "omni-home-"));
   try {
-    const r = run(home);
-    assert.equal(r.status, 0, r.stderr);
-    for (const f of ["omni-run.ts", "omni-run-lib.mjs", "omni-fallback-lib.mjs", "omni-fallback.ts", "omni-plan.ts", "omni-plan-lib.mjs"]) {
-      assert.ok(existsSync(join(home, ".pi", "agent", "extensions", f)), `${f} should be installed`);
-    }
-    // The planner's lib is the shared state machine itself (ui/plan.js), not the repo's re-export shim.
-    assert.equal(readFileSync(join(home, ".pi", "agent", "extensions", "omni-plan-lib.mjs"), "utf8"), readFileSync(join(process.cwd(), "ui", "plan.js"), "utf8"));
-  } finally { rmSync(home, { recursive: true, force: true }); }
-});
-
-test("installer ships the background-agents and context extensions with their shared libs, uninstall removes them", () => {
-  const home = mkdtempSync(join(tmpdir(), "omni-home-"));
-  try {
-    const r = run(home);
-    assert.equal(r.status, 0, r.stderr);
     const ext = join(home, ".pi", "agent", "extensions");
-    for (const f of ["omni-agents.ts", "omni-agents-lib.mjs", "omni-context.ts", "omni-context-lib.mjs", "omni-claude.ts"]) {
-      assert.ok(existsSync(join(ext, f)), `${f} should be installed`);
-      assert.equal(readFileSync(join(ext, f), "utf8"), readFileSync(join(process.cwd(), "integrations", "pi", f), "utf8"), `${f} is the repo's copy`);
-    }
-    // Every relative import of every installed extension resolves inside the installed folder.
-    for (const f of readdirSync(ext).filter((n) => n.endsWith(".ts"))) {
-      for (const [, dep] of readFileSync(join(ext, f), "utf8").matchAll(/from\s+"(\.\/[^"]+)"/g)) assert.ok(existsSync(join(ext, dep)), `${f} imports ${dep}, which must be installed beside it`);
-    }
-    const u = run(home, "--uninstall");
-    assert.equal(u.status, 0, u.stderr);
-    for (const f of ["omni-agents.ts", "omni-agents-lib.mjs", "omni-context.ts", "omni-context-lib.mjs"]) assert.ok(!existsSync(join(ext, f)), `${f} removed on uninstall`);
+    mkdirSync(join(ext, "subagent"), { recursive: true });
+    writeFileSync(join(ext, "omni-memory.ts"), "x");
+    writeFileSync(join(ext, "someone-elses.ts"), "x");
+    mkdirSync(join(home, ".pi", "agent", "skills", "omnidroid"), { recursive: true });
+    mkdirSync(join(home, ".pi", "agent", "agents"), { recursive: true });
+    writeFileSync(join(home, ".pi", "agent", "agents", "scout.md"), "EDITED");
+    assert.equal(run(home).status, 0);
+    assert.ok(existsSync(join(ext, "omni-memory.ts")), "install leaves pi's folder alone");
+    assert.equal(run(home, "--uninstall").status, 0);
+    assert.ok(!existsSync(join(ext, "omni-memory.ts")) && !existsSync(join(ext, "subagent")) && !existsSync(join(home, ".pi", "agent", "skills", "omnidroid")));
+    assert.ok(existsSync(join(ext, "someone-elses.ts")), "files that are not ours stay");
+    assert.equal(readFileSync(join(home, ".pi", "agent", "agents", "scout.md"), "utf8"), "EDITED", "agents stay: they may be user-edited");
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -146,27 +121,14 @@ test("install.mjs keeps an omniMcp.command that still exists and registers the a
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
-test("install.mjs --openrouter writes the key to auth.json and the DeepSeek provider to models.json (merging)", () => {
+test("install.mjs --openrouter no longer writes pi's files; it points at the Providers dialog", () => {
   const home = mkdtempSync(join(tmpdir(), "omni-home-"));
   try {
-    const keyFile = join(home, "openrouter.txt");
-    writeFileSync(keyFile, "sk-or-v1-test\n");
-    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
-    writeFileSync(join(home, ".pi", "agent", "models.json"), JSON.stringify({ providers: { orca: { baseUrl: "http://x/v1", api: "openai-completions", apiKey: "k", models: [{ id: "Qwen/Qwen3.8-27B" }] } } }));
-    const r = spawnSync(process.execPath, [script, "--openrouter"], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, OMNI_OPENROUTER_KEY_FILE: keyFile } });
-    assert.equal(r.status, 0, r.stderr);
-    const auth = JSON.parse(readFileSync(join(home, ".pi", "agent", "auth.json"), "utf8"));
-    assert.deepEqual(auth.openrouter, { type: "api_key", key: "sk-or-v1-test" });
-    const models = JSON.parse(readFileSync(join(home, ".pi", "agent", "models.json"), "utf8"));
-    assert.ok(models.providers.orca, "existing provider kept");
-    assert.equal(models.providers.openrouter.baseUrl, "https://openrouter.ai/api/v1");
-    assert.equal(models.providers.openrouter.api, "openai-completions");
-    assert.equal(models.providers.openrouter.apiKey, "sk-or-v1-test");
-    const m = models.providers.openrouter.models.find((x) => x.id === "deepseek/deepseek-v4-flash-0731");
-    assert.ok(m, "deepseek flash 0731 present");
-    assert.deepEqual(m.input, ["text"]);
-    const missing = spawnSync(process.execPath, [script, "--openrouter"], { encoding: "utf8", env: { ...process.env, OMNI_HOME: home, OMNI_OPENROUTER_KEY_FILE: join(home, "nope.txt") } });
-    assert.equal(missing.status, 1);
+    const r = run(home, "--openrouter");
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /Providers/);
+    assert.ok(!existsSync(join(home, ".pi", "agent", "auth.json")) && !existsSync(join(home, ".pi", "agent", "models.json")));
+    assert.ok(!existsSync(skillsDir(home)), "nothing is installed when the flag is refused");
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 

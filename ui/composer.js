@@ -1,4 +1,4 @@
-/* The composer card: textarea, + menu (file / memory / repo graph), model + thinking pill, send/stop. pi only. */
+/* The composer card: textarea, + menu (file / memory / repo graph), model + thinking pill, send/stop. OpenCode chats only. */
 import { el, esc } from "./lib.js";
 
 const SEND_ICON = `<svg viewBox="0 0 16 16"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>`;
@@ -79,11 +79,11 @@ export function createComposer(root, h) {
     manage.onclick = () => { closeMenus(); h.onManageProviders?.(); };
     modelMenu.appendChild(manage);
   }
-  /** Goal hook: re-engages pi while its plan has unfinished steps; the model picked here writes the status box. */
+  /** Goal hook: re-engages the agent while its plan has unfinished steps; the model picked here writes the status box. */
   function renderHookSection() {
     const hk = st.hook;
     const head = el("div", "mh", "Goal hook");
-    head.title = "When pi stops while its plan still has unfinished steps, it is re-engaged on the current step";
+    head.title = "When the agent stops while its plan still has unfinished steps, it is re-engaged on the current step";
     modelMenu.appendChild(head);
     const row = el("div", "seg-row");
     for (const [lbl, on] of [["off", false], ["on", true]]) { const b = el("button", `seg-btn${hk.enabled === on ? " active" : ""}`, lbl); b.onclick = () => { h.onHook?.({ enabled: on }); closeMenus(); }; row.appendChild(b); }

@@ -52,6 +52,18 @@ test("classify: reads pass, changes need approval, host controls never run remot
   assert.equal(classify("DELETE", "/api/remote/sessions"), "host");
 });
 
+test("describe: approval cards name OpenCode / the agent, never pi", () => {
+  const paths = ["prompt", "open", "send", "start", "stop", "abort", "new", "switch", "model", "thinking", "compact"];
+  for (const p of paths) for (const body of [{}, { sid: "pi:abc", cwd: "/w" }]) {
+    const t = describe("POST", `/api/pi/${p}`, body).title;
+    assert.doesNotMatch(t, /\bpi\b/i, `${p}: ${t}`);
+  }
+  assert.doesNotMatch(describe("POST", "/api/goal", { goal: "g" }).title, /\bpi\b/i);
+  assert.equal(describe("POST", "/api/pi/abort", {}).title, "Stop the agent's current turn and its goal");
+  assert.equal(describe("POST", "/api/pi/prompt", {}).title, "Send a message to the agent");
+  assert.equal(describe("POST", "/api/pi/model", { provider: "p", modelId: "m" }).title, "Switch OpenCode's model to p/m");
+});
+
 test("describe + redact: the host reads what is asked, never a secret", () => {
   const d = describe("POST", "/api/sessions/pi%3Aabc/continue", { message: "run the build" }, { titleOf: (sid) => (sid === "pi:abc" ? "APK rebuild" : "") });
   assert.equal(d.title, "Send a message to “APK rebuild”");

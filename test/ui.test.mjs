@@ -16,6 +16,23 @@ test("the Providers dialog speaks of OpenCode, not pi (toasts, confirms, tab sub
   assert.match(read("mcp-settings.js"), /OpenCode/);
 });
 
+test("the Home page, composer, toasts and errors name OpenCode, not pi", async () => {
+  const { readFileSync } = await import("node:fs");
+  const read = (f) => readFileSync(new URL(`../ui/${f}`, import.meta.url), "utf8");
+  // Only text a person reads: string literals and html text, not identifiers (S.pi, harness "pi", /api/pi/*, pi: sids).
+  const code = (src) => src.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\/?\*)/.test(l)).join("\n").replace(/ \/\/ .*$/gm, "");
+  const literals = (src) => [...code(src).matchAll(/(["`])((?:\\.|(?!\1).)*)\1/g)].map((m) => m[2]).filter((s) => /\s/.test(s) && !/\/api\/pi\//.test(s));
+  const bad = /(^|[^\w/:.-])pi(['’]s)?([^\w:/.-]|$)/;
+  for (const f of ["app.js", "composer.js", "lib.js"]) for (const s of literals(read(f))) {
+    if (/Background (pi agent|\(pi)|\\bpi\\b|pi agent/.test(s)) continue; // agent-kind label + the report header the server writes
+    assert.doesNotMatch(s, bad, `${f}: ${s}`);
+  }
+  const html = read("index.html").replace(/<script[\s\S]*?<\/script>/g, "").replace(/<[^>]*\bclass="[^"]*"/g, (m) => m.replace(/class="[^"]*"/, ""));
+  assert.match(html, /OpenCode runs here/);
+  assert.doesNotMatch(html.replace(/<[^>]+>/g, " ").replace(/(placeholder|title|aria-label)="[^"]*"/g, ""), /\bpi\b/);
+  assert.doesNotMatch(html, /placeholder="[^"]*\bpi\b/);
+});
+
 test("fmtDuration", () => {
   assert.equal(fmtDuration(0), "0s");
   assert.equal(fmtDuration(12_400), "12s");

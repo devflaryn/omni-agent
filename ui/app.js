@@ -82,7 +82,7 @@ const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices()
 const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => settings.open(), onHook: setHook };
 const home = createComposer($("#homeComposer"), { ...composerHooks, onSend: homeSend });
 // In a background agent's chat the picker shows the agent's model; picking there would change Omni's own pi.
-const notForAgents = (fn) => (...args) => { if (target().kind !== "agent") return fn(...args); toast("A background agent keeps the model it started with; this picker sets Omni's own pi. Pick it from one of its chats.", true); updateComposer(); };
+const notForAgents = (fn) => (...args) => { if (target().kind !== "agent") return fn(...args); toast("A background agent keeps the model it started with; this picker sets Omni's own chat model. Pick it from one of its chats.", true); updateComposer(); };
 const chat = createComposer($("#chatComposer"), { ...composerHooks, onPiModel: notForAgents(setPiModel), onPiThinking: notForAgents(setPiThinking), onHook: notForAgents(setHook), onSend: chatSend, onStop: chatStop });
 
 /** Choices made before pi runs are saved on the server and applied when it starts, so the picker never "forgets". */
@@ -96,7 +96,7 @@ async function setPiModel(provider, id) {
     // The server moves the thinking level to the nearest one the new model has.
     S.config = { ...(S.config || {}), piProvider: provider, piModel: id, ...(r.level ? { piThinking: r.level } : {}) };
     loadPiChoices();
-    toast(r.pending ? `pi model: ${id} (applies when pi starts)` : `pi model: ${id}`);
+    toast(r.pending ? `Model: ${id} (applies when OpenCode starts)` : `Model: ${id}`);
     if (S.page === "home") renderHome(); else updateComposer();
   } catch (e) { toast(e.message, true); }
 }
@@ -138,7 +138,7 @@ async function setHook(patch) {
   try {
     const r = await api("/api/hook", patch, "PUT");
     S.hook = r.hook;
-    toast(patch.enabled === true ? "Goal hook on: pi is re-engaged until its plan is finished" : patch.enabled === false ? "Goal hook off" : `Status box model: ${r.hook.model || "same as the chat"}`);
+    toast(patch.enabled === true ? "Goal hook on: the agent is re-engaged until its plan is finished" : patch.enabled === false ? "Goal hook off" : `Status box model: ${r.hook.model || "same as the chat"}`);
     if (S.page === "home") renderHome(); else updateComposer();
   } catch (e) { toast(e.message, true); }
 }
@@ -445,7 +445,7 @@ async function homeSend(text, o) {
     }
     // A chat of its own: a free pi child in that folder opens it, else another one starts. Chats already working keep going.
     const r = await api("/api/pi/open", { cwd });
-    if (!r.sid || r.sid === "pi:pending") throw new Error("pi did not report a session");
+    if (!r.sid || r.sid === "pi:pending") throw new Error("OpenCode did not report a session");
     S.piChats.set(r.sid, { sid: r.sid, cwd, model: r.state?.model?.id ? { provider: r.state.model.provider, id: r.state.model.id } : null, thinkingLevel: r.state?.thinkingLevel || "" });
     S.sessions.set(r.sid, { ...(S.sessions.get(r.sid) || {}), sid: r.sid, harness: "pi", owned: true, cwd, model: r.state?.model?.id, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
     openChat(r.sid);
@@ -495,7 +495,7 @@ function updateComposer() {
   }
   else {
     const fork = S.forceFork || t.live;
-    st.caption = fork ? `Forks ${t.live ? "the running " : "this "}pi chat into Omni` : "Continues this chat in Omni";
+    st.caption = fork ? `Forks ${t.live ? "the running " : "this "}chat into Omni` : "Continues this chat in Omni";
   }
   if (t.s?.compacting) st.caption = "Compacting the context (a long chat is summarized first; this can take minutes)…";
   $("#chatComposer").classList.toggle("for-agent", t.kind === "agent");
@@ -512,7 +512,7 @@ async function sendClearing(composer, text, send) {
 async function chatSend(text, o) {
   const t = target();
   // `/goal` drives Omni's own pi (the keeper); here it would quietly set that goal from an agent's chat.
-  if (t.kind === "agent" && /^\/goal\b/.test(text.trim())) { toast("/goal sets the goal of Omni's own pi. Type it in one of its chats; here, just tell the agent.", true); return; }
+  if (t.kind === "agent" && /^\/goal\b/.test(text.trim())) { toast("/goal sets the goal of Omni's own chat. Type it in one of its chats; here, just tell the agent.", true); return; }
   if (await goalCommand(text, chat)) return;
   try {
     if (t.kind === "owned-pi") {
@@ -531,7 +531,7 @@ async function chatSend(text, o) {
     chat.setState({ disabled: true, caption: "Starting…" });
     const r = await sendClearing(chat, text, () => api(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, fork: S.forceFork }));
     S.forceFork = false;
-    if (r.sid !== S.selected) { if (r.forked) toast("Forked into a new pi session"); selectSession(r.sid); }
+    if (r.sid !== S.selected) { if (r.forked) toast("Forked into a new session"); selectSession(r.sid); }
   } catch (e) { toast(e.message, true); }
   finally { updateComposer(); }
 }

@@ -1,6 +1,6 @@
 # Omni Agent
 
-A local agentic OS for one person: every **pi harness** and **Claude Code** conversation
+A local agentic OS for one person: every **OpenCode** and **Claude Code** conversation
 on this machine shows up live in one window, tokens animate in while a model streams,
 whole messages just appear when it is not, and a personal **Obsidian vault** is the
 memory both harnesses share. Node built-ins only. No npm install.
@@ -24,18 +24,27 @@ started from Finder; set `OMNI_NODE` to point at another binary.
 Console mode is still there:
 
 ```
-./start.sh                     # macOS/Linux: opens http://127.0.0.1:4400, pi works in ~/Desktop
-./start.sh /some/project       # pi works in that folder (the Graph tab uses this folder)
+./start.sh                     # macOS/Linux: opens http://127.0.0.1:4400, OpenCode works in ~/Desktop
+./start.sh /some/project       # OpenCode works in that folder (the Graph tab uses this folder)
 ./start.sh . --lan             # also reachable from other devices on your network
 start.cmd "C:\some\project"    # the Windows equivalents
 start.cmd . --lan
-node server/index.mjs --no-pi  # observe only, don't start a pi child (any OS)
+node server/index.mjs --no-pi  # observe only, don't start OpenCode (any OS)
 ```
 
-pi is started as `node <pi>/dist/cli.js --mode rpc`; the entry point is found through the `pi` launcher
-on PATH (a symlink on macOS/Linux npm installs), `%APPDATA%\npm` on Windows, or the usual global
-`node_modules` prefixes. Set `piCli` in `omni.config.json` to override, or `piBin` to run a `pi` launcher
-directly.
+Omni runs one shared `opencode serve` (OpenCode 1.18+; install it with `npm i -g opencode-ai`) and every
+chat is a session on it. The `opencode` launcher is found on PATH; set `opencodeBin` in `omni.config.json`
+to point at another one. Omni gives it its own config folder (`~/.omni-agent/opencode`, `opencodeConfigDir`),
+which holds the `opencode.json` Omni writes (your MCP servers, custom providers), the plugin that adds
+Omni's tools (plan, background agents, Claude Code, memory, graph, omnidroid) and the skills; your own
+global OpenCode config still applies underneath.
+
+**Models.** OpenCode's free models work without a key. Add your own providers and keys in the **Providers**
+dialog (gear icon); MCP servers go in its **MCP servers** tab. Providers you had set up for pi
+(`~/.pi/agent/models.json`) are copied over once at the first start.
+
+The agent personas (`integrations/pi/agents/*.md`, or `personasDir`) are read from the repo, not from the
+OpenCode config folder.
 
 ### Use it from another device or another network
 
@@ -271,12 +280,11 @@ Inbox/                    drop anything here
 ## Wire the harnesses to the vault
 
 ```
-node scripts/install.mjs                 # pi: memory_search / memory_recall / memory_save tools + auto recall, MCP clients,
-                                         #     plus the omnidroid skills (skills/ -> ~/.pi/agent/skills/)
+node scripts/install.mjs                 # OpenCode: checks `opencode` is installed, copies the skills (skills/ -> <opencodeConfigDir>/skills/),
+                                         #     writes ~/.pi/agent/omni-agent.json (the omnidroid bridge; your mcpServers are kept)
 node scripts/install.mjs --claude-hook   # Claude Code: SessionStart hook that injects the memory index
 node scripts/install.mjs --claude-skills # Claude Code: also copy the skills to ~/.claude/skills/
 node scripts/install.mjs --claude-mcp    # Claude Code: register omnidroid's MCP server (tools mcp__omnidroid__*)
-node scripts/install.mjs --openrouter    # pi: OpenRouter provider from openrouter.txt (see "Models")
 node scripts/install.mjs --uninstall
 ```
 
@@ -294,27 +302,16 @@ The skills teach either model the omnidroid engine (the sibling checkout in `Omn
 - `skills/omnidroid-qemu`, `skills/omnidroid-input` — the retired QEMU/Python VM manager
   (`Omni Apps/omnidroid-old`), kept for when it is asked for by name.
 
-The pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/omni-agent.json`:
+OpenCode loads Omni's tools through one plugin (`integrations/opencode/omni-plugin.mjs`). The server writes the
+plugin shim and `opencode.json` into the OpenCode config folder itself, on every config change, so the installer
+does not. What the plugin brings: the `plan` tool, background agents and jobs (`agent_start` …), `claude_task`,
+the memory tools (`memory_search` / `memory_recall` / `memory_save`, plus the per-prompt memory pack the composer
+attaches), `graph_build` / `graph_query` / `graph_explain` (they shell out to the local `graphify`; Omni must be
+running) and the omnidroid tools. MCP servers and omnidroid's `omni-mcp` come from `~/.pi/agent/omni-agent.json`
+(`omniMcp` and `mcpServers`), which the server renders into `opencode.json`:
 
-- `omni-plan.ts` + `omni-plan-lib.mjs` (a copy of `ui/plan.js`, the state machine the server and the goal box share): the `plan` tool.
-- `omni-memory.ts` (`autoRecall`, `budgetTokens`): the memory tools. With auto recall on, every
-  prompt of a pi started from a terminal gets a small `<omni-memory>` pack appended to the system
-  prompt. Omni's own pi child (spawned with `OMNI_MEMORY=server`) skips that: there the composer's
-  "Attach relevant memory" checkbox decides per prompt and the server attaches the pack itself.
-- `omni-claude.ts` (`port`): a `claude_task` tool so the pi model (your local Qwen) can hand a
-  task to Claude Code and wait for the answer. The run shows up in Omni as its own chat
-  ("Task from pi: …"); the tool returns Claude's final text plus a session id that can be passed
-  back as `resume` for a follow-up. Omni Agent must be running.
-- `omni-mcp.ts` (`omniMcp`): pi has no MCP client, so this is one. It starts omnidroid's
-  `omni-mcp` (`<omnidroid>/target/release/omni-mcp[.exe]`, filled in by the installer; build it with
-  `cargo build --release -p omni-mcp`) and registers each of its tools as `omnidroid_<tool>` —
-  `start_instance` / `screenshot` / `list_instances` / `web_*` for a live instance, `lab_load` /
-  `call_function` / `intercept` / `dump_module` … for the lab debugger. The server is kept across
-  chat switches and closed when pi quits (which stops the instances it booted); a call past
-  `timeoutSec` (600) restarts it. `omniMcp.env` is passed to the server (`OMNI_MCP_APK`,
-  `OMNI_MCP_REPO`, `OMNIDROID_DYNARMIC_BUILD_DIR`, …).
-- `omni-mcp-servers.ts` (`mcpServers`): any other MCP server. The block has Claude Code's
-  `.mcp.json` shape, so a server's README snippet can be pasted as-is; each tool becomes a pi tool
+- `mcpServers`: any MCP server. The block has Claude Code's
+  `.mcp.json` shape, so a server's README snippet can be pasted as-is; each tool becomes an OpenCode tool
   named `mcp__<server>__<tool>`, the same names Claude Code uses:
 
   ```json
@@ -328,49 +325,31 @@ The pi extensions are copied to `~/.pi/agent/extensions/` and read `~/.pi/agent/
   Transports are stdio (`command`, `args`, `env`, `cwd`) and Streamable HTTP (`"type": "http"`,
   `url`, `headers`). The old SSE transport and OAuth sign-in are not supported; put a token in
   `headers`. `${VAR}` / `${VAR:-default}` are read from the environment. `timeoutSec` (300) caps
-  one call. Servers start with the pi session, survive a chat switch and close when pi quits; one
-  that fails to start shows a warning and is listed as unavailable in the system prompt, and the
-  others still load. A server's `tools/list_changed` adds its new tools mid-session. Edit
-  the file and restart pi, or use the **MCP servers** tab in the Providers dialog (⚙): add, edit,
+  one call. Edit
+  the file and restart Omni's OpenCode, or use the **MCP servers** tab in the Providers dialog (⚙): add, edit,
   disable or remove a server, paste a README's JSON snippet to fill the form, and **Test connection**
-  to see its tools before saving. Saving restarts pi back onto its chat. Env and header values are
+  to see its tools before saving. Saving reloads OpenCode. Env and header values are
   masked in the dialog (a `${VAR}` reference is shown as-is) and kept when saved back unchanged.
   `install.mjs` keeps this block, including on `--uninstall`.
-- `omni-graph.ts` (`port`): `graph_build`, `graph_query` and `graph_explain` tools so the pi model
-  decides mid-turn to build a repo knowledge graph or read it instead of grinding through files.
-  They shell out to the local `graphify` (no model call), so they work even with the pi model
-  endpoint down. Omni Agent must be running.
 
 ## Models
 
-Providers live in pi's own `~/.pi/agent/models.json`; the **Providers** dialog (⚙) edits it. Each
-provider is a base URL, an API type (`openai-completions`, `openai-responses`, `anthropic-messages`,
-`google-generative-ai`), a key and the model ids you want to see. Saving restarts Omni's pi child so it
-reads the file, then switches it back to the session it had open. Fields the dialog does not show
-(`compat`, `headers`, per-model `cost` or image input) are kept as they are.
-The dialog's second tab, **MCP servers**, edits the tool servers pi connects to (see `omni-mcp-servers.ts` above).
+OpenCode's own models (the free ones need no key) and the providers you connect appear in the model picker.
+The **Providers** dialog (gear icon) connects a provider with its API key, and adds custom OpenAI-compatible
+or Anthropic/Google-style providers (a base URL, an API type, a key and the model ids you want to see); those
+custom providers are stored in `~/.omni-agent/opencode-providers.json` and rendered into `opencode.json`
+(`~/.omni-agent/opencode/`); saving reloads OpenCode. The dialog's second tab, **MCP servers**, edits the
+tool servers OpenCode connects to (see `mcpServers` above).
 
-Picking a model in the composer calls pi's `set_model` and writes `piProvider` / `piModel` to
-`omni.config.json`, so the next pi child starts on it. Without any provider in `models.json` the
-picker falls back to pi's own catalogue filtered by `piModels`.
+Picking a model in the composer sets the chat's model and writes `piProvider` / `piModel` to
+`omni.config.json` (the names are historical), so the next chat starts on it.
 
-**Fallback.** The `omni-fallback.ts` pi extension (installed by `scripts/install.mjs`) reads
-`models.json` in file order — providers as the dialog lists them, each provider's model lines in
-sequence — and treats it as a chain. When a run ends because the model returned an error (any
-error: 4xx, 5xx, connection, empty body), the extension switches pi to the model below the current
-one and continues the same turn on it at once; for a transient error pi's own retry simply runs on
-the switched model. The errored assistant messages and the extension's "model error on a/x →
-switched to b/y" notice are filtered out of the LLM context, so the new model sees the conversation
-exactly as the failed one did. The chain stops at the bottom of the list: the last error stays
-visible and the user picks a model or reorders. Dragging in the dialog posts
-`/api/providers-order` and rewrites the provider order without restarting pi. The switch is per
-session: a new chat starts back on the picked model, and Omni's top bar follows the switch.
+**Fallback.** The pi-era model fallback chain (`omni-fallback.ts`) is not installed any more; when a model
+returns an error, pick another model in the picker.
 
-`node scripts/install.mjs --openrouter` still seeds OpenRouter + DeepSeek V4 Flash from
-`openrouter.txt` for a first run. The server also hands `OPENROUTER_API_KEY` (from `openrouter.txt`,
-configurable via `apiKeyFiles`) to the pi child, so a `$OPENROUTER_API_KEY` reference in
-`models.json` resolves too. DeepSeek is not multimodal: the omnidroid skills carry a text-only
-verification loop for it; the production Qwen reads screenshots.
+OpenRouter is one more provider: add it (and its key) in the Providers dialog. `install.mjs --openrouter` is gone.
+DeepSeek is not multimodal: the omnidroid skills carry a text-only verification loop for it; the production
+Qwen reads screenshots.
 
 ### Headless runs
 

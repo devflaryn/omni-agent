@@ -452,9 +452,9 @@ export function mergeAgentSnapshot(current, snapshot, liveSince, rev) {
 export function parseCompactAt(k) {
   const s = String(k ?? "").trim();
   const n = Number(s);
-  if (!s || !Number.isFinite(n) || n < 0) return { error: "Type how many thousand tokens a chat may grow to before pi compacts it (0 = off)" };
-  // After a compaction pi still holds the system prompt and tools (~25k), the recent turns it keeps (32k) and the summary.
-  if (n > 0 && n < 100) return { error: "Too small: below 100k tokens pi would compact almost every turn (a compacted chat still holds ~60k). Use 0 to turn the cap off." };
+  if (!s || !Number.isFinite(n) || n < 0) return { error: "Type how many thousand tokens a chat may grow to before OpenCode compacts it (0 = off)" };
+  // After a compaction OpenCode still holds the system prompt and tools (~25k), the recent turns it keeps (32k) and the summary.
+  if (n > 0 && n < 100) return { error: "Too small: below 100k tokens OpenCode would compact almost every turn (a compacted chat still holds ~60k). Use 0 to turn the cap off." };
   if (n > 10000) return { error: "Too large: use at most 10000k tokens, or 0 to turn the cap off." };
   return { compactAt: Math.round(n * 1000) };
 }
