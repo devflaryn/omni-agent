@@ -773,6 +773,46 @@ test("opencode: a provider or MCP change rewrites opencode.json and disposes the
   assert.equal(app4.pis.find((c) => c.sid === ocSid), chat, "the chat keeps going on the same server");
 });
 
+test("opencode: a message sent while OpenCode restarts waits for its chat to reattach (no second chat on the session)", async () => {
+  const chat = app4.pis.find((c) => c.sid === ocSid);
+  chat.streaming = false; chat.inFlight = 0;
+  const chats = app4.pis.length;
+  oc.up = false; oc.proc = null; oc.emit("down");
+  assert.equal(chat.proc, null, "the chat is reattaching");
+  const before = oc.calls.length;
+  const pending = post4("/api/pi/prompt", { sid: ocSid, message: "during the outage", memory: false });
+  await sleep(80);
+  oc.up = true; oc.proc = { pid: 4242 }; oc.emit("up");
+  const r = await pending;
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(app4.pis.length, chats, "no second chat was opened");
+  assert.equal(app4.pis.filter((c) => c.sid === ocSid).length, 1);
+  const prompts = oc.calls.slice(before).filter((c) => /prompt_async$/.test(c.path));
+  assert.deepEqual(prompts.map((c) => c.path), ["/session/ses_fake1/prompt_async"], "the chat itself got the message");
+  oc.push({ type: "session.idle", properties: { sessionID: "ses_fake1" } });
+});
+
+test("opencode: a chat that does not come back in time answers 409 on every route that takes its sid", async () => {
+  const chat = app4.pis.find((c) => c.sid === ocSid);
+  chat.streaming = false; chat.inFlight = 0;
+  const chats = app4.pis.length;
+  app4.cfg.opencodeRestartWaitMs = 120;
+  oc.up = false; oc.proc = null; oc.emit("down");
+  try {
+    for (const [path, body] of [["/api/pi/prompt", { message: "x", memory: false }], ["/api/pi/abort", {}], ["/api/pi/compact", {}], ["/api/pi/model", { provider: "opencode", modelId: "think" }], ["/api/pi/thinking", { level: "high" }], ["/api/pi/new", {}], [`/api/sessions/${encodeURIComponent(ocSid)}/continue`, { message: "y" }]]) {
+      const r = await post4(path, { sid: ocSid, ...body });
+      assert.equal(r.status, 409, `${path}: ${JSON.stringify(r.json)}`);
+      assert.match(r.json.error, /OpenCode is restarting/, path);
+    }
+    assert.equal(app4.pis.length, chats, "no second chat was opened");
+  } finally {
+    delete app4.cfg.opencodeRestartWaitMs;
+    oc.up = true; oc.proc = { pid: 4242 }; oc.emit("up");
+  }
+  for (let i = 0; i < 50 && !chat.proc; i++) await sleep(10);
+  assert.ok(chat.proc, "back");
+});
+
 test("opencode: close() ends the opencode server synchronously (a script exits right after it)", async () => {
   app4.close();
   assert.equal(oc.stops, 1);

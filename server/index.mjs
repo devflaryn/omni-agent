@@ -557,9 +557,27 @@ export async function createApp(overrides = {}) {
     req.omniBody = s ? JSON.parse(s) : {};
     return req.omniBody;
   }
-  /** Chat `sid`'s pi child, or the current one without a sid. */
-  const requirePi = (sid = "") => {
-    const c = sid ? piFor(sid) : pi;
+  /** Chat `sid`'s child, also while it waits to reattach after OpenCode went away (it has no proc then). */
+  const chatOf = (sid) => { if (!sid) return null; for (const c of pis) if (c.sid === sid && (c.proc || (c.restoring && !c.stopped))) return c; return null; };
+  /**
+   * Chat `sid`'s child, ready for a request; null when no child has the chat. One reattaching after OpenCode went away
+   * is waited for (bounded by the server's start timeout): opening the chat in another child meanwhile would put two
+   * children on one session (doubled events and mirror entries). Not back in time → 409.
+   */
+  async function readyPi(sid) {
+    const c = chatOf(sid);
+    if (!c || c.proc) return c;
+    const until = Date.now() + (cfg.opencodeRestartWaitMs ?? opencode.startTimeoutMs ?? 60000);
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 50));
+      if (!pis.has(c) || c.stopped) return piFor(sid);
+      if (c.proc && !c.restoring) return c;
+    }
+    throw Object.assign(new Error("OpenCode is restarting — try again in a moment"), { status: 409 });
+  }
+  /** Chat `sid`'s pi child (waited for while it reattaches), or the current one without a sid. */
+  const requirePi = async (sid = "") => {
+    const c = sid ? await readyPi(sid) : pi;
     if (!c?.proc) throw Object.assign(new Error(sid ? "that chat is not open on OpenCode right now; send it a message to continue it" : "no chat is open on OpenCode (POST /api/pi/start)"), { status: 409 });
     return c;
   };
@@ -607,7 +625,8 @@ export async function createApp(overrides = {}) {
     // Omni's main pi must never open a session file a running agent's own pi is still writing.
     const busy = activeAgentIn(sid, s.file);
     if (busy) throw agentBusyError(busy);
-    const plan = planContinue(s, { liveWindowMs: cfg.liveWindowMs, piOwned: !!piFor(sid), claudeAlive: !!claude.runs.get(sid)?.alive, forceFork: !!body.fork });
+    // A chat whose child is reattaching is that child's (waited for), never opened in a second one.
+    const plan = planContinue(s, { liveWindowMs: cfg.liveWindowMs, piOwned: !!(await readyPi(sid)), claudeAlive: !!claude.runs.get(sid)?.alive, forceFork: !!body.fork });
     if (plan.action === "error") throw Object.assign(new Error(plan.error), { status: plan.status });
     const dir = s.cwd || cfg.cwd;
     if (plan.action === "claude") {
@@ -858,7 +877,7 @@ export async function createApp(overrides = {}) {
         if (req.method === "POST" || req.method === "PUT") {
           const b = await readBody(req);
           // The chat it was typed in (`sid`); without one, the chat used last.
-          const c = b.sid ? piFor(b.sid) : pi;
+          const c = b.sid ? await readyPi(b.sid) : pi;
           if (!c?.sid) return send(res, 400, { error: b.sid ? "that chat is not open on OpenCode right now; send it a message first, then set the goal" : "no active chat session; start a chat first" });
           const goal = String(b.goal ?? "").trim();
           keeper.setExplicitGoal(c.sid, goal);
@@ -952,7 +971,7 @@ export async function createApp(overrides = {}) {
           // Another pi child; any already running keep going.
           case "/api/pi/start": { const c = startPi(body.cwd || cfg.cwd); try { await c.waitReady(); } catch { /* the UI polls /api/state */ } return send(res, 200, { ok: true, sid: c.sid }); }
           // `sid` stops that chat's child; without one, every chat's.
-          case "/api/pi/stop": { for (const c of sid ? [piFor(sid)].filter(Boolean) : [...pis]) stopPi(c); return send(res, 200, { ok: true }); }
+          case "/api/pi/stop": { for (const c of sid ? [chatOf(sid)].filter(Boolean) : [...pis]) stopPi(c); return send(res, 200, { ok: true }); }
           // A new chat in `cwd`, without a prompt yet: a free child opens a new session, else a new child starts.
           case "/api/pi/open": {
             const { child: c, fresh } = await acquirePi(body.cwd || cfg.cwd);
@@ -972,15 +991,15 @@ export async function createApp(overrides = {}) {
           case "/api/pi/prompt": {
             if (!body.message?.trim()) return send(res, 400, { error: "empty" });
             // The chat's child was closed (idle too long, or it opened another chat): pick the chat up again.
-            if (sid && !piFor(sid) && registry.get(sid)) return send(res, 200, await continueSession(sid, body));
-            const p0 = usePi(requirePi(sid));
+            if (sid && !(await readyPi(sid)) && registry.get(sid)) return send(res, 200, await continueSession(sid, body));
+            const p0 = usePi(await requirePi(sid));
             const c = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(p0.sid) });
             return send(res, 200, await p0.prompt(c.text, { images: body.images }));
           }
           case "/api/pi/abort": {
             // Stop halts this run and its goal (no re-engage until the user writes again). It used to also switch
             // the hook off globally and persist that, which silently left every later overnight run without one.
-            const p0 = requirePi(sid);
+            const p0 = await requirePi(sid);
             keeper.cancel(p0.sid);
             // A full halt includes the chat's background agents: their reports would otherwise wake the stopped chat
             // and start new, unsupervised turns in it.
@@ -990,7 +1009,7 @@ export async function createApp(overrides = {}) {
           }
           // A new chat: in `sid`'s child when it is free, else (and without a sid) like /api/pi/open in its folder.
           case "/api/pi/new": {
-            const own = sid ? requirePi(sid) : null;
+            const own = sid ? await requirePi(sid) : null;
             if (own && piFree(own)) { const r = await usePi(own).newSession(); own.claimedAt = Date.now(); return send(res, 200, { ...r, sid: own.sid }); }
             const { child: c, fresh } = await acquirePi(body.cwd || own?.cwd || pi?.cwd || cfg.cwd);
             const r = fresh ? { success: true } : await c.newSession();
@@ -1003,7 +1022,7 @@ export async function createApp(overrides = {}) {
             // Already open in a child: that one. A working child is never moved off its chat.
             const has = [...pis].find((c) => c.proc && c.owns?.(body.file));
             if (has) { usePi(has); return send(res, 200, { success: true, sid: has.sid }); }
-            const c0 = requirePi(sid);
+            const c0 = await requirePi(sid);
             const c = c0.streaming || c0.inFlight > 0 ? (await acquirePi(c0.cwd)).child : c0;
             const r = await usePi(c).switchSession(body.file);
             return send(res, 200, { ...r, sid: c.sid });
@@ -1014,7 +1033,7 @@ export async function createApp(overrides = {}) {
           // `sid` applies the pick to that chat's child (the others keep theirs); without one, to the current child.
           case "/api/pi/model": {
             if (!body.provider || !body.modelId) return send(res, 400, { error: "provider and modelId are required" });
-            const c = sid ? piFor(sid) : pi;
+            const c = sid ? await readyPi(sid) : pi;
             let r;
             if (c?.proc) r = await c.setModel(body.provider, body.modelId);
             else {
@@ -1031,7 +1050,7 @@ export async function createApp(overrides = {}) {
           }
           case "/api/pi/thinking": {
             if (!THINKING_LEVELS.includes(body.level)) return send(res, 400, { error: `level must be one of ${THINKING_LEVELS.join(", ")}` });
-            const c = sid ? piFor(sid) : pi;
+            const c = sid ? await readyPi(sid) : pi;
             const cur = currentModel(c);
             // Clamped to the levels the model has (its OpenCode variants): a level it lacks would not be sent at all.
             const level = cur ? clampThinking(body.level, await levelsOf(cur.provider, cur.id)) : body.level;
@@ -1039,8 +1058,8 @@ export async function createApp(overrides = {}) {
             if (r?.success !== false) { cfg.piThinking = level; if (cfg.persistPiModel !== false) writeConfigFile({ piThinking: level }); }
             return send(res, 200, { ...r, level: cfg.piThinking });
           }
-          case "/api/pi/compact": return send(res, 200, await requirePi(sid).compact());
-          case "/api/pi/stats": return send(res, 200, await requirePi(sid).stats());
+          case "/api/pi/compact": return send(res, 200, await (await requirePi(sid)).compact());
+          case "/api/pi/stats": return send(res, 200, await (await requirePi(sid)).stats());
           case "/api/pi/models": {
             // OpenCode's connected providers (its free `opencode` models and every provider with a key). The
             // piModels allowlist narrows the others; the `opencode` provider is always listed in full.
@@ -1056,7 +1075,7 @@ export async function createApp(overrides = {}) {
             const t = await thinkingOf(cur.provider, cur.id, c?.state?.model);
             return send(res, 200, { success: true, data: { levels: t.levels, labels: t.labels, ...(t.family ? { family: t.family } : {}), provider: cur.provider, model: cur.id } });
           }
-          case "/api/pi/state": return send(res, 200, await requirePi(sid).refreshState());
+          case "/api/pi/state": return send(res, 200, await (await requirePi(sid)).refreshState());
           default: return send(res, 404, { error: "unknown /api/pi route" });
         }
       }
