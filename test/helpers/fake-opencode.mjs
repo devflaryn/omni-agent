@@ -70,6 +70,7 @@ export class FakeServer extends EventEmitter {
     if (method === "POST" && path === "/session") return { id: `ses_fake${++this.n}`, title: "New session - 2026-10-23T00:00:00.000Z" };
     if (method === "GET" && path === "/provider") return this.catalog;
     if (method === "GET" && path === "/session/status") return this.status;
+    if (method === "GET" && path === "/experimental/tool/ids") return ["bash", "read", "edit", "plan", "agent_start"];
     if (method === "POST" && (m = /^\/session\/([^/]+)\/fork$/.exec(path))) return { id: `ses_fork${++this.n}`, title: "fork" };
     if (method === "GET" && (m = /^\/session\/([^/]+)\/message$/.exec(path))) return this.history.get(m[1]) || [];
     if (method === "GET" && (m = /^\/session\/([^/]+)$/.exec(path))) return { id: m[1], title: m[1] === "ses_titled" ? "Fix the build" : "New session - 2026-10-23T00:00:00.000Z" };

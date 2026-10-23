@@ -127,6 +127,7 @@ export async function createApp(overrides = {}) {
     opencodeStart = (async () => {
       writeConfig();
       await opencode.start();
+      checkPlugin();
       await migrateProviders();
       checkSavedModel().catch((e) => log("could not check the saved model against opencode's catalog", e.message));
       return opencode;
@@ -156,6 +157,17 @@ export async function createApp(overrides = {}) {
     catch (e) { log("could not write the opencode config", e.message); }
   }
   const systemLog = (text) => { log(text); bus.emit({ sid: "omni", harness: "omni", kind: "log", ts: Date.now(), level: "system", text }); };
+  /**
+   * Omni's plugin (integrations/opencode/omni-plugin.mjs, loaded through the shim in the config dir) gives OpenCode the
+   * `plan` tool the goal hook tracks: after a start or a config reload, a server without it is reported (never blocking).
+   */
+  function checkPlugin() {
+    const dir = [...pis].find((c) => c.cwd)?.cwd || cfg.cwd;
+    return opencode.request("GET", "/experimental/tool/ids", { directory: dir }).then((ids) => {
+      if (Array.isArray(ids) && ids.includes("plan")) return;
+      systemLog(`Omni's OpenCode plugin did not load (no plan tool) — the goal hook cannot track plans; check ${join(cfg.opencodeConfigDir, "plugin")} and OpenCode's log`);
+    }, (e) => log("could not list opencode's tools:", e.message));
+  }
   /**
    * The first start copies pi's custom providers (pi's models.json) into Omni's store once, so a BYOK setup carries
    * over. A name OpenCode already has (built in, or in the user's global config) is skipped, and each skip is logged.
@@ -209,7 +221,8 @@ export async function createApp(overrides = {}) {
     reloadPending = false;
     catalogCache = null;
     for (const c of pis) if ("catalog" in c) c.catalog = null;
-    await opencode.request("POST", "/global/dispose").catch((e) => log("opencode reload failed", e.message));
+    const ok = await opencode.request("POST", "/global/dispose").then(() => true, (e) => { log("opencode reload failed", e.message); return false; });
+    if (ok) checkPlugin();
   }
   /**
    * Omni's MCP servers or providers changed: rewrite opencode.json and let OpenCode re-read it (its instances are

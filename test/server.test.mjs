@@ -881,6 +881,45 @@ test("opencode: a failed first start is tried again when a chat is used, and the
   assert.equal(proc.listenerCount("exit"), 1, "the exit kill stays");
 });
 
+test("opencode: a server without Omni's plan tool is reported (at start and after a config reload), the start not blocked", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-oc-noplugin-"));
+  const srv = new FakeServer({ up: false, reply: (m, p) => (m === "GET" && p === "/experimental/tool/ids" ? ["bash", "read"] : undefined) });
+  const app = await createApp(failOpts(dir, { opencodeServer: srv }));
+  const logs = [];
+  app.bus.on("event", (ev) => { if (ev.kind === "log") logs.push(ev); });
+  await app.listen();
+  const port = app.server.address().port;
+  const warned = () => logs.filter((e) => /plugin did not load/.test(e.text));
+  try {
+    const open = await fetch(`http://127.0.0.1:${port}/api/pi/open`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cwd: dir }) });
+    assert.equal(open.status, 200, "the chat opens anyway");
+    for (let i = 0; i < 50 && !warned().length; i++) await sleep(10);
+    assert.equal(warned().length, 1);
+    assert.equal(warned()[0].level, "system");
+    assert.equal(warned()[0].sid, "omni", "a toast for every viewer");
+    assert.equal(warned()[0].text, `Omni's OpenCode plugin did not load (no plan tool) — the goal hook cannot track plans; check ${join(dir, "oc-config", "plugin")} and OpenCode's log`);
+    const ask = srv.calls.find((c) => c.path === "/experimental/tool/ids");
+    assert.equal(ask.directory, dir);
+    const r = await fetch(`http://127.0.0.1:${port}/api/mcp/x`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: "node" }) });
+    assert.equal((await r.json()).restarted, true);
+    for (let i = 0; i < 50 && warned().length < 2; i++) await sleep(10);
+    assert.equal(warned().length, 2, "checked again after the reload");
+  } finally { app.close(); }
+  // With the plugin loaded (the fake's default tool list has plan): no warning.
+  const ok = new FakeServer({ up: false });
+  const app2c = await createApp(failOpts(mkdtempSync(join(tmpdir(), "omni-oc-plugin-")), { opencodeServer: ok }));
+  const okLogs = [];
+  app2c.bus.on("event", (ev) => { if (ev.kind === "log") okLogs.push(ev); });
+  try {
+    await app2c.listen();
+    await fetch(`http://127.0.0.1:${app2c.server.address().port}/api/pi/open`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}) });
+    for (let i = 0; i < 50 && !ok.calls.some((c) => c.path === "/experimental/tool/ids"); i++) await sleep(10);
+    await sleep(20);
+    assert.ok(ok.calls.some((c) => c.path === "/experimental/tool/ids"));
+    assert.ok(!okLogs.some((e) => /plugin did not load/.test(e.text)));
+  } finally { app2c.close(); }
+});
+
 test("opencode: a config change starts a server whose first start failed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "omni-oc-fail2-"));
   const srv = new FakeServer({ up: false, failStarts: 1 });
