@@ -187,12 +187,25 @@ export class OpencodeServer extends EventEmitter {
     this.setUp(false);
     this.log(this.stopped ? "info" : "system", `opencode exited (code ${code}${signal ? `, ${signal}` : ""})`);
     if (this.stopped) return;
+    this.scheduleRestart();
+  }
+
+  /**
+   * Relaunches after back-off and never gives up (watchdog.mjs: fail open). A relaunch that failed with no child left
+   * (spawn threw synchronously) schedules the next one; one whose child exited was already rescheduled by handleExit,
+   * and one whose child still runs (the stream did not connect yet) is left to the stream's own reconnects.
+   */
+  scheduleRestart() {
+    if (this.stopped || this.restartTimer) return;
     this.restarts = nextRestartState({ restarts: this.restarts, lastHealthyAt: this.lastHealthyAt }).restarts;
     const delay = restartDelay(this.restarts++, this.backoff);
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
       if (this.stopped) return;
-      this.boot().catch((e) => this.log("system", `opencode restart failed: ${e.message}`));
+      this.boot().catch((e) => {
+        this.log("system", `opencode restart failed: ${e.message}`);
+        if (!this.child) this.scheduleRestart();
+      });
     }, delay);
   }
 

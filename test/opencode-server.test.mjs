@@ -235,6 +235,35 @@ test("restarts the child after an unexpected exit, with a fresh listening url an
   }
 });
 
+test("keeps relaunching when spawn throws synchronously during a restart", async () => {
+  let password = null;
+  const oc = await fakeOpencode({ password: () => password });
+  const fake = fakeSpawn(() => oc.url);
+  let launches = 0;
+  const spawn = (cmd, args, opts) => {
+    if (cmd !== "taskkill" && ++launches === 2) throw new Error("spawn EMFILE");
+    return fake.spawn(cmd, args, opts);
+  };
+  const logs = [];
+  const server = new OpencodeServer({ spawn, platform: "linux", backoff, log: (l, t) => logs.push(`${l} ${t}`) });
+  try {
+    const started = server.start();
+    await waitFor(() => fake.launches().length === 1);
+    password = fake.launches()[0].opts.env.OPENCODE_SERVER_PASSWORD;
+    await started;
+    const down = nextEvent(server, "down");
+    fake.children[0].end(1);
+    await down;
+    await nextEvent(server, "up");
+    assert.equal(launches, 3, "the throwing relaunch was followed by another");
+    assert.ok(logs.some((l) => /restart failed: spawn EMFILE/.test(l)));
+    assert.deepEqual(await server.request("GET", "/global/health"), { healthy: true, version: "fake" });
+  } finally {
+    server.stop();
+    await oc.close();
+  }
+});
+
 test("stop() does not restart", async () => {
   let password = null;
   const oc = await fakeOpencode({ password: () => password });
