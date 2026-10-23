@@ -14,6 +14,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
   };
   /** The form rows only a custom provider has (a key for one of OpenCode's own providers is just the key). */
   const customRows = [$("#pfBaseRow"), $("#pfModelsRow"), $("#pfLimits")];
+  const keyRow = $("#pfKeyRow");
   let data = { providers: [], opencode: [], presets: [], active: null };
   let editing = null; // custom provider name being edited, or null for a new one
   let keyFor = null; // the OpenCode provider id whose key the form edits (key mode), or null
@@ -102,7 +103,9 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
       const on = data.active?.provider === p.name;
       b.innerHTML = `<span class="pn"></span><span class="pm"></span>`;
       b.querySelector(".pn").textContent = p.name + (on ? " · active" : "");
-      b.querySelector(".pm").textContent = `${p.models.length} model${p.models.length === 1 ? "" : "s"} · ${p.hasKey ? `key •••${p.keyHint}` : "no key"}`;
+      b.querySelector(".pm").textContent = p.builtIn
+        ? `${p.models.length} Omni-added model${p.models.length === 1 ? "" : "s"} · OpenCode's ${p.name}`
+        : `${p.models.length} model${p.models.length === 1 ? "" : "s"} · ${p.hasKey ? `key •••${p.keyHint}` : "no key"}`;
       b.onclick = () => edit(p.name);
       // The six-dot grip under each provider: drag (or arrow keys) to set the order of Omni's providers.
       const grip = el("button", "prov-grip");
@@ -195,8 +198,11 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
   function showMode() {
     const key = keyMode();
     for (const row of customRows) if (row) row.hidden = key;
+    if (keyRow) keyRow.hidden = false;
     f.del.textContent = key ? "Remove key" : "Remove provider";
   }
+  /** The entry being edited only adds models to one of OpenCode's own providers (no URL or key of its own). */
+  const editingBuiltIn = () => !!editing && !!data.providers.find((x) => x.name === editing)?.builtIn;
   function applyPreset() {
     const p = presetFor(f.preset.value); if (!p) return;
     showMode();
@@ -251,6 +257,14 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
     f.ctx.value = cw || ""; f.max.value = mt || "";
     f.ctx.dataset.was = f.ctx.value; f.max.dataset.was = f.max.value;
     f.del.hidden = false;
+    if (p.builtIn) {
+      // Extra models for one of OpenCode's own providers: OpenCode's definition and stored key apply, so no URL or key here.
+      f.title.textContent = `${name} · Omni-added models`;
+      $("#pfBaseRow").hidden = true;
+      if (keyRow) keyRow.hidden = true;
+      f.hint.textContent = `Models OpenCode's ${name} does not list, added to it by Omni. Its key is set in its own row below.`;
+      f.del.textContent = "Remove these models";
+    }
     renderList();
   }
   function parseModels(text) {
@@ -268,8 +282,8 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
   async function save() {
     if (keyMode()) return saveKey();
     const name = (editing || f.name.value).trim().toLowerCase();
-    const body = { baseUrl: f.baseUrl.value.trim(), models: parseModels(f.models.value) };
-    if (f.key.value.trim() || !editing) body.apiKey = f.key.value.trim();
+    const body = editingBuiltIn() ? { builtIn: true, models: parseModels(f.models.value) } : { baseUrl: f.baseUrl.value.trim(), models: parseModels(f.models.value) };
+    if (!body.builtIn && (f.key.value.trim() || !editing)) body.apiKey = f.key.value.trim();
     f.save.disabled = true;
     try {
       const r = await api(`/api/providers/${encodeURIComponent(name)}`, body, "PUT");
@@ -303,7 +317,8 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
       catch (e) { toast(e.message, true); }
       return;
     }
-    if (!editing || !window.confirm(`Remove provider "${editing}" and its models from OpenCode?`)) return;
+    const confirmText = editingBuiltIn() ? `Remove the models Omni added to OpenCode's "${editing}"? OpenCode's own models and key stay.` : `Remove provider "${editing}" and its models from OpenCode?`;
+    if (!editing || !window.confirm(confirmText)) return;
     try { const r = await api(`/api/providers/${encodeURIComponent(editing)}`, null, "DELETE"); toast(`Removed ${editing}${reloaded(r)}`); editing = null; await load(); onChanged?.(); }
     catch (e) { toast(e.message, true); }
   }

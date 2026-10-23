@@ -305,7 +305,7 @@ test("claude task: empty prompt → 400", async () => {
 
 // ------------------------------------------------------------ providers
 const ocProvidersFile = join(base, "omni", "opencode-providers.json");
-test("providers: OpenCode's first start copies pi's models.json providers once (one OpenCode already has is skipped, and logged)", async () => {
+test("providers: OpenCode's first start copies pi's models.json providers once (one OpenCode already has only gets the models it lacks, logged)", async () => {
   mkdirSync(join(base, "pi-agent"), { recursive: true });
   writeFileSync(join(base, "pi-agent", "models.json"), JSON.stringify({ providers: {
     legacy: { baseUrl: "https://legacy.example/v1", api: "openai-completions", apiKey: "sk-legacy-5678", models: [{ id: "l/one", name: "L One", contextWindow: 64000, maxTokens: 8000, reasoning: false }] },
@@ -313,19 +313,25 @@ test("providers: OpenCode's first start copies pi's models.json providers once (
   } }));
   const disposed = disposes();
   const j = await (await fetch(`http://127.0.0.1:${port2}/api/providers`)).json();
-  assert.deepEqual(j.providers.map((p) => p.name), ["legacy"], "copied into Omni's own store");
+  assert.deepEqual(j.providers.map((p) => [p.name, !!p.builtIn]), [["legacy", false], ["opencode", true]], "copied into Omni's own store");
   assert.equal(j.file, ocProvidersFile);
-  assert.deepEqual(j.opencode, [{ id: "opencode", name: "OpenCode Zen" }], "OpenCode's own connected providers are listed apart");
+  assert.deepEqual(j.opencode, [{ id: "opencode", name: "OpenCode Zen" }], "OpenCode's own connected providers are listed apart (their key stays editable)");
   const conf = JSON.parse(readFileSync(join(base, "oc2-config", "opencode.json"), "utf8"));
   assert.deepEqual(conf.provider.legacy, { npm: "@ai-sdk/openai-compatible", name: "legacy", options: { baseURL: "https://legacy.example/v1", apiKey: "sk-legacy-5678" }, models: { "l/one": { name: "L One", limit: { context: 64000, output: 8000 } } } });
-  assert.equal(conf.provider.opencode, undefined, "OpenCode's own provider is never overridden");
+  assert.deepEqual(conf.provider.opencode, { models: { "zen-extra": { name: "zen-extra", limit: { context: 128000, output: 16384 } } } }, "OpenCode's own provider only gains the model it lacked: no npm, options or key");
   assert.equal(disposes(), disposed + 1, "OpenCode re-reads its config with the copied providers");
-  const line = app2Logs.find((e) => /opencode/.test(e.text) && /already has/.test(e.text));
-  assert.ok(line, `the skip is logged: ${JSON.stringify(app2Logs.map((e) => e.text))}`);
-  assert.match(line.text, /zen-extra/);
+  const line = app2Logs.find((e) => /zen-extra/.test(e.text));
+  assert.ok(line, `the added model is logged: ${JSON.stringify(app2Logs.map((e) => e.text))}`);
+  assert.match(line.text, /OpenCode's opencode/);
+  assert.ok(!app2Logs.some((e) => /big-pickle/.test(e.text)), "a model OpenCode lists is left alone");
   assert.ok(existsSync(join(base, "omni", "opencode-providers.migrated.json")), "the marker sits next to the store");
+  // a key for that provider still goes to OpenCode's auth store (it is not one of Omni's custom providers)
+  const k = await fetch(`http://127.0.0.1:${port2}/api/provider-keys/opencode`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "zen-key" }) });
+  assert.equal(k.status, 200);
+  assert.ok(oc2.calls.some((c) => c.method === "PUT" && c.path === "/auth/opencode"));
   // once: the marker stops a second copy
   await fetch(`http://127.0.0.1:${port2}/api/providers/legacy`, { method: "DELETE" });
+  await fetch(`http://127.0.0.1:${port2}/api/providers/opencode`, { method: "DELETE" });
   assert.deepEqual((await (await fetch(`http://127.0.0.1:${port2}/api/providers`)).json()).providers, []);
 });
 
@@ -339,6 +345,13 @@ test("providers: empty at first, PUT validates, writes Omni's provider store and
   const clash = await fetch(`http://127.0.0.1:${port2}/api/providers/anthropic`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ baseUrl: "https://x.example/v1", models: ["a"] }) });
   assert.equal(clash.status, 409);
   assert.match((await clash.json()).error, /OpenCode already has a provider named "anthropic"/);
+  // extra models for OpenCode's own provider are fine (no URL or key: OpenCode's definition stays)
+  const extra = await fetch(`http://127.0.0.1:${port2}/api/providers/anthropic`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ builtIn: true, models: ["claude-x-preview"] }) });
+  assert.equal(extra.status, 200);
+  assert.deepEqual(JSON.parse(readFileSync(join(base, "oc2-config", "opencode.json"), "utf8")).provider.anthropic, { models: { "claude-x-preview": { name: "claude-x-preview", limit: { context: 128000, output: 16384 } } } });
+  const unknown = await fetch(`http://127.0.0.1:${port2}/api/providers/nope-provider`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ builtIn: true, models: ["m"] }) });
+  assert.equal(unknown.status, 400, "extra models only for a provider OpenCode has");
+  await fetch(`http://127.0.0.1:${port2}/api/providers/anthropic`, { method: "DELETE" });
   app2.startPi(base);
   const before = fakePi;
   const disposed = disposes();

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -54,6 +54,21 @@ test("writeOpencodeConfig writes the plugin shim when one is given, and replaces
   assert.equal(readFileSync(pluginShimPath(dir), "utf8"), "export const Omni = 1;\n");
   assert.equal(pluginShimPath(dir), join(dir, "plugin", "omni.js"));
   assert.equal(JSON.parse(readFileSync(join(dir, "opencode.json"), "utf8")).stale, undefined);
+});
+
+test("writeOpencodeConfig: opencode.json holds provider keys, so it is written atomically and readable by its owner only", () => {
+  const dir = fresh();
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "opencode.json"), "{}", { mode: 0o644 });
+  const providers = { modal: { npm: "@ai-sdk/openai-compatible", name: "modal", options: { baseURL: "https://m/v1", apiKey: "sk-secret" }, models: {} } };
+  const path = writeOpencodeConfig({ dir, providers });
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).provider.modal.options.apiKey, "sk-secret");
+  assert.deepEqual(readdirSync(dir).filter((f) => /tmp/i.test(f)), [], "no temp file is left behind");
+  if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600, "0600 even when replacing a 0644 file");
+  // a config that cannot be serialized never touches the file in place
+  const before = readFileSync(path, "utf8");
+  assert.throws(() => writeOpencodeConfig({ dir, providers: { bad: { n: 1n } } }));
+  assert.equal(readFileSync(path, "utf8"), before);
 });
 
 test("omniShim: the plugin shim imports Omni's plugin from the repo by file URL and passes the repo root", () => {

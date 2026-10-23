@@ -4,9 +4,10 @@
  * every permission pre-allowed (nobody is there to answer a prompt; that covers OpenCode's own `task` subagents,
  * whose prompts never reach a chat), no interactive `question` tool — plus Omni's MCP servers and custom providers.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { writeModelsFile } from "./providers.mjs";
 
 /** Allowed without asking. OpenCode's PermissionConfig: a tool name → "allow" | "ask" | "deny" (or per-pattern rules). */
 export const PERMISSIONS = Object.freeze({ edit: "allow", bash: "allow", webfetch: "allow", external_directory: "allow", doom_loop: "allow" });
@@ -84,9 +85,8 @@ export function writeOpencodeConfig({ dir, mcpServers = {}, omniMcp = null, prov
   if (!dir) throw new Error("writeOpencodeConfig needs a dir");
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "opencode.json");
-  const tmp = `${path}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(opencodeConfig({ mcpServers, omniMcp, providers }), null, 2)}\n`);
-  renameSync(tmp, path);
+  // It holds the custom providers' API keys: written like models.json (atomically: temp file + rename; mode 0600).
+  writeModelsFile(path, opencodeConfig({ mcpServers, omniMcp, providers }));
   if (typeof shim === "string") {
     const file = pluginShimPath(dir);
     mkdirSync(join(dir, "plugin"), { recursive: true });

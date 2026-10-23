@@ -242,20 +242,25 @@ test("migration copies models.json once", () => {
   } })}`);
   saveCustomProvider(to, "mine", { baseUrl: "https://omni-version.example/v1", models: ["kept"] });
   // OpenCode's catalog (GET /provider): openrouter is built in, lmstudio comes from the user's global config.
-  const catalog = { all: [{ id: "openrouter", name: "OpenRouter", models: { "known/one": { id: "known/one" } } }, { id: "lmstudio", name: "LM Studio", models: {} }, { id: "mine", name: "mine", models: {} }], connected: ["openrouter", "lmstudio"] };
+  const catalog = { all: [{ id: "openrouter", name: "OpenRouter", models: { "known/one": { id: "known/one" } } }, { id: "lmstudio", name: "LM Studio", models: { q: { id: "q" } } }, { id: "mine", name: "mine", models: {} }], connected: ["openrouter", "lmstudio"] };
   const r = migratePiProviders({ from, to, catalog });
   assert.deepEqual(r.copied, ["modal", "envy", "cmd"]);
-  assert.deepEqual(r.skipped.map((s) => s.name), ["openrouter", "lmstudio", "anth", "mine"]);
+  // a provider OpenCode already has keeps OpenCode's definition and key; only the models it lacks are added to it
+  assert.deepEqual(r.extended, [{ name: "openrouter", models: ["deepseek/deepseek-v4.1-flash-1017:floor"] }]);
+  assert.deepEqual(r.skipped.map((s) => s.name), ["lmstudio", "anth", "mine"]);
   const why = Object.fromEntries(r.skipped.map((s) => [s.name, s.why]));
-  assert.match(why.openrouter, /OpenCode already has a provider named openrouter/);
-  assert.match(why.openrouter, /deepseek\/deepseek-v4\.1-flash-1017:floor/, "names the models OpenCode's own provider lacks");
-  assert.doesNotMatch(why.openrouter, /known\/one/);
+  assert.match(why.lmstudio, /OpenCode already has a provider named lmstudio/);
   assert.match(why.anth, /anthropic-messages/);
   assert.match(why.mine, /already/);
   assert.ok(r.lines.some((l) => /\bcmd\b/.test(l) && /command/.test(l)), "a key that runs a command is not carried over, and that is said");
-  assert.ok(r.lines.some((l) => /openrouter/.test(l)), "each skip is in the log lines");
+  assert.ok(r.lines.some((l) => /deepseek\/deepseek-v4\.1-flash-1017:floor/.test(l) && /OpenCode's openrouter/.test(l)), "each added model is logged");
+  assert.ok(!r.lines.some((l) => /known\/one/.test(l)), "a model OpenCode already lists is left alone");
   const store = JSON.parse(readFileSync(to, "utf8")).providers;
-  assert.deepEqual(Object.keys(store), ["mine", "modal", "envy", "cmd"]);
+  assert.deepEqual(Object.keys(store), ["mine", "modal", "openrouter", "envy", "cmd"]);
+  assert.deepEqual(store.openrouter, { builtIn: true, models: [{ id: "deepseek/deepseek-v4.1-flash-1017:floor", name: "DEEPSEEK/DEEPSEEK-V4.1-FLASH-1017:FLOOR", contextWindow: 200000, maxTokens: 8192, reasoning: true }] }, "no base URL or key: OpenCode's own provider and stored key apply");
+  assert.deepEqual(customProviderConfig(to).openrouter, { models: { "deepseek/deepseek-v4.1-flash-1017:floor": { name: "DEEPSEEK/DEEPSEEK-V4.1-FLASH-1017:FLOOR", limit: { context: 200000, output: 8192 } } } }, "rendered as extra models only: no npm, options or apiKey");
+  assert.equal(listProviders(to).find((p) => p.name === "openrouter").builtIn, true, "the dialog shows them as Omni-added models of OpenCode's provider");
+  removeProvider(to, "openrouter");
   assert.deepEqual(store.modal, { baseUrl: "https://modal.example/v1", apiKey: "sk-modal-9999", models: [
     { id: "qwen/q", name: "QWEN/Q", contextWindow: 200000, maxTokens: 8192, reasoning: true },
     { id: "plain", name: "PLAIN", contextWindow: 200000, maxTokens: 8192, reasoning: false },
@@ -274,6 +279,12 @@ test("migration copies models.json once", () => {
   const to2 = join(dir, "omni2", "opencode-providers.json");
   assert.deepEqual(migratePiProviders({ from: join(dir, "missing.json"), to: to2, catalog }).copied, []);
   assert.ok(existsSync(migrationMarker(to2)));
+  // the dialog can re-save Omni-added models of OpenCode's provider (no base URL needed), and keeps them models-only
+  saveCustomProvider(to2, "openrouter", { builtIn: true, models: [{ id: "x/y:floor", name: "XY" }] });
+  assert.deepEqual(JSON.parse(readFileSync(to2, "utf8")).providers.openrouter, { builtIn: true, models: [{ id: "x/y:floor", name: "XY", contextWindow: 128000, maxTokens: 16384, reasoning: false }] });
+  saveCustomProvider(to2, "openrouter", { baseUrl: "https://ignored/v1", apiKey: "k", models: ["x/y:floor", "z"] });
+  assert.deepEqual(customProviderConfig(to2).openrouter, { models: { "x/y:floor": { name: "XY", limit: { context: 128000, output: 16384 } }, z: { name: "z", limit: { context: 128000, output: 16384 } } } }, "an entry that extends OpenCode's provider never gets a URL or key");
+  assert.throws(() => saveCustomProvider(to2, "openrouter", { builtIn: true, models: [] }), (e) => e.status === 400 && /model/.test(e.message));
   // a pi file that cannot be read is not marked as done (the next start tries again)
   const bad = join(dir, "bad.json");
   writeFileSync(bad, "// comment\n{}");

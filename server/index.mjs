@@ -170,7 +170,7 @@ export async function createApp(overrides = {}) {
       if (!r) return;
       if (r.error) { systemLog(`Providers: pi's models.json was not copied into OpenCode (tried again at the next start): ${r.error}`); return; }
       for (const line of r.lines) systemLog(line);
-      if (r.copied.length) { writeConfig(); await disposeOpencode(); }
+      if (r.copied.length || r.extended.length) { writeConfig(); await disposeOpencode(); }
     } catch (e) { log("could not copy pi's providers:", e.message); }
   }
   let catalogCache = null;
@@ -894,7 +894,7 @@ export async function createApp(overrides = {}) {
         // OpenCode's catalog (this starts the server, as the model picker does; its first start copies pi's providers).
         const cat = await Promise.race([catalog().catch(() => null), new Promise((r) => { setTimeout(r, 15000, null).unref?.(); })]);
         const providers = listProviders(cfg.opencodeProvidersFile);
-        const own = new Set(providers.map((x) => x.name));
+        const own = new Set(providers.filter((x) => !x.builtIn).map((x) => x.name)); // Omni-added models of an OpenCode provider leave its key row
         const builtIn = (Array.isArray(cat?.connected) ? cat.connected : []).filter((id) => !own.has(id)).map((id) => ({ id, name: cat.all?.find?.((x) => x.id === id)?.name || id }));
         return send(res, 200, { providers, opencode: builtIn, presets: PRESETS, file: cfg.opencodeProvidersFile, active: mdl ? { provider: mdl.provider, id: mdl.id } : null });
       }
@@ -910,8 +910,14 @@ export async function createApp(overrides = {}) {
         const name = decodeURIComponent(m[1]);
         if (req.method === "PUT") {
           const body = await readBody(req);
-          // A name OpenCode already has (built in, or the user's global config) would be overridden by Omni's entry.
-          if (!Object.hasOwn(readModelsFile(cfg.opencodeProvidersFile).providers, name) && opencode.up) {
+          const stored = Object.hasOwn(readModelsFile(cfg.opencodeProvidersFile).providers, name);
+          if (!stored && body.builtIn === true) {
+            // Extra models for one of OpenCode's own providers: only for a provider OpenCode has.
+            const cat = await catalog().catch(() => null);
+            if (!cat) return send(res, 503, { error: "OpenCode is not running, so its providers cannot be checked" });
+            if (!cat.all?.some?.((x) => x.id === name)) return send(res, 400, { error: `OpenCode has no provider named "${name}"` });
+          } else if (!stored && opencode.up) {
+            // A name OpenCode already has (built in, or the user's global config) would be overridden by Omni's entry.
             const cat = await catalog().catch(() => null);
             if (cat?.all?.some?.((x) => x.id === name)) return send(res, 409, { error: `OpenCode already has a provider named "${name}": set its key with its own preset (OpenCode providers), or give this one another name` });
           }
@@ -927,7 +933,9 @@ export async function createApp(overrides = {}) {
         const key = String(body.key ?? "").trim();
         if (!/^[a-z0-9][a-z0-9._-]*$/i.test(id)) return send(res, 400, { error: "not a provider id" });
         if (req.method === "PUT" && !key) return send(res, 400, { error: "paste the API key" });
-        if (Object.hasOwn(readModelsFile(cfg.opencodeProvidersFile).providers, id)) return send(res, 409, { error: `"${id}" is one of your custom providers: its key is saved in its own form` });
+        // Omni's custom providers keep their key in their own form; Omni-added models of an OpenCode provider (builtIn) do not.
+        const ownEntry = readModelsFile(cfg.opencodeProvidersFile).providers;
+        if (Object.hasOwn(ownEntry, id) && ownEntry[id]?.builtIn !== true) return send(res, 409, { error: `"${id}" is one of your custom providers: its key is saved in its own form` });
         let server;
         try { server = await opencodeUp(); } catch (e) { return send(res, 503, { error: `OpenCode is not running: ${e.message}` }); }
         if (req.method === "PUT") {

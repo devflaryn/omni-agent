@@ -186,6 +186,7 @@ export function listProviders(file) {
     api: p?.api || "openai-completions",
     hasKey: !!p?.apiKey,
     keyHint: keyHint(p?.apiKey),
+    ...(p?.builtIn === true ? { builtIn: true } : {}),
     models: (Array.isArray(p?.models) ? p.models : []).map((m) => ({ id: m.id, name: m.name || m.id, reasoning: m.reasoning === true, contextWindow: m.contextWindow ?? null, maxTokens: m.maxTokens ?? null })),
   }));
 }
@@ -239,9 +240,13 @@ export function normalizeCustomModels(list) {
   return out;
 }
 
-/** @returns {string|null} an error message, or null when the custom provider is valid */
-export function validateCustomProvider(name, body) {
+/**
+ * @param {boolean} [builtIn] the entry only adds models to one of OpenCode's own providers (no base URL of its own)
+ * @returns {string|null} an error message, or null when the custom provider is valid
+ */
+export function validateCustomProvider(name, body, builtIn = body?.builtIn === true) {
   if (!NAME_RE.test(String(name || ""))) return "provider name must be lowercase letters, digits, - or _ (e.g. modal)";
+  if (builtIn) return normalizeCustomModels(body?.models).length ? null : "add at least one model id";
   try { const u = new URL(String(body?.baseUrl || "")); if (!/^https?:$/.test(u.protocol)) throw new Error(); } catch { return "base URL must be a valid http(s) URL"; }
   if (!normalizeCustomModels(body?.models).length) return "add at least one model id";
   return null;
@@ -250,12 +255,15 @@ export function validateCustomProvider(name, body) {
 /**
  * Create or replace the custom provider `name` in Omni's store. An omitted apiKey keeps the stored one; "" clears it.
  * A model re-saved by id alone keeps its stored name, limits and reasoning; keys the form does not edit are kept.
+ * `builtIn: true` (given, or already on the stored entry) stores only extra models for one of OpenCode's own providers:
+ * `{builtIn: true, models}`, never a base URL or key, so OpenCode's definition of it and its stored key still apply.
  */
 export function saveCustomProvider(file, name, body) {
-  const err = validateCustomProvider(name, body);
-  if (err) throw Object.assign(new Error(err), { status: 400 });
   const json = readModelsFile(file, { strict: true });
   const prev = isObj(json.providers[name]) ? json.providers[name] : {};
+  const builtIn = body?.builtIn === true || prev.builtIn === true;
+  const err = validateCustomProvider(name, body, builtIn);
+  if (err) throw Object.assign(new Error(err), { status: 400 });
   const prevById = new Map((Array.isArray(prev.models) ? prev.models : []).map((m) => [m?.id, m]));
   const models = [];
   for (const raw of body.models) {
@@ -265,6 +273,11 @@ export function saveCustomProvider(file, name, body) {
     const old = prevById.get(m.id);
     if (old) for (const k of ["name", "contextWindow", "maxTokens", "reasoning"]) if (given[k] === undefined && old[k] !== undefined) m[k] = old[k];
     models.push(m);
+  }
+  if (builtIn) {
+    json.providers[name] = { builtIn: true, models };
+    writeModelsFile(file, json);
+    return json.providers[name];
   }
   const { apiKey: _k, ...rest } = prev;
   const next = { ...rest, baseUrl: String(body.baseUrl).trim() };
@@ -279,16 +292,21 @@ export function saveCustomProvider(file, name, body) {
 /** A stored key as OpenCode config: pi's `$VAR` / `${VAR}` references become OpenCode's `{env:VAR}`. */
 const opencodeKey = (k) => { const m = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(String(k).trim()); return m ? `{env:${m[1]}}` : String(k); };
 
-/** Omni's custom providers as OpenCode's `provider` config block (OpenAI-compatible endpoints), in store order. */
+/**
+ * Omni's custom providers as OpenCode's `provider` config block (OpenAI-compatible endpoints), in store order. An entry
+ * that extends one of OpenCode's own providers (`builtIn`) renders as `{models}` only: OpenCode merges those models into
+ * its own definition of the provider, whose SDK, URL and stored key stay as they are.
+ */
 export function customProviderConfig(file) {
   const out = {};
   for (const [name, p] of Object.entries(readModelsFile(file).providers)) {
-    if (!isObj(p) || !p.baseUrl) continue;
+    if (!isObj(p) || (!p.baseUrl && p.builtIn !== true)) continue;
     const models = {};
     for (const m of Array.isArray(p.models) ? p.models : []) {
       if (!m?.id) continue;
-      models[m.id] = { name: m.name || m.id, limit: { context: num(m.contextWindow, DEFAULTS.contextWindow), output: num(m.maxTokens, DEFAULTS.maxTokens) }, ...(m.reasoning === true ? { reasoning: true } : {}) };
+      models[m.id] = { name: m.name || m.id, limit: { context: num(m.contextWindow, DEFAULTS.contextWindow), output: num(m.maxTokens, DEFAULTS.maxTokens) }, ...(m.reasoning === true && p.builtIn !== true ? { reasoning: true } : {}) };
     }
+    if (p.builtIn === true) { if (Object.keys(models).length) out[name] = { models }; continue; }
     const options = { baseURL: String(p.baseUrl) };
     if (p.apiKey) options.apiKey = opencodeKey(p.apiKey);
     out[name] = { npm: "@ai-sdk/openai-compatible", name, options, models };
@@ -301,12 +319,14 @@ export const migrationMarker = (file) => join(dirname(file), `${basename(file).r
 
 /**
  * Copies pi's custom providers (`from`, pi's models.json) into Omni's store (`to`) once; the marker file next to the
- * store makes every later call a no-op (→ null). Skipped, each with a reason in `lines`: a name Omni's store already has,
- * a name OpenCode already has (`catalog` is its `GET /provider` answer: built-in providers and the user's global
- * config — copying would override that provider), and a provider that does not speak the OpenAI chat API. A key that
- * runs a command (pi's `!cmd`) cannot be expressed in OpenCode's config: the provider is copied without it.
+ * store makes every later call a no-op (→ null). A name OpenCode already has (`catalog` is its `GET /provider` answer:
+ * built-in providers and the user's global config) is never overridden: only the models of pi's entry that OpenCode's
+ * provider does not list are kept, as `{builtIn: true, models}` (`extended`), so OpenCode's own definition and stored key
+ * still apply. Skipped, each with a reason in `lines`: a name Omni's store already has, one OpenCode has with nothing to
+ * add, and a provider that does not speak the OpenAI chat API. A key that runs a command (pi's `!cmd`) cannot be
+ * expressed in OpenCode's config: the provider is copied without it.
  * A pi file that cannot be read → `{ error }` and no marker, so the next start tries again.
- * @returns {{copied: string[], skipped: {name: string, why: string}[], lines: string[]} | {error: string} | null}
+ * @returns {{copied: string[], extended: {name: string, models: string[]}[], skipped: {name: string, why: string}[], lines: string[]} | {error: string} | null}
  */
 export function migratePiProviders({ from, to, catalog = null }) {
   const marker = migrationMarker(to);
@@ -316,16 +336,22 @@ export function migratePiProviders({ from, to, catalog = null }) {
   const store = readModelsFile(to, { strict: true });
   const known = new Map((Array.isArray(catalog?.all) ? catalog.all : []).map((p) => [p?.id, p]));
   const connected = new Set(Array.isArray(catalog?.connected) ? catalog.connected : []);
-  const copied = [], skipped = [], lines = [];
+  const copied = [], extended = [], skipped = [], lines = [];
   for (const [name, p] of Object.entries(pi.providers)) {
     if (!isObj(p)) continue;
     const ids = (Array.isArray(p.models) ? p.models : []).map((m) => m?.id).filter(Boolean);
     let why = null;
     if (Object.hasOwn(store.providers, name)) why = `Omni already has a provider named ${name}`;
     else if (known.has(name)) {
-      const lacks = ids.filter((id) => !Object.hasOwn(known.get(name)?.models || {}, id));
-      why = `OpenCode already has a provider named ${name}${connected.has(name) ? " (connected)" : ""}, so it was left as OpenCode has it`
-        + (lacks.length ? `; models of pi's ${name} it does not list: ${lacks.join(", ")} (add them under another provider name to keep them)` : "");
+      const lacks = new Set(ids.filter((id) => !Object.hasOwn(known.get(name)?.models || {}, id)));
+      if (!lacks.size) why = `OpenCode already has a provider named ${name}${connected.has(name) ? " (connected)" : ""} with every model pi listed for it`;
+      else {
+        const models = normalizeCustomModels(p.models.filter((m) => lacks.has(m?.id)));
+        store.providers[name] = { builtIn: true, models };
+        extended.push({ name, models: models.map((m) => m.id) });
+        for (const m of models) lines.push(`Providers: added pi's model ${m.id} to OpenCode's ${name} (OpenCode's own provider and its key stay as they are).`);
+        continue;
+      }
     } else if ((p.api || "openai-completions") !== "openai-completions") why = `it uses ${p.api}, and Omni's custom providers are OpenAI-compatible only (OpenCode's own provider for it takes just a key)`;
     else if (!p.baseUrl || !ids.length) why = "it has no base URL or no models";
     if (why) { skipped.push({ name, why }); lines.push(`Providers: pi's ${name} was not copied: ${why}.`); continue; }
@@ -337,10 +363,10 @@ export function migratePiProviders({ from, to, catalog = null }) {
     copied.push(name);
     lines.push(`Providers: copied pi's ${name} (${entry.models.length} model${entry.models.length === 1 ? "" : "s"}) into OpenCode.`);
   }
-  if (copied.length) writeModelsFile(to, store);
+  if (copied.length || extended.length) writeModelsFile(to, store);
   mkdirSync(dirname(marker), { recursive: true });
-  writeFileSync(marker, `${JSON.stringify({ at: new Date().toISOString(), from, copied, skipped }, null, 2)}\n`);
-  return { copied, skipped, lines };
+  writeFileSync(marker, `${JSON.stringify({ at: new Date().toISOString(), from, copied, extended, skipped }, null, 2)}\n`);
+  return { copied, extended, skipped, lines };
 }
 
 /** fillThinkingMaps on the file (call before a pi starts: pi reads models.json only at boot). Never throws. */
