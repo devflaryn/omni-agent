@@ -23,6 +23,8 @@ const SHARED_PROC = Object.freeze({ pid: null, kill() {} });
 /** OpenCode's placeholder titles are not a chat name. */
 const PLACEHOLDER_TITLE = /^(New|Child) session - /;
 const CATALOG_TTL_MS = 60000;
+/** Mirror entry (`{type:"custom", customType, data:{messageIDs}}`, invisible to the watcher) naming OpenCode messages never to mirror. */
+const KNOWN = "opencode-known";
 
 /** A model's OpenCode `variants` as thinking levels ("none" is off), in ladder order; unknown names last. */
 function variantLevels(variants) {
@@ -97,19 +99,29 @@ export class OpencodeRpc extends EventEmitter {
     this.lastModel = null;
     this.live = false; // between start() and stop()
     this.alive = false; // the server's event stream is connected
+    this.gen = 0; // bumped by start() and stop(): work begun before a stop must not attach or announce after it
+    this.booting = false; // the first session is being opened
+    this.exited = false; // "exit" was emitted for this outage or stop
+    this.runSeq = 0; // counts agent_start/agent_settled, so a prompt can tell whether its run already began or ended
     this.sessionID = null;
     this.mirror = null;
     this.catalog = null;
     this.onDown = () => this.serverDown();
-    this.onUp = () => { this.serverUp().catch(() => {}); };
+    this.onUp = () => { this.serverUp().catch((e) => this.log("system", `opencode reattach failed: ${e.message}`)); };
   }
 
   get ctx() {
     return { sid: this.sid, harness: "pi" };
   }
 
+  /** Null until the chat has a session, after stop() and while the server is down: nothing is routed to it then. */
   get proc() {
-    return this.live && this.alive ? SHARED_PROC : null;
+    return this.live && this.alive && this.sessionID ? SHARED_PROC : null;
+  }
+
+  /** Throws when stop() ended the run `gen` was taken in: a stopped chat must not attach or announce anything. */
+  current(gen) {
+    if (gen !== this.gen) throw new Error("the chat was stopped");
   }
 
   owns(file) {
@@ -125,38 +137,64 @@ export class OpencodeRpc extends EventEmitter {
     if (!this.mirrorDir) throw new Error("OpencodeRpc needs a mirrorDir");
     this.stopped = false;
     this.live = true;
+    this.exited = false;
+    this.gen++;
     this.alive = !!this.server.proc && this.server.up !== false;
     // Every chat listens on the one server: lift the 10-listener warning.
     if (this.server.getMaxListeners?.() !== 0) this.server.setMaxListeners?.(0);
     this.server.off("down", this.onDown).off("up", this.onUp).on("down", this.onDown).on("up", this.onUp);
-    this.ready = (async () => {
-      if (!this.alive && typeof this.server.waitUp === "function") await this.server.waitUp();
-      await this.createSession();
-      return this.state;
-    })();
-    this.ready.catch(() => {});
+    this.boot();
     return this;
   }
 
-  /** Ends the chat: stops listening, aborts a turn still running (a killed pi child would have ended it too). */
+  /** Opens the chat's first session. A failure is logged, and retried by the next prompt or the server's next `up`. */
+  boot() {
+    const gen = this.gen;
+    this.booting = true;
+    this.ready = (async () => {
+      try {
+        if (!this.alive && typeof this.server.waitUp === "function") await this.server.waitUp();
+        await this.createSession(gen);
+        return this.state;
+      } catch (e) {
+        if (gen === this.gen) this.log("system", `opencode could not open a session for this chat: ${e.message}`);
+        throw e;
+      } finally { if (gen === this.gen) this.booting = false; }
+    })();
+    this.ready.catch(() => {});
+    return this.ready;
+  }
+
+  /**
+   * Ends the chat: stops listening, aborts a turn still running (a killed pi child would have ended it too) and drops
+   * a session nobody used. Emits "exit" unless the server's going down already did.
+   */
   stop() {
     const busy = this.streaming || this.inFlight > 0;
     const wasLive = this.live;
+    this.gen++;
     this.stopped = true;
     this.live = false;
+    this.booting = false;
     this.stopWatchdog();
     this.unlisten?.();
     this.unlisten = null;
     this.server.off("down", this.onDown).off("up", this.onUp);
     if (busy && this.sessionID) this.server.request("POST", `/session/${this.sessionID}/abort`, { directory: this.cwd }).catch(() => {});
+    else if (wasLive && this.sessionID && !this.used) this.discard(this.sessionID, this.mirror);
     this.streaming = false;
     this.openTools.clear();
-    if (wasLive) this.emit("exit", null);
+    if (wasLive && !this.exited) { this.exited = true; this.emit("exit", null); }
   }
 
+  /**
+   * The server is gone: the run is over for Omni (status streaming:false) and "exit" tells a background agent its
+   * process died (agents.mjs onPiExit). A live chat reattaches on `up`; one stopped meanwhile does not.
+   */
   serverDown() {
     if (!this.live || !this.alive) return;
     this.alive = false;
+    if (!this.sessionID) return; // nothing to restore: the session is opened once the server is back
     if (this.translator) this.translator.streaming = false;
     this.streaming = false;
     this.openTools.clear();
@@ -165,19 +203,25 @@ export class OpencodeRpc extends EventEmitter {
     this.restoring = true;
     this.log("system", "opencode server went away — the chat reattaches when it is back");
     this.bus.emit({ ...this.ctx, kind: "status", ts: Date.now(), streaming: false });
+    if (!this.exited) { this.exited = true; this.emit("exit", null); }
   }
 
   /** Back after a "down": mirror what was missed, re-read the run state, then let the supervisor replay. */
   async serverUp() {
     if (!this.live || this.alive) return;
     this.alive = true;
+    if (!this.sessionID) { if (!this.booting) this.boot(); return; }
     if (!this.restoring) return;
+    const gen = this.gen;
     try {
       await this.reconcile();
       await this.syncStatus();
       await this.refreshState();
     } catch (e) { this.log("system", `opencode reattach failed: ${e.message}`); }
+    if (gen !== this.gen) return;
+    this.exited = false;
     try { if (this.onRestart) await this.onRestart(); }
+    catch (e) { this.log("system", `opencode resume failed: ${e.message}`); }
     finally { this.restoring = false; }
   }
 
@@ -211,20 +255,20 @@ export class OpencodeRpc extends EventEmitter {
   }
 
   /**
-   * Points the chat at session `id` and its mirror `file`, and listens to it; returns what it was on before. `past`:
-   * the finished messages the session already had (pastOf).
+   * Points the chat at session `id` and its mirror `file`, and listens to it; returns what it was on before. Messages
+   * already in the mirror, and those its `opencode-known` entries list (a fork's copies), are never mirrored again.
    */
-  attach(id, file, past = new Set()) {
+  attach(id, file) {
     const prev = { id: this.sessionID, file: this.mirror, used: this.used };
     this.unlisten?.();
-    const known = readMirror(file);
+    const entries = readMirror(file);
     this.sessionID = id;
     this.mirror = file;
     this.sid = `pi:${id}`;
-    this.mirrored = new Set(known.map((e) => e.id));
-    this.lastId = known.at(-1)?.id ?? null;
-    this.used = known.length > 0;
-    this.past = past;
+    this.mirrored = new Set(entries.map((e) => e.id));
+    this.known = new Set(entries.filter((e) => e.type === "custom" && e.customType === KNOWN).flatMap((e) => e.data?.messageIDs || []));
+    this.lastId = entries.at(-1)?.id ?? null;
+    this.used = entries.length > 0;
     this.translator = new OpencodeTranslator({ sessionID: id, cwd: this.cwd, parentId: this.lastId });
     this.streaming = false;
     this.openTools.clear();
@@ -236,23 +280,16 @@ export class OpencodeRpc extends EventEmitter {
   /** A session left before anything was said in it is dropped, like pi never writing a session nobody used. */
   dropUnused(prev) {
     if (!prev.id || prev.id === this.sessionID || prev.used) return;
-    try { unlinkSync(prev.file); } catch { /* already gone */ }
-    this.server.request("DELETE", `/session/${prev.id}`, { directory: this.cwd }).catch(() => {});
+    this.discard(prev.id, prev.file);
+  }
+  discard(id, file) {
+    if (file) { try { unlinkSync(file); } catch { /* already gone */ } }
+    this.server.request("DELETE", `/session/${id}`, { directory: this.cwd }).catch(() => {});
   }
 
-  /**
-   * The ids of the finished messages session `id` already has (null when unknown). Their payloads are ignored and a
-   * reconcile never mirrors them: a fork re-emits its copies as new messages, an import's transcript is not history.
-   */
-  async pastOf(id) {
-    try {
-      const msgs = await this.server.request("GET", `/session/${id}/message`, { directory: this.cwd });
-      return new Set((Array.isArray(msgs) ? msgs : []).filter((m) => m?.info?.role === "user" || m?.info?.time?.completed || m?.info?.error).map((m) => m.info.id));
-    } catch { return null; }
-  }
-
-  async createSession() {
+  async createSession(gen = this.gen) {
     const info = await this.server.request("POST", "/session", { directory: this.cwd, body: {} });
+    if (gen !== this.gen) { this.discard(info.id, null); this.current(gen); }
     const file = this.newMirrorPath(info.id);
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, `${this.header(info.id)}\n`);
@@ -271,12 +308,14 @@ export class OpencodeRpc extends EventEmitter {
     return fresh;
   }
 
-  /** Finished messages OpenCode has that the mirror missed while the event stream was gone, chained onto its end. */
+  /**
+   * Finished messages OpenCode has that the mirror missed (while the event stream was gone, or while no chat was
+   * attached), chained onto its end.
+   */
   async reconcile() {
-    if (!this.past) return;
     const msgs = await this.server.request("GET", `/session/${this.sessionID}/message`, { directory: this.cwd });
-    const missed = historyEntries((Array.isArray(msgs) ? msgs : []).filter((m) => !this.past.has(m?.info?.id)), { cwd: this.cwd })
-      .filter((e) => !this.mirrored.has(e.id));
+    const fresh = (Array.isArray(msgs) ? msgs : []).filter((m) => !this.known.has(m?.info?.id) && !this.mirrored.has(m?.info?.id));
+    const missed = historyEntries(fresh, { cwd: this.cwd }).filter((e) => !this.mirrored.has(e.id));
     let parent = this.lastId;
     const added = this.appendEntries(missed.map((e) => { const out = { ...e, parentId: parent }; parent = e.id; return out; }));
     this.translator.chain.last = this.lastId;
@@ -299,8 +338,9 @@ export class OpencodeRpc extends EventEmitter {
     this.lastEventAt = Date.now();
     const p = payload?.properties || {};
     if (payload?.type === "permission.asked" || payload?.type === "permission.updated") return this.allow(p);
+    // A message already mirrored (finished) or listed as a fork's copy is old news, even when OpenCode re-announces it.
     const mid = p.info?.id ?? p.part?.messageID ?? p.messageID;
-    if (mid && this.past?.has(mid)) return;
+    if (mid && (this.known.has(mid) || this.mirrored.has(mid))) return;
     const { rpc, entries } = this.translator.push(payload);
     if (entries.length) this.appendEntries(entries);
     for (const ev of rpc) this.onEvent(ev);
@@ -314,8 +354,8 @@ export class OpencodeRpc extends EventEmitter {
   }
 
   onEvent(ev) {
-    if (ev.type === "agent_start") this.streaming = true;
-    if (ev.type === "agent_settled") { this.streaming = false; this.openTools.clear(); }
+    if (ev.type === "agent_start") { this.streaming = true; this.runSeq++; }
+    if (ev.type === "agent_settled") { this.streaming = false; this.openTools.clear(); this.runSeq++; }
     if (ev.type === "tool_execution_start" && ev.toolCallId) this.openTools.add(ev.toolCallId);
     if (ev.type === "tool_execution_end" && ev.toolCallId) this.openTools.delete(ev.toolCallId);
     if (ev.type === "message_end" && ev.message?.role === "assistant") {
@@ -356,12 +396,14 @@ export class OpencodeRpc extends EventEmitter {
   }
 
   async announce(info) {
+    const gen = this.gen;
     const p = this.pick() || this.lastModel;
     let model = null;
     if (p) {
       const m = findModel(await this.loadCatalog().catch(() => null), p.providerID, p.modelID);
       model = m ? modelOf(p.providerID, m) : { provider: p.providerID, id: p.modelID, name: p.modelID, contextWindow: 0, maxTokens: 0, reasoning: false, variants: [] };
     }
+    this.current(gen);
     const title = info?.title && !PLACEHOLDER_TITLE.test(info.title) ? info.title : undefined;
     this.state = { sessionId: this.sessionID, sessionFile: this.mirror, model, thinkingLevel: this.thinking || "off", isStreaming: this.streaming, sessionName: title };
     this.bus.emit({ ...this.meta, ...this.ctx, kind: "session", ts: Date.now(), owned: true, cwd: this.cwd, file: this.mirror, sessionId: this.sessionID, model: model?.id, provider: model?.provider, thinkingLevel: this.state.thinkingLevel, title: cleanTitle(title) || undefined });
@@ -454,16 +496,29 @@ export class OpencodeRpc extends EventEmitter {
   }
 
   async sendPrompt(message, images) {
+    if (!this.sessionID && this.live && !this.booting) this.boot(); // the first session failed to open: try again
     await this.ready;
     if (this.compacting) await this.compacting.catch(() => {});
     if (this.compactAt > 0 && !this.streaming && this.lastContext > this.compactAt) await this.compact().catch(() => {});
     await this.loadCatalog().catch(() => null);
     this.used = true;
+    const seq = this.runSeq;
     const r = await this.call("POST", `/session/${this.sessionID}/prompt_async`, this.promptBody(message, images));
-    return r.success ? { success: true } : r;
+    if (!r.success) return r;
+    // The run counts from the accepted post: its `busy` comes over another socket, maybe later, and until then the chat
+    // must not look free (server/index.mjs piFree). Not when OpenCode already started or even settled it meanwhile.
+    if (!this.streaming && this.runSeq === seq) {
+      this.translator.streaming = true;
+      this.lastEventAt = Date.now();
+      this.onEvent({ type: "agent_start" });
+    }
+    return { success: true };
   }
 
-  abort() { return this.call("POST", `/session/${this.sessionID}/abort`); }
+  abort() {
+    if (!this.sessionID) return Promise.resolve({ success: false, error: "opencode has no session for this chat yet" });
+    return this.call("POST", `/session/${this.sessionID}/abort`);
+  }
 
   /** Summarizes the session with the chat's model; the translator reports compaction_start/_end from OpenCode's events. */
   compact() {
@@ -493,23 +548,43 @@ export class OpencodeRpc extends EventEmitter {
     try { head = JSON.parse(readFileSync(sessionPath, "utf8").split("\n", 1)[0]); } catch { /* not a mirror */ }
     if (head?.type !== "session" || head.harness !== "opencode" || !head.id) throw new Error("not an opencode chat file");
     await this.ready?.catch(() => {});
+    const gen = this.gen;
     const info = await this.server.request("GET", `/session/${head.id}`, { directory: this.cwd });
-    const past = await this.pastOf(head.id);
-    this.dropUnused(this.attach(head.id, resolve(sessionPath), past));
+    this.current(gen);
+    this.dropUnused(this.attach(head.id, resolve(sessionPath)));
+    // OpenCode may have gone on without Omni (an Omni restart mid-run): mirror what it did meanwhile.
+    try { await this.reconcile(); } catch (e) { this.log("system", `could not bring the chat mirror up to date: ${e.message}`); }
+    this.current(gen);
     await this.syncStatus();
     await this.announce(info);
     return { success: true, data: { cancelled: false } };
   }
 
-  /** Forks the session into a new one with a copy of the mirror and switches to it (the original stays untouched). */
+  /**
+   * Forks the session into a new one and switches to it (the original stays untouched). The new mirror is a copy of
+   * the current one plus an `opencode-known` entry listing the fork's copied messages: OpenCode gives them new ids and
+   * announces them as new, and they must never be mirrored twice. Without that list the clone fails.
+   */
   async clone() {
     await this.ready;
+    const gen = this.gen;
     const info = await this.server.request("POST", `/session/${this.sessionID}/fork`, { directory: this.cwd, body: {} });
+    let copies;
+    try {
+      this.current(gen);
+      const msgs = await this.server.request("GET", `/session/${info.id}/message`, { directory: this.cwd });
+      copies = (Array.isArray(msgs) ? msgs : []).map((m) => m?.info?.id).filter(Boolean);
+      this.current(gen);
+    } catch (e) {
+      this.discard(info.id, null);
+      if (gen === this.gen) this.log("system", `could not clone the chat: ${e.message}`);
+      throw e;
+    }
+    const rest = readMirror(this.mirror);
+    const known = { type: "custom", customType: KNOWN, id: `known_${info.id}`, parentId: rest.at(-1)?.id ?? null, timestamp: new Date().toISOString(), data: { messageIDs: copies } };
     const file = this.newMirrorPath(info.id);
-    const rest = readMirror(this.mirror).map((e) => `${JSON.stringify(e)}\n`).join("");
-    writeFileSync(file, `${this.header(info.id)}\n${rest}`);
-    const past = await this.pastOf(info.id);
-    this.dropUnused(this.attach(info.id, file, past));
+    writeFileSync(file, [this.header(info.id), ...rest.map((e) => JSON.stringify(e)), JSON.stringify(known)].join("\n") + "\n");
+    this.dropUnused(this.attach(info.id, file));
     await this.announce(info);
     return { success: true, data: { cancelled: false } };
   }

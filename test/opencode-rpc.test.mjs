@@ -316,7 +316,12 @@ test("clone forks and switches the mirror", async () => {
   assert.equal(h1.id, "ses_fork2");
   assert.equal(h1.harness, "opencode");
   assert.equal(h1.cwd, h0.cwd);
+  const known = rest1.pop();
   assert.deepEqual(rest1, rest0, "history copied verbatim, the copies not mirrored again");
+  assert.equal(known.type, "custom");
+  assert.equal(known.customType, "opencode-known");
+  assert.deepEqual(known.data.messageIDs, ["msg_cu1", "msg_ca1"], "the fork's copies are remembered in the mirror");
+  assert.deepEqual(normalizePiEntry(known, { sid: "x", harness: "pi" }), [], "and stay invisible");
   assert.ok(events.some((e) => e.kind === "session" && e.sid === "pi:ses_fork2" && e.file === file));
   assert.equal(server.listeners_("ses_fake1"), 0, "stops listening to the old session");
   // New payloads go to the fork's mirror and chain onto the copied history.
@@ -325,10 +330,187 @@ test("clone forks and switches the mirror", async () => {
   server.push({ type: "session.status", properties: { sessionID: "ses_fork2", status: { type: "busy" } } });
   const after = lines(file);
   assert.equal(after.at(-1).id, "msg_u2");
-  assert.equal(after.at(-1).parentId, rest0.at(-1).id);
+  assert.equal(after.at(-1).parentId, known.id);
   assert.equal(readFileSync(oldFile, "utf8"), before);
   assert.ok(existsSync(oldFile), "a session with history is kept");
-  void mirrorDir;
+  // Reopening the fork later (another chat, e.g. after an Omni restart) does not back-fill the copies either.
+  const forkBefore = readFileSync(file, "utf8");
+  server.history.set(F, [...copies, { info: { id: "msg_u2", sessionID: F, role: "user", time: { created: 9000 } }, parts: [{ id: "prt_u2", type: "text", text: "again" }] }]);
+  const other = new OpencodeRpc({ server, cwd: rpc.cwd, provider: "opencode", model: "big-pickle", bus: { emit() {} }, mirrorDir });
+  other.start();
+  await other.waitReady();
+  await other.switchSession(file);
+  assert.equal(readFileSync(file, "utf8"), forkBefore);
+});
+
+test("a posted prompt counts as a running turn until OpenCode settles it", async () => {
+  const { server, rpc, events } = setup();
+  rpc.start();
+  await rpc.waitReady();
+  events.length = 0;
+  await rpc.prompt("go");
+  assert.equal(rpc.streaming, true, "busy from the accepted post, whichever socket answers first");
+  assert.ok(Date.now() - rpc.lastEventAt < 1000, "the watchdog counts from the post");
+  server.push({ type: "session.status", properties: { sessionID: S, status: { type: "busy" } } });
+  assert.equal(events.filter((e) => e.kind === "status" && e.streaming === true).length, 1, "busy is not announced twice");
+  server.push({ type: "session.idle", properties: { sessionID: S } });
+  assert.equal(rpc.streaming, false);
+  assert.equal(events.filter((e) => e.kind === "status" && e.streaming === false).length, 1);
+});
+
+test("a turn that settled before the post answered is not reopened", async () => {
+  let server;
+  const ctx = setup({ reply: (m, p) => {
+    if (!/prompt_async$/.test(p)) return undefined;
+    server.push({ type: "session.status", properties: { sessionID: S, status: { type: "busy" } } });
+    server.push({ type: "session.idle", properties: { sessionID: S } });
+    return null;
+  } });
+  server = ctx.server;
+  const { rpc } = ctx;
+  rpc.start();
+  await rpc.waitReady();
+  await rpc.prompt("quick");
+  assert.equal(rpc.streaming, false);
+});
+
+test("switchSession back-fills messages the mirror missed while no chat was attached", async () => {
+  const { server, rpc, mirrorDir, cwd } = setup();
+  rpc.start();
+  await rpc.waitReady();
+  const T = "ses_titled";
+  const file = join(mirrorDir, `2026-10-20T10-00-00.000Z_${T}.jsonl`);
+  const A = { info: { id: "msg_A", sessionID: T, role: "user", time: { created: 1 } }, parts: [{ id: "prt_A", type: "text", text: "do it" }] };
+  const B = { info: { id: "msg_B", sessionID: T, role: "assistant", time: { created: 2, completed: 3 }, finish: "stop", modelID: "big-pickle", providerID: "opencode", tokens: {}, cost: 0 }, parts: [{ id: "prt_B", type: "text", text: "working" }] };
+  const C = { info: { id: "msg_C", sessionID: T, role: "assistant", time: { created: 4, completed: 5 }, finish: "stop", modelID: "big-pickle", providerID: "opencode", tokens: {}, cost: 0 }, parts: [{ id: "prt_C", type: "text", text: "finished" }] };
+  const head = JSON.stringify({ type: "session", version: 3, id: T, cwd, timestamp: "2026-10-20T10:00:00.000Z", harness: "opencode" });
+  const { historyEntries } = await import("../server/opencode-events.mjs");
+  writeFileSync(file, [head, ...historyEntries([A, B]).map((e) => JSON.stringify(e))].join("\n") + "\n");
+  server.history.set(T, [A, B, C]);
+  await rpc.switchSession(file);
+  const all = lines(file);
+  assert.equal(all.filter((e) => e.id === "msg_C").length, 1, "C is mirrored once");
+  assert.equal(all.filter((e) => e.id === "msg_A" || e.id === "msg_B").length, 2, "A and B are not repeated");
+  assert.equal(all.at(-1).id, "msg_C");
+  assert.equal(all.at(-1).parentId, all.at(-2).id);
+  server.push({ type: "message.updated", properties: { sessionID: T, info: C.info } });
+  assert.equal(lines(file).filter((e) => e.id === "msg_C").length, 1);
+});
+
+test("a failed start logs, reports no proc, and opens its session with the next prompt", async () => {
+  let fail = true;
+  const { server, rpc, events } = setup({ reply: (m, p) => (m === "POST" && p === "/session" && fail ? Object.assign(new Error("database is locked"), { status: 500 }) : undefined) });
+  rpc.start();
+  await assert.rejects(rpc.waitReady(), /database is locked/);
+  assert.ok(events.some((e) => e.kind === "log" && e.level === "system" && /database is locked/.test(e.text)));
+  assert.equal(rpc.proc, null, "no chat is routed to a chat without a session");
+  assert.equal(rpc.sid, "pi:pending");
+  fail = false;
+  assert.deepEqual(await rpc.prompt("hi"), { success: true });
+  assert.equal(rpc.sid, "pi:ses_fake1");
+  assert.ok(rpc.proc);
+  assert.equal(posts(server, /^\/session\/ses_fake1\/prompt_async$/).length, 1);
+});
+
+test("a start that failed while the server was down opens its session when it is back", async () => {
+  let fail = true;
+  const { server, rpc } = setup({ reply: (m, p) => (m === "POST" && p === "/session" && fail ? new Error("opencode server is not running") : undefined) });
+  rpc.start();
+  await assert.rejects(rpc.waitReady());
+  server.up = false;
+  server.emit("down");
+  fail = false;
+  server.up = true;
+  server.emit("up");
+  await waitFor(() => rpc.sid === "pi:ses_fake1", "the session");
+  await rpc.waitReady();
+  assert.ok(rpc.proc);
+});
+
+test("stop() while the session is being created leaves nothing behind", async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const { server, rpc, events, mirrorDir } = setup({ reply: (m, p) => (m === "POST" && p === "/session" ? gate.then(() => ({ id: "ses_late" })) : undefined) });
+  rpc.start();
+  rpc.stop();
+  release();
+  await assert.rejects(rpc.waitReady());
+  await tick();
+  assert.equal(server.listeners_("ses_late"), 0, "no listener leaks");
+  assert.ok(!events.some((e) => e.kind === "session"), "a stopped chat announces nothing");
+  assert.ok(!existsSync(mirrorDir) || readdirSync(mirrorDir).length === 0, "no mirror");
+  assert.ok(server.calls.some((c) => c.method === "DELETE" && c.path === "/session/ses_late"), "the late session is removed");
+});
+
+test("stop() drops a session nobody used", async () => {
+  const { server, rpc } = setup();
+  rpc.start();
+  await rpc.waitReady();
+  const file = rpc.state.sessionFile;
+  rpc.stop();
+  assert.ok(!existsSync(file));
+  assert.ok(server.calls.some((c) => c.method === "DELETE" && c.path === "/session/ses_fake1"));
+  const { rpc: used, server: s2 } = setup();
+  used.start();
+  await used.waitReady();
+  await used.prompt("keep me");
+  const kept = used.state.sessionFile;
+  used.stop();
+  assert.ok(existsSync(kept));
+  assert.ok(!s2.calls.some((c) => c.method === "DELETE"));
+});
+
+test("clone fails loudly when the fork's messages cannot be read", async () => {
+  const { server, rpc, events } = setup({ reply: (m, p) => (m === "GET" && p === "/session/ses_fork2/message" ? Object.assign(new Error("boom"), { status: 500 }) : undefined) });
+  rpc.start();
+  await rpc.waitReady();
+  for (const p of planTurn()) server.push(p);
+  await assert.rejects(rpc.clone(), /boom/);
+  assert.equal(rpc.sid, "pi:ses_fake1", "the chat stays on its session");
+  assert.ok(events.some((e) => e.kind === "log" && e.level === "system" && /boom/.test(e.text)));
+  assert.ok(server.calls.some((c) => c.method === "DELETE" && c.path === "/session/ses_fork2"));
+});
+
+test("down emits exit once; a chat stopped then does not reattach on up", async () => {
+  const { server, rpc } = setup();
+  let restarted = 0;
+  rpc.onRestart = async () => { restarted++; };
+  rpc.start();
+  await rpc.waitReady();
+  await rpc.prompt("work");
+  const exits = [];
+  rpc.on("exit", (c) => exits.push(c));
+  server.up = false;
+  server.emit("down");
+  assert.deepEqual(exits, [null]);
+  rpc.stop(); // what agents.onPiExit does
+  assert.equal(exits.length, 1, "exit once");
+  const n = server.calls.length;
+  server.up = true;
+  server.emit("up");
+  await tick(); await tick();
+  assert.equal(restarted, 0);
+  assert.equal(server.calls.length, n, "nothing reattached");
+});
+
+test("onRestart failures are logged", async () => {
+  const { server, rpc, events } = setup();
+  rpc.onRestart = async () => { throw new Error("goal gone"); };
+  rpc.start();
+  await rpc.waitReady();
+  server.up = false;
+  server.emit("down");
+  server.up = true;
+  server.emit("up");
+  await waitFor(() => events.some((e) => e.kind === "log" && /resume failed: goal gone/.test(e.text)), "the log");
+  await waitFor(() => !rpc.restoring, "restoring cleared");
+});
+
+test("abort without a session sends nothing", async () => {
+  const { server, rpc } = setup();
+  const r = await rpc.abort();
+  assert.equal(r.success, false);
+  assert.equal(server.calls.length, 0);
 });
 
 test("switchSession(opencode mirror) attaches to that session", async () => {
