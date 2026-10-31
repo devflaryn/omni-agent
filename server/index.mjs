@@ -36,6 +36,9 @@ import { createServer as createNetServer } from "node:net";
 import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, classify, clientIp, describe, isHostRequest, parseCookies, parseProxyLine, redact } from "./access.mjs";
 import { loadOrCreateCert } from "./tls.mjs";
 import { SshTunnel } from "./tunnel.mjs";
+import { ProjectStore } from "./projects.mjs";
+import { MissionManager } from "./missions.mjs";
+import { handleMissionRoutes } from "./mission-routes.mjs";
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -53,7 +56,7 @@ export async function createApp(overrides = {}) {
     // Nor is the real ~/.pi/agent/models.json (and its keys) copied into a test's provider store.
     if (!("piModelsFile" in overrides)) cfg.migratePiProviders = false;
     if (!("persistContext" in overrides)) cfg.persistContext = false;
-    for (const k of ["opencodeConfigDir", "statusSessionsDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
+    for (const k of ["opencodeConfigDir", "statusSessionsDir", "projectsDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
   }
   cfg.opencodeMirrorDir ||= join(cfg.piSessionsDir, "opencode");
   // Another Omni on another port (headless.mjs, a scratch instance) keeps its own registry and goals: each server
@@ -336,6 +339,18 @@ export async function createApp(overrides = {}) {
     }),
   });
 
+  // Missions: a boss chat (boss tools only, never raw tool output) per mission, workers as background agents.
+  const projects = new ProjectStore({ root: cfg.projectsDir });
+  const missions = cfg.missionManager || new MissionManager({
+    bus, store: projects, agents, config: cfg.missions, log,
+    createBoss: cfg.createBoss || ((o) => {
+      // compactAt 0: the boss is never compacted by Omni; past its rebirth point a fresh boss continues from the ledger.
+      const c = new OpencodeRpc({ server: opencode, ensureServer: ensureOpencode, bus, cwd: o.cwd, provider: o.provider, model: o.model, thinking: cfg.piThinking, system: o.system, tools: allowTools(o.tools), meta: o.meta, mirrorDir: cfg.opencodeMirrorDir, compactAt: 0 });
+      c.startWatchdog({ stallMs: cfg.stallMs, toolStallMs: cfg.toolStallMs });
+      return c;
+    }),
+  });
+
   /** Explicit goals survive an Omni restart (cfg.goalsFile): the goal, its chat's session file and cwd. */
   function saveGoals() {
     // An unattended run (scripts/run.mjs) keeps its goal in its own ledger; it must never be reopened by the GUI.
@@ -357,7 +372,7 @@ export async function createApp(overrides = {}) {
 
   // Owned sessions also need registry + tally bookkeeping from their live events.
   bus.on("event", (ev) => {
-    if (ev.kind === "log" || ev.kind === "removed" || ev.kind === "agent" || ev.kind === "pis") return;
+    if (ev.kind === "log" || ev.kind === "removed" || ev.kind === "agent" || ev.kind === "pis" || ev.kind === "mission" || ev.kind === "notify") return;
     const s = registry.upsert(ev.sid, {});
     if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom, ...(ev.parentSid ? { parentSid: ev.parentSid, agentId: ev.agentId, agentKind: ev.agentKind } : {}) });
     // Invariant: run.json.sessionFile always names pi's current session file, and the child's resumeFile mirrors it.
@@ -1095,6 +1110,7 @@ export async function createApp(overrides = {}) {
       }
       // background agents (pi subagents, Claude Code sessions, shell jobs) started by the agents
       if (p.startsWith("/api/agents") && (await handleAgentRoutes(req, res, { p, q, agents, send, readBody, isLocal }))) return;
+      if (p.startsWith("/api/missions") && (await handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal }))) return;
       // claude
       // pi (or any local caller) hands Claude Code a task and waits for the answer
       if (req.method === "POST" && p === "/api/claude/task") {
@@ -1279,6 +1295,8 @@ export async function createApp(overrides = {}) {
     // running when Omni last stopped come back interrupted (their processes are gone); finished reports not yet
     // delivered stay, so the parent chat still gets them.
     agents.reconcile();
+    // After the agents: a mission's interrupted workers are reported to its boss, which is reopened on its session.
+    missions.reconcile();
     await new Promise((r) => server.listen(cfg.port, cfg.host, r));
     log(`Omni Agent on http://127.0.0.1:${cfg.port}  vault=${cfg.vaultDir}`);
     if (cfg.lan) await listenRemote();
@@ -1317,6 +1335,8 @@ export async function createApp(overrides = {}) {
     clearInterval(trimTimer);
     clearTimeout(pisTimer);
     for (const c of [...pis]) c.stop();
+    // Before the agents stop: their "interrupted" reports are delivered by the next start's reconcile, not now.
+    missions.dispose({ stopBosses: true });
     agents.stopAll();
     agents.dispose();
     // The shared `opencode serve` never outlives Omni (an injected one is stopped too): its tree is ended before this
@@ -1333,7 +1353,7 @@ export async function createApp(overrides = {}) {
     relay.server?.closeAllConnections?.();
   }
 
-  return { server, remote, relay, get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, opencode, cfg };
+  return { server, remote, relay, get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, missions, projects, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, opencode, cfg };
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || process.argv[1]?.endsWith("index.mjs")) {

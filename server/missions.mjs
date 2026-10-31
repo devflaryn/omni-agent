@@ -618,10 +618,13 @@ export class MissionManager extends EventEmitter {
     return this.list();
   }
 
-  dispose() {
+  dispose({ stopBosses = false } = {}) {
     this.bus?.off?.("event", this.onBus);
     this.agents?.off?.("change", this.onAgent);
-    for (const rt of this.rt.values()) for (const k of Object.keys(rt.timers)) this.clearTimerOf(rt, k);
+    for (const rt of this.rt.values()) {
+      for (const k of Object.keys(rt.timers)) this.clearTimerOf(rt, k);
+      if (stopBosses && rt.boss) { const b = rt.boss; rt.boss = null; try { b.stop?.(); } catch { /* gone */ } }
+    }
     for (const m of this.missions.values()) { try { this.files.get(m.id)?.write(m); } catch { /* best effort */ } }
   }
 }

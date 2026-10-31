@@ -140,6 +140,9 @@ export const CONFIG = {
   agents: agentsConfig(fc.agents),
   agentsFile: fc.agentsFile || join(HOME, ".omni-agent", "agents.json"),
   agentsDir: fc.agentsDir || join(HOME, ".omni-agent", "agents"),
+  /** Missions: per-project state (ledger, project memory, knowledge graph, artifacts), outside every project folder. */
+  projectsDir: fc.projectsDir || join(HOME, ".omni-agent", "projects"),
+  missions: fc.missions && typeof fc.missions === "object" ? fc.missions : {},
   /** Explicit goals survive an Omni restart: the goal, its chat's session file and cwd. */
   goalsFile: fc.goalsFile || join(HOME, ".omni-agent", "goals.json"),
   /** Where unattended run ledgers live. */

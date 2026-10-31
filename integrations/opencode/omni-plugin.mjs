@@ -655,6 +655,76 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       },
     });
 
+    // ------------------------------------------------------------ missions (server/mission-tools.mjs runs them)
+    /** Mission scope of a chat (boss / worker / none), cached per root session; a failed lookup is not cached. */
+    const scopes = new Map();
+    async function scopeOf(sid) {
+      if (!sid) return null;
+      const root = await rootOf(sid);
+      if (scopes.has(root)) return scopes.get(root);
+      try {
+        const r = await fetch(`${base}/api/missions/scope?session=${encodeURIComponent(root)}`);
+        const j = await r.json();
+        const v = j?.missionId ? j : null;
+        scopes.set(root, v);
+        return v;
+      } catch { return null; }
+    }
+    async function missionTool(name, args, ctx) {
+      const sessionID = await rootOf(ctx.sessionID);
+      let r;
+      try {
+        r = await fetch(`${base}/api/missions/tool`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionID, tool: name, args }), signal: ctx.abort });
+      } catch (e) {
+        return reply(ctx.abort?.aborted ? `${name} stopped.` : `Omni Agent is not reachable on ${base} (${e?.message || e}); retry in a moment.`, { error: true });
+      }
+      const j = await r.json().catch(() => ({}));
+      return reply(String(j.output ?? j.error ?? `${name}: HTTP ${r.status}`), j.metadata || {});
+    }
+    const mt = (name, description, args) => { tools[name] = tool({ description, args, execute: (a, ctx) => missionTool(name, a, ctx) }); };
+    const Scope = z.object({
+      files: z.array(z.string()).optional().describe("Files / directories the worker should start from"),
+      notes: z.array(z.string()).optional().describe("Project memory note names to read first"),
+      kg: z.array(z.string()).optional().describe("Knowledge-graph queries or node ids to start from"),
+    }).passthrough();
+    // Boss tools (a boss chat's allowlist has only these).
+    mt("mission_state", "The mission at a glance: task tree with statuses, active workers (status, run time, last activity), unanswered questions, recent notes. Short by design.", {});
+    mt("task_add", "Add tasks to the mission's task tree. Either one (title, parent?) or several at once (tasks: [{title, parent?}]). Sub-tasks: parent = the parent task id, e.g. t2.", {
+      title: z.string().optional(), parent: z.string().optional().describe("Parent task id for a sub-task"), detail: z.string().optional(),
+      tasks: z.array(z.object({ title: z.string(), parent: z.string().optional(), detail: z.string().optional() }).passthrough()).optional(),
+    });
+    mt("task_update", "Update a task: status todo|active|done|blocked|dropped and/or a one-line summary of where it stands.", {
+      id: z.string(), status: z.enum(["todo", "active", "done", "blocked", "dropped"]).optional(), summary: z.string().optional(), title: z.string().optional(),
+    });
+    mt("worker_spawn", "Start a worker on one task. It works alone with full tools and reports back by itself when done or stuck (a [mission] report message). The brief must be complete: goal of the task, what is known, what was tried and failed, constraints, what to report. kind: opencode (investigations, scans, RE analysis, device loops, parallel work) or claude (heavy coding, refactors, tricky debugging).", {
+      task: z.string().describe("The complete, self-contained brief"), kind: z.enum(["opencode", "claude"]).optional(), task_id: z.string().optional().describe("The task-tree id this worker works on"),
+      title: z.string().optional(), agent: z.string().optional().describe("Persona, e.g. re-analyst, droid-operator, scout"), model: z.string().optional().describe("Model (provider/id for opencode; a Claude model id for claude)"),
+      scope: Scope.optional(), timeout_minutes: z.number().optional(),
+    });
+    mt("worker_message", "Steer a worker or answer its question (pass question_id when answering an ask). A finished worker is resumed on its own session with the message.", {
+      id: z.string(), message: z.string(), question_id: z.string().optional(),
+    });
+    mt("worker_summary", "Ask a worker for a short structured status (what works, what failed, errors, next) without stopping it; a finished one returns its report. Use only when you must decide before its report arrives.", { id: z.string() });
+    mt("worker_cancel", "Stop a worker (its partial report is still delivered).", { id: z.string() });
+    mt("note", "Record a mission note in the ledger: decision (and why), dead_end (what failed and why — never retry it), fact, risk, lesson.", {
+      kind: z.enum(["decision", "dead_end", "fact", "risk", "lesson"]), title: z.string(), body: z.string().optional(),
+    });
+    mt("notify", "Notify the user (shown in Omni's window and remote page). Use when they are genuinely needed or would want to know: a decision only they can make, a credential, a risky action, a milestone, a long stall. Add a question to get an answer back as a message.", {
+      title: z.string(), body: z.string().optional(), urgency: z.enum(["info", "action", "urgent"]).optional(), question: z.string().optional(),
+    });
+    mt("mission_done", "Finish the mission with a final summary (what was achieved and how it was verified, what is left or risky). The user is notified.", { summary: z.string() });
+    mt("kg_search", "Search the project's knowledge graph (files, symbols, binaries, functions, strings, offsets and what is known about them). Token-budgeted.", {
+      query: z.string(), kind: z.string().optional(), limit: z.number().optional(), budget: z.number().optional(),
+    });
+    mt("kg_node", "One knowledge-graph node (by id or name) with its neighbours: what it is, status (hypothesis/confirmed), evidence, what it calls / is called by.", {
+      id: z.string(), depth: z.number().optional(), budget: z.number().optional(),
+    });
+    // Worker tools.
+    mt("ask_boss", "Mission workers only: ask the mission's boss when you are truly blocked on a decision only it can make. Waits up to 30 minutes for the answer.", { question: z.string() });
+    mt("progress", "Mission workers only: a one-line progress note into the mission ledger (a milestone reached, a key finding).", { note: z.string() });
+    mt("handoff", "Mission workers only: hand your task to a fresh worker when your context was compacted twice or you are losing track. Give a complete handoff note (state, what works, what failed, next steps); then stop.", { note: z.string() });
+
+
     if (droidEntry) {
       const pollMs = Math.max(50, Number(env.OMNI_WAIT_DEVICE_POLL_MS) || 3000);
       const sleep = (ms, signal) => new Promise((done) => {
@@ -702,7 +772,12 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
 
       "experimental.chat.system.transform": async (inp, output) => {
         resume(inp?.sessionID);
-        if (Array.isArray(output?.system)) output.system.push(notes());
+        if (!Array.isArray(output?.system)) return;
+        // A boss's system prompt is complete on its own: Omni's generic guidelines (plan, agent_start, jobs) would contradict it.
+        const sc = await scopeOf(inp?.sessionID).catch(() => null);
+        if (sc?.role === "boss") return;
+        output.system.push(notes());
+        if (sc?.role === "worker") output.system.push(`## Mission\nYou are part of Omni mission ${sc.missionId}. Project artifacts go in ${sc.artifactsDir}. Record durable findings with memory_save / kg_upsert; ask_boss only when truly blocked; finish with the structured report.`);
       },
 
       // The open plan's reminder at the tail of the context, for this call only (as omni-plan.ts did): everything in
