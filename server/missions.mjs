@@ -450,7 +450,7 @@ export class MissionManager extends EventEmitter {
       timeoutMinutes: spec.timeoutMinutes,
     });
     this.files.get(m.id)?.writeBrief(rec.id, brief);
-    m.workers.push(rec.id);
+    if (!m.workers.includes(rec.id)) m.workers.push(rec.id);
     if (taskRef) { taskRef.workers = [...new Set([...(taskRef.workers || []), rec.id])]; if (taskRef.status === "todo") taskRef.status = "active"; }
     this.ledger(m, `worker ${rec.id} (${kindName(kind)}${model ? ` ${model}` : ""}) spawned${taskRef ? ` for ${taskRef.id}` : ""}: ${oneLine(task, 200)}`);
     this.save(m, { kind: "worker", op: "spawn", id: rec.id, workerKind: kind, taskId: taskRef?.id || null });
