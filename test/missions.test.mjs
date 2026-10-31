@@ -405,6 +405,14 @@ test("a handoff whose successor cannot start keeps the worker's own report", asy
   assert.ok(m.queue.some((q) => q.type === "report" && q.ref === w.id), "its report still reaches the boss");
 });
 
+test("a boss chat is recognised by its saved and earlier sessions while the boss is not running", () => {
+  const { mm, dir } = setup({ boss: false });
+  const m = mm.create(spec(dir));
+  m.boss.sessionId = "ses_now"; m.boss.previous = [{ sessionId: "ses_old" }];
+  for (const sid of ["pi:ses_now", "ses_now", "pi:ses_old"]) { assert.equal(mm.bySession(sid)?.id, m.id, sid); assert.equal(mm.isBoss(m, sid), true, sid); }
+  assert.equal(mm.bySession("pi:ses_other"), null);
+});
+
 test("bus events carry a slim mission; GET-style pub has everything", () => {
   const { mm, dir, events } = setup({ boss: false });
   const m = mm.create(spec(dir));

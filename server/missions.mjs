@@ -121,11 +121,16 @@ export class MissionManager extends EventEmitter {
     const s = String(sid), full = s.includes(":") ? s : `pi:${s}`;
     const byBoss = this.bossSids.get(full);
     if (byBoss) return this.get(byBoss);
-    for (const m of this.missions.values()) if (m.boss?.sid === full || m.boss?.sessionId === s) return m;
+    for (const m of this.missions.values()) if (this.bossSession(m, full)) return m;
     const a = this.agents?.agentBySid?.(full);
     return a?.missionId ? this.get(a.missionId) : null;
   }
-  isBoss(m, sid) { const full = String(sid).includes(":") ? String(sid) : `pi:${sid}`; return !!m && (m.boss?.sid === full || this.bossSids.get(full) === m.id); }
+  /** Is `sid` one of the mission's boss chats — the live one, its saved session, or an earlier generation's? */
+  bossSession(m, sid) {
+    const full = String(sid).includes(":") ? String(sid) : `pi:${sid}`, bare = full.replace(/^pi:/, "");
+    return !!m && (m.boss?.sid === full || m.boss?.sessionId === bare || (m.boss?.previous || []).some((p) => p.sessionId === bare));
+  }
+  isBoss(m, sid) { const full = String(sid).includes(":") ? String(sid) : `pi:${sid}`; return !!m && (this.bossSids.get(full) === m.id || this.bossSession(m, full)); }
   projectOf(m) { let p = this.paths.get(m.id); if (!p) { p = this.store.project(m.dir); this.paths.set(m.id, p); } return p; }
 
   save(m, ev = null) {
