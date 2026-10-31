@@ -308,6 +308,26 @@ test("user message to worker is relayed to boss", async () => {
   assert.equal(m.queue.filter((q) => /told worker/.test(q.text)).length, 1);
 });
 
+test("handoff: a successor continues the task with the note; the old worker's end is not a report", async () => {
+  const { mm, dir, agents } = setup({ boss: false });
+  const m = mm.create(spec(dir));
+  mm.addTask(m, { title: "Unpack" });
+  const w = mm.spawnWorker(m, { task: "Unpack libapp.so", taskId: "t1" });
+  await assert.rejects(mm.handoffWorker(m, w.id, "too short"), (e) => e.status === 400);
+  const note = "State: found the XOR loop at 0x4a20. Works: key derivation. Failed: static dump (encrypted). Next: dump after relocation.";
+  const next = await mm.handoffWorker(m, w.id, note);
+  await flush();
+  const r = agents.get(next.id);
+  assert.equal(r.taskId, "t1"); assert.equal(r.role, "worker");
+  assert.match(r.task, /Unpack libapp\.so/);
+  assert.match(r.task, /Handoff from the previous worker/);
+  assert.match(r.task, /0x4a20/);
+  assert.equal(agents.get(w.id).status, "cancelled");
+  assert.equal(m.queue.filter((q) => q.type === "report").length, 0, "no report for the handed-off worker");
+  assert.match(m.queue.at(-1).text, /handed its task t1 to a fresh worker/);
+  assert.deepEqual(m.tasks[0].workers, [w.id, next.id]);
+});
+
 test("ask_boss waits for the boss's answer", async () => {
   const { mm, dir } = setup({ boss: false });
   const m = mm.create(spec(dir));

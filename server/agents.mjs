@@ -97,7 +97,7 @@ export class AgentManager extends EventEmitter {
    * `keeper` → the GoalKeeper (setManagedGoal); without one a pi agent is done 3 s (`idleDoneMs`) after it
    * stops streaming; with one, its goal event decides, and `keeperIdleMs` of silence is only the backstop.
    */
-  constructor({ bus, config = {}, file = "", dir = "", personasDir = "", createPi, claude, keeper = null, composeSystem = null, piEnv = {}, shellPath = "", shellArgs = ["-lc"], cwd = process.cwd(),
+  constructor({ bus, config = {}, file = "", dir = "", personasDir = "", createPi, claude, keeper = null, composeSystem = null, piEnv = {}, omniUrl = "", shellPath = "", shellArgs = ["-lc"], cwd = process.cwd(),
     now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout, killTree, spawn = nodeSpawn, log = () => {},
     idleDoneMs = 3000, keeperIdleMs = 30 * 60000, graceMs = 1500, saveDelayMs = 150, pollMs = 500 } = {}) {
     super();
@@ -109,6 +109,8 @@ export class AgentManager extends EventEmitter {
     this.piEnv = piEnv; this.shellPath = shellPath; this.shellArgs = shellArgs; this.cwd = cwd;
     this.now = now; this.setTimer = setTimer; this.clearTimer = clearTimer; this.spawn = spawn; this.log = log;
     this.killTree = killTree || ((pid, proc, o = {}) => killProcessTree(pid, { spawn: this.spawn, proc, group: !!o.group }));
+    /** Omni's own base URL: a Claude Code worker of a mission reaches the mission tools at <omniUrl>/mcp. */
+    this.omniUrl = omniUrl;
     this.idleDoneMs = idleDoneMs; this.keeperIdleMs = keeperIdleMs; this.graceMs = graceMs; this.saveDelayMs = saveDelayMs; this.pollMs = pollMs;
     this.records = new Map(); // id -> record (plain JSON, persisted)
     this.rt = new Map();      // id -> runtime: process handles, timers, the full task (never persisted)
@@ -382,7 +384,9 @@ export class AgentManager extends EventEmitter {
     // The vault memory pack / repo graph the old blocking /api/claude/task gave Claude, when the caller asks for it.
     const extra = (rec.memory || rec.graph) && this.composeSystem ? await Promise.resolve(this.composeSystem(rec, followup ?? rt.task)).catch(() => "") : "";
     if (rt.gen !== gen || rt.stopping) return;
+    const mcpConfig = rec.missionId && this.omniUrl ? this.writeMcpConfig(rec) : undefined;
     const r = this.claude.run({
+      mcpConfig,
       prompt: (followup ?? rt.task) + (rec.footer || AGENT_FOOTER), cwd: rec.cwd, model: rec.model || this.config.claudeModel || undefined,
       interactive: true, autonomous: true, permissionMode: this.config.claudePermissionMode, maxTurns: this.config.claudeMaxTurns,
       title: rec.title, name: rec.title, appendSystem: [persona?.body, extra].filter(Boolean).join("\n\n") || undefined,
@@ -413,6 +417,16 @@ export class AgentManager extends EventEmitter {
     const isErr = run.error ? true : lr ? lr.isError : run.exitCode !== 0;
     const error = !isErr ? null : run.error ? run.error : lr ? `${lr.subtype || "error"}${lr.text ? `: ${oneLine(lr.text, 300)}` : ""}` : `claude exited with code ${run.exitCode}`;
     this.finish(rec, isErr ? "error" : "done", { error });
+  }
+
+  /** `--mcp-config` file for a mission's Claude Code agent: Omni's mission tools over HTTP, as the "omni" server. */
+  writeMcpConfig(rec) {
+    try {
+      mkdirSync(this.dir || dirname(this.file) || ".", { recursive: true });
+      const f = join(this.dir || dirname(this.file), `${rec.id}.mcp.json`);
+      writeFileSync(f, `${JSON.stringify({ mcpServers: { omni: { type: "http", url: `${this.omniUrl.replace(/\/+$/, "")}/mcp?agent=${rec.id}` } } }, null, 1)}\n`);
+      return f;
+    } catch (e) { this.log("agents: could not write the MCP config", e.message); return undefined; }
   }
 
   // ------------------------------------------------------------------ shell

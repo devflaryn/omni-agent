@@ -39,6 +39,7 @@ import { SshTunnel } from "./tunnel.mjs";
 import { ProjectStore } from "./projects.mjs";
 import { MissionManager } from "./missions.mjs";
 import { handleMissionRoutes } from "./mission-routes.mjs";
+import { handleMcp } from "./omni-mcp-http.mjs";
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -327,7 +328,7 @@ export async function createApp(overrides = {}) {
 
   agents = cfg.agentManager || new AgentManager({
     bus, config: cfg.agents, file: cfg.agentsFile, dir: cfg.agentsDir, personasDir: cfg.personasDir,
-    claude, keeper, shellPath: cfg.agentShell || "", cwd: cfg.cwd, log,
+    claude, keeper, shellPath: cfg.agentShell || "", cwd: cfg.cwd, log, omniUrl: `http://127.0.0.1:${cfg.port}`,
     // A Claude agent asked for memory gets the vault pack (and repo graph) the old /api/claude/task gave it.
     composeSystem: async (rec, text) => (await composePrompt("claude", text, { memory: rec.memory, graph: rec.graph, dir: rec.cwd })).system,
     // A pi agent is a chat of its own on the shared server: its persona goes with each prompt (system + tool allowlist).
@@ -1116,6 +1117,8 @@ export async function createApp(overrides = {}) {
       }
       // background agents (pi subagents, Claude Code sessions, shell jobs) started by the agents
       if (p.startsWith("/api/agents") && (await handleAgentRoutes(req, res, { p, q, agents, send, readBody, isLocal }))) return;
+      // Claude Code workers of a mission call the mission tools here (local only: it acts as that worker).
+      if (p === "/mcp") { if (!isLocal(req)) return send(res, 403, { error: "local only" }); return handleMcp(req, res, { q, missions, agents, deps: missionDeps, readBody, send }); }
       if (p.startsWith("/api/missions") && (await handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal, deps: missionDeps }))) return;
       // claude
       // pi (or any local caller) hands Claude Code a task and waits for the answer

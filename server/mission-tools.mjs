@@ -64,6 +64,24 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
         if (!mem) return out("Project memory is not available.");
         return out((await mem.pack(String(a.topic || ""), { budgetTokens: Math.min(1000, Number(a.budget_tokens) || 800) })) || "Nothing relevant in project memory.");
       }
+      case "memory_search": {
+        const mem = deps.memory?.(m);
+        if (!mem) return out("Project memory is not available.");
+        const hits = await mem.search(String(a.query || ""), { limit: Math.min(20, Number(a.limit) || 8) });
+        return out(hits.length ? hits.map((h) => `- ${h.name} [${h.type || "note"}] (${h.path}): ${h.description || h.preview}`).join("\n") : "No matching notes.");
+      }
+      case "memory_save": {
+        const mem = deps.memory?.(m);
+        if (!mem) return out("Project memory is not available.");
+        const r = await mem.save({ name: a.name, description: a.description, type: a.type || "project", body: a.body, tags: list(a.tags), source: `mission:${m.id}:${me?.id || "boss"}` });
+        return out(`${r.created ? "Saved" : "Updated"} ${r.path}`);
+      }
+      case "kg_upsert": {
+        const kg = deps.kg?.(m);
+        if (!kg) return out("The knowledge graph is not available yet for this project.");
+        const r = kg.upsert({ nodes: Array.isArray(a.nodes) ? a.nodes : [], edges: Array.isArray(a.edges) ? a.edges : [] }, { by: me?.id || "boss" });
+        return out(`Recorded ${r.nodes} node(s) and ${r.edges} edge(s).`);
+      }
       case "ask_boss": {
         if (!me) return out("Only a mission worker can ask the boss.", { error: true });
         const answer = await missions.askBoss(m, me.role === "worker" ? me.id : `${me.id} (subagent)`, a.question);

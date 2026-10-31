@@ -12,7 +12,7 @@
  */
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { MissionFiles } from "./projects.mjs";
 import { BOSS_SYSTEM, BOSS_TOOLS, bossBriefing } from "./boss-prompt.mjs";
@@ -475,6 +475,8 @@ export class MissionManager extends EventEmitter {
     const key = `${rec.id}:${rec.endedAt}`;
     if (rt.reported.has(key)) return;
     rt.reported.add(key);
+    // A worker that handed off has a successor on its task: its own end is not a report.
+    if (m.handoffs?.some((h) => h.from === rec.id)) { try { this.agents.markDelivered(rec.id); } catch { /* gone */ } return; }
     this.deliverReport(m, rec);
   }
 
@@ -517,6 +519,38 @@ export class MissionManager extends EventEmitter {
     if (from === "user") this.enqueue(m, { type: "event", text: `The user told worker ${wid} directly: ${clip(t, 2000)}` });
     else this.save(m, { kind: "message", to: wid, from });
     return r;
+  }
+
+  /**
+   * A worker hands its task to a fresh one (its context is spent): the successor gets the same brief, scope and task
+   * plus the handoff note; the old one is stopped without a report. → the successor's record.
+   */
+  async handoffWorker(m, wid, note) {
+    const rec = this.mustWorker(m, wid);
+    const text = String(note ?? "").trim();
+    if (text.length < 40) throw bad("a handoff needs a complete note: state, what works, what failed, next steps");
+    const f = this.files.get(m.id);
+    let brief = rec.task || "";
+    try { brief = readFileSync(join(f.dir, "workers", rec.id, "brief.md"), "utf8"); } catch { /* the record's copy */ }
+    try { f.writeBrief(rec.id, text, "handoff.md"); } catch { /* best effort */ }
+    m.handoffs = [...(m.handoffs || []), { from: rec.id, at: this.now() }];
+    const chain = m.handoffs.filter((h) => h.task === rec.taskId).length;
+    const next = this.agents.start({
+      kind: rec.kind, task: `${brief}\n\n## Handoff from the previous worker (${rec.id})\nYou continue its task. Its notes:\n\n${clip(text, 12000)}`,
+      title: rec.title, cwd: rec.cwd, agent: rec.agent || undefined, model: rec.model, provider: rec.provider,
+      parentSid: `mission:${m.id}`, parentSessionId: null, depth: 0, missionId: m.id, taskId: rec.taskId, role: "worker", footer: WORKER_FOOTER, memory: true,
+    });
+    m.handoffs[m.handoffs.length - 1].to = next.id;
+    m.handoffs[m.handoffs.length - 1].task = rec.taskId;
+    try { f.writeBrief(next.id, `${brief}\n\n(continued from ${rec.id}; see its handoff.md)`); } catch { /* best effort */ }
+    if (!m.workers.includes(next.id)) m.workers.push(next.id);
+    const task = rec.taskId ? m.tasks.find((t) => t.id === rec.taskId) : null;
+    if (task) task.workers = [...new Set([...(task.workers || []), next.id])];
+    this.ledger(m, `worker ${rec.id} handed off to ${next.id}${task ? ` (task ${task.id})` : ""}: ${oneLine(text, 300)}`);
+    this.enqueue(m, { type: "event", text: `Worker ${rec.id} ran out of context and handed its task${task ? ` ${task.id}` : ""} to a fresh worker ${next.id}${chain ? ` (handoff #${chain + 1} on this task)` : ""}. Its handoff note:\n${clip(text, 1500)}` });
+    // Stopped after the successor exists, so its "cancelled" end is recognized as a handoff, not a report.
+    this.agents.cancel(rec.id).catch(() => {});
+    return next;
   }
 
   async cancelWorker(m, wid) { this.mustWorker(m, wid); const r = await this.agents.cancel(wid); this.ledger(m, `worker ${wid} cancelled`); return r; }

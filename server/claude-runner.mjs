@@ -79,7 +79,7 @@ export class ClaudeRunner extends EventEmitter {
     return [...this.runs.values()].map(({ proc, ctl, ...r }) => r);
   }
 
-  run({ prompt, cwd, model, resume, fork = false, forkedFrom = null, appendSystem, autonomous = true, maxTurns, allowedTools, title, interactive = false, permissionPrompts, permissionMode, meta = {}, name }) {
+  run({ prompt, cwd, model, resume, fork = false, forkedFrom = null, appendSystem, autonomous = true, maxTurns, allowedTools, title, interactive = false, permissionPrompts, permissionMode, meta = {}, name, mcpConfig }) {
     if (!prompt?.trim()) throw new Error("empty prompt");
     const pending = !!(resume && fork);
     if (fork && !forkedFrom) forkedFrom = `claude:${resume}`;
@@ -101,6 +101,8 @@ export class ClaudeRunner extends EventEmitter {
     if (allowedTools) args.push("--allowedTools", allowedTools);
     if (name) args.push("--name", String(name).slice(0, 120));
     if (appendSystem) args.push("--append-system-prompt", appendSystem);
+    // A file path (written by the caller): JSON on the command line does not survive Windows' .cmd shims.
+    if (mcpConfig) args.push("--mcp-config", mcpConfig);
 
     const env = { ...process.env, OMNI_AGENT: "1" };
     if (interactive) for (const k of NESTED_ENV) delete env[k];
