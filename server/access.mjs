@@ -87,7 +87,7 @@ const READ = [
 const HOST_ONLY = [
   /^\/api\/shutdown$/,
   /^\/api\/claude\/task$/,
-  // The agents' own tool endpoints: acting as a boss or a worker is never a remote user's request.
+  // The agents' own tool endpoints: acting as an orchestrator or a worker is never a remote user's request.
   /^\/api\/missions\/tool$/,
   /^\/api\/missions\/m-[0-9a-f]{8}\/kg\/load$/,
   /^\/mcp$/,
@@ -139,10 +139,10 @@ export function describe(method, path, body = {}, { titleOf = () => "" } = {}) {
   if (path === "/api/pi/model") return { title: `Switch OpenCode's model to ${body.provider || "?"}/${body.modelId || "?"}` };
   if (path === "/api/pi/thinking") return { title: `Set the thinking level to ${body.level || "?"}` };
   if (path === "/api/pi/compact") return { title: "Compact the chat's context" };
-  if (path === "/api/missions") return { title: `Start a mission${body.dir ? ` in ${body.dir}` : ""}${body.bossModel ? ` (boss ${typeof body.bossModel === "string" ? body.bossModel : body.bossModel.id})` : ""}`, text: body.goal || "" };
-  if ((m = /^\/api\/missions\/(m-[0-9a-f]{8})\/(message|stop|resume)$/.exec(path))) return m[2] === "message" ? { title: `Message the boss of mission ${m[1]}`, text: body.text || "" } : { title: `${m[2] === "stop" ? "Pause" : "Resume"} mission ${m[1]}${m[2] === "stop" ? " (stops every worker)" : ""}` };
+  if (path === "/api/missions") return { title: `Start a mission${body.dir ? ` in ${body.dir}` : ""}${body.orchestratorModel ? ` (orchestrator ${typeof body.orchestratorModel === "string" ? body.orchestratorModel : body.orchestratorModel.id})` : ""}`, text: body.goal || "" };
+  if ((m = /^\/api\/missions\/(m-[0-9a-f]{8})\/(message|stop|resume)$/.exec(path))) return m[2] === "message" ? { title: `Message the orchestrator of mission ${m[1]}`, text: body.text || "" } : { title: `${m[2] === "stop" ? "Pause" : "Resume"} mission ${m[1]}${m[2] === "stop" ? " (stops every worker)" : ""}` };
   if ((m = /^\/api\/missions\/(m-[0-9a-f]{8})\/workers\/(a-[0-9a-f]{8})\/(message|summary|cancel)$/.exec(path))) return { title: m[3] === "message" ? `Message worker ${m[2]} of mission ${m[1]}` : m[3] === "summary" ? `Ask worker ${m[2]} for a status summary` : `Stop worker ${m[2]} of mission ${m[1]}`, text: body.text || "" };
-  if ((m = /^\/api\/missions\/(m-[0-9a-f]{8})\/notifications\/([\w-]+)$/.exec(path))) return body.answer ? { title: `Answer the boss of mission ${m[1]}`, text: body.answer } : { title: `Mark a notification of mission ${m[1]} read` };
+  if ((m = /^\/api\/missions\/(m-[0-9a-f]{8})\/notifications\/([\w-]+)$/.exec(path))) return body.answer ? { title: `Answer the orchestrator of mission ${m[1]}`, text: body.answer } : { title: `Mark a notification of mission ${m[1]} read` };
   if (path === "/api/goal") return { title: "Set the goal and start working on it", text: body.goal || "" };
   if (path === "/api/hook") return { title: "Change the goal-hook settings" };
   if (path === "/api/claude/run") return { title: `Start Claude Code${body.cwd ? ` in ${body.cwd}` : ""}`, text: body.prompt || "" };

@@ -736,7 +736,7 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 .ms-sub .ms-card { width: calc(220px - var(--d, 1) * 14px); background: var(--ground); }
 .ms-card:hover { border-color: var(--line-2); background: var(--field-2); }
 .ms-card.on { border-color: var(--ink); }
-.ms-card.boss { width: 280px; background: var(--raised); border-color: var(--line-2); }
+.ms-card.orchestrator { width: 280px; background: var(--raised); border-color: var(--line-2); }
 .ms-card-top { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); }
 .ms-card-kind { flex: 1; }
 .ms-card-badge { font-size: 11px; color: var(--dim); }
@@ -801,7 +801,7 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
   .ms-body { flex-direction: column; overflow: auto; }
   .ms-col { overflow: visible; }
   .ms-side { width: auto; border-left: 0; border-top: 1px solid var(--line); }
-  .ms-card, .ms-card.boss { width: min(280px, calc(100vw - 48px)); }
+  .ms-card, .ms-card.orchestrator { width: min(280px, calc(100vw - 48px)); }
   .ms-head { padding: 12px 16px; flex-direction: column; }
   .ms-detail { margin: 6px 16px 16px; }
 }

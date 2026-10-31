@@ -342,12 +342,12 @@ export async function createApp(overrides = {}) {
     }),
   });
 
-  // Missions: a boss chat (boss tools only, never raw tool output) per mission, workers as background agents.
+  // Missions: an orchestrator chat (orchestrator tools only, never raw tool output) per mission, workers as background agents.
   const projects = new ProjectStore({ root: cfg.projectsDir });
   const missions = cfg.missionManager || new MissionManager({
     bus, store: projects, agents, config: cfg.missions, log,
-    createBoss: cfg.createBoss || ((o) => {
-      // compactAt 0: the boss is never compacted by Omni; past its rebirth point a fresh boss continues from the ledger.
+    createOrchestrator: cfg.createOrchestrator || ((o) => {
+      // compactAt 0: the orchestrator is never compacted by Omni; past its rebirth point a fresh orchestrator continues from the ledger.
       const c = new OpencodeRpc({ server: opencode, ensureServer: ensureOpencode, bus, cwd: o.cwd, provider: o.provider, model: o.model, thinking: cfg.piThinking, system: o.system, tools: allowTools(o.tools), meta: o.meta, mirrorDir: cfg.opencodeMirrorDir, compactAt: 0 });
       c.startWatchdog({ stallMs: cfg.stallMs, toolStallMs: cfg.toolStallMs });
       return c;
@@ -696,9 +696,9 @@ export async function createApp(overrides = {}) {
   const agentBusyError = (a) => Object.assign(new Error(`that chat belongs to background agent ${a.id}${a.title ? ` ("${a.title}")` : ""}, which is still running: message it with POST /api/agents/${a.id}/message, or stop it first`), { status: 409 });
 
   async function continueSession(sid, body) {
-    // A mission boss's chat is driven by its mission (one queue, boss-only tools): never as a plain chat.
-    const bossOf = missions.bySession(sid);
-    if (bossOf && missions.isBoss(bossOf, sid)) throw Object.assign(new Error(`This is the boss of mission "${bossOf.title}": message it from the Missions view.`), { status: 409 });
+    // A mission orchestrator's chat is driven by its mission (one queue, orchestrator-only tools): never as a plain chat.
+    const orchestratorOf = missions.bySession(sid);
+    if (orchestratorOf && missions.isOrchestrator(orchestratorOf, sid)) throw Object.assign(new Error(`This is the orchestrator of mission "${orchestratorOf.title}": message it from the Missions view.`), { status: 409 });
     const s = registry.get(sid);
     if (!s) throw Object.assign(new Error("unknown session"), { status: 404 });
     if (!body.message?.trim()) throw Object.assign(new Error("empty message"), { status: 400 });
@@ -1349,7 +1349,7 @@ export async function createApp(overrides = {}) {
     // running when Omni last stopped come back interrupted (their processes are gone); finished reports not yet
     // delivered stay, so the parent chat still gets them.
     agents.reconcile();
-    // After the agents: a mission's interrupted workers are reported to its boss, which is reopened on its session.
+    // After the agents: a mission's interrupted workers are reported to its orchestrator, which is reopened on its session.
     missions.reconcile();
     await new Promise((r) => server.listen(cfg.port, cfg.host, r));
     log(`Omni Agent on http://127.0.0.1:${cfg.port}  vault=${cfg.vaultDir}`);
@@ -1390,7 +1390,7 @@ export async function createApp(overrides = {}) {
     clearTimeout(pisTimer);
     for (const c of [...pis]) c.stop();
     // Before the agents stop: their "interrupted" reports are delivered by the next start's reconcile, not now.
-    missions.dispose({ stopBosses: true });
+    missions.dispose({ stopOrchestrators: true });
     agents.stopAll();
     agents.dispose();
     // The shared `opencode serve` never outlives Omni (an injected one is stopped too): its tree is ended before this

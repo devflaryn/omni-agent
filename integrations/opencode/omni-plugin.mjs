@@ -243,7 +243,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
     // ------------------------------------------------------------ memory, graph, omnidroid
     let vault = null;
     const theVault = () => (vault ??= new Vault(env.OMNI_VAULT || join(root || directory, "vault")).ensure());
-    /** A mission's agents (boss, workers, their subagents) use their project's own vault, never the global one. */
+    /** A mission's agents (orchestrator, workers, their subagents) use their project's own vault, never the global one. */
     const projectVaults = new Map();
     const vaultFor = async (ctx) => {
       const sc = ctx?.sessionID ? await scopeOf(ctx.sessionID).catch(() => null) : null;
@@ -664,7 +664,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
     });
 
     // ------------------------------------------------------------ missions (server/mission-tools.mjs runs them)
-    /** Mission scope of a chat (boss / worker / none), cached per root session; a failed lookup is not cached. */
+    /** Mission scope of a chat (orchestrator / worker / none), cached per root session; a failed lookup is not cached. */
     const scopes = new Map();
     async function scopeOf(sid) {
       if (!sid) return null;
@@ -695,7 +695,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       notes: z.array(z.string()).optional().describe("Project memory note names to read first"),
       kg: z.array(z.string()).optional().describe("Knowledge-graph queries or node ids to start from"),
     }).passthrough();
-    // Boss tools (a boss chat's allowlist has only these).
+    // Orchestrator tools (an orchestrator chat's allowlist has only these).
     mt("mission_state", "The mission at a glance: task tree with statuses, active workers (status, run time, last activity), unanswered questions, recent notes. Short by design.", {});
     mt("task_add", "Add tasks to the mission's task tree. Either one (title, parent?) or several at once (tasks: [{title, parent?}]). Sub-tasks: parent = the parent task id, e.g. t2.", {
       title: z.string().optional(), parent: z.string().optional().describe("Parent task id for a sub-task"), detail: z.string().optional(),
@@ -734,7 +734,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       source: z.enum(["graphify", "ghidra"]), path: z.string().optional(),
     });
     // Worker tools.
-    mt("ask_boss", "Mission workers only: ask the mission's boss when you are truly blocked on a decision only it can make. Waits up to 30 minutes for the answer.", { question: z.string() });
+    mt("ask_orchestrator", "Mission workers only: ask the mission's orchestrator when you are truly blocked on a decision only it can make. Waits up to 30 minutes for the answer.", { question: z.string() });
     mt("progress", "Mission workers only: a one-line progress note into the mission ledger (a milestone reached, a key finding).", { note: z.string() });
     mt("handoff", "Mission workers only: hand your task to a fresh worker when your context was compacted twice or you are losing track. Give a complete handoff note (state, what works, what failed, next steps); then stop.", { note: z.string() });
 
@@ -787,11 +787,11 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       "experimental.chat.system.transform": async (inp, output) => {
         resume(inp?.sessionID);
         if (!Array.isArray(output?.system)) return;
-        // A boss's system prompt is complete on its own: Omni's generic guidelines (plan, agent_start, jobs) would contradict it.
+        // An orchestrator's system prompt is complete on its own: Omni's generic guidelines (plan, agent_start, jobs) would contradict it.
         const sc = await scopeOf(inp?.sessionID).catch(() => null);
-        if (sc?.role === "boss") return;
+        if (sc?.role === "orchestrator") return;
         output.system.push(notes());
-        if (sc?.role === "worker") output.system.push(`## Mission\nYou are part of Omni mission ${sc.missionId}. Project artifacts go in ${sc.artifactsDir}. Record durable findings with memory_save / kg_upsert; ask_boss only when truly blocked; finish with the structured report.`);
+        if (sc?.role === "worker") output.system.push(`## Mission\nYou are part of Omni mission ${sc.missionId}. Project artifacts go in ${sc.artifactsDir}. Record durable findings with memory_save / kg_upsert; ask_orchestrator only when truly blocked; finish with the structured report.`);
       },
 
       // The open plan's reminder at the tail of the context, for this call only (as omni-plan.ts did): everything in

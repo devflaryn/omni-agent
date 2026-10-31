@@ -1,20 +1,20 @@
-/** Fakes for the mission tests: a boss chat (OpencodeRpc-like), an AgentManager, manual timers. */
+/** Fakes for the mission tests: an orchestrator chat (OpencodeRpc-like), an AgentManager, manual timers. */
 import { EventEmitter } from "node:events";
 
-export function bossFactory(bus) {
+export function orchestratorFactory(bus) {
   const made = [];
-  const createBoss = (opts) => {
+  const createOrchestrator = (opts) => {
     const n = made.length + 1;
-    const boss = Object.assign(new EventEmitter(), {
+    const orchestrator = Object.assign(new EventEmitter(), {
       opts, n, sid: "pi:pending", streaming: false, state: null, proc: { pid: 2000 + n }, prompts: [], switched: [], models: [], newSessions: 0, stops: 0, lastContext: 0, refuse: null,
       start() { return this; },
-      waitReady() { this.sid = `pi:boss${n}`; this.state = { sessionId: `boss${n}`, sessionFile: `/s/boss${n}.jsonl`, model: { contextWindow: 1000000 } }; return Promise.resolve(); },
+      waitReady() { this.sid = `pi:orchestrator${n}`; this.state = { sessionId: `orchestrator${n}`, sessionFile: `/s/orchestrator${n}.jsonl`, model: { contextWindow: 1000000 } }; return Promise.resolve(); },
       async switchSession(f) { this.switched.push(f); const id = f.split("/").pop().replace(".jsonl", ""); this.sid = `pi:${id}`; this.state = { ...this.state, sessionId: id, sessionFile: f }; },
-      async newSession() { this.newSessions++; const id = `boss${n}g${this.newSessions}`; this.sid = `pi:${id}`; this.state = { ...this.state, sessionId: id, sessionFile: `/s/${id}.jsonl` }; },
+      async newSession() { this.newSessions++; const id = `orchestrator${n}g${this.newSessions}`; this.sid = `pi:${id}`; this.state = { ...this.state, sessionId: id, sessionFile: `/s/${id}.jsonl` }; },
       async prompt(text, o = {}) { this.prompts.push({ text, ...o }); return this.refuse ? { success: false, error: this.refuse } : { success: true }; },
       async setModel(provider, id) { this.models.push(`${provider}/${id}`); return { success: true }; },
       stop() { this.stops++; this.proc = null; },
-      // drivers: one boss turn
+      // drivers: one orchestrator turn
       stream(on) { this.streaming = on; bus.emit({ sid: this.sid, harness: "pi", kind: "status", ts: Date.now(), streaming: on }); },
       turn({ error = null, context = 0 } = {}) {
         this.stream(true);
@@ -24,10 +24,10 @@ export function bossFactory(bus) {
       },
       crash(code = 1) { this.proc = null; this.emit("exit", code); },
     });
-    made.push(boss);
-    return boss;
+    made.push(orchestrator);
+    return orchestrator;
   };
-  return { made, createBoss };
+  return { made, createOrchestrator };
 }
 
 export class FakeAgents extends EventEmitter {

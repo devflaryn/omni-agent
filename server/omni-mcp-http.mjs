@@ -12,7 +12,7 @@ const obj = (properties, required = []) => ({ type: "object", properties, requir
 
 /** The tools a Claude Code worker sees (names without a prefix; Claude shows them as mcp__omni__<name>). */
 export const MCP_TOOLS = [
-  { name: "ask_boss", description: "Ask the mission's boss when you are truly blocked on a decision only it can make. Waits up to 30 minutes for the answer.", inputSchema: obj({ question: str("The question") }, ["question"]) },
+  { name: "ask_orchestrator", description: "Ask the mission's orchestrator when you are truly blocked on a decision only it can make. Waits up to 30 minutes for the answer.", inputSchema: obj({ question: str("The question") }, ["question"]) },
   { name: "progress", description: "A one-line progress note into the mission ledger (a milestone reached, a key finding).", inputSchema: obj({ note: str("The note") }, ["note"]) },
   { name: "handoff", description: "Hand your task to a fresh worker when your context was compacted twice or you are losing track. Give a complete handoff note (state, what works, what failed, next steps); then stop.", inputSchema: obj({ note: str("The handoff note") }, ["note"]) },
   { name: "memory_search", description: "Search the project's memory (durable notes other workers saved: offsets, keys, quirks, decisions).", inputSchema: obj({ query: str("Keywords"), limit: { type: "number" } }, ["query"]) },

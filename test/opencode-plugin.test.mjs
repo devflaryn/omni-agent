@@ -339,7 +339,7 @@ test("delivery prompts the session with [omni-agent-result]", async () => {
   stopPollers();
 });
 
-test("mission tools POST to /api/missions/tool with the root session; a boss chat gets no generic guidelines", async () => {
+test("mission tools POST to /api/missions/tool with the root session; an orchestrator chat gets no generic guidelines", async () => {
   const calls = [];
   const server = createServer((req, res) => {
     let raw = "";
@@ -348,7 +348,7 @@ test("mission tools POST to /api/missions/tool with the root session; a boss cha
       const url = new URL(req.url, "http://x");
       calls.push({ path: url.pathname, query: url.search, body: raw ? JSON.parse(raw) : null });
       res.writeHead(200, { "content-type": "application/json" });
-      if (url.pathname === "/api/missions/scope") return res.end(JSON.stringify(url.searchParams.get("session") === "ses_boss" ? { missionId: "m-1", role: "boss" } : url.searchParams.get("session") === "ses_w" ? { missionId: "m-1", role: "worker", artifactsDir: "/p/artifacts" } : { missionId: null }));
+      if (url.pathname === "/api/missions/scope") return res.end(JSON.stringify(url.searchParams.get("session") === "ses_orchestrator" ? { missionId: "m-1", role: "orchestrator" } : url.searchParams.get("session") === "ses_w" ? { missionId: "m-1", role: "worker", artifactsDir: "/p/artifacts" } : { missionId: null }));
       if (url.pathname === "/api/missions/tool") return res.end(JSON.stringify({ output: `ran ${JSON.parse(raw).tool}`, metadata: { id: "a-00000001" } }));
       res.end("{}");
     });
@@ -356,15 +356,15 @@ test("mission tools POST to /api/missions/tool with the root session; a boss cha
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   after(() => server.close());
   const client = fakeClient();
-  client.parents.set("ses_child", "ses_boss");
+  client.parents.set("ses_child", "ses_orchestrator");
   const { hooks } = await plugin({ client, env: { OMNI_AGENT_URL: `http://127.0.0.1:${server.address().port}` } });
-  for (const t of ["mission_state", "task_add", "worker_spawn", "worker_message", "worker_summary", "note", "notify", "mission_done", "kg_search", "kg_node", "ask_boss", "progress", "handoff"]) assert.ok(hooks.tool[t], t);
+  for (const t of ["mission_state", "task_add", "worker_spawn", "worker_message", "worker_summary", "note", "notify", "mission_done", "kg_search", "kg_node", "ask_orchestrator", "progress", "handoff"]) assert.ok(hooks.tool[t], t);
   const r = await hooks.tool.worker_spawn.execute({ task: "scan", kind: "opencode" }, ctxFor("ses_child"));
   assert.equal(r.output, "ran worker_spawn");
-  assert.deepEqual(calls.find((c) => c.path === "/api/missions/tool").body, { sessionID: "ses_boss", tool: "worker_spawn", args: { task: "scan", kind: "opencode" } });
-  const boss = { system: [] };
-  await hooks["experimental.chat.system.transform"]({ sessionID: "ses_boss" }, boss);
-  assert.deepEqual(boss.system, []);
+  assert.deepEqual(calls.find((c) => c.path === "/api/missions/tool").body, { sessionID: "ses_orchestrator", tool: "worker_spawn", args: { task: "scan", kind: "opencode" } });
+  const orchestrator = { system: [] };
+  await hooks["experimental.chat.system.transform"]({ sessionID: "ses_orchestrator" }, orchestrator);
+  assert.deepEqual(orchestrator.system, []);
   const worker = { system: [] };
   await hooks["experimental.chat.system.transform"]({ sessionID: "ses_w" }, worker);
   assert.ok(worker.system[0].includes(CONTEXT_GUIDANCE));

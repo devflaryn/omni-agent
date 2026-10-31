@@ -10,16 +10,16 @@ import { MissionManager } from "../server/missions.mjs";
 import { Vault } from "../server/memory.mjs";
 import { AgentManager } from "../server/agents.mjs";
 import { MCP_TOOLS, mcpAnswer } from "../server/omni-mcp-http.mjs";
-import { FakeAgents, bossFactory, flush } from "./helpers/mission-fakes.mjs";
+import { FakeAgents, orchestratorFactory, flush } from "./helpers/mission-fakes.mjs";
 
 const base = mkdtempSync(join(tmpdir(), "omni-mcp-"));
 after(() => rmSync(base, { recursive: true, force: true }));
 
 async function setup() {
   const dir = join(base, "repo"); mkdirSync(dir, { recursive: true });
-  const bus = new Bus(), agents = new FakeAgents(), bf = bossFactory(bus);
-  const missions = new MissionManager({ bus, store: new ProjectStore({ root: join(base, "p") }), agents, createBoss: bf.createBoss, config: { heartbeatMs: 0 } });
-  const m = missions.create({ dir, goal: "g", bossModel: "a/b" });
+  const bus = new Bus(), agents = new FakeAgents(), bf = orchestratorFactory(bus);
+  const missions = new MissionManager({ bus, store: new ProjectStore({ root: join(base, "p") }), agents, createOrchestrator: bf.createOrchestrator, config: { heartbeatMs: 0 } });
+  const m = missions.create({ dir, goal: "g", orchestratorModel: "a/b" });
   await flush(); await flush();
   const w = missions.spawnWorker(m, { task: "fix", kind: "claude" });
   const vault = new Vault(missions.projectOf(m).memoryDir).ensure();
@@ -40,13 +40,13 @@ test("initialize, tools/list, notifications and unknown methods", async () => {
   assert.equal((await mcpAnswer({ jsonrpc: "2.0", id: 3, method: "resources/list" }, ctx)).error.code, -32601);
 });
 
-test("tools/call reaches the mission as that worker: ask_boss, memory, progress", async () => {
+test("tools/call reaches the mission as that worker: ask_orchestrator, memory, progress", async () => {
   const { missions, agents, m, w, deps } = await setup();
   const ctx = { missions, agents, agentId: w.id, deps };
-  const pending = mcpAnswer({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ask_boss", arguments: { question: "arm64 or armv7?" } } }, ctx);
+  const pending = mcpAnswer({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ask_orchestrator", arguments: { question: "arm64 or armv7?" } } }, ctx);
   await flush();
   missions.answerQuestion(m, m.questions[0].id, "arm64");
-  assert.equal((await pending).result.content[0].text, "The boss answers: arm64");
+  assert.equal((await pending).result.content[0].text, "The orchestrator answers: arm64");
   const saved = await mcpAnswer({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "memory_save", arguments: { name: "xor key", description: "packer key", body: "0x5A" } } }, ctx);
   assert.match(saved.result.content[0].text, /Saved .*xor-key/);
   const found = await mcpAnswer({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "memory_search", arguments: { query: "xor" } } }, ctx);

@@ -2,12 +2,12 @@
  * HTTP routes of missions (server/missions.mjs). JSON in, JSON out.
  *
  *   GET  /api/missions                                   → { missions }
- *   POST /api/missions { dir, goal, title?, bossModel, fallbackModel?, workerKind?, workerModel? }  → { mission }  (local only)
+ *   POST /api/missions { dir, goal, title?, orchestratorModel, fallbackModel?, workerKind?, workerModel? }  → { mission }  (local only)
  *   POST /api/missions/tool { sessionID, tool, args }    → { output, metadata }  (the plugin / MCP)
  *   GET  /api/missions/scope?session=<id>                → { missionId, role, memoryDir, graphDir, artifactsDir } | { missionId: null }
  *   GET  /api/missions/:id                               → { mission, workers }
  *   GET  /api/missions/:id/report/:wid                   → { text }  (the full stored report)
- *   POST /api/missions/:id/message { text }              → { ok }    user → boss
+ *   POST /api/missions/:id/message { text }              → { ok }    user → orchestrator
  *   POST /api/missions/:id/workers/:wid/message { text } → { ok, how }
  *   POST /api/missions/:id/workers/:wid/summary          → { text }
  *   POST /api/missions/:id/workers/:wid/cancel           → { agent }
@@ -40,7 +40,7 @@ export async function handleMissionRoutes(req, res, { p, q, missions, send, read
       const m = missions.bySession(sid);
       if (!m) { send(res, 200, { missionId: null }); return true; }
       const pr = missions.projectOf(m);
-      send(res, 200, { missionId: m.id, role: missions.isBoss(m, sid) ? "boss" : "worker", memoryDir: pr.memoryDir, graphDir: pr.graphDir, artifactsDir: pr.artifactsDir, dir: m.dir });
+      send(res, 200, { missionId: m.id, role: missions.isOrchestrator(m, sid) ? "orchestrator" : "worker", memoryDir: pr.memoryDir, graphDir: pr.graphDir, artifactsDir: pr.artifactsDir, dir: m.dir });
       return true;
     }
     const mm = /^\/api\/missions\/(m-[0-9a-f]{8})(\/.*)?$/.exec(p);
@@ -70,7 +70,7 @@ export async function handleMissionRoutes(req, res, { p, q, missions, send, read
       send(res, 200, await deps.kgLoad(m, String(body.file || ""), String(body.binary || "")));
       return true;
     }
-    if (rest === "/message") { missions.messageBoss(m, body.text); send(res, 200, { ok: true }); return true; }
+    if (rest === "/message") { missions.messageOrchestrator(m, body.text); send(res, 200, { ok: true }); return true; }
     if (rest === "/stop") { await missions.stop(m); send(res, 200, { mission: missions.pub(m) }); return true; }
     if (rest === "/resume") { await missions.resume(m); send(res, 200, { mission: missions.pub(m) }); return true; }
     if ((r = /^\/workers\/(a-[0-9a-f]{8})\/(message|summary|cancel)$/.exec(rest))) {

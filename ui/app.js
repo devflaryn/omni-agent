@@ -467,8 +467,8 @@ $("#brand").onclick = () => showView("home");
 function target() {
   const s = S.sessions.get(S.selected);
   if (!s) return { kind: "none" };
-  // A mission boss's chat: a message goes to the mission (front of the boss's queue), never to Omni's main pi.
-  if (s.missionRole === "boss" && s.missionId) return { kind: "boss", s };
+  // A mission orchestrator's chat: a message goes to the mission (front of the orchestrator's queue), never to Omni's main pi.
+  if (s.missionRole === "orchestrator" && s.missionId) return { kind: "orchestrator", s };
   // A background agent's chat talks to that agent (steer / follow up / resume), never to Omni's main pi.
   if (isAgentChat(s)) { const a = agentFor(s.sid) || S.agents.get(s.agentId) || null; return { kind: "agent", s, a, id: a?.id || s.agentId || "", active: AGENT_ACTIVE.has(a?.status) }; }
   if (s.harness === "claude") return { kind: "claude", s };
@@ -490,7 +490,7 @@ function updateComposer() {
     st.caption = !t.id ? "Background agent · view only" : t.active ? `${agentKindLabel(t.a?.kind || t.s.agentKind)} at work · a message steers it, empty send stops it` : `${agentKindLabel(t.a?.kind || t.s.agentKind)} · ${t.a?.status || "finished"} · a message picks it up again`;
   }
   else if (t.kind === "claude") { st.caption = "Claude Code chat · view only in Omni"; st.disabled = true; }
-  else if (t.kind === "boss") { Object.assign(st, { hook: null, streaming: false, caption: "Mission boss · your message goes to the boss first, ahead of worker reports" }); }
+  else if (t.kind === "orchestrator") { Object.assign(st, { hook: null, streaming: false, caption: "Mission orchestrator · your message goes to the orchestrator first, ahead of worker reports" }); }
   else if (t.kind === "owned-pi") {
     // pi is idle while the goal hook waits to retry or check, but the chat is not: Stop must reach the hook too.
     const armed = !t.streaming && !!t.s.hookArmed;
@@ -526,7 +526,7 @@ async function chatSend(text, o) {
       if (r?.sid && r.sid !== S.selected) selectSession(r.sid);
       return;
     }
-    if (t.kind === "boss") { await sendClearing(chat, text, () => api(`/api/missions/${encodeURIComponent(t.s.missionId)}/message`, { text })); return; }
+    if (t.kind === "orchestrator") { await sendClearing(chat, text, () => api(`/api/missions/${encodeURIComponent(t.s.missionId)}/message`, { text })); return; }
     if (t.kind === "agent") {
       if (!t.id) return;
       const r = await sendClearing(chat, text, () => api(`/api/agents/${encodeURIComponent(t.id)}/message`, { text }));
@@ -620,7 +620,7 @@ document.addEventListener("click", (e) => { if (!e.target.closest("#chatMenu, #b
 $("#btnExplorer").onclick = () => { explorer.setRoot(currentDir()); setExplorer(!document.body.classList.contains("explorer-open"), true); };
 $("#btnSummary").onclick = () => { try { localStorage.setItem("omni.summary", summaryOn() ? "off" : "on"); } catch { /* */ } renderSummary(); };
 $("#btnSettings").onclick = () => settings.open();
-// Missions: the boss/worker view (ui/mission.js). Its badge counts unread notifications across missions.
+// Missions: the orchestrator/worker view (ui/mission.js). Its badge counts unread notifications across missions.
 const missionView = createMissionView({
   root: $("#view-mission"), api, toast, onOpenChat: (sid) => openChat(sid), sessionOf: (sid) => S.sessions.get(sid) || null,
   defaultDir: () => homeCwd(), defaultModel: () => S.pi.state?.model?.id ? { provider: S.pi.state.model.provider || "", id: S.pi.state.model.id } : (S.config?.piModel ? { provider: S.config.piProvider || "", id: S.config.piModel } : null),
@@ -676,7 +676,7 @@ function handle(ev) {
     for (const k of ["parentSid", "agentId", "agentKind", "missionId", "missionRole"]) if (ev[k]) s[k] = ev[k];
     if (ev.agentId) S.agentSids.set(ev.sid, ev.agentId);
   }
-  if (ev.kind === "status") { applyStatus(s, ev); if (s.missionRole === "boss" && S.page === "mission") missionView.onStatus(ev); }
+  if (ev.kind === "status") { applyStatus(s, ev); if (s.missionRole === "orchestrator" && S.page === "mission") missionView.onStatus(ev); }
   if (ev.kind === "msg" && ev.role === "user" && !s.title) s.title = cleanTitle(ev.blocks?.[0]?.text || "");
   if (ev.kind === "msg" && ev.usage) { const t = s.tally || (s.tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, messages: 0, cost: 0, context: 0 }); if (!ev.groupId || t.lastGroup !== ev.groupId) { t.lastGroup = ev.groupId; t.input += ev.usage.input; t.output += ev.usage.output; t.cacheRead += ev.usage.cacheRead; t.cacheWrite += ev.usage.cacheWrite; t.total += ev.usage.total; t.messages++; t.context = ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite; t.cost += ev.cost || 0; } }
   if (ev.kind !== "session") s.lastActivity = Math.max(s.lastActivity || 0, ev.ts || 0);

@@ -1,15 +1,15 @@
 /**
  * The mission tools, executed server-side for the Omni OpenCode plugin (POST /api/missions/tool) and the MCP endpoint
- * Claude Code workers use. The caller is identified by its chat (`sessionID`): a boss chat may use the boss tools, a
- * worker (or a worker's subagent) the worker tools. Every output is short and capped: the boss must never be handed
+ * Claude Code workers use. The caller is identified by its chat (`sessionID`): an orchestrator chat may use the orchestrator tools, a
+ * worker (or a worker's subagent) the worker tools. Every output is short and capped: the orchestrator must never be handed
  * raw tool output.
  *
  * `deps` (optional): { kg: (m) => KGraph-like {search, node, upsert}, memory: (m) => Vault-like {pack, search, save} }.
  */
-import { BOSS_TOOLS } from "./boss-prompt.mjs";
+import { ORCHESTRATOR_TOOLS } from "./orchestrator-prompt.mjs";
 import { clip, renderState } from "./missions.mjs";
 
-export const WORKER_TOOLS = Object.freeze(["ask_boss", "progress", "handoff"]);
+export const WORKER_TOOLS = Object.freeze(["ask_orchestrator", "progress", "handoff"]);
 const oneLine = (s, n) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 const list = (v) => (Array.isArray(v) ? v.map(String).filter(Boolean) : v ? [String(v)] : []);
 
@@ -20,12 +20,12 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
   const m = missions.bySession(sid);
   if (!m) return out("This chat is not part of a mission.", { error: true });
   const full = sid.includes(":") ? sid : `pi:${sid}`;
-  const boss = missions.isBoss(m, full);
+  const orchestrator = missions.isOrchestrator(m, full);
   const name = String(tool || "");
-  if (BOSS_TOOLS.includes(name) && !boss && !["kg_search", "kg_node", "memory_recall"].includes(name)) return out(`${name} is for the mission's boss only.`, { error: true });
-  if (WORKER_TOOLS.includes(name) && boss) return out(`${name} is for workers; you are the boss.`, { error: true });
+  if (ORCHESTRATOR_TOOLS.includes(name) && !orchestrator && !["kg_search", "kg_node", "memory_recall"].includes(name)) return out(`${name} is for the mission's orchestrator only.`, { error: true });
+  if (WORKER_TOOLS.includes(name) && orchestrator) return out(`${name} is for workers; you are the orchestrator.`, { error: true });
   const a = args && typeof args === "object" ? args : {};
-  const me = boss ? null : missions.agents?.agentBySid?.(full);
+  const me = orchestrator ? null : missions.agents?.agentBySid?.(full);
   try {
     switch (name) {
       case "mission_state": return out(renderState(m, { workers: missions.workersOf(m), now: missions.now(), max }));
@@ -45,7 +45,7 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
       }
       case "worker_message": {
         if (a.question_id && missions.answerQuestion(m, a.question_id, a.message)) return out(`Answered ${a.question_id}; worker ${a.id} continues with it.`);
-        const r = await missions.messageWorker(m, a.id, a.message, { from: "boss" });
+        const r = await missions.messageWorker(m, a.id, a.message, { from: "orchestrator" });
         const how = { steer: "it gets it in its current run", followUp: "it gets it after its current step", resumed: "it had finished and is running again", restarted: "it was restarted on its session" };
         return out(`Sent to worker ${a.id}: ${how[r?.how] || r?.how || "delivered"}.`);
       }
@@ -73,24 +73,24 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
       case "memory_save": {
         const mem = deps.memory?.(m);
         if (!mem) return out("Project memory is not available.");
-        const r = await mem.save({ name: a.name, description: a.description, type: a.type || "project", body: a.body, tags: list(a.tags), source: `mission:${m.id}:${me?.id || "boss"}` });
+        const r = await mem.save({ name: a.name, description: a.description, type: a.type || "project", body: a.body, tags: list(a.tags), source: `mission:${m.id}:${me?.id || "orchestrator"}` });
         return out(`${r.created ? "Saved" : "Updated"} ${r.path}`);
       }
       case "kg_upsert": {
         const kg = await deps.kg?.(m);
         if (!kg) return out("The knowledge graph is not available yet for this project.");
-        const r = kg.upsert({ nodes: Array.isArray(a.nodes) ? a.nodes : [], edges: Array.isArray(a.edges) ? a.edges : [] }, { by: me?.id || "boss" });
+        const r = kg.upsert({ nodes: Array.isArray(a.nodes) ? a.nodes : [], edges: Array.isArray(a.edges) ? a.edges : [] }, { by: me?.id || "orchestrator" });
         return out(`Recorded ${r.nodes} node(s) and ${r.edges} edge(s).`);
       }
       case "kg_import": {
         if (!deps.kgImport) return out("Knowledge-graph import is not available.", { error: true });
-        const r = await deps.kgImport(m, { source: String(a.source || ""), path: a.path ? String(a.path) : "", callerSid: full, by: me?.id || "boss" });
+        const r = await deps.kgImport(m, { source: String(a.source || ""), path: a.path ? String(a.path) : "", callerSid: full, by: me?.id || "orchestrator" });
         return out(r.text, r.meta);
       }
-      case "ask_boss": {
-        if (!me) return out("Only a mission worker can ask the boss.", { error: true });
-        const answer = await missions.askBoss(m, me.id, a.question, { label: me.role === "worker" ? me.id : `subagent ${me.id}` });
-        return out(answer == null ? "No answer from the boss yet. Continue with your best assumption and note it in your report." : `The boss answers: ${answer}`, { answered: answer != null });
+      case "ask_orchestrator": {
+        if (!me) return out("Only a mission worker can ask the orchestrator.", { error: true });
+        const answer = await missions.askOrchestrator(m, me.id, a.question, { label: me.role === "worker" ? me.id : `subagent ${me.id}` });
+        return out(answer == null ? "No answer from the orchestrator yet. Continue with your best assumption and note it in your report." : `The orchestrator answers: ${answer}`, { answered: answer != null });
       }
       case "progress": {
         if (!me) return out("Only a mission worker can report progress.", { error: true });

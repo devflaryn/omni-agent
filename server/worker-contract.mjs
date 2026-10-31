@@ -1,5 +1,5 @@
 /**
- * What a mission worker is told: the contract it works under, the report format, and the status request the boss sends.
+ * What a mission worker is told: the contract it works under, the report format, and the status request the orchestrator sends.
  */
 
 export const REPORT_HEADINGS = Object.freeze(["Status", "Outcome", "What works", "Tried and failed", "Errors", "Artifacts", "Knowledge recorded", "Open questions / next"]);
@@ -8,17 +8,17 @@ const FORMAT = REPORT_HEADINGS.map((h) => `## ${h}`).join("\n");
 
 export const WORKER_FOOTER = `
 
-(You are a worker in an Omni mission, started by the mission's boss for this one task. You work alone: the boss does not see your chat, only your final report.
+(You are a worker in an Omni mission, started by the mission's orchestrator for this one task. You work alone: the orchestrator does not see your chat, only your final report.
 - Record durable findings as you go so they outlive your context: memory_save for facts (offsets, keys, quirks, what an obfuscated function does), kg_upsert for structure (functions, calls, strings, names, with status hypothesis/confirmed and evidence) when those tools are available.
 - Put big outputs (dumps, decrypted binaries, scripts, exports) in the project artifacts directory, never in the report.
-- If you are truly blocked on something only the boss can decide, call ask_boss. Otherwise make reasonable assumptions and note them.
+- If you are truly blocked on something only the orchestrator can decide, call ask_orchestrator. Otherwise make reasonable assumptions and note them.
 - If your context has been compacted twice or you are losing track, call handoff with a complete handoff note; a fresh worker continues.
 - Use subagents for independent sub-investigations when it helps.
 Finish with a report in exactly this format (short, factual; no code dumps — paths instead):
 ${FORMAT}
 Status is one of: done, stuck, partial.)`;
 
-export const SUMMARY_REQUEST = `[omni-boss] Status request from the mission boss. Do not stop your work for long: reply now with a short status in exactly this format (so far), then continue.
+export const SUMMARY_REQUEST = `[omni-orchestrator] Status request from the mission orchestrator. Do not stop your work for long: reply now with a short status in exactly this format (so far), then continue.
 ${FORMAT}
 Status is one of: done, stuck, partial (still working = partial).`;
 

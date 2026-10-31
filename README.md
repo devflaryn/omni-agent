@@ -190,34 +190,34 @@ The registry lives in `~/.omni-agent/agents.json`; agents that were running when
 path: it waits up to `timeoutMinutes` and leaves Claude running in the background after that. For quick parallel
 lookups OpenCode's own `task` tool (its subagents) is there too.
 
-### Missions: a boss, its workers, and a project knowledge store
+### Missions: an orchestrator, its workers, and a project knowledge store
 
 For jobs that run for days (a large refactor, reverse engineering an obfuscated app), open **Missions** (the tree
-icon in the top bar, or `/#missions`) and start one: a project folder, a goal, a **boss model** and a **fallback model**
+icon in the top bar, or `/#missions`) and start one: a project folder, a goal, a **orchestrator model** and a **fallback model**
 (any OpenCode model; pick a large context window), and the default worker kind.
 
-- **The boss** (`server/missions.mjs`, `server/boss-prompt.mjs`) is an OpenCode chat whose only tools are
+- **The orchestrator** (`server/missions.mjs`, `server/orchestrator-prompt.mjs`) is an OpenCode chat whose only tools are
   orchestration tools: `mission_state`, `task_add/update`, `worker_spawn/message/summary/cancel`, `note`
   (decision / dead end / fact / risk / lesson), `kg_search/node`, `memory_recall`, `notify`, `mission_done`. It cannot
   read files or run commands, and every tool result is capped at 4000 characters, so its context lasts. It is prompted
   with compact `[mission …]` deliveries from a queue that is saved to disk: worker reports, worker questions, your messages,
   a heartbeat while workers run.
-- **Workers** are background agents (OpenCode or Claude Code, the boss picks per task) with a brief, a scope (files,
-  memory notes, graph queries) and a contract: record findings as they go, `ask_boss` only when truly blocked,
+- **Workers** are background agents (OpenCode or Claude Code, the orchestrator picks per task) with a brief, a scope (files,
+  memory notes, graph queries) and a contract: record findings as they go, `ask_orchestrator` only when truly blocked,
   `handoff` to a fresh worker when their context is spent, finish with a fixed report (`## Status`, `## Outcome`,
   `## What works`, `## Tried and failed`, `## Errors`, `## Artifacts`, `## Knowledge recorded`,
-  `## Open questions / next`). The boss gets the report capped at 8000 characters; the full one is kept. Workers can
+  `## Open questions / next`). The orchestrator gets the report capped at 8000 characters; the full one is kept. Workers can
   start subagents (missions nest 3 deep); Claude Code workers get the mission tools over MCP (`/mcp?agent=<id>`) and
   their own Task subagents show in the tree too.
-- **It does not stop.** A failed boss turn (an API error, a rate limit, a turn that ends without a reply) is retried
+- **It does not stop.** A failed orchestrator turn (an API error, a rate limit, a turn that ends without a reply) is retried
   with backoff (15 s doubling to 10 min). After 3 failures in a row it switches to the fallback model and tells you
-  once, then tries the primary again after an hour. A dead boss chat is reopened on its session. Workers keep running
-  meanwhile and their reports wait in the queue. When the boss's context passes 60 % of its window, a fresh boss
+  once, then tries the primary again after an hour. A dead orchestrator chat is reopened on its session. Workers keep running
+  meanwhile and their reports wait in the queue. When the orchestrator's context passes 60 % of its window, a fresh orchestrator
   continues from the ledger. After an Omni restart every running mission resumes, and its interrupted workers are
-  reported to the boss.
-- **You, live:** the Mission view shows the boss on top, its workers below it and their subagents under them, with
+  reported to the orchestrator.
+- **You, live:** the Mission view shows the orchestrator on top, its workers below it and their subagents under them, with
   status, last activity, run time and cost. Click any node to message it, ask a worker for a summary, read a report
-  or open its chat; the boss is told what you said to a worker. The **Inbox** has the boss's `notify` messages, and
+  or open its chat; the orchestrator is told what you said to a worker. The **Inbox** has the orchestrator's `notify` messages, and
   you can answer their questions there. A notification is only stored and shown (here and on the remote page); phone
   delivery comes later. The **Tasks**, **Ledger** and **Knowledge** tabs show the task tree, the notes and the graph.
 - **Storage, outside the project folder:** `~/.omni-agent/projects/<name>-<hash>/` (`projectsDir`) holds

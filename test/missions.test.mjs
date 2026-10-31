@@ -1,41 +1,41 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Bus } from "../server/bus.mjs";
 import { ProjectStore } from "../server/projects.mjs";
 import { MissionManager, compactReport, renderState } from "../server/missions.mjs";
-import { BOSS_TOOLS } from "../server/boss-prompt.mjs";
+import { ORCHESTRATOR_TOOLS } from "../server/orchestrator-prompt.mjs";
 import { SUMMARY_REQUEST, WORKER_FOOTER } from "../server/worker-contract.mjs";
-import { FakeAgents, bossFactory, fakeClock, flush } from "./helpers/mission-fakes.mjs";
+import { FakeAgents, orchestratorFactory, fakeClock, flush } from "./helpers/mission-fakes.mjs";
 
 const base = mkdtempSync(join(tmpdir(), "omni-missions-"));
 after(() => rmSync(base, { recursive: true, force: true }));
 let k = 0;
-function setup({ boss = true, config = {}, clock = null } = {}) {
+function setup({ orchestrator = true, config = {}, clock = null } = {}) {
   const d = join(base, `t${++k}`);
   const dir = join(d, "repo"); mkdirSync(dir, { recursive: true });
   const bus = new Bus();
   const agents = new FakeAgents();
-  const bf = bossFactory(bus);
+  const bf = orchestratorFactory(bus);
   const store = new ProjectStore({ root: join(d, "projects") });
   const c = clock || fakeClock();
-  const mm = new MissionManager({ bus, store, agents, createBoss: boss ? bf.createBoss : null, config: { heartbeatMs: 0, ...config }, now: c.now, setTimer: c.setTimer, clearTimer: c.clearTimer });
+  const mm = new MissionManager({ bus, store, agents, createOrchestrator: orchestrator ? bf.createOrchestrator : null, config: { heartbeatMs: 0, ...config }, now: c.now, setTimer: c.setTimer, clearTimer: c.clearTimer });
   const events = []; bus.on("event", (e) => events.push(e));
   return { d, dir, bus, agents, bf, store, mm, clock: c, events };
 }
-const spec = (dir, x = {}) => ({ dir, goal: "Map the auth flow of app.apk", bossModel: "opencode-go/kimi", fallbackModel: "opencode/free", ...x });
+const spec = (dir, x = {}) => ({ dir, goal: "Map the auth flow of app.apk", orchestratorModel: "opencode-go/kimi", fallbackModel: "opencode/free", ...x });
 
 // ------------------------------------------------------------------ model
 test("create validates and persists", () => {
-  const { mm, dir, store } = setup({ boss: false });
-  assert.throws(() => mm.create({ dir, bossModel: "x/y" }), (e) => e.status === 400);
-  assert.throws(() => mm.create({ dir: join(dir, "nope"), goal: "g", bossModel: "x/y" }), (e) => e.status === 400);
+  const { mm, dir, store } = setup({ orchestrator: false });
+  assert.throws(() => mm.create({ dir, orchestratorModel: "x/y" }), (e) => e.status === 400);
+  assert.throws(() => mm.create({ dir: join(dir, "nope"), goal: "g", orchestratorModel: "x/y" }), (e) => e.status === 400);
   assert.throws(() => mm.create({ dir, goal: "g" }), (e) => e.status === 400);
   const m = mm.create(spec(dir));
   assert.match(m.id, /^m-[0-9a-f]{8}$/);
-  assert.deepEqual(m.bossModel, { provider: "opencode-go", id: "kimi" });
+  assert.deepEqual(m.orchestratorModel, { provider: "opencode-go", id: "kimi" });
   const p = store.project(dir);
   assert.ok(existsSync(join(p.missionsDir, m.id, "mission.json")));
   assert.equal(mm.list()[0].id, m.id);
@@ -43,7 +43,7 @@ test("create validates and persists", () => {
 });
 
 test("tasks and notes", () => {
-  const { mm, dir, store } = setup({ boss: false });
+  const { mm, dir, store } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   const t1 = mm.addTask(m, { title: "Unpack libapp.so" });
   const t2 = mm.addTask(m, { title: "Find the login request" });
@@ -60,7 +60,7 @@ test("tasks and notes", () => {
 });
 
 test("notify emits a bus event and stores it", () => {
-  const { mm, dir, events } = setup({ boss: false });
+  const { mm, dir, events } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   const n = mm.notify(m, { title: "Need the APK password", urgency: "action", question: "Which account?" });
   assert.equal(m.notifications.length, 1);
@@ -73,7 +73,7 @@ test("notify emits a bus event and stores it", () => {
 });
 
 test("renderState is capped and readable", () => {
-  const { mm, dir } = setup({ boss: false });
+  const { mm, dir } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   mm.addTask(m, { title: "Unpack" }); mm.updateTask(m, "t1", { status: "active" });
   const s = renderState(m, { workers: [] });
@@ -84,56 +84,56 @@ test("renderState is capped and readable", () => {
 });
 
 test("two missions share a project", () => {
-  const { mm, dir } = setup({ boss: false });
+  const { mm, dir } = setup({ orchestrator: false });
   const a = mm.create(spec(dir)), b = mm.create(spec(dir, { goal: "other" }));
   assert.equal(a.slug, b.slug);
   assert.notEqual(a.id, b.id);
 });
 
-// ------------------------------------------------------------------ boss
-test("create starts the boss with the boss allowlist and system; briefing is the first prompt", async () => {
+// ------------------------------------------------------------------ orchestrator
+test("create starts the orchestrator with the orchestrator allowlist and system; briefing is the first prompt", async () => {
   const { mm, dir, bf } = setup();
   const m = mm.create(spec(dir));
   await flush(); await flush();
-  const boss = bf.made[0];
-  assert.deepEqual(boss.opts.tools, BOSS_TOOLS);
-  assert.match(boss.opts.system, /You are the boss/);
-  assert.equal(boss.opts.model, "kimi"); assert.equal(boss.opts.provider, "opencode-go");
+  const orchestrator = bf.made[0];
+  assert.deepEqual(orchestrator.opts.tools, ORCHESTRATOR_TOOLS);
+  assert.match(orchestrator.opts.system, /You are the orchestrator/);
+  assert.equal(orchestrator.opts.model, "kimi"); assert.equal(orchestrator.opts.provider, "opencode-go");
   assert.equal(m.status, "running");
-  assert.equal(boss.prompts.length, 1);
-  assert.match(boss.prompts[0].text, /^\[mission m-[0-9a-f]{8}\] A new mission/);
-  assert.equal(mm.bySession(boss.sid).id, m.id);
+  assert.equal(orchestrator.prompts.length, 1);
+  assert.match(orchestrator.prompts[0].text, /^\[mission m-[0-9a-f]{8}\] A new mission/);
+  assert.equal(mm.bySession(orchestrator.sid).id, m.id);
 });
 
 test("queue delivers one at a time when idle; user messages jump the queue", async () => {
   const { mm, dir, bf, bus } = setup();
   const m = mm.create(spec(dir));
   await flush(); await flush();
-  const boss = bf.made[0];
-  boss.stream(true); // the briefing turn is running
+  const orchestrator = bf.made[0];
+  orchestrator.stream(true); // the briefing turn is running
   mm.enqueue(m, { type: "event", text: "first" });
   mm.enqueue(m, { type: "event", text: "second" });
-  mm.messageBoss(m, "hurry up");
-  assert.equal(boss.prompts.length, 1);
-  bus.emit({ sid: boss.sid, kind: "msg", role: "assistant", live: true, stopReason: "stop", blocks: [{ type: "text", text: "planned" }] });
-  boss.stream(false); // briefing turn over
+  mm.messageOrchestrator(m, "hurry up");
+  assert.equal(orchestrator.prompts.length, 1);
+  bus.emit({ sid: orchestrator.sid, kind: "msg", role: "assistant", live: true, stopReason: "stop", blocks: [{ type: "text", text: "planned" }] });
+  orchestrator.stream(false); // briefing turn over
   await flush();
-  assert.equal(boss.prompts.length, 2);
-  assert.match(boss.prompts[1].text, /Message from the user:\nhurry up/);
-  boss.turn(); await flush();
-  assert.match(boss.prompts[2].text, /first/);
-  boss.turn(); await flush();
-  assert.match(boss.prompts[3].text, /second/);
-  boss.turn(); await flush();
+  assert.equal(orchestrator.prompts.length, 2);
+  assert.match(orchestrator.prompts[1].text, /Message from the user:\nhurry up/);
+  orchestrator.turn(); await flush();
+  assert.match(orchestrator.prompts[2].text, /first/);
+  orchestrator.turn(); await flush();
+  assert.match(orchestrator.prompts[3].text, /second/);
+  orchestrator.turn(); await flush();
   assert.equal(m.queue.length, 0);
 });
 
 test("queue survives a reload", async () => {
-  const s = setup({ boss: false });
+  const s = setup({ orchestrator: false });
   const m = s.mm.create(spec(s.dir));
   s.mm.enqueue(m, { type: "event", text: "pending thing" });
-  const bf = bossFactory(s.bus);
-  const mm2 = new MissionManager({ bus: s.bus, store: s.store, agents: s.agents, createBoss: bf.createBoss, config: { heartbeatMs: 0 } });
+  const bf = orchestratorFactory(s.bus);
+  const mm2 = new MissionManager({ bus: s.bus, store: s.store, agents: s.agents, createOrchestrator: bf.createOrchestrator, config: { heartbeatMs: 0 } });
   mm2.reconcile();
   const m2 = mm2.get(m.id);
   assert.ok(m2.queue.some((q) => /pending thing/.test(q.text)));
@@ -141,67 +141,67 @@ test("queue survives a reload", async () => {
   assert.equal(bf.made.length, 1);
 });
 
-test("boss errors back off, switch to fallback once, notify once", async () => {
+test("orchestrator errors back off, switch to fallback once, notify once", async () => {
   const { mm, dir, bf, clock } = setup();
   const m = mm.create(spec(dir));
   await flush(); await flush();
-  const boss = bf.made[0];
-  boss.turn({ error: "429 rate limited" }); await flush();
+  const orchestrator = bf.made[0];
+  orchestrator.turn({ error: "429 rate limited" }); await flush();
   assert.equal(m.errors.consecutive, 1);
   assert.deepEqual(clock.pending()[0], 15000);
-  assert.equal(boss.prompts.length, 1);
+  assert.equal(orchestrator.prompts.length, 1);
   await clock.tick(15000);
-  assert.equal(boss.prompts.length, 2, "retried the same item");
-  assert.equal(boss.prompts[1].text, boss.prompts[0].text);
-  boss.turn({ error: "429" }); await flush();
+  assert.equal(orchestrator.prompts.length, 2, "retried the same item");
+  assert.equal(orchestrator.prompts[1].text, orchestrator.prompts[0].text);
+  orchestrator.turn({ error: "429" }); await flush();
   assert.equal(clock.pending()[0], 30000);
   await clock.tick(30000);
-  boss.turn({ error: "429" }); await flush(); await flush();
-  assert.deepEqual(boss.models, ["opencode/free"]);
+  orchestrator.turn({ error: "429" }); await flush(); await flush();
+  assert.deepEqual(orchestrator.models, ["opencode/free"]);
   assert.equal(m.usingFallback, true);
   assert.equal(m.notifications.filter((n) => /fallback/.test(n.title)).length, 1);
   assert.equal(clock.pending()[0], 60000);
   await clock.tick(60000);
-  boss.turn({ error: "still" }); await flush(); await flush();
+  orchestrator.turn({ error: "still" }); await flush(); await flush();
   assert.equal(m.notifications.filter((n) => /fallback/.test(n.title)).length, 1, "no second fallback notice");
-  assert.equal(boss.models.length, 1);
+  assert.equal(orchestrator.models.length, 1);
 });
 
-test("a boss turn that ends without any reply is retried, not dropped", async () => {
+test("an orchestrator turn that ends without any reply is retried, not dropped", async () => {
   const { mm, dir, bf, clock } = setup();
   const m = mm.create(spec(dir));
   await flush(); await flush();
-  const boss = bf.made[0];
-  boss.stream(true); boss.stream(false); // the watchdog aborted a stalled stream: no assistant message
+  const orchestrator = bf.made[0];
+  orchestrator.stream(true); orchestrator.stream(false); // the watchdog aborted a stalled stream: no assistant message
   await flush();
   assert.equal(m.queue.length, 1, "the briefing is still queued");
   assert.match(m.errors.lastError, /without a reply/);
   await clock.tick(15000);
-  assert.equal(boss.prompts.length, 2);
+  assert.equal(orchestrator.prompts.length, 2);
 });
 
 test("success resets the error count; primary is retried after an hour", async () => {
   const { mm, dir, bf, clock } = setup({ config: { fallbackAfter: 1 } });
   const m = mm.create(spec(dir));
   await flush(); await flush();
-  const boss = bf.made[0];
-  boss.turn({ error: "down" }); await flush(); await flush();
+  const orchestrator = bf.made[0];
+  orchestrator.turn({ error: "down" }); await flush(); await flush();
   assert.equal(m.usingFallback, true);
   await clock.tick(15000);
-  boss.turn(); await flush();
+  orchestrator.turn(); await flush();
   assert.equal(m.errors.consecutive, 0);
   await clock.tick(3600000);
   mm.enqueue(m, { text: "later" });
   await flush(); await flush();
-  assert.deepEqual(boss.models, ["opencode/free", "opencode-go/kimi"]);
+  assert.deepEqual(orchestrator.models, ["opencode/free", "opencode-go/kimi"]);
   assert.equal(m.usingFallback, false);
 });
 
-test("boss exit restarts it on the same session", async () => {
+test("orchestrator exit restarts it on the same session", async () => {
   const { mm, dir, bf, clock } = setup();
   const m = mm.create(spec(dir));
   await flush(); await flush();
-  const file = m.boss.sessionFile;
+  const file = m.orchestrator.sessionFile;
   bf.made[0].crash(1);
   assert.equal(bf.made.length, 1);
   await clock.tick(15000); await flush(); await flush();
@@ -214,13 +214,13 @@ test("rebirth past 60 %", async () => {
   const { mm, dir, bf } = setup();
   const m = mm.create(spec(dir));
   await flush(); await flush();
-  const boss = bf.made[0];
+  const orchestrator = bf.made[0];
   mm.addTask(m, { title: "Unpack" });
-  boss.turn({ context: 650000 }); await flush(); await flush(); await flush();
-  assert.equal(boss.newSessions, 1);
-  assert.equal(m.boss.generation, 2);
-  assert.equal(m.boss.previous.length, 1);
-  const last = boss.prompts.at(-1).text;
+  orchestrator.turn({ context: 650000 }); await flush(); await flush(); await flush();
+  assert.equal(orchestrator.newSessions, 1);
+  assert.equal(m.orchestrator.generation, 2);
+  assert.equal(m.orchestrator.previous.length, 1);
+  const last = orchestrator.prompts.at(-1).text;
   assert.match(last, /taking over this mission/);
   assert.match(last, /\[todo\] t1 Unpack/);
 });
@@ -241,7 +241,7 @@ test("heartbeat only when workers run and nothing queued", async () => {
 
 // ------------------------------------------------------------------ workers
 test("spawn tags the agent and writes the brief", () => {
-  const { mm, dir, agents, store } = setup({ boss: false });
+  const { mm, dir, agents, store } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   mm.addTask(m, { title: "Unpack" });
   const w = mm.spawnWorker(m, { task: "Unpack libapp.so and dump it", taskId: "t1", kind: "opencode", scope: { files: ["lib/arm64-v8a/libapp.so"], kg: ["packer"] } });
@@ -259,7 +259,7 @@ test("spawn tags the agent and writes the brief", () => {
 });
 
 test("report capping, task summary, empty report", async () => {
-  const { mm, dir, agents } = setup({ boss: false });
+  const { mm, dir, agents } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   mm.addTask(m, { title: "Unpack" });
   const w = mm.spawnWorker(m, { task: "Unpack", taskId: "t1" });
@@ -284,7 +284,7 @@ test("compactReport of an interrupted worker hints at resuming", () => {
 });
 
 test("summary of a running worker asks it and returns its answer", async () => {
-  const { mm, dir, agents, bus } = setup({ boss: false });
+  const { mm, dir, agents, bus } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   const w = mm.spawnWorker(m, { task: "scan" });
   const p = mm.workerSummary(m, w.id, { timeoutMs: 5000 });
@@ -297,19 +297,19 @@ test("summary of a running worker asks it and returns its answer", async () => {
   assert.match(await mm.workerSummary(m, w.id), /all good/);
 });
 
-test("user message to worker is relayed to boss", async () => {
-  const { mm, dir, agents } = setup({ boss: false });
+test("user message to worker is relayed to orchestrator", async () => {
+  const { mm, dir, agents } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   const w = mm.spawnWorker(m, { task: "scan" });
   await mm.messageWorker(m, w.id, "look at libfoo too", { from: "user" });
   assert.equal(agents.messages[0].text, "[from the user] look at libfoo too");
   assert.match(m.queue.at(-1).text, /The user told worker a-\d+ directly: look at libfoo too/);
-  await mm.messageWorker(m, w.id, "ok", { from: "boss" });
+  await mm.messageWorker(m, w.id, "ok", { from: "orchestrator" });
   assert.equal(m.queue.filter((q) => /told worker/.test(q.text)).length, 1);
 });
 
 test("handoff: a successor continues the task with the note; the old worker's end is not a report", async () => {
-  const { mm, dir, agents } = setup({ boss: false });
+  const { mm, dir, agents } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   mm.addTask(m, { title: "Unpack" });
   const w = mm.spawnWorker(m, { task: "Unpack libapp.so", taskId: "t1" });
@@ -328,11 +328,11 @@ test("handoff: a successor continues the task with the note; the old worker's en
   assert.deepEqual(m.tasks[0].workers, [w.id, next.id]);
 });
 
-test("ask_boss waits for the boss's answer", async () => {
-  const { mm, dir } = setup({ boss: false });
+test("ask_orchestrator waits for the orchestrator's answer", async () => {
+  const { mm, dir } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   const w = mm.spawnWorker(m, { task: "scan" });
-  const p = mm.askBoss(m, w.id, "Which ABI?");
+  const p = mm.askOrchestrator(m, w.id, "Which ABI?");
   const q = m.questions[0];
   assert.match(m.queue[0].text, /asks \(q\d+\):\nWhich ABI\?/);
   assert.equal(mm.answerQuestion(m, q.id, "arm64-v8a"), true);
@@ -341,7 +341,7 @@ test("ask_boss waits for the boss's answer", async () => {
 });
 
 // ------------------------------------------------------------------ review fixes
-test("a boss that exits is stopped before a new one starts (no orphan reattaching)", async () => {
+test("an orchestrator that exits is stopped before a new one starts (no orphan reattaching)", async () => {
   const { mm, dir, bf, clock } = setup();
   mm.create(spec(dir));
   await flush(); await flush();
@@ -351,11 +351,11 @@ test("a boss that exits is stopped before a new one starts (no orphan reattachin
   assert.equal(bf.made.length, 2);
 });
 
-test("a boss that fails to start is retried with backoff", async () => {
+test("an orchestrator that fails to start is retried with backoff", async () => {
   const s = setup();
   let fail = true;
-  const orig = s.bf.createBoss;
-  s.mm.createBoss = (o) => { const b = orig(o); if (fail) b.waitReady = () => Promise.reject(new Error("opencode serve is down")); return b; };
+  const orig = s.bf.createOrchestrator;
+  s.mm.createOrchestrator = (o) => { const b = orig(o); if (fail) b.waitReady = () => Promise.reject(new Error("opencode serve is down")); return b; };
   const m = s.mm.create(spec(s.dir));
   await flush(); await flush(); await flush();
   assert.match(m.errors.lastError, /could not start: opencode serve is down/);
@@ -363,26 +363,26 @@ test("a boss that fails to start is retried with backoff", async () => {
   fail = false;
   await s.clock.tick(15000); await flush(); await flush(); await flush();
   assert.equal(s.bf.made.length, 2);
-  assert.equal(s.bf.made[1].prompts.length, 1, "the briefing reaches the new boss");
+  assert.equal(s.bf.made[1].prompts.length, 1, "the briefing reaches the new orchestrator");
 });
 
-test("a boss whose saved session cannot be reopened gets a fresh briefing", async () => {
-  const s = setup({ boss: false });
+test("an orchestrator whose saved session cannot be reopened gets a fresh briefing", async () => {
+  const s = setup({ orchestrator: false });
   const m = s.mm.create(spec(s.dir));
-  m.boss.sessionFile = "/s/gone.jsonl"; m.tasks.push({ id: "t1", title: "Unpack", status: "active", summary: "", workers: [] });
+  m.orchestrator.sessionFile = "/s/gone.jsonl"; m.tasks.push({ id: "t1", title: "Unpack", status: "active", summary: "", workers: [] });
   s.mm.save(m);
-  const bf = bossFactory(s.bus);
-  const mm2 = new MissionManager({ bus: s.bus, store: s.store, agents: s.agents, createBoss: (o) => { const b = bf.createBoss(o); b.switchSession = () => Promise.reject(new Error("no such session")); return b; }, config: { heartbeatMs: 0 } });
+  const bf = orchestratorFactory(s.bus);
+  const mm2 = new MissionManager({ bus: s.bus, store: s.store, agents: s.agents, createOrchestrator: (o) => { const b = bf.createOrchestrator(o); b.switchSession = () => Promise.reject(new Error("no such session")); return b; }, config: { heartbeatMs: 0 } });
   mm2.reconcile();
   await flush(); await flush(); await flush();
   assert.ok(bf.made[0].prompts.some((p) => /\[active\] t1 Unpack/.test(p.text)), "briefed from the ledger");
 });
 
-test("stop() during a pending start leaves no boss running; resume starts one", async () => {
+test("stop() during a pending start leaves no orchestrator running; resume starts one", async () => {
   const s = setup();
   let release;
-  const orig = s.bf.createBoss;
-  s.mm.createBoss = (o) => { const b = orig(o); if (s.bf.made.length === 1) b.waitReady = () => new Promise((r) => { release = () => { b.sid = "pi:slow"; b.state = { sessionId: "slow", sessionFile: "/s/slow.jsonl" }; r(); }; }); return b; };
+  const orig = s.bf.createOrchestrator;
+  s.mm.createOrchestrator = (o) => { const b = orig(o); if (s.bf.made.length === 1) b.waitReady = () => new Promise((r) => { release = () => { b.sid = "pi:slow"; b.state = { sessionId: "slow", sessionFile: "/s/slow.jsonl" }; r(); }; }); return b; };
   const m = s.mm.create(spec(s.dir));
   await flush();
   await s.mm.stop(m);
@@ -394,7 +394,7 @@ test("stop() during a pending start leaves no boss running; resume starts one", 
 });
 
 test("a handoff whose successor cannot start keeps the worker's own report", async () => {
-  const { mm, dir, agents } = setup({ boss: false });
+  const { mm, dir, agents } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   const w = mm.spawnWorker(m, { task: "Unpack" });
   const start = agents.start.bind(agents);
@@ -402,19 +402,33 @@ test("a handoff whose successor cannot start keeps the worker's own report", asy
   await assert.rejects(mm.handoffWorker(m, w.id, "State: XOR loop at 0x4a20 found; static dump failed; next: dump after relocation."));
   agents.start = start;
   agents.end(w.id, "done", "## Status\ndone\n## Outcome\nunpacked");
-  assert.ok(m.queue.some((q) => q.type === "report" && q.ref === w.id), "its report still reaches the boss");
+  assert.ok(m.queue.some((q) => q.type === "report" && q.ref === w.id), "its report still reaches the orchestrator");
 });
 
-test("a boss chat is recognised by its saved and earlier sessions while the boss is not running", () => {
-  const { mm, dir } = setup({ boss: false });
+test("an orchestrator chat is recognised by its saved and earlier sessions while the orchestrator is not running", () => {
+  const { mm, dir } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
-  m.boss.sessionId = "ses_now"; m.boss.previous = [{ sessionId: "ses_old" }];
-  for (const sid of ["pi:ses_now", "ses_now", "pi:ses_old"]) { assert.equal(mm.bySession(sid)?.id, m.id, sid); assert.equal(mm.isBoss(m, sid), true, sid); }
+  m.orchestrator.sessionId = "ses_now"; m.orchestrator.previous = [{ sessionId: "ses_old" }];
+  for (const sid of ["pi:ses_now", "ses_now", "pi:ses_old"]) { assert.equal(mm.bySession(sid)?.id, m.id, sid); assert.equal(mm.isOrchestrator(m, sid), true, sid); }
   assert.equal(mm.bySession("pi:ses_other"), null);
 });
 
+test("a mission saved with the old boss field names loads as an orchestrator mission", () => {
+  const s = setup({ orchestrator: false });
+  const m = s.mm.create(spec(s.dir));
+  const file = join(s.store.project(s.dir).missionsDir, m.id, "mission.json");
+  const raw = JSON.parse(readFileSync(file, "utf8"));
+  raw["boss"] = raw.orchestrator; raw["bossModel"] = raw.orchestratorModel; delete raw.orchestrator; delete raw.orchestratorModel;
+  writeFileSync(file, JSON.stringify(raw));
+  const mm2 = new MissionManager({ bus: s.bus, store: s.store, agents: s.agents, config: { heartbeatMs: 0 } });
+  mm2.reconcile();
+  const m2 = mm2.get(m.id);
+  assert.deepEqual(m2.orchestratorModel, { provider: "opencode-go", id: "kimi" });
+  assert.ok(m2.orchestrator && !("boss" in m2) && !("bossModel" in m2));
+});
+
 test("bus events carry a slim mission; GET-style pub has everything", () => {
-  const { mm, dir, events } = setup({ boss: false });
+  const { mm, dir, events } = setup({ orchestrator: false });
   const m = mm.create(spec(dir));
   for (let i = 0; i < 60; i++) mm.addNote(m, { kind: "fact", title: `n${i}` });
   const ev = events.filter((e) => e.kind === "mission").at(-1);

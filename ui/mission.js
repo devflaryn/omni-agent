@@ -1,5 +1,5 @@
 /**
- * The Mission view: every mission, and for the open one its layered tree (the boss on top, its workers below, their
+ * The Mission view: every mission, and for the open one its layered tree (the orchestrator on top, its workers below, their
  * subagents under them), live status per node, a detail pane to talk to any node, the user's inbox (notifications),
  * the task tree and the ledger notes. Pure helpers (buildTree, …) are exported for tests.
  */
@@ -12,7 +12,7 @@ const one = (s, n = 140) => { const t = String(s ?? "").replace(/(^|\s)#{1,4}\s+
 
 /**
  * The mission's agents as a tree: `workers` (role worker), each with `children` (agents whose parentSid is that
- * worker's chat, recursively). Agents whose parent is unknown hang under the boss as orphans. Pure.
+ * worker's chat, recursively). Agents whose parent is unknown hang under the orchestrator as orphans. Pure.
  */
 export function buildTree(mission, agents = []) {
   const mine = agents.filter((a) => a && a.missionId === mission?.id);
@@ -37,8 +37,8 @@ export function buildTree(mission, agents = []) {
 /** Unread notifications across missions. Pure. */
 export const unreadCount = (missions) => [...missions].reduce((n, m) => n + (m.notifications || []).filter((x) => !x.read).length, 0);
 
-/** The boss's state for its card. Pure. */
-export function bossState(m, session) {
+/** The orchestrator's state for its card. Pure. */
+export function orchestratorState(m, session) {
   if (m.status === "paused") return { tone: "off", text: "paused" };
   if (m.status === "done") return { tone: "ok", text: "done" };
   if (m.errors?.consecutive) return { tone: "err", text: `retrying (${m.errors.consecutive}) · ${one(m.errors.lastError, 60)}` };
@@ -48,7 +48,7 @@ export function bossState(m, session) {
 }
 
 export function createMissionView({ root, api, toast, onOpenChat, sessionOf = () => null, defaultDir = () => "", defaultModel = () => null }) {
-  const M = { list: new Map(), agents: new Map(), open: null, selected: "boss", tab: "inbox", timer: null, tick: null, models: null, kg: { q: "", text: "", node: "", stats: null, missionId: null } };
+  const M = { list: new Map(), agents: new Map(), open: null, selected: "orchestrator", tab: "inbox", timer: null, tick: null, models: null, kg: { q: "", text: "", node: "", stats: null, missionId: null } };
   const shell = el("div", "ms-shell");
   const side = el("aside", "ms-list");
   const main = el("div", "ms-main");
@@ -125,7 +125,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       const txt = el("span", "ms-row-text"); txt.append(t, sub);
       row.append(dot, txt);
       if (unread) row.append(el("span", "ms-badge", String(unread)));
-      row.onclick = async () => { M.open = m.id; M.selected = "boss"; try { await loadOne(m.id); } catch { /* live events fill it */ } render(); };
+      row.onclick = async () => { M.open = m.id; M.selected = "orchestrator"; try { await loadOne(m.id); } catch { /* live events fill it */ } render(); };
       side.appendChild(row);
     }
   }
@@ -133,7 +133,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   function emptyState() {
     const box = el("div", "ms-empty");
     box.append(el("h2", "ms-empty-title", "Give it a big job and walk away"));
-    box.append(el("p", "ms-empty-sub", "A mission has a boss that only plans and delegates, and workers (OpenCode or Claude Code) that do the work and report back. Everything it learns is kept in Omni's own folder for the project, so it can run for days."));
+    box.append(el("p", "ms-empty-sub", "A mission has an orchestrator that only plans and delegates, and workers (OpenCode or Claude Code) that do the work and report back. Everything it learns is kept in Omni's own folder for the project, so it can run for days."));
     const b = el("button", "btn primary", "New mission"); b.onclick = () => openNew();
     box.append(b);
     return box;
@@ -145,14 +145,14 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     const title = el("div", "ms-title"); title.append(el("span", "", m.title), el("span", `ms-status s-${m.status}`, m.status));
     left.append(title);
     const meta = el("div", "ms-meta mono");
-    const ctx = m.boss?.contextWindow ? ` · context ${Math.round((m.boss.contextUsed / m.boss.contextWindow) * 100)}%` : "";
-    meta.textContent = `${m.dir} · boss ${modelLabel(m.usingFallback ? m.fallbackModel : m.bossModel)}${m.usingFallback ? " (fallback)" : ""} · generation ${m.boss?.generation || 1}${ctx}`;
+    const ctx = m.orchestrator?.contextWindow ? ` · context ${Math.round((m.orchestrator.contextUsed / m.orchestrator.contextWindow) * 100)}%` : "";
+    meta.textContent = `${m.dir} · orchestrator ${modelLabel(m.usingFallback ? m.fallbackModel : m.orchestratorModel)}${m.usingFallback ? " (fallback)" : ""} · generation ${m.orchestrator?.generation || 1}${ctx}`;
     left.append(meta);
     const goal = el("div", "ms-goal", one(m.goal, 400)); goal.title = m.goal;
     left.append(goal);
     const acts = el("div", "ms-head-acts");
     if (m.status === "paused" || m.status === "error") { const b = el("button", "btn small", "Resume"); b.onclick = () => act(`/api/missions/${m.id}/resume`, "Mission resumed"); acts.append(b); }
-    else if (m.status !== "done") { const b = el("button", "btn small", "Pause"); b.title = "Stops the boss and every worker; resume continues from the ledger"; b.onclick = () => { if (window.confirm("Pause this mission? Every worker is stopped; Resume continues from the ledger.")) act(`/api/missions/${m.id}/stop`, "Mission paused"); }; acts.append(b); }
+    else if (m.status !== "done") { const b = el("button", "btn small", "Pause"); b.title = "Stops the orchestrator and every worker; resume continues from the ledger"; b.onclick = () => { if (window.confirm("Pause this mission? Every worker is stopped; Resume continues from the ledger.")) act(`/api/missions/${m.id}/stop`, "Mission paused"); }; acts.append(b); }
     h.append(left, acts);
     return h;
   }
@@ -167,8 +167,8 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     return b;
   }
 
-  function card(n, { boss = false, m } = {}) {
-    const c = el("button", `ms-card${M.selected === n.id ? " on" : ""}${boss ? " boss" : ""}`);
+  function card(n, { orchestrator = false, m } = {}) {
+    const c = el("button", `ms-card${M.selected === n.id ? " on" : ""}${orchestrator ? " orchestrator" : ""}`);
     const top = el("div", "ms-card-top");
     top.append(el("span", `dot ${n.tone}`), el("span", "ms-card-kind", n.kindText));
     if (n.badge) top.append(el("span", "ms-card-badge mono", n.badge));
@@ -186,12 +186,12 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   function tree(m) {
     const t = buildTree(m, [...M.agents.values()]);
     const wrap = el("div", "ms-tree");
-    const bs = bossState(m, m.boss?.sid ? sessionOf(m.boss.sid) : null);
-    const bossRow = el("div", "ms-layer ms-layer-boss");
-    bossRow.append(card({ id: "boss", tone: bs.tone, kindText: "Boss", badge: `gen ${m.boss?.generation || 1}`, title: modelLabel(m.usingFallback ? m.fallbackModel : m.bossModel), line: bs.text, meta: `${m.tasks?.filter((x) => x.status === "done").length || 0}/${m.tasks?.length || 0} tasks done · ${m.workers?.length || 0} workers` }, { boss: true, m }));
-    wrap.append(bossRow);
+    const bs = orchestratorState(m, m.orchestrator?.sid ? sessionOf(m.orchestrator.sid) : null);
+    const orchestratorRow = el("div", "ms-layer ms-layer-orchestrator");
+    orchestratorRow.append(card({ id: "orchestrator", tone: bs.tone, kindText: "Orchestrator", badge: `gen ${m.orchestrator?.generation || 1}`, title: modelLabel(m.usingFallback ? m.fallbackModel : m.orchestratorModel), line: bs.text, meta: `${m.tasks?.filter((x) => x.status === "done").length || 0}/${m.tasks?.length || 0} tasks done · ${m.workers?.length || 0} workers` }, { orchestrator: true, m }));
+    wrap.append(orchestratorRow);
     const all = [...t.workers, ...t.orphans];
-    if (!all.length) { wrap.append(el("div", "ms-tree-empty", m.status === "running" ? "The boss is planning; workers appear here as it starts them." : "No workers.")); return wrap; }
+    if (!all.length) { wrap.append(el("div", "ms-tree-empty", m.status === "running" ? "The orchestrator is planning; workers appear here as it starts them." : "No workers.")); return wrap; }
     const row = el("div", "ms-layer ms-branches");
     for (const w of all) {
       const br = el("div", "ms-branch");
@@ -216,14 +216,14 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       d.append(o);
       return d;
     }
-    if (M.selected === "boss" || !M.agents.get(M.selected)) {
-      M.selected = "boss";
-      d.append(el("div", "ms-detail-title", "Boss"));
+    if (M.selected === "orchestrator" || !M.agents.get(M.selected)) {
+      M.selected = "orchestrator";
+      d.append(el("div", "ms-detail-title", "Orchestrator"));
       const q = m.queue || [];
-      d.append(el("div", "ms-detail-sub", q.length ? `Next for the boss: ${q.map((x) => x.type).join(", ")}` : "Nothing waiting for the boss."));
+      d.append(el("div", "ms-detail-sub", q.length ? `Next for the orchestrator: ${q.map((x) => x.type).join(", ")}` : "Nothing waiting for the orchestrator."));
       const acts = el("div", "ms-detail-acts");
-      if (m.boss?.sid) { const o = el("button", "btn small quiet", "Open the boss's chat"); o.onclick = () => onOpenChat(m.boss.sid); acts.append(o); }
-      d.append(acts, composer("Message the boss…", (text) => act(`/api/missions/${m.id}/message`, "Sent to the boss", { text })));
+      if (m.orchestrator?.sid) { const o = el("button", "btn small quiet", "Open the orchestrator's chat"); o.onclick = () => onOpenChat(m.orchestrator.sid); acts.append(o); }
+      d.append(acts, composer("Message the orchestrator…", (text) => act(`/api/missions/${m.id}/message`, "Sent to the orchestrator", { text })));
       return d;
     }
     const a = M.agents.get(M.selected);
@@ -247,7 +247,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     }
     if (ACTIVE.has(a.status)) { const c = el("button", "btn small quiet", "Stop"); c.onclick = () => { if (window.confirm(`Stop ${a.id}?`)) act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/cancel` : `/api/agents/${a.id}/cancel`, "Stopped"); }; acts.append(c); }
     d.append(acts, out);
-    if (a.kind !== "shell") d.append(composer(a.role === "worker" ? "Message this worker (the boss is told)…" : "Message this subagent…", (text) => act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/message` : `/api/agents/${a.id}/message`, "Sent", { text })));
+    if (a.kind !== "shell") d.append(composer(a.role === "worker" ? "Message this worker (the orchestrator is told)…" : "Message this subagent…", (text) => act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/message` : `/api/agents/${a.id}/message`, "Sent", { text })));
     return d;
   }
 
@@ -279,7 +279,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
 
   function inbox(m, box) {
     const ns = [...(m.notifications || [])].reverse();
-    if (!ns.length) { box.append(el("div", "ms-none", "Nothing yet. The boss notifies you when it needs you or reaches a milestone.")); return; }
+    if (!ns.length) { box.append(el("div", "ms-none", "Nothing yet. The orchestrator notifies you when it needs you or reaches a milestone.")); return; }
     for (const n of ns) {
       const it = el("div", `ms-note u-${n.urgency}${n.read ? "" : " unread"}`);
       const h = el("div", "ms-note-head"); h.append(el("span", `ms-urg u-${n.urgency}`, n.urgency), el("span", "ms-note-title", n.title), el("span", "ms-note-ago", ago(n.at)));
@@ -288,14 +288,14 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       if (n.question) {
         it.append(el("div", "ms-note-q", n.question));
         if (n.answer != null) it.append(el("div", "ms-note-a", `You answered: ${n.answer}`));
-        else it.append(composer("Your answer (goes to the boss)…", (text) => act(`/api/missions/${m.id}/notifications/${n.id}`, "Answer sent to the boss", { answer: text }), `answer-${n.id}`));
+        else it.append(composer("Your answer (goes to the orchestrator)…", (text) => act(`/api/missions/${m.id}/notifications/${n.id}`, "Answer sent to the orchestrator", { answer: text }), `answer-${n.id}`));
       }
       if (!n.read) { const r = el("button", "btn small quiet", "Mark read"); r.onclick = () => act(`/api/missions/${m.id}/notifications/${n.id}`, null, { read: true }); it.append(r); }
       box.append(it);
     }
   }
   function tasks(m, box) {
-    if (!m.tasks?.length) { box.append(el("div", "ms-none", "The boss has not planned any tasks yet.")); return; }
+    if (!m.tasks?.length) { box.append(el("div", "ms-none", "The orchestrator has not planned any tasks yet.")); return; }
     for (const t of m.tasks) {
       const r = el("div", `ms-task t-${t.status}`);
       r.style.setProperty("--d", t.id.split(".").length - 1);
@@ -308,7 +308,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   }
   function ledger(m, box) {
     const notes = [...(m.notes || [])].reverse();
-    if (!notes.length) { box.append(el("div", "ms-none", "Decisions, dead ends and facts the boss records show up here.")); return; }
+    if (!notes.length) { box.append(el("div", "ms-none", "Decisions, dead ends and facts the orchestrator records show up here.")); return; }
     for (const n of notes) {
       const r = el("div", `ms-ledger k-${n.kind}`);
       const h = el("div", "ms-ledger-head"); h.append(el("span", `ms-kind k-${n.kind}`, n.kind.replace("_", " ")), el("span", "ms-ledger-title", n.title), el("span", "ms-note-ago", ago(n.at)));
@@ -356,20 +356,20 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     const wrap = el("div", "ms-dlg-wrap");
     const dlg = el("form", "ms-dlg");
     dlg.append(el("div", "ms-dlg-title", "New mission"));
-    dlg.append(el("div", "ms-dlg-sub", "The boss plans and delegates; workers do the work. Project memory, the knowledge graph and the ledger live in Omni's folder, not in the project."));
+    dlg.append(el("div", "ms-dlg-sub", "The orchestrator plans and delegates; workers do the work. Project memory, the knowledge graph and the ledger live in Omni's folder, not in the project."));
     const field = (label, input, hint) => { const f = el("label", "ms-field"); f.append(el("span", "ms-field-label", label), input); if (hint) f.append(el("span", "ms-field-hint", hint)); dlg.append(f); return input; };
     const dir = field("Project folder", Object.assign(el("input", "mono"), { value: defaultDir(), required: true, spellcheck: false }));
     const goal = field("Goal", Object.assign(el("textarea"), { rows: 6, required: true, placeholder: "e.g. Fully map the login and token-refresh flow of app.apk (lib/arm64-v8a/libapp.so is packed); document every key, offset and request, and write a working client for it." }));
     const title = field("Title (optional)", el("input"));
     const list = await models();
     const sel = (withNone) => { const s = el("select"); if (withNone) s.append(Object.assign(el("option", "", "None"), { value: "" })); for (const x of list) s.append(Object.assign(el("option", "", `${x.provider}/${x.id}${x.contextWindow ? ` · ${fmtN(x.contextWindow)}` : ""}`), { value: `${x.provider}/${x.id}` })); return s; };
-    const boss = field("Boss model", sel(false), "Pick a model with a large context window; the boss only reads summaries.");
-    const dm = defaultModel(); if (dm) boss.value = modelLabel(dm);
-    const fb = field("Fallback model", sel(true), "Used when the boss's model keeps failing (rate limits, outages); the primary is tried again after an hour.");
+    const orchestrator = field("Orchestrator model", sel(false), "Pick a model with a large context window; the orchestrator only reads summaries.");
+    const dm = defaultModel(); if (dm) orchestrator.value = modelLabel(dm);
+    const fb = field("Fallback model", sel(true), "Used when the orchestrator's model keeps failing (rate limits, outages); the primary is tried again after an hour.");
     const wk = el("div", "ms-seg");
     let kind = "pi";
     for (const [k, l] of [["pi", "OpenCode"], ["claude", "Claude Code"]]) { const b = el("button", `seg-btn${k === kind ? " active" : ""}`, l); b.type = "button"; b.onclick = () => { kind = k; for (const x of wk.children) x.classList.toggle("active", x === b); }; wk.append(b); }
-    field("Default workers", wk, "The boss still picks per task.");
+    field("Default workers", wk, "The orchestrator still picks per task.");
     const wm = field("Worker model (optional)", Object.assign(el("input", "mono"), { placeholder: "provider/id for OpenCode, a Claude model id for Claude Code" }));
     const acts = el("div", "ms-dlg-acts");
     const cancel = el("button", "btn quiet", "Cancel"); cancel.type = "button"; cancel.onclick = () => wrap.remove();
@@ -380,8 +380,8 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       e.preventDefault();
       go.disabled = true;
       try {
-        const r = await api("/api/missions", { dir: dir.value.trim(), goal: goal.value.trim(), title: title.value.trim() || undefined, bossModel: boss.value, fallbackModel: fb.value || undefined, workerKind: kind, workerModel: wm.value.trim() || undefined });
-        M.list.set(r.mission.id, r.mission); M.open = r.mission.id; M.selected = "boss";
+        const r = await api("/api/missions", { dir: dir.value.trim(), goal: goal.value.trim(), title: title.value.trim() || undefined, orchestratorModel: orchestrator.value, fallbackModel: fb.value || undefined, workerKind: kind, workerModel: wm.value.trim() || undefined });
+        M.list.set(r.mission.id, r.mission); M.open = r.mission.id; M.selected = "orchestrator";
         wrap.remove(); toast("Mission started"); render();
       } catch (err) { toast(err.message, true); go.disabled = false; }
     };

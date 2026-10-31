@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bossState, buildTree, unreadCount } from "../ui/mission.js";
+import { orchestratorState, buildTree, unreadCount } from "../ui/mission.js";
 
 const m = { id: "m-1", status: "running", queue: [], errors: { consecutive: 0 } };
 const a = (id, x) => ({ id, kind: "pi", status: "running", title: id, missionId: "m-1", createdAt: Number(id.slice(2)), activity: [], ...x });
@@ -19,16 +19,16 @@ test("buildTree: workers, their subagents (recursively) and orphans; other missi
   assert.deepEqual(t.workers[0].children.map((c) => c.id), ["a-3"]);
   assert.deepEqual(t.workers[0].children[0].children.map((c) => c.id), ["a-4"]);
   assert.deepEqual(t.orphans.map((o) => o.id), ["a-5"]);
-  assert.equal(t.layers, 4, "boss, workers, subagents, sub-subagents");
+  assert.equal(t.layers, 4, "orchestrator, workers, subagents, sub-subagents");
   assert.equal(buildTree(m, []).layers, 1);
   const withSubs = buildTree(m, [a("a-7", { role: "worker", kind: "claude", sid: "claude:x", subtasks: [{ id: "toolu_1", title: "Explore auth", status: "running", startedAt: 1 }] })]);
   assert.deepEqual(withSubs.workers[0].children.map((c) => [c.id, c.kind, c.status]), [["a-7/toolu_1", "claude-sub", "running"]]);
 });
 
-test("bossState and unreadCount", () => {
-  assert.equal(bossState({ ...m, status: "paused" }).text, "paused");
-  assert.equal(bossState({ ...m, errors: { consecutive: 2, lastError: "429" } }).tone, "err");
-  assert.equal(bossState(m, { streaming: true }).text, "thinking");
-  assert.match(bossState({ ...m, queue: [{}, {}] }).text, /2 queued/);
+test("orchestratorState and unreadCount", () => {
+  assert.equal(orchestratorState({ ...m, status: "paused" }).text, "paused");
+  assert.equal(orchestratorState({ ...m, errors: { consecutive: 2, lastError: "429" } }).tone, "err");
+  assert.equal(orchestratorState(m, { streaming: true }).text, "thinking");
+  assert.match(orchestratorState({ ...m, queue: [{}, {}] }).text, /2 queued/);
   assert.equal(unreadCount([{ notifications: [{ read: false }, { read: true }] }, { notifications: [{ read: false }] }]), 2);
 });
