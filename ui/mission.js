@@ -8,7 +8,7 @@ import { el, ago, agentTone, agentElapsed, fmtN } from "./lib.js";
 const ACTIVE = new Set(["queued", "starting", "running"]);
 const kindLabel = (k) => (k === "claude" ? "Claude Code" : k === "shell" ? "Shell" : "OpenCode");
 const modelLabel = (m) => (m ? (m.provider ? `${m.provider}/${m.id}` : m.id) : "");
-const one = (s, n = 140) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+const one = (s, n = 140) => { const t = String(s ?? "").replace(/(^|\s)#{1,4}\s+/g, "$1").replace(/\*\*/g, "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 
 /**
  * The mission's agents as a tree: `workers` (role worker), each with `children` (agents whose parentSid is that
@@ -46,7 +46,7 @@ export function bossState(m, session) {
 }
 
 export function createMissionView({ root, api, toast, onOpenChat, sessionOf = () => null, defaultDir = () => "", defaultModel = () => null }) {
-  const M = { list: new Map(), agents: new Map(), open: null, selected: "boss", tab: "inbox", timer: null, tick: null, models: null };
+  const M = { list: new Map(), agents: new Map(), open: null, selected: "boss", tab: "inbox", timer: null, tick: null, models: null, kg: { q: "", text: "", node: "", stats: null, missionId: null } };
   const shell = el("div", "ms-shell");
   const side = el("aside", "ms-list");
   const main = el("div", "ms-main");
@@ -242,14 +242,14 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     const p = el("aside", "ms-side");
     const tabs = el("div", "ms-tabs");
     const unread = (m.notifications || []).filter((x) => !x.read).length;
-    for (const [k, label] of [["inbox", `Inbox${unread ? ` (${unread})` : ""}`], ["tasks", `Tasks (${m.tasks?.length || 0})`], ["ledger", "Ledger"]]) {
+    for (const [k, label] of [["inbox", `Inbox${unread ? ` (${unread})` : ""}`], ["tasks", `Tasks (${m.tasks?.length || 0})`], ["ledger", "Ledger"], ["kg", "Knowledge"]]) {
       const b = el("button", `seg-btn${M.tab === k ? " active" : ""}`, label);
       b.onclick = () => { M.tab = k; render(); };
       tabs.append(b);
     }
     p.append(tabs);
     const box = el("div", "ms-side-body");
-    if (M.tab === "inbox") inbox(m, box); else if (M.tab === "tasks") tasks(m, box); else ledger(m, box);
+    if (M.tab === "inbox") inbox(m, box); else if (M.tab === "tasks") tasks(m, box); else if (M.tab === "kg") knowledge(m, box); else ledger(m, box);
     p.append(box);
     return p;
   }
@@ -292,6 +292,33 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       r.append(h);
       if (n.body) r.append(el("div", "ms-ledger-body", n.body));
       box.append(r);
+    }
+  }
+
+  /** The project's knowledge graph: what it holds, a search, one node with its neighbours (ids are clickable). */
+  function knowledge(m, box) {
+    const K = M.kg;
+    if (K.missionId !== m.id) Object.assign(K, { missionId: m.id, q: "", text: "", node: "", stats: null });
+    if (!K.stats) { K.stats = "loading"; api(`/api/missions/${m.id}/kg/stats`).then((s) => { K.stats = s; schedule(); }, () => { K.stats = { nodes: 0, edges: 0, byKind: {} }; schedule(); }); }
+    const st = K.stats && K.stats !== "loading" ? K.stats : null;
+    box.append(el("div", "ms-kg-stats mono", st ? `${fmtN(st.nodes)} nodes · ${fmtN(st.edges)} edges${Object.keys(st.byKind || {}).length ? ` · ${Object.entries(st.byKind).map(([k, n]) => `${fmtN(n)} ${k}`).join(" · ")}` : ""}` : "…"));
+    if (st && !st.nodes) box.append(el("div", "ms-none", "Empty so far. Workers seed it with kg_import (graphify for source, Ghidra for binaries) and add what they learn with kg_upsert."));
+    const f = el("form", "ms-kg-search");
+    const inp = Object.assign(el("input", "mono"), { type: "search", placeholder: "Search functions, strings, files…", value: K.q });
+    f.append(inp);
+    f.onsubmit = async (e) => { e.preventDefault(); K.q = inp.value.trim(); K.node = ""; if (!K.q) { K.text = ""; render(); return; } try { K.text = (await api(`/api/missions/${m.id}/kg/search?q=${encodeURIComponent(K.q)}`)).text; } catch (err) { K.text = err.message; } render(); };
+    box.append(f);
+    const show = async (id) => { K.node = id; try { K.text = (await api(`/api/missions/${m.id}/kg/node?id=${encodeURIComponent(id)}`)).text; } catch (err) { K.text = err.message; } render(); };
+    if (K.text) {
+      const out = el("div", "ms-kg-out mono");
+      for (const line of K.text.split("\n")) {
+        const row = el("div", "ms-kg-line");
+        const id = /^\s*(?:\w+ )?([a-z]+:[^\s]+)/.exec(line)?.[1];
+        if (id && id !== K.node) { const b = el("button", "ms-kg-id", id); b.onclick = () => show(id); row.append(document.createTextNode(line.slice(0, line.indexOf(id))), b, document.createTextNode(line.slice(line.indexOf(id) + id.length))); }
+        else row.textContent = line;
+        out.append(row);
+      }
+      box.append(out);
     }
   }
 
