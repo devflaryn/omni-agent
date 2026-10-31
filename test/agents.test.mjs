@@ -124,6 +124,26 @@ test("depth: the chat (0) and its agents (1) may start agents; an agent at depth
   m.dispose();
 });
 
+test("mission subagents inherit missionId and may nest 3 deep; a custom footer replaces the default one", async () => {
+  const { m, pis } = setup({ opts: nodeShell });
+  const w = m.start({ task: "worker task", parentSid: "mission:m-1", depth: 0, missionId: "m-1", taskId: "t1", role: "worker", footer: "\n\nWORKER CONTRACT" });
+  assert.equal(w.missionId, "m-1"); assert.equal(w.role, "worker"); assert.equal(w.taskId, "t1");
+  await until(() => m.get(w.id).status === "running");
+  assert.ok(pis.made[0].prompts[0].text.endsWith("WORKER CONTRACT"));
+  assert.equal(pis.made[0].opts.meta.missionId, "m-1");
+  const s1 = m.start({ task: "sub", parentSid: m.get(w.id).sid });
+  assert.equal(s1.missionId, "m-1"); assert.equal(s1.role, "subagent"); assert.equal(s1.depth, 2);
+  await until(() => m.get(s1.id).status === "running");
+  assert.ok(pis.made[1].prompts[0].text.endsWith(AGENT_FOOTER));
+  const s2 = m.start({ task: "subsub", parentSid: m.get(s1.id).sid });
+  assert.equal(s2.depth, 3);
+  await until(() => m.get(s2.id).status === "running");
+  assert.throws(() => m.start({ task: "too deep", parentSid: m.get(s2.id).sid }), (e) => e.status === 400 && /nest at most 3 deep/.test(e.message));
+  assert.throws(() => m.start({ task: "x", depth: 2 }), (e) => /nest at most 2 deep/.test(e.message), "outside missions the limit is unchanged");
+  await m.stopAll();
+  m.dispose();
+});
+
 test("depth: without one in the spec, the caller's depth comes from its parent agent's record (an agent's own chat → its depth; any other chat → 0)", async () => {
   const { m } = setup({ opts: nodeShell });
   const a = m.start({ task: "look around", parentSid: "pi:main" });

@@ -103,7 +103,7 @@ export class AgentManager extends EventEmitter {
     super();
     this.setMaxListeners(500);
     this.bus = bus;
-    this.config = { maxConcurrent: 6, maxDepth: 2, maxMinutes: 360, claudePermissionMode: "bypassPermissions", claudeMaxTurns: 300, claudeModel: "", ...config };
+    this.config = { maxConcurrent: 6, maxDepth: 2, missionMaxDepth: 3, maxMinutes: 360, claudePermissionMode: "bypassPermissions", claudeMaxTurns: 300, claudeModel: "", ...config };
     this.file = file; this.dir = dir; this.personasDir = personasDir;
     this.createPi = createPi; this.claude = claude; this.keeper = keeper; this.composeSystem = composeSystem;
     this.piEnv = piEnv; this.shellPath = shellPath; this.shellArgs = shellArgs; this.cwd = cwd;
@@ -197,9 +197,13 @@ export class AgentManager extends EventEmitter {
     // A shared `opencode serve` cannot hand each chat its own OMNI_AGENT_DEPTH, so a caller that gives none (the
     // OpenCode plugin) is placed by its chat: an agent's own chat is at that agent's depth, any other chat at 0.
     const given = s.depth !== undefined && s.depth !== null && s.depth !== "";
-    const callerDepth = Math.max(0, Math.floor(Number(given ? s.depth : this.agentBySid(s.parentSid)?.depth) || 0));
+    const parentAgent = this.agentBySid(s.parentSid);
+    const callerDepth = Math.max(0, Math.floor(Number(given ? s.depth : parentAgent?.depth) || 0));
+    // Inside a mission (a worker, or anything a worker starts) agents may nest one level deeper.
+    const missionId = s.missionId ? String(s.missionId) : parentAgent?.missionId || null;
+    const maxDepth = missionId ? Math.max(this.config.maxDepth, Number(this.config.missionMaxDepth) || 3) : this.config.maxDepth;
     // A shell job cannot start anything itself, so the nesting limit only applies to agents.
-    if (kind !== "shell" && callerDepth + 1 > this.config.maxDepth) throw bad(`agents nest at most ${this.config.maxDepth} deep and this caller is already at depth ${callerDepth}: do this work yourself instead of starting another agent`);
+    if (kind !== "shell" && callerDepth + 1 > maxDepth) throw bad(`agents nest at most ${maxDepth} deep and this caller is already at depth ${callerDepth}: do this work yourself instead of starting another agent`);
     let persona = null;
     if (s.agent) { if (kind === "shell") throw bad("a shell job takes no agent persona"); persona = this.persona(s.agent); }
     const cwd = String(s.cwd || this.cwd || process.cwd());
@@ -220,6 +224,8 @@ export class AgentManager extends EventEmitter {
       timeoutMinutes: minutes(s.timeoutMinutes, kind === "shell" ? SHELL_TIMEOUT_MIN : this.config.maxMinutes),
       resume: s.resume ? String(s.resume) : null, steer: !!s.steer,
       memory: !!s.memory, graph: !!s.graph,
+      missionId, taskId: s.taskId ? String(s.taskId) : null, role: s.role ? String(s.role) : missionId ? "subagent" : null,
+      footer: s.footer ? clip(String(s.footer), 8000) : null,
     };
     this.records.set(id, rec);
     this.runtime(id).task = kind === "shell" ? command : task;
@@ -289,7 +295,7 @@ export class AgentManager extends EventEmitter {
     const model = rec.model || persona?.model || "";
     const provider = rec.model ? rec.provider : persona?.model ? "" : rec.provider;
     const env = { ...this.piEnv, OMNI_AGENT_ID: rec.id, OMNI_AGENT_DEPTH: String(rec.depth), OMNI_PARENT_SID: rec.parentSid || "" };
-    const pi = this.createPi({ cwd: rec.cwd, model, provider, thinking: rec.thinking, env, system, tools, meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "pi" } });
+    const pi = this.createPi({ cwd: rec.cwd, model, provider, thinking: rec.thinking, env, system, tools, meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "pi", ...(rec.missionId ? { missionId: rec.missionId, role: rec.role } : {}) } });
     rt.pi = pi;
     pi.on?.("exit", (code) => this.onPiExit(rec.id, gen, pi, code));
     pi.start();
@@ -310,7 +316,7 @@ export class AgentManager extends EventEmitter {
     rec.lastActivityAt = this.now();
     this.touch(rec);
     rt.prompted = true;
-    const r = await pi.prompt(text + AGENT_FOOTER, { echo: true });
+    const r = await pi.prompt(text + (rec.footer || AGENT_FOOTER), { echo: true });
     if (r && r.success === false) throw new Error(r.error || "OpenCode refused the prompt");
   }
 
@@ -377,10 +383,10 @@ export class AgentManager extends EventEmitter {
     const extra = (rec.memory || rec.graph) && this.composeSystem ? await Promise.resolve(this.composeSystem(rec, followup ?? rt.task)).catch(() => "") : "";
     if (rt.gen !== gen || rt.stopping) return;
     const r = this.claude.run({
-      prompt: (followup ?? rt.task) + AGENT_FOOTER, cwd: rec.cwd, model: rec.model || this.config.claudeModel || undefined,
+      prompt: (followup ?? rt.task) + (rec.footer || AGENT_FOOTER), cwd: rec.cwd, model: rec.model || this.config.claudeModel || undefined,
       interactive: true, autonomous: true, permissionMode: this.config.claudePermissionMode, maxTurns: this.config.claudeMaxTurns,
       title: rec.title, name: rec.title, appendSystem: [persona?.body, extra].filter(Boolean).join("\n\n") || undefined,
-      meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "claude" }, resume: resume || undefined,
+      meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "claude", ...(rec.missionId ? { missionId: rec.missionId, role: rec.role } : {}) }, resume: resume || undefined,
     });
     if (rt.gen !== gen) return;
     rt.run = this.claude.runs?.get?.(r.sid) || null;
