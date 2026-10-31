@@ -190,6 +190,50 @@ The registry lives in `~/.omni-agent/agents.json`; agents that were running when
 path: it waits up to `timeoutMinutes` and leaves Claude running in the background after that. For quick parallel
 lookups OpenCode's own `task` tool (its subagents) is there too.
 
+### Missions: a boss, its workers, and a project knowledge store
+
+For jobs that run for days (a large refactor, reverse engineering an obfuscated app), open **Missions** (the tree
+icon in the top bar, or `/#missions`) and start one: a project folder, a goal, a **boss model** and a **fallback model**
+(any OpenCode model; pick a large context window), and the default worker kind.
+
+- **The boss** (`server/missions.mjs`, `server/boss-prompt.mjs`) is an OpenCode chat whose only tools are
+  orchestration tools: `mission_state`, `task_add/update`, `worker_spawn/message/summary/cancel`, `note`
+  (decision / dead end / fact / risk / lesson), `kg_search/node`, `memory_recall`, `notify`, `mission_done`. It cannot
+  read files or run commands, and every tool result is capped at 4000 characters, so its context lasts. It is prompted
+  with compact `[mission …]` deliveries from a queue that is saved to disk: worker reports, worker questions, your messages,
+  a heartbeat while workers run.
+- **Workers** are background agents (OpenCode or Claude Code, the boss picks per task) with a brief, a scope (files,
+  memory notes, graph queries) and a contract: record findings as they go, `ask_boss` only when truly blocked,
+  `handoff` to a fresh worker when their context is spent, finish with a fixed report (`## Status`, `## Outcome`,
+  `## What works`, `## Tried and failed`, `## Errors`, `## Artifacts`, `## Knowledge recorded`,
+  `## Open questions / next`). The boss gets the report capped at 8000 characters; the full one is kept. Workers can
+  start subagents (missions nest 3 deep); Claude Code workers get the mission tools over MCP (`/mcp?agent=<id>`) and
+  their own Task subagents show in the tree too.
+- **It does not stop.** A failed boss turn (an API error, a rate limit, a turn that ends without a reply) is retried
+  with backoff (15 s doubling to 10 min). After 3 failures in a row it switches to the fallback model and tells you
+  once, then tries the primary again after an hour. A dead boss chat is reopened on its session. Workers keep running
+  meanwhile and their reports wait in the queue. When the boss's context passes 60 % of its window, a fresh boss
+  continues from the ledger. After an Omni restart every running mission resumes, and its interrupted workers are
+  reported to the boss.
+- **You, live:** the Mission view shows the boss on top, its workers below it and their subagents under them, with
+  status, last activity, run time and cost. Click any node to message it, ask a worker for a summary, read a report
+  or open its chat; the boss is told what you said to a worker. The **Inbox** has the boss's `notify` messages, and
+  you can answer their questions there. A notification is only stored and shown (here and on the remote page); phone
+  delivery comes later. The **Tasks**, **Ledger** and **Knowledge** tabs show the task tree, the notes and the graph.
+- **Storage, outside the project folder:** `~/.omni-agent/projects/<name>-<hash>/` (`projectsDir`) holds
+  `missions/<id>/` (`mission.json`, `ledger.md`, `events.jsonl`, `reports/`, `workers/<id>/brief.md`,
+  `handoff.md`), `memory/` (the project's own vault; mission agents' `memory_*` tools use it, not the global one),
+  `graph/kg.sqlite` and `artifacts/`.
+- **Knowledge graph** (`server/kgraph.mjs`, `node:sqlite` with FTS5): nodes (function, string, offset, struct, file,
+  symbol, …) with a status (unknown → hypothesis → confirmed), confidence and evidence, plus edges (calls, xref,
+  decrypts, imports, …). Workers seed it with `kg_import`: `graphify` for a source repo (a `graphify-out/` it has to
+  build is moved out of the repo), or `ghidra` for a binary. Ghidra runs headless as a background job with
+  `integrations/ghidra/OmniExport.java`, and its functions, calls, strings with their referencing functions, imports
+  and exports are loaded when the job ends. Workers then add what they learn with `kg_upsert`. Settings:
+  `ghidraHeadless` (found under `~/re-tools/ghidra` by default) and `ghidraProjectsDir` (Ghidra rejects paths with a
+  dot-folder, so this defaults to `%LOCALAPPDATA%\OmniAgent\ghidra`). `missions` in `omni.config.json` overrides the
+  timings (`retryBaseMs`, `fallbackAfter`, `primaryRetryMs`, `heartbeatMs`, `rebirthAt`, …).
+
 ## What you get
 
 - **Home**: one container. "What should we work on?", the composer, the working directory (recent
