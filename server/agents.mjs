@@ -295,7 +295,7 @@ export class AgentManager extends EventEmitter {
     const model = rec.model || persona?.model || "";
     const provider = rec.model ? rec.provider : persona?.model ? "" : rec.provider;
     const env = { ...this.piEnv, OMNI_AGENT_ID: rec.id, OMNI_AGENT_DEPTH: String(rec.depth), OMNI_PARENT_SID: rec.parentSid || "" };
-    const pi = this.createPi({ cwd: rec.cwd, model, provider, thinking: rec.thinking, env, system, tools, meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "pi", ...(rec.missionId ? { missionId: rec.missionId, role: rec.role } : {}) } });
+    const pi = this.createPi({ cwd: rec.cwd, model, provider, thinking: rec.thinking, env, system, tools, meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "pi", ...(rec.missionId ? { missionId: rec.missionId, missionRole: rec.role } : {}) } });
     rt.pi = pi;
     pi.on?.("exit", (code) => this.onPiExit(rec.id, gen, pi, code));
     pi.start();
@@ -386,7 +386,7 @@ export class AgentManager extends EventEmitter {
       prompt: (followup ?? rt.task) + (rec.footer || AGENT_FOOTER), cwd: rec.cwd, model: rec.model || this.config.claudeModel || undefined,
       interactive: true, autonomous: true, permissionMode: this.config.claudePermissionMode, maxTurns: this.config.claudeMaxTurns,
       title: rec.title, name: rec.title, appendSystem: [persona?.body, extra].filter(Boolean).join("\n\n") || undefined,
-      meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "claude", ...(rec.missionId ? { missionId: rec.missionId, role: rec.role } : {}) }, resume: resume || undefined,
+      meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "claude", ...(rec.missionId ? { missionId: rec.missionId, missionRole: rec.role } : {}) }, resume: resume || undefined,
     });
     if (rt.gen !== gen) return;
     rt.run = this.claude.runs?.get?.(r.sid) || null;

@@ -10,6 +10,7 @@ import { initResizers } from "./resizer.js";
 import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
 import { createRemote } from "./remote.js";
 import { createStream } from "./stream.js";
+import { createMissionView } from "./mission.js";
 
 const $ = (s) => document.querySelector(s);
 // agents: background agents by id (/api/state + live `agent` events); agentSids: an agent chat's sid → agent id;
@@ -234,6 +235,7 @@ function showView(name) {
   document.body.classList.toggle("in-chat", name === "chat");
   // Both composers share the remembered attachment choices (memory / repo graph).
   if (name === "home") { setExplorer(false); home.reloadOptions(); renderHome(); home.focus(); }
+  if (name === "mission") { setExplorer(false); missionView.load(); }
   if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth > 760 && explorerPreferred()); chat.reloadOptions(); updateHeader(); updateComposer(); }
   renderSummary();
   renderAgents();
@@ -465,6 +467,8 @@ $("#brand").onclick = () => showView("home");
 function target() {
   const s = S.sessions.get(S.selected);
   if (!s) return { kind: "none" };
+  // A mission boss's chat: a message goes to the mission (front of the boss's queue), never to Omni's main pi.
+  if (s.missionRole === "boss" && s.missionId) return { kind: "boss", s };
   // A background agent's chat talks to that agent (steer / follow up / resume), never to Omni's main pi.
   if (isAgentChat(s)) { const a = agentFor(s.sid) || S.agents.get(s.agentId) || null; return { kind: "agent", s, a, id: a?.id || s.agentId || "", active: AGENT_ACTIVE.has(a?.status) }; }
   if (s.harness === "claude") return { kind: "claude", s };
@@ -486,6 +490,7 @@ function updateComposer() {
     st.caption = !t.id ? "Background agent · view only" : t.active ? `${agentKindLabel(t.a?.kind || t.s.agentKind)} at work · a message steers it, empty send stops it` : `${agentKindLabel(t.a?.kind || t.s.agentKind)} · ${t.a?.status || "finished"} · a message picks it up again`;
   }
   else if (t.kind === "claude") { st.caption = "Claude Code chat · view only in Omni"; st.disabled = true; }
+  else if (t.kind === "boss") { Object.assign(st, { hook: null, streaming: false, caption: "Mission boss · your message goes to the boss first, ahead of worker reports" }); }
   else if (t.kind === "owned-pi") {
     // pi is idle while the goal hook waits to retry or check, but the chat is not: Stop must reach the hook too.
     const armed = !t.streaming && !!t.s.hookArmed;
@@ -521,6 +526,7 @@ async function chatSend(text, o) {
       if (r?.sid && r.sid !== S.selected) selectSession(r.sid);
       return;
     }
+    if (t.kind === "boss") { await sendClearing(chat, text, () => api(`/api/missions/${encodeURIComponent(t.s.missionId)}/message`, { text })); return; }
     if (t.kind === "agent") {
       if (!t.id) return;
       const r = await sendClearing(chat, text, () => api(`/api/agents/${encodeURIComponent(t.id)}/message`, { text }));
@@ -614,6 +620,13 @@ document.addEventListener("click", (e) => { if (!e.target.closest("#chatMenu, #b
 $("#btnExplorer").onclick = () => { explorer.setRoot(currentDir()); setExplorer(!document.body.classList.contains("explorer-open"), true); };
 $("#btnSummary").onclick = () => { try { localStorage.setItem("omni.summary", summaryOn() ? "off" : "on"); } catch { /* */ } renderSummary(); };
 $("#btnSettings").onclick = () => settings.open();
+// Missions: the boss/worker view (ui/mission.js). Its badge counts unread notifications across missions.
+const missionView = createMissionView({
+  root: $("#view-mission"), api, toast, onOpenChat: (sid) => openChat(sid), sessionOf: (sid) => S.sessions.get(sid) || null,
+  defaultDir: () => homeCwd(), defaultModel: () => S.pi.state?.model?.id ? { provider: S.pi.state.model.provider || "", id: S.pi.state.model.id } : (S.config?.piModel ? { provider: S.config.piProvider || "", id: S.config.piModel } : null),
+});
+missionView.onBadge((n) => { const b = $("#missionsBadge"); b.hidden = !n; b.textContent = n > 99 ? "99+" : String(n); });
+$("#btnMissions").onclick = () => showView("mission");
 
 // ------------------------------------------------------------------ SSE
 // seq + boot let a reconnect ask for exactly what it missed (server/bus.mjs addClient).
@@ -649,7 +662,9 @@ let railTimer = null;
 function handle(ev) {
   S.seq = Math.max(S.seq, ev.seq || 0);
   // A background agent's record changed (`sid` is its parent chat, or "agents"): no chat of its own to update.
-  if (ev.kind === "agent") { onAgent(ev.agent); return; }
+  if (ev.kind === "agent") { onAgent(ev.agent); if (ev.agent?.missionId) missionView.onAgent(ev.agent); return; }
+  if (ev.kind === "mission") { missionView.onMission(ev.mission); return; }
+  if (ev.kind === "notify") { if ((ev.ts || 0) >= BOOT_TS) missionView.onNotify(ev); return; }
   // Which chats have a pi child right now (one per chat that runs at once).
   if (ev.kind === "pis") { setPiChats(ev.pis); if (S.page === "chat") updateComposer(); return; }
   if (ev.kind === "removed") { S.sessions.delete(ev.sid); S.buffers.delete(ev.sid); if (S.selected === ev.sid) { S.selected = null; S.view = null; showView("home"); } history.render(); return; }
@@ -658,10 +673,10 @@ function handle(ev) {
   if (ev.kind === "session") {
     Object.assign(s, Object.fromEntries(Object.entries({ cwd: ev.cwd, title: ev.title ? cleanTitle(ev.title) || undefined : undefined, model: ev.model, file: ev.file, owned: ev.owned, forkedFrom: ev.forkedFrom }).filter(([, v]) => v != null)));
     // A background agent's chat names the chat that started it and its agent (OpencodeRpc / ClaudeRunner `meta`).
-    for (const k of ["parentSid", "agentId", "agentKind"]) if (ev[k]) s[k] = ev[k];
+    for (const k of ["parentSid", "agentId", "agentKind", "missionId", "missionRole"]) if (ev[k]) s[k] = ev[k];
     if (ev.agentId) S.agentSids.set(ev.sid, ev.agentId);
   }
-  if (ev.kind === "status") applyStatus(s, ev);
+  if (ev.kind === "status") { applyStatus(s, ev); if (s.missionRole === "boss" && S.page === "mission") missionView.onStatus(ev); }
   if (ev.kind === "msg" && ev.role === "user" && !s.title) s.title = cleanTitle(ev.blocks?.[0]?.text || "");
   if (ev.kind === "msg" && ev.usage) { const t = s.tally || (s.tally = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, messages: 0, cost: 0, context: 0 }); if (!ev.groupId || t.lastGroup !== ev.groupId) { t.lastGroup = ev.groupId; t.input += ev.usage.input; t.output += ev.usage.output; t.cacheRead += ev.usage.cacheRead; t.cacheWrite += ev.usage.cacheWrite; t.total += ev.usage.total; t.messages++; t.context = ev.usage.input + ev.usage.cacheRead + ev.usage.cacheWrite; t.cost += ev.cost || 0; } }
   if (ev.kind !== "session") s.lastActivity = Math.max(s.lastActivity || 0, ev.ts || 0);
@@ -673,7 +688,7 @@ function handle(ev) {
   if (ev.kind === "hook" && ev.attempt) { goalBox(s).nudges = ev.attempt; if (ev.sid === S.selected) renderSummary(); }
   S.sessions.set(ev.sid, s);
   // A background pi agent is owned too, but it is its own pi process: it must not pass for Omni's main pi.
-  if (ev.harness === "pi" && s.owned && !isAgentChat(s)) {
+  if (ev.harness === "pi" && s.owned && !isAgentChat(s) && !s.missionId) {
     S.pi.running = true;
     if (ev.kind === "session") {
       if (ev.cwd) S.pi.cwd = ev.cwd;
@@ -712,7 +727,8 @@ async function init() {
   if (st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
   history.render();
-  showView("home");
+  // #missions opens the Mission view (a link, a bookmark, the phone's home screen).
+  showView(location.hash === "#missions" ? "mission" : "home");
   stream.start();
   setInterval(() => { if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "chat") updateComposer(); }, 15000);
 }

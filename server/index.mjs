@@ -379,7 +379,7 @@ export async function createApp(overrides = {}) {
     // Gated on !restoring so the transient empty session a fresh child opens during a crash restart
     // cannot clobber the resume anchor before resumeSession() reads it (C1).
     // A background pi agent announces an owned session too; it must never become the main chat's resume anchor.
-    if (ev.kind === "session" && ev.owned && ev.harness === "pi" && !ev.agentId) {
+    if (ev.kind === "session" && ev.owned && ev.harness === "pi" && !ev.agentId && !ev.missionId) {
       const c = piFor(ev.sid);
       if (ev.file && !c?.restoring) {
         if (c) c.resumeFile = ev.file;

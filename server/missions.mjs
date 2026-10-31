@@ -246,7 +246,7 @@ export class MissionManager extends EventEmitter {
     if (!this.createBoss) throw new Error("missions: no boss factory");
     rt.starting = (async () => {
       const model = m.usingFallback && m.fallbackModel ? m.fallbackModel : m.bossModel;
-      const boss = this.createBoss({ cwd: m.dir, model: model.id, provider: model.provider, system: BOSS_SYSTEM, tools: [...BOSS_TOOLS], meta: { missionId: m.id, role: "boss", title: `Boss · ${m.title}` } });
+      const boss = this.createBoss({ cwd: m.dir, model: model.id, provider: model.provider, system: BOSS_SYSTEM, tools: [...BOSS_TOOLS], meta: { missionId: m.id, missionRole: "boss", title: `Boss · ${m.title}` } });
       rt.boss = boss; rt.ready = false; rt.inFlight = null;
       boss.on?.("exit", (code) => this.onBossExit(m, boss, code));
       boss.start?.();
@@ -311,7 +311,7 @@ export class MissionManager extends EventEmitter {
     if (!item) return;
     rt.pumping = true;
     try {
-      rt.inFlight = item.id; rt.sawStreaming = false; rt.turnError = null;
+      rt.inFlight = item.id; rt.sawStreaming = false; rt.turnError = null; rt.sawReply = false;
       this.clearTimerOf(rt, "turn");
       rt.timers.turn = this.later(this.config.turnTimeoutMs, () => { rt.timers.turn = null; if (rt.inFlight === item.id) this.onBossTurnEnd(m, { error: "the boss turn did not finish in time" }); });
       const text = clip(`[mission ${m.id}] ${item.text}`, this.config.deliverMax);
@@ -417,10 +417,12 @@ export class MissionManager extends EventEmitter {
     if (id) {
       const m = this.get(id), rt = m && this.runtime(id);
       if (!m) return;
+      if (ev.kind === "msg" && ev.role === "assistant" && rt.inFlight && ev.stopReason !== "error" && ev.stopReason !== "aborted") rt.sawReply = true;
       if (ev.kind === "msg" && ev.role === "assistant" && ev.stopReason === "error") rt.turnError = oneLine((ev.blocks || []).map((b) => b.text || "").join(" ").replace(/^Model error:\s*/, ""), 500) || "model error";
       if (ev.kind === "status" && typeof ev.streaming === "boolean") {
         if (ev.streaming) rt.sawStreaming = true;
-        else if (rt.inFlight && rt.sawStreaming) this.onBossTurnEnd(m, { error: rt.turnError });
+        // A turn that ended without any reply (a stalled stream the watchdog aborted, a dropped connection) failed too.
+        else if (rt.inFlight && rt.sawStreaming) this.onBossTurnEnd(m, { error: rt.turnError || (rt.sawReply ? null : "the boss's turn ended without a reply") });
         else if (!rt.inFlight) this.pump(m);
       }
       return;

@@ -1,0 +1,344 @@
+/**
+ * The Mission view: every mission, and for the open one its layered tree (the boss on top, its workers below, their
+ * subagents under them), live status per node, a detail pane to talk to any node, the user's inbox (notifications),
+ * the task tree and the ledger notes. Pure helpers (buildTree, …) are exported for tests.
+ */
+import { el, ago, agentTone, agentElapsed, fmtN } from "./lib.js";
+
+const ACTIVE = new Set(["queued", "starting", "running"]);
+const kindLabel = (k) => (k === "claude" ? "Claude Code" : k === "shell" ? "Shell" : "OpenCode");
+const modelLabel = (m) => (m ? (m.provider ? `${m.provider}/${m.id}` : m.id) : "");
+const one = (s, n = 140) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+
+/**
+ * The mission's agents as a tree: `workers` (role worker), each with `children` (agents whose parentSid is that
+ * worker's chat, recursively). Agents whose parent is unknown hang under the boss as orphans. Pure.
+ */
+export function buildTree(mission, agents = []) {
+  const mine = agents.filter((a) => a && a.missionId === mission?.id);
+  const bySid = new Map(mine.filter((a) => a.sid).map((a) => [a.sid, a]));
+  const node = (a) => ({ id: a.id, kind: a.kind, status: a.status, title: a.title, model: a.model, agent: a.agent, taskId: a.taskId, activity: a.activity?.at(-1) || "", sid: a.sid, rec: a, children: [] });
+  const nodes = new Map(mine.map((a) => [a.id, node(a)]));
+  const workers = [], orphans = [];
+  for (const a of mine) {
+    const n = nodes.get(a.id);
+    if (a.role === "worker") { workers.push(n); continue; }
+    const parent = bySid.get(a.parentSid);
+    if (parent && nodes.has(parent.id) && parent.id !== a.id) nodes.get(parent.id).children.push(n); else orphans.push(n);
+  }
+  const order = (x, y) => (ACTIVE.has(y.status) - ACTIVE.has(x.status)) || ((x.rec.createdAt || 0) - (y.rec.createdAt || 0));
+  workers.sort(order);
+  const depth = (n) => (n.children.length ? 1 + Math.max(...n.children.map(depth)) : 0);
+  return { workers, orphans, layers: 1 + (workers.length ? 1 + Math.max(0, ...workers.map(depth)) : 0) };
+}
+
+/** Unread notifications across missions. Pure. */
+export const unreadCount = (missions) => [...missions].reduce((n, m) => n + (m.notifications || []).filter((x) => !x.read).length, 0);
+
+/** The boss's state for its card. Pure. */
+export function bossState(m, session) {
+  if (m.status === "paused") return { tone: "off", text: "paused" };
+  if (m.status === "done") return { tone: "ok", text: "done" };
+  if (m.errors?.consecutive) return { tone: "err", text: `retrying (${m.errors.consecutive}) · ${one(m.errors.lastError, 60)}` };
+  if (session?.streaming) return { tone: "run", text: "thinking" };
+  if (m.queue?.length) return { tone: "run", text: `${m.queue.length} queued` };
+  return { tone: "", text: "idle · waiting for reports" };
+}
+
+export function createMissionView({ root, api, toast, onOpenChat, sessionOf = () => null, defaultDir = () => "", defaultModel = () => null }) {
+  const M = { list: new Map(), agents: new Map(), open: null, selected: "boss", tab: "inbox", timer: null, tick: null, models: null };
+  const shell = el("div", "ms-shell");
+  const side = el("aside", "ms-list");
+  const main = el("div", "ms-main");
+  shell.append(side, main);
+  root.appendChild(shell);
+  const badgeListeners = new Set();
+
+  function schedule() { if (!M.timer) M.timer = setTimeout(() => { M.timer = null; render(); }, 150); }
+  function setTick(on) { if (on && !M.tick) M.tick = setInterval(() => schedule(), 5000); if (!on && M.tick) { clearInterval(M.tick); M.tick = null; } }
+  const emitBadge = () => { const n = unreadCount(M.list.values()); for (const f of badgeListeners) f(n); };
+
+  async function load() {
+    try {
+      const r = await api("/api/missions");
+      M.list = new Map(r.missions.map((m) => [m.id, m]));
+      if (!M.open && r.missions[0]) M.open = r.missions[0].id;
+      if (M.open) await loadOne(M.open);
+    } catch (e) { toast(`Missions: ${e.message}`, true); }
+    emitBadge();
+    render();
+  }
+  async function loadOne(id) {
+    const r = await api(`/api/missions/${id}`);
+    M.list.set(id, r.mission);
+    for (const a of r.workers || []) M.agents.set(a.id, a);
+  }
+
+  // ---------------------------------------------------------------- live
+  function onMission(m) { if (!m?.id) return; M.list.set(m.id, m); if (!M.open) M.open = m.id; emitBadge(); schedule(); }
+  function onAgent(a) { if (!a?.missionId) return; M.agents.set(a.id, { ...(M.agents.get(a.id) || {}), ...a }); schedule(); }
+  function onNotify(ev) {
+    const n = ev.notification;
+    toast(`${ev.missionTitle ? `${one(ev.missionTitle, 40)}: ` : ""}${n.title}`, n.urgency === "urgent");
+    emitBadge();
+  }
+  function onStatus() { if (M.open) schedule(); }
+
+  // ---------------------------------------------------------------- render
+  function render() {
+    renderList();
+    const m = M.open && M.list.get(M.open);
+    main.textContent = "";
+    if (!m) { main.appendChild(emptyState()); setTick(false); return; }
+    main.append(header(m), body(m));
+    setTick(m.status === "running");
+  }
+
+  function renderList() {
+    side.textContent = "";
+    const head = el("div", "ms-list-head");
+    head.append(el("span", "ms-list-title", "Missions"));
+    const nb = el("button", "btn small primary", "New mission");
+    nb.onclick = () => openNew();
+    head.append(nb);
+    side.appendChild(head);
+    const ms = [...M.list.values()].sort((a, b) => b.createdAt - a.createdAt);
+    if (!ms.length) side.appendChild(el("div", "ms-list-empty", "No missions yet."));
+    for (const m of ms) {
+      const row = el("button", `ms-row${m.id === M.open ? " on" : ""}`);
+      const unread = (m.notifications || []).filter((x) => !x.read).length;
+      const dot = el("span", `dot ${m.status === "running" ? "run" : m.status === "done" ? "ok" : m.status === "error" ? "err" : "off"}`);
+      const t = el("span", "ms-row-title", m.title);
+      const sub = el("span", "ms-row-sub mono", `${m.status} · ${ago(m.updatedAt)}`);
+      const txt = el("span", "ms-row-text"); txt.append(t, sub);
+      row.append(dot, txt);
+      if (unread) row.append(el("span", "ms-badge", String(unread)));
+      row.onclick = async () => { M.open = m.id; M.selected = "boss"; try { await loadOne(m.id); } catch { /* live events fill it */ } render(); };
+      side.appendChild(row);
+    }
+  }
+
+  function emptyState() {
+    const box = el("div", "ms-empty");
+    box.append(el("h2", "ms-empty-title", "Give it a big job and walk away"));
+    box.append(el("p", "ms-empty-sub", "A mission has a boss that only plans and delegates, and workers (OpenCode or Claude Code) that do the work and report back. Everything it learns is kept in Omni's own folder for the project, so it can run for days."));
+    const b = el("button", "btn primary", "New mission"); b.onclick = () => openNew();
+    box.append(b);
+    return box;
+  }
+
+  function header(m) {
+    const h = el("div", "ms-head");
+    const left = el("div", "ms-head-main");
+    const title = el("div", "ms-title"); title.append(el("span", "", m.title), el("span", `ms-status s-${m.status}`, m.status));
+    left.append(title);
+    const meta = el("div", "ms-meta mono");
+    const ctx = m.boss?.contextWindow ? ` · context ${Math.round((m.boss.contextUsed / m.boss.contextWindow) * 100)}%` : "";
+    meta.textContent = `${m.dir} · boss ${modelLabel(m.usingFallback ? m.fallbackModel : m.bossModel)}${m.usingFallback ? " (fallback)" : ""} · generation ${m.boss?.generation || 1}${ctx}`;
+    left.append(meta);
+    const goal = el("div", "ms-goal", one(m.goal, 400)); goal.title = m.goal;
+    left.append(goal);
+    const acts = el("div", "ms-head-acts");
+    if (m.status === "paused" || m.status === "error") { const b = el("button", "btn small", "Resume"); b.onclick = () => act(`/api/missions/${m.id}/resume`, "Mission resumed"); acts.append(b); }
+    else if (m.status !== "done") { const b = el("button", "btn small", "Pause"); b.title = "Stops the boss and every worker; resume continues from the ledger"; b.onclick = () => { if (window.confirm("Pause this mission? Every worker is stopped; Resume continues from the ledger.")) act(`/api/missions/${m.id}/stop`, "Mission paused"); }; acts.append(b); }
+    h.append(left, acts);
+    return h;
+  }
+
+  async function act(path, ok, body = {}) { try { await api(path, body); if (ok) toast(ok); if (M.open) await loadOne(M.open); render(); } catch (e) { toast(e.message, true); } }
+
+  function body(m) {
+    const b = el("div", "ms-body");
+    const col = el("div", "ms-col");
+    col.append(tree(m), detail(m));
+    b.append(col, sidePane(m));
+    return b;
+  }
+
+  function card(n, { boss = false, m } = {}) {
+    const c = el("button", `ms-card${M.selected === n.id ? " on" : ""}${boss ? " boss" : ""}`);
+    const top = el("div", "ms-card-top");
+    top.append(el("span", `dot ${n.tone}`), el("span", "ms-card-kind", n.kindText));
+    if (n.badge) top.append(el("span", "ms-card-badge mono", n.badge));
+    c.append(top, el("div", "ms-card-title", n.title || ""));
+    if (n.line) c.append(el("div", "ms-card-line", n.line));
+    if (n.meta) c.append(el("div", "ms-card-meta mono", n.meta));
+    c.onclick = () => { M.selected = n.id; render(); };
+    return c;
+  }
+  const agentCard = (n) => card({
+    id: n.id, tone: agentTone(n.status), kindText: `${kindLabel(n.kind)}${n.agent ? ` · ${n.agent}` : ""}`, badge: n.taskId || "",
+    title: n.title, line: one(n.activity, 90), meta: `${n.id} · ${n.status} · ${agentElapsed(n.rec)}${n.rec.cost ? ` · $${n.rec.cost.toFixed(2)}` : ""}`,
+  });
+
+  function tree(m) {
+    const t = buildTree(m, [...M.agents.values()]);
+    const wrap = el("div", "ms-tree");
+    const bs = bossState(m, m.boss?.sid ? sessionOf(m.boss.sid) : null);
+    const bossRow = el("div", "ms-layer ms-layer-boss");
+    bossRow.append(card({ id: "boss", tone: bs.tone, kindText: "Boss", badge: `gen ${m.boss?.generation || 1}`, title: modelLabel(m.usingFallback ? m.fallbackModel : m.bossModel), line: bs.text, meta: `${m.tasks?.filter((x) => x.status === "done").length || 0}/${m.tasks?.length || 0} tasks done · ${m.workers?.length || 0} workers` }, { boss: true, m }));
+    wrap.append(bossRow);
+    const all = [...t.workers, ...t.orphans];
+    if (!all.length) { wrap.append(el("div", "ms-tree-empty", m.status === "running" ? "The boss is planning; workers appear here as it starts them." : "No workers.")); return wrap; }
+    const row = el("div", "ms-layer ms-branches");
+    for (const w of all) {
+      const br = el("div", "ms-branch");
+      br.append(agentCard(w));
+      const kids = (list, depth) => { for (const k of list) { const sub = el("div", "ms-sub"); sub.style.setProperty("--d", depth); sub.append(agentCard(k)); br.append(sub); kids(k.children, depth + 1); } };
+      kids(w.children, 1);
+      row.append(br);
+    }
+    wrap.append(row);
+    return wrap;
+  }
+
+  function detail(m) {
+    const d = el("div", "ms-detail");
+    if (M.selected === "boss" || !M.agents.get(M.selected)) {
+      M.selected = "boss";
+      d.append(el("div", "ms-detail-title", "Boss"));
+      const q = m.queue || [];
+      d.append(el("div", "ms-detail-sub", q.length ? `Next for the boss: ${q.map((x) => x.type).join(", ")}` : "Nothing waiting for the boss."));
+      const acts = el("div", "ms-detail-acts");
+      if (m.boss?.sid) { const o = el("button", "btn small quiet", "Open the boss's chat"); o.onclick = () => onOpenChat(m.boss.sid); acts.append(o); }
+      d.append(acts, composer("Message the boss…", (text) => act(`/api/missions/${m.id}/message`, "Sent to the boss", { text })));
+      return d;
+    }
+    const a = M.agents.get(M.selected);
+    d.append(el("div", "ms-detail-title", `${a.title}`));
+    d.append(el("div", "ms-detail-sub mono", `${a.id} · ${kindLabel(a.kind)}${a.model ? ` · ${a.model}` : ""} · ${a.status} · ${agentElapsed(a)}${a.turns ? ` · ${a.turns} turns` : ""}${a.cost ? ` · $${a.cost.toFixed(2)}` : ""}${a.role === "subagent" ? " · subagent" : ""}`));
+    if (a.error) d.append(el("div", "ms-detail-err", a.error));
+    if (a.activity?.length) { const ul = el("ul", "ms-activity mono"); for (const l of a.activity.slice(-6)) ul.append(el("li", "", l)); d.append(ul); }
+    const out = el("pre", "ms-summary"); out.hidden = true;
+    const acts = el("div", "ms-detail-acts");
+    if (a.sid) { const o = el("button", "btn small quiet", "Open chat"); o.onclick = () => onOpenChat(a.sid); acts.append(o); }
+    if (a.role === "worker" && ACTIVE.has(a.status)) {
+      const s = el("button", "btn small", "Ask for a summary");
+      s.onclick = async () => { s.disabled = true; out.hidden = false; out.textContent = "Asking the worker…"; try { out.textContent = (await api(`/api/missions/${m.id}/workers/${a.id}/summary`, {})).text; } catch (e) { out.textContent = e.message; } s.disabled = false; };
+      acts.append(s);
+    }
+    if (a.role === "worker" && !ACTIVE.has(a.status)) {
+      const r = el("button", "btn small", "Full report");
+      r.onclick = async () => { out.hidden = false; try { out.textContent = (await api(`/api/missions/${m.id}/report/${a.id}`)).text; } catch (e) { out.textContent = e.message; } };
+      acts.append(r);
+    }
+    if (ACTIVE.has(a.status)) { const c = el("button", "btn small quiet", "Stop"); c.onclick = () => { if (window.confirm(`Stop ${a.id}?`)) act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/cancel` : `/api/agents/${a.id}/cancel`, "Stopped"); }; acts.append(c); }
+    d.append(acts, out);
+    if (a.kind !== "shell") d.append(composer(a.role === "worker" ? "Message this worker (the boss is told)…" : "Message this subagent…", (text) => act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/message` : `/api/agents/${a.id}/message`, "Sent", { text })));
+    return d;
+  }
+
+  function composer(placeholder, send) {
+    const f = el("form", "ms-compose");
+    const t = el("textarea"); t.rows = 2; t.placeholder = placeholder;
+    const b = el("button", "btn small primary", "Send"); b.type = "submit";
+    t.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); f.requestSubmit(); } });
+    f.onsubmit = (e) => { e.preventDefault(); const v = t.value.trim(); if (!v) return; t.value = ""; send(v); };
+    f.append(t, b);
+    return f;
+  }
+
+  function sidePane(m) {
+    const p = el("aside", "ms-side");
+    const tabs = el("div", "ms-tabs");
+    const unread = (m.notifications || []).filter((x) => !x.read).length;
+    for (const [k, label] of [["inbox", `Inbox${unread ? ` (${unread})` : ""}`], ["tasks", `Tasks (${m.tasks?.length || 0})`], ["ledger", "Ledger"]]) {
+      const b = el("button", `seg-btn${M.tab === k ? " active" : ""}`, label);
+      b.onclick = () => { M.tab = k; render(); };
+      tabs.append(b);
+    }
+    p.append(tabs);
+    const box = el("div", "ms-side-body");
+    if (M.tab === "inbox") inbox(m, box); else if (M.tab === "tasks") tasks(m, box); else ledger(m, box);
+    p.append(box);
+    return p;
+  }
+
+  function inbox(m, box) {
+    const ns = [...(m.notifications || [])].reverse();
+    if (!ns.length) { box.append(el("div", "ms-none", "Nothing yet. The boss notifies you when it needs you or reaches a milestone.")); return; }
+    for (const n of ns) {
+      const it = el("div", `ms-note u-${n.urgency}${n.read ? "" : " unread"}`);
+      const h = el("div", "ms-note-head"); h.append(el("span", `ms-urg u-${n.urgency}`, n.urgency), el("span", "ms-note-title", n.title), el("span", "ms-note-ago", ago(n.at)));
+      it.append(h);
+      if (n.body) it.append(el("div", "ms-note-body", n.body));
+      if (n.question) {
+        it.append(el("div", "ms-note-q", n.question));
+        if (n.answer != null) it.append(el("div", "ms-note-a", `You answered: ${n.answer}`));
+        else it.append(composer("Your answer (goes to the boss)…", (text) => act(`/api/missions/${m.id}/notifications/${n.id}`, "Answer sent to the boss", { answer: text })));
+      }
+      if (!n.read) { const r = el("button", "btn small quiet", "Mark read"); r.onclick = () => act(`/api/missions/${m.id}/notifications/${n.id}`, null, { read: true }); it.append(r); }
+      box.append(it);
+    }
+  }
+  function tasks(m, box) {
+    if (!m.tasks?.length) { box.append(el("div", "ms-none", "The boss has not planned any tasks yet.")); return; }
+    for (const t of m.tasks) {
+      const r = el("div", `ms-task t-${t.status}`);
+      r.style.setProperty("--d", t.id.split(".").length - 1);
+      const h = el("div", "ms-task-head"); h.append(el("span", `ms-tstat t-${t.status}`, t.status), el("span", "mono ms-task-id", t.id), el("span", "ms-task-title", t.title));
+      r.append(h);
+      if (t.summary) r.append(el("div", "ms-task-sum", t.summary));
+      if (t.workers?.length) r.append(el("div", "ms-task-w mono", t.workers.join(" · ")));
+      box.append(r);
+    }
+  }
+  function ledger(m, box) {
+    const notes = [...(m.notes || [])].reverse();
+    if (!notes.length) { box.append(el("div", "ms-none", "Decisions, dead ends and facts the boss records show up here.")); return; }
+    for (const n of notes) {
+      const r = el("div", `ms-ledger k-${n.kind}`);
+      const h = el("div", "ms-ledger-head"); h.append(el("span", `ms-kind k-${n.kind}`, n.kind.replace("_", " ")), el("span", "ms-ledger-title", n.title), el("span", "ms-note-ago", ago(n.at)));
+      r.append(h);
+      if (n.body) r.append(el("div", "ms-ledger-body", n.body));
+      box.append(r);
+    }
+  }
+
+  // ---------------------------------------------------------------- new mission
+  async function models() {
+    if (M.models) return M.models;
+    try { M.models = (await api("/api/pi/models")).data?.models || []; } catch { M.models = []; }
+    return M.models;
+  }
+  async function openNew() {
+    const wrap = el("div", "ms-dlg-wrap");
+    const dlg = el("form", "ms-dlg");
+    dlg.append(el("div", "ms-dlg-title", "New mission"));
+    dlg.append(el("div", "ms-dlg-sub", "The boss plans and delegates; workers do the work. Project memory, the knowledge graph and the ledger live in Omni's folder, not in the project."));
+    const field = (label, input, hint) => { const f = el("label", "ms-field"); f.append(el("span", "ms-field-label", label), input); if (hint) f.append(el("span", "ms-field-hint", hint)); dlg.append(f); return input; };
+    const dir = field("Project folder", Object.assign(el("input", "mono"), { value: defaultDir(), required: true, spellcheck: false }));
+    const goal = field("Goal", Object.assign(el("textarea"), { rows: 6, required: true, placeholder: "e.g. Fully map the login and token-refresh flow of app.apk (lib/arm64-v8a/libapp.so is packed); document every key, offset and request, and write a working client for it." }));
+    const title = field("Title (optional)", el("input"));
+    const list = await models();
+    const sel = (withNone) => { const s = el("select"); if (withNone) s.append(Object.assign(el("option", "", "None"), { value: "" })); for (const x of list) s.append(Object.assign(el("option", "", `${x.provider}/${x.id}${x.contextWindow ? ` · ${fmtN(x.contextWindow)}` : ""}`), { value: `${x.provider}/${x.id}` })); return s; };
+    const boss = field("Boss model", sel(false), "Pick a model with a large context window; the boss only reads summaries.");
+    const dm = defaultModel(); if (dm) boss.value = modelLabel(dm);
+    const fb = field("Fallback model", sel(true), "Used when the boss's model keeps failing (rate limits, outages); the primary is tried again after an hour.");
+    const wk = el("div", "ms-seg");
+    let kind = "pi";
+    for (const [k, l] of [["pi", "OpenCode"], ["claude", "Claude Code"]]) { const b = el("button", `seg-btn${k === kind ? " active" : ""}`, l); b.type = "button"; b.onclick = () => { kind = k; for (const x of wk.children) x.classList.toggle("active", x === b); }; wk.append(b); }
+    field("Default workers", wk, "The boss still picks per task.");
+    const wm = field("Worker model (optional)", Object.assign(el("input", "mono"), { placeholder: "provider/id for OpenCode, a Claude model id for Claude Code" }));
+    const acts = el("div", "ms-dlg-acts");
+    const cancel = el("button", "btn quiet", "Cancel"); cancel.type = "button"; cancel.onclick = () => wrap.remove();
+    const go = el("button", "btn primary", "Start mission"); go.type = "submit";
+    acts.append(cancel, go);
+    dlg.append(acts);
+    dlg.onsubmit = async (e) => {
+      e.preventDefault();
+      go.disabled = true;
+      try {
+        const r = await api("/api/missions", { dir: dir.value.trim(), goal: goal.value.trim(), title: title.value.trim() || undefined, bossModel: boss.value, fallbackModel: fb.value || undefined, workerKind: kind, workerModel: wm.value.trim() || undefined });
+        M.list.set(r.mission.id, r.mission); M.open = r.mission.id; M.selected = "boss";
+        wrap.remove(); toast("Mission started"); render();
+      } catch (err) { toast(err.message, true); go.disabled = false; }
+    };
+    wrap.onclick = (e) => { if (e.target === wrap) wrap.remove(); };
+    wrap.append(dlg);
+    document.body.append(wrap);
+    goal.focus();
+  }
+
+  return { load, render, onMission, onAgent, onNotify, onStatus, openNew, onBadge: (f) => { badgeListeners.add(f); f(unreadCount(M.list.values())); }, get state() { return M; } };
+}

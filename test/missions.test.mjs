@@ -106,7 +106,7 @@ test("create starts the boss with the boss allowlist and system; briefing is the
 });
 
 test("queue delivers one at a time when idle; user messages jump the queue", async () => {
-  const { mm, dir, bf } = setup();
+  const { mm, dir, bf, bus } = setup();
   const m = mm.create(spec(dir));
   await flush(); await flush();
   const boss = bf.made[0];
@@ -115,6 +115,7 @@ test("queue delivers one at a time when idle; user messages jump the queue", asy
   mm.enqueue(m, { type: "event", text: "second" });
   mm.messageBoss(m, "hurry up");
   assert.equal(boss.prompts.length, 1);
+  bus.emit({ sid: boss.sid, kind: "msg", role: "assistant", live: true, stopReason: "stop", blocks: [{ type: "text", text: "planned" }] });
   boss.stream(false); // briefing turn over
   await flush();
   assert.equal(boss.prompts.length, 2);
@@ -164,6 +165,19 @@ test("boss errors back off, switch to fallback once, notify once", async () => {
   boss.turn({ error: "still" }); await flush(); await flush();
   assert.equal(m.notifications.filter((n) => /fallback/.test(n.title)).length, 1, "no second fallback notice");
   assert.equal(boss.models.length, 1);
+});
+
+test("a boss turn that ends without any reply is retried, not dropped", async () => {
+  const { mm, dir, bf, clock } = setup();
+  const m = mm.create(spec(dir));
+  await flush(); await flush();
+  const boss = bf.made[0];
+  boss.stream(true); boss.stream(false); // the watchdog aborted a stalled stream: no assistant message
+  await flush();
+  assert.equal(m.queue.length, 1, "the briefing is still queued");
+  assert.match(m.errors.lastError, /without a reply/);
+  await clock.tick(15000);
+  assert.equal(boss.prompts.length, 2);
 });
 
 test("success resets the error count; primary is retried after an hour", async () => {
