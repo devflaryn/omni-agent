@@ -818,3 +818,52 @@ test("Claude Code's own subagents (Task / Agent tool calls) are tracked on the r
   await m.stopAll();
   m.dispose();
 });
+
+test("start message: a pi agent says it first and gets the task when that turn ends; a mission's agents get the mission's", async () => {
+  const { m, pis } = setup();
+  const rec = m.start({ task: "Find the parser.", starter: "read AGENTS.md" });
+  await until(() => m.get(rec.id).status === "running");
+  const pi = pis.made[0];
+  assert.deepEqual(pi.prompts.map((p) => p.text), ["read AGENTS.md"], "only the start message so far");
+  pi.stream(true); pi.say("Read it."); pi.stream(false);
+  await until(() => pi.prompts.length === 2);
+  assert.equal(pi.prompts[1].text, `Find the parser.${AGENT_FOOTER}`);
+  assert.equal(m.get(rec.id).status, "running", "the start message's turn is not the end");
+  // a mission's agent (and anything it starts) gets the mission's start message; a resumed session does not
+  m.starterFor = (mid) => (mid === "m-1" ? "hey" : "");
+  const w = m.start({ task: "work", missionId: "m-1", role: "worker" });
+  await until(() => pis.made.length === 2 && pis.made[1].prompts.length === 1);
+  assert.equal(pis.made[1].prompts[0].text, "hey");
+  const plain = m.start({ task: "plain" });
+  await until(() => pis.made.length === 3 && pis.made[2].prompts.length === 1);
+  assert.equal(pis.made[2].prompts[0].text, `plain${AGENT_FOOTER}`);
+  assert.ok(w && plain);
+  await m.stopAll();
+  m.dispose();
+});
+
+test("start message: a Claude agent runs it alone, then its session is resumed with the task", async () => {
+  const calls = [];
+  const bus = new Bus();
+  const claude = new ClaudeRunner({ bin: "claude", bus, spawn: claudeSpawn(calls) });
+  const { m } = setup({ claude, bus });
+  const rec = m.start({ kind: "claude", task: "build", starter: "hey" });
+  const sent = stdinLines(calls[0].proc);
+  await sleep(10);
+  assert.equal(sent[0].message.content[0].text, "hey");
+  const sessionId = m.get(rec.id).sessionId;
+  emitLine(calls[0].proc, { type: "result", subtype: "success", is_error: false, num_turns: 1, result: "Hi!", session_id: sessionId });
+  await sleep(10);
+  calls[0].proc.emit("exit", 0);
+  await sleep(10);
+  assert.equal(calls.length, 2, "resumed for the task");
+  const a2 = calls[1].args;
+  assert.equal(a2[a2.indexOf("--resume") + 1], sessionId);
+  const sent2 = stdinLines(calls[1].proc);
+  await sleep(10);
+  assert.equal(sent2[0].message.content[0].text, `build${AGENT_FOOTER}`);
+  assert.equal(m.get(rec.id).status, "running");
+  calls[1].proc.emit("exit", 0);
+  assert.equal(m.get(rec.id).status, "done");
+  m.dispose();
+});

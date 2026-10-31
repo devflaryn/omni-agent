@@ -436,3 +436,26 @@ test("bus events carry a slim mission; GET-style pub has everything", () => {
   assert.equal(ev.mission.counts.notes, 60);
   assert.equal(mm.pub(m).notes.length, 60);
 });
+
+test("start message: the orchestrator gets it verbatim, as its own turn, before the briefing (and again on rebirth); agents ask for it", async () => {
+  const { mm, dir, bf, agents } = setup();
+  const m = mm.create(spec(dir, { startMessage: "read AGENTS.md" }));
+  await flush(); await flush();
+  const orchestrator = bf.made[0];
+  assert.deepEqual(orchestrator.prompts.map((p) => p.text), ["read AGENTS.md"]);
+  orchestrator.turn(); await flush();
+  assert.match(orchestrator.prompts[1].text, /^\[mission m-[0-9a-f]{8}\] A new mission/);
+  assert.equal(agents.starterFor(m.id), "read AGENTS.md");
+  assert.equal(agents.starterFor("m-none"), "");
+  orchestrator.turn({ context: 650000 }); await flush(); await flush(); await flush();
+  assert.equal(m.orchestrator.generation, 2);
+  assert.equal(orchestrator.prompts.at(-1).text, "read AGENTS.md");
+  orchestrator.lastContext = 0; // the new generation starts empty
+  orchestrator.turn(); await flush();
+  assert.match(orchestrator.prompts.at(-1).text, /taking over this mission/);
+  // without one, the briefing is first
+  const m2 = mm.create(spec(dir));
+  await flush(); await flush();
+  assert.match(bf.made[1].prompts[0].text, /A new mission/);
+  assert.equal(m2.startMessage, "");
+});

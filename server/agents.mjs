@@ -233,6 +233,12 @@ export class AgentManager extends EventEmitter {
     };
     this.records.set(id, rec);
     this.runtime(id).task = kind === "shell" ? command : task;
+    // A start message ("hey", "read AGENTS.md"): sent first, as its own turn, before the task. Given by the caller, or the
+    // mission's own (so every agent of a mission gets it, subagents too). Not for a resumed session.
+    if (kind !== "shell" && !s.resume) {
+      const starter = String(s.starter ?? (missionId && this.starterFor ? this.starterFor(missionId) || "" : "")).trim();
+      if (starter) this.runtime(id).starter = clip(starter, 4000);
+    }
     // Extra environment for a shell job (e.g. paths a command must not see as text); runtime only, never persisted.
     if (kind === "shell" && s.env && typeof s.env === "object") this.runtime(id).env = Object.fromEntries(Object.entries(s.env).map(([k, v]) => [String(k), String(v)]));
     this.prune();
@@ -268,7 +274,7 @@ export class AgentManager extends EventEmitter {
   launch(rec) {
     const rt = this.runtime(rec.id);
     const gen = ++rt.gen;
-    Object.assign(rt, { stopping: null, prompted: false, sawStreaming: false, texts: [] });
+    Object.assign(rt, { stopping: null, prompted: false, sawStreaming: false, texts: [], pendingTask: null });
     Object.assign(rec, { status: "starting", startedAt: this.now(), endedAt: null, error: null, exitCode: null, delivered: false, lastActivityAt: this.now() });
     this.clearTimers(rt);
     const mins = rec.timeoutMinutes;
@@ -316,13 +322,16 @@ export class AgentManager extends EventEmitter {
     rec.sessionFile = pi.state?.sessionFile || rec.sessionFile;
     rec.pid = pi.proc?.pid ?? null;
     const text = rt.followup ?? rt.task;
-    rt.followup = null;
+    const starter = rt.followup == null ? rt.starter : null;
+    rt.followup = null; rt.starter = null;
     this.keeper?.setManagedGoal?.(pi.sid, text);
     rec.status = "running";
     rec.lastActivityAt = this.now();
     this.touch(rec);
     rt.prompted = true;
-    const r = await pi.prompt(text + (rec.footer || AGENT_FOOTER), { echo: true });
+    // With a start message the task waits for that turn's end (onPiStatus sends it).
+    if (starter) rt.pendingTask = text + (rec.footer || AGENT_FOOTER);
+    const r = await pi.prompt(starter || text + (rec.footer || AGENT_FOOTER), { echo: true });
     if (r && r.success === false) throw new Error(r.error || "OpenCode refused the prompt");
   }
 
@@ -348,6 +357,13 @@ export class AgentManager extends EventEmitter {
   onPiStatus(rec, rt, streaming) {
     if (streaming) { rt.sawStreaming = true; this.clear(rt, "idle"); return; }
     if (!rt.sawStreaming || rec.status !== "running") return;
+    if (rt.pendingTask != null && rt.pi) {
+      // The start message's turn ended: now the task.
+      const t = rt.pendingTask, pi = rt.pi; rt.pendingTask = null; rt.sawStreaming = false;
+      Promise.resolve(pi.prompt(t, { echo: true })).then((r) => { if (r && r.success === false) this.finish(rec, "error", { error: r.error || "OpenCode refused the task" }); },
+        (e) => this.finish(rec, "error", { error: `could not send the task: ${e?.message || e}` }));
+      return;
+    }
     this.armIdle(rec, rt);
   }
   /** Not streaming any more: without a keeper that is the end; with one it is only a backstop. Children keep it alive. */
@@ -381,8 +397,9 @@ export class AgentManager extends EventEmitter {
   async launchClaude(rec, rt, gen) {
     if (!this.claude) throw new Error("Claude agents are not available");
     const persona = rec.agent ? this.persona(rec.agent) : null;
-    const followup = rt.followup;
-    rt.followup = null;
+    let followup = rt.followup;
+    const starter = followup == null ? rt.starter : null;
+    rt.followup = null; rt.starter = null;
     const resume = followup != null ? rec.sessionId : rec.resume;
     rt.turnsBase = rec.turns; rt.costBase = rec.cost;
     // The vault memory pack / repo graph the old blocking /api/claude/task gave Claude, when the caller asks for it.
@@ -391,12 +408,14 @@ export class AgentManager extends EventEmitter {
     const mcpConfig = rec.missionId && this.omniUrl ? this.writeMcpConfig(rec) : undefined;
     const r = this.claude.run({
       mcpConfig,
-      prompt: (followup ?? rt.task) + (rec.footer || AGENT_FOOTER), cwd: rec.cwd, model: rec.model || this.config.claudeModel || undefined,
+      prompt: starter || (followup ?? rt.task) + (rec.footer || AGENT_FOOTER), cwd: rec.cwd, model: rec.model || this.config.claudeModel || undefined,
       interactive: true, autonomous: true, permissionMode: this.config.claudePermissionMode, maxTurns: this.config.claudeMaxTurns,
       title: rec.title, name: rec.title, appendSystem: [persona?.body, extra].filter(Boolean).join("\n\n") || undefined,
       meta: { parentSid: rec.parentSid, agentId: rec.id, agentKind: "claude", ...(rec.missionId ? { missionId: rec.missionId, missionRole: rec.role } : {}) }, resume: resume || undefined,
     });
     if (rt.gen !== gen) return;
+    // The start message runs alone; when it exits its session is resumed with the task (onClaudeExit → requeue).
+    if (starter) rt.followup = rt.followup != null ? `${rt.task}\n\n${rt.followup}` : rt.task;
     rt.run = this.claude.runs?.get?.(r.sid) || null;
     this.bindSid(rec, r.sid);
     rec.sessionId = r.sessionId || rec.sessionId;

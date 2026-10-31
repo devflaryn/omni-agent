@@ -2,7 +2,7 @@
  * HTTP routes of missions (server/missions.mjs). JSON in, JSON out.
  *
  *   GET  /api/missions                                   → { missions }
- *   POST /api/missions { dir, goal, title?, orchestratorModel, fallbackModel?, workerKind?, workerModel? }  → { mission }  (local only)
+ *   POST /api/missions { dir, goal, title?, orchestratorModel, fallbackModel?, workerKind?, workerModel?, startMessage? }  → { mission }  (local only)
  *   POST /api/missions/tool { sessionID, tool, args }    → { output, metadata }  (the plugin / MCP)
  *   GET  /api/missions/scope?session=<id>                → { missionId, role, memoryDir, graphDir, artifactsDir } | { missionId: null }
  *   GET  /api/missions/:id                               → { mission, workers }

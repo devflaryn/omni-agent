@@ -399,6 +399,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     for (const [k, l] of [["pi", "OpenCode"], ["claude", "Claude Code"]]) { const b = el("button", `seg-btn${k === kind ? " active" : ""}`, l); b.type = "button"; b.onclick = () => { kind = k; for (const x of wk.children) x.classList.toggle("active", x === b); }; wk.append(b); }
     field("Default workers", wk, "The orchestrator still picks per task.");
     const wm = field("Worker model (optional)", Object.assign(el("input", "mono"), { placeholder: "provider/id for OpenCode, a Claude model id for Claude Code" }));
+    const sm = field("Start message (optional)", Object.assign(el("textarea"), { rows: 2, placeholder: "e.g. hey · read AGENTS.md" }), "Sent first to every agent that starts (the orchestrator, each worker and subagent); its reply comes before the real prompt.");
     const acts = el("div", "ms-dlg-acts");
     const cancel = el("button", "btn quiet", "Cancel"); cancel.type = "button"; cancel.onclick = () => wrap.remove();
     const go = el("button", "btn primary", "Start mission"); go.type = "submit";
@@ -408,7 +409,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       e.preventDefault();
       go.disabled = true;
       try {
-        const r = await api("/api/missions", { dir: dir.value.trim(), goal: goal.value.trim(), title: title.value.trim() || undefined, orchestratorModel: orchestrator.value, fallbackModel: fb.value || undefined, workerKind: kind, workerModel: wm.value.trim() || undefined });
+        const r = await api("/api/missions", { dir: dir.value.trim(), goal: goal.value.trim(), title: title.value.trim() || undefined, orchestratorModel: orchestrator.value, fallbackModel: fb.value || undefined, workerKind: kind, workerModel: wm.value.trim() || undefined, startMessage: sm.value.trim() || undefined });
         M.list.set(r.mission.id, r.mission); M.open = r.mission.id; M.selected = "orchestrator";
         wrap.remove(); toast("Mission started"); render();
       } catch (err) { toast(err.message, true); go.disabled = false; }

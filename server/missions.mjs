@@ -94,6 +94,8 @@ export class MissionManager extends EventEmitter {
       ...config,
     };
     this.now = now; this.setTimer = setTimer; this.clearTimer = clearTimer; this.log = log;
+    // Every agent of a mission (workers, their subagents) gets the mission's start message first.
+    if (agents && !agents.starterFor) agents.starterFor = (mid) => this.missions.get(mid)?.startMessage || "";
     this.missions = new Map(); // id -> record (plain JSON)
     this.files = new Map();    // id -> MissionFiles
     this.paths = new Map();    // id -> project paths
@@ -168,6 +170,7 @@ export class MissionManager extends EventEmitter {
       status: "starting", createdAt: now, updatedAt: now,
       orchestratorModel, fallbackModel: asModel(spec.fallbackModel), usingFallback: false, fallbackAt: 0,
       workerKind: spec.workerKind === "claude" ? "claude" : "pi", workerModel: String(spec.workerModel || ""),
+      startMessage: clip(String(spec.startMessage ?? "").trim(), 4000),
       orchestrator: { sid: null, sessionId: null, sessionFile: null, generation: 0, contextUsed: 0, contextWindow: 0, previous: [] },
       tasks: [], notes: [], workers: [], notifications: [], questions: [], queue: [],
       errors: { consecutive: 0, lastError: "", nextRetryAt: 0, notifiedUrgent: false },
@@ -291,7 +294,7 @@ export class MissionManager extends EventEmitter {
         rt.ready = true;
         if (!reopen) {
           m.orchestrator.generation = (m.orchestrator.generation || 0) + 1;
-          this.enqueue(m, { type: "briefing", front: true, text: orchestratorBriefing(m, renderState(m, { workers: this.workersOf(m), now: this.now(), max: 6000 }), { rebirth: m.orchestrator.generation > 1 }) }, { pump: false });
+          this.brief(m, { rebirth: m.orchestrator.generation > 1 });
         }
         if (m.status === "starting") m.status = "running";
         this.save(m, { kind: "orchestrator", op: reopen ? "reopened" : "started", generation: m.orchestrator.generation, sid: m.orchestrator.sid });
@@ -335,14 +338,23 @@ export class MissionManager extends EventEmitter {
 
   backoff(m) { const n = Math.max(1, m.errors.consecutive); return Math.min(this.config.retryMaxMs, this.config.retryBaseMs * 2 ** (n - 1)); }
 
+  /** A new orchestrator generation: its briefing, and before that the mission's start message (as its own turn). */
+  brief(m, { rebirth = false } = {}) {
+    this.enqueue(m, { type: "briefing", front: true, text: orchestratorBriefing(m, renderState(m, { workers: this.workersOf(m), now: this.now(), max: 6000 }), { rebirth }) }, { pump: false });
+    if (m.startMessage) this.enqueue(m, { type: "start", front: true, text: m.startMessage }, { pump: false });
+  }
+
   /** Queue a delivery to the orchestrator (persisted). `front` puts it before everything not yet in flight. */
   enqueue(m, { type = "event", text, front = false, ref = null } = {}, { pump = true } = {}) {
     const item = { id: this.nextId(m, "d"), type, text: String(text ?? ""), at: this.now(), ref };
     if (front) {
       const rt = this.rt.get(m.id);
       const lead = rt?.inFlight && m.queue[0]?.id === rt.inFlight ? 1 : 0;
-      // A briefing goes before everything (a new orchestrator must know the mission first); other front items keep their order.
-      let i = lead; if (type !== "briefing") while (i < m.queue.length && m.queue[i].front) i++;
+      // The start message, then the briefing, go before everything (a new orchestrator must know the mission first);
+      // other front items keep their order.
+      let i = lead;
+      if (type === "briefing") while (i < m.queue.length && m.queue[i].type === "start") i++;
+      else if (type !== "start") while (i < m.queue.length && m.queue[i].front) i++;
       m.queue.splice(i, 0, { ...item, front: true });
     } else m.queue.push(item);
     this.save(m, { kind: "enqueue", id: item.id, type });
@@ -365,7 +377,8 @@ export class MissionManager extends EventEmitter {
       rt.inFlight = item.id; rt.sawStreaming = false; rt.turnError = null; rt.sawReply = false;
       this.clearTimerOf(rt, "turn");
       rt.timers.turn = this.later(this.config.turnTimeoutMs, () => { rt.timers.turn = null; if (rt.inFlight === item.id) this.onOrchestratorTurnEnd(m, { error: "the orchestrator turn did not finish in time" }); });
-      const text = clip(`[mission ${m.id}] ${item.text}`, this.config.deliverMax);
+      // The start message goes exactly as the user wrote it.
+      const text = item.type === "start" ? item.text : clip(`[mission ${m.id}] ${item.text}`, this.config.deliverMax);
       (async () => {
         if (m.usingFallback && this.now() - (m.fallbackAt || 0) >= this.config.primaryRetryMs) await this.switchModel(m, false);
         return orchestrator.prompt(text, { echo: true });
@@ -448,7 +461,8 @@ export class MissionManager extends EventEmitter {
       m.orchestrator.generation++;
       m.orchestrator.contextUsed = 0;
       rt.ready = true;
-      this.enqueue(m, { type: "briefing", front: true, text: orchestratorBriefing(m, renderState(m, { workers: this.workersOf(m), now: this.now(), max: 6000 }), { rebirth: true }) });
+      this.brief(m, { rebirth: true });
+      this.pump(m);
     })().catch((e) => { m.orchestrator.rebirthFailedAt = this.now(); if (rt.orchestrator === orchestrator) rt.ready = true; this.log("missions: rebirth failed", e?.message || e); this.pump(m); });
     return true;
   }
