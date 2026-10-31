@@ -24,6 +24,8 @@ import { PLAN_TOOL } from "../ui/plan.js";
 
 export const AGENT_FOOTER = "\n\n(You are a background agent started by another agent for this one task. Work on your own until it is done — nobody will answer questions mid-task, so make reasonable assumptions and note them. Finish with a concise final report: what you did, the results, and file paths.)";
 export const AGENT_KINDS = ["pi", "claude", "shell"];
+/** Tool names Claude Code uses to run a subagent of its own. */
+export const SUBAGENT_TOOLS = new Set(["Task", "Agent"]);
 export const FINISHED_STATUSES = new Set(["done", "error", "cancelled", "timeout", "interrupted", "stalled"]);
 export const ACTIVE_STATUSES = new Set(["queued", "starting", "running"]);
 const MAX_RECORDS = 500, TASK_MAX = 4000, RESULT_MAX = 20000, ACTIVITY_MAX = 8, SHELL_RESULT_MAX = 4000;
@@ -552,6 +554,7 @@ export class AgentManager extends EventEmitter {
     if (!isActive(rec)) return;
     rec.lastActivityAt = ev.ts || this.now();
     if (ev.kind === "msg" && ev.live && ev.role === "assistant") this.onAssistant(rec, rt, ev);
+    else if (ev.kind === "msg" && ev.live && ev.role === "tool" && rec.subtasks?.length) this.onToolResults(rec, ev);
     else if (ev.kind === "run" && rec.kind === "claude") {
       // The report itself is taken from the run's last result when the process exits (onClaudeExit).
       if (Number.isFinite(ev.turns)) rec.turns = Math.max(rec.turns, rt.turnsBase + ev.turns);
@@ -566,6 +569,10 @@ export class AgentManager extends EventEmitter {
     const calls = blocks.filter((b) => b.type === "tool_call");
     rec.toolCalls += calls.length;
     for (const c of calls) this.pushActivity(rec, `${c.name}(${oneLine(JSON.stringify(c.args ?? {}), 80)})`);
+    // Claude Code's own subagents (its Task / Agent tool): shown under the agent in the mission tree.
+    for (const c of calls) if (SUBAGENT_TOOLS.has(c.name) && c.toolId && !(rec.subtasks || []).some((s) => s.id === c.toolId)) {
+      rec.subtasks = [...(rec.subtasks || []), { id: c.toolId, title: oneLine(c.args?.description || c.args?.subagent_type || c.args?.prompt || "subagent", 80), type: c.args?.subagent_type || "", status: "running", startedAt: ev.ts || this.now(), endedAt: null }].slice(-30);
+    }
     if (text) {
       this.pushActivity(rec, oneLine(text, 160));
       rec.resultText = clip(text, RESULT_MAX);
@@ -574,6 +581,14 @@ export class AgentManager extends EventEmitter {
     }
     if (rec.kind === "pi") { rec.turns++; if (Number.isFinite(ev.cost)) rec.cost += ev.cost; }
     this.touch(rec);
+  }
+  onToolResults(rec, ev) {
+    let changed = false;
+    for (const b of ev.blocks || []) {
+      const s = b.type === "tool_result" && rec.subtasks.find((x) => x.id === b.toolId && x.status === "running");
+      if (s) { s.status = b.isError ? "error" : "done"; s.endedAt = ev.ts || this.now(); changed = true; }
+    }
+    if (changed) this.touch(rec);
   }
   pushActivity(rec, line) { rec.activity.push(line); if (rec.activity.length > ACTIVITY_MAX) rec.activity.splice(0, rec.activity.length - ACTIVITY_MAX); }
 

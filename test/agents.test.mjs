@@ -804,3 +804,17 @@ test("records are plain JSON and capped: task ≤ 4000 chars, activity ≤ 8 lin
   await m.stopAll();
   m.dispose();
 });
+
+test("Claude Code's own subagents (Task / Agent tool calls) are tracked on the record until their result arrives", async () => {
+  const { m, bus } = setup({ opts: nodeShell });
+  const a = m.start({ task: "x", parentSid: "pi:main" });
+  await until(() => m.get(a.id).status === "running");
+  const sid = m.get(a.id).sid;
+  bus.emit({ sid, harness: "pi", kind: "msg", ts: 5, role: "assistant", live: true, blocks: [{ type: "tool_call", toolId: "toolu_9", name: "Task", args: { description: "Map the JNI exports", subagent_type: "Explore" } }] });
+  assert.deepEqual(m.get(a.id).subtasks.map((s) => [s.id, s.title, s.type, s.status]), [["toolu_9", "Map the JNI exports", "Explore", "running"]]);
+  bus.emit({ sid, harness: "pi", kind: "msg", ts: 9, role: "tool", live: true, blocks: [{ type: "tool_result", toolId: "toolu_9", text: "done" }] });
+  assert.equal(m.get(a.id).subtasks[0].status, "done");
+  assert.equal(m.get(a.id).subtasks[0].endedAt, 9);
+  await m.stopAll();
+  m.dispose();
+});

@@ -6,7 +6,7 @@
 import { el, ago, agentTone, agentElapsed, fmtN } from "./lib.js";
 
 const ACTIVE = new Set(["queued", "starting", "running"]);
-const kindLabel = (k) => (k === "claude" ? "Claude Code" : k === "shell" ? "Shell" : "OpenCode");
+const kindLabel = (k) => (k === "claude" ? "Claude Code" : k === "claude-sub" ? "Claude subagent" : k === "shell" ? "Shell" : "OpenCode");
 const modelLabel = (m) => (m ? (m.provider ? `${m.provider}/${m.id}` : m.id) : "");
 const one = (s, n = 140) => { const t = String(s ?? "").replace(/(^|\s)#{1,4}\s+/g, "$1").replace(/\*\*/g, "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 
@@ -17,7 +17,9 @@ const one = (s, n = 140) => { const t = String(s ?? "").replace(/(^|\s)#{1,4}\s+
 export function buildTree(mission, agents = []) {
   const mine = agents.filter((a) => a && a.missionId === mission?.id);
   const bySid = new Map(mine.filter((a) => a.sid).map((a) => [a.sid, a]));
-  const node = (a) => ({ id: a.id, kind: a.kind, status: a.status, title: a.title, model: a.model, agent: a.agent, taskId: a.taskId, activity: a.activity?.at(-1) || "", sid: a.sid, rec: a, children: [] });
+  // Claude Code's own subagents (rec.subtasks) are leaves under their agent; they cannot be messaged.
+  const subs = (a) => (a.subtasks || []).map((s) => ({ id: `${a.id}/${s.id}`, kind: "claude-sub", status: s.status === "running" && !ACTIVE.has(a.status) ? "interrupted" : s.status, title: s.title, model: s.type, activity: "", sid: null, rec: { ...s, createdAt: s.startedAt, role: "claude-sub", parent: a.id }, children: [] }));
+  const node = (a) => ({ id: a.id, kind: a.kind, status: a.status, title: a.title, model: a.model, agent: a.agent, taskId: a.taskId, activity: a.activity?.at(-1) || "", sid: a.sid, rec: a, children: subs(a) });
   const nodes = new Map(mine.map((a) => [a.id, node(a)]));
   const workers = [], orphans = [];
   for (const a of mine) {
@@ -194,6 +196,16 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
 
   function detail(m) {
     const d = el("div", "ms-detail");
+    const sub = String(M.selected).includes("/") ? String(M.selected).split("/") : null;
+    if (sub && M.agents.get(sub[0])) {
+      const parent = M.agents.get(sub[0]), s = (parent.subtasks || []).find((x) => x.id === sub[1]);
+      d.append(el("div", "ms-detail-title", s?.title || "Claude subagent"));
+      d.append(el("div", "ms-detail-sub mono", `Claude Code subagent${s?.type ? ` (${s.type})` : ""} of ${parent.id} · ${s?.status || "?"}${s?.startedAt ? ` · ${agentElapsed({ startedAt: s.startedAt, endedAt: s.endedAt })}` : ""}`));
+      d.append(el("div", "ms-detail-sub", "It runs inside its Claude Code agent and reports to it; message the agent instead."));
+      const o = el("button", "btn small quiet", `Select ${parent.id}`); o.onclick = () => { M.selected = parent.id; render(); };
+      d.append(o);
+      return d;
+    }
     if (M.selected === "boss" || !M.agents.get(M.selected)) {
       M.selected = "boss";
       d.append(el("div", "ms-detail-title", "Boss"));
@@ -205,6 +217,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       return d;
     }
     const a = M.agents.get(M.selected);
+    if (!a) return d;
     d.append(el("div", "ms-detail-title", `${a.title}`));
     d.append(el("div", "ms-detail-sub mono", `${a.id} · ${kindLabel(a.kind)}${a.model ? ` · ${a.model}` : ""} · ${a.status} · ${agentElapsed(a)}${a.turns ? ` · ${a.turns} turns` : ""}${a.cost ? ` · $${a.cost.toFixed(2)}` : ""}${a.role === "subagent" ? " · subagent" : ""}`));
     if (a.error) d.append(el("div", "ms-detail-err", a.error));

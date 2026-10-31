@@ -21,6 +21,8 @@ test("buildTree: workers, their subagents (recursively) and orphans; other missi
   assert.deepEqual(t.orphans.map((o) => o.id), ["a-5"]);
   assert.equal(t.layers, 4, "boss, workers, subagents, sub-subagents");
   assert.equal(buildTree(m, []).layers, 1);
+  const withSubs = buildTree(m, [a("a-7", { role: "worker", kind: "claude", sid: "claude:x", subtasks: [{ id: "toolu_1", title: "Explore auth", status: "running", startedAt: 1 }] })]);
+  assert.deepEqual(withSubs.workers[0].children.map((c) => [c.id, c.kind, c.status]), [["a-7/toolu_1", "claude-sub", "running"]]);
 });
 
 test("bossState and unreadCount", () => {
