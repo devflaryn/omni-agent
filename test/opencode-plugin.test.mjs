@@ -373,3 +373,23 @@ test("mission tools POST to /api/missions/tool with the root session; a boss cha
   await hooks["experimental.chat.system.transform"]({ sessionID: "ses_plain" }, plain);
   assert.equal(plain.system.length, 1);
 });
+
+test("memory tools of a mission chat use the project's vault, other chats the global one", async () => {
+  const projectMem = join(base, "project-mem");
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, "http://x");
+    res.writeHead(200, { "content-type": "application/json" });
+    if (url.pathname === "/api/missions/scope") return res.end(JSON.stringify(url.searchParams.get("session") === "ses_mw" ? { missionId: "m-1", role: "worker", memoryDir: projectMem } : { missionId: null }));
+    res.end("{}");
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  after(() => server.close());
+  const { hooks } = await plugin({ env: { OMNI_AGENT_URL: `http://127.0.0.1:${server.address().port}`, OMNI_VAULT: join(base, "global-vault") } });
+  await hooks.tool.memory_save.execute({ name: "xor key", description: "the packer key", body: "0x5A" }, ctxFor("ses_mw"));
+  await hooks.tool.memory_save.execute({ name: "pref", description: "a user pref", body: "dark" }, ctxFor("ses_plain"));
+  const { existsSync: ex, readdirSync: rd } = await import("node:fs");
+  assert.ok(rd(join(projectMem, "Memory")).some((f) => /xor-key/.test(f)), "project vault has the mission's note");
+  assert.ok(!rd(join(base, "global-vault", "Memory")).some((f) => /xor-key/.test(f)), "global vault does not");
+  assert.ok(ex(join(base, "global-vault", "Memory")) && rd(join(base, "global-vault", "Memory")).some((f) => /pref/.test(f)));
+  assert.match((await hooks.tool.memory_search.execute({ query: "xor" }, ctxFor("ses_mw"))).output, /xor-key/);
+});

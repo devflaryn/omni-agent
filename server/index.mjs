@@ -351,6 +351,12 @@ export async function createApp(overrides = {}) {
     }),
   });
 
+  // What the mission tools reach beyond the mission itself: the project's own vault (and, later, its knowledge graph).
+  const projectVaults = new Map();
+  const missionDeps = {
+    memory: (m) => { const dir = missions.projectOf(m).memoryDir; if (!projectVaults.has(dir)) projectVaults.set(dir, new Vault(dir).ensure()); return projectVaults.get(dir); },
+  };
+
   /** Explicit goals survive an Omni restart (cfg.goalsFile): the goal, its chat's session file and cwd. */
   function saveGoals() {
     // An unattended run (scripts/run.mjs) keeps its goal in its own ledger; it must never be reopened by the GUI.
@@ -1110,7 +1116,7 @@ export async function createApp(overrides = {}) {
       }
       // background agents (pi subagents, Claude Code sessions, shell jobs) started by the agents
       if (p.startsWith("/api/agents") && (await handleAgentRoutes(req, res, { p, q, agents, send, readBody, isLocal }))) return;
-      if (p.startsWith("/api/missions") && (await handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal }))) return;
+      if (p.startsWith("/api/missions") && (await handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal, deps: missionDeps }))) return;
       // claude
       // pi (or any local caller) hands Claude Code a task and waits for the answer
       if (req.method === "POST" && p === "/api/claude/task") {

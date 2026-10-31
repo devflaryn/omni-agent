@@ -243,6 +243,14 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
     // ------------------------------------------------------------ memory, graph, omnidroid
     let vault = null;
     const theVault = () => (vault ??= new Vault(env.OMNI_VAULT || join(root || directory, "vault")).ensure());
+    /** A mission's agents (boss, workers, their subagents) use their project's own vault, never the global one. */
+    const projectVaults = new Map();
+    const vaultFor = async (ctx) => {
+      const sc = ctx?.sessionID ? await scopeOf(ctx.sessionID).catch(() => null) : null;
+      if (!sc?.memoryDir) return theVault();
+      if (!projectVaults.has(sc.memoryDir)) projectVaults.set(sc.memoryDir, new Vault(sc.memoryDir).ensure());
+      return projectVaults.get(sc.memoryDir);
+    };
 
     async function graphCall(path, body) {
       let r;
@@ -581,8 +589,8 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         query: z.string().describe("Keywords to search for"),
         limit: z.number().optional().describe("Max hits (default 8)"),
       },
-      async execute(args) {
-        const hits = await theVault().search(args.query, { limit: args.limit ?? 8 });
+      async execute(args, ctx) {
+        const hits = await (await vaultFor(ctx)).search(args.query, { limit: args.limit ?? 8 });
         const text = hits.length ? hits.map((h) => `- ${h.name} [${h.type || "note"}] (${h.path}): ${h.description || h.preview}`).join("\n") : "No matching notes.";
         return reply(text, { count: hits.length });
       },
@@ -594,8 +602,8 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         topic: z.string().describe("What you are working on or need to remember"),
         budgetTokens: z.number().optional().describe("Approximate token budget (default 800)"),
       },
-      async execute(args) {
-        const pack = await theVault().pack(args.topic, { budgetTokens: args.budgetTokens ?? 800 });
+      async execute(args, ctx) {
+        const pack = await (await vaultFor(ctx)).pack(args.topic, { budgetTokens: args.budgetTokens ?? 800 });
         return reply(pack || "Nothing relevant in memory.");
       },
     });
@@ -610,7 +618,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
         tags: z.array(z.string()).optional(),
       },
       async execute(args, ctx) {
-        const r = await theVault().save({ name: args.name, description: args.description, type: args.type ?? "project", body: args.body, tags: args.tags ?? [], source: `opencode:${ctx.directory || directory}` });
+        const r = await (await vaultFor(ctx)).save({ name: args.name, description: args.description, type: args.type ?? "project", body: args.body, tags: args.tags ?? [], source: `opencode:${ctx.directory || directory}` });
         return reply(`${r.created ? "Saved" : "Updated"} ${r.path}`, r);
       },
     });
