@@ -813,3 +813,23 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 .ms-kg-line { white-space: pre-wrap; word-break: break-word; color: var(--muted); }
 .ms-kg-id { background: none; border: 0; padding: 0; font: inherit; color: var(--link); cursor: pointer; text-align: left; }
 .ms-kg-id:hover { text-decoration: underline; }
+/* pixel avatars: an agent at its computer (ui/pixel.js) */
+.ms-card { display: grid; grid-template-columns: auto 1fr; column-gap: 10px; align-items: center; width: 270px; }
+.ms-card.orchestrator { width: 360px; }
+.ms-sub .ms-card { width: calc(250px - var(--d, 1) * 14px); }
+.ms-card-art { display: grid; place-items: center; }
+.ms-card-body { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.px-avatar { display: block; image-rendering: pixelated; flex: none; }
+.px-run .px-person { animation: px-bob 0.9s steps(1) infinite; }
+.px-run .px-glyph { animation: px-type 1.2s steps(1) infinite; }
+.px-waiting .px-glyph { animation: px-type 1.6s steps(1) infinite; }
+.px-off .px-person { opacity: 0.55; }
+@keyframes px-bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1px); } }
+@keyframes px-type { 0%, 100% { opacity: 1; } 33% { opacity: 0.35; } 66% { opacity: 0.75; } }
+.ms-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: center; align-items: center; color: var(--dim); font-size: 11.5px; padding-top: 4px; }
+.ms-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.ms-legend-states { color: var(--dim); }
+.ms-detail-head { display: flex; align-items: center; gap: 14px; }
+.ms-detail-head-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+@media (max-width: 760px) { .ms-card, .ms-card.orchestrator, .ms-sub .ms-card { width: min(320px, calc(100vw - 48px)); } }
+@media (prefers-reduced-motion: reduce) { .px-run .px-person, .px-run .px-glyph, .px-waiting .px-glyph { animation: none; } }

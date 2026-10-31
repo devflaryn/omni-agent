@@ -4,6 +4,7 @@
  * the task tree and the ledger notes. Pure helpers (buildTree, …) are exported for tests.
  */
 import { el, ago, agentTone, agentElapsed, fmtN } from "./lib.js";
+import { pixelAvatar } from "./pixel.js";
 
 const ACTIVE = new Set(["queued", "starting", "running"]);
 const kindLabel = (k) => (k === "claude" ? "Claude Code" : k === "claude-sub" ? "Claude subagent" : k === "shell" ? "Shell" : "OpenCode");
@@ -39,12 +40,12 @@ export const unreadCount = (missions) => [...missions].reduce((n, m) => n + (m.n
 
 /** The orchestrator's state for its card. Pure. */
 export function orchestratorState(m, session) {
-  if (m.status === "paused") return { tone: "off", text: "paused" };
-  if (m.status === "done") return { tone: "ok", text: "done" };
-  if (m.errors?.consecutive) return { tone: "err", text: `retrying (${m.errors.consecutive}) · ${one(m.errors.lastError, 60)}` };
-  if (session?.streaming) return { tone: "run", text: "thinking" };
-  if (m.queue?.length) return { tone: "run", text: `${m.queue.length} queued` };
-  return { tone: "", text: "idle · waiting for reports" };
+  if (m.status === "paused") return { tone: "off", text: "paused", px: "cancelled" };
+  if (m.status === "done") return { tone: "ok", text: "done", px: "done" };
+  if (m.errors?.consecutive) return { tone: "err", text: `retrying (${m.errors.consecutive}) · ${one(m.errors.lastError, 60)}`, px: "error" };
+  if (session?.streaming) return { tone: "run", text: "thinking", px: "running" };
+  if (m.queue?.length) return { tone: "run", text: `${m.queue.length} queued`, px: "running" };
+  return { tone: "", text: "idle · waiting for reports", px: "idle" };
 }
 
 export function createMissionView({ root, api, toast, onOpenChat, sessionOf = () => null, defaultDir = () => "", defaultModel = () => null }) {
@@ -169,17 +170,21 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
 
   function card(n, { orchestrator = false, m } = {}) {
     const c = el("button", `ms-card${M.selected === n.id ? " on" : ""}${orchestrator ? " orchestrator" : ""}`);
+    const art = el("div", "ms-card-art");
+    art.append(pixelAvatar(n.avatar || "pi", n.avatarStatus, { scale: orchestrator ? 3 : n.small ? 2 : 3 }));
+    const body = el("div", "ms-card-body");
     const top = el("div", "ms-card-top");
     top.append(el("span", `dot ${n.tone}`), el("span", "ms-card-kind", n.kindText));
     if (n.badge) top.append(el("span", "ms-card-badge mono", n.badge));
-    c.append(top, el("div", "ms-card-title", n.title || ""));
-    if (n.line) c.append(el("div", "ms-card-line", n.line));
-    if (n.meta) c.append(el("div", "ms-card-meta mono", n.meta));
+    body.append(top, el("div", "ms-card-title", n.title || ""));
+    if (n.line) body.append(el("div", "ms-card-line", n.line));
+    if (n.meta) body.append(el("div", "ms-card-meta mono", n.meta));
+    c.append(art, body);
     c.onclick = () => { M.selected = n.id; render(); };
     return c;
   }
-  const agentCard = (n) => card({
-    id: n.id, tone: agentTone(n.status), kindText: `${kindLabel(n.kind)}${n.agent ? ` · ${n.agent}` : ""}`, badge: n.taskId || "",
+  const agentCard = (n, { small = false } = {}) => card({
+    id: n.id, tone: agentTone(n.status), avatar: n.kind, avatarStatus: n.status, small, kindText: `${kindLabel(n.kind)}${n.agent ? ` · ${n.agent}` : ""}`, badge: n.taskId || "",
     title: n.title, line: one(n.activity, 90), meta: `${n.id} · ${n.status} · ${agentElapsed(n.rec)}${n.rec.cost ? ` · $${n.rec.cost.toFixed(2)}` : ""}`,
   });
 
@@ -188,7 +193,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     const wrap = el("div", "ms-tree");
     const bs = orchestratorState(m, m.orchestrator?.sid ? sessionOf(m.orchestrator.sid) : null);
     const orchestratorRow = el("div", "ms-layer ms-layer-orchestrator");
-    orchestratorRow.append(card({ id: "orchestrator", tone: bs.tone, kindText: "Orchestrator", badge: `gen ${m.orchestrator?.generation || 1}`, title: modelLabel(m.usingFallback ? m.fallbackModel : m.orchestratorModel), line: bs.text, meta: `${m.tasks?.filter((x) => x.status === "done").length || 0}/${m.tasks?.length || 0} tasks done · ${m.workers?.length || 0} workers` }, { orchestrator: true, m }));
+    orchestratorRow.append(card({ id: "orchestrator", tone: bs.tone, avatar: "orchestrator", avatarStatus: bs.px, kindText: "Orchestrator", badge: `gen ${m.orchestrator?.generation || 1}`, title: modelLabel(m.usingFallback ? m.fallbackModel : m.orchestratorModel), line: bs.text, meta: `${m.tasks?.filter((x) => x.status === "done").length || 0}/${m.tasks?.length || 0} tasks done · ${m.workers?.length || 0} workers` }, { orchestrator: true, m }));
     wrap.append(orchestratorRow);
     const all = [...t.workers, ...t.orphans];
     if (!all.length) { wrap.append(el("div", "ms-tree-empty", m.status === "running" ? "The orchestrator is planning; workers appear here as it starts them." : "No workers.")); return wrap; }
@@ -196,12 +201,36 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     for (const w of all) {
       const br = el("div", "ms-branch");
       br.append(agentCard(w));
-      const kids = (list, depth) => { for (const k of list) { const sub = el("div", "ms-sub"); sub.style.setProperty("--d", depth); sub.append(agentCard(k)); br.append(sub); kids(k.children, depth + 1); } };
+      const kids = (list, depth) => { for (const k of list) { const sub = el("div", "ms-sub"); sub.style.setProperty("--d", depth); sub.append(agentCard(k, { small: true })); br.append(sub); kids(k.children, depth + 1); } };
       kids(w.children, 1);
       row.append(br);
     }
-    wrap.append(row);
+    wrap.append(row, legend());
     return wrap;
+  }
+
+  /** Who is who: the three characters, so a glance at the tree says which agent runs where. */
+  function legend() {
+    const l = el("div", "ms-legend");
+    for (const [kind, label] of [["orchestrator", "Orchestrator"], ["claude", "Claude Code"], ["pi", "OpenCode"], ["shell", "Shell job"]]) {
+      const it = el("span", "ms-legend-item");
+      it.append(pixelAvatar(kind, "idle", { scale: 1, title: label }), el("span", "", label));
+      l.append(it);
+    }
+    const states = el("span", "ms-legend-item ms-legend-states", "screen: moving = working · ✓ done · ✗ failed · … queued · dark = stopped");
+    l.append(states);
+    return l;
+  }
+
+  /** The detail pane's heading: the node's avatar, bigger, beside its title and facts. */
+  function detailHead(kind, status, title, sub) {
+    const h = el("div", "ms-detail-head");
+    h.append(pixelAvatar(kind, status, { scale: 4 }));
+    const t = el("div", "ms-detail-head-text");
+    t.append(el("div", "ms-detail-title", title));
+    if (sub) t.append(el("div", "ms-detail-sub mono", sub));
+    h.append(t);
+    return h;
   }
 
   function detail(m) {
@@ -209,8 +238,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     const sub = String(M.selected).includes("/") ? String(M.selected).split("/") : null;
     if (sub && M.agents.get(sub[0])) {
       const parent = M.agents.get(sub[0]), s = (parent.subtasks || []).find((x) => x.id === sub[1]);
-      d.append(el("div", "ms-detail-title", s?.title || "Claude subagent"));
-      d.append(el("div", "ms-detail-sub mono", `Claude Code subagent${s?.type ? ` (${s.type})` : ""} of ${parent.id} · ${s?.status || "?"}${s?.startedAt ? ` · ${agentElapsed({ startedAt: s.startedAt, endedAt: s.endedAt })}` : ""}`));
+      d.append(detailHead("claude", s?.status === "running" && !ACTIVE.has(parent.status) ? "interrupted" : s?.status, s?.title || "Claude subagent", `Claude Code subagent${s?.type ? ` (${s.type})` : ""} of ${parent.id} · ${s?.status || "?"}${s?.startedAt ? ` · ${agentElapsed({ startedAt: s.startedAt, endedAt: s.endedAt })}` : ""}`));
       d.append(el("div", "ms-detail-sub", "It runs inside its Claude Code agent and reports to it; message the agent instead."));
       const o = el("button", "btn small quiet", `Select ${parent.id}`); o.onclick = () => { M.selected = parent.id; render(); };
       d.append(o);
@@ -218,8 +246,9 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     }
     if (M.selected === "orchestrator" || !M.agents.get(M.selected)) {
       M.selected = "orchestrator";
-      d.append(el("div", "ms-detail-title", "Orchestrator"));
       const q = m.queue || [];
+      const os = orchestratorState(m, m.orchestrator?.sid ? sessionOf(m.orchestrator.sid) : null);
+      d.append(detailHead("orchestrator", os.px, "Orchestrator", `${modelLabel(m.usingFallback ? m.fallbackModel : m.orchestratorModel)} · ${os.text}`));
       d.append(el("div", "ms-detail-sub", q.length ? `Next for the orchestrator: ${q.map((x) => x.type).join(", ")}` : "Nothing waiting for the orchestrator."));
       const acts = el("div", "ms-detail-acts");
       if (m.orchestrator?.sid) { const o = el("button", "btn small quiet", "Open the orchestrator's chat"); o.onclick = () => onOpenChat(m.orchestrator.sid); acts.append(o); }
@@ -228,8 +257,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     }
     const a = M.agents.get(M.selected);
     if (!a) return d;
-    d.append(el("div", "ms-detail-title", `${a.title}`));
-    d.append(el("div", "ms-detail-sub mono", `${a.id} · ${kindLabel(a.kind)}${a.model ? ` · ${a.model}` : ""} · ${a.status} · ${agentElapsed(a)}${a.turns ? ` · ${a.turns} turns` : ""}${a.cost ? ` · $${a.cost.toFixed(2)}` : ""}${a.role === "subagent" ? " · subagent" : ""}`));
+    d.append(detailHead(a.kind, a.status, a.title, `${a.id} · ${kindLabel(a.kind)}${a.model ? ` · ${a.model}` : ""} · ${a.status} · ${agentElapsed(a)}${a.turns ? ` · ${a.turns} turns` : ""}${a.cost ? ` · $${a.cost.toFixed(2)}` : ""}${a.role === "subagent" ? " · subagent" : ""}`));
     if (a.error) d.append(el("div", "ms-detail-err", a.error));
     if (a.activity?.length) { const ul = el("ul", "ms-activity mono"); for (const l of a.activity.slice(-6)) ul.append(el("li", "", l)); d.append(ul); }
     const out = el("pre", "ms-summary"); out.hidden = true;
