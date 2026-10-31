@@ -339,3 +339,78 @@ test("ask_boss waits for the boss's answer", async () => {
   assert.equal(await p, "arm64-v8a");
   assert.equal(mm.answerQuestion(m, q.id, "again"), false);
 });
+
+// ------------------------------------------------------------------ review fixes
+test("a boss that exits is stopped before a new one starts (no orphan reattaching)", async () => {
+  const { mm, dir, bf, clock } = setup();
+  mm.create(spec(dir));
+  await flush(); await flush();
+  bf.made[0].crash(1);
+  assert.equal(bf.made[0].stops, 1, "the exited chat was stopped");
+  await clock.tick(15000); await flush(); await flush();
+  assert.equal(bf.made.length, 2);
+});
+
+test("a boss that fails to start is retried with backoff", async () => {
+  const s = setup();
+  let fail = true;
+  const orig = s.bf.createBoss;
+  s.mm.createBoss = (o) => { const b = orig(o); if (fail) b.waitReady = () => Promise.reject(new Error("opencode serve is down")); return b; };
+  const m = s.mm.create(spec(s.dir));
+  await flush(); await flush(); await flush();
+  assert.match(m.errors.lastError, /could not start: opencode serve is down/);
+  assert.equal(s.bf.made[0].stops, 1);
+  fail = false;
+  await s.clock.tick(15000); await flush(); await flush(); await flush();
+  assert.equal(s.bf.made.length, 2);
+  assert.equal(s.bf.made[1].prompts.length, 1, "the briefing reaches the new boss");
+});
+
+test("a boss whose saved session cannot be reopened gets a fresh briefing", async () => {
+  const s = setup({ boss: false });
+  const m = s.mm.create(spec(s.dir));
+  m.boss.sessionFile = "/s/gone.jsonl"; m.tasks.push({ id: "t1", title: "Unpack", status: "active", summary: "", workers: [] });
+  s.mm.save(m);
+  const bf = bossFactory(s.bus);
+  const mm2 = new MissionManager({ bus: s.bus, store: s.store, agents: s.agents, createBoss: (o) => { const b = bf.createBoss(o); b.switchSession = () => Promise.reject(new Error("no such session")); return b; }, config: { heartbeatMs: 0 } });
+  mm2.reconcile();
+  await flush(); await flush(); await flush();
+  assert.ok(bf.made[0].prompts.some((p) => /\[active\] t1 Unpack/.test(p.text)), "briefed from the ledger");
+});
+
+test("stop() during a pending start leaves no boss running; resume starts one", async () => {
+  const s = setup();
+  let release;
+  const orig = s.bf.createBoss;
+  s.mm.createBoss = (o) => { const b = orig(o); if (s.bf.made.length === 1) b.waitReady = () => new Promise((r) => { release = () => { b.sid = "pi:slow"; b.state = { sessionId: "slow", sessionFile: "/s/slow.jsonl" }; r(); }; }); return b; };
+  const m = s.mm.create(spec(s.dir));
+  await flush();
+  await s.mm.stop(m);
+  release(); await flush(); await flush();
+  assert.equal(s.bf.made[0].stops >= 1, true, "the overtaken start stopped its chat");
+  await s.mm.resume(m); await flush(); await flush();
+  assert.equal(s.bf.made.length, 2);
+  assert.equal(m.status, "running");
+});
+
+test("a handoff whose successor cannot start keeps the worker's own report", async () => {
+  const { mm, dir, agents } = setup({ boss: false });
+  const m = mm.create(spec(dir));
+  const w = mm.spawnWorker(m, { task: "Unpack" });
+  const start = agents.start.bind(agents);
+  agents.start = () => { throw Object.assign(new Error("agent limit"), { status: 400 }); };
+  await assert.rejects(mm.handoffWorker(m, w.id, "State: XOR loop at 0x4a20 found; static dump failed; next: dump after relocation."));
+  agents.start = start;
+  agents.end(w.id, "done", "## Status\ndone\n## Outcome\nunpacked");
+  assert.ok(m.queue.some((q) => q.type === "report" && q.ref === w.id), "its report still reaches the boss");
+});
+
+test("bus events carry a slim mission; GET-style pub has everything", () => {
+  const { mm, dir, events } = setup({ boss: false });
+  const m = mm.create(spec(dir));
+  for (let i = 0; i < 60; i++) mm.addNote(m, { kind: "fact", title: `n${i}` });
+  const ev = events.filter((e) => e.kind === "mission").at(-1);
+  assert.equal(ev.mission.notes.length, 40);
+  assert.equal(ev.mission.counts.notes, 60);
+  assert.equal(mm.pub(m).notes.length, 60);
+});

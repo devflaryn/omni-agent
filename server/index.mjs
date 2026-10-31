@@ -41,7 +41,7 @@ import { MissionManager } from "./missions.mjs";
 import { handleMissionRoutes } from "./mission-routes.mjs";
 import { handleMcp } from "./omni-mcp-http.mjs";
 import { KGraph } from "./kgraph.mjs";
-import { ghidraCommand, importGhidraJsonl, importGraphify } from "./kgraph-import.mjs";
+import { importGhidraJsonl, importGraphify } from "./kgraph-import.mjs";
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -389,9 +389,10 @@ export async function createApp(overrides = {}) {
         mkdirSync(dirname(out), { recursive: true });
         const projectDir = join(cfg.ghidraProjectsDir, p.slug);
         mkdirSync(projectDir, { recursive: true });
-        const q = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
-        const command = `${ghidraCommand({ analyzeHeadless: cfg.ghidraHeadless, projectDir, projectName: name.replace(/[^\w.-]+/g, "_"), binary: path, out, scriptDir: join(ROOT, "integrations", "ghidra") })} && node ${q(join(ROOT, "scripts", "kg-load.mjs"))} ${q(`http://127.0.0.1:${cfg.port}`)} ${m.id} ${q(out)} ${q(name)}`;
-        const job = agents.start({ kind: "shell", command, cwd: m.dir, parentSid: callerSid, title: `Ghidra → knowledge graph: ${name}`, timeoutMinutes: 24 * 60 });
+        // No path is ever part of the command text (a binary may be named anything): the launcher reads them from its env.
+        const env = { OMNI_GHIDRA: cfg.ghidraHeadless, OMNI_GHIDRA_PROJECT: projectDir, OMNI_GHIDRA_NAME: name.replace(/[^\w.-]+/g, "_"), OMNI_GHIDRA_BIN: resolve(path), OMNI_GHIDRA_OUT: out, OMNI_GHIDRA_SCRIPTS: join(ROOT, "integrations", "ghidra"), OMNI_URL: `http://127.0.0.1:${cfg.port}`, OMNI_MISSION: m.id, OMNI_BIN_NAME: name };
+        const command = `node '${join(ROOT, "scripts", "ghidra-import.mjs").replace(/\\/g, "/").replace(/'/g, "'\\''")}'`;
+        const job = agents.start({ kind: "shell", command, env, cwd: m.dir, parentSid: callerSid, title: `Ghidra → knowledge graph: ${name}`, timeoutMinutes: 24 * 60 });
         missions.ledger(m, `knowledge graph: Ghidra import of ${name} started as job ${job.id}`);
         return { text: `Ghidra is analysing ${name} as background job ${job.id} (large binaries take a long time). When it ends, the functions, calls, strings, imports and exports are loaded into the graph automatically (the log ends with "KG LOADED"). job_wait {id: "${job.id}", until: "KG LOADED|ERROR"} to wait; meanwhile keep working.`, meta: { job: job.id } };
       }
@@ -422,7 +423,7 @@ export async function createApp(overrides = {}) {
   bus.on("event", (ev) => {
     if (ev.kind === "log" || ev.kind === "removed" || ev.kind === "agent" || ev.kind === "pis" || ev.kind === "mission" || ev.kind === "notify") return;
     const s = registry.upsert(ev.sid, {});
-    if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom, ...(ev.parentSid ? { parentSid: ev.parentSid, agentId: ev.agentId, agentKind: ev.agentKind } : {}) });
+    if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom, ...(ev.parentSid ? { parentSid: ev.parentSid, agentId: ev.agentId, agentKind: ev.agentKind } : {}), ...(ev.missionId ? { missionId: ev.missionId, missionRole: ev.missionRole } : {}) });
     // Invariant: run.json.sessionFile always names pi's current session file, and the child's resumeFile mirrors it.
     // Gated on !restoring so the transient empty session a fresh child opens during a crash restart
     // cannot clobber the resume anchor before resumeSession() reads it (C1).
@@ -695,6 +696,9 @@ export async function createApp(overrides = {}) {
   const agentBusyError = (a) => Object.assign(new Error(`that chat belongs to background agent ${a.id}${a.title ? ` ("${a.title}")` : ""}, which is still running: message it with POST /api/agents/${a.id}/message, or stop it first`), { status: 409 });
 
   async function continueSession(sid, body) {
+    // A mission boss's chat is driven by its mission (one queue, boss-only tools): never as a plain chat.
+    const bossOf = missions.bySession(sid);
+    if (bossOf && missions.isBoss(bossOf, sid)) throw Object.assign(new Error(`This is the boss of mission "${bossOf.title}": message it from the Missions view.`), { status: 409 });
     const s = registry.get(sid);
     if (!s) throw Object.assign(new Error("unknown session"), { status: 404 });
     if (!body.message?.trim()) throw Object.assign(new Error("empty message"), { status: 400 });

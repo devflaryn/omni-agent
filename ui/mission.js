@@ -87,13 +87,23 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   function onStatus() { if (M.open) schedule(); }
 
   // ---------------------------------------------------------------- render
+  /** Live updates rebuild the view: what is being typed (inputs with data-k), the focus and the caret survive it. */
   function render() {
+    const keep = new Map();
+    for (const e of root.querySelectorAll("[data-k]")) if (e.value) keep.set(e.dataset.k, e.value);
+    const act = document.activeElement, focus = act?.dataset?.k && root.contains(act) ? act.dataset.k : null;
+    let caret = null; try { caret = focus ? [act.selectionStart, act.selectionEnd] : null; } catch { /* no selection */ }
     renderList();
     const m = M.open && M.list.get(M.open);
     main.textContent = "";
     if (!m) { main.appendChild(emptyState()); setTick(false); return; }
     main.append(header(m), body(m));
     setTick(m.status === "running");
+    for (const e of root.querySelectorAll("[data-k]")) if (!e.value && keep.has(e.dataset.k)) e.value = keep.get(e.dataset.k);
+    if (focus) {
+      const e = [...root.querySelectorAll("[data-k]")].find((x) => x.dataset.k === focus);
+      if (e) { e.focus(); if (caret) { try { e.setSelectionRange(caret[0], caret[1]); } catch { /* not a text input */ } } }
+    }
   }
 
   function renderList() {
@@ -241,9 +251,9 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     return d;
   }
 
-  function composer(placeholder, send) {
+  function composer(placeholder, send, key = placeholder) {
     const f = el("form", "ms-compose");
-    const t = el("textarea"); t.rows = 2; t.placeholder = placeholder;
+    const t = el("textarea"); t.rows = 2; t.placeholder = placeholder; t.dataset.k = `${M.open}:${M.selected}:${key}`;
     const b = el("button", "btn small primary", "Send"); b.type = "submit";
     t.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); f.requestSubmit(); } });
     f.onsubmit = (e) => { e.preventDefault(); const v = t.value.trim(); if (!v) return; t.value = ""; send(v); };
@@ -278,7 +288,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       if (n.question) {
         it.append(el("div", "ms-note-q", n.question));
         if (n.answer != null) it.append(el("div", "ms-note-a", `You answered: ${n.answer}`));
-        else it.append(composer("Your answer (goes to the boss)…", (text) => act(`/api/missions/${m.id}/notifications/${n.id}`, "Answer sent to the boss", { answer: text })));
+        else it.append(composer("Your answer (goes to the boss)…", (text) => act(`/api/missions/${m.id}/notifications/${n.id}`, "Answer sent to the boss", { answer: text }), `answer-${n.id}`));
       }
       if (!n.read) { const r = el("button", "btn small quiet", "Mark read"); r.onclick = () => act(`/api/missions/${m.id}/notifications/${n.id}`, null, { read: true }); it.append(r); }
       box.append(it);
@@ -318,6 +328,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     if (st && !st.nodes) box.append(el("div", "ms-none", "Empty so far. Workers seed it with kg_import (graphify for source, Ghidra for binaries) and add what they learn with kg_upsert."));
     const f = el("form", "ms-kg-search");
     const inp = Object.assign(el("input", "mono"), { type: "search", placeholder: "Search functions, strings, files…", value: K.q });
+    inp.dataset.k = `${m.id}:kg-search`;
     f.append(inp);
     f.onsubmit = async (e) => { e.preventDefault(); K.q = inp.value.trim(); K.node = ""; if (!K.q) { K.text = ""; render(); return; } try { K.text = (await api(`/api/missions/${m.id}/kg/search?q=${encodeURIComponent(K.q)}`)).text; } catch (err) { K.text = err.message; } render(); };
     box.append(f);

@@ -671,7 +671,7 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       const root = await rootOf(sid);
       if (scopes.has(root)) return scopes.get(root);
       try {
-        const r = await fetch(`${base}/api/missions/scope?session=${encodeURIComponent(root)}`);
+        const r = await fetch(`${base}/api/missions/scope?session=${encodeURIComponent(root)}`, { signal: AbortSignal.timeout(3000) });
         const j = await r.json();
         const v = j?.missionId ? j : null;
         scopes.set(root, v);

@@ -81,3 +81,17 @@ test("notify and mission_done", async () => {
   assert.equal(a.status, "done");
   assert.equal(a.notifications.at(-1).urgency, "action");
 });
+
+test("handoff is refused to a subagent; a subagent's question keeps its id", async () => {
+  const { mm, a, bossA, agents } = await setup();
+  const r = await call(mm, bossA.sid, "worker_spawn", { task: "scan" });
+  const w = agents.get(r.metadata.id);
+  const sub = agents.start({ kind: "pi", task: "sub", parentSid: w.sid, missionId: a.id, role: "subagent" });
+  assert.match((await call(mm, agents.get(sub.id).sid, "handoff", { note: "x".repeat(60) })).output, /handoff is for a mission's workers/);
+  const pending = call(mm, agents.get(sub.id).sid, "ask_boss", { question: "which?" });
+  await flush();
+  assert.equal(a.questions[0].worker, sub.id);
+  assert.match(a.queue.find((q) => q.type === "question").text, /^subagent a-\d+ is blocked/);
+  mm.answerQuestion(a, a.questions[0].id, "this");
+  await pending;
+});

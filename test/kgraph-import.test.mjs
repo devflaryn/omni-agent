@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { KGraph } from "../server/kgraph.mjs";
-import { fromGraphify, ghidraCommand, importGhidraJsonl } from "../server/kgraph-import.mjs";
+import { fromGraphify, importGhidraJsonl } from "../server/kgraph-import.mjs";
 
 const base = mkdtempSync(join(tmpdir(), "omni-kgi-"));
 const open = [];
@@ -34,9 +34,4 @@ test("a real Ghidra export (libz.so, arm64) loads into the graph: functions, cal
   assert.match(kg.node("function:libz.so:0x1126a4"), /→ out/);
   assert.match(kg.search("inflate", { kind: "function" }), /0x1126a4/);
   assert.match(kg.node("binary:libz.so"), /AARCH64/);
-});
-
-test("ghidraCommand quotes paths with spaces", () => {
-  const c = ghidraCommand({ analyzeHeadless: "C:/g/analyzeHeadless.bat", projectDir: "C:/Users/a b/proj", projectName: "libz", binary: "C:/x y/libz.so", out: "C:/o/libz.jsonl", scriptDir: "C:/Omni Apps/integrations/ghidra" });
-  assert.equal(c, 'cmd.exe //c "C:/g/analyzeHeadless.bat" "C:/Users/a b/proj" "libz" -import "C:/x y/libz.so" -overwrite -scriptPath "C:/Omni Apps/integrations/ghidra" -postScript OmniExport.java "C:/o/libz.jsonl"');
 });

@@ -106,6 +106,11 @@ export class MissionManager extends EventEmitter {
   clearTimerOf(rt, name) { if (rt.timers[name]) { this.clearTimer(rt.timers[name]); rt.timers[name] = null; } }
 
   pub(m) { return { ...m, queue: (m.queue || []).map((q) => ({ id: q.id, type: q.type, at: q.at, preview: oneLine(q.text, 140) })) }; }
+  /** What a bus event carries: the recent tail of the long lists (GET /api/missions/:id has them all). */
+  slim(m) {
+    const p = this.pub(m);
+    return { ...p, notes: (m.notes || []).slice(-40), notifications: (m.notifications || []).slice(-100), questions: (m.questions || []).slice(-40), counts: { notes: m.notes?.length || 0, notifications: m.notifications?.length || 0, questions: m.questions?.length || 0 } };
+  }
   get(id) { return this.missions.get(String(id)) || null; }
   must(id) { const m = this.get(id); if (!m) throw httpError(404, `no mission ${id}`); return m; }
   list() { return [...this.missions.values()].sort((a, b) => b.createdAt - a.createdAt); }
@@ -127,7 +132,7 @@ export class MissionManager extends EventEmitter {
     m.updatedAt = this.now();
     const f = this.files.get(m.id);
     try { f?.write(m); if (ev) f?.append(ev); } catch (e) { this.log("missions: could not save", m.id, e.message); }
-    this.bus?.emit?.({ sid: `mission:${m.id}`, harness: "omni", kind: "mission", ts: m.updatedAt, mission: this.pub(m) });
+    this.bus?.emit?.({ sid: `mission:${m.id}`, harness: "omni", kind: "mission", ts: m.updatedAt, mission: this.slim(m) });
     this.emit("change", m);
   }
   ledger(m, line) { try { this.files.get(m.id)?.ledger(line); } catch { /* best effort */ } }
@@ -240,47 +245,78 @@ export class MissionManager extends EventEmitter {
   }
 
   /** Start (or reopen, on its saved session) the boss chat; a fresh mission gets its briefing first. */
+  /**
+   * Start (or reopen, on its saved session) the boss chat; a fresh mission gets its briefing first. A start that
+   * fails is retried with backoff; one overtaken by stop() (or a newer start) stops the chat it made.
+   */
   async startBoss(m, { fresh = false } = {}) {
     const rt = this.runtime(m.id);
     if (rt.starting) return rt.starting;
     if (!this.createBoss) throw new Error("missions: no boss factory");
-    rt.starting = (async () => {
+    const token = rt.startToken = (rt.startToken || 0) + 1;
+    const current = () => token === rt.startToken && m.status !== "paused" && m.status !== "done";
+    const p = (async () => {
+      if (rt.boss) { const old = rt.boss; rt.boss = null; rt.ready = false; try { old.stop?.(); } catch { /* gone */ } }
       const model = m.usingFallback && m.fallbackModel ? m.fallbackModel : m.bossModel;
       const boss = this.createBoss({ cwd: m.dir, model: model.id, provider: model.provider, system: BOSS_SYSTEM, tools: [...BOSS_TOOLS], meta: { missionId: m.id, missionRole: "boss", title: `Boss · ${m.title}` } });
       rt.boss = boss; rt.ready = false; rt.inFlight = null;
       boss.on?.("exit", (code) => this.onBossExit(m, boss, code));
-      boss.start?.();
-      await boss.waitReady?.();
-      const reopen = !fresh && m.boss.sessionFile;
-      if (reopen) { try { await boss.switchSession(m.boss.sessionFile); } catch (e) { this.log("missions: could not reopen the boss session", m.id, e?.message || e); } }
-      this.bindBoss(m, rt);
-      rt.ready = true;
-      if (!reopen) {
-        m.boss.generation = (m.boss.generation || 0) + 1;
-        this.enqueue(m, { type: "briefing", front: true, text: bossBriefing(m, renderState(m, { workers: this.workersOf(m), now: this.now(), max: 6000 }), { rebirth: m.boss.generation > 1 }) }, { pump: false });
+      try {
+        boss.start?.();
+        await boss.waitReady?.();
+        let reopen = !fresh && !!m.boss.sessionFile;
+        if (reopen) {
+          try { await boss.switchSession(m.boss.sessionFile); } catch (e) {
+            // Its session is gone (deleted, a reset server): continue in the new one, briefed from the ledger.
+            reopen = false;
+            this.log("missions: could not reopen the boss session", m.id, e?.message || e);
+          }
+        }
+        if (!current() || rt.boss !== boss) { if (rt.boss === boss) rt.boss = null; try { boss.stop?.(); } catch { /* gone */ } return; }
+        this.bindBoss(m, rt);
+        rt.ready = true;
+        if (!reopen) {
+          m.boss.generation = (m.boss.generation || 0) + 1;
+          this.enqueue(m, { type: "briefing", front: true, text: bossBriefing(m, renderState(m, { workers: this.workersOf(m), now: this.now(), max: 6000 }), { rebirth: m.boss.generation > 1 }) }, { pump: false });
+        }
+        if (m.status === "starting") m.status = "running";
+        this.save(m, { kind: "boss", op: reopen ? "reopened" : "started", generation: m.boss.generation, sid: m.boss.sid });
+        this.pump(m);
+      } catch (e) {
+        if (rt.boss === boss) { rt.boss = null; rt.ready = false; }
+        try { boss.stop?.(); } catch { /* gone */ }
+        this.log("missions: the boss could not start", m.id, e?.message || e);
+        if (current()) this.scheduleBossRestart(m, `the boss chat could not start: ${oneLine(e?.message || e, 300)}`);
       }
-      if (m.status === "starting") m.status = "running";
-      this.save(m, { kind: "boss", op: reopen ? "reopened" : "started", generation: m.boss.generation, sid: m.boss.sid });
-      this.pump(m);
-    })().finally(() => { rt.starting = null; });
-    return rt.starting;
+    })();
+    rt.starting = p.finally(() => { if (rt.starting === wrapped) rt.starting = null; });
+    const wrapped = rt.starting;
+    return wrapped;
+  }
+
+  /** The boss chat is gone (it exited, or never started): count it as a failure and start it again after the backoff. */
+  scheduleBossRestart(m, reason) {
+    const rt = this.runtime(m.id);
+    if (rt.inFlight) { rt.inFlight = null; this.clearTimerOf(rt, "turn"); }
+    m.errors.consecutive++;
+    m.errors.lastError = reason;
+    const delay = this.backoff(m);
+    m.errors.nextRetryAt = this.now() + delay;
+    this.ledger(m, `${reason}; trying again in ${fmtDur(delay)}`);
+    this.save(m, { kind: "boss", op: "restart-scheduled", reason, inMs: delay });
+    this.clearTimerOf(rt, "restart");
+    rt.timers.restart = this.later(delay, () => { rt.timers.restart = null; if (!rt.boss && m.status !== "paused" && m.status !== "done") this.startBoss(m).catch((e) => this.log("missions: boss restart failed", m.id, e?.message || e)); });
   }
 
   onBossExit(m, boss, code) {
     const rt = this.runtime(m.id);
     if (rt.boss !== boss) return;
     rt.ready = false; rt.boss = null;
+    // A chat whose server went away would reattach by itself when it comes back: stop it, so only the new one runs.
+    try { boss.stop?.(); } catch { /* gone */ }
     if (m.boss.sid) this.bossSids.delete(m.boss.sid);
     if (rt.stopping || m.status === "paused" || m.status === "done") return;
-    if (rt.inFlight) { rt.inFlight = null; this.clearTimerOf(rt, "turn"); }
-    m.errors.consecutive++;
-    m.errors.lastError = `the boss chat exited (code ${code})`;
-    const delay = this.backoff(m);
-    m.errors.nextRetryAt = this.now() + delay;
-    this.ledger(m, `boss chat exited (code ${code}); reopening in ${fmtDur(delay)}`);
-    this.save(m, { kind: "boss", op: "exit", code });
-    this.clearTimerOf(rt, "restart");
-    rt.timers.restart = this.later(delay, () => { rt.timers.restart = null; if (!rt.boss && m.status !== "paused" && m.status !== "done") this.startBoss(m).catch((e) => this.log("missions: boss restart failed", m.id, e?.message || e)); });
+    this.scheduleBossRestart(m, `the boss chat exited (code ${code})`);
   }
 
   backoff(m) { const n = Math.max(1, m.errors.consecutive); return Math.min(this.config.retryMaxMs, this.config.retryBaseMs * 2 ** (n - 1)); }
@@ -291,7 +327,8 @@ export class MissionManager extends EventEmitter {
     if (front) {
       const rt = this.rt.get(m.id);
       const lead = rt?.inFlight && m.queue[0]?.id === rt.inFlight ? 1 : 0;
-      let i = lead; while (i < m.queue.length && m.queue[i].front) i++;
+      // A briefing goes before everything (a new boss must know the mission first); other front items keep their order.
+      let i = lead; if (type !== "briefing") while (i < m.queue.length && m.queue[i].front) i++;
       m.queue.splice(i, 0, { ...item, front: true });
     } else m.queue.push(item);
     this.save(m, { kind: "enqueue", id: item.id, type });
@@ -380,12 +417,17 @@ export class MissionManager extends EventEmitter {
     const rt = this.runtime(m.id);
     const { contextUsed: used, contextWindow: win } = m.boss;
     if (!rt.boss || !win || !used || used / win < this.config.rebirthAt) return false;
+    // A rebirth that failed is not retried after every turn: once per 30 minutes.
+    if (m.boss.rebirthFailedAt && this.now() - m.boss.rebirthFailedAt < 30 * 60000) return false;
+    const boss = rt.boss;
     const prev = { sessionFile: m.boss.sessionFile, sessionId: m.boss.sessionId, generation: m.boss.generation, endedAt: this.now(), contextUsed: used };
-    m.boss.previous = [...(m.boss.previous || []), prev].slice(-50);
-    this.ledger(m, `boss rebirth: generation ${m.boss.generation} used ${Math.round((used / win) * 100)}% of its context; a new boss continues from the ledger`);
     rt.ready = false;
     (async () => {
-      await rt.boss.newSession();
+      await boss.newSession();
+      if (rt.boss !== boss) return; // stopped or replaced meanwhile
+      m.boss.previous = [...(m.boss.previous || []), prev].slice(-50);
+      m.boss.rebirthFailedAt = 0;
+      this.ledger(m, `boss rebirth: generation ${prev.generation} used ${Math.round((used / win) * 100)}% of its context; a new boss continues from the ledger`);
       this.bindBoss(m, rt);
       m.boss.sessionFile = rt.boss.state?.sessionFile || null;
       m.boss.sessionId = rt.boss.state?.sessionId || null;
@@ -393,7 +435,7 @@ export class MissionManager extends EventEmitter {
       m.boss.contextUsed = 0;
       rt.ready = true;
       this.enqueue(m, { type: "briefing", front: true, text: bossBriefing(m, renderState(m, { workers: this.workersOf(m), now: this.now(), max: 6000 }), { rebirth: true }) });
-    })().catch((e) => { rt.ready = true; this.log("missions: rebirth failed", e?.message || e); this.pump(m); });
+    })().catch((e) => { m.boss.rebirthFailedAt = this.now(); if (rt.boss === boss) rt.ready = true; this.log("missions: rebirth failed", e?.message || e); this.pump(m); });
     return true;
   }
 
@@ -475,8 +517,9 @@ export class MissionManager extends EventEmitter {
     const key = `${rec.id}:${rec.endedAt}`;
     if (rt.reported.has(key)) return;
     rt.reported.add(key);
-    // A worker that handed off has a successor on its task: its own end is not a report.
-    if (m.handoffs?.some((h) => h.from === rec.id)) { try { this.agents.markDelivered(rec.id); } catch { /* gone */ } return; }
+    // The end of a worker that handed off (its successor has the task) is not a report; a later end (resumed) is.
+    const h = (m.handoffs || []).find((x) => x.from === rec.id && !x.consumed && (rec.endedAt || 0) >= x.at);
+    if (h) { h.consumed = true; try { this.agents.markDelivered(rec.id); } catch { /* gone */ } this.save(m); return; }
     this.deliverReport(m, rec);
   }
 
@@ -533,15 +576,15 @@ export class MissionManager extends EventEmitter {
     let brief = rec.task || "";
     try { brief = readFileSync(join(f.dir, "workers", rec.id, "brief.md"), "utf8"); } catch { /* the record's copy */ }
     try { f.writeBrief(rec.id, text, "handoff.md"); } catch { /* best effort */ }
-    m.handoffs = [...(m.handoffs || []), { from: rec.id, at: this.now() }];
-    const chain = m.handoffs.filter((h) => h.task === rec.taskId).length;
+    const chain = (m.handoffs || []).filter((h) => rec.taskId && h.task === rec.taskId).length;
+    const at = this.now();
     const next = this.agents.start({
       kind: rec.kind, task: `${brief}\n\n## Handoff from the previous worker (${rec.id})\nYou continue its task. Its notes:\n\n${clip(text, 12000)}`,
       title: rec.title, cwd: rec.cwd, agent: rec.agent || undefined, model: rec.model, provider: rec.provider,
       parentSid: `mission:${m.id}`, parentSessionId: null, depth: 0, missionId: m.id, taskId: rec.taskId, role: "worker", footer: WORKER_FOOTER, memory: true,
     });
-    m.handoffs[m.handoffs.length - 1].to = next.id;
-    m.handoffs[m.handoffs.length - 1].task = rec.taskId;
+    // Recorded only once the successor exists: a failed start leaves the worker's own report intact.
+    m.handoffs = [...(m.handoffs || []), { from: rec.id, to: next.id, task: rec.taskId, at }].slice(-500);
     try { f.writeBrief(next.id, `${brief}\n\n(continued from ${rec.id}; see its handoff.md)`); } catch { /* best effort */ }
     if (!m.workers.includes(next.id)) m.workers.push(next.id);
     const task = rec.taskId ? m.tasks.find((t) => t.id === rec.taskId) : null;
@@ -556,12 +599,12 @@ export class MissionManager extends EventEmitter {
   async cancelWorker(m, wid) { this.mustWorker(m, wid); const r = await this.agents.cancel(wid); this.ledger(m, `worker ${wid} cancelled`); return r; }
 
   /** A worker's question to the boss; resolves with the answer or a timeout note. */
-  askBoss(m, wid, question, { timeoutMs = this.config.questionTimeoutMs } = {}) {
-    const q = { id: this.nextId(m, "q"), worker: wid, question: clip(String(question || "").trim(), 3000), at: this.now(), answer: null };
+  askBoss(m, wid, question, { timeoutMs = this.config.questionTimeoutMs, label = "" } = {}) {
+    const q = { id: this.nextId(m, "q"), worker: wid, label: label || wid, question: clip(String(question || "").trim(), 3000), at: this.now(), answer: null };
     if (!q.question) return Promise.reject(bad("empty question"));
     m.questions = [...(m.questions || []), q].slice(-500);
-    this.ledger(m, `worker ${wid} asks ${q.id}: ${oneLine(q.question, 300)}`);
-    this.enqueue(m, { type: "question", front: true, ref: q.id, text: `Worker ${wid} is blocked and asks (${q.id}):\n${q.question}\n\nAnswer with worker_message {id: "${wid}", question_id: "${q.id}", message: …}.` });
+    this.ledger(m, `${q.label} asks ${q.id}: ${oneLine(q.question, 300)}`);
+    this.enqueue(m, { type: "question", front: true, ref: q.id, text: `${q.label === wid ? `Worker ${wid}` : q.label} is blocked and asks (${q.id}):\n${q.question}\n\nAnswer with worker_message {id: "${wid}", question_id: "${q.id}", message: …}.` });
     const rt = this.runtime(m.id);
     return new Promise((resolve) => {
       const timer = this.later(timeoutMs, () => { rt.questions.delete(q.id); resolve(null); });
@@ -602,6 +645,9 @@ export class MissionManager extends EventEmitter {
     const rt = this.runtime(m.id);
     rt.stopping = true;
     m.status = "paused";
+    // A start still in flight finds itself overtaken and stops the chat it made; resume() starts a new one.
+    rt.startToken = (rt.startToken || 0) + 1;
+    rt.starting = null;
     for (const w of this.workersOf(m)) if (ACTIVE.has(w.status)) { try { await this.agents.cancel(w.id); } catch { /* gone */ } }
     for (const k of Object.keys(rt.timers)) this.clearTimerOf(rt, k);
     const boss = rt.boss; rt.boss = null; rt.ready = false; rt.inFlight = null;
@@ -640,6 +686,8 @@ export class MissionManager extends EventEmitter {
         this.files.set(id, f);
         if (m.boss?.sid) this.bossSids.delete(m.boss.sid);
         m.boss = { ...m.boss, sid: null };
+        // A paused mission keeps its lost reports queued for when it is resumed.
+        if (m.status === "paused") for (const w of this.workersOf(m).filter((x) => x.role === "worker" && FINISHED.has(x.status) && !x.delivered)) this.onAgent(w);
         if (m.status === "running" || m.status === "starting" || m.status === "waiting") {
           this.ledger(m, "Omni restarted; resuming the mission");
           m.queue = m.queue || [];

@@ -233,6 +233,8 @@ export class AgentManager extends EventEmitter {
     };
     this.records.set(id, rec);
     this.runtime(id).task = kind === "shell" ? command : task;
+    // Extra environment for a shell job (e.g. paths a command must not see as text); runtime only, never persisted.
+    if (kind === "shell" && s.env && typeof s.env === "object") this.runtime(id).env = Object.fromEntries(Object.entries(s.env).map(([k, v]) => [String(k), String(v)]));
     this.prune();
     this.touch(rec);
     this.pump();
@@ -443,7 +445,7 @@ export class AgentManager extends EventEmitter {
     try {
       proc = this.spawn(this.shellPath || defaultShell(), [...this.shellArgs, rt.task], {
         cwd: rec.cwd, windowsHide: true, shell: false, detached: process.platform !== "win32", stdio: ["ignore", fd, fd],
-        env: { ...process.env, CHERE_INVOKING: "1", OMNI_AGENT_ID: rec.id, OMNI_AGENT_DEPTH: String(rec.depth), OMNI_PARENT_SID: rec.parentSid || "" },
+        env: { ...process.env, ...(rt.env || {}), CHERE_INVOKING: "1", OMNI_AGENT_ID: rec.id, OMNI_AGENT_DEPTH: String(rec.depth), OMNI_PARENT_SID: rec.parentSid || "" },
       });
     } finally { closeSync(fd); }
     if (rt.gen !== gen) return;

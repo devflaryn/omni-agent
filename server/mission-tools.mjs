@@ -89,7 +89,7 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
       }
       case "ask_boss": {
         if (!me) return out("Only a mission worker can ask the boss.", { error: true });
-        const answer = await missions.askBoss(m, me.role === "worker" ? me.id : `${me.id} (subagent)`, a.question);
+        const answer = await missions.askBoss(m, me.id, a.question, { label: me.role === "worker" ? me.id : `subagent ${me.id}` });
         return out(answer == null ? "No answer from the boss yet. Continue with your best assumption and note it in your report." : `The boss answers: ${answer}`, { answered: answer != null });
       }
       case "progress": {
@@ -98,8 +98,8 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
         return out("Noted.");
       }
       case "handoff": {
-        if (!me || typeof missions.handoffWorker !== "function") return out("handoff is not available.", { error: true });
-        const next = await missions.handoffWorker(m, me.role === "worker" ? me.id : me.id, a.note);
+        if (!me || me.role !== "worker" || typeof missions.handoffWorker !== "function") return out("handoff is for a mission's workers; a subagent finishes with its report to the worker that started it.", { error: true });
+        const next = await missions.handoffWorker(m, me.id, a.note);
         return out(`Handed off to ${next.id}. Stop now: your successor continues the task.`, { successor: next.id });
       }
       default: return out(`Unknown mission tool "${name}".`, { error: true });

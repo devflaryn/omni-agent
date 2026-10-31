@@ -84,11 +84,3 @@ export async function importGhidraJsonl(kg, file, { binary = "", by = "ghidra", 
   flush();
   return { nodes, edges, lines };
 }
-
-/** The shell command that analyses one binary headless with Ghidra and writes OmniExport's JSONL. */
-export function ghidraCommand({ analyzeHeadless = "analyzeHeadless", projectDir, projectName, binary, out, scriptDir }) {
-  const q = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
-  // A Windows .bat runs through cmd.exe (the job's shell is Git Bash, which cannot run one itself).
-  const run = /\.(bat|cmd)$/i.test(analyzeHeadless) ? `cmd.exe //c ${q(analyzeHeadless)}` : q(analyzeHeadless);
-  return `${run} ${q(projectDir)} ${q(projectName)} -import ${q(binary)} -overwrite -scriptPath ${q(scriptDir)} -postScript OmniExport.java ${q(out)}`;
-}
