@@ -727,6 +727,12 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
     mt("kg_node", "One knowledge-graph node (by id or name) with its neighbours: what it is, status (hypothesis/confirmed), evidence, what it calls / is called by.", {
       id: z.string(), depth: z.number().optional(), budget: z.number().optional(),
     });
+    mt("kg_upsert", "Record what you learned in the project's knowledge graph so later workers start from it: nodes {id?, kind (function|string|offset|struct|symbol|file|binary|concept), name, binary?, addr?, summary, status (unknown|hypothesis|confirmed), confidence 0-1, evidence} and edges {src, dst, rel (calls|xref|reads|writes|decrypts|contains|imports|implements|related), note?}. Existing nodes are merged (a status never moves down).", {
+      nodes: z.array(z.object({}).passthrough()).optional(), edges: z.array(z.object({}).passthrough()).optional(),
+    });
+    mt("kg_import", "Seed the project's knowledge graph: source \"graphify\" (a source repo; path = its directory, default the project) or \"ghidra\" (path = a binary such as a .so; Ghidra analyses it headless as a background job, then its functions, calls, strings, imports and exports are loaded).", {
+      source: z.enum(["graphify", "ghidra"]), path: z.string().optional(),
+    });
     // Worker tools.
     mt("ask_boss", "Mission workers only: ask the mission's boss when you are truly blocked on a decision only it can make. Waits up to 30 minutes for the answer.", { question: z.string() });
     mt("progress", "Mission workers only: a one-line progress note into the mission ledger (a milestone reached, a key finding).", { note: z.string() });

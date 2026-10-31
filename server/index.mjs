@@ -11,7 +11,7 @@ import { createServer as createHttpsServer } from "node:https";
 import { promises as fs, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { CONFIG, ROOT, contextConfig, hookConfig, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
 import { AgentManager } from "./agents.mjs";
 import { handleAgentRoutes } from "./agent-routes.mjs";
@@ -40,6 +40,8 @@ import { ProjectStore } from "./projects.mjs";
 import { MissionManager } from "./missions.mjs";
 import { handleMissionRoutes } from "./mission-routes.mjs";
 import { handleMcp } from "./omni-mcp-http.mjs";
+import { KGraph } from "./kgraph.mjs";
+import { ghidraCommand, importGhidraJsonl, importGraphify } from "./kgraph-import.mjs";
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -353,9 +355,48 @@ export async function createApp(overrides = {}) {
   });
 
   // What the mission tools reach beyond the mission itself: the project's own vault (and, later, its knowledge graph).
-  const projectVaults = new Map();
+  const projectVaults = new Map(), projectGraphs = new Map();
+  const kgOf = (m) => {
+    const file = join(missions.projectOf(m).graphDir, "kg.sqlite");
+    if (!projectGraphs.has(file)) projectGraphs.set(file, KGraph.open(file).catch((e) => { projectGraphs.delete(file); log("kg: could not open", file, e.message); return null; }));
+    return projectGraphs.get(file);
+  };
   const missionDeps = {
     memory: (m) => { const dir = missions.projectOf(m).memoryDir; if (!projectVaults.has(dir)) projectVaults.set(dir, new Vault(dir).ensure()); return projectVaults.get(dir); },
+    kg: kgOf,
+    kgLoad: async (m, file, binary) => {
+      if (!file || !existsSync(file)) throw Object.assign(new Error(`no export file ${file}`), { status: 400 });
+      const kg = await kgOf(m);
+      const r = await importGhidraJsonl(kg, file, { binary, by: "ghidra" });
+      missions.ledger(m, `knowledge graph: loaded ${r.nodes} nodes / ${r.edges} edges from Ghidra (${binary || file})`);
+      return r;
+    },
+    kgImport: async (m, { source, path, callerSid, by }) => {
+      const p = missions.projectOf(m);
+      const kg = await kgOf(m);
+      if (!kg) return { text: "The knowledge graph could not be opened (node:sqlite needs Node 22.13 or newer).", meta: { error: true } };
+      if (source === "graphify") {
+        const dir = path || m.dir;
+        if (!existsSync(dir)) return { text: `No such directory: ${dir}`, meta: { error: true } };
+        const r = await importGraphify(kg, dir, { graphDir: p.graphDir, bin: cfg.graphifyBin, by });
+        missions.ledger(m, `knowledge graph: imported ${r.nodes} nodes / ${r.edges} edges from graphify (${dir})`);
+        return { text: `Imported ${r.nodes} source nodes and ${r.edges} relations from ${dir}${r.built ? " (graph built and kept in the project's graph folder, not in the repo)" : ""}. Query them with kg_search / kg_node (ids start with src:).`, meta: r };
+      }
+      if (source === "ghidra") {
+        if (!path || !existsSync(path)) return { text: `Give the binary to analyse as path (not found: ${path || "none"}).`, meta: { error: true } };
+        const name = basename(path);
+        const out = join(p.graphDir, "imports", "ghidra", `${name}-${Date.now()}.jsonl`);
+        mkdirSync(dirname(out), { recursive: true });
+        const projectDir = join(cfg.ghidraProjectsDir, p.slug);
+        mkdirSync(projectDir, { recursive: true });
+        const q = (s) => `"${String(s).replace(/"/g, '\\"')}"`;
+        const command = `${ghidraCommand({ analyzeHeadless: cfg.ghidraHeadless, projectDir, projectName: name.replace(/[^\w.-]+/g, "_"), binary: path, out, scriptDir: join(ROOT, "integrations", "ghidra") })} && node ${q(join(ROOT, "scripts", "kg-load.mjs"))} ${q(`http://127.0.0.1:${cfg.port}`)} ${m.id} ${q(out)} ${q(name)}`;
+        const job = agents.start({ kind: "shell", command, cwd: m.dir, parentSid: callerSid, title: `Ghidra → knowledge graph: ${name}`, timeoutMinutes: 24 * 60 });
+        missions.ledger(m, `knowledge graph: Ghidra import of ${name} started as job ${job.id}`);
+        return { text: `Ghidra is analysing ${name} as background job ${job.id} (large binaries take a long time). When it ends, the functions, calls, strings, imports and exports are loaded into the graph automatically (the log ends with "KG LOADED"). job_wait {id: "${job.id}", until: "KG LOADED|ERROR"} to wait; meanwhile keep working.`, meta: { job: job.id } };
+      }
+      return { text: 'source must be "graphify" or "ghidra".', meta: { error: true } };
+    },
   };
 
   /** Explicit goals survive an Omni restart (cfg.goalsFile): the goal, its chat's session file and cwd. */

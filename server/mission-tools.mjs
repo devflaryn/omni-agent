@@ -55,7 +55,7 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
       case "notify": { const n = missions.notify(m, { title: a.title, body: a.body, urgency: a.urgency, question: a.question }); return out(`Notification ${n.id} sent (${n.urgency}).${n.question ? " The user's answer arrives as a message; keep working on what does not depend on it." : ""}`); }
       case "mission_done": missions.finish(m, a.summary); return out("Mission marked done. The user has been notified.");
       case "kg_search": case "kg_node": {
-        const kg = deps.kg?.(m);
+        const kg = await deps.kg?.(m);
         if (!kg) return out("The knowledge graph is not available yet for this project.");
         return out(name === "kg_search" ? kg.search(String(a.query || ""), { kind: a.kind, limit: a.limit, budget: Math.min(max, Number(a.budget) || 1500) }) : kg.node(String(a.id || a.name || ""), { depth: a.depth, budget: Math.min(max, Number(a.budget) || 1500) }));
       }
@@ -77,10 +77,15 @@ export async function runMissionTool(missions, { sessionID, tool, args = {} } = 
         return out(`${r.created ? "Saved" : "Updated"} ${r.path}`);
       }
       case "kg_upsert": {
-        const kg = deps.kg?.(m);
+        const kg = await deps.kg?.(m);
         if (!kg) return out("The knowledge graph is not available yet for this project.");
         const r = kg.upsert({ nodes: Array.isArray(a.nodes) ? a.nodes : [], edges: Array.isArray(a.edges) ? a.edges : [] }, { by: me?.id || "boss" });
         return out(`Recorded ${r.nodes} node(s) and ${r.edges} edge(s).`);
+      }
+      case "kg_import": {
+        if (!deps.kgImport) return out("Knowledge-graph import is not available.", { error: true });
+        const r = await deps.kgImport(m, { source: String(a.source || ""), path: a.path ? String(a.path) : "", callerSid: full, by: me?.id || "boss" });
+        return out(r.text, r.meta);
       }
       case "ask_boss": {
         if (!me) return out("Only a mission worker can ask the boss.", { error: true });

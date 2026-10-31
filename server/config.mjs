@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, networkInterfaces } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,6 +6,19 @@ import { fileURLToPath } from "node:url";
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const HOME = homedir();
 export const CONFIG_FILE = join(ROOT, "omni.config.json");
+
+/** analyzeHeadless of the newest Ghidra under ~/re-tools/ghidra, else the bare name (PATH). */
+export function findGhidra(home = HOME) {
+  try {
+    const root = join(home, "re-tools", "ghidra");
+    const dirs = readdirSync(root).filter((d) => /^ghidra_/i.test(d)).sort().reverse();
+    for (const d of dirs) {
+      const f = join(root, d, "support", process.platform === "win32" ? "analyzeHeadless.bat" : "analyzeHeadless");
+      if (existsSync(f)) return f;
+    }
+  } catch { /* not installed there */ }
+  return "analyzeHeadless";
+}
 
 /** { ENV_NAME: "/path/to/key.txt" } → { ENV_NAME: "<first line>" } for the files that exist. */
 export function apiKeyEnv(files) {
@@ -142,6 +155,10 @@ export const CONFIG = {
   agentsDir: fc.agentsDir || join(HOME, ".omni-agent", "agents"),
   /** Missions: per-project state (ledger, project memory, knowledge graph, artifacts), outside every project folder. */
   projectsDir: fc.projectsDir || join(HOME, ".omni-agent", "projects"),
+  /** Ghidra headless (analyzeHeadless[.bat]) for kg_import; found under ~/re-tools/ghidra when not set. */
+  ghidraHeadless: fc.ghidraHeadless || findGhidra(),
+  /** Ghidra refuses project paths with a folder starting with "." — so its projects live in a plain cache folder. */
+  ghidraProjectsDir: fc.ghidraProjectsDir || (process.platform === "win32" && process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, "OmniAgent", "ghidra") : join(HOME, "OmniAgentCache", "ghidra")),
   missions: fc.missions && typeof fc.missions === "object" ? fc.missions : {},
   /** Explicit goals survive an Omni restart: the goal, its chat's session file and cwd. */
   goalsFile: fc.goalsFile || join(HOME, ".omni-agent", "goals.json"),

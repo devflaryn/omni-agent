@@ -55,8 +55,21 @@ export async function handleMissionRoutes(req, res, { p, q, missions, send, read
       send(res, 200, { text });
       return true;
     }
+    if (get && rest.startsWith("/kg/")) {
+      const kg = await deps.kg?.(m);
+      if (!kg) { send(res, 404, { error: "no knowledge graph" }); return true; }
+      if (rest === "/kg/stats") { send(res, 200, kg.stats()); return true; }
+      if (rest === "/kg/search") { send(res, 200, { text: kg.search(q.get("q") || "", { kind: q.get("kind") || "", limit: Number(q.get("limit")) || 30, budget: 2500 }) }); return true; }
+      if (rest === "/kg/node") { send(res, 200, { text: kg.node(q.get("id") || "", { depth: Number(q.get("depth")) || 1, budget: 3000 }) }); return true; }
+    }
     if (!post) { send(res, 405, { error: "method not allowed" }); return true; }
     const body = await readBody(req).catch(() => ({}));
+    if (rest === "/kg/load") {
+      if (!isLocal(req)) { send(res, 403, { error: "local only" }); return true; }
+      if (!deps.kgLoad) { send(res, 404, { error: "no knowledge graph" }); return true; }
+      send(res, 200, await deps.kgLoad(m, String(body.file || ""), String(body.binary || "")));
+      return true;
+    }
     if (rest === "/message") { missions.messageBoss(m, body.text); send(res, 200, { ok: true }); return true; }
     if (rest === "/stop") { await missions.stop(m); send(res, 200, { mission: missions.pub(m) }); return true; }
     if (rest === "/resume") { await missions.resume(m); send(res, 200, { mission: missions.pub(m) }); return true; }
