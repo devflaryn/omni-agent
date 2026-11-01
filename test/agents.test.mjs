@@ -867,3 +867,25 @@ test("start message: a Claude agent runs it alone, then its session is resumed w
   assert.equal(m.get(rec.id).status, "done");
   m.dispose();
 });
+
+test("records keep tokens (each model call once) and plan progress (the plan tool, the goal keeper, Claude Code's todo list)", async () => {
+  const bus = new Bus();
+  const { m, pis } = setup({ bus });
+  const rec = m.start({ task: "x" });
+  await until(() => m.get(rec.id).status === "running");
+  const sid = pis.made[0].sid;
+  const say = (extra) => bus.emit({ sid, harness: "pi", kind: "msg", ts: Date.now(), role: "assistant", live: true, blocks: [{ type: "text", text: "." }], ...extra });
+  say({ groupId: "g1", usage: { input: 1000, output: 200, cacheRead: 500, cacheWrite: 0, total: 1700 } });
+  say({ groupId: "g1", usage: { input: 1000, output: 200, cacheRead: 500, cacheWrite: 0, total: 1700 } });
+  say({ groupId: "g2", usage: { input: 3000, output: 100, cacheRead: 0, cacheWrite: 0, total: 3100 } });
+  assert.equal(m.get(rec.id).tokens, 4800, "a message split into parts counts once");
+  assert.equal(m.get(rec.id).context, 3000);
+  bus.emit({ sid, harness: "pi", kind: "tool", phase: "end", name: "plan", ts: Date.now(), details: { plan: { milestones: [{ id: "m1", title: "M", steps: [{ id: "s1", title: "a", status: "done" }, { id: "s2", title: "b", status: "skipped" }, { id: "s3", title: "c", status: "todo" }] }] } } });
+  assert.deepEqual(m.get(rec.id).plan, { done: 2, of: 3 });
+  bus.emit({ sid, harness: "pi", kind: "goal", ts: Date.now(), done: false, paused: false, progress: { steps: 4, done: 3, skipped: 0 } });
+  assert.deepEqual(m.get(rec.id).plan, { done: 3, of: 4 });
+  say({ blocks: [{ type: "tool_call", toolId: "t", name: "TodoWrite", args: { todos: [{ status: "completed" }, { status: "in_progress" }, { status: "pending" }] } }] });
+  assert.deepEqual(m.get(rec.id).plan, { done: 1, of: 3 });
+  await m.stopAll();
+  m.dispose();
+});

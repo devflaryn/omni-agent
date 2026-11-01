@@ -732,17 +732,6 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 .ms-branch::before { content: ""; position: absolute; left: 50%; top: -15px; height: 14px; border-left: 1px solid var(--line-2); }
 .ms-sub { padding-left: calc(var(--d, 1) * 14px); position: relative; }
 .ms-sub::before { content: ""; position: absolute; left: calc(var(--d, 1) * 14px - 8px); top: -8px; bottom: 50%; border-left: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2); width: 6px; border-bottom-left-radius: 4px; }
-.ms-card { width: 220px; text-align: left; background: var(--field); border: 1px solid var(--line); border-radius: var(--r); padding: 9px 11px; cursor: pointer; color: var(--ink); display: flex; flex-direction: column; gap: 3px; transition: border-color 0.12s var(--ease), background 0.12s var(--ease); }
-.ms-sub .ms-card { width: calc(220px - var(--d, 1) * 14px); background: var(--ground); }
-.ms-card:hover { border-color: var(--line-2); background: var(--field-2); }
-.ms-card.on { border-color: var(--ink); }
-.ms-card.orchestrator { width: 280px; background: var(--raised); border-color: var(--line-2); }
-.ms-card-top { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--muted); }
-.ms-card-kind { flex: 1; }
-.ms-card-badge { font-size: 11px; color: var(--dim); }
-.ms-card-title { font-size: 13px; font-weight: 600; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.ms-card-line { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ms-card-meta { font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ms-detail { margin: 6px 20px 20px; border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; background: var(--side); }
 .ms-detail-title { font-weight: 600; font-size: 13.5px; }
 .ms-detail-sub { font-size: 12px; color: var(--muted); }
@@ -801,7 +790,6 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
   .ms-body { flex-direction: column; overflow: auto; }
   .ms-col { overflow: visible; }
   .ms-side { width: auto; border-left: 0; border-top: 1px solid var(--line); }
-  .ms-card, .ms-card.orchestrator { width: min(280px, calc(100vw - 48px)); }
   .ms-head { padding: 12px 16px; flex-direction: column; }
   .ms-detail { margin: 6px 16px 16px; }
 }
@@ -813,23 +801,9 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 .ms-kg-line { white-space: pre-wrap; word-break: break-word; color: var(--muted); }
 .ms-kg-id { background: none; border: 0; padding: 0; font: inherit; color: var(--link); cursor: pointer; text-align: left; }
 .ms-kg-id:hover { text-decoration: underline; }
-/* pixel avatars: an agent at its computer (ui/pixel.js) */
-.ms-card { display: grid; grid-template-columns: auto 1fr; column-gap: 10px; align-items: center; width: 270px; }
-.ms-card.orchestrator { width: 360px; }
-.ms-sub .ms-card { width: calc(250px - var(--d, 1) * 14px); }
-.ms-card-art { display: grid; place-items: center; }
-.ms-card-body { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.px-avatar { display: block; image-rendering: pixelated; flex: none; }
-.px-run .px-person { animation: px-bob 0.9s steps(1) infinite; }
-.px-run .px-glyph { animation: px-type 1.2s steps(1) infinite; }
-.px-waiting .px-glyph { animation: px-type 1.6s steps(1) infinite; }
-.px-off .px-person { opacity: 0.55; }
-@keyframes px-bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-1px); } }
-@keyframes px-type { 0%, 100% { opacity: 1; } 33% { opacity: 0.35; } 66% { opacity: 0.75; } }
-.ms-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; justify-content: center; align-items: center; color: var(--dim); font-size: 11.5px; padding-top: 4px; }
-.ms-legend-item { display: inline-flex; align-items: center; gap: 6px; }
-.ms-legend-states { color: var(--dim); }
+/* the mission as an office (ui/office.js): one pixel canvas */
+.ms-office { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.ms-office-canvas { display: block; width: 100%; height: auto; image-rendering: pixelated; image-rendering: crisp-edges; border-radius: 10px; background: #141417; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .ms-detail-head { display: flex; align-items: center; gap: 14px; }
 .ms-detail-head-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-@media (max-width: 760px) { .ms-card, .ms-card.orchestrator, .ms-sub .ms-card { width: min(320px, calc(100vw - 48px)); } }
-@media (prefers-reduced-motion: reduce) { .px-run .px-person, .px-run .px-glyph, .px-waiting .px-glyph { animation: none; } }

@@ -20,7 +20,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rea
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { killProcessTree } from "./claude-runner.mjs";
-import { PLAN_TOOL } from "../ui/plan.js";
+import { PLAN_TOOL, asPlan, planProgress } from "../ui/plan.js";
 
 export const AGENT_FOOTER = "\n\n(You are a background agent started by another agent for this one task. Work on your own until it is done — nobody will answer questions mid-task, so make reasonable assumptions and note them. Finish with a concise final report: what you did, the results, and file paths.)";
 export const AGENT_KINDS = ["pi", "claude", "shell"];
@@ -571,7 +571,8 @@ export class AgentManager extends EventEmitter {
     const id = this.bySid.get(ev.sid);
     const rec = id && this.records.get(id), rt = id && this.rt.get(id);
     if (!rec || !rt) return;
-    if (ev.kind === "goal") return this.onGoal(rec, ev);
+    if (ev.kind === "goal") { if (ev.progress?.steps) this.setPlan(rec, ev.progress.done + (ev.progress.skipped || 0), ev.progress.steps); return this.onGoal(rec, ev); }
+    if (ev.kind === "tool" && ev.phase === "end" && ev.name === PLAN_TOOL && ev.details) { const p = asPlan(ev.details); if (p) { const pr = planProgress(p); if (pr.steps) this.setPlan(rec, pr.done + pr.skipped, pr.steps); } }
     if (!isActive(rec)) return;
     rec.lastActivityAt = ev.ts || this.now();
     if (ev.kind === "msg" && ev.live && ev.role === "assistant") this.onAssistant(rec, rt, ev);
@@ -590,6 +591,10 @@ export class AgentManager extends EventEmitter {
     const calls = blocks.filter((b) => b.type === "tool_call");
     rec.toolCalls += calls.length;
     for (const c of calls) this.pushActivity(rec, `${c.name}(${oneLine(JSON.stringify(c.args ?? {}), 80)})`);
+    // Claude Code's todo list is its plan: x of y done.
+    for (const c of calls) if (c.name === "TodoWrite" && Array.isArray(c.args?.todos) && c.args.todos.length) this.setPlan(rec, c.args.todos.filter((t) => t?.status === "completed").length, c.args.todos.length);
+    // Tokens: every model call once (a message split into parts shares its group).
+    if (ev.usage && (!ev.groupId || rt.lastUsageGroup !== ev.groupId)) { rt.lastUsageGroup = ev.groupId; rec.tokens = (rec.tokens || 0) + (Number(ev.usage.total) || 0); rec.context = (Number(ev.usage.input) || 0) + (Number(ev.usage.cacheRead) || 0) + (Number(ev.usage.cacheWrite) || 0); }
     // Claude Code's own subagents (its Task / Agent tool): shown under the agent in the mission tree.
     for (const c of calls) if (SUBAGENT_TOOLS.has(c.name) && c.toolId && !(rec.subtasks || []).some((s) => s.id === c.toolId)) {
       rec.subtasks = [...(rec.subtasks || []), { id: c.toolId, title: oneLine(c.args?.description || c.args?.subagent_type || c.args?.prompt || "subagent", 80), type: c.args?.subagent_type || "", status: "running", startedAt: ev.ts || this.now(), endedAt: null }].slice(-30);
@@ -603,6 +608,8 @@ export class AgentManager extends EventEmitter {
     if (rec.kind === "pi") { rec.turns++; if (Number.isFinite(ev.cost)) rec.cost += ev.cost; }
     this.touch(rec);
   }
+  /** The agent's plan progress (its plan tool, the goal keeper, or Claude Code's todo list): shown as x/y. */
+  setPlan(rec, done, of) { const p = { done: Math.max(0, Math.min(of, done | 0)), of: of | 0 }; if (rec.plan?.done === p.done && rec.plan?.of === p.of) return; rec.plan = p; this.touch(rec); }
   onToolResults(rec, ev) {
     let changed = false;
     for (const b of ev.blocks || []) {

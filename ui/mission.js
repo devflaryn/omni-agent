@@ -4,7 +4,7 @@
  * the task tree and the ledger notes. Pure helpers (buildTree, …) are exported for tests.
  */
 import { el, ago, agentTone, agentElapsed, fmtN } from "./lib.js";
-import { pixelAvatar } from "./pixel.js";
+import { createOffice, officeData } from "./office.js";
 
 const ACTIVE = new Set(["queued", "starting", "running"]);
 const kindLabel = (k) => (k === "claude" ? "Claude Code" : k === "claude-sub" ? "Claude subagent" : k === "shell" ? "Shell" : "OpenCode");
@@ -168,64 +168,41 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     return b;
   }
 
-  function card(n, { orchestrator = false, m } = {}) {
-    const c = el("button", `ms-card${M.selected === n.id ? " on" : ""}${orchestrator ? " orchestrator" : ""}`);
-    const art = el("div", "ms-card-art");
-    art.append(pixelAvatar(n.avatar || "pi", n.avatarStatus, { scale: orchestrator ? 3 : n.small ? 2 : 3 }));
-    const body = el("div", "ms-card-body");
-    const top = el("div", "ms-card-top");
-    top.append(el("span", `dot ${n.tone}`), el("span", "ms-card-kind", n.kindText));
-    if (n.badge) top.append(el("span", "ms-card-badge mono", n.badge));
-    body.append(top, el("div", "ms-card-title", n.title || ""));
-    if (n.line) body.append(el("div", "ms-card-line", n.line));
-    if (n.meta) body.append(el("div", "ms-card-meta mono", n.meta));
-    c.append(art, body);
-    c.onclick = () => { M.selected = n.id; render(); };
-    return c;
-  }
-  const agentCard = (n, { small = false } = {}) => card({
-    id: n.id, tone: agentTone(n.status), avatar: n.kind, avatarStatus: n.status, small, kindText: `${kindLabel(n.kind)}${n.agent ? ` · ${n.agent}` : ""}`, badge: n.taskId || "",
-    title: n.title, line: one(n.activity, 90), meta: `${n.id} · ${n.status} · ${agentElapsed(n.rec)}${n.rec.cost ? ` · $${n.rec.cost.toFixed(2)}` : ""}`,
-  });
-
+  /** The mission as an office (ui/office.js): one canvas, re-drawn from live data; a click on a desk selects that agent. */
+  const office = createOffice();
   function tree(m) {
     const t = buildTree(m, [...M.agents.values()]);
-    const wrap = el("div", "ms-tree");
-    const bs = orchestratorState(m, m.orchestrator?.sid ? sessionOf(m.orchestrator.sid) : null);
-    const orchestratorRow = el("div", "ms-layer ms-layer-orchestrator");
-    orchestratorRow.append(card({ id: "orchestrator", tone: bs.tone, avatar: "orchestrator", avatarStatus: bs.px, kindText: "Orchestrator", badge: `gen ${m.orchestrator?.generation || 1}`, title: modelLabel(m.usingFallback ? m.fallbackModel : m.orchestratorModel), line: bs.text, meta: `${m.tasks?.filter((x) => x.status === "done").length || 0}/${m.tasks?.length || 0} tasks done · ${m.workers?.length || 0} workers` }, { orchestrator: true, m }));
-    wrap.append(orchestratorRow);
-    const all = [...t.workers, ...t.orphans];
-    if (!all.length) { wrap.append(el("div", "ms-tree-empty", m.status === "running" ? "The orchestrator is planning; workers appear here as it starts them." : "No workers.")); return wrap; }
-    const row = el("div", "ms-layer ms-branches");
-    for (const w of all) {
-      const br = el("div", "ms-branch");
-      br.append(agentCard(w));
-      const kids = (list, depth) => { for (const k of list) { const sub = el("div", "ms-sub"); sub.style.setProperty("--d", depth); sub.append(agentCard(k, { small: true })); br.append(sub); kids(k.children, depth + 1); } };
-      kids(w.children, 1);
-      row.append(br);
+    const orch = orchestratorState(m, m.orchestrator?.sid ? sessionOf(m.orchestrator.sid) : null);
+    const wrap = el("div", "ms-office");
+    if (!M.canvas) {
+      const c = M.canvas = document.createElement("canvas");
+      c.className = "ms-office-canvas";
+      c.setAttribute("role", "img");
+      const at = (e) => { const r = c.getBoundingClientRect(), x = ((e.clientX - r.left) * c.width) / r.width, y = ((e.clientY - r.top) * c.height) / r.height; return [...(M.hits || [])].reverse().find((h) => x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h); };
+      c.onclick = (e) => { const h = at(e); if (h) { M.selected = h.id; render(); } };
+      c.onmousemove = (e) => { c.style.cursor = at(e) ? "pointer" : "default"; };
     }
-    wrap.append(row, legend());
+    let hits = [];
+    try {
+      const { img, hits: hs } = office.draw(officeData(m, t, orch), { selected: M.selected });
+      hits = M.hits = hs;
+      const c = M.canvas;
+      if (c.width !== img.w || c.height !== img.h) { c.width = img.w; c.height = img.h; c.style.aspectRatio = `${img.w} / ${img.h}`; c.style.maxWidth = `${img.w * 3}px`; }
+      c.getContext("2d").putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0);
+      c.setAttribute("aria-label", `The mission as an office: the orchestrator and ${t.workers.length + t.orphans.length} workers`);
+    } catch (e) { console.error("office", e); }
+    wrap.append(M.canvas);
+    // the same choices for keyboards and screen readers
+    const sr = el("div", "sr-only");
+    for (const h of hits) { const b = el("button", "", `Open ${h.label}`); b.onclick = () => { M.selected = h.id; render(); }; sr.append(b); }
+    wrap.append(sr);
+    if (!t.workers.length && !t.orphans.length) wrap.append(el("div", "ms-tree-empty", m.status === "running" ? "The orchestrator is planning; its workers take a desk here as it starts them." : "No workers."));
     return wrap;
   }
 
-  /** Who is who: the three characters, so a glance at the tree says which agent runs where. */
-  function legend() {
-    const l = el("div", "ms-legend");
-    for (const [kind, label] of [["orchestrator", "Orchestrator"], ["claude", "Claude Code"], ["pi", "OpenCode"], ["shell", "Shell job"]]) {
-      const it = el("span", "ms-legend-item");
-      it.append(pixelAvatar(kind, "idle", { scale: 1, title: label }), el("span", "", label));
-      l.append(it);
-    }
-    const states = el("span", "ms-legend-item ms-legend-states", "screen: moving = working · ✓ done · ✗ failed · … queued · dark = stopped");
-    l.append(states);
-    return l;
-  }
-
-  /** The detail pane's heading: the node's avatar, bigger, beside its title and facts. */
+  /** The detail pane's heading: title and facts. */
   function detailHead(kind, status, title, sub) {
     const h = el("div", "ms-detail-head");
-    h.append(pixelAvatar(kind, status, { scale: 4 }));
     const t = el("div", "ms-detail-head-text");
     t.append(el("div", "ms-detail-title", title));
     if (sub) t.append(el("div", "ms-detail-sub mono", sub));
