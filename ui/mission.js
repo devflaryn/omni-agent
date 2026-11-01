@@ -52,6 +52,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   const M = { list: new Map(), agents: new Map(), open: null, selected: "orchestrator", tab: "inbox", timer: null, tick: null, models: null, kg: { q: "", text: "", node: "", stats: null, missionId: null } };
   const shell = el("div", "ms-shell");
   const side = el("aside", "ms-list");
+  side.dataset.scroll = "list";
   const main = el("div", "ms-main");
   shell.append(side, main);
   root.appendChild(shell);
@@ -93,17 +94,22 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     const keep = new Map();
     for (const e of root.querySelectorAll("[data-k]")) if (e.value) keep.set(e.dataset.k, e.value);
     const act = document.activeElement, focus = act?.dataset?.k && root.contains(act) ? act.dataset.k : null;
+    // Live updates rebuild the view: every scrolling part keeps where it was (keys name the mission/tab/agent).
+    const scrolls = new Map();
+    for (const e of root.querySelectorAll("[data-scroll]")) scrolls.set(e.dataset.scroll, [e.scrollTop, e.scrollLeft]);
     let caret = null; try { caret = focus ? [act.selectionStart, act.selectionEnd] : null; } catch { /* no selection */ }
     renderList();
+    { const v = scrolls.get("list"); if (v) side.scrollTop = v[0]; }
     const m = M.open && M.list.get(M.open);
     main.textContent = "";
     if (!m) { main.appendChild(emptyState()); setTick(false); return; }
     main.append(header(m), body(m));
     setTick(m.status === "running");
     for (const e of root.querySelectorAll("[data-k]")) if (!e.value && keep.has(e.dataset.k)) e.value = keep.get(e.dataset.k);
+    for (const e of root.querySelectorAll("[data-scroll]")) { const v = scrolls.get(e.dataset.scroll); if (v) { e.scrollTop = v[0]; e.scrollLeft = v[1]; } }
     if (focus) {
       const e = [...root.querySelectorAll("[data-k]")].find((x) => x.dataset.k === focus);
-      if (e) { e.focus(); if (caret) { try { e.setSelectionRange(caret[0], caret[1]); } catch { /* not a text input */ } } }
+      if (e) { e.focus({ preventScroll: true }); if (caret) { try { e.setSelectionRange(caret[0], caret[1]); } catch { /* not a text input */ } } }
     }
   }
 
@@ -163,6 +169,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   function body(m) {
     const b = el("div", "ms-body");
     const col = el("div", "ms-col");
+    b.dataset.scroll = `body:${m.id}`; col.dataset.scroll = `col:${m.id}`;
     col.append(tree(m), detail(m));
     b.append(col, sidePane(m));
     return b;
@@ -237,7 +244,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     d.append(detailHead(a.kind, a.status, a.title, `${a.id} · ${kindLabel(a.kind)}${a.model ? ` · ${a.model}` : ""} · ${a.status} · ${agentElapsed(a)}${a.turns ? ` · ${a.turns} turns` : ""}${a.cost ? ` · $${a.cost.toFixed(2)}` : ""}${a.role === "subagent" ? " · subagent" : ""}`));
     if (a.error) d.append(el("div", "ms-detail-err", a.error));
     if (a.activity?.length) { const ul = el("ul", "ms-activity mono"); for (const l of a.activity.slice(-6)) ul.append(el("li", "", l)); d.append(ul); }
-    const out = el("pre", "ms-summary"); out.hidden = true;
+    const out = el("pre", "ms-summary"); out.hidden = true; out.dataset.scroll = `summary:${M.selected}`;
     const acts = el("div", "ms-detail-acts");
     if (a.sid) { const o = el("button", "btn small quiet", "Open chat"); o.onclick = () => onOpenChat(a.sid); acts.append(o); }
     if (a.role === "worker" && ACTIVE.has(a.status)) {
@@ -277,6 +284,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     }
     p.append(tabs);
     const box = el("div", "ms-side-body");
+    box.dataset.scroll = `side:${m.id}:${M.tab}`;
     if (M.tab === "inbox") inbox(m, box); else if (M.tab === "tasks") tasks(m, box); else if (M.tab === "kg") knowledge(m, box); else ledger(m, box);
     p.append(box);
     return p;

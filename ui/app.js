@@ -656,7 +656,15 @@ function checkSignedIn() {
 async function resync() {
   await refreshState();
   history.render();
-  if (S.page === "chat" && S.selected) selectSession(S.selected);
+  if (S.page === "chat" && S.selected) {
+    // The open chat reloads (the live stream lost events): keep the reader where they were. The transcript keeps
+    // its height while it is rebuilt (no jump to the top), then the scroll position comes back (the bottom stays the bottom).
+    const wrap = $("#transcriptWrap"), tr = $("#transcript");
+    const top = wrap.scrollTop, atBottom = wrap.scrollHeight - top - wrap.clientHeight < 40;
+    tr.style.minHeight = `${tr.offsetHeight}px`;
+    try { await selectSession(S.selected); } finally { tr.style.minHeight = ""; }
+    if (!atBottom) wrap.scrollTop = top;
+  }
 }
 let railTimer = null;
 function handle(ev) {
