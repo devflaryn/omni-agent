@@ -3,7 +3,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -552,6 +552,30 @@ test("file routes still work for everything else", async () => {
   assert.equal((await overChannel.buffer()).length, 1024);
 });
 
+test("an agent's view of a stored recovery code: no file route opens it, and the show route needs the window", async () => {
+  writeFileSync(join(accountDir, "recovery-code.json"), "SECRET-KEY-BYTES");
+  const { http } = realDevice();
+  const params = q({ root: accountDir, path: "recovery-code.json" });
+  for (const route of FS_ROUTES) {
+    const local = await raw(`${route}?${params}`);
+    assert.equal(local.status, 403, route);
+    assert.ok(!local.text.includes("SECRET"));
+    const channel = await http.request({ method: "GET", path: `${route}?${params}` });
+    assert.equal(channel.status, 403, route);
+    assert.ok(!(await channel.text()).includes("SECRET"));
+  }
+  for (const name of ["show", "saved"]) {
+    const path = `/api/account/recovery-code/${name}`;
+    const origin = `http://127.0.0.1:${port}`;
+    assert.equal((await raw(path, { method: "POST", headers: { origin, "content-type": "application/json" }, body: "{}" })).status, 403, "no cookie, even from loopback with the right Origin");
+    const channel = await http.request({ method: "POST", path, body: Buffer.from("{}") });
+    assert.equal(channel.status, 403, "never over a channel");
+    await channel.text();
+    assert.equal((await raw(path, { method: "POST", headers: { "content-type": "application/json", cookie: "omni_window=forged", origin }, body: "{}" })).status, 403, "a forged cookie");
+  }
+  rmSync(join(accountDir, "recovery-code.json"));
+});
+
 test("any other route taking a path refuses the account folder, local or channel", async () => {
   const { http } = realDevice();
   const cases = [
@@ -681,6 +705,15 @@ test("account POST: the cookie is not enough, it needs this page's own Origin", 
 
 test("account GET with a foreign Origin is refused too", async () => {
   assert.equal((await raw("/api/account/status", { headers: { cookie, origin: "https://evil.example" } })).status, 403);
+});
+
+test("the recovery-code routes need this page's Origin too, and say when nothing is waiting", async () => {
+  const headers = { cookie, "content-type": "application/json" };
+  const origin = `http://127.0.0.1:${port}`;
+  assert.equal((await raw("/api/account/recovery-code/show", { method: "POST", headers, body: "{}" })).status, 403, "no Origin");
+  assert.equal((await raw("/api/account/recovery-code/show", { method: "POST", headers: { ...headers, origin: "https://evil.example" }, body: "{}" })).status, 403);
+  assert.equal((await raw("/api/account/recovery-code/show", { method: "POST", headers: { ...headers, origin }, body: "{}" })).status, 404);
+  assert.equal((await raw("/api/account/recovery-code/show", { headers })).status, 404, "GET is no such route");
 });
 
 test("account routes: settings and audit answer through the window cookie", async () => {

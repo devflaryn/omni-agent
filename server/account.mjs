@@ -9,6 +9,10 @@
  * Files, all in one folder (~/.omni-agent/account/ by default), readable only by this user:
  *   keys.json      the private keys, protected (DPAPI, Keychain, or file permissions alone with a warning in status())
  *   session.json   the hub session token, protected the same way
+ *   recovery-code.json  a one-time recovery code, protected the same way, from just before the hub call that makes it live until
+ *                  the person says they saved it. A kill at any moment must not lose it, and a stolen device must not be able
+ *                  to replace it, so it cannot be issued again. Anyone who can read this store already holds this full
+ *                  device's keys, so keeping it here that short while gives them nothing they did not have.
  *   state.json     email, name, phase, and a confirmed approval's head and approver (not its code). No secrets.
  *   log.candidate.json  a log about to be sent to the hub, so that a kill right after the hub takes it can be resumed. No secrets.
  *   log.json       the longest log verified so far
@@ -16,7 +20,7 @@
  *   alerts.json    what the person has been warned of
  *   audit.jsonl    one line per request from another device, with one older file, audit.1.jsonl
  *
- * Never logged, alerted, audited or put in an error: keys, tokens, passwords, codes.
+ * Never logged, alerted, audited or put in an error: keys, tokens, passwords, codes. Never in state.json or alerts.json.
  */
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -72,6 +76,7 @@ const HUB_CLAIMS_REMOVED = "The hub says this device was removed from the accoun
 const CLOSE_SESSION_GONE = 4401, CLOSE_REMOVED = 4403, CLOSE_PENDING_EXPIRED = 4408, CLOSE_REPLACED = 4409, CLOSE_DENIED = 4410;
 
 const SETTINGS_DAMAGED = "The saved settings could not be read, so Allow web page access is off until you choose again.";
+const RECOVERY_CODE_FILE = "recovery-code.json";
 const LOG_NOT_SAVED = "This computer could not save its device list. It will try again the next time Omni starts: check the disk.";
 // ------------------------------------------------------------------------------ the slow key
 
@@ -165,8 +170,7 @@ export class Account extends EventEmitter {
   #alertsQueued = false;
   #candidate = null;      // { kind, entries }: a log sent, or about to be sent, to the hub and not yet known to have landed
   #registerAttempt = null;
-  #codeHandedOut = false;
-  #codeNotShown = false;
+  #codePending = false;
   #hubClaimedRemoved = false;
   #sentInWindow = 0;
   #windowStart = 0;
@@ -233,7 +237,7 @@ export class Account extends EventEmitter {
       alerts: this.#alerts.slice(),
       recoveries: this.#verified?.recoveries ?? [],
       recoveryUnconfirmed: this.#recoveryAt !== null,
-      recoveryCodeNotShown: this.#codeNotShown,
+      recoveryCodePending: this.#codePending,
       channels: this.#links.all().filter((c) => c.state === "open").map((c) => ({ id: c.id, device: c.peerId, name: c.peer.name, direction: c.direction })),
       handshakes: this.#links.all().filter((c) => c.state === "handshake").length,
     };
@@ -378,7 +382,7 @@ export class Account extends EventEmitter {
 
   #persistState() {
     const exchange = this.#exchange?.confirmed ? { head: this.#exchange.head, from: this.#exchange.from } : null;
-    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange, recoveryAt: this.#recoveryAt, codeNotShown: this.#codeNotShown }));
+    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange, recoveryAt: this.#recoveryAt }));
   }
 
   async #ensureKeys() {
@@ -431,12 +435,12 @@ export class Account extends EventEmitter {
       this.#alerts = rows;
       if (!Array.isArray(alerts) || rows.length !== alerts.length) this.#warnings.add("The saved security alerts could not be read, so some earlier alerts may be missing.");
     }
+    this.#codePending = await fs.access(join(this.dir, RECOVERY_CODE_FILE)).then(() => true, () => false);
     const candidate = await this.#readJson("log.candidate.json").catch(() => null);
     if (Array.isArray(candidate?.entries)) this.#candidate = { kind: candidate.kind, entries: candidate.entries };
     const state = await this.#readJson("state.json").catch(() => null);
     this.#email = candidate?.email ?? null;
     if (state) {
-      this.#codeNotShown = state.codeNotShown === true;
       this.#email = state.email ?? this.#email;
       this.#name = state.name ?? this.#name;
       this.#recoveryAt = Number.isSafeInteger(state.recoveryAt) ? state.recoveryAt : null;
@@ -581,10 +585,14 @@ export class Account extends EventEmitter {
     }
     // A retry after no answer sends the same thing, so that if the first one landed its code is the code that counts.
     const retry = this.#registerAttempt?.email === email ? this.#registerAttempt : null;
+    // What an earlier, killed attempt left: if the hub turns this one down, that one may be the live account and its code.
+    const earlier = retry ? null : await this.#unsettledFiles();
     const { recoveryCode, entries, salt } = retry ?? await this.#newRegistration(email);
     const loginKey = await this.#loginKey(password, salt);
     const token = await this.#bootstrapToken();
-    await this.#writeCandidate("register", email, entries); // nothing has been sent if this fails
+    // Both on disk before the hub can make them live. Nothing has been sent if either fails.
+    await this.#storeRecoveryCode(recoveryCode);
+    await this.#writeCandidate("register", email, entries);
     let accepted = true;
     try {
       await this.#post("/api/register", { email, salt: toB64(salt), verifierInput: loginKey, firstLogEntry: entries[0], ...(token ? { bootstrapToken: token } : {}) });
@@ -593,6 +601,8 @@ export class Account extends EventEmitter {
       if (!retry) {
         this.#registerAttempt = null;
         await this.#dropCandidate();
+        await this.#dropRecoveryCode();
+        await this.#restoreUnsettled(earlier);
         throw error;
       }
       accepted = false;
@@ -601,13 +611,13 @@ export class Account extends EventEmitter {
       const state = await this.#login(email, loginKey).catch(() => null);
       if (state !== "approved") {
         await this.#dropCandidate();
+        await this.#dropRecoveryCode();
         throw error;
       }
     }
     this.#registerAttempt = null;
     // The account exists now. From here nothing may stop the person getting this code: it is never shown again.
     this.#email = email;
-    this.#codeHandedOut = true;
     await this.#settleCommitted(entries);
     await this.#tryLocal(() => fs.rm(join(this.dir, "bootstrap-token"), { force: true }), "Could not delete the bootstrap token from the account folder. It opens nothing now, but delete it by hand.");
     if (accepted) await this.#login(email, loginKey).catch(() => {});
@@ -644,6 +654,61 @@ export class Account extends EventEmitter {
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
     this.#connect();
     return true;
+  }
+
+  // ---------------------------------------------------------------------------- the one-time code, while it is on disk
+
+  async #storeRecoveryCode(code) {
+    await this.#writeSecret(RECOVERY_CODE_FILE, {}, Buffer.from(code));
+    this.#codePending = true;
+    this.#changed();
+  }
+
+  async #dropRecoveryCode() {
+    this.#codePending = false;
+    await this.#tryLocal(() => fs.rm(join(this.dir, RECOVERY_CODE_FILE), { force: true }), "A used recovery code could not be deleted from the account folder.");
+    this.#changed();
+  }
+
+  /** The stored code. `confirmed` is false while the hub may not have taken it, and then it may not work yet. */
+  async showRecoveryCode() {
+    await this.start();
+    if (!this.#codePending) throw new AccountError(404, "no-code", "There is no recovery code waiting to be shown.");
+    let record;
+    try {
+      record = await this.#readJson(RECOVERY_CODE_FILE);
+      return { recoveryCode: Buffer.from(await this.#readSecret(record)).toString(), confirmed: !this.#candidate };
+    } catch {
+      throw new AccountError(500, "code-unavailable", "The stored recovery code could not be opened on this computer.");
+    }
+  }
+
+  /** The person says they saved it. Until then it stays, and the UI keeps asking. */
+  async recoveryCodeSaved() {
+    await this.start();
+    if (this.#candidate) throw new AccountError(409, "not-settled", "Wait until the hub has confirmed this code before discarding it.");
+    await this.#dropRecoveryCode();
+    return { recoveryCodePending: false };
+  }
+
+  async #unsettledFiles() {
+    if (!this.#candidate && !this.#codePending) return null;
+    const read = (name) => fs.readFile(join(this.dir, name), "utf8").catch(() => null);
+    return { candidate: await read("log.candidate.json"), code: await read(RECOVERY_CODE_FILE) };
+  }
+
+  async #restoreUnsettled(earlier) {
+    if (!earlier) return;
+    if (earlier.candidate) {
+      await this.#writeFile("log.candidate.json", earlier.candidate);
+      const parsed = JSON.parse(earlier.candidate);
+      this.#candidate = { kind: parsed.kind, entries: parsed.entries };
+    }
+    if (earlier.code) {
+      await this.#writeFile(RECOVERY_CODE_FILE, earlier.code);
+      this.#codePending = true;
+    }
+    this.#changed();
   }
 
   async #tryLocal(work, warning) {
@@ -693,6 +758,7 @@ export class Account extends EventEmitter {
     if (!candidate) return;
     const notThere = async (message) => {
       await this.#dropCandidate();
+      await this.#dropRecoveryCode(); // it never became live
       if (this.#phase !== "recovering") return;
       this.#phase = "signed-out";
       this.#recoveryAt = null;
@@ -715,10 +781,6 @@ export class Account extends EventEmitter {
     }
     if (verdict !== "same" && verdict !== "b-newer") return notThere("The recovery did not reach the hub. Your old recovery code still works.");
     if (await this.#adopt(reply.entries, verified, { bestEffort: true })) await this.#dropCandidate();
-    if (!this.#codeHandedOut) {
-      this.#codeNotShown = true;
-      this.#warnings.add("Omni stopped before it could show this account's new recovery code, and it cannot be shown again. This computer keeps full control, but the account has no recovery code you know.");
-    }
     if (candidate.kind === "recover") this.#recoveryAt ??= candidate.entries.length - 1;
     this.#phase = "approved";
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
@@ -778,7 +840,9 @@ export class Account extends EventEmitter {
     this.#approvedByHub = false;
     this.#hubError = null;
     if (forget) {
-      for (const file of ["keys.json", "log.json", "state.json"]) await fs.rm(join(this.dir, file), { force: true });
+      for (const file of ["keys.json", "log.json", "state.json", "log.candidate.json", RECOVERY_CODE_FILE]) await fs.rm(join(this.dir, file), { force: true });
+      this.#codePending = false;
+      this.#candidate = null;
       this.#recoveryAt = null;
       this.#keys = null;
       this.#log = null;
@@ -1424,6 +1488,8 @@ export class Account extends EventEmitter {
     if (this.#everOnLog(this.#keys.signPub) && !this.#verified?.devices.has(this.#keys.signPub)) {
       throw new AccountError(409, "removed", "This device was removed from the account. Sign out and forget this device first.");
     }
+    // That code may be the live one, and a failed attempt here must not cost it.
+    if (this.#codePending) throw new AccountError(409, "recovery-code-pending", "This computer holds a recovery code you have not saved yet. Save that one first.");
     const salt = await this.#saltFor(email);
     await this.#login(email, await this.#loginKey(password, salt));
     this.#phase = "recovering";
@@ -1443,7 +1509,9 @@ export class Account extends EventEmitter {
         }
         const entries = await this.#checkedRecoveryLog(reply.entries, recovery);
         const appended = await recoverOnto(entries, { name: this.#name, kind: this.#kind, signPub: this.#keys.signPub, boxPub: this.#keys.boxPub }, { current: recovery, next, addedAt: this.now() });
-        await this.#writeCandidate("recover", email, appended); // nothing has been sent if this fails: the old code stands
+        // Both on disk before the hub can make them live. Nothing has been sent if either fails: the old code stands.
+        await this.#storeRecoveryCode(nextCode);
+        await this.#writeCandidate("recover", email, appended);
         let answer;
         try {
           answer = await this.#rpc({ type: "log.append", prevHead: entries.at(-1) ? await entryHash(entries.at(-1)) : "", entry: appended.at(-1) }, ["log.ok", "log.conflict"]);
@@ -1454,6 +1522,7 @@ export class Account extends EventEmitter {
         }
         if (answer.type === "log.conflict") {
           await this.#dropCandidate();
+          await this.#dropRecoveryCode();
           continue;
         }
         return this.#finishRecovery(nextCode, appended);
@@ -1461,6 +1530,7 @@ export class Account extends EventEmitter {
       throw new AccountError(409, "log-conflict", "The device list keeps changing. Try again.");
     } catch (error) {
       await this.#dropCandidate();
+      await this.#dropRecoveryCode();
       this.#phase = "signed-out";
       this.#dropConnection("signed-out");
       await this.#forgetSession().catch(() => {});
@@ -1471,7 +1541,6 @@ export class Account extends EventEmitter {
 
   /** The hub has the entry, so the old code is dead. Never throws: losing this code could leave the account with none. */
   async #finishRecovery(nextCode, appended) {
-    this.#codeHandedOut = true;
     this.#phase = "approved";
     // Until another device shows it holds this entry, the hub may have shown an older log and this new code may not count.
     this.#recoveryAt = appended.length - 1;
@@ -1486,7 +1555,6 @@ export class Account extends EventEmitter {
   }
 
   async #recoveryInDoubt(nextCode, appended) {
-    this.#codeHandedOut = true;
     this.#recoveryAt = appended.length - 1;
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
     // Reconnecting says which: an approved session means the hub has the entry.

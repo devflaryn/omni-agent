@@ -50,6 +50,12 @@ export async function handleAccountRoutes(req, res, { p, q, account, send, readB
     case "/api/account/recover":
       if (post) return send(res, 200, await account.recover({ email: need(body.email, "email"), password: need(body.password, "password"), recoveryCode: need(body.recoveryCode, "recoveryCode"), name: body.name }));
       break;
+    case "/api/account/recovery-code/show":
+      if (post) return send(res, 200, await account.showRecoveryCode());
+      break;
+    case "/api/account/recovery-code/saved":
+      if (post) return send(res, 200, await account.recoveryCodeSaved());
+      break;
     case "/api/account/settings":
       if (get) return send(res, 200, account.settings());
       if (post) return send(res, 200, await account.setSettings({ allowWebAccess: body.allowWebAccess }));
