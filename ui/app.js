@@ -1,6 +1,6 @@
 /* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only. */
 import { el, baseName, cleanTitle, applyStatus, AGENT_ACTIVE, agentTone, agentKindLabel, harnessLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
-import { newView, applyEvent, finish, forkNote, agentNote, emptyNote } from "./transcript.js";
+import { newView, applyEvent, finish, forkNote, agentNote, emptyNote, isFollowing } from "./transcript.js";
 import { createComposer } from "./composer.js";
 import { createHistory } from "./sidebar.js";
 import { createPanel } from "./panel.js";
@@ -546,13 +546,17 @@ async function chatStop() {
   if (t.kind === "agent") { if (t.id) await stopAgent(t.id); return; }
   try { if (t.kind === "owned-pi") await api("/api/pi/abort", { sid: t.s.sid }); } catch (e) { toast(e.message, true); }
 }
-async function selectSession(sid) {
-  if (S.view) finish(S.view);
+/** `reload`: the same chat again after the stream lost events. It is built aside and swapped in whole, so the reader
+ *  never sees it empty and the panel they are scrolling never loses its height. */
+async function selectSession(sid, { reload = false } = {}) {
+  const previous = S.view;
+  if (S.view && !reload) finish(S.view);
   S.selected = sid;
   S.forceFork = false;
   history.render();
   const s0 = S.sessions.get(sid);
-  const view = newView($("#transcript"), $("#transcriptWrap"), sid, { cwd: s0?.cwd, openAgent });
+  const wrap = $("#transcriptWrap"), follow = isFollowing(wrap);
+  const view = newView(reload ? document.createElement("div") : $("#transcript"), wrap, sid, { cwd: s0?.cwd, openAgent, keepFollow: reload });
   S.view = view;
   updateHeader(); updateComposer(); renderAgents();
   if (s0?.cwd) explorer.setRoot(s0.cwd);
@@ -586,9 +590,17 @@ async function selectSession(sid) {
       const parent = s.parentSid || agentFor(sid)?.parentSid;
       agentNote(view, { kind: s.agentKind || agentFor(sid)?.kind, parentTitle: S.sessions.get(parent)?.title, onOpen: parent && S.sessions.has(parent) ? () => openChat(parent) : null });
     }
-    $("#transcriptWrap").scrollTop = $("#transcriptWrap").scrollHeight;
     if (!events.length) emptyNote(view, "nothing here yet");
-  } catch (e) { toast(`Could not load history: ${e.message}`, true); }
+    if (reload) {
+      const top = wrap.scrollTop, shown = $("#transcript");
+      shown.replaceChildren(...view.root.childNodes);
+      view.root = shown;
+      wrap.scrollTop = follow ? wrap.scrollHeight : top;
+    } else wrap.scrollTop = wrap.scrollHeight;
+  } catch (e) {
+    toast(`Could not load history: ${e.message}`, true);
+    if (reload && S.selected === sid) S.view = previous; // what is on the screen stays, and stays live
+  }
   updateHeader(); updateComposer();
   if (document.body.classList.contains("panel-open")) panel.renderStats();
 }
@@ -657,13 +669,8 @@ async function resync() {
   await refreshState();
   history.render();
   if (S.page === "chat" && S.selected) {
-    // The open chat reloads (the live stream lost events): keep the reader where they were. The transcript keeps
-    // its height while it is rebuilt (no jump to the top), then the scroll position comes back (the bottom stays the bottom).
-    const wrap = $("#transcriptWrap"), tr = $("#transcript");
-    const top = wrap.scrollTop, atBottom = wrap.scrollHeight - top - wrap.clientHeight < 40;
-    tr.style.minHeight = `${tr.offsetHeight}px`;
-    try { await selectSession(S.selected); } finally { tr.style.minHeight = ""; }
-    if (!atBottom) wrap.scrollTop = top;
+    // The open chat reloads (the live stream lost events): the reader stays where they are.
+    await selectSession(S.selected, { reload: true });
   }
 }
 let railTimer = null;

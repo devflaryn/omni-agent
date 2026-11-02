@@ -27,8 +27,9 @@ const ICONS = {
 const icon = (kind, cls = "ico") => `<span class="${cls}">${ICONS[kind] || ICONS.other}</span>`;
 
 /** `openAgent(id)`: what an agent report card's Open button does (the app opens that agent's chat or log). */
-export function newView(root, wrap, sid, { cwd, openAgent } = {}) {
+export function newView(root, wrap, sid, { cwd, openAgent, keepFollow = false } = {}) {
   root.innerHTML = "";
+  const f = followOf(wrap); if (f && !keepFollow) f.on = true;
   const view = { sid, root, wrap, cwd: cwd || "", harness: sid.split(":")[0], tools: new Map(), turn: null, stream: null, lastTs: 0, empty: null, lastUser: null, openAgent: openAgent || null };
   active.view = view;
   if (!active.timer) active.timer = setInterval(() => {
@@ -54,7 +55,38 @@ export function agentNote(view, { kind, parentTitle, onOpen }) {
   view.root.prepend(n);
 }
 
-function scrollBottom(view) { const w = view.wrap; if (w.scrollHeight - w.scrollTop - w.clientHeight < 200) w.scrollTop = w.scrollHeight; }
+/**
+ * Whether the chat stays on its newest line. Pure. Moving up at all stops following at once, and only coming back to the
+ * bottom starts it again: a distance-from-the-bottom test alone pulls a reader back while they are scrolling up.
+ */
+export function nextFollow(on, { top, lastTop, gap }) {
+  if (top < lastTop - 0.5) return false; // first: the start of a move up is still close to the bottom
+  return gap < 24 ? true : on;
+}
+const follows = new WeakMap();
+function followOf(w) {
+  if (!w?.addEventListener) return null;
+  let f = follows.get(w);
+  if (f) return f;
+  f = { on: true, held: false, lastTop: w.scrollTop };
+  follows.set(w, f);
+  w.addEventListener("scroll", () => { f.on = nextFollow(f.on, { top: w.scrollTop, lastTop: f.lastTop, gap: w.scrollHeight - w.scrollTop - w.clientHeight }); f.lastTop = w.scrollTop; }, { passive: true });
+  // The intent arrives before the position moves: a stream's next word must not undo it.
+  w.addEventListener("wheel", (e) => { if (e.deltaY < 0 && w.scrollTop > 0) f.on = false; }, { passive: true });
+  w.addEventListener("touchstart", () => { f.held = true; }, { passive: true });
+  for (const n of ["touchend", "touchcancel"]) w.addEventListener(n, () => { f.held = false; }, { passive: true });
+  w.addEventListener("pointerdown", (e) => { if (e.target === w) f.held = true; }); // the scrollbar
+  globalThis.window?.addEventListener("pointerup", () => { f.held = false; });
+  return f;
+}
+function scrollBottom(view) {
+  const w = view.wrap, f = followOf(w);
+  if (f && (!f.on || f.held)) return;
+  w.scrollTop = w.scrollHeight;
+  if (f) f.lastTop = w.scrollTop;
+}
+/** Is this chat following its newest line? (app.js, when it reloads a chat in place.) */
+export const isFollowing = (wrap) => followOf(wrap)?.on ?? true;
 
 // ------------------------------------------------------------- turns
 function openTurn(view, ts, live) {

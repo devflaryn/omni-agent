@@ -172,7 +172,7 @@ export function render(scene, view) {
     }
     if (edge) { const oc = hexRgb(m.line || m.ramp[0]); const k = m.line ? 1 : 0.55; out[i * 4] = rgba[i * 4] * (1 - k) * 0.4 + oc[0] * k; out[i * 4 + 1] = rgba[i * 4 + 1] * (1 - k) * 0.4 + oc[1] * k; out[i * 4 + 2] = rgba[i * 4 + 2] * (1 - k) * 0.4 + oc[2] * k; }
   }
-  return { w, h, rgba: out, id: idb, depth, project, prims };
+  return { w, h, rgba: out, id: idb, depth, project, prims, view: { pitch: view.pitch, x0: view.x0, y0: view.y0 } };
 }
 
 /** Paint a pixel only where `prim` is the visible surface (for faces drawn on heads). */

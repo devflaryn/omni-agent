@@ -49,14 +49,24 @@ export function orchestratorState(m, session) {
 }
 
 export function createMissionView({ root, api, toast, onOpenChat, sessionOf = () => null, defaultDir = () => "", defaultModel = () => null }) {
-  const M = { list: new Map(), agents: new Map(), open: null, selected: "orchestrator", tab: "inbox", timer: null, tick: null, models: null, kg: { q: "", text: "", node: "", stats: null, missionId: null } };
+  const M = { list: new Map(), agents: new Map(), reports: new Map(), open: null, selected: "orchestrator", tab: "inbox", timer: null, tick: null, models: null, kg: { q: "", text: "", node: "", stats: null, missionId: null } };
   const shell = el("div", "ms-shell");
   const side = el("aside", "ms-list");
-  side.dataset.scroll = "list";
   const main = el("div", "ms-main");
   shell.append(side, main);
   root.appendChild(shell);
   const badgeListeners = new Set();
+  // The scrolling panels live as long as the view. A live update only swaps what changed inside them: replacing a
+  // panel would end a scroll in progress (a wheel's glide, a finger's fling, a dragged scrollbar) every time an event came.
+  const headSlot = el("div", "ms-head-slot"), bodyEl = el("div", "ms-body"), col = el("div", "ms-col");
+  const officeEl = el("div", "ms-office"), detailSlot = el("div", "ms-detail-slot"), sideEl = el("aside", "ms-side"), tabsSlot = el("div", "ms-tabs-slot"), sideBody = el("div", "ms-side-body");
+  col.append(officeEl, detailSlot);
+  sideEl.append(tabsSlot, sideBody);
+  bodyEl.append(col, sideEl);
+  const sigs = new Map(); // what each part was last built from
+  const changed = (name, sig) => { if (sigs.get(name) === sig) return false; sigs.set(name, sig); return true; };
+  const saved = new Map(); // where each mission's and tab's panels were left
+  let shownMission = null, shownSide = null;
 
   function schedule() { if (!M.timer) M.timer = setTimeout(() => { M.timer = null; render(); }, 150); }
   function setTick(on) { if (on && !M.tick) M.tick = setInterval(() => schedule(), 5000); if (!on && M.tick) { clearInterval(M.tick); M.tick = null; } }
@@ -89,40 +99,66 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   function onStatus() { if (M.open) schedule(); }
 
   // ---------------------------------------------------------------- render
-  /** Live updates rebuild the view: what is being typed (inputs with data-k), the focus and the caret survive it. */
+  /** Live updates change only the parts whose data changed; what is being typed, the focus and the caret survive them. */
   function render() {
     const keep = new Map();
     for (const e of root.querySelectorAll("[data-k]")) if (e.value) keep.set(e.dataset.k, e.value);
     const act = document.activeElement, focus = act?.dataset?.k && root.contains(act) ? act.dataset.k : null;
-    // Live updates rebuild the view: every scrolling part keeps where it was (keys name the mission/tab/agent).
-    const scrolls = new Map();
-    for (const e of root.querySelectorAll("[data-scroll]")) scrolls.set(e.dataset.scroll, [e.scrollTop, e.scrollLeft]);
     let caret = null; try { caret = focus ? [act.selectionStart, act.selectionEnd] : null; } catch { /* no selection */ }
     renderList();
-    { const v = scrolls.get("list"); if (v) side.scrollTop = v[0]; }
     const m = M.open && M.list.get(M.open);
-    main.textContent = "";
-    if (!m) { main.appendChild(emptyState()); setTick(false); return; }
-    main.append(header(m), body(m));
+    if (!m) {
+      if (!main.querySelector(".ms-empty")) { sigs.clear(); shownMission = shownSide = null; main.replaceChildren(emptyState()); }
+      setTick(false);
+      return;
+    }
+    if (!bodyEl.isConnected) main.replaceChildren(headSlot, bodyEl);
+    if (changed("head", headSig(m))) headSlot.replaceChildren(header(m));
+    moveTo(m);
+    tree(m);
+    if (changed("detail", detailSig(m))) {
+      const pre = detailSlot.querySelector(".ms-summary"), top = pre?.scrollTop || 0;
+      detailSlot.replaceChildren(detail(m));
+      const now = detailSlot.querySelector(".ms-summary");
+      if (now) now.scrollTop = top;
+    }
+    sidePane(m);
     setTick(m.status === "running");
     for (const e of root.querySelectorAll("[data-k]")) if (!e.value && keep.has(e.dataset.k)) e.value = keep.get(e.dataset.k);
-    for (const e of root.querySelectorAll("[data-scroll]")) { const v = scrolls.get(e.dataset.scroll); if (v) { e.scrollTop = v[0]; e.scrollLeft = v[1]; } }
     if (focus) {
       const e = [...root.querySelectorAll("[data-k]")].find((x) => x.dataset.k === focus);
-      if (e) { e.focus({ preventScroll: true }); if (caret) { try { e.setSelectionRange(caret[0], caret[1]); } catch { /* not a text input */ } } }
+      if (e && e !== document.activeElement) { e.focus({ preventScroll: true }); if (caret) { try { e.setSelectionRange(caret[0], caret[1]); } catch { /* not a text input */ } } }
     }
   }
 
+  /** Another mission opened: its panels go back to where they were left in it (the top the first time). */
+  function moveTo(m) {
+    if (shownMission === m.id) return;
+    if (shownMission) { saved.set(`col:${shownMission}`, col.scrollTop); saved.set(`body:${shownMission}`, bodyEl.scrollTop); }
+    shownMission = m.id;
+    sigs.delete("detail");
+    queueMicrotask(() => { col.scrollTop = saved.get(`col:${m.id}`) || 0; bodyEl.scrollTop = saved.get(`body:${m.id}`) || 0; }); // once its content is in
+  }
+
+  const minute = () => Math.floor(Date.now() / 60_000);
+  const headSig = (m) => JSON.stringify([m.id, m.title, m.status, m.dir, m.goal, m.usingFallback, m.fallbackModel, m.orchestratorModel, m.orchestrator?.generation, m.orchestrator?.contextUsed, m.orchestrator?.contextWindow]);
+  function detailSig(m) {
+    const a = M.agents.get(String(M.selected).split("/")[0]);
+    const os = orchestratorState(m, m.orchestrator?.sid ? sessionOf(m.orchestrator.sid) : null);
+    return JSON.stringify([m.id, M.selected, minute(), os.text, os.px, (m.queue || []).map((x) => x.type), m.orchestrator?.sid, m.usingFallback, a && [a.title, a.status, a.model, a.turns, a.cost, a.error, a.role, a.sid, a.kind, a.activity?.slice(-6), a.subtasks], M.reports.get(M.selected)]);
+  }
+
   function renderList() {
-    side.textContent = "";
+    const ms = [...M.list.values()].sort((a, b) => b.createdAt - a.createdAt);
+    if (!changed("list", JSON.stringify([M.open, minute(), ms.map((m) => [m.id, m.title, m.status, ago(m.updatedAt), (m.notifications || []).filter((x) => !x.read).length])]))) return;
+    const out = [];
     const head = el("div", "ms-list-head");
     head.append(el("span", "ms-list-title", "Missions"));
     const nb = el("button", "btn small primary", "New mission");
     nb.onclick = () => openNew();
     head.append(nb);
-    side.appendChild(head);
-    const ms = [...M.list.values()].sort((a, b) => b.createdAt - a.createdAt);
-    if (!ms.length) side.appendChild(el("div", "ms-list-empty", "No missions yet."));
+    out.push(head);
+    if (!ms.length) out.push(el("div", "ms-list-empty", "No missions yet."));
     for (const m of ms) {
       const row = el("button", `ms-row${m.id === M.open ? " on" : ""}`);
       const unread = (m.notifications || []).filter((x) => !x.read).length;
@@ -133,8 +169,9 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       row.append(dot, txt);
       if (unread) row.append(el("span", "ms-badge", String(unread)));
       row.onclick = async () => { M.open = m.id; M.selected = "orchestrator"; try { await loadOne(m.id); } catch { /* live events fill it */ } render(); };
-      side.appendChild(row);
+      out.push(row);
     }
+    side.replaceChildren(...out);
   }
 
   function emptyState() {
@@ -166,21 +203,12 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
 
   async function act(path, ok, body = {}) { try { await api(path, body); if (ok) toast(ok); if (M.open) await loadOne(M.open); render(); } catch (e) { toast(e.message, true); } }
 
-  function body(m) {
-    const b = el("div", "ms-body");
-    const col = el("div", "ms-col");
-    b.dataset.scroll = `body:${m.id}`; col.dataset.scroll = `col:${m.id}`;
-    col.append(tree(m), detail(m));
-    b.append(col, sidePane(m));
-    return b;
-  }
-
   /** The mission as an office (ui/office.js): one canvas, re-drawn from live data; a click on a desk selects that agent. */
-  const office = createOffice();
+  const office = createOffice({ spawn: () => new Worker(new URL("./office-worker.js", import.meta.url), { type: "module" }), onReady: () => schedule() });
+  let drawn = null;
   function tree(m) {
     const t = buildTree(m, [...M.agents.values()]);
     const orch = orchestratorState(m, m.orchestrator?.sid ? sessionOf(m.orchestrator.sid) : null);
-    const wrap = el("div", "ms-office");
     if (!M.canvas) {
       const c = M.canvas = document.createElement("canvas");
       c.className = "ms-office-canvas";
@@ -188,23 +216,26 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       const at = (e) => { const r = c.getBoundingClientRect(), x = ((e.clientX - r.left) * c.width) / r.width, y = ((e.clientY - r.top) * c.height) / r.height; return [...(M.hits || [])].reverse().find((h) => x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h); };
       c.onclick = (e) => { const h = at(e); if (h) { M.selected = h.id; render(); } };
       c.onmousemove = (e) => { c.style.cursor = at(e) ? "pointer" : "default"; };
+      M.officeSr = el("div", "sr-only");
+      M.officeNote = el("div", "ms-tree-empty");
+      officeEl.append(c, M.officeSr, M.officeNote);
     }
-    let hits = [];
-    try {
-      const { img, hits: hs } = office.draw(officeData(m, t, orch), { selected: M.selected });
-      hits = M.hits = hs;
-      const c = M.canvas;
-      if (c.width !== img.w || c.height !== img.h) { c.width = img.w; c.height = img.h; c.style.aspectRatio = `${img.w} / ${img.h}`; c.style.maxWidth = `${img.w * 3}px`; }
-      c.getContext("2d").putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0);
-      c.setAttribute("aria-label", `The mission as an office: the orchestrator and ${t.workers.length + t.orphans.length} workers`);
-    } catch (e) { console.error("office", e); }
-    wrap.append(M.canvas);
+    const none = !t.workers.length && !t.orphans.length;
+    M.officeNote.hidden = !none;
+    if (none) M.officeNote.textContent = m.status === "running" ? "The orchestrator is planning; its workers take a desk here as it starts them." : "No workers.";
+    let result = null;
+    try { result = office.draw(officeData(m, t, orch), { selected: M.selected }); } catch (e) { console.error("office", e); }
+    if (!result) return;
+    const { img, hits } = result, c = M.canvas;
+    M.hits = hits;
+    if (c.width !== img.w || c.height !== img.h) { c.width = img.w; c.height = img.h; c.style.aspectRatio = `${img.w} / ${img.h}`; c.style.maxWidth = `${img.w * 3}px`; }
+    const sum = `${result.version}|${M.selected}|${JSON.stringify(result.labels)}`;
+    if (sum !== drawn) { drawn = sum; c.getContext("2d").putImageData(new ImageData(img.rgba, img.w, img.h), 0, 0); }
+    c.setAttribute("aria-label", `The mission as an office: the orchestrator and ${t.workers.length + t.orphans.length} workers`);
     // the same choices for keyboards and screen readers
-    const sr = el("div", "sr-only");
-    for (const h of hits) { const b = el("button", "", `Open ${h.label}`); b.onclick = () => { M.selected = h.id; render(); }; sr.append(b); }
-    wrap.append(sr);
-    if (!t.workers.length && !t.orphans.length) wrap.append(el("div", "ms-tree-empty", m.status === "running" ? "The orchestrator is planning; its workers take a desk here as it starts them." : "No workers."));
-    return wrap;
+    if (changed("sr", JSON.stringify(hits.map((h) => [h.id, h.label])))) {
+      M.officeSr.replaceChildren(...hits.map((h) => { const b = el("button", "", `Open ${h.label}`); b.onclick = () => { M.selected = h.id; render(); }; return b; }));
+    }
   }
 
   /** The detail pane's heading: title and facts. */
@@ -244,17 +275,19 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     d.append(detailHead(a.kind, a.status, a.title, `${a.id} · ${kindLabel(a.kind)}${a.model ? ` · ${a.model}` : ""} · ${a.status} · ${agentElapsed(a)}${a.turns ? ` · ${a.turns} turns` : ""}${a.cost ? ` · $${a.cost.toFixed(2)}` : ""}${a.role === "subagent" ? " · subagent" : ""}`));
     if (a.error) d.append(el("div", "ms-detail-err", a.error));
     if (a.activity?.length) { const ul = el("ul", "ms-activity mono"); for (const l of a.activity.slice(-6)) ul.append(el("li", "", l)); d.append(ul); }
-    const out = el("pre", "ms-summary"); out.hidden = true; out.dataset.scroll = `summary:${M.selected}`;
+    const out = el("pre", "ms-summary"); const selected = M.selected, shownReport = M.reports.get(selected);
+    out.hidden = shownReport == null; if (shownReport != null) out.textContent = shownReport;
+    const report = (text) => { M.reports.set(selected, text); out.hidden = false; out.textContent = text; };
     const acts = el("div", "ms-detail-acts");
     if (a.sid) { const o = el("button", "btn small quiet", "Open chat"); o.onclick = () => onOpenChat(a.sid); acts.append(o); }
     if (a.role === "worker" && ACTIVE.has(a.status)) {
       const s = el("button", "btn small", "Ask for a summary");
-      s.onclick = async () => { s.disabled = true; out.hidden = false; out.textContent = "Asking the worker…"; try { out.textContent = (await api(`/api/missions/${m.id}/workers/${a.id}/summary`, {})).text; } catch (e) { out.textContent = e.message; } s.disabled = false; };
+      s.onclick = async () => { s.disabled = true; report("Asking the worker…"); try { report((await api(`/api/missions/${m.id}/workers/${a.id}/summary`, {})).text); } catch (e) { report(e.message); } s.disabled = false; schedule(); };
       acts.append(s);
     }
     if (a.role === "worker" && !ACTIVE.has(a.status)) {
       const r = el("button", "btn small", "Full report");
-      r.onclick = async () => { out.hidden = false; try { out.textContent = (await api(`/api/missions/${m.id}/report/${a.id}`)).text; } catch (e) { out.textContent = e.message; } };
+      r.onclick = async () => { try { report((await api(`/api/missions/${m.id}/report/${a.id}`)).text); } catch (e) { report(e.message); } schedule(); };
       acts.append(r);
     }
     if (ACTIVE.has(a.status)) { const c = el("button", "btn small quiet", "Stop"); c.onclick = () => { if (window.confirm(`Stop ${a.id}?`)) act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/cancel` : `/api/agents/${a.id}/cancel`, "Stopped"); }; acts.append(c); }
@@ -273,21 +306,28 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     return f;
   }
 
+  /** The side pane: the panel stays; each tab of each mission remembers where it was. */
   function sidePane(m) {
-    const p = el("aside", "ms-side");
-    const tabs = el("div", "ms-tabs");
     const unread = (m.notifications || []).filter((x) => !x.read).length;
-    for (const [k, label] of [["inbox", `Inbox${unread ? ` (${unread})` : ""}`], ["tasks", `Tasks (${m.tasks?.length || 0})`], ["ledger", "Ledger"], ["kg", "Knowledge"]]) {
-      const b = el("button", `seg-btn${M.tab === k ? " active" : ""}`, label);
-      b.onclick = () => { M.tab = k; render(); };
-      tabs.append(b);
+    const tabs = [["inbox", `Inbox${unread ? ` (${unread})` : ""}`], ["tasks", `Tasks (${m.tasks?.length || 0})`], ["ledger", "Ledger"], ["kg", "Knowledge"]];
+    if (changed("tabs", JSON.stringify([M.tab, tabs]))) {
+      const row = el("div", "ms-tabs");
+      for (const [k, label] of tabs) {
+        const b = el("button", `seg-btn${M.tab === k ? " active" : ""}`, label);
+        b.onclick = () => { M.tab = k; render(); };
+        row.append(b);
+      }
+      tabsSlot.replaceChildren(row);
     }
-    p.append(tabs);
-    const box = el("div", "ms-side-body");
-    box.dataset.scroll = `side:${m.id}:${M.tab}`;
-    if (M.tab === "inbox") inbox(m, box); else if (M.tab === "tasks") tasks(m, box); else if (M.tab === "kg") knowledge(m, box); else ledger(m, box);
-    p.append(box);
-    return p;
+    const key = `side:${m.id}:${M.tab}`, K = M.kg;
+    const data = M.tab === "inbox" ? m.notifications : M.tab === "tasks" ? m.tasks : M.tab === "ledger" ? m.notes : [K.missionId, K.text, K.node, K.q, K.stats];
+    if (!changed("side", JSON.stringify([key, minute(), data]))) return;
+    const moved = shownSide !== key;
+    if (moved && shownSide) saved.set(shownSide, sideBody.scrollTop);
+    shownSide = key;
+    sideBody.replaceChildren();
+    if (M.tab === "inbox") inbox(m, sideBody); else if (M.tab === "tasks") tasks(m, sideBody); else if (M.tab === "kg") knowledge(m, sideBody); else ledger(m, sideBody);
+    if (moved) sideBody.scrollTop = saved.get(key) || 0;
   }
 
   function inbox(m, box) {

@@ -32,3 +32,13 @@ test("orchestratorState and unreadCount", () => {
   assert.match(orchestratorState({ ...m, queue: [{}, {}] }).text, /2 queued/);
   assert.equal(unreadCount([{ notifications: [{ read: false }, { read: true }] }, { notifications: [{ read: false }] }]), 2);
 });
+
+test("a chat follows its newest line only while the reader is there: any move up stops it, only the bottom restarts it", async () => {
+  const { nextFollow } = await import("../ui/transcript.js");
+  // 100 px above the bottom and moving up: still stops following (the old rule pulled anyone within 200 px back down)
+  assert.equal(nextFollow(true, { top: 900, lastTop: 1000, gap: 100 }), false);
+  assert.equal(nextFollow(true, { top: 995, lastTop: 1000, gap: 5 }), false, "the first pixels of a move up count, though still near the bottom");
+  assert.equal(nextFollow(false, { top: 950, lastTop: 900, gap: 50 }), false, "moving down without reaching the bottom does not restart it");
+  assert.equal(nextFollow(false, { top: 1000, lastTop: 950, gap: 10 }), true);
+  assert.equal(nextFollow(true, { top: 1000, lastTop: 1000, gap: 300 }), true, "content growing below does not stop it");
+});
