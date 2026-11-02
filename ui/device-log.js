@@ -269,6 +269,12 @@ function isPresent(device, now) {
   return device.role !== "client" || (now >= device.addedAt - CLOCK_SKEW_MS && now < device.addedAt + CLIENT_LIFETIME_MS);
 }
 
+/** Whether a device from verifyLog is still inside its window, for checking again without a replay. */
+export const deviceCurrent = isPresent;
+
+/** When a device leaves the list by itself, in this verifier's clock, or null for a device that never does. */
+export const deviceExpiresAt = (device) => (device.role === "client" ? device.addedAt + CLIENT_LIFETIME_MS : null);
+
 /**
  * Replays a log from the start. Throws LogError naming the first bad entry.
  * `now` is this verifier's own clock and is required: without it a client would never expire.
