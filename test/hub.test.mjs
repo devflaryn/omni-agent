@@ -4,9 +4,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { loginKeyFrom, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, fromB64 } from "../ui/account-core.js";
 import { append, createLog, entryBytes, entryHash, verifyLog } from "../ui/device-log.js";
 import { startHub } from "../hub/server.mjs";
+import { HubSocket } from "../hub/ws.mjs";
 
 const ORIGIN = "https://hub.example";
 const BOOTSTRAP = "test-bootstrap-token-0123456789";
@@ -235,7 +238,7 @@ function api(hub, path, body, { headers = {}, localAddress, method = "POST", raw
 async function newAccount(hub, email = "owner@example.com") {
   const device = named(await newDeviceKeys(), "Main PC");
   const recovery = await recoveryKeysFrom(newRecoveryCode());
-  const log = await createLog({ device, recoveryPub: recovery.signPub });
+  const log = await createLog({ device, recovery });
   const account = { email, device, recovery, log, loginKey: randomKey(), salt: b64(randomBytes(16)) };
   const r = await api(hub, "/api/register", { email, salt: account.salt, verifierInput: account.loginKey, firstLogEntry: log[0], bootstrapToken: BOOTSTRAP });
   assert.equal(r.status, 201, r.text);
@@ -304,7 +307,7 @@ test("the first account registers, then registration is closed, also after a res
   await newAccount(hub);
 
   const second = await newDeviceKeys();
-  const log = await createLog({ device: named(second), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(second), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   const body = { email: "second@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0] };
   assert.equal((await api(hub, "/api/register", body)).status, 403);
 
@@ -319,7 +322,7 @@ test("allowSignup reopens registration, and an email can only be taken once", as
   await newAccount(hub, "two@example.com");
 
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   const r = await api(hub, "/api/register", { email: "ONE@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0] });
   assert.equal(r.status, 409);
   assert.equal((await signIn(hub, first, first.device)).state, "approved");
@@ -329,7 +332,7 @@ test("two registrations at once: one account, the other is refused", async (t) =
   const hub = await hubFor(t);
   const attempts = await Promise.all(["a@example.com", "b@example.com", "c@example.com"].map(async (email) => {
     const device = await newDeviceKeys();
-    const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+    const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
     return api(hub, "/api/register", { email, salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0], bootstrapToken: BOOTSTRAP });
   }));
   assert.deepEqual(attempts.map((r) => r.status).sort(), [201, 403, 403]);
@@ -339,7 +342,7 @@ test("registration refuses a first entry that does not verify, and malformed fie
   const hub = await hubFor(t);
   const device = await newDeviceKeys();
   const recovery = await recoveryKeysFrom(newRecoveryCode());
-  const [entry] = await createLog({ device: named(device), recoveryPub: recovery.signPub });
+  const [entry] = await createLog({ device: named(device), recovery });
   const good = { email: "o@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: entry, bootstrapToken: BOOTSTRAP };
   const tampered = structuredClone(entry);
   tampered.body.name = "Someone else";
@@ -372,7 +375,7 @@ test("the store holds a salted verifier: never the password, never the loginKey,
   const loginKey = b64(await loginKeyFrom(password, salt));
 
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   const email = "real@example.com";
   assert.equal((await api(hub, "/api/register", { email, salt: b64(salt), verifierInput: loginKey, firstLogEntry: log[0], bootstrapToken: BOOTSTRAP })).status, 201);
 
@@ -386,7 +389,7 @@ test("the store holds a salted verifier: never the password, never the loginKey,
   await socket.next("presence");
 
   const twin = await newDeviceKeys();
-  const twinLog = await createLog({ device: named(twin), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const twinLog = await createLog({ device: named(twin), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   assert.equal((await api(hub, "/api/register", { email: "twin@example.com", salt: b64(randomBytes(16)), verifierInput: loginKey, firstLogEntry: twinLog[0] })).status, 201);
 
   const files = dataFiles(hub.dir);
@@ -1318,7 +1321,7 @@ test("an approved session survives a restart", async (t) => {
 /** A pending device with the recovery code builds and sends its recover entry. */
 async function recoverEntry(account, device, signerKeys = account.recovery) {
   const replacement = await recoveryKeysFrom(newRecoveryCode());
-  const next = await append(account.log, { type: "recover", name: "Rescue", kind: "desktop", signPub: device.signPub, boxPub: device.boxPub, recoveryPub: replacement.signPub, addedAt: 1 }, { ...signerKeys, boxPub: device.boxPub });
+  const next = await append(account.log, { type: "recover", name: "Rescue", kind: "desktop", signPub: device.signPub, boxPub: device.boxPub, newRecovery: replacement, addedAt: 1 }, { ...signerKeys, boxPub: device.boxPub });
   return { next, entry: next.at(-1), replacement };
 }
 
@@ -1608,7 +1611,7 @@ test("a log append after a password change keeps the new password", async (t) =>
 
 const firstBody = async (extra = {}) => {
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   return { email: "first@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0], ...extra };
 };
 
@@ -1627,6 +1630,36 @@ test("a fresh hub refuses registration without the right token, all in the same 
     assert.equal(r.text, responses[0].text);
   }
   assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201);
+});
+
+test("wrong bootstrap tokens count against the address: guessing stops, the right token included, and only there", async (t) => {
+  const hub = await hubFor(t);
+  for (let i = 0; i < 20; i++) {
+    assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: `wrong-token-of-a-good-length-${i}` }))).status, 403);
+  }
+  const blocked = await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }));
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.json.error, "locked");
+  assert.equal((await api(hub, "/api/login", { email: "x@example.com", loginKey: randomKey(), signPub: randomKey() })).status, 429, "it is the same counter as sign-in's");
+
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: "wrong-token-of-a-good-length" }), { localAddress: "127.0.0.2" })).status, 403, "another address has its own count");
+
+  hub.clock.t += 15 * MINUTE + 1;
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201, "it wears off");
+});
+
+test("the lock on guessing looks the same on a hub that is already closed, so it does not show that a hub is fresh", async (t) => {
+  const hub = await hubFor(t);
+  await newAccount(hub);
+  for (let i = 0; i < 20; i++) assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: "wrong-token-of-a-good-length" }))).status, 403);
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: "wrong-token-of-a-good-length" }))).status, 429);
+});
+
+test("a malformed registration or a right token is not counted as a guess", async (t) => {
+  const hub = await hubFor(t, { allowSignup: true });
+  for (let i = 0; i < 25; i++) assert.equal((await api(hub, "/api/register", await firstBody({ salt: "short", bootstrapToken: "wrong-token-of-a-good-length" }))).status, 400);
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201);
+  for (let i = 0; i < 25; i++) assert.equal((await api(hub, "/api/register", await firstBody({ email: `n${i}@example.com` }))).status, 201, "allowSignup needs no token, so nothing is a guess");
 });
 
 test("a fresh hub with no token configured refuses every registration, allowSignup or not", async (t) => {
@@ -1849,6 +1882,68 @@ test("WS parser: a frame in many small packets arrives whole", async (t) => {
   assert.equal(socket.closeCode, null);
 });
 
+/** A socket with no network under it, so a test can give the parser exact packets. */
+function parserOnFakeSocket(onMessage, { maxMessageBytes = 2 * 1024 * 1024 } = {}) {
+  const socket = new EventEmitter();
+  Object.assign(socket, { writableLength: 0, setNoDelay() {}, write() {}, end() {}, destroy() { socket.emit("close"); } });
+  const parser = new HubSocket(socket, Buffer.alloc(0), { maxMessageBytes, maxFramesPerSecond: 100_000, maxBuffered: 1 << 30, pingIntervalMs: 1 << 30, onMessage, onClose() {} });
+  return { socket, parser };
+}
+
+test("WS parser: a long frame in tiny packets costs one buffer, not a copy per packet", (t) => {
+  const messages = [];
+  const { socket } = parserOnFakeSocket((text) => messages.push(text));
+  t.after(() => socket.destroy());
+  const message = "x".repeat(1024 * 1024);
+  const bytes = frame(TEXT, message);
+
+  let copied = 0, allocated = 0;
+  const { concat, alloc, allocUnsafe, allocUnsafeSlow } = Buffer;
+  t.mock.method(Buffer, "concat", (list, size) => { const out = concat.call(Buffer, list, size); copied += out.length; return out; });
+  for (const [name, original] of [["alloc", alloc], ["allocUnsafe", allocUnsafe], ["allocUnsafeSlow", allocUnsafeSlow]]) {
+    t.mock.method(Buffer, name, (size, ...rest) => { allocated += size; return original.call(Buffer, size, ...rest); });
+  }
+  for (let at = 0; at < bytes.length; at += 64) socket.emit("data", bytes.subarray(at, at + 64));
+  t.mock.restoreAll();
+
+  assert.deepEqual(messages, [message]);
+  assert.equal(copied, 0, "nothing is joined");
+  assert.ok(allocated <= bytes.length + 64, `${allocated} bytes allocated for a frame of ${bytes.length}`);
+});
+
+test("WS parser: frames cut at every possible place arrive whole and in order, and a chunk's own bytes are not lost", (t) => {
+  const texts = ["a", "b".repeat(125), "c".repeat(126), "d".repeat(70_000), "é".repeat(300)];
+  const bytes = Buffer.concat(texts.map((text) => frame(TEXT, text)));
+  const cuts = [1, 2, 3, 5, 7, 13, 14, 127, 1000, 65_536, bytes.length];
+  for (const size of cuts) {
+    const messages = [];
+    const { socket } = parserOnFakeSocket((text) => messages.push(text));
+    for (let at = 0; at < bytes.length; at += size) socket.emit("data", Buffer.from(bytes.subarray(at, at + size)));
+    assert.deepEqual(messages, texts, `packets of ${size}`);
+    socket.destroy();
+  }
+});
+
+test("WS parser: fragments held across tiny packets arrive whole, and a frame over the limit is refused before it is held", (t) => {
+  const messages = [];
+  const { socket, parser } = parserOnFakeSocket((text) => messages.push(text), { maxMessageBytes: 1000 });
+  t.after(() => socket.destroy());
+  const parts = [frame(TEXT, "x".repeat(400), { fin: false }), frame(PING, "p"), frame(CONTINUATION, "y".repeat(400))];
+  for (const byte of Buffer.concat(parts)) socket.emit("data", Buffer.from([byte]));
+  assert.deepEqual(messages, ["x".repeat(400) + "y".repeat(400)]);
+
+  let allocated = 0;
+  const { alloc } = Buffer;
+  t.mock.method(Buffer, "alloc", (size, ...rest) => { allocated += size; return alloc.call(Buffer, size, ...rest); });
+  const closed = [];
+  const close = parser.close.bind(parser);
+  parser.close = (code, reason) => { closed.push(code); close(code, reason); };
+  socket.emit("data", frame(TEXT, "z".repeat(1001)).subarray(0, 8));
+  t.mock.restoreAll();
+  assert.deepEqual(closed, [1009]);
+  assert.ok(allocated < 1000, "only the header was ever held");
+});
+
 // --- limits ---
 
 test("sockets per account are limited: the next device is closed, the ones online stay", async (t) => {
@@ -1894,7 +1989,7 @@ test("total accounts are limited", async (t) => {
   const hub = await hubFor(t, { allowSignup: true, limits: { maxAccounts: 1 } });
   await newAccount(hub);
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   assert.equal((await api(hub, "/api/register", { email: "b@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0] })).status, 403);
 });
 
@@ -2274,11 +2369,61 @@ test("without TLS the hub only listens on loopback, whatever it is asked", async
   assert.equal(hub.address, "127.0.0.1");
 });
 
+// A throwaway self-signed certificate, made for these tests and used nowhere else.
+const TEST_TLS = () => ({ cert: readFileSync(new URL("./fixtures/hub-test-tls-cert.pem", import.meta.url)), key: readFileSync(new URL("./fixtures/hub-test-tls-key.pem", import.meta.url)) });
+
+async function hubOverTls(t, options) {
+  const dir = mkdtempSync(join(tmpdir(), "omni-hub-test-"));
+  const hub = await startHub({ port: 0, host: "127.0.0.1", dataDir: dir, origin: ORIGIN, tls: TEST_TLS(), log: () => {}, ...options });
+  t.after(async () => {
+    await hub.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+  });
+  return hub;
+}
+
+const headersOverTls = (hub) => new Promise((resolve, reject) => {
+  https.get({ port: hub.port, host: "127.0.0.1", path: "/api/health", rejectUnauthorized: false, agent: false }, (res) => {
+    res.resume();
+    res.on("end", () => resolve({ status: res.statusCode, headers: res.headers }));
+  }).on("error", reject);
+});
+
+test("over TLS: it answers, and sends HSTS only when told how long, on every reply", async (t) => {
+  const off = await headersOverTls(await hubOverTls(t));
+  assert.equal(off.status, 200);
+  assert.equal(off.headers["strict-transport-security"], undefined, "HSTS covers every port of the name, so it is never on by default");
+
+  const on = await hubOverTls(t, { hstsMaxAge: 31536000 });
+  const ok = await headersOverTls(on);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers["strict-transport-security"], "max-age=31536000");
+
+  const refused = await new Promise((resolve, reject) => {
+    https.get({ port: on.port, host: "127.0.0.1", path: "/nope", rejectUnauthorized: false, agent: false }, (res) => { res.resume(); res.on("end", () => resolve(res)); }).on("error", reject);
+  });
+  assert.equal(refused.statusCode, 404);
+  assert.equal(refused.headers["strict-transport-security"], "max-age=31536000");
+});
+
+test("HSTS is never sent over plain HTTP, whatever it is told, and a bad length stops the hub", async (t) => {
+  const hub = await hubFor(t, { hstsMaxAge: 31536000 });
+  const r = await api(hub, "/api/health", undefined, { method: "GET" });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers["strict-transport-security"], undefined);
+  for (const bad of [-1, 1.5, "1", NaN]) {
+    await assert.rejects(async () => {
+      const opened = await startHub({ port: 0, dataDir: hub.dir, hstsMaxAge: bad, log: () => {} });
+      await opened.close();
+    }, /hstsMaxAge/);
+  }
+});
+
 test("run as a program: it reads its settings from the environment, and a corrupt store exits with the reason", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "omni-hub-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const server = fileURLToPath(new URL("../hub/server.mjs", import.meta.url));
-  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir, OMNI_HUB_BOOTSTRAP_TOKEN: BOOTSTRAP, OMNI_HUB_ORIGIN: ORIGIN, OMNI_HUB_EXTRA_ORIGINS: "capacitor://omni,null" };
+  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir, OMNI_HUB_BOOTSTRAP_TOKEN: BOOTSTRAP, OMNI_HUB_ORIGIN: ORIGIN, OMNI_HUB_EXTRA_ORIGINS: " capacitor://omni , ,null,,", OMNI_HUB_HSTS_MAX_AGE: "60" };
 
   const child = spawn(process.execPath, [server], { env, stdio: ["ignore", "pipe", "pipe"] });
   t.after(() => child.kill());
@@ -2294,7 +2439,9 @@ test("run as a program: it reads its settings from the environment, and a corrup
   assert.equal((await api({ port }, "/api/health", undefined, { method: "GET" })).status, 200);
   assert.equal(readFileSync(join(dir, "bootstrap"), "utf8"), createHash("sha256").update(BOOTSTRAP).digest("hex"));
   assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "capacitor://omni" } })).status, 200);
+  assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "null" } })).status, 200);
   assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "https://evil.example" } })).status, 403);
+  assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "" } })).status, 403, "stray commas do not allow an empty origin");
   const stopped = new Promise((resolve) => child.once("exit", resolve));
   child.kill();
   await stopped;
