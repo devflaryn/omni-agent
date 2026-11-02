@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2368,11 +2369,61 @@ test("without TLS the hub only listens on loopback, whatever it is asked", async
   assert.equal(hub.address, "127.0.0.1");
 });
 
+// A throwaway self-signed certificate, made for these tests and used nowhere else.
+const TEST_TLS = () => ({ cert: readFileSync(new URL("./fixtures/hub-test-tls-cert.pem", import.meta.url)), key: readFileSync(new URL("./fixtures/hub-test-tls-key.pem", import.meta.url)) });
+
+async function hubOverTls(t, options) {
+  const dir = mkdtempSync(join(tmpdir(), "omni-hub-test-"));
+  const hub = await startHub({ port: 0, host: "127.0.0.1", dataDir: dir, origin: ORIGIN, tls: TEST_TLS(), log: () => {}, ...options });
+  t.after(async () => {
+    await hub.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5 });
+  });
+  return hub;
+}
+
+const headersOverTls = (hub) => new Promise((resolve, reject) => {
+  https.get({ port: hub.port, host: "127.0.0.1", path: "/api/health", rejectUnauthorized: false, agent: false }, (res) => {
+    res.resume();
+    res.on("end", () => resolve({ status: res.statusCode, headers: res.headers }));
+  }).on("error", reject);
+});
+
+test("over TLS: it answers, and sends HSTS only when told how long, on every reply", async (t) => {
+  const off = await headersOverTls(await hubOverTls(t));
+  assert.equal(off.status, 200);
+  assert.equal(off.headers["strict-transport-security"], undefined, "HSTS covers every port of the name, so it is never on by default");
+
+  const on = await hubOverTls(t, { hstsMaxAge: 31536000 });
+  const ok = await headersOverTls(on);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers["strict-transport-security"], "max-age=31536000");
+
+  const refused = await new Promise((resolve, reject) => {
+    https.get({ port: on.port, host: "127.0.0.1", path: "/nope", rejectUnauthorized: false, agent: false }, (res) => { res.resume(); res.on("end", () => resolve(res)); }).on("error", reject);
+  });
+  assert.equal(refused.statusCode, 404);
+  assert.equal(refused.headers["strict-transport-security"], "max-age=31536000");
+});
+
+test("HSTS is never sent over plain HTTP, whatever it is told, and a bad length stops the hub", async (t) => {
+  const hub = await hubFor(t, { hstsMaxAge: 31536000 });
+  const r = await api(hub, "/api/health", undefined, { method: "GET" });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers["strict-transport-security"], undefined);
+  for (const bad of [-1, 1.5, "1", NaN]) {
+    await assert.rejects(async () => {
+      const opened = await startHub({ port: 0, dataDir: hub.dir, hstsMaxAge: bad, log: () => {} });
+      await opened.close();
+    }, /hstsMaxAge/);
+  }
+});
+
 test("run as a program: it reads its settings from the environment, and a corrupt store exits with the reason", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "omni-hub-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const server = fileURLToPath(new URL("../hub/server.mjs", import.meta.url));
-  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir, OMNI_HUB_BOOTSTRAP_TOKEN: BOOTSTRAP, OMNI_HUB_ORIGIN: ORIGIN, OMNI_HUB_EXTRA_ORIGINS: " capacitor://omni , ,null,," };
+  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir, OMNI_HUB_BOOTSTRAP_TOKEN: BOOTSTRAP, OMNI_HUB_ORIGIN: ORIGIN, OMNI_HUB_EXTRA_ORIGINS: " capacitor://omni , ,null,,", OMNI_HUB_HSTS_MAX_AGE: "60" };
 
   const child = spawn(process.execPath, [server], { env, stdio: ["ignore", "pipe", "pipe"] });
   t.after(() => child.kill());

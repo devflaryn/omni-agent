@@ -174,15 +174,18 @@ class FailureLog {
 /**
  * Starts a hub. Options: port, dataDir, tls ({cert, key}, without it the hub only listens on loopback), host, origin
  * (the hub's own browser origin, also bound into every proof), origins (more exact origins allowed to connect, for the
- * iPhone app), bootstrapToken (opens the first registration, once), allowSignup (opens later registrations), now,
- * log(line), sweepMs, limits (overrides of DEFAULT_LIMITS).
+ * iPhone app), bootstrapToken (opens the first registration, once), allowSignup (opens later registrations), hstsMaxAge
+ * (seconds of Strict-Transport-Security, TLS only, off by default: a browser applies it to every port of the name, so
+ * it also turns plain sites on other ports of that name into failures), now, log(line), sweepMs, limits (overrides of DEFAULT_LIMITS).
  * Rejects with a StoreError if the data dir is damaged.
  */
-export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, origins = [], bootstrapToken = null, allowSignup = false, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
+export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, origins = [], bootstrapToken = null, allowSignup = false, hstsMaxAge = null, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
   const limits = { ...DEFAULT_LIMITS, ...limitOverrides };
   if (bootstrapToken !== null && (typeof bootstrapToken !== "string" || bootstrapToken.length < MIN_BOOTSTRAP_TOKEN || bootstrapToken.length > MAX_BOOTSTRAP_TOKEN)) {
     throw new Error(`hub: bootstrapToken must be text of ${MIN_BOOTSTRAP_TOKEN} to ${MAX_BOOTSTRAP_TOKEN} characters`);
   }
+  if (hstsMaxAge !== null && (!Number.isSafeInteger(hstsMaxAge) || hstsMaxAge < 0)) throw new Error("hub: hstsMaxAge must be a whole number of seconds");
+  const securityHeaders = tls && hstsMaxAge !== null ? { "Strict-Transport-Security": `max-age=${hstsMaxAge}` } : {};
   const store = openStore(dataDir);
   // Once an account exists the token has been spent, even if the setting is still there after a restart.
   if (bootstrapToken !== null && store.accounts.size === 0) store.setBootstrapHash(sha256(bootstrapToken));
@@ -487,7 +490,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   function reply(res, status, body) {
     const text = JSON.stringify(body);
-    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...securityHeaders });
     res.end(text);
   }
 
@@ -945,6 +948,7 @@ async function main() {
     origins: (env.OMNI_HUB_EXTRA_ORIGINS ?? "").split(",").map((entry) => entry.trim()).filter(Boolean),
     bootstrapToken: env.OMNI_HUB_BOOTSTRAP_TOKEN || null,
     allowSignup: env.OMNI_HUB_ALLOW_SIGNUP === "1",
+    hstsMaxAge: env.OMNI_HUB_HSTS_MAX_AGE ? Number(env.OMNI_HUB_HSTS_MAX_AGE) : null,
     tls,
   });
   console.log(`omni-hub listening on port ${hub.port}`);

@@ -56,7 +56,7 @@ rm -rf /opt/omni-hub.old
 
 systemctl daemon-reload
 if [ -e /etc/letsencrypt/live/tomcamp.tech/privkey.pem ]; then
-  systemctl enable omni-hub >/dev/null 2>&1
+  systemctl enable omni-hub
   systemctl restart omni-hub
   sleep 1
   systemctl is-active omni-hub

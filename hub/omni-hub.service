@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Environment=OMNI_HUB_PORT=443 OMNI_HUB_DATA=/var/lib/omni-hub OMNI_HUB_ORIGIN=https://tomcamp.tech
 Environment=OMNI_HUB_CERT=%d/fullchain.pem OMNI_HUB_KEY=%d/privkey.pem
+# OMNI_HUB_HSTS_MAX_AGE stays unset for now: HSTS would cover http://tomcamp.tech on 80, 8081 and 8082 too, and those sites have no TLS.
 # Holds OMNI_HUB_BOOTSTRAP_TOKEN. Root-only: systemd reads it before it drops to the throwaway user.
 EnvironmentFile=/etc/omni-hub/bootstrap.env
 # systemd reads these as root and hands the service a private copy, so the certbot folders stay root-only.
@@ -36,6 +37,11 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+# This VPS runs other services: a compromised hub should not see or call beyond what a network service needs.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ProtectProc=invisible
+ProcSubset=pid
 # V8 compiles to memory it then runs, so this stays off.
 MemoryDenyWriteExecute=no
 RestrictAddressFamilies=AF_INET AF_INET6
