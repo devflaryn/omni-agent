@@ -6,6 +6,7 @@ import { newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, approvalCode, t
 import { createLog, append, verifyLog, compareLogs, entryBytes, entryHash, LogError, MAX_LOG_ENTRIES } from "../ui/device-log.js";
 
 const T0 = 1_800_000_000_000;
+const MAX_ADDED_AT = 8.64e15;
 const DAY = 24 * 60 * 60 * 1000;
 const THIRTY_DAYS = 30 * DAY;
 const opts = { now: T0 };
@@ -407,6 +408,41 @@ test("a client is gone at 30 days by the verifier's clock, and that is not a log
   assert.equal(later.head, (await verifyLog(log, opts)).head);
 });
 
+test("a client is present only inside its window, both edges exact", async () => {
+  const added = T0 + 100 * DAY;
+  const log = await append(await created(), addOf(web, "client", added), alice);
+  const at = async (now) => (await verifyLog(log, { now })).devices.has(web.signPub);
+  assert.equal(await at(added - DAY - 1), false);
+  assert.equal(await at(added - DAY), true);
+  assert.equal(await at(added + THIRTY_DAYS - 1), true);
+  assert.equal(await at(added + THIRTY_DAYS), false);
+});
+
+test("a client dated far in the future is absent now, and it is not a log error", async () => {
+  const log = await append(await created(), addOf(web, "client", T0 + 3650 * DAY), alice);
+  const state = await verifyLog(log, opts);
+  assert.equal(state.version, 2);
+  assert.equal(state.devices.has(web.signPub), false);
+});
+
+test("no immortal client: MAX_SAFE_INTEGER is refused, and the latest date allowed still expires exactly", async () => {
+  const log = await created();
+  await assert.rejects(append(log, addOf(web, "client", Number.MAX_SAFE_INTEGER), alice), /addedAt/);
+  await assert.rejects(append(log, addOf(web, "client", MAX_ADDED_AT + 1), alice), /addedAt/);
+  const latest = await append(log, addOf(web, "client", MAX_ADDED_AT), alice);
+  const at = async (now) => (await verifyLog(latest, { now })).devices.has(web.signPub);
+  assert.equal(await at(T0), false);
+  assert.equal(await at(MAX_ADDED_AT), true);
+  assert.equal(await at(MAX_ADDED_AT + THIRTY_DAYS - 1), true);
+  assert.equal(await at(MAX_ADDED_AT + THIRTY_DAYS), false);
+  assert.equal(await at(Number.MAX_SAFE_INTEGER), false);
+});
+
+test("a full device's window is not checked: an old or future date changes nothing", async () => {
+  const log = await append(await created(), addOf(bob, "full", T0 + 3650 * DAY), alice);
+  assert.ok((await verifyLog(log, opts)).devices.has(bob.signPub));
+});
+
 test("a full device never expires", async () => {
   const state = await verifyLog(await base(), { now: T0 + 100 * THIRTY_DAYS });
   assert.ok(state.devices.has(alice.signPub));
@@ -415,7 +451,7 @@ test("a full device never expires", async () => {
 
 test("now is required: a verifier with no clock does not get immortal clients", async () => {
   const log = await base();
-  for (const bad of [undefined, {}, { now: NaN }, { now: Infinity }, { now: "1" }, { now: null }]) {
+  for (const bad of [undefined, null, {}, { now: NaN }, { now: Infinity }, { now: "1" }, { now: null }]) {
     await assert.rejects(verifyLog(log, bad), LogError, JSON.stringify(bad));
   }
 });
@@ -467,6 +503,29 @@ test("a key can only join once", async () => {
   await assert.rejects(createLog({ device: named(alice), recoveryPub: alice.signPub }), /already/);
 });
 
+test("signing, box and recovery keys share one namespace", async () => {
+  const log = await base();
+  await rejectedAt(await forged(log, "add", { ...bodyOf(addOf(carol)), boxPub: bob.signPub }, alice), 3, /already/);
+  await rejectedAt(await forged(log, "add", { ...bodyOf(addOf(carol)), boxPub: recovery.signPub }, alice), 3, /already/);
+  await rejectedAt(await forged(log, "add", { ...bodyOf(addOf(carol)), signPub: bob.boxPub }, alice), 3, /already/);
+  await rejectedAt(await forged(log, "add", { ...bodyOf(addOf(carol)), boxPub: carol.signPub }, alice), 3, /already/);
+  await rejectedAt(await forged(log, "recover", recoverBody(carol, bob.boxPub), recovery), 3, /already/);
+  await assert.rejects(createLog({ device: named(alice), recoveryPub: alice.boxPub }), /already/);
+});
+
+test("an oversized base64 field is refused before it is decoded", () => {
+  const entry = { type: "remove", index: 1, prev: toB64(new Uint8Array(32)), signer: alice.signPub, body: { signPub: "A".repeat(2 ** 20) } };
+  const realAtob = globalThis.atob;
+  let decoded = 0;
+  globalThis.atob = (text) => { decoded++; return realAtob(text); };
+  try {
+    assert.throws(() => entryBytes(entry), (e) => e instanceof LogError && /signPub/.test(e.message));
+  } finally {
+    globalThis.atob = realAtob;
+  }
+  assert.equal(decoded, 2, "only prev and signer, which have the right length");
+});
+
 test("the same key in another spelling is not another key", async () => {
   const log = await base();
   // 32 bytes leave two unused bits in the last base64 character. atob ignores them; the log must not.
@@ -506,7 +565,7 @@ test("malformed entries are refused with a LogError naming them", async () => {
     for (const value of values) await rejectedAt([...log.slice(0, -1), { ...last, [field]: value }], 2, new RegExp(field));
   }
   for (const [field, values] of Object.entries({
-    name: ["", 5, "x".repeat(129)], kind: ["", "x".repeat(33)], addedAt: [-1, 1.5, "1", 2 ** 53, null],
+    name: ["", 5, "x".repeat(129)], kind: ["", "x".repeat(33)], addedAt: [-1, 1.5, "1", 2 ** 53, Number.MAX_SAFE_INTEGER, MAX_ADDED_AT + 1, null],
     boxPub: [toB64(new Uint8Array(31))], signPub: [toB64(new Uint8Array(33))], role: [1],
   })) {
     for (const value of values) await rejectedAt([...log.slice(0, -1), { ...last, body: { ...last.body, [field]: value } }], 2, new RegExp(field));
@@ -565,8 +624,16 @@ test("compareLogs: two valid entries at one position are a fork", async () => {
   assert.equal(await compareLogs(twoLonger, one), "fork");
 });
 
-test("compareLogs: another account's log is a fork at position 0", async () => {
-  assert.equal(await compareLogs(await created(), await created()), "fork");
+test("compareLogs: another account's log is a different account, not a fork, at any length", async () => {
+  const [a, b] = [await created(), await base()];
+  assert.equal(await compareLogs(a, b), "different-account");
+  assert.equal(await compareLogs(b, a), "different-account");
+});
+
+test("compareLogs: two different creates with one account id are a fork at position 0", async () => {
+  const a = await created();
+  const b = await forged([], "create", { ...a[0].body, name: "Other" }, alice);
+  assert.equal(await compareLogs(a, b), "fork");
 });
 
 test("compareLogs: a log that does not verify is an error, never newer and never a fork", async () => {

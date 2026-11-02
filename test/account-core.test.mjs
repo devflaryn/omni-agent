@@ -4,7 +4,7 @@ import { createHash, createPrivateKey, createPublicKey, hkdfSync, scryptSync } f
 import { readFileSync } from "node:fs";
 import {
   scrypt, loginKeyFrom, newDeviceKeys, sign, verify, approverCommit, newApprovalRandom, verifyReveal, approvalCode,
-  startHandshake, newRecoveryCode, recoveryKeysFrom, toB64, fromB64,
+  startHandshake, newRecoveryCode, recoveryKeysFrom, toB64, fromB64, checkPassword, approverExchange, newDeviceExchange,
 } from "../ui/account-core.js";
 
 const utf8 = (s) => new TextEncoder().encode(s);
@@ -74,6 +74,22 @@ test("loginKeyFrom: the same password typed on another platform (decomposed Unic
   assert.equal(hex(await loginKeyFrom("sifre-ğüşçö-12", salt)), hex(await loginKeyFrom("sifre-ğüşçö-12".normalize("NFD"), salt)));
 });
 
+test("checkPassword: 12 characters after normalisation, counted as code points", () => {
+  assert.throws(() => checkPassword("a".repeat(11)), /at least 12/);
+  checkPassword("a".repeat(12));
+  assert.throws(() => checkPassword(""), /at least 12/);
+  assert.throws(() => checkPassword(undefined), /at least 12/);
+  assert.throws(() => checkPassword("g\u0306".repeat(11)), /at least 12/, "22 code points as typed, 11 once composed");
+  checkPassword("\ufb03".repeat(4)); // one ligature each as typed, three letters each once normalised
+  assert.throws(() => checkPassword("\u{1F600}".repeat(11)), /at least 12/, "22 UTF-16 units, but 11 characters");
+  checkPassword("\u{1F600}".repeat(12));
+});
+
+test("loginKeyFrom: a short password gets a key like any other, so that it fails as a wrong password would", async () => {
+  assert.throws(() => checkPassword("short"));
+  assert.equal((await loginKeyFrom("short", utf8("s"))).length, 32);
+});
+
 // --- device keys and signatures ---
 
 test("newDeviceKeys: Ed25519 and X25519 pairs, raw public keys in base64, private keys not extractable", async () => {
@@ -113,6 +129,8 @@ test("verify: returns false, not an exception, on malformed input", async () => 
   assert.equal(await verify(toB64(new Uint8Array(31)), msg, sig), false);
   assert.equal(await verify(alice.signPub, msg, "not base64!!"), false);
   assert.equal(await verify(alice.signPub, msg, toB64(new Uint8Array(10))), false);
+  assert.equal(await verify(alice.signPub, msg, `${sig}\n`), false, "a second spelling of a good signature");
+  assert.equal(await verify(`${alice.signPub}\n`, msg, sig), false, "a second spelling of a good key");
 });
 
 test("sign is domain separated: its signature is not a bare Ed25519 signature on those bytes", async () => {
@@ -206,6 +224,130 @@ test("approval: refuses a random value or key of the wrong size and an empty log
   }
 });
 
+const exchangeContext = () => ({ approverPub: alice.signPub, newPub: bob.signPub, logHead: "head-1" });
+const bothSides = async () => [await approverExchange(exchangeContext()), await newDeviceExchange(exchangeContext())];
+
+test("exchange: the honest order gives both sides the code the pure function gives", async () => {
+  const [approver, device] = await bothSides();
+  device.receiveCommit(approver.commit);
+  const newRandom = device.releaseRandom();
+  approver.receiveRandom(newRandom);
+  const approverRandom = approver.revealRandom();
+  await device.receiveReveal(approverRandom);
+  const [onApprover, onDevice] = [await approver.code(), await device.code()];
+  assert.equal(onApprover, onDevice);
+  assert.equal(onApprover, await approvalCode({ approverRandom, newRandom, ...exchangeContext() }));
+  assert.equal(await verifyReveal(approver.commit, approverRandom), true);
+});
+
+test("exchange: the approver will not reveal before it has the new device's random value", async () => {
+  const approver = await approverExchange(exchangeContext());
+  assert.throws(() => approver.revealRandom(), /out of order/);
+});
+
+test("exchange: the approver gives no code before it has revealed", async () => {
+  const approver = await approverExchange(exchangeContext());
+  approver.receiveRandom(await newApprovalRandom());
+  await assert.rejects(approver.code(), /out of order/);
+});
+
+test("exchange: the approver takes one random value only, of the right size", async () => {
+  const twice = await approverExchange(exchangeContext());
+  const value = await newApprovalRandom();
+  twice.receiveRandom(value);
+  assert.throws(() => twice.receiveRandom(value), /out of order/);
+  const malformed = await approverExchange(exchangeContext());
+  assert.throws(() => malformed.receiveRandom(toB64(new Uint8Array(4))), /malformed/);
+  assert.throws(() => malformed.revealRandom(), /out of order/, "and that ends the exchange");
+});
+
+test("exchange: the new device will not release its random value before it has recorded a commit", async () => {
+  const device = await newDeviceExchange(exchangeContext());
+  assert.throws(() => device.releaseRandom(), /out of order/);
+  const { commit } = await approverCommit();
+  assert.throws(() => device.receiveCommit(commit), /out of order/, "and that ends the exchange");
+});
+
+test("exchange: the new device refuses a malformed commit and then has nothing to release", async () => {
+  const device = await newDeviceExchange(exchangeContext());
+  assert.throws(() => device.receiveCommit(toB64(new Uint8Array(4))), /malformed/);
+  assert.throws(() => device.releaseRandom(), /out of order/);
+});
+
+test("exchange: a commit cannot be replaced once recorded, or after the random value has gone", async () => {
+  const [approver, device] = await bothSides();
+  device.receiveCommit(approver.commit);
+  assert.throws(() => device.receiveCommit(approver.commit), /out of order/);
+  const other = await newDeviceExchange(exchangeContext());
+  other.receiveCommit(approver.commit);
+  other.releaseRandom();
+  assert.throws(() => other.receiveCommit(approver.commit), /out of order/);
+});
+
+test("exchange: the new device refuses a reveal before its random value has gone", async () => {
+  const [approver, device] = await bothSides();
+  device.receiveCommit(approver.commit);
+  await assert.rejects(device.receiveReveal(toB64(new Uint8Array(32))), /out of order/);
+});
+
+test("exchange: the new device gives no code before the reveal, or after one that does not match", async () => {
+  const [approver, device] = await bothSides();
+  await assert.rejects(device.code(), /out of order/);
+  const wrong = await newDeviceExchange(exchangeContext());
+  wrong.receiveCommit(approver.commit);
+  wrong.releaseRandom();
+  await assert.rejects(wrong.code(), /out of order/);
+
+  const swapped = await newDeviceExchange(exchangeContext());
+  swapped.receiveCommit(approver.commit);
+  swapped.releaseRandom();
+  await assert.rejects(swapped.receiveReveal(await newApprovalRandom()), /does not match/);
+  await assert.rejects(swapped.code(), /out of order/);
+  await assert.rejects(swapped.receiveReveal(await newApprovalRandom()), /out of order/, "one failed reveal ends it, no second try");
+});
+
+test("exchange: two reveals at once cannot get a code out", async () => {
+  const [approver, device] = await bothSides();
+  device.receiveCommit(approver.commit);
+  approver.receiveRandom(device.releaseRandom());
+  const random = approver.revealRandom();
+  const results = await Promise.allSettled([device.receiveReveal(random), device.receiveReveal(random)]);
+  assert.deepEqual(results.map((r) => r.status), ["rejected", "rejected"]);
+  await assert.rejects(device.code(), /out of order/);
+});
+
+test("exchange: single use, on both sides", async () => {
+  const [approver, device] = await bothSides();
+  device.receiveCommit(approver.commit);
+  approver.receiveRandom(device.releaseRandom());
+  const random = approver.revealRandom();
+  assert.throws(() => approver.revealRandom(), /out of order/);
+  await device.receiveReveal(random);
+  await device.code();
+  await assert.rejects(device.code(), /out of order/);
+  assert.throws(() => device.releaseRandom(), /out of order/);
+
+  const [approver2, device2] = await bothSides();
+  device2.receiveCommit(approver2.commit);
+  approver2.receiveRandom(device2.releaseRandom());
+  approver2.revealRandom();
+  await approver2.code();
+  await assert.rejects(approver2.code(), /out of order/);
+});
+
+test("exchange: every run uses fresh values, and bad context is refused at the start", async () => {
+  const [a1, d1] = await bothSides(), [a2, d2] = await bothSides();
+  assert.notEqual(a1.commit, a2.commit);
+  d1.receiveCommit(a1.commit);
+  d2.receiveCommit(a2.commit);
+  assert.notEqual(d1.releaseRandom(), d2.releaseRandom());
+  for (const make of [approverExchange, newDeviceExchange]) {
+    await assert.rejects(make({ ...exchangeContext(), approverPub: "x" }), /approval/);
+    await assert.rejects(make({ ...exchangeContext(), newPub: toB64(new Uint8Array(4)) }), /approval/);
+    await assert.rejects(make({ ...exchangeContext(), logHead: "" }), /approval/);
+  }
+});
+
 // --- channel handshake ---
 
 test("handshake: both sides end up talking, each sees the other's log head, and hellos and proofs survive JSON", async () => {
@@ -243,7 +385,36 @@ test("handshake: fails when peerPub is wrong, on either side", async () => {
   const cb = await hb.finish(expectsCarol.hello);
   await assert.rejects(ca.confirm(cb.proof), /proof/);
   await assert.rejects(cb.confirm(ca.proof), /proof/);
-  await assert.rejects(ca.seal(utf8("x")), /not confirmed/, "a failed confirm leaves the channel shut");
+  await assert.rejects(ca.seal(utf8("x")), /closed/, "a failed confirm leaves the channel shut");
+});
+
+test("channel: a bad proof shuts it for good; the good proof arriving afterwards is refused too", async () => {
+  const ha = await startHandshake({ device: alice, peerPub: bob.signPub, logHead: "a" });
+  const hb = await startHandshake({ device: bob, peerPub: alice.signPub, logHead: "b" });
+  const ca = await ha.finish(hb.hello);
+  const cb = await hb.finish(ha.hello);
+  await assert.rejects(ca.confirm(flipB64(cb.proof)), /bad proof/);
+  await assert.rejects(ca.confirm(cb.proof), /closed/);
+  await assert.rejects(ca.seal(utf8("x")), /closed/);
+  await assert.rejects(ca.open(new Uint8Array(40)), /closed/);
+  assert.throws(() => ca.peerLogHead, /closed/);
+});
+
+test("channel: a confirm and what follows it, called in one tick, run in that order", async () => {
+  const ha = await startHandshake({ device: alice, peerPub: bob.signPub, logHead: "a" });
+  const hb = await startHandshake({ device: bob, peerPub: alice.signPub, logHead: "b" });
+  const ca = await ha.finish(hb.hello);
+  const cb = await hb.finish(ha.hello);
+  await cb.confirm(ca.proof);
+  const frame = await cb.seal(utf8("hello"));
+  const [, opened, sealed] = await Promise.all([ca.confirm(cb.proof), ca.open(frame), ca.seal(utf8("back"))]);
+  assert.equal(new TextDecoder().decode(opened), "hello");
+  assert.equal(new TextDecoder().decode(await cb.open(sealed)), "back");
+
+  const bad = await (await startHandshake({ device: alice, peerPub: bob.signPub, logHead: "a" })).finish(hb.hello);
+  const results = await Promise.allSettled([bad.confirm(cb.proof), bad.seal(utf8("x"))]);
+  assert.match(results[0].reason.message, /bad proof/);
+  assert.match(results[1].reason.message, /closed/, "nothing is sealed behind a failed confirm");
 });
 
 test("handshake: an attacker with its own device key cannot pose as the expected peer", async () => {
@@ -275,7 +446,7 @@ test("handshake: a hub hiding a newer log cannot rewrite a log head", async () =
   const ca = await ha.finish({ ...hb.hello, logHead: "old" });
   const cb = await hb.finish(ha.hello);
   await assert.rejects(ca.confirm(cb.proof), /proof/);
-  assert.throws(() => ca.peerLogHead, /not confirmed/);
+  assert.throws(() => ca.peerLogHead, /closed/);
 });
 
 test("handshake: a hello and proof replayed from an earlier session are refused, so a stale log head cannot be replayed", async () => {
@@ -313,8 +484,9 @@ test("handshake: refuses malformed input, a low-order key share, itself as a pee
   await assert.rejects(startHandshake({ device: alice, peerPub: alice.signPub, logHead: "a" }), /handshake/);
   const b64Letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const sameKeyOtherSpelling = alice.signPub.slice(0, 42) + b64Letters[b64Letters.indexOf(alice.signPub[42]) + 1] + "="; // the last letter's low bits are unused
-  assert.equal(hex(fromB64(sameKeyOtherSpelling)), hex(fromB64(alice.signPub)));
-  await assert.rejects(startHandshake({ device: alice, peerPub: sameKeyOtherSpelling, logHead: "a" }), /itself/);
+  await assert.rejects(startHandshake({ device: alice, peerPub: sameKeyOtherSpelling, logHead: "a" }), /handshake/);
+  await assert.rejects(startHandshake({ device: alice, peerPub: alice.signPub, logHead: "a" }), /itself/);
+  await assert.rejects((await start()).finish({ eph: `${hb.hello.eph}\n`, logHead: "b" }), /handshake/);
   await assert.rejects(startHandshake({ device: alice, peerPub: toB64(new Uint8Array(3)), logHead: "a" }), /handshake/);
   await assert.rejects(startHandshake({ device: alice, peerPub: bob.signPub, logHead: "" }), /handshake/);
   const once = await start();
@@ -330,23 +502,27 @@ async function threeFrames() {
   return { ca, cb, frames };
 }
 
-test("channel: a replayed frame is refused, and the channel carries on", async () => {
+test("channel: a replayed frame is refused and shuts the channel, both ways", async () => {
   const { cb, frames: [f0, f1] } = await threeFrames();
   assert.equal(new TextDecoder().decode(await cb.open(f0)), "one");
   await assert.rejects(cb.open(f0), /order/);
-  assert.equal(new TextDecoder().decode(await cb.open(f1)), "two");
-  await assert.rejects(cb.open(f0), /order/);
-  await assert.rejects(cb.open(f1), /order/);
+  await assert.rejects(cb.open(f1), /closed/, "the genuine next frame is refused too");
+  await assert.rejects(cb.seal(utf8("x")), /closed/);
+  assert.throws(() => cb.peerLogHead, /closed/);
 });
 
 test("channel: a reordered or skipped frame is refused; only the next expected one opens", async () => {
-  const { cb, frames: [f0, f1, f2] } = await threeFrames();
-  await assert.rejects(cb.open(f1), /order/);
-  await assert.rejects(cb.open(f2), /order/);
-  await cb.open(f0);
-  await assert.rejects(cb.open(f2), /order/, "f1 was dropped");
-  await cb.open(f1);
-  assert.equal(new TextDecoder().decode(await cb.open(f2)), "three");
+  const inOrder = await threeFrames();
+  for (const [i, text] of ["one", "two", "three"].entries()) assert.equal(new TextDecoder().decode(await inOrder.cb.open(inOrder.frames[i])), text);
+
+  const early = await threeFrames();
+  await assert.rejects(early.cb.open(early.frames[1]), /order/);
+  await assert.rejects(early.cb.open(early.frames[0]), /closed/);
+
+  const dropped = await threeFrames();
+  await dropped.cb.open(dropped.frames[0]);
+  await assert.rejects(dropped.cb.open(dropped.frames[2]), /order/, "the second frame went missing");
+  await assert.rejects(dropped.cb.open(dropped.frames[1]), /closed/);
 });
 
 test("channel: two opens of one frame at the same moment cannot both succeed", async () => {
@@ -364,14 +540,23 @@ test("channel: seals called together come out with their own counters, in call o
   assert.deepEqual(got, ["a", "b", "c", "d"]);
 });
 
-test("channel: a frame altered anywhere is refused, and does not spend the counter", async () => {
-  const { cb, frames: [f0] } = await threeFrames();
-  for (const at of [0, 7, 8, 10, -1]) await assert.rejects(cb.open(flip(f0, at)), /order|authentic/, `byte ${at}`);
-  await assert.rejects(cb.open(f0.slice(0, 7)), /short/);
-  await assert.rejects(cb.open(f0.slice(0, 20)), /short/);
-  await assert.rejects(cb.open(f0.slice(0, f0.length - 1)), /authentic/);
-  await assert.rejects(cb.open(new Uint8Array(0)), /short/);
-  assert.equal(new TextDecoder().decode(await cb.open(f0)), "one");
+test("channel: a frame altered anywhere is refused and shuts the channel, so the genuine frame after it is refused too", async () => {
+  const alterations = {
+    "counter, high byte": [(f) => flip(f, 0), /order/],
+    "counter, low byte": [(f) => flip(f, 7), /order/],
+    "first ciphertext byte": [(f) => flip(f, 8), /authentic/],
+    "a ciphertext byte": [(f) => flip(f, 10), /authentic/],
+    "tag": [(f) => flip(f, -1), /authentic/],
+    "cut inside the counter": [(f) => f.slice(0, 7), /short/],
+    "cut too short for a tag": [(f) => f.slice(0, 20), /short/],
+    "cut by a byte": [(f) => f.slice(0, f.length - 1), /authentic/],
+    "empty": [() => new Uint8Array(0), /short/],
+  };
+  for (const [what, [alter, expected]] of Object.entries(alterations)) {
+    const { cb, frames: [f0] } = await threeFrames();
+    await assert.rejects(cb.open(alter(f0)), expected, what);
+    await assert.rejects(cb.open(f0), /closed/, what);
+  }
 });
 
 test("channel: a later frame relabelled with the expected counter is refused", async () => {
@@ -396,15 +581,15 @@ test("channel: each direction has its own key, so a frame reflected at its sende
   const fromA = await ca.seal(secret), fromB = await cb.seal(secret);
   assert.notEqual(hex(fromA.slice(8)), hex(fromB.slice(8)), "the same counter and message in the two directions must not match");
   await assert.rejects(ca.open(fromA), /authentic/);
-  assert.equal(hex(await ca.open(fromB)), hex(secret));
 });
 
 test("channel: the two directions use different keys and different nonces, each matching the other side's opposite", async () => {
   const realImport = crypto.subtle.importKey, realEncrypt = crypto.subtle.encrypt;
-  const aesKeys = [], ivs = [];
-  crypto.subtle.importKey = function (format, data, algorithm, ...rest) {
-    if (algorithm === "AES-GCM") aesKeys.push(hex(data));
-    return realImport.call(this, format, data, algorithm, ...rest);
+  let aesKeys = {};
+  const ivs = [];
+  crypto.subtle.importKey = function (format, data, algorithm, extractable, usages) {
+    if (algorithm === "AES-GCM") aesKeys[usages[0]] = hex(data); // keyed by use: the two keys arrive in either order
+    return realImport.call(this, format, data, algorithm, extractable, usages);
   };
   crypto.subtle.encrypt = function (params, ...rest) {
     ivs.push(hex(params.iv));
@@ -414,14 +599,15 @@ test("channel: the two directions use different keys and different nonces, each 
     const ha = await startHandshake({ device: alice, peerPub: bob.signPub, logHead: "a" });
     const hb = await startHandshake({ device: bob, peerPub: alice.signPub, logHead: "b" });
     const ca = await ha.finish(hb.hello);
+    const onAlice = aesKeys;
+    aesKeys = {};
     const cb = await hb.finish(ha.hello);
+    const onBob = aesKeys;
     await ca.confirm(cb.proof);
     await cb.confirm(ca.proof);
-    const [aSend, aRecv, bSend, bRecv] = aesKeys;
-    assert.equal(aesKeys.length, 4);
-    assert.notEqual(aSend, aRecv);
-    assert.equal(aSend, bRecv);
-    assert.equal(bSend, aRecv);
+    assert.notEqual(onAlice.encrypt, onAlice.decrypt);
+    assert.equal(onAlice.encrypt, onBob.decrypt);
+    assert.equal(onBob.encrypt, onAlice.decrypt);
     await ca.seal(utf8("x"));
     await cb.seal(utf8("x"));
     await ca.seal(utf8("x"));
@@ -492,7 +678,16 @@ test("base64 helpers round trip every byte value and refuse junk", () => {
   const all = Uint8Array.from({ length: 256 }, (_, i) => i);
   assert.equal(hex(fromB64(toB64(all))), hex(all));
   assert.equal(toB64(all), Buffer.from(all).toString("base64"));
-  assert.throws(() => fromB64("not base64!!"));
+  assert.throws(() => fromB64("not base64!!"), /base64/);
+  assert.equal(fromB64("").length, 0);
+});
+
+test("fromB64: one spelling only, whitespace, missing padding and unused bits all refused", () => {
+  assert.equal(hex(fromB64("AQ==")), "01", "the canonical spelling");
+  for (const spelling of ["AQ== ", " AQ==", "A Q==", "AQ==\n", "\tAQ=="]) assert.throws(() => fromB64(spelling), /base64/, JSON.stringify(spelling));
+  for (const spelling of ["AQ", "AQ=", "AQI"]) assert.throws(() => fromB64(spelling), /base64/, spelling);
+  for (const spelling of ["AR==", "AQJ=", "Af=="]) assert.throws(() => fromB64(spelling), /base64/, spelling);
+  for (const notText of [undefined, null, 7]) assert.throws(() => fromB64(notText), /base64/);
 });
 
 /** The module's length-prefixed encoding, restated here so that a change to it fails a test. */

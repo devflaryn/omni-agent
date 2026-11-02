@@ -7,7 +7,7 @@
 //   signer  the signing key; sig covers everything above and the whole body
 //
 // Whether a log is valid is decided by its entries alone, never by a clock, so every verifier agrees on it.
-// Only the final list of devices looks at the time: a client past its 30 days is left out of it.
+// Only the final list of devices looks at the time: a client outside its window is left out of it.
 
 import { sign, verify, toB64, fromB64 } from "./account-core.js";
 
@@ -23,7 +23,11 @@ const SIGNATURE_BYTES = 64;
 const ACCOUNT_ID_BYTES = 32;
 const MAX_NAME = 128;
 const MAX_KIND = 32;
-const CLIENT_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const CLIENT_LIFETIME_MS = 30 * DAY_MS;
+const CLOCK_SKEW_MS = DAY_MS;
+/** The latest time a JS Date can hold. Adding the client lifetime to it is still exact. */
+const MAX_ADDED_AT = 8.64e15;
 
 /** Centuries of re-approvals. A replay checks every signature, and the log comes through the hub. */
 export const MAX_LOG_ENTRIES = 4096;
@@ -66,7 +70,8 @@ const sha256 = async (bytes) => new Uint8Array(await subtle.digest("SHA-256", by
 /** One spelling per value, so that a key can be compared as text and a hash cannot vary with how it is written. */
 function canonicalB64(text, length, label, at) {
   let bytes = null;
-  if (typeof text === "string") {
+  // Checked before decoding, since the text comes from outside and can be any size.
+  if (typeof text === "string" && text.length === Math.ceil(length / 3) * 4) {
     try { bytes = fromB64(text); } catch { bytes = null; }
   }
   if (!bytes || bytes.length !== length || toB64(bytes) !== text) throw new LogError(at, `${label} is not ${length} bytes of canonical base64`);
@@ -94,7 +99,10 @@ const FIELD_ENCODERS = {
   },
   signPub: (v, at) => canonicalB64(v, KEY_BYTES, "signPub", at),
   boxPub: (v, at) => canonicalB64(v, KEY_BYTES, "boxPub", at),
-  addedAt: (v, at) => count(v, "addedAt", at),
+  addedAt(v, at) {
+    if (v > MAX_ADDED_AT) throw new LogError(at, "addedAt is later than any date");
+    return count(v, "addedAt", at);
+  },
   recoveryPub: (v, at) => canonicalB64(v, KEY_BYTES, "recoveryPub", at),
 };
 
@@ -133,22 +141,23 @@ function parseEntry(entry, at) {
 const hashOf = async ({ bytes, sig }) => toB64(await sha256(framed(HASH_DOMAIN, bytes, sig)));
 
 /** The signature is in the hash, so two differently signed entries at one position always count as a fork. */
+// This relies on verifiers rejecting non-canonical signatures: otherwise a re-encoded signature would be a false fork.
 export const entryHash = async (entry, at = entry?.index ?? null) => hashOf(parseEntry(entry, at));
 
 function newState() {
-  return { accountId: null, devices: new Map(), recoveryPub: null, recoveries: [], hashes: [], signKeys: new Set(), boxKeys: new Set() };
+  return { accountId: null, devices: new Map(), recoveryPub: null, recoveries: [], hashes: [], keys: new Set() };
 }
 
-// A key that has ever been on the log can never join again: a removal is final, and the rule needs no clock.
+// A key that has ever been on the log, in any field, can never join again: a removal is final, and the rule needs no clock.
 // So a web page approved again after its 30 days comes back with fresh keys.
-function claimKey(keys, key, at) {
-  if (keys.has(key)) throw new LogError(at, "that key has already been on this log");
-  keys.add(key);
+function claimKey(state, key, at) {
+  if (state.keys.has(key)) throw new LogError(at, "that key has already been on this log");
+  state.keys.add(key);
 }
 
 function addDevice(state, body, at) {
-  claimKey(state.signKeys, body.signPub, at);
-  claimKey(state.boxKeys, body.boxPub, at);
+  claimKey(state, body.signPub, at);
+  claimKey(state, body.boxPub, at);
   const device = {};
   for (const field of DEVICE_FIELDS) device[field] = body[field];
   state.devices.set(body.signPub, device);
@@ -164,7 +173,7 @@ const APPLY = {
     requireFullDevice(body, at);
     state.accountId = body.accountId;
     addDevice(state, body, at);
-    claimKey(state.signKeys, body.recoveryPub, at);
+    claimKey(state, body.recoveryPub, at);
     state.recoveryPub = body.recoveryPub;
   },
   add(state, { body }, at) {
@@ -182,7 +191,7 @@ const APPLY = {
   recover(state, { body }, at) {
     requireFullDevice(body, at);
     addDevice(state, body, at);
-    claimKey(state.signKeys, body.recoveryPub, at);
+    claimKey(state, body.recoveryPub, at);
     state.recoveryPub = body.recoveryPub;
     state.recoveries.push({ index: at, signPub: body.signPub, name: body.name, kind: body.kind, addedAt: body.addedAt });
   },
@@ -255,11 +264,16 @@ export async function append(log, { type, ...fields }, signerKeys) {
   return [...log, entry];
 }
 
+/** A client is judged by this verifier's clock. Its window has a start too, so a fast approver clock cannot lengthen it by more than the skew. */
+function isPresent(device, now) {
+  return device.role !== "client" || (now >= device.addedAt - CLOCK_SKEW_MS && now < device.addedAt + CLIENT_LIFETIME_MS);
+}
+
 /**
  * Replays a log from the start. Throws LogError naming the first bad entry.
  * `now` is this verifier's own clock and is required: without it a client would never expire.
  * Returns:
- *   devices      Map of signPub to {name, kind, role, signPub, boxPub, addedAt}, without expired clients.
+ *   devices      Map of signPub to {name, kind, role, signPub, boxPub, addedAt}, without clients outside their window.
  *                The recovery key is not a device: holding the code must not open a channel without leaving a notice.
  *   head         the last entry's hash, for handshakes and approval codes
  *   version      the number of entries
@@ -267,22 +281,26 @@ export async function append(log, { type, ...fields }, signerKeys) {
  *   recoveryPub  the current recovery key
  *   recoveries   one {index, signPub, name, kind, addedAt} per recover, for the notice every device must show
  */
-export async function verifyLog(entries, { now } = {}) {
+export async function verifyLog(entries, opts) {
+  const now = opts?.now;
   if (!Number.isFinite(now)) throw new LogError(null, "verifying needs the current time");
   const state = await replay(entries);
   const devices = new Map();
   for (const [key, device] of state.devices) {
-    if (device.role !== "client" || now < device.addedAt + CLIENT_LIFETIME_MS) devices.set(key, device);
+    if (isPresent(device, now)) devices.set(key, device);
   }
   return { devices, head: state.hashes.at(-1), version: state.hashes.length, accountId: state.accountId, recoveryPub: state.recoveryPub, recoveries: state.recoveries };
 }
 
 /**
- * Compares two logs of one account by entry hash, position by position.
+ * Returns "same", "a-newer", "b-newer", "fork" or "different-account".
+ * Two logs of one account are compared by entry hash, position by position.
  * Both are verified first and a bad one throws LogError: garbage from the hub must not read as newer, or as a fork.
  */
 export async function compareLogs(a, b) {
-  const [ours, theirs] = [(await replay(a)).hashes, (await replay(b)).hashes];
+  const [stateA, stateB] = [await replay(a), await replay(b)];
+  if (stateA.accountId !== stateB.accountId) return "different-account";
+  const [ours, theirs] = [stateA.hashes, stateB.hashes];
   const shared = Math.min(ours.length, theirs.length);
   for (let at = 0; at < shared; at++) if (ours[at] !== theirs[at]) return "fork";
   if (ours.length === theirs.length) return "same";
