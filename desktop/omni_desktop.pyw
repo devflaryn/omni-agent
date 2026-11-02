@@ -141,12 +141,37 @@ def shutdown(p, proc):
         kill_tree(proc)
 
 
+def set_window_icon(title="Omni Agent"):
+    """pywebview has no icon option on Windows: give the window and the taskbar button the logo by hand."""
+    if not WIN:
+        return
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        user32.LoadImageW.restype = ctypes.c_void_p
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+        hwnd = user32.FindWindowW(None, title)
+        for which, size in ((0, 16), (1, 32)):  # ICON_SMALL, ICON_BIG
+            icon = user32.LoadImageW(None, os.path.join(HERE, "omni.ico"), 1, size, size, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+            if hwnd and icon:
+                user32.SendMessageW(hwnd, 0x80, which, icon)  # WM_SETICON
+    except Exception:
+        pass  # only the look of the window
+
+
 def open_window(url):
     try:
         import webview
     except ImportError:
         return False
+    if WIN:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Omni.Agent")  # its own taskbar button, not Python's
+        except Exception:
+            pass
     window = webview.create_window("Omni Agent", url, width=1280, height=820, min_size=(720, 520))
+    window.events.shown += lambda: set_window_icon()
 
     def sync_title():
         last = None
