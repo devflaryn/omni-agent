@@ -25,7 +25,7 @@ import { hostname } from "node:os";
 import { basename, join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { checkPassword, fromB64, loginKeyFrom, newDeviceExchange, newDeviceKeys, newRecoveryCode, approverExchange, recoveryKeysFrom, sign, startHandshake, toB64, verify } from "../ui/account-core.js";
-import { LogError, append, compareLogs, createLog, deviceCurrent, deviceExpiresAt, entryHash, verifyLog } from "../ui/device-log.js";
+import { LogError, append, canRecover, compareLogs, createLog, deviceCurrent, deviceExpiresAt, entryHash, verifyLog } from "../ui/device-log.js";
 import { CLOSE_REASONS, FRAME, decodeFrame, decodeOuter, encodeFrame, encodeOuter } from "../ui/channel-frames.js";
 
 export class AccountError extends Error {
@@ -63,6 +63,7 @@ const encoder = new TextEncoder();
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 const clip = (value, max) => String(value ?? "").trim().slice(0, max);
 const isFiniteDevice = (value) => typeof value === "string" && value.length > 0 && value.length < 4096;
+const DISAGREEMENT_REASONS = new Set(["not-on-log", "removed", "expired", "log-mismatch"]);
 const CLOSE_SESSION_GONE = 4401, CLOSE_REMOVED = 4403, CLOSE_PENDING_EXPIRED = 4408, CLOSE_REPLACED = 4409, CLOSE_DENIED = 4410;
 
 // ------------------------------------------------------------------------------ protecting secrets
@@ -236,12 +237,12 @@ class Channel extends EventEmitter {
 // ------------------------------------------------------------------------------ recovery keys on the log
 // Every call that puts a recovery key on a log, or decides a log may be recovered, is here and nowhere else.
 
-const startLog = ({ device, recovery }) => createLog({ device, recoveryPub: recovery.signPub });
+const startLog = ({ device, recovery }) => createLog({ device, recovery });
 
-const recoverOnto = (entries, device, { current, next, addedAt }) => append(entries, { type: "recover", ...device, recoveryPub: next.signPub, addedAt }, current);
+const recoverOnto = (entries, device, { current, next, addedAt }) => append(entries, { type: "recover", ...device, newRecovery: next, addedAt }, current);
 
 /** Whether a log the hub gave is one this code may recover. Asked before anything is signed for it. */
-const mayRecover = (verified, recovery) => verified.recoveryPub === recovery.signPub;
+const mayRecover = (entries, recovery) => canRecover(entries, recovery.signPub);
 
 // ------------------------------------------------------------------------------ the account
 
@@ -256,6 +257,7 @@ const ALERT_TEXT = {
   recovered: "A device recovered this account with the recovery code. If that was not you, your recovery code is out and that device has full control.",
   "channel-failure": "An encrypted channel failed its check and was closed. A frame was changed, lost or replayed on the way.",
   "approval-failed": "An approval exchange failed its check and was abandoned. No code from it is shown.",
+  "refused-by-device": "A device on your account refused this computer, so the two hold different device lists. The hub may be hiding a change from one of them, or this computer may have been removed.",
   "key-unavailable": "This computer's account keys could not be opened. Nothing was changed. To start over, sign out and forget this device.",
 };
 
@@ -285,6 +287,7 @@ export class Account extends EventEmitter {
   #exchange = null;       // on a new device: { from, core, head, code, confirmed }
   #attempts = 0;
   #exchangeFailed = false;
+  #recoveryAt = null;     // the position of this device's own recover, until another device shows it holds that entry
   #acceptExchange = true; // one exchange per press of the person's button: a hub cannot try again by itself
   #approvedByHub = false;
   #channels = new Map();
@@ -352,6 +355,7 @@ export class Account extends EventEmitter {
       warnings: [...this.#warnings, ...(keyProtection.warning ? [keyProtection.warning] : [])],
       alerts: this.#alerts.slice(),
       recoveries: this.#verified?.recoveries ?? [],
+      recoveryUnconfirmed: this.#recoveryAt !== null,
       channels: [...this.#channels.values()].filter((c) => c.state === "open").map((c) => ({ id: c.id, device: c.peerId, name: c.peer.name, direction: c.direction })),
       handshakes: [...this.#channels.values()].filter((c) => c.state === "handshake").length,
     };
@@ -478,7 +482,7 @@ export class Account extends EventEmitter {
 
   #persistState() {
     const exchange = this.#exchange?.confirmed ? { head: this.#exchange.head, from: this.#exchange.from, code: this.#exchange.code } : null;
-    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange }));
+    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange, recoveryAt: this.#recoveryAt }));
   }
 
   async #ensureKeys() {
@@ -525,6 +529,7 @@ export class Account extends EventEmitter {
     if (state) {
       this.#email = state.email ?? null;
       this.#name = state.name ?? this.#name;
+      this.#recoveryAt = Number.isSafeInteger(state.recoveryAt) ? state.recoveryAt : null;
       if (state.exchange?.head) this.#acceptExchange = false;
       if (state.exchange?.head) this.#exchange = { from: state.exchange.from, head: state.exchange.head, code: state.exchange.code, core: null, confirmed: true };
     }
@@ -738,6 +743,7 @@ export class Account extends EventEmitter {
     this.#hubError = null;
     if (forget) {
       for (const file of ["keys.json", "log.json", "state.json"]) await fs.rm(join(this.dir, file), { force: true });
+      this.#recoveryAt = null;
       this.#keys = null;
       this.#log = null;
       this.#verified = null;
@@ -1007,6 +1013,7 @@ export class Account extends EventEmitter {
   async #adopt(entries, verified) {
     await this.#writeFile("log.json", JSON.stringify(entries));
     await this.#setLog(entries, verified);
+    if (this.#recoveryAt !== null && entries.slice(this.#recoveryAt + 1).some((entry) => entry.signer !== this.#keys?.signPub)) this.#recoveryConfirmed();
     const fresh = verified.recoveries.slice(this.#knownRecoveries);
     this.#knownRecoveries = verified.recoveries.length;
     for (const recovery of fresh) if (recovery.signPub !== this.#keys?.signPub) this.#alert("recovered", String(recovery.index));
@@ -1023,6 +1030,12 @@ export class Account extends EventEmitter {
       return;
     }
     this.#recheckChannels();
+  }
+
+  #recoveryConfirmed() {
+    this.#recoveryAt = null;
+    this.#persistState().catch(() => {});
+    this.#changed();
   }
 
   /** A log from outside against the one held here. Returns same, adopted, rollback, fork, different-account or bad-log. */
@@ -1376,6 +1389,8 @@ export class Account extends EventEmitter {
         const answer = await this.#rpc({ type: "log.append", prevHead: entries.at(-1) ? await entryHash(entries.at(-1)) : "", entry: appended.at(-1) }, ["log.ok", "log.conflict"]);
         if (answer.type === "log.conflict") continue;
         this.#phase = "approved";
+        // Until another device shows it holds this entry, the hub may have shown an older log and this new code may not count.
+        this.#recoveryAt = appended.length - 1;
         await this.#adopt(appended, await this.verifyLogImpl(appended, { now: this.now() }));
         await this.#persistState();
         try {
@@ -1405,7 +1420,7 @@ export class Account extends EventEmitter {
       this.#alert("bad-log", error.message);
       throw new AccountError(403, "wrong-code", "The hub's device list failed its checks.");
     }
-    if (!mayRecover(verified, recovery)) throw new AccountError(403, "wrong-code", "That recovery code does not belong to this account, or has been used.");
+    if (!await mayRecover(entries, recovery)) throw new AccountError(403, "wrong-code", "That recovery code does not belong to this account, or has been used.");
     if (this.#log) {
       const verdict = await compareLogs(this.#log, entries);
       if (verdict !== "b-newer" && verdict !== "same") {
@@ -1535,6 +1550,11 @@ export class Account extends EventEmitter {
       case "proof": queued = channel.enqueue(size, () => this.#onProof(channel, outer), this.limits.maxInboundBytes); break;
       case "data": queued = channel.enqueue(size, () => this.#onData(channel, outer), this.limits.maxInboundBytes); break;
       case "close":
+        // Being told no by a device this computer trusts means the two logs disagree: a security matter, not a plain error.
+        if (DISAGREEMENT_REASONS.has(outer.reason) && this.#verified?.devices.has(from)) {
+          this.#alert("refused-by-device", `${from}|${outer.reason}`);
+          this.syncLog().catch(() => {});
+        }
         channel.close(Object.hasOwn(CLOSE_REASONS, outer.reason) ? outer.reason : "closed", { notify: false });
         return;
       default: return;
@@ -1584,6 +1604,7 @@ export class Account extends EventEmitter {
       return;
     }
     // The log heads were signed in the transcript, so this is what the other device really holds.
+    if (this.#recoveryAt !== null && this.#hashes.indexOf(channel.core.peerLogHead) >= this.#recoveryAt) this.#recoveryConfirmed();
     const reconciled = await this.#reconcile(channel.core.peerLogHead);
     if (!reconciled) {
       channel.close("log-mismatch");

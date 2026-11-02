@@ -12,8 +12,8 @@ import { Account, keychainProtector, plainProtector, windowsProtector } from "..
 import { channelClient, serveChannel } from "../server/channel-host.mjs";
 import { createApp } from "../server/index.mjs";
 import { FRAME, encodeFrame, encodeJson, encodeOuter } from "../ui/channel-frames.js";
-import { fromB64, newDeviceKeys, recoveryKeysFrom, startHandshake, toB64 } from "../ui/account-core.js";
-import { append, createLog, verifyLog } from "../ui/device-log.js";
+import { fromB64, newDeviceKeys, recoveryKeysFrom, sign, startHandshake, toB64 } from "../ui/account-core.js";
+import { append, canRecover, createLog, entryBytes, verifyLog } from "../ui/device-log.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const until = async (check, what = "condition", ms = 8000) => {
@@ -465,7 +465,7 @@ test("approval: on log.conflict the approver refreshes, tells the person, and mu
 async function fakeAccountAdding(newcomer) {
   const attacker = { ...(await newDeviceKeys({ extractable: true })), name: "Attacker", kind: "desktop" };
   const recovery = await newDeviceKeys({ extractable: true });
-  const entries = await createLog({ device: attacker, recoveryPub: recovery.signPub });
+  const entries = await createLog({ device: attacker, recovery });
   const { head } = await verifyLog(entries, { now: Date.now() });
   return { attacker, entries, head, withDevice: () => append(entries, { type: "add", name: "Victim", kind: "desktop", role: "full", signPub: newcomer.status().device.id, boxPub: toB64(new Uint8Array(32).fill(9)) }, attacker) };
 }
@@ -695,7 +695,7 @@ test("hacked hub: another account's log, and garbage, are refused and named", as
   const before = readFileSync(join(second.dir, "log.json"), "utf8");
   const stranger = { ...(await newDeviceKeys({ extractable: true })), name: "S", kind: "desktop" };
   const recovery = await newDeviceKeys({ extractable: true });
-  const theirs = await createLog({ device: stranger, recoveryPub: recovery.signPub });
+  const theirs = await createLog({ device: stranger, recovery });
   tap.incoming = (m) => (m.type === "log" ? { ...m, entries: theirs, head: "t", version: 1 } : m);
   inject(second, { type: "log.updated", head: "t", version: 1 });
   await until(() => second.alerts.some((a) => a.kind === "different-account"), "different account");
@@ -1142,7 +1142,7 @@ test("recovery: a log from the hub that does not name this code's key is refused
   const first = await registered(fixture, { name: "First" });
   const fake = { ...(await newDeviceKeys({ extractable: true })), name: "F", kind: "desktop" };
   const otherRecovery = await newDeviceKeys({ extractable: true });
-  const theirs = await createLog({ device: fake, recoveryPub: otherRecovery.signPub });
+  const theirs = await createLog({ device: fake, recovery: otherRecovery });
   const tap = {};
   let appended = false;
   tap.incoming = (m) => (m.type === "log" ? { ...m, entries: theirs, head: "t", version: 1 } : m);
@@ -1150,6 +1150,138 @@ test("recovery: a log from the hub that does not name this code's key is refused
   const lost = makeAccount(fixture, { WebSocketImpl: tappedSocket(tap) });
   await assert.rejects(lost.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }), (e) => e.status === 403);
   assert.equal(appended, false);
+});
+
+test("recovery: a fake account built around the real recovery key is refused before anything is signed", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const realRecovery = await recoveryKeysFrom(first.recoveryCode);
+  // The public half is no secret, so a hub can put it in a create. It cannot sign for it.
+  const attacker = { ...(await newDeviceKeys({ extractable: true })), name: "Attacker", kind: "desktop" };
+  const [made] = await createLog({ device: attacker, recovery: await newDeviceKeys({ extractable: true }) });
+  const body = { ...made.body, recoveryPub: realRecovery.signPub };
+  const unsigned = { type: "create", index: 0, prev: "", signer: attacker.signPub, body };
+  const forged = [{ ...unsigned, sig: await sign(attacker.sign.privateKey, entryBytes(unsigned)) }];
+  assert.equal(await canRecover(forged, realRecovery.signPub), false);
+  const withForeignSig = [{ ...forged[0], recoverySig: made.recoverySig }];
+  assert.equal(await canRecover(withForeignSig, realRecovery.signPub), false);
+  for (const entries of [forged, withForeignSig]) {
+    const lost = makeAccount(fixture);
+    let signed = false;
+    lost.tap.incoming = (m) => (m.type === "log" ? { ...m, entries, head: "t", version: 1 } : m);
+    lost.tap.outgoing = (m) => { if (m.type === "log.append") signed = true; return m; };
+    await assert.rejects(lost.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }), (e) => e.status === 403);
+    assert.equal(signed, false);
+    assert.equal(lost.status().phase, "signed-out");
+    assert.ok(lost.alerts.some((a) => a.kind === "bad-log"), "and it is visible");
+  }
+});
+
+test("recovery: the flag to keep the old code stays until another device shows it holds the recover", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  assert.equal(first.status().recoveryUnconfirmed, false);
+  const oldHead = first.status().logHead;
+  // The other device misses the news for now.
+  first.tap.incoming = (m) => (m.type === "log.updated" ? null : m);
+  const fresh = makeAccount(fixture);
+  await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+  assert.equal(fresh.status().recoveryUnconfirmed, true);
+  const freshId = fresh.status().device.id;
+
+  const restarted = makeAccount(fixture, { dir: fresh.dir });
+  await fresh.stop();
+  await restarted.start();
+  assert.equal(restarted.status().recoveryUnconfirmed, true, "kept across a restart");
+  await until(() => restarted.status().hub.connected, "reconnected");
+
+  // A real device, by hand, signing a head from before the recover: the handshake completes, and confirms nothing.
+  const keys = await keysOf(first);
+  const c = toB64(new Uint8Array(16).fill(3));
+  const send = (fields) => first.tap.sockets.at(-1).real.send(JSON.stringify({ type: "channel.msg", to: freshId, opaque: encodeOuter({ c, ...fields }) }));
+  const hs = await startHandshake({ device: keys, peerPub: freshId, logHead: oldHead });
+  let core, proofChecked = false, order = Promise.resolve();
+  first.tap.incoming = (m) => {
+    if (m.type === "log.updated") return null;
+    if (m.type !== "channel.msg") return m;
+    const outer = JSON.parse(m.opaque);
+    if (outer.c !== c) return m;
+    order = order.then(async () => {
+      if (outer.t === "hello") {
+        core = await hs.finish({ eph: outer.eph, logHead: outer.logHead });
+        send({ t: "proof", proof: core.proof });
+      } else if (outer.t === "proof") {
+        await core.confirm(outer.proof);
+        proofChecked = true;
+      }
+    });
+    return null;
+  };
+  send({ t: "hello", ...hs.hello });
+  await until(() => proofChecked, "that handshake");
+  await sleep(30);
+  assert.equal(restarted.status().recoveryUnconfirmed, true, "a head from before the recover confirms nothing");
+  first.tap.incoming = undefined;
+  const current = await first.openChannel(freshId);
+  await until(() => restarted.status().recoveryUnconfirmed === false, "a head holding the recover confirms it");
+  current.close();
+  const again = makeAccount(fixture, { dir: fresh.dir });
+  await restarted.stop();
+  await again.start();
+  assert.equal(again.status().recoveryUnconfirmed, false, "and that is remembered");
+});
+
+test("recovery: an entry another device signed after the recover also confirms it", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const fresh = makeAccount(fixture);
+  await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+  assert.equal(fresh.status().recoveryUnconfirmed, true);
+  await until(() => first.status().logHead === fresh.status().logHead, "first adopts");
+  // This device's own later entry proves nothing.
+  const own = await joined(fixture, fresh, { name: "Added by the recovered device" });
+  assert.equal(fresh.status().recoveryUnconfirmed, true);
+  await until(() => first.status().logHead === fresh.status().logHead, "first adopts again");
+  await first.remove(own.status().device.id);
+  await until(() => fresh.status().recoveryUnconfirmed === false, "another device's entry");
+});
+
+test("refused by a device on this log: a visible alert, and the log is checked; ordinary refusals are not alarms", async () => {
+  const fixture = await hubFixture();
+  const { first, second, tap } = await connected(fixture);
+  const firstId = first.status().device.id;
+  for (const reason of ["not-on-log", "log-mismatch", "removed", "expired"]) {
+    second.alerts.length = 0;
+    let fetched = 0;
+    const before = tap.outgoing;
+    tap.outgoing = (m) => { if (m.type === "log.get") fetched++; return m; };
+    first.tap.outgoing = (m) => {
+      if (m.type !== "channel.msg" || JSON.parse(m.opaque).t !== "hello") return m;
+      return { ...m, opaque: JSON.stringify({ v: 1, c: JSON.parse(m.opaque).c, t: "close", reason }) };
+    };
+    await assert.rejects(second.openChannel(firstId), /refused/);
+    assert.ok(second.status().alerts.some((a) => a.kind === "refused-by-device" && a.key.endsWith(reason)), reason);
+    assert.ok(second.alerts.some((a) => a.kind === "refused-by-device"), reason);
+    await until(() => fetched > 0, "the log is fetched");
+    tap.outgoing = before;
+  }
+  await second.clearAlerts();
+  second.alerts.length = 0;
+  for (const reason of ["busy", "unavailable", "web-access-off"]) {
+    first.tap.outgoing = (m) => {
+      if (m.type !== "channel.msg" || JSON.parse(m.opaque).t !== "hello") return m;
+      return { ...m, opaque: JSON.stringify({ v: 1, c: JSON.parse(m.opaque).c, t: "close", reason }) };
+    };
+    await assert.rejects(second.openChannel(firstId), /refused/);
+  }
+  assert.equal(second.alerts.length, 0);
+  // A stranger's refusal says nothing about this log.
+  const stranger = await newDeviceKeys({ extractable: true });
+  // Its hello opens a channel entry while the log is checked, so a close can land on one.
+  inject(second, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, c: "x", t: "hello", eph: stranger.boxPub, logHead: "h" }) });
+  inject(second, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, c: "x", t: "close", reason: "removed" }) });
+  await sleep(20);
+  assert.equal(second.alerts.length, 0);
 });
 
 test("password change: full device only, old password stops working, keys and the log are untouched", async () => {
