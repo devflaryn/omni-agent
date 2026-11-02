@@ -70,7 +70,7 @@ export function keychainProtector({ service, run = runCommand } = {}) {
   };
 }
 
-export const PLAIN_WARNING = "This computer's keys are protected by file permissions alone: any program running as you can read them.";
+export const PLAIN_WARNING = "This computer's keys, and any recovery code you have not saved yet, are protected by file permissions alone: any program running as you can read them.";
 export function plainProtector() {
   return { name: "none", warning: PLAIN_WARNING, protect: async (bytes) => Buffer.from(bytes), unprotect: async (bytes) => Buffer.from(bytes) };
 }

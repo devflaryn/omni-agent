@@ -48,6 +48,7 @@ const DEFAULT_LIMITS = Object.freeze({
   rpcTimeoutMs: 30 * SECOND,
   httpTimeoutMs: 20 * SECOND,
   connectTimeoutMs: 15 * SECOND,
+  settleRetryMs: MINUTE,
   maxChannels: 64,
   maxChannelsPerDevice: 8,
   maxInboundBytes: 16 * 1024 * 1024,
@@ -77,6 +78,7 @@ const CLOSE_SESSION_GONE = 4401, CLOSE_REMOVED = 4403, CLOSE_PENDING_EXPIRED = 4
 
 const SETTINGS_DAMAGED = "The saved settings could not be read, so Allow web page access is off until you choose again.";
 const RECOVERY_CODE_FILE = "recovery-code.json";
+const CONTESTED = "The hub's answers do not match this recovery code, so this computer cannot tell which code counts. Keep every recovery code you have until another device confirms.";
 const LOG_NOT_SAVED = "This computer could not save its device list. It will try again the next time Omni starts: check the disk.";
 // ------------------------------------------------------------------------------ the slow key
 
@@ -171,6 +173,9 @@ export class Account extends EventEmitter {
   #candidate = null;      // { kind, entries }: a log sent, or about to be sent, to the hub and not yet known to have landed
   #registerAttempt = null;
   #codePending = false;
+  #contested = false;     // a hub has contradicted the candidate: nothing is deleted, and the person is told to keep every code
+  #lastHubState = null;
+  #settleTimer = null;
   #hubClaimedRemoved = false;
   #sentInWindow = 0;
   #windowStart = 0;
@@ -238,6 +243,7 @@ export class Account extends EventEmitter {
       recoveries: this.#verified?.recoveries ?? [],
       recoveryUnconfirmed: this.#recoveryAt !== null,
       recoveryCodePending: this.#codePending,
+      recoveryContested: this.#contested,
       channels: this.#links.all().filter((c) => c.state === "open").map((c) => ({ id: c.id, device: c.peerId, name: c.peer.name, direction: c.direction })),
       handshakes: this.#links.all().filter((c) => c.state === "handshake").length,
     };
@@ -501,6 +507,7 @@ export class Account extends EventEmitter {
 
   #dropConnection(reason) {
     clearTimeout(this.#reconnectTimer);
+    clearTimeout(this.#settleTimer);
     this.#reconnectTimer = null;
     const ws = this.#ws;
     this.#ws = null;
@@ -590,9 +597,18 @@ export class Account extends EventEmitter {
     const { recoveryCode, entries, salt } = retry ?? await this.#newRegistration(email);
     const loginKey = await this.#loginKey(password, salt);
     const token = await this.#bootstrapToken();
-    // Both on disk before the hub can make them live. Nothing has been sent if either fails.
-    await this.#storeRecoveryCode(recoveryCode);
-    await this.#writeCandidate("register", email, entries);
+    // Both on disk before the hub can make them live. Nothing has been sent if either fails, unless this is a retry.
+    try {
+      await this.#storeRecoveryCode(recoveryCode);
+      await this.#writeCandidate("register", email, entries);
+    } catch (error) {
+      if (!retry) {
+        this.#registerAttempt = null;
+        await this.#dropRecoveryCode();
+        await this.#restoreUnsettled(earlier);
+      }
+      throw error;
+    }
     let accepted = true;
     try {
       await this.#post("/api/register", { email, salt: toB64(salt), verifierInput: loginKey, firstLogEntry: entries[0], ...(token ? { bootstrapToken: token } : {}) });
@@ -606,16 +622,16 @@ export class Account extends EventEmitter {
         throw error;
       }
       accepted = false;
-      this.#registerAttempt = null;
-      // Refused the second time: the first may have landed. The login below tells.
+      // Refused the second time: the first may have landed. Only a login shows that, and a mistyped password shows nothing.
       const state = await this.#login(email, loginKey).catch(() => null);
       if (state !== "approved") {
-        await this.#dropCandidate();
-        await this.#dropRecoveryCode();
+        this.#contest();
         throw error;
       }
     }
     this.#registerAttempt = null;
+    this.#contested = false;
+    clearTimeout(this.#settleTimer);
     // The account exists now. From here nothing may stop the person getting this code: it is never shown again.
     this.#email = email;
     await this.#settleCommitted(entries);
@@ -686,7 +702,8 @@ export class Account extends EventEmitter {
   /** The person says they saved it. Until then it stays, and the UI keeps asking. */
   async recoveryCodeSaved() {
     await this.start();
-    if (this.#candidate) throw new AccountError(409, "not-settled", "Wait until the hub has confirmed this code before discarding it.");
+    // While nothing is known it stays. Once a hub has contradicted it, waiting may never end, so the person may decide.
+    if (this.#candidate && !this.#contested) throw new AccountError(409, "not-settled", "Wait until the hub has confirmed this code before discarding it.");
     await this.#dropRecoveryCode();
     return { recoveryCodePending: false };
   }
@@ -741,7 +758,7 @@ export class Account extends EventEmitter {
       this.#warnings.add(LOG_NOT_SAVED);
       return false;
     }
-    const saved = await this.#adopt(entries, verified, { bestEffort: true }).catch(() => {
+    const saved = await this.#adoptLocked(entries, verified, { bestEffort: true }).catch(() => {
       this.#warnings.add(LOG_NOT_SAVED);
       return false;
     });
@@ -756,35 +773,81 @@ export class Account extends EventEmitter {
   async #resolveCandidate(hubState) {
     const candidate = this.#candidate;
     if (!candidate) return;
-    const notThere = async (message) => {
-      await this.#dropCandidate();
-      await this.#dropRecoveryCode(); // it never became live
-      if (this.#phase !== "recovering") return;
-      this.#phase = "signed-out";
-      this.#recoveryAt = null;
-      this.#hubError = message;
-      this.#dropConnection("signed-out");
-      await this.#tryLocal(() => this.#forgetSession(), LOG_NOT_SAVED);
-      await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
-      this.#changed();
-    };
-    if (hubState !== "approved") return notThere("The recovery did not reach the hub. Your old recovery code still works.");
-    const reply = await this.#rpc({ type: "log.get" }, ["log"]);
+    this.#lastHubState = hubState;
+    const entry = candidate.entries.at(-1);
+    if (hubState === "approved") {
+      const reply = await this.#rpc({ type: "log.get" }, ["log"]);
+      await this.#settleAgainst(candidate, reply.entries);
+      return;
+    }
+    // The hub says this key is not on the log. That is only its word, and a recover not yet landed can simply be sent again:
+    // the person's own old key signed it, and that is what they set out to do.
+    if (candidate.kind !== "recover") return this.#contest();
+    let answer;
+    try {
+      answer = await this.#rpc({ type: "log.append", prevHead: entry.prev, entry }, ["log.ok", "log.conflict"]);
+    } catch (error) {
+      if (error.code === "hub-unreachable" || error.code === "hub-timeout") throw error;
+      return this.#contest();
+    }
+    await this.#settleAgainst(candidate, answer.type === "log.ok" ? candidate.entries : answer.entries);
+  }
+
+  /** Only a log that holds the candidate settles anything. Anything else is a hub contradicting this device: it deletes nothing. */
+  async #settleAgainst(candidate, entries) {
     let verified, verdict;
     try {
-      verified = await this.verifyLogImpl(reply.entries, { now: this.now() });
-      verdict = await compareLogs(candidate.entries, reply.entries);
+      verified = await this.verifyLogImpl(entries, { now: this.now() });
+      verdict = await compareLogs(candidate.entries, entries);
     } catch (error) {
       if (!(error instanceof LogError)) throw error;
       this.#alert("bad-log");
-      return;
+      return this.#contest();
     }
-    if (verdict !== "same" && verdict !== "b-newer") return notThere("The recovery did not reach the hub. Your old recovery code still works.");
-    if (await this.#adopt(reply.entries, verified, { bestEffort: true })) await this.#dropCandidate();
+    if (verdict !== "same" && verdict !== "b-newer") {
+      if (verdict === "a-newer") this.#alert("rollback", String(verified.head));
+      else if (verdict === "fork") this.#alert("fork", String(verified.head));
+      else this.#alert("different-account", String(verified.accountId));
+      return this.#contest();
+    }
+    if (await this.#adoptLocked(entries, verified, { bestEffort: true })) await this.#dropCandidate();
     if (candidate.kind === "recover") this.#recoveryAt ??= candidate.entries.length - 1;
+    this.#contested = false;
+    this.#hubError = null;
+    clearTimeout(this.#settleTimer);
     this.#phase = "approved";
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
     this.#changed();
+  }
+
+  /** The person keeps every code they hold, and may now say they saved this one. It is asked again later, since a lie may stop. */
+  #contest() {
+    this.#contested = true;
+    this.#hubError = CONTESTED;
+    clearTimeout(this.#settleTimer);
+    this.#settleTimer = setTimeout(() => this.#settleAgain(), this.limits.settleRetryMs);
+    this.#settleTimer.unref?.();
+    this.#changed();
+  }
+
+  async #settleAgain() {
+    if (!this.#candidate || !this.#connected) return;
+    try {
+      await this.#resolveCandidate(this.#lastHubState);
+    } catch {
+      this.#reconnectToSettle();
+      return;
+    }
+    if (this.#phase !== "approved") return;
+    try {
+      this.#sendNow({ type: "presence" });
+      if (this.#role() === "full") this.#sendNow({ type: "pending.list" });
+    } catch { /* the next connection does this */ }
+  }
+
+  /** No answer in time, on a socket that may be fine: a new connection starts settling again from the top. */
+  #reconnectToSettle() {
+    try { this.#ws?.close(); } catch { /* it has gone */ }
   }
 
   async signIn({ email, password, name } = {}) {
@@ -843,6 +906,7 @@ export class Account extends EventEmitter {
       for (const file of ["keys.json", "log.json", "state.json", "log.candidate.json", RECOVERY_CODE_FILE]) await fs.rm(join(this.dir, file), { force: true });
       this.#codePending = false;
       this.#candidate = null;
+      this.#contested = false;
       this.#recoveryAt = null;
       this.#keys = null;
       this.#log = null;
@@ -1079,7 +1143,10 @@ export class Account extends EventEmitter {
     if (this.#candidate) {
       try {
         await this.#resolveCandidate(state);
-      } catch { /* the socket went: the next connection does this again */ }
+      } catch {
+        this.#reconnectToSettle();
+        return;
+      }
     }
     if (this.#phase === "approved") {
       try {
@@ -1087,7 +1154,7 @@ export class Account extends EventEmitter {
         this.#sendNow({ type: "presence" });
         if (this.#role() === "full") this.#sendNow({ type: "pending.list" });
       } catch { /* the socket went: the next connection does this again */ }
-    } else if (this.#phase === "pending" && state === "approved") {
+    } else if (this.#phase === "pending" && state === "approved" && !this.#candidate) {
       this.#approvedByHub = true;
       this.#tryFinishApproval();
     }
@@ -1120,6 +1187,13 @@ export class Account extends EventEmitter {
     this.#log = entries;
     this.#verified = verified;
     this.#hashes = await Promise.all(entries.map((entry) => entryHash(entry)));
+  }
+
+  /** One adoption at a time, in order with #considerLog's. */
+  #adoptLocked(entries, verified, options) {
+    const run = this.#logLock.then(() => this.#adopt(entries, verified, options));
+    this.#logLock = run.catch(() => {});
+    return run;
   }
 
   /** Disk first: a log believed but not kept could be rolled back by a restart. */
@@ -1212,9 +1286,7 @@ export class Account extends EventEmitter {
     }
     const verified = await this.verifyLogImpl(entries, { now: this.now() });
     if (reply.head !== verified.head) this.log("account: the hub's head differs from the appended entry's");
-    await new Promise((resolve, reject) => {
-      this.#logLock = this.#logLock.then(() => this.#adopt(entries, verified)).then(resolve, reject);
-    });
+    await this.#adoptLocked(entries, verified);
     return "ok";
   }
 
@@ -1462,7 +1534,7 @@ export class Account extends EventEmitter {
         return;
       }
     }
-    await this.#adopt(entries, verified);
+    await this.#adoptLocked(entries, verified);
     this.#phase = "approved";
     this.#exchange = null;
     this.#approvedByHub = false;
@@ -1494,10 +1566,11 @@ export class Account extends EventEmitter {
     await this.#login(email, await this.#loginKey(password, salt));
     this.#phase = "recovering";
     this.#connect();
+    let nextCode, sent = null;
     try {
       await this.#whenConnected();
       const proof = await sign(recovery.sign.privateKey, encoder.encode(`${RECOVERY_DOMAIN} ${this.hubOrigin} ${this.#nonce}`));
-      const nextCode = newRecoveryCode();
+      nextCode = newRecoveryCode();
       const next = await recoveryKeysFrom(nextCode);
       for (let attempt = 0; attempt < 3; attempt++) {
         let reply;
@@ -1507,28 +1580,30 @@ export class Account extends EventEmitter {
           if (error.code === "forbidden") throw new AccountError(403, "wrong-code", "That recovery code does not belong to this account, or has been used.");
           throw error;
         }
+        // A conflict may be a hub lying after it appended. The same code is on disk for every attempt, so nothing is lost by asking.
+        if (sent && await this.#holdsCandidate(sent, reply.entries)) return this.#finishRecovery(nextCode, reply.entries, sent.length - 1);
         const entries = await this.#checkedRecoveryLog(reply.entries, recovery);
         const appended = await recoverOnto(entries, { name: this.#name, kind: this.#kind, signPub: this.#keys.signPub, boxPub: this.#keys.boxPub }, { current: recovery, next, addedAt: this.now() });
         // Both on disk before the hub can make them live. Nothing has been sent if either fails: the old code stands.
         await this.#storeRecoveryCode(nextCode);
         await this.#writeCandidate("recover", email, appended);
+        sent = appended;
         let answer;
         try {
           answer = await this.#rpc({ type: "log.append", prevHead: entries.at(-1) ? await entryHash(entries.at(-1)) : "", entry: appended.at(-1) }, ["log.ok", "log.conflict"]);
         } catch (error) {
           // No answer: the old code may be dead already. The person gets the new one and keeps both until the reconnect settles it.
           if (error.code === "hub-unreachable" || error.code === "hub-timeout") return this.#recoveryInDoubt(nextCode, appended);
+          if (attempt > 0) return this.#recoveryInDoubt(nextCode, appended); // an earlier attempt may have landed
+          sent = null;
           throw error;
         }
-        if (answer.type === "log.conflict") {
-          await this.#dropCandidate();
-          await this.#dropRecoveryCode();
-          continue;
-        }
-        return this.#finishRecovery(nextCode, appended);
+        if (answer.type === "log.conflict") continue;
+        return this.#finishRecovery(nextCode, appended, appended.length - 1);
       }
-      throw new AccountError(409, "log-conflict", "The device list keeps changing. Try again.");
+      return this.#recoveryInDoubt(nextCode, sent); // only ever told "conflict": any of those may have landed
     } catch (error) {
+      if (sent) return this.#recoveryInDoubt(nextCode, sent);
       await this.#dropCandidate();
       await this.#dropRecoveryCode();
       this.#phase = "signed-out";
@@ -1540,11 +1615,11 @@ export class Account extends EventEmitter {
   }
 
   /** The hub has the entry, so the old code is dead. Never throws: losing this code could leave the account with none. */
-  async #finishRecovery(nextCode, appended) {
+  async #finishRecovery(nextCode, entries, recoveryAt) {
     this.#phase = "approved";
     // Until another device shows it holds this entry, the hub may have shown an older log and this new code may not count.
-    this.#recoveryAt = appended.length - 1;
-    await this.#settleCommitted(appended);
+    this.#recoveryAt = recoveryAt;
+    await this.#settleCommitted(entries);
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
     try {
       this.#sendNow({ type: "presence" });
@@ -1552,6 +1627,16 @@ export class Account extends EventEmitter {
     } catch { /* the next connection does this */ }
     this.#changed();
     return { recoveryCode: nextCode, confirmed: true };
+  }
+
+  async #holdsCandidate(candidateEntries, entries) {
+    try {
+      const verdict = await compareLogs(candidateEntries, entries);
+      return verdict === "same" || verdict === "b-newer";
+    } catch (error) {
+      if (error instanceof LogError) return false;
+      throw error;
+    }
   }
 
   async #recoveryInDoubt(nextCode, appended) {
