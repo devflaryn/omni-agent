@@ -4,7 +4,7 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createServer as createNetServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startHub } from "../hub/server.mjs";
@@ -323,6 +323,92 @@ test("sign-in with the real key derivation does not hold up the server", async (
   await assert.rejects(wrong.signIn({ email: EMAIL, password: `${PASSWORD}x`, name: "Third" }), (e) => e.status === 401);
 });
 
+test("register: a local failure at any step after the hub accepted still returns the code, as a warning", async () => {
+  for (const blocked of ["log.json", "session.json", "state.json"]) {
+    const fixture = await hubFixture();
+    const account = makeAccount(fixture);
+    writeBootstrap(account.dir);
+    await account.start();
+    mkdirSync(join(account.dir, blocked)); // the write's rename fails, as on a full or failing disk
+    const out = await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
+    assert.ok(out.recoveryCode, blocked);
+    assert.ok(account.status().warnings.length > 0 || blocked === "session.json", blocked);
+  }
+});
+
+test("register: a failure on the verify step after the hub accepted still returns the code", async () => {
+  const fixture = await hubFixture();
+  const account = makeAccount(fixture, { verifyLogImpl: async () => { throw new Error("disk gone"); } });
+  writeBootstrap(account.dir);
+  const out = await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
+  assert.ok(out.recoveryCode);
+  assert.equal(out.signedIn, false);
+  assert.ok(account.status().warnings.some((w) => /could not save/.test(w)));
+});
+
+test("register: if the candidate cannot be written first, nothing reaches the hub", async () => {
+  const fixture = await hubFixture();
+  const sent = [];
+  const account = makeAccount(fixture, { fetchImpl: async (url, init) => { sent.push(String(url)); return fetch(url, init); } });
+  writeBootstrap(account.dir);
+  await account.start();
+  mkdirSync(join(account.dir, "log.candidate.json"));
+  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }));
+  assert.ok(!sent.some((u) => u.endsWith("/api/register")));
+});
+
+test("register: killed right after the hub accepted, the next sign-in resumes on the candidate and says the code is gone", async () => {
+  const fixture = await hubFixture();
+  const killedDir = join(freshDir(), "account");
+  const account = makeAccount(fixture, { fetchImpl: async (url, init) => {
+    const reply = await fetch(url, init);
+    if (String(url).endsWith("/api/register")) { cpSync(account.dir, killedDir, { recursive: true }); throw new Error("killed"); }
+    return reply;
+  } });
+  writeBootstrap(account.dir);
+  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }));
+  const after = makeAccount(fixture, { dir: killedDir });
+  await after.start();
+  assert.equal(after.status().phase, "signed-out");
+  await after.signIn({ email: EMAIL, password: PASSWORD });
+  await until(() => after.status().phase === "approved", "resumed");
+  assert.equal(after.status().logVersion, 1);
+  assert.equal(after.status().recoveryCodeNotShown, true);
+  assert.ok(after.status().warnings.some((w) => /cannot be shown again/.test(w)));
+  assert.ok(!existsSync(join(killedDir, "log.candidate.json")));
+  assert.ok(existsSync(join(killedDir, "log.json")));
+});
+
+test("register: no answer from the hub, then a retry, gives the code of the attempt that landed", async () => {
+  const fixture = await hubFixture();
+  let lost = true;
+  const account = makeAccount(fixture, { fetchImpl: async (url, init) => {
+    const reply = await fetch(url, init);
+    if (lost && String(url).endsWith("/api/register")) { lost = false; throw new Error("the answer was lost"); }
+    return reply;
+  } });
+  writeBootstrap(account.dir);
+  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }), (e) => e.code === "hub-unreachable");
+  const out = await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
+  await until(() => account.status().hub.connected, "connected");
+  assert.equal(account.status().phase, "approved");
+  const recovered = makeAccount(fixture);
+  await recovered.recover({ email: EMAIL, password: PASSWORD, recoveryCode: out.recoveryCode, name: "New" });
+  assert.equal(recovered.status().phase, "approved", "that code is the real one");
+});
+
+test("register: a stale candidate that never landed does not block a fresh registration", async () => {
+  const fixture = await hubFixture();
+  const account = makeAccount(fixture);
+  mkdirSync(account.dir, { recursive: true });
+  const stale = { ...(await newDeviceKeys({ extractable: true })), name: "Old", kind: "desktop" };
+  writeFileSync(join(account.dir, "log.candidate.json"), JSON.stringify({ v: 1, kind: "register", email: EMAIL, entries: await createLog({ device: stale, recovery: await newDeviceKeys({ extractable: true }) }) }));
+  writeBootstrap(account.dir);
+  const out = await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
+  assert.ok(out.recoveryCode);
+  assert.equal(account.status().logVersion, 1);
+});
+
 test("sign-in passes the bootstrap token along when it is there, and keeps the file", async () => {
   const fixture = await hubFixture();
   const first = await registered(fixture);
@@ -428,6 +514,52 @@ test("approval: one review at a time; deny ends the attempt and the device does 
   assert.equal(a.status().hub.connected, false);
   assert.equal(a.status().phase, "denied", "no retry");
   await approver.review(rowB.id);
+});
+
+test("approval: a review that fails late does not wipe another review, and hints are only for real cards", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture, { limits: { reviewTimeoutMs: 150 } });
+  const second = await joined(fixture, approver);
+  const silent = makeAccount(fixture), b = makeAccount(fixture);
+  await silent.signIn({ email: EMAIL, password: PASSWORD, name: "Silent" });
+  await b.signIn({ email: EMAIL, password: PASSWORD, name: "B" });
+  silent.tap.outgoing = (m) => (m.type === "approval.msg" ? null : m);
+  const rowA = await until(() => approver.pendingSignIns().find((r) => r.name === "Silent"), "card A");
+  const rowB = await until(() => approver.pendingSignIns().find((r) => r.name === "B"), "card B");
+  const failing = assert.rejects(approver.review(rowA.id), (e) => e.status === 504);
+  await sleep(20);
+  await assert.rejects(approver.review(rowB.id), (e) => e.status === 409, "A is still in hand");
+  // A is denied, so B can start. A's timer then runs out while B is on screen.
+  await approver.deny(rowA.id);
+  await approver.review(rowB.id);
+  await failing;
+  assert.equal(approver.status().review?.id, rowB.id, "A's failure leaves B's review alone");
+  await approver.deny(rowB.id);
+  const c = makeAccount(fixture);
+  await c.signIn({ email: EMAIL, password: PASSWORD, name: "C" });
+  const rowC = await until(() => approver.pendingSignIns().find((r) => r.name === "C"), "card C");
+
+  // A hub's hints: an id with no card is dropped, however many.
+  const from = second.status().device.id;
+  for (let i = 0; i < 200; i++) inject(approver, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, t: "review", id: `made-up-${i}` }) });
+  inject(approver, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, t: "review", id: rowC.id }) });
+  assert.equal(approver.pendingSignIns().find((r) => r.id === rowC.id).reviewedBy, "Second");
+  // A hint is not kept for a card that may come later: nothing is held for an id the hub made up.
+  inject(approver, { type: "pending.list", pending: [{ ...rowC, id: "made-up-7" }] });
+  assert.equal(approver.pendingSignIns().find((r) => r.id === "made-up-7").reviewedBy, null);
+});
+
+test("a hub's error code is clipped before it reaches an error the person sees", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture);
+  const long = `<script>${"x".repeat(5000)}`;
+  first.tap.incoming = (m) => (m.type === "pending.denied" ? null : m);
+  const denied = first.deny("id");
+  inject(first, { type: "error", for: "pending.deny", code: long });
+  await assert.rejects(denied, (e) => e.code.length <= 64 && e.message.length < 120 && !e.message.includes("<"));
+  const proto = first.deny("id");
+  inject(first, { type: "error", for: "pending.deny", code: "constructor" });
+  await assert.rejects(proto, (e) => e.status === 502 && /constructor/.test(e.message));
 });
 
 test("approval: on log.conflict the approver refreshes, tells the person, and must review again", async () => {
@@ -633,6 +765,29 @@ test("hacked hub: more commits while one exchange runs are ignored, and cannot r
   await until(() => newcomer.status().phase === "approved", "the real approval still lands");
 });
 
+test("the confirmed code is not stored, and a restart between confirming and the approval still lands", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture);
+  const newcomer = makeAccount(fixture);
+  await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
+  const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
+  const review = await approver.review(row.id);
+  const code = await until(() => newcomer.status().pending?.code, "the code");
+  newcomer.confirmCode(code);
+  const stored = await until(() => { try { const s = JSON.parse(readFileSync(join(newcomer.dir, "state.json"), "utf8")); return s.exchange ? s : null; } catch { return null; } }, "the confirmation on disk");
+  assert.equal(stored.exchange.code, undefined);
+  for (const content of onDisk(newcomer.dir)) assert.ok(!content.includes(`"${code}"`), "the code is on no file in that window");
+  await newcomer.stop();
+  const again = makeAccount(fixture, { dir: newcomer.dir });
+  await again.start();
+  await until(() => again.status().hub.connected, "reconnected");
+  assert.equal(again.status().pending.code, null);
+  assert.equal(again.status().pending.confirmed, true);
+  await approver.approve(row.id, { code: review.code, role: "full" });
+  await until(() => again.status().phase === "approved", "approved after the restart");
+  assert.equal(again.alerts.filter((a) => a.kind === "fake-log").length, 0);
+});
+
 test("a new device adopts nothing before its person confirms, even once the hub says approved", async () => {
   const fixture = await hubFixture();
   const approver = await registered(fixture);
@@ -715,6 +870,85 @@ test("a longer valid log is adopted, kept on disk and announced", async () => {
   assert.ok(second.devices().some((d) => d.id === third.status().device.id));
   assert.ok(devicesEvents.length > 0);
   assert.equal(JSON.parse(readFileSync(join(second.dir, "log.json"), "utf8")).length, 3);
+});
+
+test("hacked hub: a flood of forgeable alerts evicts nothing that matters, and stays small", async () => {
+  const fixture = await hubFixture();
+  const { first, second, tap } = await pairWithTap(fixture);
+  const old = JSON.parse(readFileSync(join(first.dir, "log.json"), "utf8")).slice(0, 1);
+  tap.incoming = (m) => (m.type === "log" ? { ...m, entries: old, head: "old", version: 1 } : m);
+  inject(second, { type: "log.updated", head: "old", version: 1 });
+  const rollback = await until(() => second.status().alerts.find((a) => a.kind === "rollback"), "the rollback alert");
+  tap.incoming = undefined;
+  // Public data only: a hello from a device on the log, with a new channel id each time and a proof that fails.
+  const from = first.status().device.id;
+  const eph = (await newDeviceKeys({ extractable: true })).boxPub;
+  const proof = toB64(new Uint8Array(64).fill(1));
+  let order = 0;
+  second.limits.maxChannelsPerDevice = 1000;
+  second.limits.maxChannels = 1000;
+  for (let round = 0; round < 60; round++) {
+    const c = toB64(new Uint8Array(16).fill(round, 0, 8).fill(++order, 8));
+    inject(second, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, c, t: "hello", eph, logHead: second.status().logHead }) });
+    inject(second, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, c, t: "proof", proof }) });
+    await sleep(1);
+  }
+  const flood = await until(() => { const row = second.status().alerts.find((a) => a.kind === "channel-failure"); return row?.count >= 60 ? row : null; }, "the flood counted");
+  assert.equal(second.status().alerts.filter((a) => a.kind === "channel-failure").length, 1, "one row");
+  assert.ok(flood.count >= 60);
+  assert.ok(second.status().alerts.some((a) => a.key === rollback.key), "still there");
+  const raised = second.alerts.filter((a) => a.kind === "rollback").length;
+  tap.incoming = (m) => (m.type === "log" ? { ...m, entries: old, head: "old", version: 1 } : m);
+  inject(second, { type: "log.updated", head: "old2", version: 1 });
+  await until(() => second.status().alerts.find((a) => a.key === rollback.key).count === 2, "the same rollback counted, not raised again");
+  assert.equal(second.alerts.filter((a) => a.kind === "rollback").length, raised);
+  tap.incoming = undefined;
+  await second.stop();
+  const again = makeAccount(fixture, { dir: second.dir });
+  await again.start();
+  assert.ok(again.status().alerts.some((a) => a.key === rollback.key), "and it survives a restart");
+});
+
+test("hacked hub: endless new logs cannot grow the alert list without end", async () => {
+  const fixture = await hubFixture();
+  const { second, tap } = await pairWithTap(fixture);
+  for (let i = 0; i < 12; i++) {
+    const stranger = { ...(await newDeviceKeys({ extractable: true })), name: "S", kind: "desktop" };
+    const theirs = await createLog({ device: stranger, recovery: await newDeviceKeys({ extractable: true }) });
+    tap.incoming = (m) => (m.type === "log" ? { ...m, entries: theirs, head: `t${i}`, version: 1 } : m);
+    inject(second, { type: "log.updated", head: `t${i}`, version: 1 });
+    await until(() => second.status().alerts.filter((a) => a.kind === "different-account").reduce((sum, a) => sum + a.count, 0) === i + 1, `round ${i}`);
+  }
+  assert.equal(second.status().alerts.filter((a) => a.kind === "different-account").length, 8);
+});
+
+test("a damaged settings file turns web page access off, says so, and choosing again clears it", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture);
+  await first.stop();
+  for (const bad of ["{nope", "null", JSON.stringify({ allowWebAccess: "yes" }), "[]"]) {
+    writeFileSync(join(first.dir, "settings.json"), bad);
+    const again = makeAccount(fixture, { dir: first.dir });
+    await again.start();
+    assert.equal(again.settings().allowWebAccess, false, bad);
+    assert.ok(again.status().warnings.some((w) => /Allow web page access is off/.test(w)), bad);
+    await again.stop();
+  }
+  const again = makeAccount(fixture, { dir: first.dir });
+  await again.start();
+  await again.setSettings({ allowWebAccess: true });
+  assert.ok(!again.status().warnings.some((w) => /Allow web page access is off/.test(w)));
+  assert.equal(again.settings().allowWebAccess, true);
+});
+
+test("damaged saved alerts are said to be missing", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture);
+  await first.stop();
+  writeFileSync(join(first.dir, "alerts.json"), "{nope");
+  const again = makeAccount(fixture, { dir: first.dir });
+  await again.start();
+  assert.ok(again.status().warnings.some((w) => /alerts could not be read/.test(w)));
 });
 
 test("a tampered log file on disk is not believed", async () => {
@@ -1043,6 +1277,25 @@ test("handshake: a hub hiding the newer log gets the channel refused and an aler
   assert.equal(second.status().channels.length, 0);
 });
 
+test("handshake: a timeout while fetching the log closes the channel without a false alert", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const second = await joined(fixture, first, { name: "Second", limits: { handshakeTimeoutMs: 60, rpcTimeoutMs: 180 } });
+  const { tap } = second;
+  first.on("channel", (c) => serveChannel(c, (req, res) => res.end("x"), { device: c.peer, audit() {} }));
+  tap.incoming = (m) => (m.type === "log.updated" ? null : m);
+  await joined(fixture, first, { name: "Third" });
+  tap.incoming = (m) => (m.type === "log.updated" || m.type === "log" ? null : m);
+  await assert.rejects(second.openChannel(first.status().device.id), /did not finish/);
+  await sleep(250);
+  assert.ok(!second.alerts.some((a) => a.kind === "log-unreconciled"));
+});
+
+test("the handshake outlasts a log fetch by default", () => {
+  const account = new Account({ dir: freshDir(), hubUrl: "https://tomcamp.tech" });
+  assert.ok(account.limits.handshakeTimeoutMs > account.limits.rpcTimeoutMs);
+});
+
 test("handshake: a device behind us on the same chain is fine, and it catches up itself", async () => {
   const fixture = await hubFixture();
   const first = await registered(fixture, { name: "First" });
@@ -1150,6 +1403,87 @@ test("recovery: a log from the hub that does not name this code's key is refused
   const lost = makeAccount(fixture, { WebSocketImpl: tappedSocket(tap) });
   await assert.rejects(lost.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }), (e) => e.status === 403);
   assert.equal(appended, false);
+});
+
+test("recovery: a local failure at any step after the hub rotated the key still returns the new code", async () => {
+  for (const blocked of ["log.json", "state.json"]) {
+    const fixture = await hubFixture();
+    const first = await registered(fixture, { name: "First" });
+    const fresh = makeAccount(fixture);
+    await fresh.start();
+    mkdirSync(fresh.dir, { recursive: true });
+    mkdirSync(join(fresh.dir, blocked));
+    const out = await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+    assert.ok(out.recoveryCode, blocked);
+    assert.equal(out.confirmed, true);
+    assert.equal(fresh.status().phase, "approved", blocked);
+    assert.ok(fresh.status().warnings.some((w) => /could not save/.test(w)), blocked);
+    const next = makeAccount(fixture);
+    await next.recover({ email: EMAIL, password: PASSWORD, recoveryCode: out.recoveryCode, name: "Newer" });
+    assert.equal(next.status().phase, "approved", "the code returned is the live one");
+  }
+});
+
+test("recovery: if the candidate cannot be written first, nothing is sent and the old code still works", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const fresh = makeAccount(fixture);
+  await fresh.start();
+  mkdirSync(join(fresh.dir, "log.candidate.json"), { recursive: true });
+  await assert.rejects(fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }));
+  const other = makeAccount(fixture);
+  await other.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "Other" });
+  assert.equal(other.status().phase, "approved");
+});
+
+test("recovery: killed right after the hub took it, a restart resumes on the candidate and says the code is gone", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const killedDir = join(freshDir(), "account");
+  const fresh = makeAccount(fixture);
+  fresh.tap.incoming = (m) => {
+    if (m.type === "log.ok") { cpSync(fresh.dir, killedDir, { recursive: true }); fresh.tap.sockets.at(-1).real.close(); return null; }
+    return m;
+  };
+  await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }).catch(() => {});
+  await fresh.stop();
+  const after = makeAccount(fixture, { dir: killedDir });
+  await after.start();
+  await until(() => after.status().phase === "approved", "resumed");
+  assert.equal(after.status().recoveryCodeNotShown, true);
+  assert.equal(after.status().recoveryUnconfirmed, true);
+  assert.ok(after.status().logVersion >= 2);
+});
+
+test("recovery: no answer after sending: the new code is returned unconfirmed, and the reconnect settles it either way", async () => {
+  // It landed.
+  let fixture = await hubFixture();
+  let first = await registered(fixture, { name: "First" });
+  let fresh = makeAccount(fixture);
+  fresh.tap.incoming = (m) => (m.type === "log.ok" ? null : m);
+  fresh.limits.rpcTimeoutMs = 100;
+  let out = await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+  assert.ok(out.recoveryCode);
+  assert.equal(out.confirmed, false);
+  assert.equal(fresh.status().recoveryUnconfirmed, true);
+  fresh.tap.incoming = undefined;
+  await until(() => fresh.status().phase === "approved", "the hub had it");
+  assert.equal(fresh.status().recoveryCodeNotShown, false, "this code was handed out");
+  // It did not land.
+  fixture = await hubFixture();
+  first = await registered(fixture, { name: "First" });
+  fresh = makeAccount(fixture);
+  fresh.tap.outgoing = (m) => (m.type === "log.append" ? null : m);
+  fresh.limits.rpcTimeoutMs = 100;
+  out = await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+  assert.equal(out.confirmed, false);
+  fresh.tap.outgoing = undefined;
+  await until(() => fresh.status().phase === "signed-out", "the hub never had it");
+  assert.match(fresh.status().hub.lastError, /old recovery code still works/);
+  assert.equal(fresh.status().recoveryUnconfirmed, false);
+  const other = makeAccount(fixture);
+  await other.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "Other" });
+  assert.equal(other.status().phase, "approved");
 });
 
 test("recovery: a fake account built around the real recovery key is refused before anything is signed", async () => {
@@ -1347,6 +1681,33 @@ test("an unreachable hub is retried with backoff and joined when it comes back",
   const back = await startHub({ dataDir, port, origin: ORIGIN, log() {} });
   cleanups.push(() => back.close());
   await until(() => account.status().hub.connected, "reconnected");
+});
+
+test("hacked hub: a close claiming removal does not make this device removed; the log decides", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture);
+  const before = first.status().tapped;
+  assert.equal(before, undefined);
+  const socket = first.tap.sockets.at(-1);
+  socket.onclose({ code: 4403 });
+  await until(() => first.alerts.some((a) => a.kind === "hub-says-removed"), "the claim is shown");
+  assert.notEqual(first.status().phase, "removed");
+  assert.ok(!first.alerts.some((a) => a.kind === "removed"));
+  await until(() => first.status().hub.connected, "the session still stands, so it looks");
+  assert.equal(first.status().phase, "approved");
+  assert.equal(first.status().hub.lastError, null);
+});
+
+test("hub says removed for real: sign-in is still allowed, and the person is not told to forget the device", async () => {
+  const fixture = await hubFixture();
+  const { first, second } = await pairWithTap(fixture);
+  await first.remove(second.status().device.id);
+  await until(() => second.alerts.some((a) => a.kind === "hub-says-removed"), "the claim");
+  await until(() => second.status().phase === "signed-out", "the session is gone");
+  assert.match(second.status().hub.lastError, /hub says/i);
+  assert.ok(!second.alerts.some((a) => a.kind === "removed"), "this device has not seen a log saying so");
+  const out = await second.signIn({ email: EMAIL, password: PASSWORD });
+  assert.equal(out.phase, "pending", "it may ask");
 });
 
 test("a session the hub replaced, removed or expired does not loop reconnecting", async () => {

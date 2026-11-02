@@ -31,6 +31,7 @@ export async function handleMissionRoutes(req, res, { p, q, missions, send, read
       return true;
     }
     if (p === "/api/missions/tool" && post) {
+      if (!isLocal(req)) { send(res, 403, { error: "local only" }); return true; }
       const body = await readBody(req);
       send(res, 200, await runMissionTool(missions, body, deps));
       return true;

@@ -15,7 +15,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, promises as fsp, readFileSync, writeFileSync } from "node:fs";
 import { isIP } from "node:net";
 import { hostname } from "node:os";
-import { dirname, resolve as resolvePath, sep } from "node:path";
+import { basename, dirname, resolve as resolvePath, sep } from "node:path";
 import { promisify } from "node:util";
 
 const scrypt = promisify(scryptCb);
@@ -155,6 +155,16 @@ const within = (child, parent) => {
   return c === p || c.startsWith(p + sep);
 };
 
+/**
+ * In this folder or a sibling of its family: a second instance's account-<port> holds another device identity.
+ */
+function inFamily(child, dir) {
+  const c = fold(child), d = fold(dir).replace(/[\\/]+$/, "");
+  const parent = dirname(d);
+  const prefix = parent.endsWith(sep) ? parent : parent + sep;
+  return c.startsWith(prefix) && c.slice(prefix.length).split(sep, 1)[0].startsWith(basename(d).replace(/-\d+$/, ""));
+}
+
 /** What Windows would open: it ignores trailing dots and spaces in a name and takes `name:stream` as `name`. */
 function windowsSpelling(path) {
   const drive = /^[a-zA-Z]:/.exec(path)?.[0] ?? "";
@@ -187,7 +197,7 @@ const statOf = async (path) => { try { return await fsp.stat(path, { bigint: tru
 const sameFolder = (a, b) => a && b && a.ino === b.ino && (WINDOWS || a.dev === b.dev);
 
 /**
- * Whether a path is in one of the account folders, by any spelling: `..`, case, 8.3 names, links, streams, device paths and
+ * Whether a path is in one of the account folders or their `account*` siblings, by any spelling: `..`, case, 8.3 names, links, streams, device paths and
  * shares. Without `containing` a parent of the folder is fine to read. With it, a parent counts too: renaming or copying
  * a parent would take the folder along.
  */
@@ -203,7 +213,7 @@ export async function inAccountFolder(path, dirs, { containing = false } = {}) {
       const lexical = resolvePath(dir);
       const realDir = await realPathOf(lexical);
       for (const candidate of [spelling, real]) {
-        if (within(candidate, lexical) || within(candidate, realDir)) return true;
+        if (inFamily(candidate, lexical) || inFamily(candidate, realDir)) return true;
         if (containing && (within(lexical, candidate) || within(realDir, candidate))) return true;
       }
       // The same folder seen some other way (another share, a mount): ask the file system.

@@ -11,7 +11,7 @@ import { FRAME, MAX_CHUNK, MAX_HEAD, WINDOW, decodeAck, decodeFrame, decodeHead,
 
 const MAX_BODY = 32 * 1024 * 1024; // as for a signed-in remote browser
 const MAX_STREAMS = 64;
-const MAX_AUDIT_PATH = 512;
+const MAX_AUDIT_PATH = 1024;
 const SAFE_REQUEST_HEADERS = new Set(["accept", "accept-language", "content-type", "last-event-id", "if-none-match", "if-modified-since", "range"]);
 const DROPPED_RESPONSE_HEADERS = new Set(["set-cookie", "connection", "keep-alive", "transfer-encoding", "upgrade"]);
 
@@ -223,6 +223,18 @@ class ChannelRequest extends IncomingBody {
   setTimeout() { return this; }
 }
 
+/** What the audit keeps of a target. A query can hold search text, so it goes, but a file read must name its file. */
+function auditPath(target) {
+  const path = target.split(/[?#]/, 1)[0].slice(0, MAX_AUDIT_PATH);
+  if (!path.startsWith("/api/fs/")) return path;
+  let query;
+  try { query = new URL(target, "http://audit.invalid").searchParams; } catch { return path; }
+  const kept = new URLSearchParams();
+  for (const name of ["root", "path"]) if (query.has(name)) kept.set(name, query.get(name));
+  const text = kept.toString();
+  return `${path}${text ? `?${text}` : ""}`.slice(0, MAX_AUDIT_PATH);
+}
+
 function safeHeaders(given) {
   const headers = { host: CHANNEL_HOST };
   for (const [name, value] of Object.entries(given ?? {})) {
@@ -235,8 +247,8 @@ function safeHeaders(given) {
 /**
  * Serves one channel until it closes.
  *   device  { id, name, role }, from the verified log
- *   audit   audit({at, device, deviceName, method, path}), called for every request, refused ones too. No body or query:
- *           a query can hold search text. Only the path, as sent, so an odd attempt can be recognised.
+ *   audit   audit({at, device, deviceName, method, path}), called for every request, refused ones too. No body, and only
+ *           the path as sent, so an odd attempt can be recognised, plus `root` and `path` for a file route.
  */
 export function serveChannel(channel, handle, { device, audit = () => {}, limits = {} }) {
   const { maxBody = MAX_BODY, maxStreams = MAX_STREAMS, window = WINDOW } = limits;
@@ -260,7 +272,7 @@ export function serveChannel(channel, handle, { device, audit = () => {}, limits
       return;
     }
     highest = id;
-    audit({ at: Date.now(), device: device.id, deviceName: device.name, method: head.method.slice(0, 16), path: head.path.split(/[?#]/, 1)[0].slice(0, MAX_AUDIT_PATH) });
+    audit({ at: Date.now(), device: device.id, deviceName: device.name, method: head.method.slice(0, 16), path: auditPath(head.path) });
     if (!channelAllowed(head.method, head.path)) return answer(id, 403, "that is not available over a channel");
     if (streams.size >= maxStreams) return answer(id, 503, "too many requests at once on this channel");
 

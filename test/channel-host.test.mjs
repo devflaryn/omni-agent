@@ -164,6 +164,14 @@ test("serveChannel: a request reaches handle as the channel's device, never as t
   assert.equal(lines[0].path, "/api/state", "no query: it can hold search text");
 });
 
+test("serveChannel: the audit of a file route names its root and path, and nothing else from the query", async () => {
+  const { http, lines } = served(okHandle);
+  await (await http.request({ method: "GET", path: "/api/fs/read?root=C%3A%5Cwork&path=a%20b.txt&secret=x" })).text();
+  assert.equal(lines[0].path, "/api/fs/read?root=C%3A%5Cwork&path=a+b.txt");
+  await (await http.request({ method: "GET", path: "/api/memory/search?q=private&path=x" })).text();
+  assert.equal(lines[1].path, "/api/memory/search");
+});
+
 test("serveChannel: a device cannot send itself a host's headers", async () => {
   let headers;
   const { http } = served((req, res) => { headers = { ...req.headers }; okHandle(req, res); });
@@ -510,7 +518,10 @@ test("inAccountFolder: inside and outside", async () => {
   assert.equal(await inAccountFolder(secrets, dirs), true);
   assert.equal(await inAccountFolder(join(accountDir, "no", "such", "file"), dirs), true);
   assert.equal(await inAccountFolder(join(base, "acct"), dirs), false, "the parent itself can be listed");
-  assert.equal(await inAccountFolder(`${accountDir}-other`, dirs), false, "a sibling with the same start");
+  assert.equal(await inAccountFolder(`${accountDir}-4411`, dirs), true, "a second instance's device identity");
+  assert.equal(await inAccountFolder(join(`${accountDir}-4411`, "keys.json"), dirs), true);
+  assert.equal(await inAccountFolder(join(base, "acct", "other-folder"), dirs), false, "a sibling of another name");
+  assert.equal(await inAccountFolder(`${accountDir}-4411`, [`${accountDir}-4400`]), true, "seen from another instance");
   assert.equal(await inAccountFolder(join(work, "note.txt"), dirs), false);
   assert.equal(await inAccountFolder(join(base, "acct"), dirs, { containing: true }), true, "changing a parent would take the folder with it");
 });
