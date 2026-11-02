@@ -20,6 +20,7 @@ const KEY_BYTES = 32;
 const RANDOM_BYTES = 32;
 const COUNTER_BYTES = 8;
 const TAG_BYTES = 16;
+const PASSWORD_MIN_LENGTH = 12;
 
 export function toB64(bytes) {
   let binary = "";
@@ -27,8 +28,16 @@ export function toB64(bytes) {
   return btoa(binary);
 }
 
+/** Strict: one set of bytes has one spelling, because keys in this form become identities in the device log. */
 export function fromB64(text) {
-  return Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+  let bytes;
+  try {
+    bytes = Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+  } catch {
+    throw new Error("base64: invalid");
+  }
+  if (toB64(bytes) !== text) throw new Error("base64: not canonical");
+  return bytes;
 }
 
 const randomBytes = (length) => globalThis.crypto.getRandomValues(new Uint8Array(length));
@@ -168,9 +177,19 @@ export async function scrypt(password, salt, { N, r, p, dkLen }) {
   return pbkdf2(lanes, dkLen);
 }
 
-/** NFKC first: the same password typed on another platform can arrive as different code points. */
+/** The same password typed on another platform or keyboard can arrive as different code points. */
+const normalizedPassword = (password) => password.normalize("NFKC");
+
+/** For registration and password change. Counts code points, so an emoji is one character. */
+export function checkPassword(password) {
+  if (typeof password !== "string" || [...normalizedPassword(password)].length < PASSWORD_MIN_LENGTH) {
+    throw new Error(`password: at least ${PASSWORD_MIN_LENGTH} characters`);
+  }
+}
+
+/** Takes any length: a short password here is a wrong password, and must not reveal the policy. */
 export async function loginKeyFrom(password, salt) {
-  const stretched = await scrypt(encoder.encode(password.normalize("NFKC")), salt, { N: 2 ** 17, r: 8, p: 1, dkLen: KEY_BYTES });
+  const stretched = await scrypt(encoder.encode(normalizedPassword(password)), salt, { N: 2 ** 17, r: 8, p: 1, dkLen: KEY_BYTES });
   return hkdf(stretched, new Uint8Array(0), LOGIN_INFO, KEY_BYTES);
 }
 
@@ -201,8 +220,9 @@ export async function verify(b64pub, bytes, sig) {
 }
 
 // --- approving a new sign-in (spec section 4) ---
-// The order is the security: the approver sends `commit`; the new device sends newApprovalRandom() only after
-// the commit has arrived; only then the approver reveals `random`, which the new device checks with verifyReveal.
+// The order is the security: the approver sends its commit; the new device sends its random value only after the
+// commit has arrived; only then the approver reveals, and the new device checks the reveal against the commit.
+// approverExchange and newDeviceExchange hold to that order. The pure functions below them do not.
 
 const commitTo = (random) => sha256(framed(COMMIT_DOMAIN, random));
 
@@ -237,6 +257,86 @@ export async function approvalCode({ approverRandom, newRandom, approverPub, new
   return String(value % 1_000_000n).padStart(6, "0");
 }
 
+/**
+ * Steps in a fixed order, once each. Any other call ends the exchange for good: it is either a bug or a hub
+ * replaying messages, and a person must not be shown a code from it.
+ */
+function approvalSteps(first) {
+  let step = first;
+  return {
+    advance(from, to) {
+      if (step !== from) {
+        step = "dead";
+        throw new Error(`approval: out of order, expected ${from}`);
+      }
+      step = to;
+    },
+    fail(message) {
+      step = "dead";
+      throw new Error(`approval: ${message}`);
+    },
+  };
+}
+
+function checkApprovalContext({ approverPub, newPub, logHead }) {
+  sizedB64(approverPub, KEY_BYTES, "approval: approver key");
+  sizedB64(newPub, KEY_BYTES, "approval: new device key");
+  if (typeof logHead !== "string" || !logHead) throw new Error("approval: missing log head");
+}
+
+/** The approver's side: send `commit`, receiveRandom(newRandom), send revealRandom(), then code(). */
+export async function approverExchange({ approverPub, newPub, logHead }) {
+  checkApprovalContext({ approverPub, newPub, logHead });
+  const { commit, random } = await approverCommit();
+  const steps = approvalSteps("receiveRandom");
+  let newRandom;
+  return {
+    commit,
+    receiveRandom(value) {
+      steps.advance("receiveRandom", "revealRandom");
+      try { sizedB64(value, RANDOM_BYTES, "random"); } catch { steps.fail("malformed random value"); }
+      newRandom = value;
+    },
+    revealRandom() {
+      steps.advance("revealRandom", "code");
+      return random;
+    },
+    async code() {
+      steps.advance("code", "done");
+      return approvalCode({ approverRandom: random, newRandom, approverPub, newPub, logHead });
+    },
+  };
+}
+
+/** The new device's side: receiveCommit(commit), send releaseRandom(), await receiveReveal(random), then code(). */
+export async function newDeviceExchange({ approverPub, newPub, logHead }) {
+  checkApprovalContext({ approverPub, newPub, logHead });
+  const random = await newApprovalRandom();
+  const steps = approvalSteps("receiveCommit");
+  let commit, approverRandom;
+  return {
+    receiveCommit(value) {
+      steps.advance("receiveCommit", "releaseRandom");
+      try { sizedB64(value, RANDOM_BYTES, "commit"); } catch { steps.fail("malformed commit"); }
+      commit = value;
+    },
+    releaseRandom() {
+      steps.advance("releaseRandom", "receiveReveal");
+      return random;
+    },
+    async receiveReveal(value) {
+      steps.advance("receiveReveal", "checking");
+      if (!await verifyReveal(commit, value)) steps.fail("the reveal does not match the commit");
+      steps.advance("checking", "code");
+      approverRandom = value;
+    },
+    async code() {
+      steps.advance("code", "done");
+      return approvalCode({ approverRandom, newRandom: random, approverPub, newPub, logHead });
+    },
+  };
+}
+
 // --- channel (spec section 6) ---
 //
 // Each side signs both fresh X25519 keys, so its signature cannot exist before it has seen the other side's hello.
@@ -248,10 +348,16 @@ export async function approvalCode({ approverRandom, newRandom, approverPub, new
 
 function newChannel({ proof, peerProofOk, sendKey, recvKey, sendDirection, peerLogHead }) {
   const recvDirection = 1 - sendDirection;
-  let confirmed = false, sendCount = 0n, recvCount = 0n, queue = Promise.resolve();
+  let confirmed = false, dead = false, sendCount = 0n, recvCount = 0n, queue = Promise.resolve();
 
   const requireConfirmed = () => {
+    if (dead) throw new Error("channel: closed");
     if (!confirmed) throw new Error("channel: peer not confirmed");
+  };
+  // On an ordered transport a failed check is evidence of an attack, so the channel stays shut whatever the caller does.
+  const fail = (message) => {
+    dead = true;
+    throw new Error(message);
   };
   // WebCrypto is async, so without a queue two opens of one frame could both pass the counter check.
   const inOrder = (step) => {
@@ -268,9 +374,12 @@ function newChannel({ proof, peerProofOk, sendKey, recvKey, sendDirection, peerL
 
   return {
     proof,
-    async confirm(peerProof) {
-      if (!await peerProofOk(peerProof)) throw new Error("channel: bad proof from peer");
-      confirmed = true;
+    confirm(peerProof) {
+      return inOrder(async () => {
+        if (dead) throw new Error("channel: closed");
+        if (!await peerProofOk(peerProof)) fail("channel: bad proof from peer");
+        confirmed = true;
+      });
     },
     get peerLogHead() {
       requireConfirmed();
@@ -290,14 +399,14 @@ function newChannel({ proof, peerProofOk, sendKey, recvKey, sendDirection, peerL
     open(frame) {
       return inOrder(async () => {
         requireConfirmed();
-        if (frame.length < COUNTER_BYTES + TAG_BYTES) throw new Error("channel: frame too short");
+        if (frame.length < COUNTER_BYTES + TAG_BYTES) fail("channel: frame too short");
         const count = new DataView(frame.buffer, frame.byteOffset, COUNTER_BYTES).getBigUint64(0);
-        if (count !== recvCount) throw new Error("channel: frame out of order or replayed");
+        if (count !== recvCount) fail("channel: frame out of order or replayed");
         let plain;
         try {
           plain = await subtle.decrypt(gcm(recvDirection, count), recvKey, frame.subarray(COUNTER_BYTES));
         } catch {
-          throw new Error("channel: frame failed authentication");
+          fail("channel: frame failed authentication");
         }
         recvCount++;
         return new Uint8Array(plain);
