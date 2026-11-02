@@ -15,7 +15,7 @@ import {
   approvalCode, approverCommit, approverExchange, fromB64, loginKeyFrom, newApprovalRandom, newDeviceExchange, newDeviceKeys,
   newRecoveryCode, recoveryKeysFrom, sign, startHandshake, toB64,
 } from "../ui/account-core.js";
-import { LogError, append, compareLogs, createLog, entryBytes, entryHash, verifyLog } from "../ui/device-log.js";
+import { LogError, append, canRecover, compareLogs, createLog, entryBytes, entryHash, recoverySignature, verifyLog } from "../ui/device-log.js";
 import { startHub } from "../hub/server.mjs";
 
 const ORIGIN = "https://hub.test";
@@ -32,6 +32,8 @@ const now = () => Date.now();
 
 const named = async (name, kind = "desktop") => ({ ...await newDeviceKeys(), name, kind });
 const addBody = (device, role = "full", addedAt = now()) => ({ name: device.name, kind: device.kind, role, signPub: device.signPub, boxPub: device.boxPub, addedAt });
+
+const recoverFields = (device, newRecovery) => ({ type: "recover", name: device.name, kind: device.kind, signPub: device.signPub, boxPub: device.boxPub, newRecovery });
 
 /** What the holder of a key can always make, whatever the log says. append() would refuse most of these. */
 async function signedEntry(log, type, body, signer) {
@@ -102,15 +104,8 @@ class ThinClient {
 
   /** Section 5: everything a recovering device knows is its recovery code. */
   async recoverOnto(entries, recoveryKeys) {
-    let trust;
-    try {
-      trust = await verifyLog(entries, { now: now() });
-    } catch (error) {
-      if (error instanceof LogError) return this.#refuse("bad-log");
-      throw error;
-    }
-    if (trust.recoveryPub !== recoveryKeys.signPub) return this.#refuse("not-my-recovery-key");
-    this.log = await append(entries, { type: "recover", name: this.keys.name, kind: this.keys.kind, signPub: this.keys.signPub, boxPub: this.keys.boxPub, recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub }, recoveryKeys);
+    if (!await canRecover(entries, recoveryKeys.signPub)) return this.#refuse("not-my-recovery-key");
+    this.log = await append(entries, recoverFields(this.keys, await recoveryKeysFrom(newRecoveryCode())), recoveryKeys);
     return "adopted";
   }
 
@@ -137,7 +132,7 @@ async function familyOf(...names) {
   const owner = await named("Main PC");
   const recoveryCode = newRecoveryCode();
   const recovery = await recoveryKeysFrom(recoveryCode);
-  let log = await createLog({ device: owner, recoveryPub: recovery.signPub });
+  let log = await createLog({ device: owner, recovery });
   const others = [];
   for (const name of names) {
     const device = await named(name);
@@ -490,7 +485,7 @@ test("a hub playing a whole fake account: the log verifies, so only the person c
   // said the code it shows is also on another device of theirs. Otherwise the fake account's device can reach this machine.
   const { owner, fresh, logHead } = await approvalSetting();
   const mallory = await named("Main PC");
-  const fakeLog = await createLog({ device: mallory, recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const fakeLog = await createLog({ device: mallory, recovery: await recoveryKeysFrom(newRecoveryCode()) });
   const fakeHead = (await verifyLog(fakeLog, { now: now() })).head;
 
   const context = { approverPub: mallory.signPub, newPub: fresh.signPub, logHead: fakeHead };
@@ -535,20 +530,130 @@ test("recovery: an old log cannot be replayed at a device holding the new code",
   const { log, recovery } = await familyOf();
   const newCode = await recoveryKeysFrom(newRecoveryCode());
   const replacement = await named("Replacement");
-  const rotated = await append(log, { type: "recover", name: replacement.name, kind: replacement.kind, signPub: replacement.signPub, boxPub: replacement.boxPub, recoveryPub: newCode.signPub }, recovery);
+  const rotated = await append(log, recoverFields(replacement, newCode), recovery);
   const client = new ThinClient(await named("Second"));
   assert.equal(await client.recoverOnto(log, newCode), "not-my-recovery-key");
   assert.equal(await client.recoverOnto(rotated, recovery), "not-my-recovery-key");
 });
 
-test("recovery: a hub cannot hand a recovering device a fake account built on its public recovery key", { todo: "PROTOCOL HOLE, reported in task-5-report.md: the core has no way to refuse this. Nothing is weakened: this assertion is what has to become true" }, async () => {
-  const { recovery } = await familyOf("Laptop");
-  // The recovery public key is on the real log, so the hub has it. It needs nothing else to write this log.
+test("recovery: a hub cannot hand a recovering device a fake account built on its public recovery key", async () => {
+  const { recovery, log } = await familyOf("Laptop");
+  // The recovery public key is on the real log, so the hub has it. It does not have the private key.
   const mallory = await named("Main PC");
-  const fake = await createLog({ device: mallory, recoveryPub: recovery.signPub });
+  const create = await signedEntry([], "create", { accountId: randomKey(), ...addBody(mallory), recoveryPub: recovery.signPub }, mallory);
+  const fakes = [
+    [create],
+    [{ ...create, recoverySig: await recoverySignature(create, mallory) }],
+    [{ ...create, recoverySig: log[0].recoverySig }],
+    [{ ...create, recoverySig: randomBytes(64).toString("base64") }],
+  ];
+  for (const fake of fakes) {
+    await assert.rejects(verifyLog(fake, { now: now() }), /recovery key it introduces/);
+    const client = new ThinClient(await named("Replacement"));
+    assert.notEqual(await client.recoverOnto(fake, recovery), "adopted", "a device recovering with the real code must refuse a log the real code never endorsed");
+    assert.equal(client.log, null);
+    assert.deepEqual(client.alerts, ["not-my-recovery-key"]);
+  }
+});
 
-  const client = new ThinClient(await named("Replacement"));
-  assert.notEqual(await client.recoverOnto(fake, recovery), "adopted", "a device recovering with the real code must refuse a log the real code never endorsed");
+test("recovery: a hub's own fake account with a recovery key it does hold is valid, and is refused for not being the person's", async () => {
+  const { recovery } = await familyOf();
+  const mallory = await named("Main PC");
+  const fake = await createLog({ device: mallory, recovery: await recoveryKeysFrom(newRecoveryCode()) });
+  await verifyLog(fake, { now: now() });
+  assert.equal(await canRecover(fake, recovery.signPub), false);
+  assert.equal(await new ThinClient(await named("Replacement")).recoverOnto(fake, recovery), "not-my-recovery-key");
+});
+
+test("recovery: a recover introducing a key nobody holds is refused, so a hub cannot strand the account", async () => {
+  const { log, recovery } = await familyOf();
+  const thief = await named("Device");
+  const nobody = randomKey();
+  const body = { ...addBody(thief), recoveryPub: nobody };
+  const entry = await signedEntry(log, "recover", body, recovery);
+  await assert.rejects(verifyLog([...log, entry], { now: now() }), /recovery key it introduces/);
+  await assert.rejects(verifyLog([...log, { ...entry, recoverySig: await recoverySignature(entry, recovery) }], { now: now() }), /recovery key it introduces/, "the old key cannot vouch for the new one");
+  const lying = { ...await recoveryKeysFrom(newRecoveryCode()), signPub: nobody };
+  await assert.rejects(append(log, recoverFields(thief, lying), recovery), /recovery key it introduces/);
+});
+
+test("recovery: the new key's signature cannot be swapped for the main signature's bytes, or moved or altered", async () => {
+  const { log, recovery } = await familyOf();
+  const device = await named("Device");
+  const newCode = await recoveryKeysFrom(newRecoveryCode());
+  const good = (await append(log, recoverFields(device, newCode), recovery)).at(-1);
+  await verifyLog([...log, good], { now: now() });
+  const altered = Uint8Array.from(fromB64(good.recoverySig));
+  altered[0] ^= 1;
+  const attempts = [
+    { ...good, recoverySig: await sign(newCode.sign.privateKey, entryBytes(good)) },
+    { ...good, recoverySig: good.sig },
+    { ...good, recoverySig: toB64(altered) },
+    { ...good, body: { ...good.body, name: "Renamed" }, sig: await sign(recovery.sign.privateKey, entryBytes({ ...good, body: { ...good.body, name: "Renamed" } })) },
+  ];
+  for (const attempt of attempts) await assert.rejects(verifyLog([...log, attempt], { now: now() }), /recovery key it introduces/);
+});
+
+test("known limit: an older real prefix from one recovery key's era passes the log alone, and a handshake with a device that has seen more catches it", async () => {
+  const { log: start, owner, recovery, others } = await familyOf("Stolen laptop");
+  const stolen = others[0];
+  const prefix = start;
+  const real = await append(prefix, { type: "remove", signPub: stolen.signPub }, owner);
+
+  // The recovering device cannot tell. The log verifies, and its code's key is current on it.
+  await verifyLog(prefix, { now: now() });
+  assert.equal(await canRecover(prefix, recovery.signPub), true);
+  assert.equal(await compareLogs(prefix, real), "b-newer", "only someone holding the longer log can see this one is behind");
+
+  const device = new ThinClient(await named("Replacement"));
+  assert.equal(await device.recoverOnto(prefix, recovery), "adopted");
+
+  // What does happen: a device removed after that point is back on this device's list, and can reach it.
+  assert.equal(await device.refuseUnknownPeer(stolen.signPub), false);
+  const thief = new ThinClient(stolen);
+  thief.log = device.log;
+  const { chA, chB } = await connected(device, thief);
+  assert.equal(decoder.decode(await chA.open(await chB.seal(utf8("run this")))), "run this");
+
+  // What does not happen: the hub alone gets nothing from this. It holds no device on the prefix.
+  const mallory = await named("Mallory");
+  await assert.rejects(verifyLog([...prefix, await signedEntry(prefix, "add", addBody(mallory), mallory)], { now: now() }), /not on the log/);
+  assert.ok(await device.refuseUnknownPeer(mallory.signPub));
+
+  // A peer as stale as the prefix does not catch it: it sees a valid longer log, and adopts it.
+  const stale = new ThinClient(owner);
+  stale.log = prefix;
+  assert.equal(await compareLogs(stale.log, device.log), "b-newer");
+
+  // A device that has seen more does. It has to finish the handshake and send its log for that, although this device is
+  // not on its list. See the Task 5 report: a peer that refuses before the handshake leaves only a refusal to see.
+  const phone = new ThinClient(owner);
+  phone.log = real;
+  assert.ok(await phone.refuseUnknownPeer(device.keys.signPub), "it would not give this device a working channel");
+  const { chA: atDevice, chB: atPhone } = await connected(device, phone);
+  assert.notEqual(atDevice.peerLogHead, (await device.trust()).head);
+  assert.equal(await device.see(await sendLog(atPhone, atDevice, phone.log)), "fork");
+  assert.deepEqual(device.alerts, ["fork"]);
+  assert.equal(await phone.see(device.log), "fork");
+});
+
+test("known limit: a removed device's backdated fork also passes canRecover, and is caught the same way", async () => {
+  const { log, owner, recovery, others } = await familyOf("Stolen laptop");
+  const real = await append(log, { type: "remove", signPub: others[0].signPub }, owner);
+  const accomplice = await named("Accomplice");
+  const fork = [...log, await signedEntry(log, "add", addBody(accomplice), others[0])];
+  assert.equal(await canRecover(fork, recovery.signPub), true);
+  assert.equal(await compareLogs(real, fork), "fork");
+});
+
+test("kind carries no authority: only the role on the log counts", async () => {
+  const { log, owner } = await familyOf();
+  const claimsDesktop = await named("Claims desktop", "desktop");
+  const claimsWeb = await named("Claims web", "web");
+  const mallory = await named("Mallory");
+  const withBoth = await append(await append(log, { type: "add", ...addBody(claimsDesktop, "client") }, owner), { type: "add", ...addBody(claimsWeb, "full") }, owner);
+  await assert.rejects(verifyLog([...withBoth, await signedEntry(withBoth, "add", addBody(mallory), claimsDesktop)], { now: now() }), /a client key/);
+  await verifyLog([...withBoth, await signedEntry(withBoth, "add", addBody(mallory), claimsWeb)], { now: now() });
 });
 
 // --- replay, rollback ---
@@ -652,11 +757,11 @@ test("backdated fork: an old recovery key does the same, and is caught the same 
   const { log, owner, recovery } = await familyOf();
   const newCode = await recoveryKeysFrom(newRecoveryCode());
   const replacement = await named("Replacement");
-  const honest = await append(log, { type: "recover", name: replacement.name, kind: replacement.kind, signPub: replacement.signPub, boxPub: replacement.boxPub, recoveryPub: newCode.signPub }, recovery);
+  const honest = await append(log, recoverFields(replacement, newCode), recovery);
 
   const thief = await named("Thief");
   const stolenCode = await recoveryKeysFrom(newRecoveryCode());
-  const fork = await append(log, { type: "recover", name: thief.name, kind: thief.kind, signPub: thief.signPub, boxPub: thief.boxPub, recoveryPub: stolenCode.signPub }, recovery);
+  const fork = await append(log, recoverFields(thief, stolenCode), recovery);
   assert.equal(await compareLogs(honest, fork), "fork");
   const machine = new ThinClient(owner);
   machine.log = honest;
@@ -684,10 +789,9 @@ test("an old recovery key on the current log is refused", async () => {
   const { log, recovery } = await familyOf();
   const newCode = await recoveryKeysFrom(newRecoveryCode());
   const replacement = await named("Replacement");
-  const fields = { type: "recover", name: replacement.name, kind: replacement.kind, signPub: replacement.signPub, boxPub: replacement.boxPub };
-  const rotated = await append(log, { ...fields, recoveryPub: newCode.signPub }, recovery);
+  const rotated = await append(log, recoverFields(replacement, newCode), recovery);
   const thief = await named("Thief");
-  await assert.rejects(append(rotated, { type: "recover", name: thief.name, kind: thief.kind, signPub: thief.signPub, boxPub: thief.boxPub, recoveryPub: thief.boxPub }, recovery), /not on the log/);
+  await assert.rejects(append(rotated, recoverFields(thief, await recoveryKeysFrom(newRecoveryCode())), recovery), /not on the log/);
 });
 
 test("a client device or the recovery key cannot add or remove anyone, and only the first entry can be a create", async () => {
@@ -1188,7 +1292,7 @@ test("first valid rule on the real hub: an old recovery key gets nowhere, and th
   assert.deepEqual((await recovering.next("log")).entries, log);
 
   const newCode = await recoveryKeysFrom(newRecoveryCode());
-  const rotated = await append(log, { type: "recover", name: replacement.name, kind: replacement.kind, signPub: replacement.signPub, boxPub: replacement.boxPub, recoveryPub: newCode.signPub }, recovery);
+  const rotated = await append(log, recoverFields(replacement, newCode), recovery);
   await appended(recovering, log, rotated.at(-1));
 
   const thief = await named("Thief");
@@ -1197,8 +1301,7 @@ test("first valid rule on the real hub: an old recovery key gets nowhere, and th
   assert.equal((await thiefSocket.next("error")).code, "forbidden");
 
   const stolen = await recoveryKeysFrom(newRecoveryCode());
-  const thiefFields = { type: "recover", name: thief.name, kind: thief.kind, signPub: thief.signPub, boxPub: thief.boxPub, recoveryPub: stolen.signPub };
-  const forkAtOldHead = await append(log, thiefFields, recovery);
+  const forkAtOldHead = await append(log, recoverFields(thief, stolen), recovery);
   thiefSocket.send({ type: "log.append", prevHead: await headOf(log), entry: forkAtOldHead.at(-1) });
   assert.equal((await thiefSocket.next("error")).code, "forbidden");
   const body = { name: thief.name, kind: thief.kind, role: "full", signPub: thief.signPub, boxPub: thief.boxPub, addedAt: now(), recoveryPub: stolen.signPub };
@@ -1208,6 +1311,34 @@ test("first valid rule on the real hub: an old recovery key gets nowhere, and th
   // Its verified log on the hub is the rotated one, as the holder of the new code sees.
   thiefSocket.send({ type: "log.get", recoveryProof: await proof(newCode, thiefSocket.nonce) });
   assert.deepEqual((await thiefSocket.next("log")).entries, rotated);
+});
+
+test("the real hub: a recover with no signature by its new key is refused, and a claimed kind gives no authority", async (t) => {
+  const hub = await realHub(t);
+  const { owner, log, recovery, account } = await registered(hub);
+  const socket = await dial(hub, account, owner);
+
+  const device = await named("Replacement");
+  const pending = await dial(hub, account, device, { name: device.name, kind: "desktop" });
+  assert.equal(pending.auth.state, "pending", "saying desktop at sign-in changes nothing");
+  const body = { ...addBody(device), recoveryPub: randomKey() };
+  pending.send({ type: "log.append", prevHead: await headOf(log), entry: await signedEntry(log, "recover", body, recovery) });
+  const refused = await pending.next("error");
+  assert.equal(refused.code, "invalid-entry");
+  assert.match(refused.reason, /recovery key it introduces/);
+
+  const web = await named("Web page", "desktop");
+  const withWeb = await append(log, { type: "add", ...addBody(web, "client") }, owner);
+  await appended(socket, log, withWeb.at(-1));
+  const webSocket = await dial(hub, account, web, { name: web.name, kind: "desktop" });
+  assert.equal(webSocket.auth.state, "approved");
+  webSocket.send({ type: "log.append", prevHead: await headOf(withWeb), entry: await signedEntry(withWeb, "add", addBody(await named("Mallory")), web) });
+  assert.equal((await webSocket.next("error")).code, "forbidden");
+  webSocket.send({ type: "pending.list" });
+  assert.equal((await webSocket.next("error")).code, "forbidden");
+
+  socket.send({ type: "log.get" });
+  assert.deepEqual((await socket.next("log")).entries, withWeb);
 });
 
 test("two valid appends at one position on the real hub: the first wins and the second is told", async (t) => {

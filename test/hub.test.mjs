@@ -237,7 +237,7 @@ function api(hub, path, body, { headers = {}, localAddress, method = "POST", raw
 async function newAccount(hub, email = "owner@example.com") {
   const device = named(await newDeviceKeys(), "Main PC");
   const recovery = await recoveryKeysFrom(newRecoveryCode());
-  const log = await createLog({ device, recoveryPub: recovery.signPub });
+  const log = await createLog({ device, recovery });
   const account = { email, device, recovery, log, loginKey: randomKey(), salt: b64(randomBytes(16)) };
   const r = await api(hub, "/api/register", { email, salt: account.salt, verifierInput: account.loginKey, firstLogEntry: log[0], bootstrapToken: BOOTSTRAP });
   assert.equal(r.status, 201, r.text);
@@ -306,7 +306,7 @@ test("the first account registers, then registration is closed, also after a res
   await newAccount(hub);
 
   const second = await newDeviceKeys();
-  const log = await createLog({ device: named(second), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(second), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   const body = { email: "second@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0] };
   assert.equal((await api(hub, "/api/register", body)).status, 403);
 
@@ -321,7 +321,7 @@ test("allowSignup reopens registration, and an email can only be taken once", as
   await newAccount(hub, "two@example.com");
 
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   const r = await api(hub, "/api/register", { email: "ONE@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0] });
   assert.equal(r.status, 409);
   assert.equal((await signIn(hub, first, first.device)).state, "approved");
@@ -331,7 +331,7 @@ test("two registrations at once: one account, the other is refused", async (t) =
   const hub = await hubFor(t);
   const attempts = await Promise.all(["a@example.com", "b@example.com", "c@example.com"].map(async (email) => {
     const device = await newDeviceKeys();
-    const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+    const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
     return api(hub, "/api/register", { email, salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0], bootstrapToken: BOOTSTRAP });
   }));
   assert.deepEqual(attempts.map((r) => r.status).sort(), [201, 403, 403]);
@@ -341,7 +341,7 @@ test("registration refuses a first entry that does not verify, and malformed fie
   const hub = await hubFor(t);
   const device = await newDeviceKeys();
   const recovery = await recoveryKeysFrom(newRecoveryCode());
-  const [entry] = await createLog({ device: named(device), recoveryPub: recovery.signPub });
+  const [entry] = await createLog({ device: named(device), recovery });
   const good = { email: "o@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: entry, bootstrapToken: BOOTSTRAP };
   const tampered = structuredClone(entry);
   tampered.body.name = "Someone else";
@@ -374,7 +374,7 @@ test("the store holds a salted verifier: never the password, never the loginKey,
   const loginKey = b64(await loginKeyFrom(password, salt));
 
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   const email = "real@example.com";
   assert.equal((await api(hub, "/api/register", { email, salt: b64(salt), verifierInput: loginKey, firstLogEntry: log[0], bootstrapToken: BOOTSTRAP })).status, 201);
 
@@ -388,7 +388,7 @@ test("the store holds a salted verifier: never the password, never the loginKey,
   await socket.next("presence");
 
   const twin = await newDeviceKeys();
-  const twinLog = await createLog({ device: named(twin), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const twinLog = await createLog({ device: named(twin), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   assert.equal((await api(hub, "/api/register", { email: "twin@example.com", salt: b64(randomBytes(16)), verifierInput: loginKey, firstLogEntry: twinLog[0] })).status, 201);
 
   const files = dataFiles(hub.dir);
@@ -1320,7 +1320,7 @@ test("an approved session survives a restart", async (t) => {
 /** A pending device with the recovery code builds and sends its recover entry. */
 async function recoverEntry(account, device, signerKeys = account.recovery) {
   const replacement = await recoveryKeysFrom(newRecoveryCode());
-  const next = await append(account.log, { type: "recover", name: "Rescue", kind: "desktop", signPub: device.signPub, boxPub: device.boxPub, recoveryPub: replacement.signPub, addedAt: 1 }, { ...signerKeys, boxPub: device.boxPub });
+  const next = await append(account.log, { type: "recover", name: "Rescue", kind: "desktop", signPub: device.signPub, boxPub: device.boxPub, newRecovery: replacement, addedAt: 1 }, { ...signerKeys, boxPub: device.boxPub });
   return { next, entry: next.at(-1), replacement };
 }
 
@@ -1610,7 +1610,7 @@ test("a log append after a password change keeps the new password", async (t) =>
 
 const firstBody = async (extra = {}) => {
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   return { email: "first@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0], ...extra };
 };
 
@@ -1988,7 +1988,7 @@ test("total accounts are limited", async (t) => {
   const hub = await hubFor(t, { allowSignup: true, limits: { maxAccounts: 1 } });
   await newAccount(hub);
   const device = await newDeviceKeys();
-  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  const log = await createLog({ device: named(device), recovery: await recoveryKeysFrom(newRecoveryCode()) });
   assert.equal((await api(hub, "/api/register", { email: "b@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0] })).status, 403);
 });
 
