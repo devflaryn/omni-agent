@@ -1,5 +1,6 @@
 // The hub's data dir: JSON files written whole and renamed into place, so a crash leaves the old file or the new one.
 //   secret         for the fake salts, created on first run
+//   bootstrap      SHA-256 of the one-shot registration token, only until the first account exists
 //   accounts.json  {version, accounts: [{id, email, salt, verifier: {salt, hash}, log}]}
 //   sessions.json  {version, sessions: [{hash, accountId, signPub, name, kind, ip, createdAt, expiresAt, proven, approved}]}
 //
@@ -11,7 +12,8 @@ import { join } from "node:path";
 
 const VERSION = 1;
 const SECRET_BYTES = 32;
-const SECRET_FILE = "secret", ACCOUNTS_FILE = "accounts.json", SESSIONS_FILE = "sessions.json";
+const BOOTSTRAP_HASH_BYTES = 32;
+const SECRET_FILE = "secret", ACCOUNTS_FILE = "accounts.json", SESSIONS_FILE = "sessions.json", BOOTSTRAP_FILE = "bootstrap";
 const PRIVATE_FILE = 0o600, PRIVATE_DIR = 0o700;
 
 export class StoreError extends Error {
@@ -64,7 +66,7 @@ const isText = (value) => typeof value === "string" && value.length > 0;
 const isTime = (value) => Number.isSafeInteger(value);
 
 const validAccount = (a) => isText(a?.id) && isText(a.email) && isText(a.salt) && isText(a.verifier?.salt) && isText(a.verifier?.hash) && Array.isArray(a.log) && a.log.length > 0;
-const validSession = (s) => isText(s?.hash) && isText(s.accountId) && isText(s.signPub) && typeof s.name === "string" && typeof s.kind === "string" && typeof s.ip === "string"
+const validSession = (s) => isText(s?.hash) && isText(s.id) && isText(s.accountId) && isText(s.signPub) && typeof s.name === "string" && typeof s.kind === "string" && typeof s.ip === "string"
   && isTime(s.createdAt) && isTime(s.expiresAt) && typeof s.proven === "boolean" && typeof s.approved === "boolean";
 
 function readSecret(dir) {
@@ -89,9 +91,9 @@ export function openStore(dir) {
 
   const present = [SECRET_FILE, ACCOUNTS_FILE, SESSIONS_FILE].filter((file) => existsSync(join(dir, file)));
   if (present.length === 0) {
+    writeAtomic(join(dir, SECRET_FILE), randomBytes(SECRET_BYTES).toString("hex"));
     writeAtomic(join(dir, ACCOUNTS_FILE), JSON.stringify({ version: VERSION, accounts: [] }));
     writeAtomic(join(dir, SESSIONS_FILE), JSON.stringify({ version: VERSION, sessions: [] }));
-    writeFileSync(join(dir, SECRET_FILE), randomBytes(SECRET_BYTES).toString("hex"), { mode: PRIVATE_FILE, flag: "wx" });
     syncDir(dir);
   }
   const accountList = readJson(dir, ACCOUNTS_FILE, "accounts", validAccount);
@@ -103,6 +105,15 @@ export function openStore(dir) {
   const sessions = new Map(sessionList.map((s) => [s.hash, s]));
   if (accounts.size !== accountList.length || byEmail.size !== accountList.length) throw new StoreError(ACCOUNTS_FILE, "has duplicate accounts");
   if (sessionList.some((s) => !accounts.has(s.accountId))) throw new StoreError(SESSIONS_FILE, "names an account that does not exist");
+
+  // Left behind only by a crash between the first registration and its deletion. It opens nothing by then.
+  const bootstrapPath = join(dir, BOOTSTRAP_FILE);
+  let bootstrapHash = null;
+  if (accounts.size > 0) rmSync(bootstrapPath, { force: true });
+  else if (existsSync(bootstrapPath)) {
+    bootstrapHash = Buffer.from(readFileSync(bootstrapPath, "utf8"), "hex");
+    if (bootstrapHash.length !== BOOTSTRAP_HASH_BYTES) throw new StoreError(BOOTSTRAP_FILE, "has the wrong size");
+  }
 
   const writeAccounts = (list) => {
     writeAtomic(join(dir, ACCOUNTS_FILE), JSON.stringify({ version: VERSION, accounts: list }));
@@ -118,6 +129,17 @@ export function openStore(dir) {
     accounts,
     byEmail,
     sessions,
+    get bootstrapHash() { return bootstrapHash; },
+    setBootstrapHash(hash) {
+      writeAtomic(bootstrapPath, hash.toString("hex"));
+      syncDir(dir);
+      bootstrapHash = hash;
+    },
+    clearBootstrap() {
+      bootstrapHash = null;
+      rmSync(bootstrapPath, { force: true });
+      syncDir(dir);
+    },
     /** Adds or replaces an account, by its id. */
     putAccount(account) {
       writeAccounts([...accounts.values()].filter((a) => a.id !== account.id).concat(account));

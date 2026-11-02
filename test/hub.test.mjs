@@ -16,6 +16,7 @@ import { append, createLog, entryBytes, entryHash, verifyLog } from "../ui/devic
 import { startHub } from "../hub/server.mjs";
 
 const ORIGIN = "https://hub.example";
+const BOOTSTRAP = "test-bootstrap-token-0123456789";
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 const WAIT_MS = 4000;
@@ -196,7 +197,7 @@ async function hubFor(t, { dataDir, ...options } = {}) {
   const clock = options.clock ?? { t: 1_800_000_000_000 };
   const logged = options.logged ?? [];
   const clients = [];
-  const open = async () => startHub({ port: 0, dataDir: dir, origin: ORIGIN, now: () => clock.t, sweepMs: 20, log: (line) => logged.push(line), ...options });
+  const open = async () => startHub({ port: 0, dataDir: dir, origin: ORIGIN, bootstrapToken: BOOTSTRAP, now: () => clock.t, sweepMs: 20, log: (line) => logged.push(line), ...options });
   let running = await open();
   const hub = {
     get port() { return running.port; },
@@ -236,7 +237,7 @@ async function newAccount(hub, email = "owner@example.com") {
   const recovery = await recoveryKeysFrom(newRecoveryCode());
   const log = await createLog({ device, recoveryPub: recovery.signPub });
   const account = { email, device, recovery, log, loginKey: randomKey(), salt: b64(randomBytes(16)) };
-  const r = await api(hub, "/api/register", { email, salt: account.salt, verifierInput: account.loginKey, firstLogEntry: log[0] });
+  const r = await api(hub, "/api/register", { email, salt: account.salt, verifierInput: account.loginKey, firstLogEntry: log[0], bootstrapToken: BOOTSTRAP });
   assert.equal(r.status, 201, r.text);
   return account;
 }
@@ -247,7 +248,7 @@ async function signIn(hub, account, device, extra = {}) {
   return r.json;
 }
 
-const proofBytes = (domain, nonce) => new TextEncoder().encode(`${domain} ${nonce}`);
+const proofBytes = (domain, nonce, origin = ORIGIN) => new TextEncoder().encode(`${domain} ${origin} ${nonce}`);
 
 /** A socket that has given its token and proved it holds the device key. */
 async function connect(hub, session, device) {
@@ -329,7 +330,7 @@ test("two registrations at once: one account, the other is refused", async (t) =
   const attempts = await Promise.all(["a@example.com", "b@example.com", "c@example.com"].map(async (email) => {
     const device = await newDeviceKeys();
     const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
-    return api(hub, "/api/register", { email, salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0] });
+    return api(hub, "/api/register", { email, salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0], bootstrapToken: BOOTSTRAP });
   }));
   assert.deepEqual(attempts.map((r) => r.status).sort(), [201, 403, 403]);
 });
@@ -339,7 +340,7 @@ test("registration refuses a first entry that does not verify, and malformed fie
   const device = await newDeviceKeys();
   const recovery = await recoveryKeysFrom(newRecoveryCode());
   const [entry] = await createLog({ device: named(device), recoveryPub: recovery.signPub });
-  const good = { email: "o@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: entry };
+  const good = { email: "o@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: entry, bootstrapToken: BOOTSTRAP };
   const tampered = structuredClone(entry);
   tampered.body.name = "Someone else";
   const anAdd = { ...structuredClone(entry), type: "add" };
@@ -373,7 +374,7 @@ test("the store holds a salted verifier: never the password, never the loginKey,
   const device = await newDeviceKeys();
   const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
   const email = "real@example.com";
-  assert.equal((await api(hub, "/api/register", { email, salt: b64(salt), verifierInput: loginKey, firstLogEntry: log[0] })).status, 201);
+  assert.equal((await api(hub, "/api/register", { email, salt: b64(salt), verifierInput: loginKey, firstLogEntry: log[0], bootstrapToken: BOOTSTRAP })).status, 201);
 
   const served = await api(hub, "/api/salt", { email });
   assert.equal(served.json.salt, b64(salt));
@@ -464,7 +465,7 @@ test("a wrong password and an unknown email get byte-identical 401s", async (t) 
 });
 
 test("an unknown email costs the hub as much as a wrong password", async (t) => {
-  const hub = await hubFor(t, { limits: { maxLoginFailures: 1000 } });
+  const hub = await hubFor(t, { limits: { maxPairFailures: 1000, maxAccountFailures: 1000, maxAddressFailures: 1000 } });
   const account = await newAccount(hub);
   const signPub = account.device.signPub;
   const timed = async (email) => {
@@ -497,7 +498,7 @@ test("a known device signs in approved, a new one pending; login refuses malform
   }
 });
 
-test("5 failures lock the account and the address for 15 minutes, a right password included", async (t) => {
+test("5 failures lock one account from one address for 15 minutes, a right password included", async (t) => {
   const hub = await hubFor(t, { allowSignup: true });
   const account = await newAccount(hub);
   const other = await newAccount(hub, "other@example.com");
@@ -507,14 +508,11 @@ test("5 failures lock the account and the address for 15 minutes, a right passwo
   for (let i = 0; i < 5; i++) assert.equal((await attempt(account.email, randomKey())).status, 401);
   assert.equal((await attempt(account.email, account.loginKey)).status, 429, "locked, even with the right password");
 
-  // The address is locked for every account.
-  assert.equal((await attempt(other.email, other.loginKey)).status, 429);
-  // Another address cannot get into the locked account either.
-  assert.equal((await attempt(account.email, account.loginKey, { localAddress: "127.0.0.2" })).status, 429);
-  // But that other address reaches other accounts.
-  assert.equal((await attempt(other.email, other.loginKey, { localAddress: "127.0.0.2" })).status, 200);
+  // A stranger's guesses do not lock the owner out from elsewhere, or that address out of another account.
+  assert.equal((await attempt(account.email, account.loginKey, { localAddress: "127.0.0.2" })).status, 200);
+  assert.equal((await attempt(other.email, other.loginKey)).status, 200);
   // A header cannot pretend to be another address.
-  assert.equal((await attempt(other.email, other.loginKey, { headers: { "X-Forwarded-For": "9.9.9.9", "X-Real-IP": "9.9.9.9" } })).status, 429);
+  assert.equal((await attempt(account.email, account.loginKey, { headers: { "X-Forwarded-For": "9.9.9.9", "X-Real-IP": "9.9.9.9" } })).status, 429);
 
   hub.clock.t += 15 * MINUTE - 1;
   assert.equal((await attempt(account.email, account.loginKey)).status, 429);
@@ -522,14 +520,42 @@ test("5 failures lock the account and the address for 15 minutes, a right passwo
   assert.equal((await attempt(account.email, account.loginKey)).status, 200);
 });
 
+test("50 failures lock an account from everywhere, so rotating addresses does not help", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const signPub = account.device.signPub;
+  const attempt = (loginKey, n) => api(hub, "/api/login", { email: account.email, loginKey, signPub }, { localAddress: `127.0.0.${n}` });
+  for (let n = 0; n < 10; n++) {
+    for (let i = 0; i < 5; i++) assert.equal((await attempt(randomKey(), 10 + n)).status, 401);
+  }
+  const locked = await attempt(account.loginKey, 100);
+  assert.equal(locked.status, 429, "a fresh address, with the right password");
+  hub.clock.t += 15 * MINUTE;
+  assert.equal((await attempt(account.loginKey, 100)).status, 200);
+});
+
+test("20 failures from one address lock it out of every account", async (t) => {
+  const hub = await hubFor(t, { allowSignup: true });
+  const account = await newAccount(hub);
+  const signPub = account.device.signPub;
+  const attempt = (email, loginKey, options) => api(hub, "/api/login", { email, loginKey, signPub }, options);
+  for (let i = 0; i < 20; i++) assert.equal((await attempt(`n${i}@example.com`, randomKey())).status, 401);
+  assert.equal((await attempt(account.email, account.loginKey)).status, 429);
+  assert.equal((await attempt(account.email, account.loginKey, { localAddress: "127.0.0.2" })).status, 200);
+});
+
 test("the lock looks the same for an unknown email", async (t) => {
   const hub = await hubFor(t);
-  await newAccount(hub);
-  const signPub = (await newDeviceKeys()).signPub;
-  const responses = [];
-  for (let i = 0; i < 5; i++) responses.push(await api(hub, "/api/login", { email: "nobody@example.com", loginKey: randomKey(), signPub }, { localAddress: `127.0.0.${10 + i}` }));
-  assert.deepEqual(responses.map((r) => r.status), [401, 401, 401, 401, 401]);
-  assert.equal((await api(hub, "/api/login", { email: "nobody@example.com", loginKey: randomKey(), signPub }, { localAddress: "127.0.0.20" })).status, 429);
+  const account = await newAccount(hub);
+  const signPub = account.device.signPub;
+  const lockedOut = async (email) => {
+    for (let i = 0; i < 5; i++) assert.equal((await api(hub, "/api/login", { email, loginKey: randomKey(), signPub }, { localAddress: "127.0.0.2" })).status, 401);
+    return api(hub, "/api/login", { email, loginKey: randomKey(), signPub }, { localAddress: "127.0.0.2" });
+  };
+  const [known, unknown] = [await lockedOut(account.email), await lockedOut("nobody@example.com")];
+  assert.equal(known.status, 429);
+  assert.equal(unknown.status, 429);
+  assert.equal(known.text, unknown.text);
 });
 
 test("guesses sent all at once cannot outrun the lock", async (t) => {
@@ -542,7 +568,7 @@ test("guesses sent all at once cannot outrun the lock", async (t) => {
 });
 
 test("the failure records stay bounded under a flood of made-up emails: the oldest are forgotten", async (t) => {
-  const hub = await hubFor(t, { limits: { maxTrackedFailures: 8, maxLoginFailures: 2 } });
+  const hub = await hubFor(t, { limits: { maxTrackedFailures: 8, maxAccountFailures: 2 } });
   const account = await newAccount(hub);
   const signPub = account.device.signPub;
   const attempt = (email, loginKey, n) => api(hub, "/api/login", { email, loginKey, signPub }, { localAddress: `127.0.0.${n}` });
@@ -1191,11 +1217,9 @@ test("the hub stores nothing that fails verification", async (t) => {
   assert.equal((await owner.next("log")).version, account.log.length);
 
   // A client device cannot sign, so an add signed by it is refused however it gets here.
-  const asClient = await verifyLog(account.log, { now: hub.clock.t });
-  assert.equal(asClient.devices.get(web.device.signPub).role, "client");
   const byClient = await forge(account.log, "add", { name: "Evil", kind: "desktop", role: "full", ...pick(await newDeviceKeys()), addedAt: 1 }, web.device);
-  web.send({ type: "log.append", prevHead: head, entry: byClient });
-  assert.equal((await web.next("error")).code, "invalid-entry");
+  owner.send({ type: "log.append", prevHead: head, entry: byClient });
+  assert.equal((await owner.next("error")).code, "invalid-entry");
 
   owner.send({ type: "log.append", prevHead: head, entry });
   await owner.next("log.ok");
@@ -1298,6 +1322,22 @@ async function recoverEntry(account, device, signerKeys = account.recovery) {
   return { next, entry: next.at(-1), replacement };
 }
 
+test("a proof signed for another hub's origin is refused, for sign-in and for recovery", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const { session } = await signIn(hub, account, account.device);
+  const elsewhere = "https://other-hub.example";
+  const socket = await rawClient(hub);
+  socket.send({ type: "auth", session });
+  const { nonce } = await socket.next("auth.challenge");
+  socket.send({ type: "auth.proof", sig: await sign(account.device.sign.privateKey, proofBytes("omni-hub-auth-v1", nonce, elsewhere)) });
+  assert.equal(await socket.closedWithin(), 4401);
+
+  const pending = await pendingDevice(hub, account);
+  pending.send({ type: "log.get", recoveryProof: await sign(account.recovery.sign.privateKey, proofBytes("omni-hub-recovery-v1", pending.nonce, elsewhere)) });
+  assert.equal((await pending.next("error")).code, "forbidden");
+});
+
 test("recovery: a pending session reads the log with the code's key, appends its recover, and is approved", async (t) => {
   const hub = await hubFor(t);
   const account = await newAccount(hub);
@@ -1399,6 +1439,414 @@ test("a recover signed by the code's key but on a stale head gets the conflict w
   const conflict = await pending.next("log.conflict");
   assert.equal(conflict.version, 2);
   assert.equal(pending.has("session.approved"), false);
+});
+
+// --- denying a sign-in ---
+
+test("a full device denies a sign-in: socket closed with the reason, token dead, card gone", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const [owner, laptop] = await household(hub, account, "full");
+  const pending = await pendingDevice(hub, account);
+  owner.send({ type: "pending.list" });
+  const { id } = (await owner.next("pending.list")).pending.find((p) => p.signPub === pending.device.signPub) ?? {};
+  assert.equal(typeof id, "string");
+
+  laptop.inbox.length = 0;
+  owner.send({ type: "pending.deny", id });
+  assert.deepEqual(await owner.next("pending.denied"), { type: "pending.denied", id });
+  assert.equal(await pending.closedWithin(), 4410);
+  // The push from the sign-in itself may still be on its way, so read until the card is gone; next() times out if it never goes.
+  let cards = (await laptop.next("pending.list")).pending;
+  while (cards.length > 0) cards = (await laptop.next("pending.list")).pending;
+
+  const reuse = await rawClient(hub);
+  reuse.send({ type: "auth", session: pending.session });
+  assert.equal(await reuse.closedWithin(), 4401);
+  await hub.restart();
+  const again = await rawClient(hub);
+  again.send({ type: "auth", session: pending.session });
+  assert.equal(await again.closedWithin(), 4401, "still blocked after a restart");
+});
+
+test("only an approved full device of the same account can deny, and only a pending session", async (t) => {
+  const hub = await hubFor(t, { allowSignup: true });
+  const account = await newAccount(hub);
+  const [owner, laptop, web] = await household(hub, account, "full", "client");
+  const a = await pendingDevice(hub, account);
+  const b = await pendingDevice(hub, account);
+  const stranger = await newAccount(hub, "stranger@example.com");
+  const strangerOwner = await online(hub, stranger, stranger.device);
+  owner.inbox.length = 0;
+  owner.send({ type: "pending.list" });
+  const { id } = (await owner.next("pending.list")).pending.find((p) => p.signPub === a.device.signPub);
+
+  web.send({ type: "pending.deny", id });
+  assert.equal((await web.next("error")).code, "forbidden");
+  b.send({ type: "pending.deny", id });
+  assert.equal((await b.next("error")).code, "forbidden");
+  strangerOwner.send({ type: "pending.deny", id });
+  assert.equal((await strangerOwner.next("error")).code, "not-found");
+  owner.send({ type: "pending.deny", id: "made-up" });
+  assert.equal((await owner.next("error")).code, "not-found");
+  owner.send({ type: "pending.deny", id: 7 });
+  assert.equal((await owner.next("error")).code, "bad-message");
+  await a.settled();
+  assert.equal(a.closeCode, null, "none of those touched it");
+
+  const stored = JSON.parse(readFileSync(join(hub.dir, "sessions.json"), "utf8")).sessions;
+  const approvedId = stored.find((s) => s.signPub === laptop.device.signPub).id;
+  owner.send({ type: "pending.deny", id: approvedId });
+  assert.equal((await owner.next("error")).code, "not-found");
+  await laptop.settled();
+  assert.equal(laptop.closeCode, null, "an approved device is removed through the log, not denied");
+});
+
+// --- changing the password ---
+
+const passwordChange = (currentLoginKey, salt = b64(randomBytes(16)), verifierInput = randomKey()) => ({ type: "password.change", currentLoginKey, salt, verifierInput });
+
+test("a full device changes the password: the new one signs in, the old one stops, sessions stay", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const [owner, laptop] = await household(hub, account, "full");
+  const change = passwordChange(account.loginKey);
+  owner.send(change);
+  await owner.next("password.changed");
+
+  const signPub = account.device.signPub;
+  assert.equal((await api(hub, "/api/login", { email: account.email, loginKey: account.loginKey, signPub })).status, 401);
+  assert.equal((await api(hub, "/api/login", { email: account.email, loginKey: change.verifierInput, signPub })).status, 200);
+  assert.equal((await api(hub, "/api/salt", { email: account.email })).json.salt, change.salt);
+
+  owner.send({ type: "channel.msg", to: laptop.device.signPub, opaque: "still here" });
+  assert.equal((await laptop.next("channel.msg")).opaque, "still here");
+
+  await hub.restart();
+  assert.equal((await api(hub, "/api/login", { email: account.email, loginKey: change.verifierInput, signPub })).status, 200, "survives a restart");
+  const text = readFileSync(join(hub.dir, "accounts.json"), "utf8");
+  assert.ok(!text.includes(change.verifierInput), "the new key is stored only as a hash");
+});
+
+test("a password change needs an approved full device and the current loginKey", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const [owner, web] = await household(hub, account, "client");
+  const pending = await pendingDevice(hub, account);
+
+  web.send(passwordChange(account.loginKey));
+  assert.equal((await web.next("error")).code, "forbidden");
+  pending.send(passwordChange(account.loginKey));
+  assert.equal((await pending.next("error")).code, "forbidden");
+  owner.send(passwordChange(randomKey()));
+  assert.equal((await owner.next("error")).code, "wrong-credentials");
+
+  for (const bad of [
+    passwordChange("short"),
+    passwordChange(7),
+    passwordChange(account.loginKey, "short"),
+    passwordChange(account.loginKey, b64(randomBytes(32))),
+    passwordChange(account.loginKey, undefined, "short"),
+    passwordChange(account.loginKey, undefined, null),
+  ]) {
+    owner.send(bad);
+    assert.equal((await owner.next("error")).code, "bad-message");
+  }
+  assert.equal((await signIn(hub, account, account.device)).state, "approved", "the password is unchanged");
+});
+
+test("a password change shares the lockout with sign-in", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const owner = await online(hub, account, account.device);
+  for (let i = 0; i < 5; i++) {
+    owner.send(passwordChange(randomKey()));
+    assert.equal((await owner.next("error")).code, "wrong-credentials");
+  }
+  owner.send(passwordChange(account.loginKey));
+  assert.equal((await owner.next("error")).code, "locked", "even with the right key");
+  const signPub = account.device.signPub;
+  assert.equal((await api(hub, "/api/login", { email: account.email, loginKey: account.loginKey, signPub })).status, 429);
+  assert.equal((await signInFrom(hub, account, "127.0.0.2")).status, 200, "another address is not locked");
+});
+
+function signInFrom(hub, account, localAddress) {
+  return api(hub, "/api/login", { email: account.email, loginKey: account.loginKey, signPub: account.device.signPub }, { localAddress });
+}
+
+test("two password changes at once: one wins, the other is told", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const [owner, laptop] = await household(hub, account, "full");
+  owner.send(passwordChange(account.loginKey));
+  laptop.send(passwordChange(account.loginKey));
+  const until = Date.now() + WAIT_MS;
+  const answered = (s) => s.has("password.changed") || s.has("error");
+  while (!answered(owner) || !answered(laptop)) {
+    assert.ok(Date.now() < until, "no answer");
+    await later(2);
+  }
+  assert.equal([owner, laptop].filter((s) => s.has("password.changed")).length, 1);
+  const loser = [owner, laptop].find((s) => s.has("error"));
+  assert.equal((await loser.next("error")).code, "conflict");
+});
+
+test("a log append after a password change keeps the new password", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const owner = await online(hub, account, account.device);
+  const change = passwordChange(account.loginKey);
+  owner.send(change);
+  await owner.next("password.changed");
+  await approve(account, owner, named(await newDeviceKeys()));
+  await hub.restart();
+  const signPub = account.device.signPub;
+  assert.equal((await api(hub, "/api/login", { email: account.email, loginKey: change.verifierInput, signPub })).status, 200);
+});
+
+// --- the bootstrap token ---
+
+const firstBody = async (extra = {}) => {
+  const device = await newDeviceKeys();
+  const log = await createLog({ device: named(device), recoveryPub: (await recoveryKeysFrom(newRecoveryCode())).signPub });
+  return { email: "first@example.com", salt: b64(randomBytes(16)), verifierInput: randomKey(), firstLogEntry: log[0], ...extra };
+};
+
+test("a fresh hub refuses registration without the right token, all in the same words", async (t) => {
+  const hub = await hubFor(t);
+  const responses = [
+    await api(hub, "/api/register", await firstBody()),
+    await api(hub, "/api/register", await firstBody({ bootstrapToken: "wrong-token-of-a-good-length" })),
+    await api(hub, "/api/register", await firstBody({ bootstrapToken: 7 })),
+    await api(hub, "/api/register", await firstBody({ bootstrapToken: "" })),
+    await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP.slice(0, -1) })),
+    await api(hub, "/api/register", await firstBody({ bootstrapToken: "x".repeat(300) })),
+  ];
+  for (const r of responses) {
+    assert.equal(r.status, 403);
+    assert.equal(r.text, responses[0].text);
+  }
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201);
+});
+
+test("a fresh hub with no token configured refuses every registration, allowSignup or not", async (t) => {
+  for (const allowSignup of [false, true]) {
+    const hub = await hubFor(t, { bootstrapToken: null, allowSignup });
+    assert.equal((await api(hub, "/api/register", await firstBody())).status, 403);
+    assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 403);
+  }
+});
+
+test("the token is stored only as a hash, and is deleted by the first registration", async (t) => {
+  const hub = await hubFor(t);
+  const stored = readFileSync(join(hub.dir, "bootstrap"), "utf8");
+  assert.equal(stored, createHash("sha256").update(BOOTSTRAP).digest("hex"));
+  if (process.platform !== "win32") assert.equal(statSync(join(hub.dir, "bootstrap")).mode & 0o777, 0o600);
+  await newAccount(hub);
+  assert.deepEqual(readdirSync(hub.dir).sort(), ["accounts.json", "secret", "sessions.json"]);
+});
+
+test("the token works once: not again, not after a restart that still has it configured", async (t) => {
+  const hub = await hubFor(t);
+  await newAccount(hub);
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 403);
+  await hub.restart();
+  assert.ok(!readdirSync(hub.dir).includes("bootstrap"));
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 403);
+});
+
+test("the stored token survives a restart without the setting", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "omni-hub-test-"));
+  const first = await startHub({ port: 0, dataDir: dir, bootstrapToken: BOOTSTRAP, log: () => {} });
+  await first.close();
+  const hub = await hubFor(t, { dataDir: dir, bootstrapToken: null });
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201);
+});
+
+test("allowSignup opens later registrations with no token, never the first", async (t) => {
+  const hub = await hubFor(t, { allowSignup: true });
+  assert.equal((await api(hub, "/api/register", await firstBody())).status, 403);
+  await newAccount(hub);
+  assert.equal((await api(hub, "/api/register", await firstBody())).status, 201);
+});
+
+test("a bootstrap file left by a crash after registering opens nothing and is removed", async (t) => {
+  const hub = await hubFor(t, { bootstrapToken: null, allowSignup: false });
+  await hub.close();
+  writeFileSync(join(hub.dir, "bootstrap"), createHash("sha256").update(BOOTSTRAP).digest("hex"));
+  await hub.restart();
+  await newAccount(hub);
+  await hub.close();
+  writeFileSync(join(hub.dir, "bootstrap"), createHash("sha256").update(BOOTSTRAP).digest("hex"));
+  await hub.restart();
+  assert.ok(!readdirSync(hub.dir).includes("bootstrap"));
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 403);
+});
+
+test("a damaged bootstrap file on a fresh hub stops it, and a weak token is refused", async (t) => {
+  const hub = await hubFor(t, { bootstrapToken: null });
+  await hub.close();
+  writeFileSync(join(hub.dir, "bootstrap"), "abc");
+  await assert.rejects(startHub({ port: 0, dataDir: hub.dir, log: () => {} }), /bootstrap/);
+  await assert.rejects(startHub({ port: 0, dataDir: hub.dir, bootstrapToken: "short", log: () => {} }), /bootstrapToken/);
+  await assert.rejects(startHub({ port: 0, dataDir: hub.dir, bootstrapToken: 7, log: () => {} }), /bootstrapToken/);
+});
+
+// --- extra origins ---
+
+test("origins adds exact origins for connecting, and proofs still name the hub's own origin", async (t) => {
+  const app = "capacitor://omni";
+  const hub = await hubFor(t, { origins: [app, "null"] });
+  const account = await newAccount(hub);
+  for (const Origin of [app, "null", ORIGIN]) assert.equal((await openSocket(hub, { headers: { Origin } })).status, 101, Origin);
+  for (const Origin of [`${app}x`, "capacitor://other", "https://evil.example"]) assert.equal((await openSocket(hub, { headers: { Origin } })).status, 403, Origin);
+  assert.equal((await api(hub, "/api/salt", { email: account.email }, { headers: { Origin: app } })).status, 200);
+  assert.equal((await api(hub, "/api/salt", { email: account.email }, { headers: { Origin: `${app}x` } })).status, 403);
+
+  const { session } = await signIn(hub, account, account.device);
+  const { client } = await openSocket(hub, { headers: { Origin: app } });
+  client.send({ type: "auth", session });
+  const { nonce } = await client.next("auth.challenge");
+  client.send({ type: "auth.proof", sig: await sign(account.device.sign.privateKey, proofBytes("omni-hub-auth-v1", nonce, ORIGIN)) });
+  assert.equal((await client.next("auth.ok")).state, "approved");
+});
+
+test("without origins, the origin an extra list would add stays refused", async (t) => {
+  const hub = await hubFor(t);
+  assert.equal((await openSocket(hub, { headers: { Origin: "capacitor://omni" } })).status, 403);
+});
+
+// --- review fixes ---
+
+test("session.approved is not sent if saving it failed, and the next change tries again", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const owner = await online(hub, account, account.device);
+  const device = named(await newDeviceKeys());
+  const pending = await online(hub, account, device);
+
+  const sessions = join(hub.dir, "sessions.json");
+  const backup = readFileSync(sessions);
+  rmSync(sessions);
+  mkdirSync(sessions);
+  writeFileSync(join(sessions, "keep"), "");
+  await approve(account, owner, device);
+  assert.equal(pending.has("session.approved"), false);
+  pending.send({ type: "channel.msg", to: account.device.signPub, opaque: "x" });
+  assert.equal((await pending.next("error")).code, "forbidden", "not approved until it is saved");
+
+  rmSync(sessions, { recursive: true });
+  writeFileSync(sessions, backup);
+  await approve(account, owner, named(await newDeviceKeys()));
+  await pending.next("session.approved");
+  pending.send({ type: "channel.msg", to: account.device.signPub, opaque: "y" });
+  assert.equal((await owner.next("channel.msg")).opaque, "y");
+});
+
+test("a client's log.append is refused outright, whatever it holds", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const [owner, web] = await household(hub, account, "client");
+  const valid = await append(account.log, { type: "add", name: "Y", kind: "desktop", role: "full", ...pick(await newDeviceKeys()), addedAt: 1 }, account.device);
+  web.send({ type: "log.append", prevHead: await headOf(account.log), entry: valid.at(-1) });
+  assert.equal((await web.next("error")).code, "forbidden");
+  web.send({ type: "log.append", prevHead: "stale", entry: valid.at(-1) });
+  assert.equal((await web.next("error")).code, "forbidden");
+  assert.equal(web.has("log.conflict"), false);
+  owner.send({ type: "log.get" });
+  assert.equal((await owner.next("log")).version, account.log.length);
+});
+
+test("an entry that cannot be next is refused before any replay", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const owner = await online(hub, account, account.device);
+  const prevHead = await headOf(account.log);
+  const valid = (await append(account.log, { type: "add", name: "Y", kind: "desktop", role: "full", ...pick(await newDeviceKeys()), addedAt: 1 }, account.device)).at(-1);
+  // A replay would say what it found in LogError's words. These reasons are only said by the check before it.
+  const refused = async (entry, reason) => {
+    owner.send({ type: "log.append", prevHead, entry });
+    const error = await owner.next("error");
+    assert.equal(error.code, "invalid-entry");
+    assert.equal(error.reason, reason);
+  };
+  await refused({ ...valid, index: 7 }, "not the next entry");
+  await refused({ ...valid, prev: b64(randomBytes(32)) }, "not the next entry");
+  await refused(null, "not the next entry");
+  await refused("text", "not the next entry");
+  const { sig, ...noSig } = valid;
+  await refused(noSig, "no signature");
+  await refused({ ...valid, sig: 7 }, "no signature");
+  await refused({ ...valid, extra: 1 }, "malformed");
+  await refused({ ...valid, body: null }, "malformed");
+  await refused({ ...valid, type: "nonsense" }, "malformed");
+  assert.ok(sig);
+
+  // And a well-formed next entry with a bad signature does reach the replay.
+  owner.send({ type: "log.append", prevHead, entry: { ...valid, sig: b64(randomBytes(64)) } });
+  assert.match((await owner.next("error")).reason, /bad signature/);
+});
+
+test("connections per address are capped on the listener, and closing frees them", async (t) => {
+  const hub = await hubFor(t, { limits: { maxConnectionsPerIp: 2 } });
+  const open = (localAddress) => new Promise((resolve, reject) => {
+    const socket = net.connect({ port: hub.port, host: "127.0.0.1", localAddress }, () => resolve(socket));
+    socket.on("error", () => {});
+    setTimeout(() => reject(new Error("no connection")), WAIT_MS).unref();
+  });
+  const dropped = (socket) => new Promise((resolve) => {
+    if (socket.destroyed) resolve(true);
+    socket.resume();
+    socket.once("close", () => resolve(true));
+    setTimeout(() => resolve(false), 300).unref();
+  });
+  const [a, b] = [await open(), await open()];
+  const third = await open();
+  assert.equal(await dropped(third), true, "over the cap");
+  const other = await open("127.0.0.2");
+  assert.equal(await dropped(other), false, "another address is not affected");
+  assert.equal(a.destroyed, false);
+
+  a.destroy();
+  await later(50);
+  const again = await open();
+  assert.equal(await dropped(again), false, "the place was freed");
+  for (const socket of [b, other, again]) socket.destroy();
+});
+
+test("a pending socket closing updates the cards and does not push presence", async (t) => {
+  const hub = await hubFor(t);
+  const account = await newAccount(hub);
+  const [owner, laptop] = await household(hub, account, "full");
+  const pending = await pendingDevice(hub, account);
+  await later(20);
+  owner.inbox.length = 0;
+  pending.destroy();
+  const row = (await owner.next("pending.list")).pending.find((p) => p.signPub === pending.device.signPub);
+  assert.equal(row.online, false);
+  await owner.settled();
+  assert.equal(owner.has("presence"), false);
+
+  // An approved one closing is the opposite.
+  owner.inbox.length = 0;
+  laptop.destroy();
+  assert.deepEqual((await owner.next("presence")).online, [account.device.signPub]);
+  await owner.settled();
+  assert.equal(owner.has("pending.list"), false);
+});
+
+test("WS parser: a frame in many small packets arrives whole", async (t) => {
+  const { socket } = await parserHub(t);
+  const message = JSON.stringify({ type: "presence", pad: "x".repeat(900) });
+  const bytes = frame(TEXT, message);
+  socket.socket.setNoDelay(true);
+  for (let at = 0; at < bytes.length; at += 10) {
+    socket.write(bytes.subarray(at, at + 10));
+    await later(1);
+  }
+  await socket.next("presence");
+  await socket.settled();
+  assert.equal(socket.closeCode, null);
 });
 
 // --- limits ---
@@ -1767,6 +2215,8 @@ test("loginKey, tokens and opaque payloads never reach the log output", async (t
     await api(hub, "/api/login", null, { raw: `{"loginKey":"${account.loginKey}"` });
     owner.write(frame(TEXT, `{"opaque":"${opaque}"`));
     await owner.next("error");
+    owner.send({ type: "password.change", currentLoginKey: account.loginKey, salt: "bad", verifierInput: randomKey() });
+    await owner.next("error");
     const bad = await rawClient(hub);
     bad.send({ type: "auth", session: owner.session.slice(0, -2) });
     await bad.closedWithin();
@@ -1793,6 +2243,7 @@ test("loginKey, tokens and opaque payloads never reach the log output", async (t
   assert.ok(!everything.includes(owner.session));
   assert.ok(!everything.includes(owner.session.slice(0, -2)));
   assert.ok(!everything.includes(opaque));
+  assert.ok(!everything.includes(BOOTSTRAP));
 });
 
 // --- what the hub is built from ---
@@ -1827,7 +2278,7 @@ test("run as a program: it reads its settings from the environment, and a corrup
   const dir = mkdtempSync(join(tmpdir(), "omni-hub-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const server = fileURLToPath(new URL("../hub/server.mjs", import.meta.url));
-  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir };
+  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir, OMNI_HUB_BOOTSTRAP_TOKEN: BOOTSTRAP, OMNI_HUB_ORIGIN: ORIGIN, OMNI_HUB_EXTRA_ORIGINS: "capacitor://omni,null" };
 
   const child = spawn(process.execPath, [server], { env, stdio: ["ignore", "pipe", "pipe"] });
   t.after(() => child.kill());
@@ -1841,6 +2292,9 @@ test("run as a program: it reads its settings from the environment, and a corrup
     child.once("exit", (code) => reject(new Error(`exited with ${code}`)));
   });
   assert.equal((await api({ port }, "/api/health", undefined, { method: "GET" })).status, 200);
+  assert.equal(readFileSync(join(dir, "bootstrap"), "utf8"), createHash("sha256").update(BOOTSTRAP).digest("hex"));
+  assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "capacitor://omni" } })).status, 200);
+  assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "https://evil.example" } })).status, 403);
   const stopped = new Promise((resolve) => child.once("exit", resolve));
   child.kill();
   await stopped;

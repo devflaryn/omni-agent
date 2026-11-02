@@ -6,6 +6,7 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const OP_CONTINUATION = 0, OP_TEXT = 1, OP_BINARY = 2, OP_CLOSE = 8, OP_PING = 9, OP_PONG = 10;
 const MAX_CONTROL_BYTES = 125;
 const CLOSE_LINGER_MS = 1000;
+const MAX_HELD_CHUNKS = 64;
 const KEY_PATTERN = /^[A-Za-z0-9+/]{22}==$/;
 
 export const CLOSE_PROTOCOL = 1002, CLOSE_UNSUPPORTED = 1003, CLOSE_BAD_TEXT = 1007, CLOSE_POLICY = 1008, CLOSE_TOO_BIG = 1009;
@@ -115,6 +116,8 @@ export class HubSocket {
     if (this.#closing) return;
     this.#chunks.push(chunk);
     this.#have += chunk.length;
+    // A long frame in tiny packets must not cost a Buffer object per packet.
+    if (this.#chunks.length > MAX_HELD_CHUNKS) this.#chunks = [Buffer.concat(this.#chunks, this.#have)];
     while (!this.#closing && this.#have >= this.#need) {
       const buffer = this.#chunks.length === 1 ? this.#chunks[0] : Buffer.concat(this.#chunks, this.#have);
       const used = this.#frame(buffer);

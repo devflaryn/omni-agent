@@ -5,6 +5,27 @@
 //
 // Runs on Node 20.19 with built-ins only. Deploy together: hub/server.mjs, hub/ws.mjs, hub/store.mjs,
 // ui/device-log.js, ui/account-core.js, keeping that hub/ and ui/ layout.
+//
+// For clients:
+// - Connect straight after /api/login. A session that has not proved its key on a socket shows no approval card, is
+//   replaced by the next login with that key, and is gone after 10 minutes.
+// - A proof is sign(key, utf8(`${domain} ${origin} ${nonce}`)), where origin is the hub's own configured origin and
+//   nonce comes from auth.challenge: domain omni-hub-auth-v1 with the device key, omni-hub-recovery-v1 with the recovery key.
+// - WebSocket errors are {type: "error", code, for?, to?, reason?}:
+//     forbidden          this session may not do that
+//     unreachable        offline, unknown or another account's device: deliberately the same
+//     busy               the receiver is not reading, or the hub is at its limit of password checks: try again later
+//     invalid-entry      the entry is malformed, does not follow the head, or does not verify
+//     bad-message        not JSON, or a field has the wrong type or shape
+//     unknown            no such message type
+//     not-found          pending.deny: no such pending sign-in on this account
+//     wrong-credentials  password.change: the current loginKey is wrong
+//     locked             password.change: too many failures, as for login
+//     conflict           password.change: another device changed the password first
+//     internal           the hub could not save; nothing changed
+// - Close codes: 4401 no valid token or proof, or a timeout; 4403 no longer on the log; 4408 pending expired;
+//   4409 replaced by a newer socket or sign-in of this device; 4410 denied by a device on the account;
+//   4429 too many sockets on the account; 1002, 1003, 1007, 1009 bad frames; 1008 rate or queue limit; 1011 internal.
 
 import { createHash, createHmac, randomBytes, scrypt, timingSafeEqual } from "node:crypto";
 import http from "node:http";
@@ -22,7 +43,9 @@ const KIB = 1024;
 const MIB = 1024 * KIB;
 
 const DEFAULT_LIMITS = Object.freeze({
-  maxLoginFailures: 5,                 // per account, and per address
+  maxPairFailures: 5,                  // per account and address together
+  maxAccountFailures: 50,              // per account from anywhere, so a botnet cannot just rotate addresses
+  maxAddressFailures: 20,              // per address over all accounts; above the pair limit, so that one still decides
   loginFailureWindowMs: 15 * MINUTE,
   maxTrackedFailures: 10_000,          // made-up emails must not grow memory without end
   maxConcurrentHashes: 8,              // each scrypt holds 16 MiB and a worker thread
@@ -48,12 +71,14 @@ const DEFAULT_LIMITS = Object.freeze({
   tlsHandshakeTimeoutMs: 10_000,
   maxHeaderBytes: 8 * KIB,
   maxConnections: 4096,
+  maxConnectionsPerIp: 64,
 });
 
 const SWEEP_MS = 1000;
 const SALT_BYTES = 16;
 const KEY_BYTES = 32;
 const MAX_EMAIL = 254, MAX_NAME = 128, MAX_KIND = 32;
+const MIN_BOOTSTRAP_TOKEN = 16, MAX_BOOTSTRAP_TOKEN = 256;
 
 // The login verifier. loginKey is already the output of a slow scrypt on the client.
 const VERIFIER_SCRYPT = { N: 2 ** 14, r: 8, p: 1 };
@@ -67,6 +92,7 @@ const CLOSE_UNAUTHORIZED = 4401;    // no valid token or proof
 const CLOSE_REMOVED = 4403;         // no longer on the log: removed, or a client past its 30 days
 const CLOSE_PENDING_EXPIRED = 4408;
 const CLOSE_REPLACED = 4409;        // a newer sign-in or socket of this device took over
+const CLOSE_DENIED = 4410;          // a full device on the account refused this sign-in
 const CLOSE_TOO_MANY = 4429;
 const CLOSE_INTERNAL = 1011;
 
@@ -85,7 +111,7 @@ const isB64Of = (text, length) => {
 
 const hashToken = (token) => createHash("sha256").update(token).digest("base64");
 const ipOf = (socket) => (socket.remoteAddress ?? "").replace(/^::ffff:/, "");
-const proofText = (domain, nonce) => new TextEncoder().encode(`${domain} ${nonce}`);
+const sha256 = (text) => createHash("sha256").update(text).digest();
 
 const deriveVerifier = (loginKey, salt) => new Promise((resolve, reject) => {
   scrypt(loginKey, salt, VERIFIER_BYTES, VERIFIER_SCRYPT, (error, hash) => (error ? reject(error) : resolve(hash)));
@@ -108,8 +134,7 @@ function optionalLabel(value, max) {
 class FailureLog {
   #entries = new Map();
 
-  constructor({ maxLoginFailures, loginFailureWindowMs, maxTrackedFailures }, now) {
-    this.max = maxLoginFailures;
+  constructor({ loginFailureWindowMs, maxTrackedFailures }, now) {
     this.windowMs = loginFailureWindowMs;
     this.maxKeys = maxTrackedFailures;
     this.now = now;
@@ -120,7 +145,7 @@ class FailureLog {
     return (this.#entries.get(key) ?? []).filter((t) => t > cutoff);
   }
 
-  locked(key) { return this.#recent(key).length >= this.max; }
+  locked(key, max) { return this.#recent(key).length >= max; }
 
   add(key) {
     const times = [...this.#recent(key), this.now()];
@@ -148,12 +173,21 @@ class FailureLog {
 
 /**
  * Starts a hub. Options: port, dataDir, tls ({cert, key}, without it the hub only listens on loopback), host, origin
- * (the one browser origin allowed), allowSignup, now, log(line), sweepMs, limits (overrides of DEFAULT_LIMITS).
+ * (the hub's own browser origin, also bound into every proof), origins (more exact origins allowed to connect, for the
+ * iPhone app), bootstrapToken (opens the first registration, once), allowSignup (opens later registrations), now,
+ * log(line), sweepMs, limits (overrides of DEFAULT_LIMITS).
  * Rejects with a StoreError if the data dir is damaged.
  */
-export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, allowSignup = false, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
+export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, origins = [], bootstrapToken = null, allowSignup = false, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
   const limits = { ...DEFAULT_LIMITS, ...limitOverrides };
+  if (bootstrapToken !== null && (typeof bootstrapToken !== "string" || bootstrapToken.length < MIN_BOOTSTRAP_TOKEN || bootstrapToken.length > MAX_BOOTSTRAP_TOKEN)) {
+    throw new Error(`hub: bootstrapToken must be text of ${MIN_BOOTSTRAP_TOKEN} to ${MAX_BOOTSTRAP_TOKEN} characters`);
+  }
   const store = openStore(dataDir);
+  // Once an account exists the token has been spent, even if the setting is still there after a restart.
+  if (bootstrapToken !== null && store.accounts.size === 0) store.setBootstrapHash(sha256(bootstrapToken));
+  const allowedOrigins = new Set([origin, ...origins].filter((value) => value !== null));
+  const proofText = (domain, nonce) => new TextEncoder().encode(`${domain} ${origin ?? ""} ${nonce}`);
   const failures = new FailureLog(limits, now);
   const dummyVerifier = { salt: randomBytes(16).toString("base64"), hash: randomBytes(VERIFIER_BYTES).toString("base64") };
 
@@ -161,6 +195,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   const live = new Map();
   const conns = new Set();
   const unauthByIp = new Map();
+  const connectionsByIp = new Map();
   let hashesRunning = 0;
 
   const liveOf = (accountId) => {
@@ -176,11 +211,14 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   // --- sessions and trust ---
 
+  /** Returns whether the write succeeded. */
   function saveSessionQuietly(work) {
     try {
       work();
+      return true;
     } catch (error) {
       log(`hub: could not save sessions: ${error.code ?? error.name}`);
+      return false;
     }
   }
 
@@ -228,7 +266,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     const { sockets } = liveOf(accountId);
     return sessionsOf(accountId)
       .filter((s) => !s.approved && s.proven && s.expiresAt > now())
-      .map((s) => ({ signPub: s.signPub, name: s.name, kind: s.kind, ip: s.ip, createdAt: s.createdAt, expiresAt: s.expiresAt, online: sockets.get(s.signPub)?.hash === s.hash }));
+      .map((s) => ({ id: s.id, signPub: s.signPub, name: s.name, kind: s.kind, ip: s.ip, createdAt: s.createdAt, expiresAt: s.expiresAt, online: sockets.get(s.signPub)?.hash === s.hash }));
   };
 
   const approvedConns = (accountId) => [...liveOf(accountId).sockets.values()].filter((conn) => store.sessions.get(conn.hash)?.approved);
@@ -260,7 +298,8 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
         endSession(session.hash, CLOSE_REMOVED, "no longer on the log");
         presenceChanged = true;
       } else if (!session.approved && onLog && session.proven) {
-        saveSessionQuietly(() => store.putSession({ ...session, approved: true, expiresAt: now() + limits.sessionLifetimeMs }));
+        // If this fails the session stays pending and the next sync tries again: never say approved without it.
+        if (!saveSessionQuietly(() => store.putSession({ ...session, approved: true, expiresAt: now() + limits.sessionLifetimeMs }))) continue;
         const conn = sockets.get(session.signPub);
         if (conn?.hash === session.hash) {
           sendTo(conn, { type: "session.approved" });
@@ -325,11 +364,18 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   // --- HTTP routes ---
 
+  function bootstrapMatches(given) {
+    const stored = store.bootstrapHash;
+    if (!stored || typeof given !== "string") return false;
+    return timingSafeEqual(sha256(given), stored);
+  }
+
   async function register(body) {
     const email = cleanEmail(body.email);
     if (!isB64Of(body.salt, SALT_BYTES)) throw new HttpError(400, "bad-salt");
     if (!isB64Of(body.verifierInput, KEY_BYTES)) throw new HttpError(400, "bad-verifier");
-    const closed = () => (store.accounts.size > 0 && !allowSignup) || store.accounts.size >= limits.maxAccounts;
+    // A fresh hub is open only to whoever holds the token. Otherwise the first stranger to find it would own it.
+    const closed = () => (store.accounts.size === 0 ? !bootstrapMatches(body.bootstrapToken) : !allowSignup || store.accounts.size >= limits.maxAccounts);
     if (closed()) throw new HttpError(403, "registration-closed");
     const entries = [body.firstLogEntry];
     let trust;
@@ -354,6 +400,11 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     const entry = liveOf(trust.accountId);
     entry.trust = trust;
     entry.trustAt = now();
+    try {
+      store.clearBootstrap();
+    } catch (error) {
+      log(`hub: could not delete the bootstrap token: ${error.code ?? error.name}`); // it opens nothing now an account exists
+    }
     return { status: 201, body: { ok: true } };
   }
 
@@ -365,6 +416,36 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     return { status: 200, body: { salt: fake.toString("base64") } };
   }
 
+  /**
+   * The one check of a loginKey, with the lockout, for signing in and for changing the password. Returns the account and
+   * the verifier it matched, or throws HttpError 429, 503 or 401. Everything here is the same for a known and an unknown email.
+   */
+  async function checkLoginKey(email, ip, loginKey) {
+    const counters = [
+      [`pair ${email} ${ip}`, limits.maxPairFailures],
+      [`account ${email}`, limits.maxAccountFailures],
+      [`ip ${ip}`, limits.maxAddressFailures],
+    ];
+    if (counters.some(([key, max]) => failures.locked(key, max))) throw new HttpError(429, "locked");
+    if (hashesRunning >= limits.maxConcurrentHashes) throw new HttpError(503, "busy");
+    // Counted before the hash, so guesses sent at once cannot all get in before the first one fails.
+    for (const [key] of counters) failures.add(key);
+
+    const account = store.byEmail.get(email);
+    const verifier = account?.verifier ?? dummyVerifier;
+    hashesRunning++;
+    let hash;
+    try {
+      hash = await deriveVerifier(Buffer.from(loginKey, "base64"), Buffer.from(verifier.salt, "base64"));
+    } finally {
+      hashesRunning--;
+    }
+    const matches = timingSafeEqual(hash, Buffer.from(verifier.hash, "base64"));
+    if (!account || !matches) throw new HttpError(401, "wrong-credentials");
+    for (const [key] of counters) failures.undo(key);
+    return { account, verifier };
+  }
+
   async function login(body, ip) {
     const email = cleanEmail(body.email);
     if (!isB64Of(body.loginKey, KEY_BYTES)) throw new HttpError(400, "bad-login-key");
@@ -372,25 +453,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     const name = optionalLabel(body.name, MAX_NAME);
     const kind = optionalLabel(body.kind, MAX_KIND);
 
-    // Everything up to the answer is the same for a known and an unknown email.
-    const keys = [`account ${email}`, `ip ${ip}`];
-    if (keys.some((key) => failures.locked(key))) throw new HttpError(429, "locked");
-    if (hashesRunning >= limits.maxConcurrentHashes) throw new HttpError(503, "busy");
-    // Counted before the hash, so guesses sent at once cannot all get in before the first one fails.
-    for (const key of keys) failures.add(key);
-
-    const account = store.byEmail.get(email);
-    const verifier = account?.verifier ?? dummyVerifier;
-    hashesRunning++;
-    let hash;
-    try {
-      hash = await deriveVerifier(Buffer.from(body.loginKey, "base64"), Buffer.from(verifier.salt, "base64"));
-    } finally {
-      hashesRunning--;
-    }
-    const matches = timingSafeEqual(hash, Buffer.from(verifier.hash, "base64"));
-    if (!account || !matches) throw new HttpError(401, "wrong-credentials");
-    for (const key of keys) failures.undo(key);
+    const { account } = await checkLoginKey(email, ip, body.loginKey);
 
     await refreshTrust(account.id);
     const { devices } = liveOf(account.id).trust;
@@ -406,7 +469,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
     const token = randomBytes(32).toString("base64url");
     store.putSession({
-      hash: hashToken(token), accountId: account.id, signPub: body.signPub, name, kind, ip,
+      hash: hashToken(token), id: randomBytes(16).toString("base64url"), accountId: account.id, signPub: body.signPub, name, kind, ip,
       createdAt: now(), expiresAt: now() + limits.pendingLifetimeMs, proven: false, approved: false,
     });
     return { status: 200, body: { session: token, state: onLog ? "approved" : "pending" } };
@@ -414,7 +477,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   const ROUTES = new Map([["/api/register", register], ["/api/salt", salt], ["/api/login", login]]);
 
-  const originAllowed = (req) => req.headers.origin === undefined || (origin !== null && req.headers.origin === origin);
+  const originAllowed = (req) => req.headers.origin === undefined || allowedOrigins.has(req.headers.origin);
 
   function reply(res, status, body) {
     const text = JSON.stringify(body);
@@ -504,8 +567,8 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   function onClosed(conn) {
     if (!forgetConn(conn)) return;
-    pushPresence(conn.accountId);
-    pushPending(conn.accountId);
+    if (store.sessions.get(conn.hash)?.approved) pushPresence(conn.accountId);
+    else pushPending(conn.accountId);
   }
 
   /** For a socket that is at fault, where nothing else will tell the other devices it has gone. */
@@ -619,6 +682,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   }
 
   const forbidden = (conn, type) => sendTo(conn, { type: "error", code: "forbidden", for: type });
+  const isFullSession = (accountId, session) => session.approved && liveOf(accountId).trust.devices.get(session.signPub)?.role === "full";
 
   const currentLog = (accountId) => {
     const { trust } = liveOf(accountId);
@@ -649,11 +713,28 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     return verify(entry.signer, bytes, entry.sig);
   }
 
+  /** Why this entry cannot be the next one, found without replaying the log, or null. */
+  function refusalBeforeReplay(entry, trust) {
+    if (entry?.index !== trust.version || entry?.prev !== trust.head) return "not the next entry";
+    if (typeof entry.sig !== "string") return "no signature";
+    try {
+      entryBytes(entry, null);
+      return null;
+    } catch (error) {
+      if (error instanceof LogError) return "malformed";
+      throw error;
+    }
+  }
+
   async function logAppend(conn, session, { prevHead, entry }) {
     const { accountId } = conn;
-    if (!session.approved && !await isOwnRecover(session, entry)) return forbidden(conn, "log.append");
     const state = liveOf(accountId);
+    // A client can never sign an entry. Refused first, because a replay is costly and it could ask for one at will.
+    if (session.approved && !isFullSession(accountId, session)) return forbidden(conn, "log.append");
+    if (!session.approved && !await isOwnRecover(session, entry)) return forbidden(conn, "log.append");
     if (prevHead !== state.trust.head) return sendTo(conn, { type: "log.conflict", ...currentLog(accountId) });
+    const refusal = refusalBeforeReplay(entry, state.trust);
+    if (refusal) return sendTo(conn, { type: "error", code: "invalid-entry", for: "log.append", reason: refusal });
 
     const account = store.accounts.get(accountId);
     const entries = [...account.log, entry];
@@ -668,7 +749,8 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     // Others were verifying too while this one was. The first to reach here wins.
     if (store.accounts.get(accountId).log !== account.log) return sendTo(conn, { type: "log.conflict", ...currentLog(accountId) });
     try {
-      store.putAccount({ ...account, log: entries });
+      // Read again: a password may have changed during the replay, and this must not put the old one back.
+      store.putAccount({ ...store.accounts.get(accountId), log: entries });
     } catch (error) {
       log(`hub: could not save a log: ${error.code ?? error.name}`);
       return sendTo(conn, { type: "error", code: "internal", for: "log.append" });
@@ -691,7 +773,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     if (!session.approved) {
       return sendTo(conn, { type: "pending.list", pending: pendingRows(conn.accountId).filter((row) => row.signPub === session.signPub) });
     }
-    if (liveOf(conn.accountId).trust.devices.get(session.signPub)?.role !== "full") return forbidden(conn, "pending.list");
+    if (!isFullSession(conn.accountId, session)) return forbidden(conn, "pending.list");
     sendTo(conn, { type: "pending.list", pending: pendingRows(conn.accountId) });
   }
 
@@ -713,14 +795,60 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   }
 
   function approvalMsg(conn, session, message) {
-    const { trust } = liveOf(conn.accountId);
-    const isFull = (s) => s.approved && trust.devices.get(s.signPub)?.role === "full";
+    const isFull = (s) => isFullSession(conn.accountId, s);
     return route(conn, "approval.msg", message, (target) => (session.approved ? isFull(session) && !target.approved : isFull(target)));
   }
 
   function channelMsg(conn, session, message) {
     if (!session.approved) return forbidden(conn, "channel.msg");
     return route(conn, "channel.msg", message, (target) => target.approved);
+  }
+
+  function pendingDeny(conn, session, { id }) {
+    if (!isFullSession(conn.accountId, session)) return forbidden(conn, "pending.deny");
+    if (typeof id !== "string") return sendTo(conn, { type: "error", code: "bad-message", for: "pending.deny" });
+    const target = sessionsOf(conn.accountId).find((s) => s.id === id && !s.approved && s.proven && s.expiresAt > now());
+    if (!target) return sendTo(conn, { type: "error", code: "not-found", for: "pending.deny" });
+    endSession(target.hash, CLOSE_DENIED, "denied by a device on this account");
+    sendTo(conn, { type: "pending.denied", id });
+    pushPending(conn.accountId);
+  }
+
+  /** The password only guards new sign-ins, so devices and their sessions are not touched. */
+  async function passwordChange(conn, session, { currentLoginKey, salt: newSalt, verifierInput }) {
+    if (!isFullSession(conn.accountId, session)) return forbidden(conn, "password.change");
+    const fail = (code) => sendTo(conn, { type: "error", code, for: "password.change" });
+    if (!isB64Of(currentLoginKey, KEY_BYTES) || !isB64Of(newSalt, SALT_BYTES) || !isB64Of(verifierInput, KEY_BYTES)) return fail("bad-message");
+
+    const { email } = store.accounts.get(conn.accountId);
+    let proved;
+    try {
+      proved = await checkLoginKey(email, conn.ip, currentLoginKey);
+    } catch (error) {
+      if (error instanceof HttpError) return fail(error.message);
+      throw error;
+    }
+    if (hashesRunning >= limits.maxConcurrentHashes) return fail("busy");
+    hashesRunning++;
+    const verifierSalt = randomBytes(16);
+    let hash;
+    try {
+      hash = await deriveVerifier(Buffer.from(verifierInput, "base64"), verifierSalt);
+    } finally {
+      hashesRunning--;
+    }
+
+    // Time has passed. The device may be gone, and the proof only counts against the password it was checked against.
+    if (conn.gone || !store.sessions.get(conn.hash)) return;
+    const account = store.accounts.get(conn.accountId);
+    if (account.verifier !== proved.verifier) return fail("conflict");
+    try {
+      store.putAccount({ ...account, salt: newSalt, verifier: { salt: verifierSalt.toString("base64"), hash: hash.toString("base64") } });
+    } catch (error) {
+      log(`hub: could not save a password change: ${error.code ?? error.name}`);
+      return fail("internal");
+    }
+    sendTo(conn, { type: "password.changed" });
   }
 
   const COMMANDS = new Map([
@@ -730,6 +858,8 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     ["pending.list", pendingList],
     ["approval.msg", approvalMsg],
     ["channel.msg", channelMsg],
+    ["pending.deny", pendingDeny],
+    ["password.change", passwordChange],
   ]);
 
   // --- the listener ---
@@ -742,6 +872,20 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   server.requestTimeout = limits.requestTimeoutMs;
   server.keepAliveTimeout = limits.keepAliveTimeoutMs;
   server.maxConnections = limits.maxConnections;
+  server.on("connection", (socket) => {
+    const ip = ipOf(socket);
+    const count = connectionsByIp.get(ip) ?? 0;
+    if (count >= limits.maxConnectionsPerIp) {
+      socket.destroy();
+      return;
+    }
+    connectionsByIp.set(ip, count + 1);
+    socket.once("close", () => {
+      const left = connectionsByIp.get(ip) - 1;
+      if (left > 0) connectionsByIp.set(ip, left);
+      else connectionsByIp.delete(ip);
+    });
+  });
   server.on("upgrade", onUpgrade);
   server.on("clientError", (_error, socket) => socket.destroy());
 
@@ -756,8 +900,12 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   });
   server.on("error", (error) => log(`hub: server error: ${error.code ?? error.name}`));
 
+  // A sweep that replays long logs can outlast the interval.
+  let sweeping = false;
   const sweeper = setInterval(() => {
-    sweep().catch((error) => log(`hub: sweep failed: ${error.code ?? error.name}`));
+    if (sweeping) return;
+    sweeping = true;
+    sweep().catch((error) => log(`hub: sweep failed: ${error.code ?? error.name}`)).finally(() => { sweeping = false; });
   }, sweepMs);
   sweeper.unref();
 
@@ -788,6 +936,8 @@ async function main() {
     port: Number(env.OMNI_HUB_PORT ?? 443),
     dataDir: env.OMNI_HUB_DATA ?? "/var/lib/omni-hub",
     origin: env.OMNI_HUB_ORIGIN ?? null,
+    origins: env.OMNI_HUB_EXTRA_ORIGINS ? env.OMNI_HUB_EXTRA_ORIGINS.split(",") : [],
+    bootstrapToken: env.OMNI_HUB_BOOTSTRAP_TOKEN || null,
     allowSignup: env.OMNI_HUB_ALLOW_SIGNUP === "1",
     tls,
   });
