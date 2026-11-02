@@ -83,7 +83,7 @@ The password never reaches the hub.
    2. The new device, having received it, sends its own fresh random value.
    3. The approver reveals `approver_random`. The new device checks it against the commitment.
 4. Both compute the 6-digit code from both random values, both devices' public keys and the log head. Anyone in the middle would have to fix their value before seeing the other side's, so they match by luck one time in a million, and each failed try is visible to the person.
-5. The person checks the codes match and approves. The approver appends a signed `add` entry. The new device verifies the log against the head that went into the code, so the hub cannot hand it a fake account.
+5. The person checks the codes match, chooses what this device is, and approves. **The role is the person's choice, never the new device's claim:** it defaults to `client`, and `full` needs an explicit "This is my desktop or phone app", because a tampered page can claim to be anything. The approver appends a signed `add` entry. The new device verifies the log against the head that went into the code, so the hub cannot hand it a fake account. It adopts no log and acts on nothing before the person has confirmed the code, and never restarts an exchange on its own.
 6. Pending sign-ins expire after 10 minutes. Denying one blocks that attempt.
 
 If no `full` device is online, the page says so and waits. Recovery is the only other way in.
@@ -92,7 +92,7 @@ The password check happens on the hub, so "password and approval" protects again
 
 ### 5. Recovery
 
-At registration the app shows a **recovery code once** (my call; 128 random bits, grouped for typing). A signing key derived from it is on the log as a special `recovery` device. The hub holds no secret for it.
+At registration the app shows a **recovery code once** (my call; 128 random bits, grouped for typing). A signing key derived from it is on the log as a special `recovery` device. The hub holds no secret for it. Every entry that introduces a recovery key also carries a signature by that new key, so nobody without the private key can build a log, fake or real, naming it. Before signing anything, a recovering device checks that the log's current recovery key is the one its code derives. Without this, a hacked hub could hand it a fake account built on the public key (found by the attack tests).
 
 With email, password and the code, a new device appends a `recover` entry signed by that key, adding itself and replacing the recovery key with a new one, whose new code it shows once. The entry is in the log, so every device shows a prominent notice.
 
@@ -138,7 +138,7 @@ Once the new path has worked for a week of the user's real use: delete `server/t
 The user chose to host the page on the VPS, so that one VPS manages everything. They were told the consequence, and it is recorded here so nobody assumes otherwise:
 
 - **A hacked VPS can serve a changed page.** The next time the page is opened, it could capture the password and run actions on machines while that page is open and signed in. Installed apps do not have this problem, because their code is installed.
-- **The limits that remain:** the web page has the `client` role, so a changed page cannot approve or remove devices, or add an attacker's device to the account. Its access ends when its 30 days run out or it is removed.
+- **The limits that remain:** the web page is approved as `client`, so it cannot approve or remove devices, or add an attacker's device to the account. A changed page could claim to be a desktop, so `full` is only ever granted by the person's explicit choice on the approving device: choosing `full` for something opened in a browser would give that page full control. Its access ends when its 30 days run out or it is removed.
 - **A switch on each machine (my call):** Settings has "Allow web page access", on by default. Turned off, that machine refuses `client` devices, so someone worried about the VPS can stay protected on desktop and iPhone.
 
 ## What this does not stop
@@ -146,6 +146,7 @@ The user chose to host the page on the VPS, so that one VPS manages everything. 
 Stated so nobody assumes otherwise:
 
 - **A hacked hub working with a stolen device.** It can keep a removal from reaching a machine that no other device is talking to, so the stolen device stays in control there until the machine next talks to a device with the newer log. Refusing to act without proof of a fresh log would close this, but would lock a machine out whenever no other device is online. **My call: no lockout.** The first thing to do with a stolen device is sign out on the machine itself or stop its relay connection.
+- **A hacked hub and a recovery.** With the real recovery code, a device can be shown an older real version of the log from the same recovery key, so it may not know about a device removed since. The first channel to any device that has seen more corrects it.
 - **An agent on the machine.** An agent with a shell runs as the same user. A hijacked agent could read the key file on systems where nothing but file permissions protects it, and DPAPI decrypts for any process of that user. The token and folder block above stop casual and accidental use, not a determined attacker with a shell. A separate key process would raise the bar and is not in this design.
 - **The hub sees** which devices exist, when they connect, IP addresses and the size and timing of frames, plus email addresses and login verifiers. A hacked hub can try guessing passwords offline, which only gets it a pending session.
 
