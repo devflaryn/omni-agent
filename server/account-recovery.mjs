@@ -8,44 +8,52 @@
  *   in-doubt         yes       yes            on its way to the hub, or may have reached it. It may not work yet
  *   contested        yes       yes            a hub contradicted it, or it stayed unsettled too long. The person may decide
  *   saved-unsettled  no        yes            the person saved the code while unsettled. It may still settle later
+ *   saved-contested  no        yes            saved, and a hub has contradicted it since. Shown, so it is no silent end
  *   live             yes       no             a log from the hub holds it. It works, until the person says they saved it
  *
  * Why it may sit on disk: anyone who can read this store already holds this full device's keys. Why it must: a kill at any
  * moment must not lose it, and nothing can issue another.
  *
- * The rule the table holds to: nothing a hub says can delete a code that may be live. Only three things delete one: the
- * person saying they saved it, a send that never left this computer, and a hub reply showing that nothing was created.
+ * The rule the table holds to: nothing a hub says can delete a code that may be live, and no caller can write over one.
+ * Only three things delete one: the person saying they saved it, a send that never left this computer, and a hub reply
+ * showing that nothing was created. `forgotten` is the person's own explicit exit. `prepare` is allowed from `none`
+ * alone; where a code is held, the same code may be sent again on a new candidate (`resent`), and nothing else may.
+ * `replaced` exists only where the person has saved the code.
  */
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
 
 export const RECOVERY_CODE_FILE = "recovery-code.json";
 
-/** event -> next state, per state. An event not listed changes nothing. */
+/** event -> next state, per state. An event not listed changes nothing; `prepare` and `resent` not listed are refused. */
 export const TRANSITIONS = Object.freeze({
-  none: { forgotten: "none" },
+  none: { prepare: "in-doubt", forgotten: "none" },
   "in-doubt": {
-    settled: "live",        // a log from the hub holds the candidate
+    resent: "in-doubt",       // the same code on a new candidate: a retry, or a recover re-based after a conflict
+    settled: "live",          // a log from the hub holds the candidate
     contradicted: "contested",
-    nothingCreated: "none", // never left this computer, or the hub's reply shows nothing was created
+    nothingCreated: "none",   // never left this computer, or the hub's reply shows nothing was created
     signedOut: "in-doubt",
     saved: "saved-unsettled", // allowed only once too long unsettled: see mayDiscard
     forgotten: "none",
   },
   contested: {
+    resent: "in-doubt",
     settled: "live",
     contradicted: "contested",
     nothingCreated: "none",
-    signedOut: "in-doubt",  // nothing is contesting it now that no hub is being asked
+    signedOut: "in-doubt",    // nothing is contesting it now that no hub is being asked
     saved: "saved-unsettled",
     forgotten: "none",
   },
-  "saved-unsettled": { settled: "none", replaced: "none", forgotten: "none" },
-  live: { saved: "none", forgotten: "none" },
+  "saved-unsettled": { settled: "none", contradicted: "saved-contested", replaced: "none", forgotten: "none" },
+  "saved-contested": { settled: "none", contradicted: "saved-contested", signedOut: "saved-unsettled", replaced: "none", forgotten: "none" },
+  live: { saved: "none", forgotten: "none" }, // never sent again: it is on the hub's log already
 });
 
 const HAS_CODE = new Set(["in-doubt", "contested", "live"]);
-const HAS_CANDIDATE = new Set(["in-doubt", "contested", "saved-unsettled"]);
+const HAS_CANDIDATE = new Set(["in-doubt", "contested", "saved-unsettled", "saved-contested"]);
+const CONTRADICTED = new Set(["contested", "saved-contested"]);
 
 export class RecoveryStore {
   state = "none";
@@ -53,6 +61,7 @@ export class RecoveryStore {
   #kind = null;
   #email = null;
   #entries = null;
+  #queue = Promise.resolve();
 
   /** writeSecret(name, publicFields, bytes), readSecret(record), writeFile(name, text), warn(text), now(), unsettledMs */
   constructor(io) { this.io = io; this.file = join(io.dir, RECOVERY_CODE_FILE); }
@@ -68,10 +77,14 @@ export class RecoveryStore {
   /** It works: a log from the hub holds it. */
   get confirmed() { return this.state === "live"; }
 
-  #tooLong() { return this.state === "in-doubt" && this.io.now() - this.#since >= this.io.unsettledMs; }
+  /** A hub's answer has contradicted this code, or the recovery it was made by. */
+  get contradicted() { return CONTRADICTED.has(this.state); }
+
+  /** Nothing has been heard either way for too long. */
+  get unsettledTooLong() { return this.state === "in-doubt" && this.io.now() - this.#since >= this.io.unsettledMs; }
 
   /** The person is told to keep every code they have, and may say they saved this one. */
-  get contested() { return this.state === "contested" || this.#tooLong(); }
+  get contested() { return this.contradicted || this.unsettledTooLong; }
 
   /** Whether saying "I saved it" is allowed now. While nothing at all is known it stays, but not for ever. */
   get mayDiscard() { return this.state === "live" || this.contested; }
@@ -97,9 +110,29 @@ export class RecoveryStore {
 
   /**
    * Before the hub call that could make it live, as one write. If this throws, nothing has changed on disk or here, and
-   * nothing may be sent. A retry of the same code goes through here too.
+   * nothing may be sent. From `none` it is a new code. Where a code is held it must be that same code, of the same kind,
+   * being sent again on a new candidate: a code that may be live is never written over, whoever asks.
    */
-  async prepare({ kind, email, code, entries }) {
+  prepare(args) { return this.#serial(() => this.#prepare(args)); }
+
+  /** Applies an event from the table. A failed write only leaves the older state on disk, which settles again next time. */
+  apply(event) { return this.#serial(() => this.#apply(event)); }
+
+  /** One change at a time, in order: each reads the record the one before it wrote, so disk and memory cannot cross. */
+  #serial(work) {
+    const run = this.#queue.then(work);
+    this.#queue = run.catch(() => {});
+    return run;
+  }
+
+  async #prepare({ kind, email, code, entries }) {
+    const event = this.state === "none" ? "prepare" : "resent";
+    if (TRANSITIONS[this.state][event] === undefined) throw new Error(`a recovery code is held (${this.state}) and may be live: only the person may discard it`);
+    if (event === "resent") {
+      let held = null;
+      try { held = await this.code(); } catch { /* cannot be read, so cannot be shown to be the same */ }
+      if (held === null || held !== code || this.#kind !== kind) throw new Error(`a recovery code is held (${this.state}) and may be live: only the same code may be sent again`);
+    }
     const since = this.io.now();
     await this.io.writeSecret(RECOVERY_CODE_FILE, { state: "in-doubt", since, kind, email, entries }, Buffer.from(code));
     this.state = "in-doubt";
@@ -109,8 +142,8 @@ export class RecoveryStore {
     this.#entries = entries;
   }
 
-  /** Applies an event from the table. A failed write only leaves the older state on disk, which settles again next time. */
-  async apply(event) {
+  async #apply(event) {
+    if (event === "prepare" || event === "resent") throw new Error("prepare() carries the code");
     const next = TRANSITIONS[this.state][event];
     if (next === undefined) return false;
     const before = this.state;
@@ -139,17 +172,5 @@ export class RecoveryStore {
   async code() {
     const record = JSON.parse(await fs.readFile(this.file, "utf8"));
     return Buffer.from(await this.io.readSecret(record)).toString();
-  }
-
-  /** The record as it stands, so that an attempt the hub turns down can put it back. */
-  async snapshot() {
-    if (this.state === "none") return null;
-    return fs.readFile(this.file, "utf8").catch(() => null);
-  }
-
-  async restore(snapshot) {
-    if (!snapshot) return;
-    await this.io.writeFile(RECOVERY_CODE_FILE, snapshot);
-    await this.load();
   }
 }

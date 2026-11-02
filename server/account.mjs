@@ -76,7 +76,10 @@ const HUB_CLAIMS_REMOVED = "The hub says this device was removed from the accoun
 const CLOSE_SESSION_GONE = 4401, CLOSE_REMOVED = 4403, CLOSE_PENDING_EXPIRED = 4408, CLOSE_REPLACED = 4409, CLOSE_DENIED = 4410;
 
 const SETTINGS_DAMAGED = "The saved settings could not be read, so Allow web page access is off until you choose again.";
-const CONTESTED = "The hub's answers do not match this recovery code, so this computer cannot tell which code counts. Keep every recovery code you have until another device confirms.";
+const CONTRADICTED = "The hub's answers do not match this recovery code, so this computer cannot tell which code counts. Keep every recovery code you have until another device confirms.";
+const unsettledText = (ms) => `The hub has not confirmed this recovery code in ${Math.round(ms / MINUTE)} minutes, so this computer cannot tell whether it counts. Keep every recovery code you have until another device confirms, or say you saved it to move on.`;
+/** How a code held on this computer is let go of: the person's choice, never a new attempt's. */
+const discardAdvice = (ms) => `To register afresh instead, say you saved that code once Omni allows it (when a hub contradicts it, or ${Math.round(ms / MINUTE)} minutes after it was sent), or sign out and forget this device.`;
 const LOG_NOT_SAVED = "This computer could not save its device list. It will try again the next time Omni starts: check the disk.";
 // ------------------------------------------------------------------------------ the slow key
 
@@ -236,7 +239,7 @@ export class Account extends EventEmitter {
       email: this.#email,
       accountId: this.#verified?.accountId ?? null,
       device: this.#keys ? { id: this.#keys.signPub, name: this.#name, kind: this.#kind, role: me?.role ?? null } : null,
-      hub: { url: this.hubUrl, connected: this.#connected, attempts: this.#connectAttempts, lastError: this.#recovery.contested ? CONTESTED : this.#hubError },
+      hub: { url: this.hubUrl, connected: this.#connected, attempts: this.#connectAttempts, lastError: this.#lastError() },
       logHead: this.#hashes.at(-1) ?? null,
       logVersion: this.#hashes.length,
       pending: this.#phase === "pending" ? { code: this.#exchange?.code ?? null, attempts: this.#attempts, failed: this.#exchangeFailed, confirmed: !!this.#exchange?.confirmed, approvedByHub: this.#approvedByHub } : null,
@@ -252,6 +255,12 @@ export class Account extends EventEmitter {
       channels: this.#links.all().filter((c) => c.state === "open").map((c) => ({ id: c.id, device: c.peerId, name: c.peer.name, direction: c.direction })),
       handshakes: this.#links.all().filter((c) => c.state === "handshake").length,
     };
+  }
+
+  /** What is wrong, in the person's terms: a held code's trouble, in its own true words, and the connection's, both. */
+  #lastError() {
+    const code = this.#recovery.contradicted ? CONTRADICTED : this.#recovery.unsettledTooLong ? unsettledText(this.limits.unsettledMs) : null;
+    return [code, this.#hubError].filter(Boolean).join(" ") || null;
   }
 
   devices() {
@@ -589,20 +598,31 @@ export class Account extends EventEmitter {
     this.#name = clip(name, 128) || this.#name;
     await this.#ensureDir();
     await this.#ensureKeys();
-    // That code may be the live one of another registration, and this one would overwrite it.
-    if (this.#recovery.pending && this.#recovery.email !== email) throw new AccountError(409, "recovery-code-pending", "This computer holds a recovery code for another email that you have not saved yet. Save that one first.");
-    // A registration from before a kill may have reached the hub. If this password opens it, that is the account.
-    if (this.#recovery.candidate?.kind === "register" && !this.#registerAttempt && await this.#resumeRegistration(email, password)) {
-      return { recoveryCode: null, signedIn: true, resumed: true };
+    // A retry after no answer, in this same run, sends the same thing: if the first one landed, its code is the code that counts.
+    const retry = this.#recovery.pending && this.#registerAttempt?.email === email ? this.#registerAttempt : null;
+    // That code may be the live one of an earlier registration or recovery, and a new attempt's record would write over it.
+    // Only the person lets go of it. The one way through is the password that opens that earlier registration.
+    if (this.#recovery.pending && !retry && this.#recovery.email !== email) throw new AccountError(409, "recovery-code-pending", "This computer holds a recovery code for another email that you have not saved yet. Save that one first.");
+    const candidate = this.#recovery.candidate;
+    if (!retry && candidate && this.#recovery.email === email && (candidate.kind === "register" || !this.#recovery.pending)) {
+      // While a registration's code is unsaved this is the only way through. Once any candidate's code is saved it is a
+      // courtesy: whoever saved it after a kill still lands on their account through that candidate, rather than on a
+      // refused registration and then a sign-in with nothing to anchor it. An unsaved recovery is not resumed here: its
+      // own connection resends it, and `register` is the wrong door for it.
+      try {
+        await this.#resumeRegistration(email, password);
+        return { recoveryCode: null, signedIn: true, resumed: true };
+      } catch (error) {
+        if (this.#recovery.pending || error.code !== "recovery-code-pending") throw error;
+      }
     }
-    // A retry after no answer sends the same thing, so that if the first one landed its code is the code that counts.
-    const retry = this.#registerAttempt?.email === email ? this.#registerAttempt : null;
-    // What an earlier, killed attempt left: if the hub turns this one down, that one may be the live account and its code.
-    const earlier = retry ? null : await this.#recovery.snapshot();
+    if (this.#recovery.pending && !retry) throw new AccountError(409, "recovery-code-pending", `This computer holds a recovery code for ${email} from a recovery that you have not saved yet. It may be the live one, so a new registration cannot replace it. ${discardAdvice(this.limits.unsettledMs)}`);
+    if (!retry) await this.#recovery.apply("replaced"); // a candidate whose code the person saved: they are starting again
     const { recoveryCode, entries, salt } = retry ?? await this.#newRegistration(email);
     const loginKey = await this.#loginKey(password, salt);
     const token = await this.#bootstrapToken();
-    // On disk as one before the hub can make it live. Nothing has been sent if this fails.
+    // On disk as one before the hub can make it live. Nothing has been sent if this fails. On a retry this is the same code
+    // again, which the store allows; any other would be refused there.
     try {
       await this.#recovery.prepare({ kind: "register", email, code: recoveryCode, entries });
     } catch (error) {
@@ -615,9 +635,9 @@ export class Account extends EventEmitter {
     } catch (error) {
       if (error.code === "hub-unreachable") throw error;
       if (!retry && NOTHING_CREATED.has(error.code)) {
+        // A first attempt, so there was no earlier code on disk to lose: the store was `none` before prepare.
         this.#registerAttempt = null;
         await this.#recovery.apply("nothingCreated");
-        await this.#recovery.restore(earlier);
         this.#changed();
         if (error.code === "registration-closed") throw new AccountError(403, error.code, "This hub is closed to registration: it already holds another account, or the bootstrap token is wrong. Nothing was created by this attempt.");
         throw error;
@@ -629,6 +649,9 @@ export class Account extends EventEmitter {
       }
       accepted = false;
       // Refused the second time: the first may have landed. Only a login shows that, and a mistyped password shows nothing.
+      // The safety of this branch rests on `loginKey` being derived from this attempt's own `salt`: the hub stored that
+      // salt if and only if this attempt is the account it holds, so an `approved` here can only mean that. A key derived
+      // from any other salt could open nothing here, and would prove nothing if it did.
       const state = await this.#login(email, loginKey).catch(() => null);
       if (state !== "approved") {
         await this.#contest();
@@ -658,23 +681,28 @@ export class Account extends EventEmitter {
     return (this.#registerAttempt = { email, recoveryCode, entries, salt });
   }
 
+  /**
+   * A registration from before a kill, or whose answer was lost, may have reached the hub, and the code held here would then
+   * be its live one. If this password opens that account, this computer is on it and the held candidate settles on the
+   * socket. If not, nothing here changes on disk: a refused password looks the same whether it was mistyped or the
+   * registration never landed, and this computer cannot tell the two apart, so the code stays until the person lets it go.
+   */
   async #resumeRegistration(email, password) {
     const salt = await this.#saltFor(email);
     let state;
     try {
       state = await this.#login(email, await this.#loginKey(password, salt));
     } catch (error) {
-      if (error.code === "hub-unreachable") throw error;
-      return false;
+      if (error.code !== "wrong-credentials") throw error; // unreachable, locked, busy: the person is told that
+      throw new AccountError(409, "recovery-code-pending", `The hub did not accept that password. This computer holds a recovery code from an earlier registration of ${email} that may have reached the hub: if it did, that code is the live one and this was the wrong password, so try it again. ${discardAdvice(this.limits.unsettledMs)}`);
     }
     if (state !== "approved") {
       await this.#forgetSession();
-      return false;
+      throw new AccountError(409, "recovery-code-pending", `The hub has an account for ${email} that this computer is not on, and this computer holds an unsaved recovery code from its own registration of that email. ${discardAdvice(this.limits.unsettledMs)} Then sign in instead.`);
     }
     this.#phase = "pending";
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
     this.#connect();
-    return true;
   }
 
   // ---------------------------------------------------------------------------- the one-time code, while it is on disk
@@ -695,6 +723,7 @@ export class Account extends EventEmitter {
     await this.start();
     if (this.#recovery.pending && !this.#recovery.mayDiscard) throw new AccountError(409, "not-settled", "Wait until the hub has confirmed this code before discarding it.");
     await this.#recovery.apply("saved");
+    this.#registerAttempt = null; // the person has let go of that code: no retry may send it again
     this.#changed();
     return { recoveryCodePending: false };
   }
@@ -864,6 +893,7 @@ export class Account extends EventEmitter {
     await this.#recovery.apply(forget ? "forgotten" : "signedOut");
     if (forget) {
       for (const file of ["keys.json", "log.json", "state.json"]) await fs.rm(join(this.dir, file), { force: true });
+      this.#registerAttempt = null;
       this.#recoveryAt = null;
       this.#keys = null;
       this.#log = null;
@@ -1523,6 +1553,7 @@ export class Account extends EventEmitter {
     const salt = await this.#saltFor(email);
     const hubState = await this.#login(email, await this.#loginKey(password, salt));
     // Already on the list, by an earlier recovery that landed. The log would refuse another for this key, and none is needed.
+    // The typed code was never sent or checked: `codeUsed: false` says so, since it may be wrong or dead for all this shows.
     if (hubState === "approved") {
       const known = this.#verified?.devices.has(this.#keys.signPub);
       if (!known && !this.#recovery.candidate) {
@@ -1534,7 +1565,7 @@ export class Account extends EventEmitter {
       await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
       this.#connect();
       this.#changed();
-      return { recoveryCode: null, confirmed: false, alreadyOnLog: true };
+      return { recoveryCode: null, confirmed: false, alreadyOnLog: true, codeUsed: false };
     }
     await this.#recovery.apply("replaced"); // the person saved that code and is starting again
     this.#phase = "recovering";
