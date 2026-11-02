@@ -7,6 +7,7 @@ import { createServer as createNetServer } from "node:net";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promises as fsp } from "node:fs";
 import { startHub } from "../hub/server.mjs";
 import { Account, keychainProtector, plainProtector, windowsProtector } from "../server/account.mjs";
 import { channelClient, serveChannel } from "../server/channel-host.mjs";
@@ -347,17 +348,6 @@ test("register: a failure on the verify step after the hub accepted still return
   assert.ok(account.status().warnings.some((w) => /could not save/.test(w)));
 });
 
-test("register: if the candidate cannot be written first, nothing reaches the hub", async () => {
-  const fixture = await hubFixture();
-  const sent = [];
-  const account = makeAccount(fixture, { fetchImpl: async (url, init) => { sent.push(String(url)); return fetch(url, init); } });
-  writeBootstrap(account.dir);
-  await account.start();
-  mkdirSync(join(account.dir, "log.candidate.json"));
-  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }));
-  assert.ok(!sent.some((u) => u.endsWith("/api/register")));
-});
-
 test("register: killed right after the hub accepted, the next sign-in resumes on the candidate and says the code is gone", async () => {
   const fixture = await hubFixture();
   const killedDir = join(freshDir(), "account");
@@ -374,7 +364,6 @@ test("register: killed right after the hub accepted, the next sign-in resumes on
   await after.signIn({ email: EMAIL, password: PASSWORD });
   await until(() => after.status().phase === "approved", "resumed");
   assert.equal(after.status().logVersion, 1);
-  assert.ok(!existsSync(join(killedDir, "log.candidate.json")));
   assert.ok(existsSync(join(killedDir, "log.json")));
   assert.equal(after.status().recoveryCodePending, true);
   const { recoveryCode, confirmed } = await after.showRecoveryCode();
@@ -458,7 +447,6 @@ test("register: when the hub refuses, the stored code is deleted", async () => {
   await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "x" }), (e) => e.status === 403);
   assert.equal(account.status().recoveryCodePending, false);
   assert.ok(!existsSync(join(account.dir, "recovery-code.json")));
-  assert.ok(!existsSync(join(account.dir, "log.candidate.json")));
 });
 
 test("register: if the code cannot be stored first, nothing reaches the hub", async () => {
@@ -495,7 +483,7 @@ test("register: a stale candidate that never landed does not block a fresh regis
   const account = makeAccount(fixture);
   mkdirSync(account.dir, { recursive: true });
   const stale = { ...(await newDeviceKeys({ extractable: true })), name: "Old", kind: "desktop" };
-  writeFileSync(join(account.dir, "log.candidate.json"), JSON.stringify({ v: 1, kind: "register", email: EMAIL, entries: await createLog({ device: stale, recovery: await newDeviceKeys({ extractable: true }) }) }));
+  writeFileSync(join(account.dir, "recovery-code.json"), JSON.stringify({ v: 1, protection: "none", state: "in-doubt", since: Date.now(), kind: "register", email: EMAIL, entries: await createLog({ device: stale, recovery: await newDeviceKeys({ extractable: true }) }), data: Buffer.from("OLD-CODE").toString("base64") }));
   writeBootstrap(account.dir);
   const out = await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
   assert.ok(out.recoveryCode);
@@ -1517,18 +1505,6 @@ test("recovery: a local failure at any step after the hub rotated the key still 
   }
 });
 
-test("recovery: if the candidate cannot be written first, nothing is sent and the old code still works", async () => {
-  const fixture = await hubFixture();
-  const first = await registered(fixture, { name: "First" });
-  const fresh = makeAccount(fixture);
-  await fresh.start();
-  mkdirSync(join(fresh.dir, "log.candidate.json"), { recursive: true });
-  await assert.rejects(fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }));
-  const other = makeAccount(fixture);
-  await other.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "Other" });
-  assert.equal(other.status().phase, "approved");
-});
-
 test("recovery: killed right after the hub took it, a restart resumes on the candidate and says the code is gone", async () => {
   const fixture = await hubFixture();
   const first = await registered(fixture, { name: "First" });
@@ -1578,29 +1554,26 @@ test("recovery: killed before sending, a restart sends it again, and the stored 
   assert.equal(other.status().phase, "approved");
 });
 
-test("recovery: a refusal from the hub deletes the stored code; an unsaved code blocks a second recovery", async () => {
+test("recovery: an error reply to the send is no proof of anything: the code is kept in doubt; an unsaved code blocks a second recovery", async () => {
   const fixture = await hubFixture();
   const first = await registered(fixture, { name: "First" });
-  const refused = makeAccount(fixture);
-  let storedWhenSent = null;
-  refused.tap.outgoing = (m) => {
-    if (m.type !== "log.append") return m;
-    storedWhenSent = refused.status().recoveryCodePending;
-    setImmediate(() => inject(refused, { type: "error", code: "invalid-entry", for: "log.append" }));
-    return null;
-  };
-  const attempt = assert.rejects(refused.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }), (e) => e.status === 400);
-  await attempt;
-  assert.equal(storedWhenSent, true, "stored before sending");
-  assert.equal(refused.status().recoveryCodePending, false);
-  assert.ok(!existsSync(join(refused.dir, "recovery-code.json")));
+  // A hub that appended, then answers with an error.
+  const lying = makeAccount(fixture);
+  lying.tap.incoming = (m) => (m.type === "log.ok" ? { type: "error", for: "log.append", code: "internal" } : m);
+  const answer = await lying.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+  assert.equal(answer.confirmed, false);
+  assert.equal(lying.status().recoveryCodePending, true);
+  assert.equal((await lying.showRecoveryCode()).recoveryCode, answer.recoveryCode);
+  lying.tap.incoming = undefined;
+  await until(() => lying.status().phase === "approved", "the next connection shows it landed");
+  assert.deepEqual(await lying.showRecoveryCode(), { recoveryCode: answer.recoveryCode, confirmed: true });
 
   const malformed = makeAccount(fixture);
   await assert.rejects(malformed.recover({ email: EMAIL, password: PASSWORD, recoveryCode: "0000-0000-0000", name: "x" }), (e) => e.status === 400);
   assert.equal(malformed.status().recoveryCodePending, false, "a malformed code stores nothing");
 
   const good = makeAccount(fixture);
-  const out = await good.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "Good" });
+  const out = await good.recover({ email: EMAIL, password: PASSWORD, recoveryCode: answer.recoveryCode, name: "Good" });
   assert.equal(good.status().recoveryCodePending, true);
   await good.signOut();
   await assert.rejects(good.recover({ email: EMAIL, password: PASSWORD, recoveryCode: out.recoveryCode, name: "Again" }), (e) => e.status === 409 && e.code === "recovery-code-pending");
@@ -1665,7 +1638,9 @@ test("hacked hub: a fork or another account's log at settlement deletes nothing,
     assert.ok(existsSync(join(killedDir, "recovery-code.json")), kind);
     await after.recoveryCodeSaved();
     assert.equal(after.status().recoveryCodePending, false, kind);
-    assert.ok(existsSync(join(killedDir, "log.candidate.json")), "the candidate stays, in case the hub comes round");
+    const kept = JSON.parse(readFileSync(join(killedDir, "recovery-code.json"), "utf8"));
+    assert.equal(kept.state, "saved-unsettled", "the candidate stays, in case the hub comes round");
+    assert.equal(kept.data, "", "but not the code");
   }
 });
 
@@ -1763,31 +1738,6 @@ test("recovery: only ever told 'conflict', the code is kept unconfirmed", async 
   assert.equal(fresh.status().recoveryCodePending, true);
 });
 
-test("recovery: if the candidate cannot be written, nothing was sent, so the code goes and show does not vouch for it", async () => {
-  const fixture = await hubFixture();
-  const first = await registered(fixture, { name: "First" });
-  const fresh = makeAccount(fixture);
-  let sent = false;
-  fresh.tap.outgoing = (m) => { if (m.type === "log.append") sent = true; return m; };
-  await fresh.start();
-  mkdirSync(join(fresh.dir, "log.candidate.json"), { recursive: true });
-  await assert.rejects(fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }));
-  assert.equal(sent, false);
-  assert.equal(fresh.status().recoveryCodePending, false);
-  assert.ok(!existsSync(join(fresh.dir, "recovery-code.json")));
-});
-
-test("register: if the candidate cannot be written, nothing was sent, so the code goes", async () => {
-  const fixture = await hubFixture();
-  const account = makeAccount(fixture);
-  writeBootstrap(account.dir);
-  await account.start();
-  mkdirSync(join(account.dir, "log.candidate.json"));
-  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }));
-  assert.equal(account.status().recoveryCodePending, false);
-  assert.ok(!existsSync(join(account.dir, "recovery-code.json")));
-});
-
 test("register: a retry with a mistyped password does not cost the code of the attempt that landed", async () => {
   const fixture = await hubFixture();
   let lost = true;
@@ -1801,7 +1751,6 @@ test("register: a retry with a mistyped password does not cost the code of the a
   const held = await account.showRecoveryCode();
   await assert.rejects(account.register({ email: EMAIL, password: "a mistyped long password", name: "First" }), (e) => e.status === 403);
   assert.deepEqual(await account.showRecoveryCode(), held, "both files kept");
-  assert.ok(existsSync(join(account.dir, "log.candidate.json")));
   assert.equal(account.status().recoveryContested, true);
   const out = await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
   assert.equal(out.recoveryCode, held.recoveryCode);
@@ -1810,6 +1759,253 @@ test("register: a retry with a mistyped password does not cost the code of the a
   const proof = makeAccount(fixture);
   await proof.recover({ email: EMAIL, password: PASSWORD, recoveryCode: out.recoveryCode, name: "Proof" });
   assert.equal(proof.status().phase, "approved");
+});
+
+test("recovery: a send that never left this computer deletes the code, and the old one stands", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const fresh = makeAccount(fixture);
+  fresh.tap.outgoing = (m) => { if (m.type === "log.append") throw Object.assign(new Error("socket shut"), { code: "hub-unreachable" }); return m; };
+  await assert.rejects(fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }));
+  assert.equal(fresh.status().recoveryCodePending, false);
+  assert.ok(!existsSync(join(fresh.dir, "recovery-code.json")));
+  assert.equal(fresh.status().phase, "signed-out");
+  const other = makeAccount(fixture);
+  await other.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "Other" });
+  assert.equal(other.status().phase, "approved");
+});
+
+/** Runs `work` on an account, killing the process's view of the disk at the n-th completed file write. */
+async function killedAtWrite(account, n, killedDir, work) {
+  const real = fsp.rename;
+  let seen = 0, killed = false;
+  fsp.rename = async function (from, to) {
+    if (String(to).startsWith(account.dir)) {
+      if (++seen === n && !killed) {
+        killed = true;
+        cpSync(account.dir, killedDir, { recursive: true });
+        throw Object.assign(new Error("killed here"), { code: "EKILLED" });
+      }
+    }
+    return real.call(this, from, to);
+  };
+  try { await work().catch(() => {}); } finally { fsp.rename = real; }
+  await account.stop();
+  return killed;
+}
+
+test("recovery: a kill at every file write: the person never ends up without a working code, and confirmed:true is never wrong", async () => {
+  for (let n = 1; n < 40; n++) {
+    const fixture = await hubFixture();
+    const first = await registered(fixture, { name: "First" });
+    const fresh = makeAccount(fixture);
+    const killedDir = join(freshDir(), "account");
+    const killed = await killedAtWrite(fresh, n, killedDir, () => fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }));
+    if (!killed) {
+      assert.ok(n > 3, "the test reached some writes");
+      break;
+    }
+    const after = makeAccount(fixture, { dir: killedDir });
+    await after.start();
+    await sleep(120);
+    const shown = after.status().recoveryCodePending ? await after.showRecoveryCode() : null;
+    const works = async (code) => { const a = makeAccount(fixture); return a.recover({ email: EMAIL, password: PASSWORD, recoveryCode: code, name: "Proof" }).then(() => true, () => false); };
+    if (shown?.confirmed) assert.equal(await works(shown.recoveryCode), true, `write ${n}: confirmed but dead`);
+    else {
+      const oldWorks = await works(first.recoveryCode);
+      assert.ok(oldWorks || (shown && await works(shown.recoveryCode)), `write ${n}: no code works`);
+    }
+  }
+});
+
+test("register: a kill at every file write: if the account exists, its code is held and works", async () => {
+  for (let n = 1; n < 40; n++) {
+    const fixture = await hubFixture();
+    const account = makeAccount(fixture);
+    writeBootstrap(account.dir);
+    await account.start();
+    const killedDir = join(freshDir(), "account");
+    const killed = await killedAtWrite(account, n, killedDir, () => account.register({ email: EMAIL, password: PASSWORD, name: "First" }));
+    if (!killed) {
+      assert.ok(n > 3, "the test reached some writes");
+      break;
+    }
+    const exists = await makeAccount(fixture).signIn({ email: EMAIL, password: PASSWORD, name: "Asker" }).then(() => true, () => false);
+    const after = makeAccount(fixture, { dir: killedDir });
+    await after.start();
+    if (!exists) continue;
+    assert.equal(after.status().recoveryCodePending, true, `write ${n}: the account exists, and no code is held`);
+    const { recoveryCode } = await after.showRecoveryCode();
+    const proof = makeAccount(fixture);
+    await proof.recover({ email: EMAIL, password: PASSWORD, recoveryCode, name: "Proof" });
+    assert.equal(proof.status().phase, "approved", `write ${n}: the held code does not work`);
+  }
+});
+
+test("contested survives a restart, so saved is not refused again; signing out clears the flag; a fresh recover starts clean", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const oldLog = JSON.parse(readFileSync(join(first.dir, "log.json"), "utf8"));
+  const killedDir = await killedRecovery(fixture, first);
+  const lie = (m) => (m.type === "log" ? { ...m, entries: oldLog, head: "old", version: oldLog.length } : m);
+  const a = makeAccount(fixture, { dir: killedDir });
+  a.tap.incoming = lie;
+  await a.start();
+  await until(() => a.status().recoveryContested, "contested");
+  await a.stop();
+  const b = makeAccount(fixture, { dir: killedDir, hubUrl: "http://127.0.0.1:1" });
+  await b.start();
+  assert.equal(b.status().recoveryContested, true, "with no hub to ask at all");
+  assert.equal(b.status().phase, "recovering");
+  const { recoveryCode } = await b.showRecoveryCode();
+  await b.signOut();
+  assert.equal(b.status().recoveryContested, false);
+  assert.equal(b.status().hub.lastError, null);
+  await assert.rejects(b.recoveryCodeSaved(), (e) => e.code === "not-settled");
+  await b.stop();
+  const c = makeAccount(fixture, { dir: killedDir });
+  await c.start();
+  assert.equal(c.status().recoveryContested, false, "still clear after a restart");
+  assert.equal((await c.showRecoveryCode()).recoveryCode, recoveryCode);
+  await c.stop();
+});
+
+test("saved while contested, signed out, then an honest recover with that code: it starts clean and the old attempt is not resent", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const oldLog = JSON.parse(readFileSync(join(first.dir, "log.json"), "utf8"));
+  const killedDir = await killedRecovery(fixture, first);
+  const after = makeAccount(fixture, { dir: killedDir });
+  after.tap.incoming = (m) => (m.type === "log" ? { ...m, entries: oldLog, head: "old", version: oldLog.length } : m);
+  await after.start();
+  await until(() => after.status().recoveryContested, "contested");
+  const { recoveryCode } = await after.showRecoveryCode();
+  await after.recoveryCodeSaved();
+  await after.signOut();
+  after.tap.incoming = undefined;
+  assert.equal(after.status().recoveryContested, false);
+  assert.equal(after.status().hub.lastError, null);
+  const out = await after.recover({ email: EMAIL, password: PASSWORD, recoveryCode, name: "New again" });
+  assert.deepEqual(out, { recoveryCode: null, confirmed: false, alreadyOnLog: true }, "the first recovery had landed, so none is needed");
+  await until(() => after.status().phase === "approved", "the held candidate settles it");
+  assert.equal(after.status().recoveryContested, false);
+  assert.equal(after.status().hub.lastError, null);
+  const proof = makeAccount(fixture);
+  await proof.recover({ email: EMAIL, password: PASSWORD, recoveryCode, name: "Proof" });
+  assert.equal(proof.status().phase, "approved", "and the saved code is the live one");
+});
+
+test("saved while contested on an attempt that never landed, then a new recover: the old attempt is replaced, not resent", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  const killedDir = join(freshDir(), "account");
+  const fresh = makeAccount(fixture);
+  fresh.tap.outgoing = (m) => {
+    if (m.type === "log.append") { cpSync(fresh.dir, killedDir, { recursive: true }); fresh.tap.sockets.at(-1).real.close(); return null; }
+    return m;
+  };
+  await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" }).catch(() => {});
+  await fresh.stop();
+  const after = makeAccount(fixture, { dir: killedDir });
+  let appends = 0;
+  after.tap.outgoing = (m) => {
+    if (m.type !== "log.append") return m;
+    appends++;
+    setImmediate(() => inject(after, { type: "error", code: "invalid-entry", for: "log.append" }));
+    return null;
+  };
+  await after.start();
+  await until(() => after.status().recoveryContested, "contested");
+  const stale = await after.showRecoveryCode();
+  await after.recoveryCodeSaved();
+  await after.signOut();
+  const count = appends;
+  after.tap.outgoing = undefined;
+  const out = await after.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New again" });
+  assert.equal(appends, count);
+  assert.equal(out.confirmed, true);
+  assert.notEqual(out.recoveryCode, stale.recoveryCode);
+  assert.deepEqual(await after.showRecoveryCode(), { recoveryCode: out.recoveryCode, confirmed: true });
+  assert.equal(after.status().phase, "approved");
+  assert.equal(after.status().recoveryContested, false);
+});
+
+test("an unsettled code counts as contested after ten minutes, so the person is not stuck", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  let clock = Date.now();
+  const fresh = makeAccount(fixture, { now: () => clock, limits: { rpcTimeoutMs: 40 } });
+  // The send gets no answer, and neither does any log.get afterwards.
+  fresh.tap.incoming = (m) => (m.type === "log.ok" || m.type === "log.conflict" ? null : m);
+  const out = await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+  assert.equal(out.confirmed, false);
+  await assert.rejects(fresh.recoveryCodeSaved(), (e) => e.code === "not-settled");
+  assert.equal(fresh.status().recoveryContested, false);
+  clock += 10 * 60_000 - 1;
+  assert.equal(fresh.status().recoveryContested, false);
+  await assert.rejects(fresh.recoveryCodeSaved(), (e) => e.code === "not-settled");
+  clock += 1;
+  assert.equal(fresh.status().recoveryContested, true);
+  assert.match(fresh.status().hub.lastError, /Keep every recovery code/);
+  await fresh.recoveryCodeSaved();
+  assert.equal(fresh.status().recoveryCodePending, false);
+});
+
+test("signing out starts the ten minutes again, so a stale code does not read as contested at once", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  let clock = Date.now();
+  const fresh = makeAccount(fixture, { now: () => clock, limits: { rpcTimeoutMs: 40 } });
+  fresh.tap.incoming = (m) => (m.type === "log.ok" || m.type === "log.conflict" ? null : m);
+  await fresh.recover({ email: EMAIL, password: PASSWORD, recoveryCode: first.recoveryCode, name: "New" });
+  clock += 11 * 60_000;
+  assert.equal(fresh.status().recoveryContested, true);
+  await fresh.signOut();
+  assert.equal(fresh.status().recoveryContested, false);
+  assert.equal(fresh.status().hub.lastError, null);
+  clock += 10 * 60_000;
+  assert.equal(fresh.status().recoveryContested, true, "and it is not stuck after that");
+});
+
+test("register: another email is refused while a code for the first is unsaved, so the first code cannot be overwritten", async () => {
+  const fixture = await hubFixture();
+  let lost = true;
+  const account = makeAccount(fixture, { fetchImpl: async (url, init) => {
+    const reply = await fetch(url, init);
+    if (lost && String(url).endsWith("/api/register")) { lost = false; throw new Error("the answer was lost"); }
+    return reply;
+  } });
+  writeBootstrap(account.dir);
+  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }));
+  const held = await account.showRecoveryCode();
+  await assert.rejects(account.register({ email: "other@example.com", password: PASSWORD, name: "First" }), (e) => e.status === 409 && e.code === "recovery-code-pending" && /another email/.test(e.message));
+  assert.deepEqual(await account.showRecoveryCode(), held);
+});
+
+test("register: an error from the hub keeps the code unless it shows nothing was created; closed says so plainly", async () => {
+  // Accepted, then an unknown error.
+  let fixture = await hubFixture();
+  let account = makeAccount(fixture, { fetchImpl: async (url, init) => {
+    const reply = await fetch(url, init);
+    if (String(url).endsWith("/api/register")) return new Response(JSON.stringify({ error: "internal" }), { status: 500 });
+    return reply;
+  } });
+  writeBootstrap(account.dir);
+  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }), (e) => e.status === 500);
+  assert.equal(account.status().recoveryCodePending, true);
+  assert.equal(account.status().recoveryContested, true);
+  const kept = await account.showRecoveryCode();
+  const proof = makeAccount(fixture);
+  await proof.recover({ email: EMAIL, password: PASSWORD, recoveryCode: kept.recoveryCode, name: "Proof" });
+  assert.equal(proof.status().phase, "approved", "it was live");
+  // Closed: nothing of this attempt is live.
+  fixture = await hubFixture();
+  account = makeAccount(fixture);
+  mkdirSync(account.dir, { recursive: true });
+  writeFileSync(join(account.dir, "bootstrap-token"), "wrong-token-0123456789");
+  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "x" }), (e) => e.code === "registration-closed" && /already holds another account/.test(e.message));
+  assert.equal(account.status().recoveryCodePending, false);
+  assert.ok(!existsSync(join(account.dir, "recovery-code.json")));
 });
 
 test("recovery: if the code cannot be stored first, nothing is sent and the old code still works", async () => {

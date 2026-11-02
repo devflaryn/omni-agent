@@ -9,12 +9,9 @@
  * Files, all in one folder (~/.omni-agent/account/ by default), readable only by this user:
  *   keys.json      the private keys, protected (DPAPI, Keychain, or file permissions alone with a warning in status())
  *   session.json   the hub session token, protected the same way
- *   recovery-code.json  a one-time recovery code, protected the same way, from just before the hub call that makes it live until
- *                  the person says they saved it. A kill at any moment must not lose it, and a stolen device must not be able
- *                  to replace it, so it cannot be issued again. Anyone who can read this store already holds this full
- *                  device's keys, so keeping it here that short while gives them nothing they did not have.
+ *   recovery-code.json  a one-time recovery code, protected the same way, with its candidate log and state in one record, from
+ *                  just before the hub call that makes it live until the person says they saved it. See account-recovery.mjs.
  *   state.json     email, name, phase, and a confirmed approval's head and approver (not its code). No secrets.
- *   log.candidate.json  a log about to be sent to the hub, so that a kill right after the hub takes it can be resumed. No secrets.
  *   log.json       the longest log verified so far
  *   settings.json  { allowWebAccess }
  *   alerts.json    what the person has been warned of
@@ -33,6 +30,7 @@ import { LogError, append, canRecover, compareLogs, createLog, deviceCurrent, de
 import { decodeOuter, encodeOuter } from "../ui/channel-frames.js";
 import { AccountError } from "./account-error.mjs";
 import { ChannelSet } from "./account-channels.mjs";
+import { RecoveryStore } from "./account-recovery.mjs";
 import { PLAIN_WARNING, defaultProtector, plainProtector, runCommand, system32 } from "./account-keys.mjs";
 
 export { AccountError } from "./account-error.mjs";
@@ -49,6 +47,7 @@ const DEFAULT_LIMITS = Object.freeze({
   httpTimeoutMs: 20 * SECOND,
   connectTimeoutMs: 15 * SECOND,
   settleRetryMs: MINUTE,
+  unsettledMs: 10 * MINUTE,             // after this a code stuck in doubt counts as contested, so the person can move on
   maxChannels: 64,
   maxChannelsPerDevice: 8,
   maxInboundBytes: 16 * 1024 * 1024,
@@ -77,7 +76,6 @@ const HUB_CLAIMS_REMOVED = "The hub says this device was removed from the accoun
 const CLOSE_SESSION_GONE = 4401, CLOSE_REMOVED = 4403, CLOSE_PENDING_EXPIRED = 4408, CLOSE_REPLACED = 4409, CLOSE_DENIED = 4410;
 
 const SETTINGS_DAMAGED = "The saved settings could not be read, so Allow web page access is off until you choose again.";
-const RECOVERY_CODE_FILE = "recovery-code.json";
 const CONTESTED = "The hub's answers do not match this recovery code, so this computer cannot tell which code counts. Keep every recovery code you have until another device confirms.";
 const LOG_NOT_SAVED = "This computer could not save its device list. It will try again the next time Omni starts: check the disk.";
 // ------------------------------------------------------------------------------ the slow key
@@ -170,10 +168,8 @@ export class Account extends EventEmitter {
   #auditSize = null;
   #alertsWrite = Promise.resolve();
   #alertsQueued = false;
-  #candidate = null;      // { kind, entries }: a log sent, or about to be sent, to the hub and not yet known to have landed
+  #recovery;
   #registerAttempt = null;
-  #codePending = false;
-  #contested = false;     // a hub has contradicted the candidate: nothing is deleted, and the person is told to keep every code
   #lastHubState = null;
   #settleTimer = null;
   #hubClaimedRemoved = false;
@@ -201,6 +197,15 @@ export class Account extends EventEmitter {
     this.reconnect = { minMs: reconnect.minMs ?? SECOND, maxMs: reconnect.maxMs ?? MINUTE };
     this.verifyLogImpl = verifyLogImpl;
     this.on("error", () => {});
+    this.#recovery = new RecoveryStore({
+      dir,
+      now: () => this.now(),
+      unsettledMs: this.limits.unsettledMs,
+      writeSecret: (...args) => this.#writeSecret(...args),
+      readSecret: (record) => this.#readSecret(record),
+      writeFile: (name, text) => this.#writeFile(name, text),
+      warn: (text) => this.#warnings.add(text),
+    });
     this.#links = new ChannelSet({
       limits: this.limits,
       now: () => this.now(),
@@ -231,7 +236,7 @@ export class Account extends EventEmitter {
       email: this.#email,
       accountId: this.#verified?.accountId ?? null,
       device: this.#keys ? { id: this.#keys.signPub, name: this.#name, kind: this.#kind, role: me?.role ?? null } : null,
-      hub: { url: this.hubUrl, connected: this.#connected, attempts: this.#connectAttempts, lastError: this.#hubError },
+      hub: { url: this.hubUrl, connected: this.#connected, attempts: this.#connectAttempts, lastError: this.#recovery.contested ? CONTESTED : this.#hubError },
       logHead: this.#hashes.at(-1) ?? null,
       logVersion: this.#hashes.length,
       pending: this.#phase === "pending" ? { code: this.#exchange?.code ?? null, attempts: this.#attempts, failed: this.#exchangeFailed, confirmed: !!this.#exchange?.confirmed, approvedByHub: this.#approvedByHub } : null,
@@ -242,8 +247,8 @@ export class Account extends EventEmitter {
       alerts: this.#alerts.slice(),
       recoveries: this.#verified?.recoveries ?? [],
       recoveryUnconfirmed: this.#recoveryAt !== null,
-      recoveryCodePending: this.#codePending,
-      recoveryContested: this.#contested,
+      recoveryCodePending: this.#recovery.pending,
+      recoveryContested: this.#recovery.contested,
       channels: this.#links.all().filter((c) => c.state === "open").map((c) => ({ id: c.id, device: c.peerId, name: c.peer.name, direction: c.direction })),
       handshakes: this.#links.all().filter((c) => c.state === "handshake").length,
     };
@@ -441,11 +446,9 @@ export class Account extends EventEmitter {
       this.#alerts = rows;
       if (!Array.isArray(alerts) || rows.length !== alerts.length) this.#warnings.add("The saved security alerts could not be read, so some earlier alerts may be missing.");
     }
-    this.#codePending = await fs.access(join(this.dir, RECOVERY_CODE_FILE)).then(() => true, () => false);
-    const candidate = await this.#readJson("log.candidate.json").catch(() => null);
-    if (Array.isArray(candidate?.entries)) this.#candidate = { kind: candidate.kind, entries: candidate.entries };
+    await this.#recovery.load();
     const state = await this.#readJson("state.json").catch(() => null);
-    this.#email = candidate?.email ?? null;
+    this.#email = this.#recovery.email;
     if (state) {
       this.#email = state.email ?? this.#email;
       this.#name = state.name ?? this.#name;
@@ -492,7 +495,7 @@ export class Account extends EventEmitter {
       }
     }
     if (state?.phase === "denied" || state?.phase === "expired" || state?.phase === "removed") this.#phase = state.phase;
-    else if (this.#session) this.#phase = this.#candidate?.kind === "recover" ? "recovering" : state?.phase === "pending" ? "pending" : "approved";
+    else if (this.#session) this.#phase = this.#recovery.candidate?.kind === "recover" ? "recovering" : state?.phase === "pending" ? "pending" : "approved";
     if (this.#phase === "approved" && !this.#verified?.devices.has(this.#keys.signPub)) this.#phase = "pending";
     this.#changed();
     if (this.#session && ["approved", "pending", "recovering"].includes(this.#phase)) this.#connect();
@@ -586,27 +589,24 @@ export class Account extends EventEmitter {
     this.#name = clip(name, 128) || this.#name;
     await this.#ensureDir();
     await this.#ensureKeys();
+    // That code may be the live one of another registration, and this one would overwrite it.
+    if (this.#recovery.pending && this.#recovery.email !== email) throw new AccountError(409, "recovery-code-pending", "This computer holds a recovery code for another email that you have not saved yet. Save that one first.");
     // A registration from before a kill may have reached the hub. If this password opens it, that is the account.
-    if (this.#candidate?.kind === "register" && !this.#registerAttempt && await this.#resumeRegistration(email, password)) {
+    if (this.#recovery.candidate?.kind === "register" && !this.#registerAttempt && await this.#resumeRegistration(email, password)) {
       return { recoveryCode: null, signedIn: true, resumed: true };
     }
     // A retry after no answer sends the same thing, so that if the first one landed its code is the code that counts.
     const retry = this.#registerAttempt?.email === email ? this.#registerAttempt : null;
     // What an earlier, killed attempt left: if the hub turns this one down, that one may be the live account and its code.
-    const earlier = retry ? null : await this.#unsettledFiles();
+    const earlier = retry ? null : await this.#recovery.snapshot();
     const { recoveryCode, entries, salt } = retry ?? await this.#newRegistration(email);
     const loginKey = await this.#loginKey(password, salt);
     const token = await this.#bootstrapToken();
-    // Both on disk before the hub can make them live. Nothing has been sent if either fails, unless this is a retry.
+    // On disk as one before the hub can make it live. Nothing has been sent if this fails.
     try {
-      await this.#storeRecoveryCode(recoveryCode);
-      await this.#writeCandidate("register", email, entries);
+      await this.#recovery.prepare({ kind: "register", email, code: recoveryCode, entries });
     } catch (error) {
-      if (!retry) {
-        this.#registerAttempt = null;
-        await this.#dropRecoveryCode();
-        await this.#restoreUnsettled(earlier);
-      }
+      if (!retry) this.#registerAttempt = null;
       throw error;
     }
     let accepted = true;
@@ -614,23 +614,28 @@ export class Account extends EventEmitter {
       await this.#post("/api/register", { email, salt: toB64(salt), verifierInput: loginKey, firstLogEntry: entries[0], ...(token ? { bootstrapToken: token } : {}) });
     } catch (error) {
       if (error.code === "hub-unreachable") throw error;
-      if (!retry) {
+      if (!retry && NOTHING_CREATED.has(error.code)) {
         this.#registerAttempt = null;
-        await this.#dropCandidate();
-        await this.#dropRecoveryCode();
-        await this.#restoreUnsettled(earlier);
+        await this.#recovery.apply("nothingCreated");
+        await this.#recovery.restore(earlier);
+        this.#changed();
+        if (error.code === "registration-closed") throw new AccountError(403, error.code, "This hub is closed to registration: it already holds another account, or the bootstrap token is wrong. Nothing was created by this attempt.");
+        throw error;
+      }
+      if (!retry) {
+        // Any other error may have come after the account was made.
+        await this.#contest();
         throw error;
       }
       accepted = false;
       // Refused the second time: the first may have landed. Only a login shows that, and a mistyped password shows nothing.
       const state = await this.#login(email, loginKey).catch(() => null);
       if (state !== "approved") {
-        this.#contest();
+        await this.#contest();
         throw error;
       }
     }
     this.#registerAttempt = null;
-    this.#contested = false;
     clearTimeout(this.#settleTimer);
     // The account exists now. From here nothing may stop the person getting this code: it is never shown again.
     this.#email = email;
@@ -674,26 +679,12 @@ export class Account extends EventEmitter {
 
   // ---------------------------------------------------------------------------- the one-time code, while it is on disk
 
-  async #storeRecoveryCode(code) {
-    await this.#writeSecret(RECOVERY_CODE_FILE, {}, Buffer.from(code));
-    this.#codePending = true;
-    this.#changed();
-  }
-
-  async #dropRecoveryCode() {
-    this.#codePending = false;
-    await this.#tryLocal(() => fs.rm(join(this.dir, RECOVERY_CODE_FILE), { force: true }), "A used recovery code could not be deleted from the account folder.");
-    this.#changed();
-  }
-
-  /** The stored code. `confirmed` is false while the hub may not have taken it, and then it may not work yet. */
+  /** The stored code. `confirmed` is false while a log from the hub has not shown it, and then it may not work yet. */
   async showRecoveryCode() {
     await this.start();
-    if (!this.#codePending) throw new AccountError(404, "no-code", "There is no recovery code waiting to be shown.");
-    let record;
+    if (!this.#recovery.pending) throw new AccountError(404, "no-code", "There is no recovery code waiting to be shown.");
     try {
-      record = await this.#readJson(RECOVERY_CODE_FILE);
-      return { recoveryCode: Buffer.from(await this.#readSecret(record)).toString(), confirmed: !this.#candidate };
+      return { recoveryCode: await this.#recovery.code(), confirmed: this.#recovery.confirmed };
     } catch {
       throw new AccountError(500, "code-unavailable", "The stored recovery code could not be opened on this computer.");
     }
@@ -702,30 +693,10 @@ export class Account extends EventEmitter {
   /** The person says they saved it. Until then it stays, and the UI keeps asking. */
   async recoveryCodeSaved() {
     await this.start();
-    // While nothing is known it stays. Once a hub has contradicted it, waiting may never end, so the person may decide.
-    if (this.#candidate && !this.#contested) throw new AccountError(409, "not-settled", "Wait until the hub has confirmed this code before discarding it.");
-    await this.#dropRecoveryCode();
-    return { recoveryCodePending: false };
-  }
-
-  async #unsettledFiles() {
-    if (!this.#candidate && !this.#codePending) return null;
-    const read = (name) => fs.readFile(join(this.dir, name), "utf8").catch(() => null);
-    return { candidate: await read("log.candidate.json"), code: await read(RECOVERY_CODE_FILE) };
-  }
-
-  async #restoreUnsettled(earlier) {
-    if (!earlier) return;
-    if (earlier.candidate) {
-      await this.#writeFile("log.candidate.json", earlier.candidate);
-      const parsed = JSON.parse(earlier.candidate);
-      this.#candidate = { kind: parsed.kind, entries: parsed.entries };
-    }
-    if (earlier.code) {
-      await this.#writeFile(RECOVERY_CODE_FILE, earlier.code);
-      this.#codePending = true;
-    }
+    if (this.#recovery.pending && !this.#recovery.mayDiscard) throw new AccountError(409, "not-settled", "Wait until the hub has confirmed this code before discarding it.");
+    await this.#recovery.apply("saved");
     this.#changed();
+    return { recoveryCodePending: false };
   }
 
   async #tryLocal(work, warning) {
@@ -737,16 +708,6 @@ export class Account extends EventEmitter {
       this.log("account: a local step failed after the hub had accepted");
       return false;
     }
-  }
-
-  async #writeCandidate(kind, email, entries) {
-    await this.#writeFile("log.candidate.json", JSON.stringify({ v: 1, kind, email, entries }));
-    this.#candidate = { kind, entries };
-  }
-
-  async #dropCandidate() {
-    this.#candidate = null;
-    await fs.rm(join(this.dir, "log.candidate.json"), { force: true }).catch(() => {});
   }
 
   /** The hub has this log. Never throws: a failure here only costs this computer its copy, which the candidate can restore. */
@@ -762,7 +723,7 @@ export class Account extends EventEmitter {
       this.#warnings.add(LOG_NOT_SAVED);
       return false;
     });
-    if (saved) await this.#dropCandidate();
+    if (saved) await this.#recovery.apply("settled");
     return saved;
   }
 
@@ -771,7 +732,7 @@ export class Account extends EventEmitter {
    * one-time code was lost unless it was handed out before. If not, nothing happened and the old recovery code stands.
    */
   async #resolveCandidate(hubState) {
-    const candidate = this.#candidate;
+    const candidate = this.#recovery.candidate;
     if (!candidate) return;
     this.#lastHubState = hubState;
     const entry = candidate.entries.at(-1);
@@ -810,9 +771,8 @@ export class Account extends EventEmitter {
       else this.#alert("different-account", String(verified.accountId));
       return this.#contest();
     }
-    if (await this.#adoptLocked(entries, verified, { bestEffort: true })) await this.#dropCandidate();
+    if (await this.#adoptLocked(entries, verified, { bestEffort: true })) await this.#recovery.apply("settled");
     if (candidate.kind === "recover") this.#recoveryAt ??= candidate.entries.length - 1;
-    this.#contested = false;
     this.#hubError = null;
     clearTimeout(this.#settleTimer);
     this.#phase = "approved";
@@ -821,9 +781,8 @@ export class Account extends EventEmitter {
   }
 
   /** The person keeps every code they hold, and may now say they saved this one. It is asked again later, since a lie may stop. */
-  #contest() {
-    this.#contested = true;
-    this.#hubError = CONTESTED;
+  async #contest() {
+    await this.#recovery.apply("contradicted");
     clearTimeout(this.#settleTimer);
     this.#settleTimer = setTimeout(() => this.#settleAgain(), this.limits.settleRetryMs);
     this.#settleTimer.unref?.();
@@ -831,7 +790,7 @@ export class Account extends EventEmitter {
   }
 
   async #settleAgain() {
-    if (!this.#candidate || !this.#connected) return;
+    if (!this.#recovery.candidate || !this.#connected) return;
     try {
       await this.#resolveCandidate(this.#lastHubState);
     } catch {
@@ -866,7 +825,7 @@ export class Account extends EventEmitter {
     const state = await this.#login(email, await this.#loginKey(password, salt));
     if (state === "approved") {
       // The hub's word alone is not enough: this device must already hold a log that names it, or one it sent itself.
-      if (!this.#verified?.devices.has(this.#keys.signPub) && !this.#candidate) {
+      if (!this.#verified?.devices.has(this.#keys.signPub) && !this.#recovery.candidate) {
         this.#alert("fake-log", "no-anchor");
         await this.#forgetSession();
         throw new AccountError(409, "no-anchor", "The hub says this device is on the account, but this computer holds no log to check that against. Sign out and forget this device to sign in again as a new one.");
@@ -902,11 +861,9 @@ export class Account extends EventEmitter {
     this.#online = new Set();
     this.#approvedByHub = false;
     this.#hubError = null;
+    await this.#recovery.apply(forget ? "forgotten" : "signedOut");
     if (forget) {
-      for (const file of ["keys.json", "log.json", "state.json", "log.candidate.json", RECOVERY_CODE_FILE]) await fs.rm(join(this.dir, file), { force: true });
-      this.#codePending = false;
-      this.#candidate = null;
-      this.#contested = false;
+      for (const file of ["keys.json", "log.json", "state.json"]) await fs.rm(join(this.dir, file), { force: true });
       this.#recoveryAt = null;
       this.#keys = null;
       this.#log = null;
@@ -1053,6 +1010,7 @@ export class Account extends EventEmitter {
       } catch (error) {
         clearTimeout(waiter.timer);
         this.#waiters = this.#waiters.filter((w) => w !== waiter);
+        error.neverSent = true;
         reject(error);
       }
     });
@@ -1140,7 +1098,8 @@ export class Account extends EventEmitter {
     this.#hubError = null;
     this.#hubClaimedRemoved = false;
     this.#changed();
-    if (this.#candidate) {
+    for (const waiter of this.#socketWaiters.splice(0)) waiter();
+    if (this.#recovery.candidate) {
       try {
         await this.#resolveCandidate(state);
       } catch {
@@ -1154,11 +1113,10 @@ export class Account extends EventEmitter {
         this.#sendNow({ type: "presence" });
         if (this.#role() === "full") this.#sendNow({ type: "pending.list" });
       } catch { /* the socket went: the next connection does this again */ }
-    } else if (this.#phase === "pending" && state === "approved" && !this.#candidate) {
+    } else if (this.#phase === "pending" && state === "approved" && !this.#recovery.candidate) {
       this.#approvedByHub = true;
       this.#tryFinishApproval();
     }
-    for (const waiter of this.#socketWaiters.splice(0)) waiter();
   }
 
   #socketWaiters = [];
@@ -1561,9 +1519,24 @@ export class Account extends EventEmitter {
       throw new AccountError(409, "removed", "This device was removed from the account. Sign out and forget this device first.");
     }
     // That code may be the live one, and a failed attempt here must not cost it.
-    if (this.#codePending) throw new AccountError(409, "recovery-code-pending", "This computer holds a recovery code you have not saved yet. Save that one first.");
+    if (this.#recovery.pending) throw new AccountError(409, "recovery-code-pending", "This computer holds a recovery code you have not saved yet. Save that one first.");
     const salt = await this.#saltFor(email);
-    await this.#login(email, await this.#loginKey(password, salt));
+    const hubState = await this.#login(email, await this.#loginKey(password, salt));
+    // Already on the list, by an earlier recovery that landed. The log would refuse another for this key, and none is needed.
+    if (hubState === "approved") {
+      const known = this.#verified?.devices.has(this.#keys.signPub);
+      if (!known && !this.#recovery.candidate) {
+        this.#alert("fake-log", "no-anchor");
+        await this.#forgetSession();
+        throw new AccountError(409, "no-anchor", "The hub says this device is on the account, but this computer holds no log to check that against. Sign out and forget this device to start over.");
+      }
+      this.#phase = known ? "approved" : "recovering";
+      await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
+      this.#connect();
+      this.#changed();
+      return { recoveryCode: null, confirmed: false, alreadyOnLog: true };
+    }
+    await this.#recovery.apply("replaced"); // the person saved that code and is starting again
     this.#phase = "recovering";
     this.#connect();
     let nextCode, sent = null;
@@ -1584,19 +1557,22 @@ export class Account extends EventEmitter {
         if (sent && await this.#holdsCandidate(sent, reply.entries)) return this.#finishRecovery(nextCode, reply.entries, sent.length - 1);
         const entries = await this.#checkedRecoveryLog(reply.entries, recovery);
         const appended = await recoverOnto(entries, { name: this.#name, kind: this.#kind, signPub: this.#keys.signPub, boxPub: this.#keys.boxPub }, { current: recovery, next, addedAt: this.now() });
-        // Both on disk before the hub can make them live. Nothing has been sent if either fails: the old code stands.
-        await this.#storeRecoveryCode(nextCode);
-        await this.#writeCandidate("recover", email, appended);
+        // On disk as one before the hub can make it live. Nothing has been sent if this fails: the old code stands.
+        await this.#recovery.prepare({ kind: "recover", email, code: nextCode, entries: appended });
         sent = appended;
         let answer;
         try {
           answer = await this.#rpc({ type: "log.append", prevHead: entries.at(-1) ? await entryHash(entries.at(-1)) : "", entry: appended.at(-1) }, ["log.ok", "log.conflict"]);
         } catch (error) {
-          // No answer: the old code may be dead already. The person gets the new one and keeps both until the reconnect settles it.
-          if (error.code === "hub-unreachable" || error.code === "hub-timeout") return this.#recoveryInDoubt(nextCode, appended);
-          if (attempt > 0) return this.#recoveryInDoubt(nextCode, appended); // an earlier attempt may have landed
-          sent = null;
-          throw error;
+          // It never left this computer, and nothing earlier did: the old code stands and this one never counted.
+          if (error.neverSent && attempt === 0) {
+            await this.#recovery.apply("nothingCreated");
+            sent = null;
+            throw error;
+          }
+          // Any other answer, an error included: a hub can append and then say anything. The old code may be dead already, so
+          // the person gets the new one and keeps both until a log settles it.
+          return this.#recoveryInDoubt(nextCode, appended);
         }
         if (answer.type === "log.conflict") continue;
         return this.#finishRecovery(nextCode, appended, appended.length - 1);
@@ -1604,8 +1580,6 @@ export class Account extends EventEmitter {
       return this.#recoveryInDoubt(nextCode, sent); // only ever told "conflict": any of those may have landed
     } catch (error) {
       if (sent) return this.#recoveryInDoubt(nextCode, sent);
-      await this.#dropCandidate();
-      await this.#dropRecoveryCode();
       this.#phase = "signed-out";
       this.#dropConnection("signed-out");
       await this.#forgetSession().catch(() => {});
@@ -1757,5 +1731,7 @@ const HUB_ERROR_TEXT = {
   "not-found": "That sign-in is no longer waiting.",
   "invalid-entry": "The hub refused the change to the device list.",
 };
+/** What a hub's reply to a registration says was not created. Anything else may have come after the account was made. */
+const NOTHING_CREATED = new Set(["bad-email", "bad-salt", "bad-verifier", "bad-log-entry", "bad-json", "json-only", "too-large", "origin", "locked", "too-many-pending", "busy", "registration-closed", "already-registered"]);
 const hubErrorText = (code) => (Object.hasOwn(HUB_ERROR_TEXT, code) ? HUB_ERROR_TEXT[code] : `The hub refused this (${code}).`);
 const HUB_CODE_STATUS = { "wrong-credentials": 401, locked: 429, busy: 503, conflict: 409, forbidden: 403, "not-found": 404, "invalid-entry": 400, "bad-message": 400 };
