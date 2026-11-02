@@ -18,25 +18,22 @@
  *
  * Never logged, alerted, audited or put in an error: keys, tokens, passwords, codes.
  */
-import { execFile } from "node:child_process";
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { promises as fs } from "node:fs";
 import { hostname } from "node:os";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { checkPassword, fromB64, loginKeyFrom, newDeviceExchange, newDeviceKeys, newRecoveryCode, approverExchange, recoveryKeysFrom, sign, startHandshake, toB64, verify } from "../ui/account-core.js";
+import { approverExchange, checkPassword, fromB64, newDeviceExchange, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, toB64, verify } from "../ui/account-core.js";
 import { LogError, append, canRecover, compareLogs, createLog, deviceCurrent, deviceExpiresAt, entryHash, verifyLog } from "../ui/device-log.js";
-import { CLOSE_REASONS, FRAME, decodeFrame, decodeOuter, encodeFrame, encodeOuter } from "../ui/channel-frames.js";
+import { decodeOuter, encodeOuter } from "../ui/channel-frames.js";
+import { AccountError } from "./account-error.mjs";
+import { ChannelSet } from "./account-channels.mjs";
+import { PLAIN_WARNING, defaultProtector, plainProtector, runCommand, system32 } from "./account-keys.mjs";
 
-export class AccountError extends Error {
-  constructor(status, code, message) {
-    super(message ?? code);
-    this.name = "AccountError";
-    this.status = status;
-    this.code = code;
-  }
-}
+export { AccountError } from "./account-error.mjs";
+export { handleAccountRoutes } from "./account-routes.mjs";
+export { keychainProtector, plainProtector, windowsProtector } from "./account-keys.mjs";
 
 const SECOND = 1000;
 const MINUTE = 60 * SECOND;
@@ -67,95 +64,15 @@ const safeCode = (code) => String(code ?? "").replace(/[^\w.-]/g, "").slice(0, 6
 const AUTH_DOMAIN = "omni-hub-auth-v1";
 const RECOVERY_DOMAIN = "omni-hub-recovery-v1";
 const CLAIM_DOMAIN = "omni-approval-claim-v1";
-const TIMER_MAX = 2 ** 31 - 1;
 const encoder = new TextEncoder();
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 const clip = (value, max) => String(value ?? "").trim().slice(0, max);
 const isFiniteDevice = (value) => typeof value === "string" && value.length > 0 && value.length < 4096;
-const DISAGREEMENT_REASONS = new Set(["not-on-log", "removed", "expired", "log-mismatch"]);
 const HUB_CLAIMS_REMOVED = "The hub says this device was removed from the account, and it would not show the device list. This computer's own list still has it. Sign in again to check.";
 const CLOSE_SESSION_GONE = 4401, CLOSE_REMOVED = 4403, CLOSE_PENDING_EXPIRED = 4408, CLOSE_REPLACED = 4409, CLOSE_DENIED = 4410;
 
-// ------------------------------------------------------------------------------ protecting secrets
-
-function runCommand(cmd, args, input) {
-  return new Promise((resolve, reject) => {
-    const child = execFile(cmd, args, { windowsHide: true, timeout: 30 * SECOND, maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => {
-      // The message is ours: stderr or the arguments could hold anything.
-      if (error) reject(new Error(`${basename(cmd)} failed`));
-      else resolve(stdout);
-    });
-    child.stdin.on("error", () => {});
-    child.stdin.end(input ?? "");
-  });
-}
-
-const system32 = (exe) => join(process.env.SystemRoot || "C:\\Windows", "System32", exe);
-
-/** DPAPI through PowerShell, for this user. The data goes over stdin, never in an argument. */
-export function windowsProtector({ run = runCommand } = {}) {
-  const powershell = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const call = async (method, bytes) => {
-    const script = `Add-Type -AssemblyName System.Security; $b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim()); [Convert]::ToBase64String([Security.Cryptography.ProtectedData]::${method}($b,$null,'CurrentUser'))`;
-    const out = await run(powershell, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], Buffer.from(bytes).toString("base64"));
-    const result = Buffer.from(out.trim(), "base64");
-    if (!result.length) throw new Error(`DPAPI ${method} returned nothing`);
-    return result;
-  };
-  return { name: "dpapi", warning: null, protect: (bytes) => call("Protect", bytes), unprotect: (bytes) => call("Unprotect", bytes) };
-}
-
-/**
- * A random wrapping key kept in the login Keychain through `security`, and AES-256-GCM with it. The key goes in through
- * `security -i` on stdin, since an argument could be seen by any process.
- */
-export function keychainProtector({ service, run = runCommand } = {}) {
-  const security = "/usr/bin/security";
-  const ACCOUNT = "omni-agent";
-  let cached = null;
-  const wrappingKey = async ({ create }) => {
-    if (cached) return cached;
-    try {
-      const hex = (await run(security, ["find-generic-password", "-a", ACCOUNT, "-s", service, "-w"])).trim();
-      if (/^[0-9a-f]{64}$/.test(hex)) return (cached = Buffer.from(hex, "hex"));
-    } catch { /* no such item yet */ }
-    if (!create) throw new Error("no key in the Keychain");
-    const key = randomBytes(32);
-    await run(security, ["-i"], `add-generic-password -a ${ACCOUNT} -s ${service} -U -w ${key.toString("hex")}\n`);
-    return (cached = key);
-  };
-  return {
-    name: "keychain",
-    warning: null,
-    async protect(bytes) {
-      const key = await wrappingKey({ create: true });
-      const iv = randomBytes(12);
-      const cipher = createCipheriv("aes-256-gcm", key, iv);
-      const sealed = Buffer.concat([cipher.update(bytes), cipher.final()]);
-      return Buffer.concat([iv, cipher.getAuthTag(), sealed]);
-    },
-    async unprotect(blob) {
-      const key = await wrappingKey({ create: false });
-      const decipher = createDecipheriv("aes-256-gcm", key, blob.subarray(0, 12));
-      decipher.setAuthTag(blob.subarray(12, 28));
-      return Buffer.concat([decipher.update(blob.subarray(28)), decipher.final()]);
-    },
-  };
-}
-
 const SETTINGS_DAMAGED = "The saved settings could not be read, so Allow web page access is off until you choose again.";
 const LOG_NOT_SAVED = "This computer could not save its device list. It will try again the next time Omni starts: check the disk.";
-const PLAIN_WARNING = "This computer's keys are protected by file permissions alone: any program running as you can read them.";
-export function plainProtector() {
-  return { name: "none", warning: PLAIN_WARNING, protect: async (bytes) => Buffer.from(bytes), unprotect: async (bytes) => Buffer.from(bytes) };
-}
-
-function defaultProtector(dir) {
-  if (process.platform === "win32") return windowsProtector();
-  if (process.platform === "darwin") return keychainProtector({ service: `omni-agent-${createHash("sha256").update(dir).digest("hex").slice(0, 16)}` });
-  return plainProtector();
-}
-
 // ------------------------------------------------------------------------------ the slow key
 
 /** The core's scrypt is JavaScript and runs for seconds, so it gets its own thread: the server keeps answering meanwhile. */
@@ -169,81 +86,6 @@ function loginKeyInWorker(password, salt) {
     worker.once("message", (key) => { resolve(key); worker.terminate(); });
     worker.once("error", () => reject(new Error("could not derive the login key")));
   });
-}
-
-// ------------------------------------------------------------------------------ a channel
-
-/** One encrypted channel to one device. sendFrame and onFrame carry sealed frames, in order. */
-class Channel extends EventEmitter {
-  closed = false;
-  state = "handshake";
-  #onFrame = null;
-  #backlog = [];
-  #outChain = Promise.resolve();
-  #inChain = Promise.resolve();
-  #inBytes = 0;
-  #send;
-  #closing;
-  #timer = null;
-
-  constructor({ id, peerId, direction, send, closing }) {
-    super();
-    this.id = id;
-    this.peerId = peerId;
-    this.direction = direction;
-    this.peer = { id: peerId, name: "", kind: "", role: "" };
-    this.core = null;
-    this.handshake = null;
-    this.ready = { sent: false, received: false };
-    this.#send = send;
-    this.#closing = closing;
-    this.on("error", () => {});
-  }
-
-  /** Runs one incoming step at a time, in the order they came. Returns false when too much is waiting. */
-  enqueue(bytes, step, maxBytes) {
-    this.#inBytes += bytes;
-    if (this.#inBytes > maxBytes) return false;
-    // A step that throws was handling something it could not make sense of, and that ends this channel, not the server.
-    this.#inChain = this.#inChain.then(() => (this.closed ? undefined : step())).catch(() => this.close("closed")).finally(() => { this.#inBytes -= bytes; });
-    return true;
-  }
-
-  setTimer(timer) {
-    clearTimeout(this.#timer);
-    this.#timer = timer;
-  }
-
-  onFrame(callback) {
-    this.#onFrame = callback;
-    for (const frame of this.#backlog.splice(0)) callback(frame);
-  }
-
-  deliver(frame) {
-    if (this.#onFrame) this.#onFrame(frame);
-    else this.#backlog.push(frame);
-  }
-
-  /** Seals and sends, in the order called. Resolves once the frame is in the socket and there was room for it. */
-  sendFrame(bytes) {
-    if (this.closed || !this.core) return Promise.reject(new Error("the channel is closed"));
-    const result = this.#outChain.then(async () => {
-      if (this.closed) throw new Error("the channel is closed");
-      await this.#send(this, Buffer.from(await this.core.seal(bytes)).toString("base64"));
-    });
-    this.#outChain = result.catch(() => {});
-    return result;
-  }
-
-  /** `reason` is a key of CLOSE_REASONS, or text. `notify` tells the far side, which is pointless when it told us. */
-  close(reason = "closed", { notify = true } = {}) {
-    if (this.closed) return;
-    this.closed = true;
-    this.state = "closed";
-    clearTimeout(this.#timer);
-    this.#closing(this, reason, notify);
-    this.emit("close", CLOSE_REASONS[reason] ?? String(reason));
-  }
 }
 
 // ------------------------------------------------------------------------------ recovery keys on the log
@@ -303,7 +145,7 @@ export class Account extends EventEmitter {
   #recoveryAt = null;     // the position of this device's own recover, until another device shows it holds that entry
   #acceptExchange = true; // one exchange per press of the person's button: a hub cannot try again by itself
   #approvedByHub = false;
-  #channels = new Map();
+  #links;
   #dirReady = null;
   #started = null;
   #stopped = false;
@@ -350,6 +192,22 @@ export class Account extends EventEmitter {
     this.reconnect = { minMs: reconnect.minMs ?? SECOND, maxMs: reconnect.maxMs ?? MINUTE };
     this.verifyLogImpl = verifyLogImpl;
     this.on("error", () => {});
+    this.#links = new ChannelSet({
+      limits: this.limits,
+      now: () => this.now(),
+      keys: () => this.#keys,
+      phase: () => this.#phase,
+      connected: () => this.#connected,
+      verified: () => this.#verified,
+      hashes: () => this.#hashes,
+      allowWebAccess: () => this.#settings.allowWebAccess,
+      syncLog: () => this.syncLog(),
+      sendPaced: (message) => this.#sendPaced(message),
+      alert: (kind, detail) => this.#alert(kind, detail),
+      emit: (name, ...args) => this.emit(name, ...args),
+      changed: () => this.#changed(),
+      peerHeadSigned: (head) => { if (this.#recoveryAt !== null && this.#hashes.indexOf(head) >= this.#recoveryAt) this.#recoveryConfirmed(); },
+    });
   }
 
   // ---------------------------------------------------------------------------- what is shown
@@ -376,8 +234,8 @@ export class Account extends EventEmitter {
       recoveries: this.#verified?.recoveries ?? [],
       recoveryUnconfirmed: this.#recoveryAt !== null,
       recoveryCodeNotShown: this.#codeNotShown,
-      channels: [...this.#channels.values()].filter((c) => c.state === "open").map((c) => ({ id: c.id, device: c.peerId, name: c.peer.name, direction: c.direction })),
-      handshakes: [...this.#channels.values()].filter((c) => c.state === "handshake").length,
+      channels: this.#links.all().filter((c) => c.state === "open").map((c) => ({ id: c.id, device: c.peerId, name: c.peer.name, direction: c.direction })),
+      handshakes: this.#links.all().filter((c) => c.state === "handshake").length,
     };
   }
 
@@ -400,7 +258,7 @@ export class Account extends EventEmitter {
     this.#settings.allowWebAccess = allowWebAccess;
     await this.#writeFile("settings.json", JSON.stringify(this.#settings));
     this.#warnings.delete(SETTINGS_DAMAGED);
-    if (!allowWebAccess) for (const c of [...this.#channels.values()]) if (c.peer.role === "client") c.close("web-access-off");
+    if (!allowWebAccess) for (const c of this.#links.all()) if (c.peer.role === "client") c.close("web-access-off");
     this.#changed();
     return this.settings();
   }
@@ -649,7 +507,7 @@ export class Account extends EventEmitter {
   }
 
   #closeAllChannels(reason) {
-    for (const channel of [...this.#channels.values()]) channel.close(reason);
+    for (const channel of this.#links.all()) channel.close(reason);
   }
 
   // ---------------------------------------------------------------------------- the hub over HTTP
@@ -1113,7 +971,7 @@ export class Account extends EventEmitter {
         return undefined;
       case "presence":
         this.#online = new Set(Array.isArray(message.online) ? message.online.filter((k) => typeof k === "string") : []);
-        for (const channel of [...this.#channels.values()]) {
+        for (const channel of this.#links.all()) {
           if (channel.state === "open" && !this.#online.has(channel.peerId)) channel.close("the other device went offline", { notify: false });
         }
         this.#answerWaiter(message);
@@ -1128,7 +986,7 @@ export class Account extends EventEmitter {
         return undefined;
       case "error":
         if (message.for === "channel.msg" && typeof message.to === "string") {
-          for (const channel of [...this.#channels.values()]) {
+          for (const channel of this.#links.all()) {
             if (channel.peerId === message.to) channel.close(message.code === "busy" ? "the other device is not reading, so the channel was closed" : "the other device cannot be reached", { notify: false });
           }
           return undefined;
@@ -1227,7 +1085,7 @@ export class Account extends EventEmitter {
       this.#changed();
       return saved;
     }
-    this.#recheckChannels();
+    this.#links.recheck();
     return saved;
   }
 
@@ -1672,87 +1530,8 @@ export class Account extends EventEmitter {
     return { ok: true };
   }
 
-  // ---------------------------------------------------------------------------- channels
-
-  #channelKey(peerId, id) { return `${peerId}|${id}`; }
-
-  #countFor(peerId) {
-    return [...this.#channels.values()].filter((c) => c.peerId === peerId).length;
-  }
-
-  #newChannel(id, peerId, direction) {
-    const channel = new Channel({
-      id, peerId, direction,
-      send: (ch, d) => this.#sendPaced({ type: "channel.msg", to: ch.peerId, opaque: encodeOuter({ c: ch.id, t: "data", d }) }),
-      closing: (ch, reason, notify) => this.#onChannelClosing(ch, reason, notify),
-    });
-    this.#channels.set(this.#channelKey(peerId, id), channel);
-    return channel;
-  }
-
-  #onChannelClosing(channel, reason, notify) {
-    this.#channels.delete(this.#channelKey(channel.peerId, channel.id));
-    if (notify && this.#connected && Object.hasOwn(CLOSE_REASONS, reason)) {
-      this.#sendPaced({ type: "channel.msg", to: channel.peerId, opaque: encodeOuter({ c: channel.id, t: "close", reason }) }).catch(() => {});
-    }
-    channel.rejectOpening?.(new AccountError(502, "channel-refused", CLOSE_REASONS[reason] ?? String(reason)));
-    this.emit("channel-closed", channel);
-    this.#changed();
-  }
-
-  /** A device still current on the log, or null. An unknown one may just be news, so the log is fetched once to see. */
-  async #currentDevice(peerId) {
-    const known = () => {
-      const device = this.#verified?.devices.get(peerId);
-      return device && deviceCurrent(device, this.now()) ? device : null;
-    };
-    if (known()) return known();
-    try { await this.syncLog(); } catch { return null; }
-    return known();
-  }
-
-  /** The reason this device may not hold a channel here, or null. */
-  async #whyRefused(peerId, direction) {
-    if (this.#phase !== "approved") return "unavailable";
-    const device = await this.#currentDevice(peerId);
-    if (!device) return "not-on-log";
-    if (direction === "in" && device.role === "client" && !this.#settings.allowWebAccess) return "web-access-off";
-    return null;
-  }
-
   /** Opens a channel to another machine on the account. */
-  async openChannel(deviceId) {
-    if (this.#phase === "log-damaged") throw new AccountError(409, "log-damaged", "The device log on this computer is damaged.");
-    if (this.#phase !== "approved" || !this.#connected) throw new AccountError(409, "not-connected", "This computer is not connected to the account.");
-    const peerDevice = await this.#currentDevice(deviceId);
-    if (!peerDevice) throw new AccountError(404, "no-such-device", "That device is not on the account.");
-    if (deviceId === this.#keys.signPub) throw new AccountError(400, "self", "This is this computer.");
-    const id = toB64(globalThis.crypto.getRandomValues(new Uint8Array(16)));
-    const channel = this.#newChannel(id, deviceId, "out");
-    channel.peer = { id: deviceId, name: peerDevice.name, kind: peerDevice.kind, role: peerDevice.role };
-    const opened = new Promise((resolve, reject) => {
-      channel.resolveOpening = resolve;
-      channel.rejectOpening = reject;
-    });
-    opened.catch(() => {});
-    this.#armHandshakeTimer(channel);
-    try {
-      channel.handshake = await startHandshake({ device: this.#keys, peerPub: deviceId, logHead: this.#hashes.at(-1) });
-      await this.#sendPaced({ type: "channel.msg", to: deviceId, opaque: encodeOuter({ c: id, t: "hello", ...channel.handshake.hello }) });
-    } catch (error) {
-      channel.close(error.message, { notify: false });
-      throw error;
-    }
-    return opened;
-  }
-
-  #armHandshakeTimer(channel) {
-    const timer = setTimeout(() => {
-      if (channel.state === "handshake") channel.close("the other device did not finish connecting", { notify: false });
-    }, this.limits.handshakeTimeoutMs);
-    timer.unref?.();
-    channel.setTimer(timer);
-  }
+  openChannel(deviceId) { return this.#links.open(deviceId); }
 
   #onChannelMessage(from, opaque) {
     const outer = decodeOuter(opaque);
@@ -1765,159 +1544,7 @@ export class Account extends EventEmitter {
       }
       return;
     }
-    if (typeof outer.c !== "string" || outer.c.length > 64) return;
-    const channel = this.#channels.get(this.#channelKey(from, outer.c));
-    if (!channel) {
-      if (outer.t === "hello") this.#onHello(from, outer);
-      return;
-    }
-    const size = opaque.length;
-    let queued;
-    switch (outer.t) {
-      case "hello": queued = channel.enqueue(size, () => this.#finishHandshake(channel, outer), this.limits.maxInboundBytes); break;
-      case "proof": queued = channel.enqueue(size, () => this.#onProof(channel, outer), this.limits.maxInboundBytes); break;
-      case "data": queued = channel.enqueue(size, () => this.#onData(channel, outer), this.limits.maxInboundBytes); break;
-      case "close":
-        // Being told no by a device this computer trusts means the two logs disagree: a security matter, not a plain error.
-        if (DISAGREEMENT_REASONS.has(outer.reason) && this.#verified?.devices.has(from)) {
-          this.#alert("refused-by-device", `${from}|${outer.reason}`);
-          this.syncLog().catch(() => {});
-        }
-        channel.close(Object.hasOwn(CLOSE_REASONS, outer.reason) ? outer.reason : "closed", { notify: false });
-        return;
-      default: return;
-    }
-    if (!queued) channel.close("closed");
-  }
-
-  /** Another device opens a channel to this one. Checked before any key work is done for it. */
-  #onHello(from, outer) {
-    const refuse = (reason) => this.#sendPaced({ type: "channel.msg", to: from, opaque: encodeOuter({ c: outer.c, t: "close", reason }) }).catch(() => {});
-    if (this.#phase !== "approved") return refuse("unavailable");
-    if (this.#countFor(from) >= this.limits.maxChannelsPerDevice || this.#channels.size >= this.limits.maxChannels) return refuse("busy");
-    const channel = this.#newChannel(outer.c, from, "in");
-    this.#armHandshakeTimer(channel);
-    channel.enqueue(0, async () => {
-      const reason = await this.#whyRefused(from, "in");
-      if (reason) {
-        channel.close(reason);
-        return;
-      }
-      const device = this.#verified.devices.get(from);
-      channel.peer = { id: from, name: device.name, kind: device.kind, role: device.role };
-      channel.handshake = await startHandshake({ device: this.#keys, peerPub: from, logHead: this.#hashes.at(-1) });
-      await this.#sendPaced({ type: "channel.msg", to: from, opaque: encodeOuter({ c: outer.c, t: "hello", ...channel.handshake.hello }) });
-      await this.#finishHandshake(channel, outer);
-    }, this.limits.maxInboundBytes);
-    return undefined;
-  }
-
-  async #finishHandshake(channel, hello) {
-    if (channel.core || !channel.handshake) return;
-    try {
-      channel.core = await channel.handshake.finish({ eph: hello.eph, logHead: hello.logHead });
-      await this.#sendPaced({ type: "channel.msg", to: channel.peerId, opaque: encodeOuter({ c: channel.id, t: "proof", proof: channel.core.proof }) });
-    } catch {
-      channel.close("the handshake failed", { notify: false });
-    }
-  }
-
-  async #onProof(channel, { proof }) {
-    if (!channel.core || channel.state !== "handshake") return;
-    try {
-      await channel.core.confirm(proof);
-    } catch {
-      this.#alert("channel-failure", channel.id);
-      channel.close("frame-failed");
-      return;
-    }
-    // The log heads were signed in the transcript, so this is what the other device really holds.
-    if (this.#recoveryAt !== null && this.#hashes.indexOf(channel.core.peerLogHead) >= this.#recoveryAt) this.#recoveryConfirmed();
-    const reconciled = await this.#reconcile(channel.core.peerLogHead, channel);
-    if (channel.closed) return;
-    if (!reconciled) {
-      channel.close("log-mismatch");
-      return;
-    }
-    const reason = await this.#whyRefused(channel.peerId, channel.direction);
-    if (reason) {
-      channel.close(reason);
-      return;
-    }
-    channel.ready.sent = true;
-    await channel.sendFrame(encodeFrame(FRAME.READY, 0)).catch(() => {});
-    this.#maybeOpen(channel);
-  }
-
-  /** The other device's head against this one's. An older head on this chain is fine: that device will catch up itself. */
-  async #reconcile(peerHead, channel) {
-    const knows = () => this.#hashes.includes(peerHead);
-    if (knows()) return true;
-    let verdict;
-    try { verdict = await this.syncLog(); } catch { verdict = "offline"; }
-    if (knows()) return true;
-    if (channel.closed) return false; // it timed out while waiting: nothing here was refused
-    // A fork or another account has already been named. Otherwise the hub simply will not give what the other device has.
-    if (verdict === "same" || verdict === "adopted" || verdict === "offline") this.#alert("log-unreconciled", String(peerHead));
-    return false;
-  }
-
-  async #onData(channel, { d }) {
-    if (!channel.core || typeof d !== "string") return;
-    let plain;
-    try {
-      plain = await channel.core.open(new Uint8Array(Buffer.from(d, "base64")));
-    } catch {
-      // The core has shut this channel for good: it is evidence of tampering, so it is shown, not retried.
-      this.#alert("channel-failure", channel.id);
-      channel.close("frame-failed");
-      return;
-    }
-    let frame;
-    try { frame = decodeFrame(plain); } catch { channel.close("closed"); return; }
-    if (frame.type === FRAME.READY) {
-      channel.ready.received = true;
-      this.#maybeOpen(channel);
-      return;
-    }
-    if (channel.state !== "open") {
-      channel.close("closed"); // nothing but READY may come first
-      return;
-    }
-    channel.deliver(plain);
-  }
-
-  #maybeOpen(channel) {
-    if (channel.state !== "handshake" || !channel.ready.sent || !channel.ready.received) return;
-    channel.state = "open";
-    channel.setTimer(null);
-    this.#armExpiry(channel);
-    this.#changed();
-    if (channel.direction === "in") this.emit("channel", channel);
-    else channel.resolveOpening?.(channel);
-  }
-
-  /** A client's window ends with no event to announce it, so each of its channels has a timer for the moment. */
-  #armExpiry(channel) {
-    const device = this.#verified?.devices.get(channel.peerId);
-    const at = device && deviceExpiresAt(device);
-    if (!at) return;
-    const timer = setTimeout(() => {
-      this.#recheckChannels();
-      if (!channel.closed) this.#armExpiry(channel);
-    }, Math.min(Math.max(at - this.now(), 10), TIMER_MAX));
-    timer.unref?.();
-    channel.setTimer(timer);
-  }
-
-  /** After any change to who is on the log: a device no longer on it, or past its window, is cut off now. */
-  #recheckChannels() {
-    const now = this.now();
-    for (const channel of [...this.#channels.values()]) {
-      const device = this.#verified?.devices.get(channel.peerId);
-      if (!device) channel.close("removed");
-      else if (!deviceCurrent(device, now)) channel.close("expired");
-    }
+    this.#links.receive(from, outer, opaque.length);
   }
 
   // ---------------------------------------------------------------------------- audit
@@ -1979,90 +1606,3 @@ const HUB_ERROR_TEXT = {
 };
 const hubErrorText = (code) => (Object.hasOwn(HUB_ERROR_TEXT, code) ? HUB_ERROR_TEXT[code] : `The hub refused this (${code}).`);
 const HUB_CODE_STATUS = { "wrong-credentials": 401, locked: 429, busy: 503, conflict: 409, forbidden: 403, "not-found": 404, "invalid-entry": 400, "bad-message": 400 };
-
-// ------------------------------------------------------------------------------ the /api/account routes
-
-const need = (value, what) => {
-  if (typeof value !== "string" || !value || value.length > 4096) throw new AccountError(400, "bad-request", `${what} is required`);
-  return value;
-};
-
-/** Every /api/account route. The caller has already checked the window cookie and the Origin. Answers, or throws AccountError. */
-export async function handleAccountRoutes(req, res, { p, q, account, send, readBody, streams }) {
-  const post = req.method === "POST";
-  const get = req.method === "GET";
-  const body = post ? await readBody(req) : {};
-  await account.start();
-  switch (p) {
-    case "/api/account/status": if (get) return send(res, 200, account.status()); break;
-    case "/api/account/register":
-      if (post) return send(res, 200, await account.register({ email: need(body.email, "email"), password: need(body.password, "password"), name: body.name }));
-      break;
-    case "/api/account/sign-in":
-      if (post) return send(res, 200, await account.signIn({ email: need(body.email, "email"), password: need(body.password, "password"), name: body.name }));
-      break;
-    case "/api/account/confirm-code":
-      if (post) return send(res, 200, account.confirmCode(need(body.code, "code")));
-      break;
-    case "/api/account/restart-exchange":
-      if (post) return send(res, 200, account.restartExchange());
-      break;
-    case "/api/account/sign-out":
-      if (post) return send(res, 200, await account.signOut({ forget: body.forget === true }));
-      break;
-    case "/api/account/devices": if (get) return send(res, 200, { devices: account.devices() }); break;
-    case "/api/account/approvals":
-      if (get) return send(res, 200, { pending: account.pendingSignIns(), review: account.status().review });
-      break;
-    case "/api/account/review":
-      if (post) return send(res, 200, await account.review(need(body.id, "id")));
-      break;
-    case "/api/account/approve":
-      if (post) return send(res, 200, await account.approve(need(body.id, "id"), { code: body.code, role: body.role }));
-      break;
-    case "/api/account/deny":
-      if (post) return send(res, 200, await account.deny(need(body.id, "id")));
-      break;
-    case "/api/account/remove":
-      if (post) return send(res, 200, await account.remove(need(body.id, "id")));
-      break;
-    case "/api/account/password":
-      if (post) return send(res, 200, await account.changePassword({ current: body.current, next: body.next }));
-      break;
-    case "/api/account/recover":
-      if (post) return send(res, 200, await account.recover({ email: need(body.email, "email"), password: need(body.password, "password"), recoveryCode: need(body.recoveryCode, "recoveryCode"), name: body.name }));
-      break;
-    case "/api/account/settings":
-      if (get) return send(res, 200, account.settings());
-      if (post) return send(res, 200, await account.setSettings({ allowWebAccess: body.allowWebAccess }));
-      break;
-    case "/api/account/audit":
-      if (get) return send(res, 200, { lines: await account.auditLines(q.get("limit")) });
-      break;
-    case "/api/account/alerts/clear":
-      if (post) { await account.clearAlerts(); return send(res, 200, { ok: true }); }
-      break;
-    case "/api/account/events":
-      if (get) return accountEvents(req, res, account, streams);
-      break;
-    default:
-  }
-  return send(res, 404, { error: "unknown account route" });
-}
-
-/** The window's own stream of account events. Not /events, which also goes to other devices. */
-function accountEvents(req, res, account, streams) {
-  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive" });
-  const push = (name) => (data) => { try { res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* it went */ } };
-  const listeners = Object.fromEntries(["approval", "devices", "alert", "status"].map((name) => [name, push(name)]));
-  for (const [name, listener] of Object.entries(listeners)) account.on(name, listener);
-  listeners.status(account.status());
-  const beat = setInterval(() => { try { res.write(": ka\n\n"); } catch { /* */ } }, 20_000);
-  beat.unref?.();
-  streams.add(res);
-  req.on("close", () => {
-    clearInterval(beat);
-    streams.delete(res);
-    for (const [name, listener] of Object.entries(listeners)) account.off(name, listener);
-  });
-}
