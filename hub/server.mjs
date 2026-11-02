@@ -370,13 +370,19 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     return timingSafeEqual(sha256(given), stored);
   }
 
-  async function register(body) {
+  async function register(body, ip) {
     const email = cleanEmail(body.email);
     if (!isB64Of(body.salt, SALT_BYTES)) throw new HttpError(400, "bad-salt");
     if (!isB64Of(body.verifierInput, KEY_BYTES)) throw new HttpError(400, "bad-verifier");
     // A fresh hub is open only to whoever holds the token. Otherwise the first stranger to find it would own it.
     const closed = () => (store.accounts.size === 0 ? !bootstrapMatches(body.bootstrapToken) : !allowSignup || store.accounts.size >= limits.maxAccounts);
-    if (closed()) throw new HttpError(403, "registration-closed");
+    // Sign-in's counter for this address. A closed hub counts too, or the lock would show which hubs are still fresh.
+    const addressKey = `ip ${ip}`;
+    if (failures.locked(addressKey, limits.maxAddressFailures)) throw new HttpError(429, "locked");
+    if (closed()) {
+      failures.add(addressKey);
+      throw new HttpError(403, "registration-closed");
+    }
     const entries = [body.firstLogEntry];
     let trust;
     try {
@@ -936,7 +942,7 @@ async function main() {
     port: Number(env.OMNI_HUB_PORT ?? 443),
     dataDir: env.OMNI_HUB_DATA ?? "/var/lib/omni-hub",
     origin: env.OMNI_HUB_ORIGIN ?? null,
-    origins: env.OMNI_HUB_EXTRA_ORIGINS ? env.OMNI_HUB_EXTRA_ORIGINS.split(",") : [],
+    origins: (env.OMNI_HUB_EXTRA_ORIGINS ?? "").split(",").map((entry) => entry.trim()).filter(Boolean),
     bootstrapToken: env.OMNI_HUB_BOOTSTRAP_TOKEN || null,
     allowSignup: env.OMNI_HUB_ALLOW_SIGNUP === "1",
     tls,

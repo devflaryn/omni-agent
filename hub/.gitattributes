@@ -1,0 +1,2 @@
+deploy.sh text eol=lf
+omni-hub.service text eol=lf

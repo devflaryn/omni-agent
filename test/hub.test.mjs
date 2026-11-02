@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
@@ -14,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { loginKeyFrom, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, fromB64 } from "../ui/account-core.js";
 import { append, createLog, entryBytes, entryHash, verifyLog } from "../ui/device-log.js";
 import { startHub } from "../hub/server.mjs";
+import { HubSocket } from "../hub/ws.mjs";
 
 const ORIGIN = "https://hub.example";
 const BOOTSTRAP = "test-bootstrap-token-0123456789";
@@ -1629,6 +1631,36 @@ test("a fresh hub refuses registration without the right token, all in the same 
   assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201);
 });
 
+test("wrong bootstrap tokens count against the address: guessing stops, the right token included, and only there", async (t) => {
+  const hub = await hubFor(t);
+  for (let i = 0; i < 20; i++) {
+    assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: `wrong-token-of-a-good-length-${i}` }))).status, 403);
+  }
+  const blocked = await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }));
+  assert.equal(blocked.status, 429);
+  assert.equal(blocked.json.error, "locked");
+  assert.equal((await api(hub, "/api/login", { email: "x@example.com", loginKey: randomKey(), signPub: randomKey() })).status, 429, "it is the same counter as sign-in's");
+
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: "wrong-token-of-a-good-length" }), { localAddress: "127.0.0.2" })).status, 403, "another address has its own count");
+
+  hub.clock.t += 15 * MINUTE + 1;
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201, "it wears off");
+});
+
+test("the lock on guessing looks the same on a hub that is already closed, so it does not show that a hub is fresh", async (t) => {
+  const hub = await hubFor(t);
+  await newAccount(hub);
+  for (let i = 0; i < 20; i++) assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: "wrong-token-of-a-good-length" }))).status, 403);
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: "wrong-token-of-a-good-length" }))).status, 429);
+});
+
+test("a malformed registration or a right token is not counted as a guess", async (t) => {
+  const hub = await hubFor(t, { allowSignup: true });
+  for (let i = 0; i < 25; i++) assert.equal((await api(hub, "/api/register", await firstBody({ salt: "short", bootstrapToken: "wrong-token-of-a-good-length" }))).status, 400);
+  assert.equal((await api(hub, "/api/register", await firstBody({ bootstrapToken: BOOTSTRAP }))).status, 201);
+  for (let i = 0; i < 25; i++) assert.equal((await api(hub, "/api/register", await firstBody({ email: `n${i}@example.com` }))).status, 201, "allowSignup needs no token, so nothing is a guess");
+});
+
 test("a fresh hub with no token configured refuses every registration, allowSignup or not", async (t) => {
   for (const allowSignup of [false, true]) {
     const hub = await hubFor(t, { bootstrapToken: null, allowSignup });
@@ -1847,6 +1879,68 @@ test("WS parser: a frame in many small packets arrives whole", async (t) => {
   await socket.next("presence");
   await socket.settled();
   assert.equal(socket.closeCode, null);
+});
+
+/** A socket with no network under it, so a test can give the parser exact packets. */
+function parserOnFakeSocket(onMessage, { maxMessageBytes = 2 * 1024 * 1024 } = {}) {
+  const socket = new EventEmitter();
+  Object.assign(socket, { writableLength: 0, setNoDelay() {}, write() {}, end() {}, destroy() { socket.emit("close"); } });
+  const parser = new HubSocket(socket, Buffer.alloc(0), { maxMessageBytes, maxFramesPerSecond: 100_000, maxBuffered: 1 << 30, pingIntervalMs: 1 << 30, onMessage, onClose() {} });
+  return { socket, parser };
+}
+
+test("WS parser: a long frame in tiny packets costs one buffer, not a copy per packet", (t) => {
+  const messages = [];
+  const { socket } = parserOnFakeSocket((text) => messages.push(text));
+  t.after(() => socket.destroy());
+  const message = "x".repeat(1024 * 1024);
+  const bytes = frame(TEXT, message);
+
+  let copied = 0, allocated = 0;
+  const { concat, alloc, allocUnsafe, allocUnsafeSlow } = Buffer;
+  t.mock.method(Buffer, "concat", (list, size) => { const out = concat.call(Buffer, list, size); copied += out.length; return out; });
+  for (const [name, original] of [["alloc", alloc], ["allocUnsafe", allocUnsafe], ["allocUnsafeSlow", allocUnsafeSlow]]) {
+    t.mock.method(Buffer, name, (size, ...rest) => { allocated += size; return original.call(Buffer, size, ...rest); });
+  }
+  for (let at = 0; at < bytes.length; at += 64) socket.emit("data", bytes.subarray(at, at + 64));
+  t.mock.restoreAll();
+
+  assert.deepEqual(messages, [message]);
+  assert.equal(copied, 0, "nothing is joined");
+  assert.ok(allocated <= bytes.length + 64, `${allocated} bytes allocated for a frame of ${bytes.length}`);
+});
+
+test("WS parser: frames cut at every possible place arrive whole and in order, and a chunk's own bytes are not lost", (t) => {
+  const texts = ["a", "b".repeat(125), "c".repeat(126), "d".repeat(70_000), "é".repeat(300)];
+  const bytes = Buffer.concat(texts.map((text) => frame(TEXT, text)));
+  const cuts = [1, 2, 3, 5, 7, 13, 14, 127, 1000, 65_536, bytes.length];
+  for (const size of cuts) {
+    const messages = [];
+    const { socket } = parserOnFakeSocket((text) => messages.push(text));
+    for (let at = 0; at < bytes.length; at += size) socket.emit("data", Buffer.from(bytes.subarray(at, at + size)));
+    assert.deepEqual(messages, texts, `packets of ${size}`);
+    socket.destroy();
+  }
+});
+
+test("WS parser: fragments held across tiny packets arrive whole, and a frame over the limit is refused before it is held", (t) => {
+  const messages = [];
+  const { socket, parser } = parserOnFakeSocket((text) => messages.push(text), { maxMessageBytes: 1000 });
+  t.after(() => socket.destroy());
+  const parts = [frame(TEXT, "x".repeat(400), { fin: false }), frame(PING, "p"), frame(CONTINUATION, "y".repeat(400))];
+  for (const byte of Buffer.concat(parts)) socket.emit("data", Buffer.from([byte]));
+  assert.deepEqual(messages, ["x".repeat(400) + "y".repeat(400)]);
+
+  let allocated = 0;
+  const { alloc } = Buffer;
+  t.mock.method(Buffer, "alloc", (size, ...rest) => { allocated += size; return alloc.call(Buffer, size, ...rest); });
+  const closed = [];
+  const close = parser.close.bind(parser);
+  parser.close = (code, reason) => { closed.push(code); close(code, reason); };
+  socket.emit("data", frame(TEXT, "z".repeat(1001)).subarray(0, 8));
+  t.mock.restoreAll();
+  assert.deepEqual(closed, [1009]);
+  assert.ok(allocated < 1000, "only the header was ever held");
 });
 
 // --- limits ---
@@ -2278,7 +2372,7 @@ test("run as a program: it reads its settings from the environment, and a corrup
   const dir = mkdtempSync(join(tmpdir(), "omni-hub-test-"));
   t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const server = fileURLToPath(new URL("../hub/server.mjs", import.meta.url));
-  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir, OMNI_HUB_BOOTSTRAP_TOKEN: BOOTSTRAP, OMNI_HUB_ORIGIN: ORIGIN, OMNI_HUB_EXTRA_ORIGINS: "capacitor://omni,null" };
+  const env = { ...process.env, OMNI_HUB_PORT: "0", OMNI_HUB_DATA: dir, OMNI_HUB_BOOTSTRAP_TOKEN: BOOTSTRAP, OMNI_HUB_ORIGIN: ORIGIN, OMNI_HUB_EXTRA_ORIGINS: " capacitor://omni , ,null,," };
 
   const child = spawn(process.execPath, [server], { env, stdio: ["ignore", "pipe", "pipe"] });
   t.after(() => child.kill());
@@ -2294,7 +2388,9 @@ test("run as a program: it reads its settings from the environment, and a corrup
   assert.equal((await api({ port }, "/api/health", undefined, { method: "GET" })).status, 200);
   assert.equal(readFileSync(join(dir, "bootstrap"), "utf8"), createHash("sha256").update(BOOTSTRAP).digest("hex"));
   assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "capacitor://omni" } })).status, 200);
+  assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "null" } })).status, 200);
   assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "https://evil.example" } })).status, 403);
+  assert.equal((await api({ port }, "/api/salt", { email: "a@b.c" }, { headers: { Origin: "" } })).status, 403, "stray commas do not allow an empty origin");
   const stopped = new Promise((resolve) => child.once("exit", resolve));
   child.kill();
   await stopped;
