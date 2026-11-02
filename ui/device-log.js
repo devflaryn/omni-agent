@@ -1,10 +1,12 @@
 // The device log: who is a device on the account. One file for Node 20+, browsers and iOS WKWebView.
 // Design: docs/superpowers/specs/2026-11-02-omni-accounts-remote-design.md, sections 3 to 5.
 //
-// A log is a JSON-safe array of entries: {type, index, prev, signer, body, sig}.
-//   type    create | add | remove | recover
-//   index   the entry's position; prev is the hash of the entry before it ("" for create)
-//   signer  the signing key; sig covers everything above and the whole body
+// A log is a JSON-safe array of entries: {type, index, prev, signer, body, sig}, plus recoverySig on a create or recover.
+//   type         create | add | remove | recover
+//   index        the entry's position; prev is the hash of the entry before it ("" for create)
+//   signer       the signing key; sig covers everything above and the whole body
+//   recoverySig  by the recovery key this entry introduces, over what sig covers. A recovery public key is no secret,
+//                so without this a hub could write a whole account around a person's own key and have their code accept it.
 //
 // Whether a log is valid is decided by its entries alone, never by a clock, so every verifier agrees on it.
 // Only the final list of devices looks at the time: a client outside its window is left out of it.
@@ -13,6 +15,7 @@ import { sign, verify, toB64, fromB64 } from "./account-core.js";
 
 const ENTRY_DOMAIN = "omni-log-entry-v1";
 const HASH_DOMAIN = "omni-log-hash-v1";
+const RECOVERY_KEY_DOMAIN = "omni-log-recovery-key-v1";
 
 const encoder = new TextEncoder();
 const { subtle } = globalThis.crypto;
@@ -41,6 +44,7 @@ const BODY_FIELDS = {
   recover: [...DEVICE_FIELDS, "recoveryPub"],
 };
 const SIGNER_ROLE = { add: "full", remove: "full", recover: "recovery" };
+const INTRODUCES_RECOVERY_KEY = new Set(["create", "recover"]);
 
 export class LogError extends Error {
   /** `index` is the bad entry's position, or null when the fault is not in an entry. */
@@ -115,9 +119,9 @@ function requireFields(value, fields, label, at) {
   }
 }
 
-/** The bytes an entry's signature covers. `sig` itself may be absent, since it is made from these. */
+/** The bytes an entry's signatures cover. `sig` and `recoverySig` may be absent, since they are made from these. */
 export function entryBytes(entry, at = entry?.index ?? null) {
-  const { sig: _sig, ...unsigned } = entry ?? {};
+  const { sig: _sig, recoverySig: _recoverySig, ...unsigned } = entry ?? {};
   requireFields(unsigned, ENTRY_FIELDS, "an entry", at);
   const { type, index, prev, signer, body } = entry;
   if (typeof type !== "string" || !Object.hasOwn(BODY_FIELDS, type)) throw new LogError(at, "unknown entry type");
@@ -135,10 +139,27 @@ export function entryBytes(entry, at = entry?.index ?? null) {
 function parseEntry(entry, at) {
   const bytes = entryBytes(entry, at);
   if (!Object.hasOwn(entry, "sig")) throw new LogError(at, `an entry must have exactly the fields ${ENTRY_FIELDS.join(", ")}, sig`);
-  return { bytes, sig: canonicalB64(entry.sig, SIGNATURE_BYTES, "sig", at) };
+  const sig = canonicalB64(entry.sig, SIGNATURE_BYTES, "sig", at);
+  if (!Object.hasOwn(entry, "recoverySig")) return { bytes, sig };
+  // Anything more would travel with the entry without meaning anything.
+  if (!INTRODUCES_RECOVERY_KEY.has(entry.type)) throw new LogError(at, `a ${entry.type} has no recoverySig`);
+  return { bytes, sig, recoverySig: canonicalB64(entry.recoverySig, SIGNATURE_BYTES, "recoverySig", at) };
 }
 
-const hashOf = async ({ bytes, sig }) => toB64(await sha256(framed(HASH_DOMAIN, bytes, sig)));
+const hashOf = async ({ bytes, sig, recoverySig }) => toB64(await sha256(framed(HASH_DOMAIN, bytes, sig, ...(recoverySig ? [recoverySig] : []))));
+
+/** The signature by a recovery key that an entry introducing it needs. Its own domain, so it can never pass for `sig`. */
+export function recoverySignature(entry, recoveryKeys) {
+  return sign(recoveryKeys.sign.privateKey, framed(RECOVERY_KEY_DOMAIN, entryBytes(entry)));
+}
+
+/** Nobody can make a log whose recovery key is K without holding K, including a hub that knows K's public half. */
+async function requireRecoverySignature(entry, parsed, at) {
+  if (!INTRODUCES_RECOVERY_KEY.has(entry.type)) return;
+  if (!parsed.recoverySig || !await verify(entry.body.recoveryPub, framed(RECOVERY_KEY_DOMAIN, parsed.bytes), entry.recoverySig)) {
+    throw new LogError(at, "not signed by the recovery key it introduces");
+  }
+}
 
 /** The signature is in the hash, so two differently signed entries at one position always count as a fork. */
 // This relies on verifiers rejecting non-canonical signatures: otherwise a re-encoded signature would be a false fork.
@@ -216,6 +237,7 @@ async function applyEntry(state, entry, at) {
   requireAuthority(state, entry, at);
   if (!await verify(entry.signer, parsed.bytes, entry.sig)) throw new LogError(at, "bad signature");
   APPLY[entry.type](state, entry, at);
+  await requireRecoverySignature(entry, parsed, at);
   state.hashes.push(await hashOf(parsed));
 }
 
@@ -228,16 +250,18 @@ async function replay(entries) {
   return state;
 }
 
-async function sealed(unsigned, signerKeys) {
+async function sealed(unsigned, signerKeys, newRecovery = null) {
   const bytes = entryBytes(unsigned);
-  return { ...unsigned, sig: await sign(signerKeys.sign.privateKey, bytes) };
+  const entry = { ...unsigned, sig: await sign(signerKeys.sign.privateKey, bytes) };
+  return newRecovery ? { ...entry, recoverySig: await recoverySignature(unsigned, newRecovery) } : entry;
 }
 
-/** `device` is a newDeviceKeys() result with a `name` and a `kind`. The creator is always a full device. */
-export async function createLog({ device, recoveryPub }) {
+/** `device` is a newDeviceKeys() result with a `name` and a `kind`, and the creator is always a full device. `recovery` is a recoveryKeysFrom() result. */
+export async function createLog({ device, recovery }) {
+  if (!recovery?.sign?.privateKey) throw new LogError(0, "a create needs the recovery key itself, not only its public half");
   const accountId = toB64(globalThis.crypto.getRandomValues(new Uint8Array(ACCOUNT_ID_BYTES)));
-  const body = { accountId, name: device.name, kind: device.kind, role: "full", signPub: device.signPub, boxPub: device.boxPub, addedAt: Date.now(), recoveryPub };
-  const entry = await sealed({ type: "create", index: 0, prev: "", signer: device.signPub, body }, device);
+  const body = { accountId, name: device.name, kind: device.kind, role: "full", signPub: device.signPub, boxPub: device.boxPub, addedAt: Date.now(), recoveryPub: recovery.signPub };
+  const entry = await sealed({ type: "create", index: 0, prev: "", signer: device.signPub, body }, device, recovery);
   await applyEntry(newState(), entry, 0);
   return [entry];
 }
@@ -246,22 +270,37 @@ export async function createLog({ device, recoveryPub }) {
  * Returns a new log with the entry added, or throws LogError if verifyLog would refuse the result.
  *   {type: "add", name, kind, role, signPub, boxPub, addedAt?}        signed by a full device
  *   {type: "remove", signPub}                                         signed by a full device
- *   {type: "recover", name, kind, signPub, boxPub, recoveryPub, addedAt?}   signed by the current recovery key
- * `addedAt` defaults to the signer's clock. `signerKeys` is a newDeviceKeys() or recoveryKeysFrom() result.
+ *   {type: "recover", name, kind, signPub, boxPub, newRecovery, addedAt?}   signed by the current recovery key and by newRecovery
+ * `addedAt` defaults to the signer's clock. `signerKeys` is a newDeviceKeys() or recoveryKeysFrom() result, and `newRecovery` a recoveryKeysFrom() result.
  */
-export async function append(log, { type, ...fields }, signerKeys) {
+export async function append(log, { type, newRecovery = null, ...fields }, signerKeys) {
   const state = await replay(log);
   const at = log.length;
   if (at >= MAX_LOG_ENTRIES) throw new LogError(at, `too many entries, the maximum is ${MAX_LOG_ENTRIES}`);
   if (!Object.hasOwn(SIGNER_ROLE, type)) throw new LogError(at, "append takes an add, a remove or a recover");
+  if (type === "recover" && !newRecovery?.sign?.privateKey) throw new LogError(at, "a recover needs the new recovery key itself, not only its public half");
   const body = {
     add: () => ({ addedAt: Date.now(), ...fields }),
     remove: () => fields,
-    recover: () => ({ role: "full", addedAt: Date.now(), ...fields }),
+    recover: () => ({ role: "full", addedAt: Date.now(), ...fields, recoveryPub: newRecovery.signPub }),
   }[type]();
-  const entry = await sealed({ type, index: at, prev: state.hashes.at(-1), signer: signerKeys.signPub, body }, signerKeys);
+  const entry = await sealed({ type, index: at, prev: state.hashes.at(-1), signer: signerKeys.signPub, body }, signerKeys, type === "recover" ? newRecovery : null);
   await applyEntry(state, entry, at);
   return [...log, entry];
+}
+
+/**
+ * Whether a device holding this recovery key may sign a recover onto this log. It must ask before signing anything: the
+ * log comes from the hub, and only this ties it to the person's code. False for a log that does not verify.
+ * It cannot tell an older real prefix from the latest log, or a fork made by a device that was on the list at the time.
+ */
+export async function canRecover(log, recoveryPub) {
+  try {
+    return (await replay(log)).recoveryPub === recoveryPub;
+  } catch (error) {
+    if (error instanceof LogError) return false;
+    throw error;
+  }
 }
 
 /** A client is judged by this verifier's clock. Its window has a start too, so a fast approver clock cannot lengthen it by more than the skew. */

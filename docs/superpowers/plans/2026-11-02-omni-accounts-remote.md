@@ -76,7 +76,7 @@
 **Files:** Create `ui/device-log.js`, `test/device-log.test.mjs`.
 
 **Interfaces, consumed:** `sign`, `verify` from Task 2. **Produced:**
-- `createLog({device, recoveryPub}) → log`; `append(log, entry, signerKeys) → log`
+- `createLog({device, recovery}) → log`; `append(log, entry, signerKeys) → log`
 - `verifyLog(entries, {now}) → {devices: Map, head, version}`; throws `LogError` naming the bad entry
 - `compareLogs(a, b) → "same" | "a-newer" | "b-newer" | "fork"`
 - Entry types `create`, `add` `{name, kind, role, signPub, boxPub}`, `remove`, `recover`. Roles `full`, `client`, `recovery`.

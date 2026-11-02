@@ -6,7 +6,6 @@ const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const OP_CONTINUATION = 0, OP_TEXT = 1, OP_BINARY = 2, OP_CLOSE = 8, OP_PING = 9, OP_PONG = 10;
 const MAX_CONTROL_BYTES = 125;
 const CLOSE_LINGER_MS = 1000;
-const MAX_HELD_CHUNKS = 64;
 const KEY_PATTERN = /^[A-Za-z0-9+/]{22}==$/;
 
 export const CLOSE_PROTOCOL = 1002, CLOSE_UNSUPPORTED = 1003, CLOSE_BAD_TEXT = 1007, CLOSE_POLICY = 1008, CLOSE_TOO_BIG = 1009;
@@ -37,7 +36,7 @@ export function acceptUpgrade(req, socket, head, options) {
  */
 export class HubSocket {
   #socket; #onMessage; #onClose; #maxFrames; #maxBuffered;
-  #chunks = []; #have = 0; #need = 2;
+  #held = Buffer.alloc(0); #have = 0; #need = 2;
   #fragments = []; #fragmentBytes = 0; #inMessage = false;
   #closing = false; #closeCode = 1006; #alive = true;
   #windowStart = 0; #framesInWindow = 0;
@@ -71,7 +70,7 @@ export class HubSocket {
     this.#closeCode = code;
     this.#write(OP_CLOSE, Buffer.concat([Buffer.from([code >> 8, code & 255]), Buffer.from(reason)]));
     this.#closing = true;
-    this.#chunks = [];
+    this.#held = null;
     this.#socket.end();
     this.#linger = setTimeout(() => this.#socket.destroy(), CLOSE_LINGER_MS);
     this.#linger.unref();
@@ -105,26 +104,47 @@ export class HubSocket {
     clearInterval(this.#pinger);
     clearTimeout(this.#linger);
     this.#closing = true;
-    this.#chunks = [];
+    this.#held = null;
     this.#fragments = [];
     this.#onClose?.(this.#closeCode);
     this.#onClose = null;
   }
 
-  /** Waits for a whole frame before joining the chunks, so one byte at a time cannot cost a copy of everything so far. */
+  /**
+   * A frame that is whole in its chunk is read in place. Any other is copied into one buffer, sized once its header has
+   * given the length, so one byte at a time costs no more than the frame itself. The size is checked before that buffer
+   * is made. #frame only changes bytes when it has the whole frame, so reading a part of one again is safe.
+   */
   #read(chunk) {
-    if (this.#closing) return;
-    this.#chunks.push(chunk);
-    this.#have += chunk.length;
-    // A long frame in tiny packets must not cost a Buffer object per packet.
-    if (this.#chunks.length > MAX_HELD_CHUNKS) this.#chunks = [Buffer.concat(this.#chunks, this.#have)];
-    while (!this.#closing && this.#have >= this.#need) {
-      const buffer = this.#chunks.length === 1 ? this.#chunks[0] : Buffer.concat(this.#chunks, this.#have);
-      const used = this.#frame(buffer);
-      const rest = buffer.subarray(used);
-      this.#chunks = rest.length ? [rest] : [];
-      this.#have = rest.length;
-      if (used) this.#need = 2;
+    let rest = chunk;
+    while (!this.#closing && rest.length) {
+      if (this.#have === 0 && rest.length >= this.#need) {
+        const used = this.#frame(rest);
+        if (used) {
+          rest = rest.subarray(used);
+          this.#need = 2;
+          continue;
+        }
+        if (this.#closing) return;
+      }
+      if (this.#held.length < this.#need) {
+        const larger = Buffer.alloc(this.#need);
+        this.#held.copy(larger, 0, 0, this.#have);
+        this.#held = larger;
+      }
+      const taken = Math.min(rest.length, this.#need - this.#have);
+      rest.copy(this.#held, this.#have, 0, taken);
+      this.#have += taken;
+      rest = rest.subarray(taken);
+      if (this.#have < this.#need) return;
+
+      const used = this.#frame(this.#held.subarray(0, this.#have));
+      if (used) {
+        // Not reused: a fragment can still point into it.
+        this.#held = Buffer.alloc(0);
+        this.#have = 0;
+        this.#need = 2;
+      }
     }
   }
 

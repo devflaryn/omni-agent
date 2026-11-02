@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, approvalCode, toB64, fromB64 } from "../ui/account-core.js";
-import { createLog, append, verifyLog, compareLogs, entryBytes, entryHash, LogError, MAX_LOG_ENTRIES } from "../ui/device-log.js";
+import { newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, verify, approvalCode, toB64, fromB64 } from "../ui/account-core.js";
+import { createLog, append, verifyLog, compareLogs, canRecover, entryBytes, entryHash, recoverySignature, LogError, MAX_LOG_ENTRIES } from "../ui/device-log.js";
 
 const T0 = 1_800_000_000_000;
 const MAX_ADDED_AT = 8.64e15;
@@ -20,11 +20,11 @@ const recoveryAsDevice = (keys) => ({ ...keys, boxPub: spare.boxPub });
 
 const overJson = (v) => JSON.parse(JSON.stringify(v));
 const named = (keys, name = "PC", kind = "desktop") => ({ ...keys, name, kind });
-const created = () => createLog({ device: named(alice, "Alice PC"), recoveryPub: recovery.signPub });
+const created = () => createLog({ device: named(alice, "Alice PC"), recovery });
 const addOf = (keys, role = "full", addedAt = T0, name = "Device") => ({ type: "add", name, kind: "desktop", role, signPub: keys.signPub, boxPub: keys.boxPub, addedAt });
 const bodyOf = ({ type, ...body }) => body;
-const recoverOf = (keys, recoveryPub, addedAt = T0) => ({ type: "recover", name: "Rescue", kind: "desktop", signPub: keys.signPub, boxPub: keys.boxPub, recoveryPub, addedAt });
-const recoverBody = (keys, recoveryPub) => ({ ...bodyOf(recoverOf(keys, recoveryPub)), role: "full" });
+const recoverOf = (keys, newRecovery, addedAt = T0) => ({ type: "recover", name: "Rescue", kind: "desktop", signPub: keys.signPub, boxPub: keys.boxPub, newRecovery, addedAt });
+const recoverBody = (keys, recoveryPub) => ({ name: "Rescue", kind: "desktop", role: "full", signPub: keys.signPub, boxPub: keys.boxPub, addedAt: T0, recoveryPub });
 const removeOf = (keys) => ({ type: "remove", signPub: keys.signPub });
 
 /** create, add bob (full), add web (client), all at T0. */
@@ -152,6 +152,75 @@ test("the encoding is the documented one, pinned against an independent implemen
   assert.equal(await entryHash(entry), hash);
 });
 
+// --- entries that introduce a recovery key ---
+
+test("a create and a recover carry a signature by the recovery key they introduce, under its own domain", async () => {
+  const frame = (...fields) => Buffer.concat(fields.map((f) => {
+    const bytes = Buffer.from(f), length = Buffer.alloc(4);
+    length.writeUInt32BE(bytes.length);
+    return Buffer.concat([length, bytes]);
+  }));
+  const log = await append(await base(), recoverOf(carol, recovery2), recovery);
+  for (const [entry, key] of [[log[0], recovery], [log.at(-1), recovery2]]) {
+    const inner = frame("omni-log-recovery-key-v1", entryBytes(entry));
+    assert.ok(await verify(key.signPub, inner, entry.recoverySig), "the documented bytes, under the documented label");
+    assert.ok(!await verify(key.signPub, entryBytes(entry), entry.recoverySig), "not the bytes of the main signature");
+    const hash = createHash("sha256").update(frame("omni-log-hash-v1", entryBytes(entry), fromB64(entry.sig), fromB64(entry.recoverySig))).digest("base64");
+    assert.equal(await entryHash(entry), hash, "and it is in the hash");
+  }
+  for (const entry of log.slice(1, -1)) assert.ok(!Object.hasOwn(entry, "recoverySig"));
+});
+
+test("createLog and a recover take the key itself, never only its public half", async () => {
+  await assert.rejects(createLog({ device: named(alice), recoveryPub: recovery.signPub }), LogError);
+  await assert.rejects(createLog({ device: named(alice), recovery: { signPub: recovery.signPub } }), /recovery key itself/);
+  const log = await base();
+  await assert.rejects(append(log, { ...recoverOf(carol, recovery2), newRecovery: undefined }, recovery), /new recovery key itself/);
+  await assert.rejects(append(log, { ...recoverOf(carol, { signPub: recovery2.signPub }) }, recovery), /new recovery key itself/);
+  const mismatched = { ...recovery2, signPub: recovery3.signPub };
+  await assert.rejects(append(log, recoverOf(carol, mismatched), recovery), /recovery key it introduces/);
+  const passedAlong = await append(log, { ...recoverOf(carol, recovery2), recoveryPub: recovery3.signPub }, recovery);
+  assert.equal(passedAlong.at(-1).body.recoveryPub, recovery2.signPub, "the key that signs is the key on the log");
+});
+
+test("a create or recover without a good recoverySig is refused", async () => {
+  const [create] = await created();
+  const { recoverySig: _gone, ...bare } = create;
+  await rejectedAt([bare], 0, /recovery key it introduces/);
+  await rejectedAt([{ ...create, recoverySig: create.sig }], 0, /recovery key it introduces/);
+  await rejectedAt([{ ...create, recoverySig: "short" }], 0, /recoverySig is not/);
+  await rejectedAt([{ ...create, recoverySig: await recoverySignature(create, alice) }], 0, /recovery key it introduces/);
+
+  const log = await append(await base(), recoverOf(carol, recovery2), recovery);
+  const last = log.at(-1);
+  await rejectedAt([...log.slice(0, -1), { ...last, recoverySig: await recoverySignature(last, recovery) }], last.index, /recovery key it introduces/);
+  const { recoverySig: _alsoGone, ...bareRecover } = last;
+  await rejectedAt([...log.slice(0, -1), bareRecover], last.index, /recovery key it introduces/);
+});
+
+test("the recoverySig covers the entry: moved to another entry, it is refused", async () => {
+  const [a, [b]] = [await created(), await created()];
+  await rejectedAt([{ ...a[0], recoverySig: b.recoverySig }], 0, /recovery key it introduces/);
+});
+
+test("an add or a remove with a recoverySig is refused", async () => {
+  const log = await base();
+  const last = log.at(-1);
+  await rejectedAt([...log.slice(0, -1), { ...last, recoverySig: last.sig }], last.index, /has no recoverySig/);
+});
+
+test("canRecover: only with the current recovery key, on a log that verifies", async () => {
+  const log = await base();
+  assert.equal(await canRecover(log, recovery.signPub), true);
+  assert.equal(await canRecover(log, recovery2.signPub), false);
+  const rotated = await append(log, recoverOf(carol, recovery2), recovery);
+  assert.equal(await canRecover(rotated, recovery2.signPub), true);
+  assert.equal(await canRecover(rotated, recovery.signPub), false);
+  const { recoverySig: _gone, ...bare } = rotated.at(-1);
+  assert.equal(await canRecover([...log, bare], recovery2.signPub), false);
+  for (const garbage of [null, [], "log", [{}]]) assert.equal(await canRecover(garbage, recovery.signPub), false);
+});
+
 // --- signatures and hashes ---
 
 test("a bad signature is rejected, naming the entry", async () => {
@@ -168,7 +237,7 @@ test("no field of any entry type escapes the signature", async () => {
     create: await created(),
     add: await base(),
     remove: await append(await base(), removeOf(bob), alice),
-    recover: await append(await base(), recoverOf(carol, recovery2.signPub), recovery),
+    recover: await append(await base(), recoverOf(carol, recovery2), recovery),
   };
   for (const [type, log] of Object.entries(logs)) {
     assert.equal(log.at(-1).type, type);
@@ -218,7 +287,7 @@ test("an entry cannot be spliced into another account's log", async () => {
 test("a log must start with one create, and has only one", async () => {
   await rejectedAt([], 0, /create/);
   const log = await created();
-  const again = await createLog({ device: named(bob), recoveryPub: recovery2.signPub });
+  const again = await createLog({ device: named(bob), recovery: recovery2 });
   await rejectedAt([...log, { ...again[0], index: 1, prev: log[0] && await entryHash(log[0]) }], 1, /create/);
   await rejectedAt(await forged(log, "create", { ...log[0].body }, alice), 1, /create/);
   await rejectedAt(await forged([], "add", bodyOf(addOf(alice)), alice), 0, /create/);
@@ -232,9 +301,9 @@ test("create: self-signed, with a role of full and an empty prev", async () => {
 });
 
 test("createLog and append refuse what verifyLog would refuse", async () => {
-  await assert.rejects(createLog({ device: named(alice), recoveryPub: alice.signPub }), LogError);
-  await assert.rejects(createLog({ device: { ...alice, name: "" , kind: "desktop" }, recoveryPub: recovery.signPub }), LogError);
-  await assert.rejects(createLog({ device: named(alice), recoveryPub: "nope" }), LogError);
+  await assert.rejects(createLog({ device: named(alice), recovery: alice }), LogError);
+  await assert.rejects(createLog({ device: { ...alice, name: "" , kind: "desktop" }, recovery }), LogError);
+  await assert.rejects(createLog({ device: named(alice), recovery: { ...recovery, signPub: "nope" } }), LogError);
   const log = await created();
   await assert.rejects(append(log, { type: "create" }, alice), LogError);
   await assert.rejects(append(log, { type: "nonsense" }, alice), LogError);
@@ -338,7 +407,7 @@ test("a device may remove itself while another full device remains, and can sign
 
 test("a recover first: then the old last full device can go", async () => {
   let log = await created();
-  log = await append(log, recoverOf(carol, recovery2.signPub), recovery);
+  log = await append(log, recoverOf(carol, recovery2), recovery);
   log = await append(log, removeOf(alice), carol);
   const state = await verifyLog(log, opts);
   assert.deepEqual([...state.devices.keys()], [carol.signPub]);
@@ -355,7 +424,7 @@ test("a remove must name a device on the log", async () => {
 // --- recovery ---
 
 test("a recover adds a full device, replaces the recovery key, and leaves a notice", async () => {
-  const log = await append(await base(), recoverOf(carol, recovery2.signPub, T0 + 5), recovery);
+  const log = await append(await base(), recoverOf(carol, recovery2, T0 + 5), recovery);
   const state = await verifyLog(log, opts);
   const added = state.devices.get(carol.signPub);
   assert.equal(added.role, "full");
@@ -367,10 +436,10 @@ test("a recover adds a full device, replaces the recovery key, and leaves a noti
 });
 
 test("the old recovery key is useless after a recover", async () => {
-  const log = await append(await base(), recoverOf(carol, recovery2.signPub), recovery);
+  const log = await append(await base(), recoverOf(carol, recovery2), recovery);
   await rejectedAt(await forged(log, "recover", recoverBody(dave, recovery3.signPub), recovery), 4, /recovery.*not on the log/);
-  await assert.rejects(append(log, recoverOf(dave, recovery3.signPub), recovery), LogError);
-  const next = await append(log, recoverOf(dave, recovery3.signPub), recovery2);
+  await assert.rejects(append(log, recoverOf(dave, recovery3), recovery), LogError);
+  const next = await append(log, recoverOf(dave, recovery3), recovery2);
   const state = await verifyLog(next, opts);
   assert.equal(state.recoveryPub, recovery3.signPub);
   assert.equal(state.recoveries.length, 2);
@@ -379,7 +448,7 @@ test("the old recovery key is useless after a recover", async () => {
 test("a recover always gives the role full", async () => {
   const log = await base();
   await rejectedAt(await forged(log, "recover", { ...recoverBody(carol, recovery2.signPub), role: "client" }, recovery), 3, /full/);
-  await assert.rejects(append(log, { ...recoverOf(carol, recovery2.signPub), role: "client" }, recovery), /full/);
+  await assert.rejects(append(log, { ...recoverOf(carol, recovery2), role: "client" }, recovery), /full/);
 });
 
 test("a recover cannot keep or reuse a recovery key, or make the recovery key a device", async () => {
@@ -389,7 +458,7 @@ test("a recover cannot keep or reuse a recovery key, or make the recovery key a 
   await rejectedAt(await forged(log, "recover", recoverBody(carol, carol.signPub), recovery), 3, /already/);
   await rejectedAt(await forged(log, "recover", recoverBody(bob, recovery2.signPub), recovery), 3, /already/);
   await rejectedAt(await forged(log, "recover", recoverBody(carol, bob.signPub), recovery), 3, /already/);
-  const after = await append(log, recoverOf(carol, recovery2.signPub), recovery);
+  const after = await append(log, recoverOf(carol, recovery2), recovery);
   await rejectedAt(await forged(after, "recover", recoverBody(dave, recovery.signPub), recovery2), 4, /already/);
   await rejectedAt(await forged(after, "add", bodyOf(addOf(recoveryAsDevice(recovery))), alice), 4, /already/);
 });
@@ -465,7 +534,7 @@ test("validity never depends on timestamps: they may go backwards, and any clock
   log = await append(log, addOf(bob, "full", T0), alice);
   log = await append(log, addOf(carol, "full", T0 - 10 * DAY), bob);
   log = await append(log, addOf(dave, "full", 0), carol);
-  log = await append(log, recoverOf(await newDeviceKeys(), recovery2.signPub, 1), recovery);
+  log = await append(log, recoverOf(await newDeviceKeys(), recovery2, 1), recovery);
   const head = (await verifyLog(log, opts)).head;
   for (const now of [0, T0, T0 * 1000]) {
     const state = await verifyLog(log, { now });
@@ -500,7 +569,7 @@ test("a key can only join once", async () => {
   await rejectedAt(await forged(log, "add", bodyOf(addOf(alice)), alice), 3, /already/);
   await rejectedAt(await forged(log, "add", bodyOf(addOf(recoveryAsDevice(recovery))), alice), 3, /already/);
   await rejectedAt(await forged(log, "add", { ...bodyOf(addOf(carol)), boxPub: bob.boxPub }, alice), 3, /already/);
-  await assert.rejects(createLog({ device: named(alice), recoveryPub: alice.signPub }), /already/);
+  await assert.rejects(createLog({ device: named(alice), recovery: alice }), /already/);
 });
 
 test("signing, box and recovery keys share one namespace", async () => {
@@ -510,7 +579,7 @@ test("signing, box and recovery keys share one namespace", async () => {
   await rejectedAt(await forged(log, "add", { ...bodyOf(addOf(carol)), signPub: bob.boxPub }, alice), 3, /already/);
   await rejectedAt(await forged(log, "add", { ...bodyOf(addOf(carol)), boxPub: carol.signPub }, alice), 3, /already/);
   await rejectedAt(await forged(log, "recover", recoverBody(carol, bob.boxPub), recovery), 3, /already/);
-  await assert.rejects(createLog({ device: named(alice), recoveryPub: alice.boxPub }), /already/);
+  await assert.rejects(createLog({ device: named(alice), recovery: { ...alice, signPub: alice.boxPub } }), /already/);
 });
 
 test("an oversized base64 field is refused before it is decoded", () => {
@@ -632,7 +701,8 @@ test("compareLogs: another account's log is a different account, not a fork, at 
 
 test("compareLogs: two different creates with one account id are a fork at position 0", async () => {
   const a = await created();
-  const b = await forged([], "create", { ...a[0].body, name: "Other" }, alice);
+  const [entry] = await forged([], "create", { ...a[0].body, name: "Other" }, alice);
+  const b = [{ ...entry, recoverySig: await recoverySignature(entry, recovery) }];
   assert.equal(await compareLogs(a, b), "fork");
 });
 
