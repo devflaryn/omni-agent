@@ -79,6 +79,9 @@ export const CONFIG = {
   tlsDir: fc.tlsDir || join(HOME, ".omni-agent", "tls"),
   /** The remote password's scrypt hash. Outside the repo on purpose. */
   remoteAuthFile: fc.remoteAuthFile || join(HOME, ".omni-agent", "remote-auth.json"),
+  /** The account: its folder (keys, device log, audit) and the hub this desktop signs in to. */
+  accountDir: fc.account?.dir || join(HOME, ".omni-agent", "account"),
+  accountHub: fc.account?.hub || "https://tomcamp.tech",
   /** How long a remote change waits for the host's Approve/Deny before it is refused. */
   remoteApprovalTimeoutSec: Number(fc.remoteApprovalTimeoutSec) || 300,
   remoteSessionDays: Number(fc.remoteSessionDays) || 7,

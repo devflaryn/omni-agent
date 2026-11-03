@@ -18,19 +18,20 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { runMissionTool } from "./mission-tools.mjs";
 
-export async function handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal, deps = {} }) {
+export async function handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal, isPerson = isLocal, deps = {} }) {
   if (!p.startsWith("/api/missions")) return false;
   const get = req.method === "GET", post = req.method === "POST";
   const fail = (e) => send(res, e?.status || 500, { error: e?.message || String(e) });
   try {
     if (p === "/api/missions" && get) { send(res, 200, { missions: missions.list().map((m) => missions.pub(m)) }); return true; }
     if (p === "/api/missions" && post) {
-      if (!isLocal(req)) { send(res, 403, { error: "local only" }); return true; }
+      if (!isPerson(req)) { send(res, 403, { error: "local only" }); return true; }
       const m = missions.create(await readBody(req));
       send(res, 200, { mission: missions.pub(m) });
       return true;
     }
     if (p === "/api/missions/tool" && post) {
+      if (!isLocal(req)) { send(res, 403, { error: "local only" }); return true; }
       const body = await readBody(req);
       send(res, 200, await runMissionTool(missions, body, deps));
       return true;

@@ -8,6 +8,7 @@ Falls back to an Edge app window (Windows), then the default browser, when pyweb
 """
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,20 @@ def plan(argv):
     return {"port": port, "url": f"http://127.0.0.1:{port}/?desktop=1", "node": node, "args": args, "log": os.path.join(ROOT, "omni.log"), "root": ROOT, "platform": PLATFORM}
 
 
+def new_window_token():
+    """Handed only to this window: a loopback connection alone must not be able to approve or remove devices."""
+    return secrets.token_urlsafe(32)
+
+
+def first_url(p, token):
+    """The server swaps the token for a cookie and redirects. A server this launcher did not start has no use for one."""
+    return f"{p['url']}&token={token}" if token else p["url"]
+
+
+def server_env(token):
+    return {**os.environ, "OMNI_WINDOW_TOKEN": token}
+
+
 def alive(port, timeout=1.0):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=timeout) as r:
@@ -110,9 +125,9 @@ def kill_tree(proc):
             proc.kill()
 
 
-def start_server(p):
+def start_server(p, token):
     log = open(p["log"], "ab")
-    kwargs = {"cwd": p["root"], "stdout": log, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL}
+    kwargs = {"cwd": p["root"], "stdout": log, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL, "env": server_env(token)}
     if WIN:
         kwargs["creationflags"] = CREATE_NO_WINDOW
     proc = subprocess.Popen(p["args"], **kwargs)
@@ -217,15 +232,18 @@ def main(argv):
         msgbox("Omni Agent", f"Node.js was not found on PATH. Install Node 22+ or set OMNI_NODE to {NODE_HINT}.")
         return 1
     started = None
+    token = None
     if not alive(p["port"]):
-        started = start_server(p)
+        token = new_window_token()
+        started = start_server(p, token)
         if started is None:
             msgbox("Omni Agent", f"The server did not start on port {p['port']}. See omni.log in the Omni Agent folder.")
             return 1
     keep = False
+    url = first_url(p, token)
     try:
-        if not open_window(p["url"]):
-            fallback(p["url"])
+        if not open_window(url):
+            fallback(url)
             keep = True
     except Exception as e:  # webview import worked but the window failed (e.g. no WebView2 runtime)
         msgbox("Omni Agent", f"The window could not be opened: {e}\nOpen {p['url']} in a browser instead.")

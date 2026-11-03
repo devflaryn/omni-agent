@@ -38,6 +38,7 @@ test("mission routes: create, list, get, message, tool, scope, notifications, st
   const { call, bf, dir, agents } = await serve();
   assert.equal((await call("POST", "/api/missions", { dir, goal: "" })).status, 400);
   assert.equal((await call("POST", "/api/missions", { dir, goal: "g", orchestratorModel: "a/b" }, { "x-remote": "1" })).status, 403);
+  assert.equal((await call("POST", "/api/missions/tool", { tool: "x" }, { "x-remote": "1" })).status, 403, "acting as an agent is local only, also in the route itself");
   const c = await call("POST", "/api/missions", { dir, goal: "Map the APK", orchestratorModel: "a/b" });
   assert.equal(c.status, 200);
   const id = c.body.mission.id;

@@ -8,7 +8,8 @@
  */
 import { createServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { promises as fs, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { promises as fs, createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
@@ -33,7 +34,9 @@ import { applyStatus } from "../ui/lib.js";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
 import { createServer as createNetServer } from "node:net";
-import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, classify, clientIp, describe, isHostRequest, parseCookies, parseProxyLine, redact } from "./access.mjs";
+import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, WindowGate, channelAllowed, classify, clientIp, describe, isHostRequest, parseCookies, parseProxyLine, redact, requestTouchesAccountFolder } from "./access.mjs";
+import { Account, AccountError, handleAccountRoutes } from "./account.mjs";
+import { serveChannel } from "./channel-host.mjs";
 import { loadOrCreateCert } from "./tls.mjs";
 import { SshTunnel } from "./tunnel.mjs";
 import { ProjectStore } from "./projects.mjs";
@@ -59,7 +62,7 @@ export async function createApp(overrides = {}) {
     // Nor is the real ~/.pi/agent/models.json (and its keys) copied into a test's provider store.
     if (!("piModelsFile" in overrides)) cfg.migratePiProviders = false;
     if (!("persistContext" in overrides)) cfg.persistContext = false;
-    for (const k of ["opencodeConfigDir", "statusSessionsDir", "projectsDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
+    for (const k of ["opencodeConfigDir", "statusSessionsDir", "projectsDir", "accountDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
   }
   cfg.opencodeMirrorDir ||= join(cfg.piSessionsDir, "opencode");
   // Another Omni on another port (headless.mjs, a scratch instance) keeps its own registry and goals: each server
@@ -67,7 +70,19 @@ export async function createApp(overrides = {}) {
   if (cfg.port && cfg.port !== CONFIG.port) {
     for (const k of ["agentsFile", "goalsFile"]) if (!(k in overrides)) cfg[k] = String(cfg[k]).replace(/\.json$/, `-${cfg.port}.json`);
     if (!("agentsDir" in overrides)) cfg.agentsDir = `${cfg.agentsDir}-${cfg.port}`;
+    // One device holds one hub connection: a second one on the same keys would push the desktop's off.
+    if (!("accountDir" in overrides)) cfg.accountDir = `${cfg.accountDir}-${cfg.port}`;
   }
+  // Read once and taken out of the environment: everything this server starts, agents included, inherits that.
+  const windowGate = new WindowGate(cfg.windowToken ?? process.env.OMNI_WINDOW_TOKEN);
+  delete process.env.OMNI_WINDOW_TOKEN;
+  const accountDirs = [...new Set([cfg.accountDir, CONFIG.accountDir])];
+  const accountStreams = new Set();
+  let account = null;
+  try {
+    account = new Account({ dir: cfg.accountDir, hubUrl: cfg.accountHub, log: (t) => log(t), ...cfg.accountOptions });
+    account.on("channel", (channel) => serveChannel(channel, handle, { device: channel.peer, audit: (entry) => account.audit(entry) }));
+  } catch (e) { log(`account off: ${e.message}`); }
   const bus = new Bus();
   const tally = createTally();
   const registry = new SessionRegistry();
@@ -562,7 +577,7 @@ export async function createApp(overrides = {}) {
   const normDir = (d) => { const r = resolve(String(d)); return process.platform === "win32" ? r.toLowerCase() : r; };
   function fsRootAllowed(req, root) {
     if (!String(root || "").trim()) return false;
-    if (req.omniHost) return true;
+    if (req.omniHost || req.omniChannel) return true;
     const allowed = new Set([cfg.cwd, cfg.vaultDir, ...[...pis].map((c) => c.cwd), ...registry.list().map((s) => s.cwd)].filter(Boolean).map(normDir));
     return allowed.has(normDir(root));
   }
@@ -621,8 +636,9 @@ export async function createApp(overrides = {}) {
   /** Read once and kept on the request: the approval gate reads a remote body before the route does. */
   async function readBody(req) {
     if (req.omniBody) return req.omniBody;
+    if (req.omniBodyError) throw req.omniBodyError;
     // A remote body is capped (16 KB before sign-in, 32 MB after: pasted images); the host's is not.
-    const cap = req.omniHost ? Infinity : req.omniSignedIn ? 32 * 1024 * 1024 : 16 * 1024;
+    const cap = req.omniHost ? Infinity : req.omniSignedIn || req.omniChannel ? 32 * 1024 * 1024 : 16 * 1024;
     const chunks = [];
     let size = 0;
     for await (const c of req) {
@@ -631,7 +647,7 @@ export async function createApp(overrides = {}) {
       chunks.push(c);
     }
     const s = Buffer.concat(chunks).toString("utf8");
-    req.omniBody = s ? JSON.parse(s) : {};
+    try { req.omniBody = s ? JSON.parse(s) : {}; } catch (e) { req.omniBodyError = e; throw e; }
     return req.omniBody;
   }
   /** Chat `sid`'s child, also while it waits to reattach after OpenCode went away (it has no proc then). */
@@ -672,6 +688,8 @@ export async function createApp(overrides = {}) {
     } catch (e) { log("graph query failed", e.message); return ""; }
   }
   const isLocal = (req) => !!req.omniHost;
+  /** The person, at the machine or on another of their devices. isLocal stays for what only this machine may do. */
+  const isPerson = (req) => !!req.omniHost || !!req.omniChannel;
 
   async function memoryPack(prompt) {
     const pack = await vault.pack(prompt, { budgetTokens: cfg.memoryBudgetTokens });
@@ -847,6 +865,27 @@ export async function createApp(overrides = {}) {
     return send(res, 404, { error: "unknown remote route" });
   }
 
+  /** Whether this request names a path in the account folder, in its query or anywhere in its JSON body. */
+  async function accountFolderAsked(req, p, q) {
+    let body = {};
+    if (req.method !== "GET" && req.method !== "HEAD") { try { body = await readBody(req); } catch (e) { if (e.status === 413) throw e; /* the route answers a malformed body as it always did */ } }
+    return requestTouchesAccountFolder({ method: req.method, path: p, query: q, body, bases: [cfg.cwd, cfg.vaultDir].filter(Boolean), dirs: accountDirs });
+  }
+
+  /** The account routes and the proxy to other machines: only for the desktop window, see WindowGate. */
+  async function accountRoute(req, res, p, q) {
+    const refusal = windowGate.refusal(req);
+    if (refusal) return send(res, 403, { error: refusal });
+    if (!account) return send(res, 503, { error: "the account is off: check account.hub in omni.config.json" });
+    if (p === "/remote" || p.startsWith("/remote/")) return send(res, 501, { error: "not available yet" });
+    try {
+      return await handleAccountRoutes(req, res, { p, q, account, send, readBody, streams: accountStreams });
+    } catch (e) {
+      if (e instanceof AccountError) return send(res, e.status, { error: e.message, code: e.code });
+      throw e;
+    }
+  }
+
   async function handle(req, res, { remoteListener = false } = {}) {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const p = url.pathname;
@@ -859,8 +898,17 @@ export async function createApp(overrides = {}) {
     try {
       const sfs = req.headers["sec-fetch-site"];
       if (req.method !== "GET" && sfs && sfs !== "same-origin" && sfs !== "none") return send(res, 403, { error: "cross-site request refused" });
-      req.omniHost = isHostRequest(req, { remoteListener });
-      if (!req.omniHost && (await remoteGate(req, res, p))) return;
+      req.omniHost = !req.omniChannel && isHostRequest(req, { remoteListener });
+      if (req.omniChannel) { if (!channelAllowed(req.method, req.url)) return send(res, 403, { error: "that is not available over a channel" }); }
+      else if (!req.omniHost && (await remoteGate(req, res, p))) return;
+      // Whoever asks, by whatever route: the keys are not reachable through this server.
+      if (await accountFolderAsked(req, p, q)) return send(res, 403, { error: "the account folder cannot be opened through Omni" });
+      if (req.method === "GET" && (p === "/" || p === "/index.html") && q.has("token") && req.omniHost) {
+        const swap = windowGate.swap(req, url);
+        res.writeHead(302, { Location: swap.location, "Cache-Control": "no-store", ...(swap.cookie ? { "Set-Cookie": swap.cookie } : {}) });
+        return res.end();
+      }
+      if (p === "/api/account" || p.startsWith("/api/account/") || p === "/remote" || p.startsWith("/remote/")) return await accountRoute(req, res, p, q);
       if (req.method === "GET" && p === "/api/remote/me") return send(res, 200, { role: req.omniHost ? "host" : "remote" });
       if (p.startsWith("/api/remote/")) return remoteAdmin(req, res, p);
       // static UI
@@ -886,7 +934,7 @@ export async function createApp(overrides = {}) {
       if (req.method === "GET" && p === "/api/state") {
         return send(res, 200, {
           config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: remoteStatus().urls, piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking, context: cfg.context },
-          access: { role: req.omniHost ? "host" : "remote", ...(req.omniHost ? { remote: remoteStatus() } : {}) },
+          access: { role: req.omniHost ? "host" : req.omniChannel ? "device" : "remote", ...(req.omniHost ? { remote: remoteStatus() } : {}) },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
           // Every chat with a pi child right now (`pi` is the one used last), and each one's goal.
           pis: piList().map((x) => ({ ...x, goal: keeper.goal(x.sid) ? keeper.status(x.sid) : null })),
@@ -1161,10 +1209,10 @@ export async function createApp(overrides = {}) {
         }
       }
       // background agents (pi subagents, Claude Code sessions, shell jobs) started by the agents
-      if (p.startsWith("/api/agents") && (await handleAgentRoutes(req, res, { p, q, agents, send, readBody, isLocal }))) return;
+      if (p.startsWith("/api/agents") && (await handleAgentRoutes(req, res, { p, q, agents, send, readBody, isLocal: isPerson }))) return;
       // Claude Code workers of a mission call the mission tools here (local only: it acts as that worker).
       if (p === "/mcp") { if (!isLocal(req)) return send(res, 403, { error: "local only" }); return handleMcp(req, res, { q, missions, agents, deps: missionDeps, readBody, send }); }
-      if (p.startsWith("/api/missions") && (await handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal, deps: missionDeps }))) return;
+      if (p.startsWith("/api/missions") && (await handleMissionRoutes(req, res, { p, q, missions, send, readBody, isLocal, isPerson, deps: missionDeps }))) return;
       // claude
       // pi (or any local caller) hands Claude Code a task and waits for the answer
       if (req.method === "POST" && p === "/api/claude/task") {
@@ -1251,7 +1299,8 @@ export async function createApp(overrides = {}) {
         if (!abs || !mime) return send(res, 404, { error: "not an image" });
         const st = await fs.stat(abs);
         if (st.size > IMAGE_MAX) return send(res, 413, { error: "image too large to preview" });
-        return send(res, 200, await fs.readFile(abs), mime);
+        res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-store", "Content-Length": st.size });
+        return await pipeline(createReadStream(abs), res).catch(() => {}); // read as it is taken, so a stalled device stops the reading
       }
       if (req.method === "GET" && p === "/api/fs/archive-entry") {
         const root = q.get("root") || cfg.cwd;
@@ -1353,6 +1402,7 @@ export async function createApp(overrides = {}) {
     missions.reconcile();
     await new Promise((r) => server.listen(cfg.port, cfg.host, r));
     log(`Omni Agent on http://127.0.0.1:${cfg.port}  vault=${cfg.vaultDir}`);
+    account?.start(); // never awaited: local use does not wait for the hub, or for the key store
     if (cfg.lan) await listenRemote();
     if (cfg.relay?.host) await listenRelay();
     await watcher.start();
@@ -1399,6 +1449,8 @@ export async function createApp(overrides = {}) {
     exitGuard?.release();
     claude.stopAll();
     approvals.dispose();
+    account?.stop();
+    for (const res of accountStreams) { try { res.end(); } catch { /* */ } }
     for (const res of hostStreams) { try { res.end(); } catch { /* */ } }
     server.close();
     remote.server?.close();
@@ -1407,7 +1459,7 @@ export async function createApp(overrides = {}) {
     relay.server?.closeAllConnections?.();
   }
 
-  return { server, remote, relay, get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, missions, projects, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, opencode, cfg };
+  return { server, remote, relay, account, handleChannelRequest: (req, res) => handle(req, res), get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, missions, projects, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, opencode, cfg };
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || process.argv[1]?.endsWith("index.mjs")) {
