@@ -11,6 +11,8 @@ import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
 import { createRemote } from "./remote.js";
 import { createStream } from "./stream.js";
 import { createMissionView } from "./mission.js";
+import { api as machineApi, eventSource, isRemote, local, machineName, setMachine } from "./transport.js";
+import { createAccount } from "./account.js";
 
 const $ = (s) => document.querySelector(s);
 // agents: background agents by id (/api/state + live `agent` events); agentSids: an agent chat's sid → agent id;
@@ -26,21 +28,21 @@ async function api(path, body, method) {
   const verb = body || (method && method !== "GET") ? method || "POST" : "GET";
   // A remote change is held open by the server until the host decides: say so while it waits.
   if (remote.role === "remote" && verb !== "GET" && !REMOTE_FREE.test(path)) toast("Waiting for the host to approve…");
-  const r = await fetch(path, verb !== "GET" ? { method: verb, headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined } : { method: "GET" });
-  const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && j.login) { location.reload(); throw new Error("signed out"); }
-  if (!r.ok || j.error) throw new Error(j.error || `${r.status}`);
-  return j;
+  return machineApi(verb, path, body || undefined);
 }
+/** On another machine, every caption says so: a command run on the wrong computer is the mistake to design against. */
+const onMachine = (caption) => (isRemote() ? (caption ? `On ${machineName()} · ${caption}` : `On ${machineName()}`) : caption);
 function toast(text, err) { const t = el("div", `toast${err ? " err" : ""}`, text); $("#toasts").appendChild(t); setTimeout(() => t.remove(), err ? 7000 : 3500); }
-const remote = createRemote({ api, toast });
+// The old remote settings and cards are this computer's, whichever machine the window is on.
+const hereApi = (path, body, method) => local.api(body || (method && method !== "GET") ? method || "POST" : "GET", path, body);
+const remote = createRemote({ api: isRemote() ? hereApi : api, toast });
 const homeCwd = () => $("#homeCwd").value.trim() || S.config?.cwd || "";
 const currentDir = () => (S.page === "chat" && S.sessions.get(S.selected)?.cwd) || homeCwd() || null;
 
 async function deleteChat(sid) {
   const s = S.sessions.get(sid);
   const name = s?.title ? `“${s.title.slice(0, 40)}”` : "this chat";
-  if (!window.confirm(`Delete ${name}?\nIt moves to the Omni trash folder and disappears here.`)) return;
+  if (!window.confirm(`Delete ${name}${isRemote() ? ` on ${machineName()}` : ""}?\nIt moves to the Omni trash folder and disappears here.`)) return;
   try {
     await api(`/api/sessions/${encodeURIComponent(sid)}`, null, "DELETE");
     S.sessions.delete(sid); S.buffers.delete(sid);
@@ -79,7 +81,8 @@ const openChat = (sid) => { selectSession(sid); showView("chat"); if (window.inn
 const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat, agentFor });
 const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => history.render() });
 const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat") });
-const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices(); refreshState(); }, loadRemote: () => remote.loadSettings(), getContext: () => S.config?.context, onContext: (context) => { S.config = { ...(S.config || {}), context }; } });
+const account = createAccount({ toast, openSettings: () => settings.open("account") });
+const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices(); refreshState(); }, loadRemote: () => remote.loadSettings(), loadAccount: () => account.renderSettings(), getContext: () => S.config?.context, onContext: (context) => { S.config = { ...(S.config || {}), context }; } });
 const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => settings.open(), onHook: setHook };
 const home = createComposer($("#homeComposer"), { ...composerHooks, onSend: homeSend });
 // In a background agent's chat the picker shows the agent's model; picking there would change Omni's own pi.
@@ -389,7 +392,8 @@ function updateTitle() {
   // An agent's chat goes by the title its parent gave the job, not the first line of its task prompt.
   const title = S.page === "chat" && s ? agentFor(s.sid)?.title || s.title || "" : "";
   $("#topTitle").textContent = title;
-  document.title = title ? `${title} · Omni Agent` : "Omni Agent";
+  const where = isRemote() ? `[${machineName()}] ` : "";
+  document.title = title ? `${where}${title} · Omni Agent` : `${where}Omni Agent`;
 }
 
 // ---------------------------------------------------------------- home
@@ -403,7 +407,7 @@ function renderHome() {
   if (!cwdInput.value) cwdInput.value = S.pi.cwd || S.config?.cwd || "";
   const chips = $("#dirChips"); chips.innerHTML = "";
   for (const d of recentDirs()) { const c = el("button", `chip${d === cwdInput.value ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; browseHome(); renderHome(); }; chips.appendChild(c); }
-  home.setState({ ...piModelState(), caption: "" });
+  home.setState({ ...piModelState(), caption: onMachine("") });
   updateHeader();
 }
 // `/goal <text>` sets a persistent goal: the agent brainstorms and plans it, and the keeper re-engages
@@ -504,6 +508,7 @@ function updateComposer() {
   }
   if (t.s?.compacting) st.caption = "Compacting the context (a long chat is summarized first; this can take minutes)…";
   $("#chatComposer").classList.toggle("for-agent", t.kind === "agent");
+  st.caption = onMachine(st.caption);
   chat.setState(st);
 }
 /**
@@ -632,6 +637,9 @@ document.addEventListener("click", (e) => { if (!e.target.closest("#chatMenu, #b
 $("#btnExplorer").onclick = () => { explorer.setRoot(currentDir()); setExplorer(!document.body.classList.contains("explorer-open"), true); };
 $("#btnSummary").onclick = () => { try { localStorage.setItem("omni.summary", summaryOn() ? "off" : "on"); } catch { /* */ } renderSummary(); };
 $("#btnSettings").onclick = () => settings.open();
+$("#machineBtn").onclick = (e) => { e.stopPropagation(); account.openMenu(); };
+$("#machineBack").onclick = () => setMachine(null);
+document.addEventListener("click", (e) => { if (!e.target.closest("#machineMenu, #machineBtn")) $("#machineMenu").hidden = true; });
 // Missions: the orchestrator/worker view (ui/mission.js). Its badge counts unread notifications across missions.
 const missionView = createMissionView({
   root: $("#view-mission"), api, toast, onOpenChat: (sid) => openChat(sid), sessionOf: (sid) => S.sessions.get(sid) || null,
@@ -644,6 +652,7 @@ $("#btnMissions").onclick = () => showView("mission");
 // seq + boot let a reconnect ask for exactly what it missed (server/bus.mjs addClient).
 const stream = createStream({
   url: () => `/events?since=${S.seq}${S.boot ? `&boot=${encodeURIComponent(S.boot)}` : ""}`,
+  EventSource: function MachineEvents(url) { return eventSource(url); }, // called with new: what it returns is the stream
   onMessage: (m) => { let ev; try { ev = JSON.parse(m.data); } catch { return; } handle(ev); },
   on: {
     // Only the host's own window receives these: remote changes waiting for Approve/Deny.
@@ -655,6 +664,13 @@ const stream = createStream({
   onUp: () => { $("#connStatus").hidden = true; updateHeader(); },
   onDown: () => { $("#connStatus").hidden = false; checkSignedIn(); },
 });
+// Only this computer's own stream says when a remote browser asks for something, so it stays open on another machine too.
+const hereStream = isRemote() ? createStream({
+  url: () => "/events?since=0",
+  onMessage: () => {},
+  on: { approvals: (m) => { try { remote.setApprovals(JSON.parse(m.data)); } catch { /* */ } } },
+  EventSource: function HereEvents(url) { return local.eventSource(url); },
+}) : null;
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") stream.poke(); });
 window.addEventListener("online", () => stream.poke());
 /** EventSource cannot see a 401, so a remote browser whose session ended (the server restarted, the password
@@ -725,6 +741,15 @@ function handle(ev) {
 async function init() {
   if (S.desktop) document.body.classList.add("desktop");
   initResizers();
+  hereStream?.start();
+  account.init().catch(() => {}); // never waited for: local use does not depend on the account
+  if (isRemote()) {
+    $("#connStatus").title = `The connection to ${machineName()} dropped; it reconnects by itself`;
+    $("#connStatus").textContent = `reconnecting to ${machineName()}`;
+    $(".hero-sub").textContent = `OpenCode runs on ${machineName()}, in the folder you pick there. Every chat on that machine lives in the history drawer.`;
+    $(".hero").textContent = `What should ${machineName()} work on?`;
+    updateTitle();
+  }
   const st = await api("/api/state");
   S.config = st.config; S.pi = st.pi; setPiChats(st.pis); S.runs = st.runs || []; S.hook = st.hook || null; S.boot = st.boot || "";
   for (const s of st.sessions) { S.sessions.set(s.sid, s); if (s.agentId) S.agentSids.set(s.sid, s.agentId); }
@@ -739,7 +764,7 @@ async function init() {
     Object.assign(s, { hookArmed: !!g.armed, hookRetryAt: g.retryAt || 0 });
   }
   remote.init(st.access);
-  if (st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
+  if (!isRemote() && st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
   await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
   history.render();
   // #missions opens the Mission view (a link, a bookmark, the phone's home screen).
@@ -747,4 +772,4 @@ async function init() {
   stream.start();
   setInterval(() => { if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "chat") updateComposer(); }, 15000);
 }
-init().catch((e) => toast(`Omni Agent failed to start: ${e.message}`, true));
+init().catch((e) => { if (isRemote()) account.machineDown(e.message); else toast(`Omni Agent failed to start: ${e.message}`, true); });

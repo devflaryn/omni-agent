@@ -36,6 +36,7 @@ import { createTally, estimateTokens } from "./tokens.mjs";
 import { createServer as createNetServer } from "node:net";
 import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, WindowGate, channelAllowed, classify, clientIp, describe, isHostRequest, parseCookies, parseProxyLine, redact, requestTouchesAccountFolder } from "./access.mjs";
 import { Account, AccountError, handleAccountRoutes } from "./account.mjs";
+import { MachineLinks, proxyToMachine } from "./channel-client.mjs";
 import { serveChannel } from "./channel-host.mjs";
 import { loadOrCreateCert } from "./tls.mjs";
 import { SshTunnel } from "./tunnel.mjs";
@@ -79,9 +80,11 @@ export async function createApp(overrides = {}) {
   const accountDirs = [...new Set([cfg.accountDir, CONFIG.accountDir])];
   const accountStreams = new Set();
   let account = null;
+  let machineLinks = null;
   try {
     account = new Account({ dir: cfg.accountDir, hubUrl: cfg.accountHub, log: (t) => log(t), ...cfg.accountOptions });
     account.on("channel", (channel) => serveChannel(channel, handle, { device: channel.peer, audit: (entry) => account.audit(entry) }));
+    machineLinks = new MachineLinks({ account, ...cfg.machineLinks });
   } catch (e) { log(`account off: ${e.message}`); }
   const bus = new Bus();
   const tally = createTally();
@@ -877,9 +880,9 @@ export async function createApp(overrides = {}) {
     const refusal = windowGate.refusal(req);
     if (refusal) return send(res, 403, { error: refusal });
     if (!account) return send(res, 503, { error: "the account is off: check account.hub in omni.config.json" });
-    if (p === "/remote" || p.startsWith("/remote/")) return send(res, 501, { error: "not available yet" });
+    if (p === "/remote" || p.startsWith("/remote/")) return await proxyToMachine(req, res, { links: machineLinks, send });
     try {
-      return await handleAccountRoutes(req, res, { p, q, account, send, readBody, streams: accountStreams });
+      return await handleAccountRoutes(req, res, { p, q, account, links: machineLinks, send, readBody, streams: accountStreams });
     } catch (e) {
       if (e instanceof AccountError) return send(res, e.status, { error: e.message, code: e.code });
       throw e;
@@ -901,6 +904,8 @@ export async function createApp(overrides = {}) {
       req.omniHost = !req.omniChannel && isHostRequest(req, { remoteListener });
       if (req.omniChannel) { if (!channelAllowed(req.method, req.url)) return send(res, 403, { error: "that is not available over a channel" }); }
       else if (!req.omniHost && (await remoteGate(req, res, p))) return;
+      // The proxy first: its body is the far machine's to read, as it streams, and no path in it names anything here.
+      if (p === "/remote" || p.startsWith("/remote/")) return await accountRoute(req, res, p, q);
       // Whoever asks, by whatever route: the keys are not reachable through this server.
       if (await accountFolderAsked(req, p, q)) return send(res, 403, { error: "the account folder cannot be opened through Omni" });
       if (req.method === "GET" && (p === "/" || p === "/index.html") && q.has("token") && req.omniHost) {
@@ -908,7 +913,7 @@ export async function createApp(overrides = {}) {
         res.writeHead(302, { Location: swap.location, "Cache-Control": "no-store", ...(swap.cookie ? { "Set-Cookie": swap.cookie } : {}) });
         return res.end();
       }
-      if (p === "/api/account" || p.startsWith("/api/account/") || p === "/remote" || p.startsWith("/remote/")) return await accountRoute(req, res, p, q);
+      if (p === "/api/account" || p.startsWith("/api/account/")) return await accountRoute(req, res, p, q);
       if (req.method === "GET" && p === "/api/remote/me") return send(res, 200, { role: req.omniHost ? "host" : "remote" });
       if (p.startsWith("/api/remote/")) return remoteAdmin(req, res, p);
       // static UI
@@ -1449,6 +1454,7 @@ export async function createApp(overrides = {}) {
     exitGuard?.release();
     claude.stopAll();
     approvals.dispose();
+    machineLinks?.close();
     account?.stop();
     for (const res of accountStreams) { try { res.end(); } catch { /* */ } }
     for (const res of hostStreams) { try { res.end(); } catch { /* */ } }

@@ -1436,7 +1436,7 @@ test("a removed device's open channel is closed at once, with no new request nee
   const fixture = await hubFixture();
   const { first, second } = await connected(fixture);
   const channel = await second.openChannel(first.status().device.id);
-  assert.equal(first.status().channels.length, 1);
+  await until(() => first.status().channels.length === 1, "the host's end of the channel");
   const hostChannelClosed = new Promise((r) => first.once("channel-closed", r));
   // Not by the hub's word that the peer has gone: by this machine's own log.
   first.tap.incoming = (m) => (m.type === "presence" ? null : m);
@@ -2049,9 +2049,10 @@ test("register: a retry with a mistyped password does not cost the code of the a
   writeBootstrap(account.dir);
   await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "First" }));
   const held = await account.showRecoveryCode();
-  await assert.rejects(account.register({ email: EMAIL, password: "a mistyped long password", name: "First" }), (e) => e.status === 403);
+  // Neither "closed to registration" nor a contest: a mistyped password says nothing about either.
+  await assert.rejects(account.register({ email: EMAIL, password: "a mistyped long password", name: "First" }), (e) => e.status === 409 && e.code === "recovery-code-pending" && /did not accept that password/.test(e.message) && !/not open for registration/.test(e.message));
   assert.deepEqual(await account.showRecoveryCode(), held, "both files kept");
-  assert.equal(account.status().recoveryContested, true);
+  assert.equal(account.status().recoveryContested, false);
   const out = await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
   assert.equal(out.recoveryCode, held.recoveryCode);
   await until(() => account.status().phase === "approved", "signed in");
@@ -2059,6 +2060,28 @@ test("register: a retry with a mistyped password does not cost the code of the a
   const proof = makeAccount(fixture);
   await proof.recover({ email: EMAIL, password: PASSWORD, recoveryCode: out.recoveryCode, name: "Proof" });
   assert.equal(proof.status().phase, "approved");
+});
+
+test("register: a double click gets a clean answer, not a plain error", async () => {
+  const fixture = await hubFixture();
+  const account = makeAccount(fixture);
+  writeBootstrap(account.dir);
+  const both = await Promise.allSettled([1, 2].map(() => account.register({ email: EMAIL, password: PASSWORD, name: "First" })));
+  const refused = both.filter((r) => r.status === "rejected");
+  assert.equal(refused.length, 1, "one of them lands");
+  assert.equal(refused[0].reason.code, "recovery-code-pending");
+  assert.equal(refused[0].reason.status, 409);
+});
+
+test("register: a live code whose candidate is gone is not called a recovery", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { name: "First" });
+  assert.equal(first.status().recoveryCodePending, true);
+  await first.stop();
+  for (const name of ["log.json", "state.json", "session.json"]) await fsp.rm(join(first.dir, name), { force: true });
+  const again = makeAccount(fixture, { dir: first.dir });
+  await again.start();
+  await assert.rejects(again.register({ email: EMAIL, password: "another long password", name: "First" }), (e) => e.code === "recovery-code-pending" && !/from a recovery/.test(e.message));
 });
 
 test("recovery: a send that never left this computer deletes the code, and the old one stands", async () => {

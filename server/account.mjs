@@ -80,6 +80,7 @@ const CONTRADICTED = "The hub's answers do not match this recovery code, so this
 const unsettledText = (ms) => `The hub has not confirmed this recovery code in ${Math.round(ms / MINUTE)} minutes, so this computer cannot tell whether it counts. Keep every recovery code you have until another device confirms, or say you saved it to move on.`;
 /** How a code held on this computer is let go of: the person's choice, never a new attempt's. */
 const discardAdvice = (ms) => `To register afresh instead, say you saved that code once Omni allows it (when a hub contradicts it, or ${Math.round(ms / MINUTE)} minutes after it was sent), or sign out and forget this device.`;
+const wrongPasswordText = (email, ms) => `The hub did not accept that password. This computer holds a recovery code from an earlier registration of ${email} that may have reached the hub: if it did, that code is the live one and this was the wrong password, so try it again. ${discardAdvice(ms)}`;
 const LOG_NOT_SAVED = "This computer could not save its device list. It will try again the next time Omni starts: check the disk.";
 // ------------------------------------------------------------------------------ the slow key
 
@@ -616,7 +617,11 @@ export class Account extends EventEmitter {
         if (this.#recovery.pending || error.code !== "recovery-code-pending") throw error;
       }
     }
-    if (this.#recovery.pending && !retry) throw new AccountError(409, "recovery-code-pending", `This computer holds a recovery code for ${email} from a recovery that you have not saved yet. It may be the live one, so a new registration cannot replace it. ${discardAdvice(this.limits.unsettledMs)}`);
+    if (this.#recovery.pending && !retry) {
+      // Either an unsaved recovery, or a code a log has already shown to be live, which then has no candidate left to resume.
+      const from = candidate?.kind === "recover" ? "from a recovery " : "";
+      throw new AccountError(409, "recovery-code-pending", `This computer holds a recovery code for ${email} ${from}that you have not saved yet. It may be the live one, so a new registration cannot replace it. ${discardAdvice(this.limits.unsettledMs)}`);
+    }
     if (!retry) await this.#recovery.apply("replaced"); // a candidate whose code the person saved: they are starting again
     const { recoveryCode, entries, salt } = retry ?? await this.#newRegistration(email);
     const loginKey = await this.#loginKey(password, salt);
@@ -652,7 +657,10 @@ export class Account extends EventEmitter {
       // The safety of this branch rests on `loginKey` being derived from this attempt's own `salt`: the hub stored that
       // salt if and only if this attempt is the account it holds, so an `approved` here can only mean that. A key derived
       // from any other salt could open nothing here, and would prove nothing if it did.
-      const state = await this.#login(email, loginKey).catch(() => null);
+      let loginError = null;
+      const state = await this.#login(email, loginKey).catch((e) => { loginError = e; return null; });
+      // A mistyped password says nothing about the first attempt, and the hub has not said it is closed to this one.
+      if (loginError?.code === "wrong-credentials") throw new AccountError(409, "recovery-code-pending", wrongPasswordText(email, this.limits.unsettledMs));
       if (state !== "approved") {
         await this.#contest();
         throw error;
@@ -694,7 +702,7 @@ export class Account extends EventEmitter {
       state = await this.#login(email, await this.#loginKey(password, salt));
     } catch (error) {
       if (error.code !== "wrong-credentials") throw error; // unreachable, locked, busy: the person is told that
-      throw new AccountError(409, "recovery-code-pending", `The hub did not accept that password. This computer holds a recovery code from an earlier registration of ${email} that may have reached the hub: if it did, that code is the live one and this was the wrong password, so try it again. ${discardAdvice(this.limits.unsettledMs)}`);
+      throw new AccountError(409, "recovery-code-pending", wrongPasswordText(email, this.limits.unsettledMs));
     }
     if (state !== "approved") {
       await this.#forgetSession();

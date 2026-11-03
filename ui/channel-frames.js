@@ -12,6 +12,8 @@
 // Either side: ABORT ends one stream. ACK (4 bytes, big endian) gives back that many bytes of body the receiver has
 // consumed: a sender stops at WINDOW unacknowledged, which is what makes a stalled reader stop a large file being read.
 // READY is the first sealed frame each side sends: its own log and device checks have passed. Nothing else may come first.
+// PING asks the host to answer with PONG. It proves the far side still reads this channel, which a hub can claim falsely but
+// cannot forge inside the seal, and which no request has to do: a request can rightly take minutes to answer.
 //
 // Outer message, the text the hub carries in `opaque`, which it can read and change, so nothing here is believed:
 //   {v, c, t: "hello", eph, logHead}    the handshake's hello; c is a fresh channel id from the side that opens
@@ -21,7 +23,7 @@
 //   {v, t: "review", id}                a hint for the other full devices' cards. A hub can forge it: it only changes a label.
 
 export const FRAME_VERSION = 1;
-export const FRAME = Object.freeze({ REQ: 1, REQ_BODY: 2, REQ_END: 3, RES: 4, RES_BODY: 5, RES_END: 6, ABORT: 7, ACK: 8, READY: 9 });
+export const FRAME = Object.freeze({ REQ: 1, REQ_BODY: 2, REQ_END: 3, RES: 4, RES_BODY: 5, RES_END: 6, ABORT: 7, ACK: 8, READY: 9, PING: 10, PONG: 11 });
 export const MAX_CHUNK = 256 * 1024;      // base64 of this fits the hub's 1 MiB message with room to spare
 export const WINDOW = 2 * 1024 * 1024;    // unacknowledged body bytes per channel, in each direction
 export const MAX_HEAD = 64 * 1024;

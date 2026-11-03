@@ -5,7 +5,7 @@ import { el, esc, compactAtFromField, compactAtK } from "./lib.js";
 import { createMcpSettings } from "./mcp-settings.js";
 
 /** `getContext()` → the saved context policy (`/api/state.config.context`); `onContext(policy)` after a save. */
-export function createSettings({ api, toast, onChanged, loadRemote, getContext = () => null, onContext }) {
+export function createSettings({ api, toast, onChanged, loadRemote, loadAccount, getContext = () => null, onContext }) {
   const $ = (s) => document.querySelector(s);
   const modal = $("#settings"), list = $("#provList"), form = $("#provForm");
   const f = {
@@ -21,7 +21,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
 
   const mcp = createMcpSettings({ api, toast, onChanged });
   // Four tabs in one dialog: the models OpenCode can use, the MCP servers it connects to, remote access (host only) and long runs.
-  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody"), sub: $("#subModels") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody"), sub: $("#subMcp") }, remote: { btn: $("#tabRemote"), body: $("#remoteBody"), sub: $("#subRemote") }, long: { btn: $("#tabLong"), body: $("#longBody"), sub: $("#subLong") } };
+  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody"), sub: $("#subModels") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody"), sub: $("#subMcp") }, remote: { btn: $("#tabRemote"), body: $("#remoteBody"), sub: $("#subRemote") }, long: { btn: $("#tabLong"), body: $("#longBody"), sub: $("#subLong") }, account: { btn: $("#tabAccount"), body: $("#accountBody"), sub: $("#subAccount") } };
   let tab = "models";
   function showTab(name) {
     tab = name;
@@ -30,12 +30,13 @@ export function createSettings({ api, toast, onChanged, loadRemote, getContext =
       t.btn.classList.toggle("active", on); t.btn.setAttribute("aria-selected", String(on));
       t.body.hidden = !on; t.sub.hidden = !on;
     }
-    if (name === "mcp") mcp.load(); else if (name === "remote") loadRemote?.(); else if (name === "long") renderLong(); else load();
+    if (name === "mcp") mcp.load(); else if (name === "remote") loadRemote?.(); else if (name === "long") renderLong(); else if (name === "account") loadAccount?.(); else load();
   }
   tabs.models.btn.onclick = () => showTab("models");
   tabs.mcp.btn.onclick = () => showTab("mcp");
   tabs.remote.btn.onclick = () => showTab("remote");
   tabs.long.btn.onclick = () => showTab("long");
+  tabs.account.btn.onclick = () => showTab("account");
 
   // ------------------------------------------------------------ long runs
   function renderLong() {

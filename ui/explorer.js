@@ -1,6 +1,7 @@
 /* File explorer (left column) + preview column: tree with lazy folders, previews for text, markdown,
    images and zip-like archives (.zip/.apk/.jar: entries inside, text entries readable in place). */
 import { el, md, fileKind, fmtBytes, buildTree } from "./lib.js";
+import { rawUrl } from "./transport.js";
 
 const ICONS = {
   folder: `<svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg>`,
@@ -88,7 +89,7 @@ export function createExplorer({ api, toast, insert, onClose }) {
     if (d.kind === "image") {
       if (d.tooBig) return pvBody.appendChild(el("div", "pv-note", `Image too large to preview (${fmtBytes(d.size)}).`));
       const img = el("img", "pv-img"); img.alt = current.path;
-      img.src = `/api/fs/raw?root=${encodeURIComponent(root)}&path=${encodeURIComponent(current.path)}`;
+      rawUrl(`/api/fs/raw?root=${encodeURIComponent(root)}&path=${encodeURIComponent(current.path)}`).then((url) => { img.src = url; }, (e) => { toast(e.message, true); });
       return pvBody.appendChild(img);
     }
     if (d.kind === "archive") return renderArchive(d);

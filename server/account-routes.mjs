@@ -6,7 +6,7 @@ const need = (value, what) => {
 };
 
 /** Every /api/account route. The caller has already checked the window cookie and the Origin. Answers, or throws AccountError. */
-export async function handleAccountRoutes(req, res, { p, q, account, send, readBody, streams }) {
+export async function handleAccountRoutes(req, res, { p, q, account, links, send, readBody, streams }) {
   const post = req.method === "POST";
   const get = req.method === "GET";
   const body = post ? await readBody(req) : {};
@@ -29,6 +29,7 @@ export async function handleAccountRoutes(req, res, { p, q, account, send, readB
       if (post) return send(res, 200, await account.signOut({ forget: body.forget === true }));
       break;
     case "/api/account/devices": if (get) return send(res, 200, { devices: account.devices() }); break;
+    case "/api/account/machines": if (get) return send(res, 200, { machines: links.machines() }); break;
     case "/api/account/approvals":
       if (get) return send(res, 200, { pending: account.pendingSignIns(), review: account.status().review });
       break;
@@ -67,7 +68,7 @@ export async function handleAccountRoutes(req, res, { p, q, account, send, readB
       if (post) { await account.clearAlerts(); return send(res, 200, { ok: true }); }
       break;
     case "/api/account/events":
-      if (get) return accountEvents(req, res, account, streams);
+      if (get) return accountEvents(req, res, account, links, streams);
       break;
     default:
   }
@@ -75,11 +76,13 @@ export async function handleAccountRoutes(req, res, { p, q, account, send, readB
 }
 
 /** The window's own stream of account events. Not /events, which also goes to other devices. */
-function accountEvents(req, res, account, streams) {
+function accountEvents(req, res, account, links, streams) {
   res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive" });
   const push = (name) => (data) => { try { res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* it went */ } };
   const listeners = Object.fromEntries(["approval", "devices", "alert", "status"].map((name) => [name, push(name)]));
   for (const [name, listener] of Object.entries(listeners)) account.on(name, listener);
+  const onLinks = push("links");
+  links.on("links", onLinks);
   listeners.status(account.status());
   const beat = setInterval(() => { try { res.write(": ka\n\n"); } catch { /* */ } }, 20_000);
   beat.unref?.();
@@ -87,6 +90,7 @@ function accountEvents(req, res, account, streams) {
   req.on("close", () => {
     clearInterval(beat);
     streams.delete(res);
+    links.off("links", onLinks);
     for (const [name, listener] of Object.entries(listeners)) account.off(name, listener);
   });
 }

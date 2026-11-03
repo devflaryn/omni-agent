@@ -809,3 +809,92 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .ms-detail-head { display: flex; align-items: center; gap: 14px; }
 .ms-detail-head-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+
+/* ------------------------------------------------------------ accounts and other machines (ui/account.js) */
+/* On another machine the whole bar turns over: a command run on the wrong computer is the mistake to design against. */
+body.on-remote #top { background: var(--inverse); color: var(--inverse-ink); }
+body.on-remote #top > .brand .mark { background: var(--inverse-ink); }
+body.on-remote #top > .icon-btn, body.on-remote #top > .menu-wrap > .icon-btn, body.on-remote #top > .top-title, body.on-remote #top > .top-model, body.on-remote #top > .conn-status { color: var(--inverse-ink); }
+body.on-remote #top > .icon-btn:hover, body.on-remote #top > .menu-wrap > .icon-btn:hover { background: color-mix(in srgb, var(--inverse-ink) 14%, transparent); color: var(--inverse-ink); }
+body.on-remote #top > .top-title { border-left-color: color-mix(in srgb, var(--inverse-ink) 30%, transparent); }
+.machine-wrap { margin-left: 8px; min-width: 0; }
+.machine-wrap[hidden], .machine-back[hidden] { display: none; }
+.machine-btn { display: flex; align-items: center; gap: 7px; background: transparent; border: 1px solid var(--line-2); color: var(--muted); border-radius: var(--r-pill); padding: 4px 8px 4px 10px; font-size: 12.5px; line-height: 1.3; cursor: pointer; max-width: 40vw; min-height: 28px; }
+.machine-btn:hover { color: var(--ink); background: var(--field-2); }
+.machine-btn svg { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.machine-glyph { width: 8px; height: 6px; border: 1.5px solid currentColor; border-radius: 2px; flex: none; }
+.machine-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.machine-id { font-family: var(--mono); font-size: 11px; opacity: 0.7; flex: none; }
+body.on-remote .machine-btn { background: var(--inverse-ink); color: var(--inverse); border-color: var(--inverse-ink); font-weight: 600; font-size: 13px; }
+body.on-remote .machine-btn:hover { background: var(--inverse-ink); color: var(--inverse); opacity: 0.9; }
+.machine-back { background: transparent; border: 0; color: var(--inverse-ink); font-size: 12.5px; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; padding: 4px 8px; white-space: nowrap; flex: none; }
+#machineMenu { min-width: 280px; color: var(--ink); }
+.machine-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.machine-row-id { font-family: var(--mono); font-size: 11px; color: var(--dim); flex: none; }
+.machine-row-state { color: var(--dim); font-size: 11.5px; margin-left: auto; flex: none; }
+.machine-row[disabled] { opacity: 0.55; cursor: default; }
+.machine-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--dim); flex: none; }
+.machine-dot.live { background: var(--ink); border-color: var(--ink); }
+.machine-note { display: block; color: var(--ink); font-weight: 500; margin-top: 4px; }
+.machine-note[hidden] { display: none; }
+
+#accountBanners { flex: none; display: grid; max-height: 40vh; overflow: auto; }
+#accountBanners[hidden] { display: none; }
+.acct-banner { display: flex; align-items: center; gap: 12px; padding: 8px 14px 8px 18px; font-size: 13px; line-height: 1.45; background: var(--field); border-bottom: 1px solid var(--line-2); }
+.acct-banner.danger { background: var(--err); color: #ffffff; border-bottom-color: rgba(255, 255, 255, 0.25); }
+:root:not([data-theme="light"]) .acct-banner.danger { color: #1a0505; }
+.acct-banner-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.acct-banner-text b { font-weight: 600; }
+.acct-banner-actions { display: flex; gap: 6px; flex: none; }
+.acct-banner.danger .btn { color: inherit; border-color: currentColor; background: transparent; }
+.acct-banner.danger .btn:hover { background: rgba(127, 127, 127, 0.2); }
+
+#accountCards { position: fixed; top: calc(var(--top) + 4px); right: 4px; width: min(444px, calc(100vw - 8px)); max-height: calc(100vh - var(--top) - 8px); overflow: auto; display: grid; gap: 10px; z-index: 86; padding: 4px 12px 28px; pointer-events: none; }
+#accountCards > * { pointer-events: auto; }
+#accountCards[hidden] { display: none; }
+.acct-card .ap-bar { flex-wrap: wrap; margin-top: 10px; }
+.acct-card .ap-bar .btn { min-width: 0; }
+.acct-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 12px; margin: 0 0 8px; font-size: 13px; }
+.acct-facts dt { color: var(--muted); }
+.acct-facts dd { margin: 0; overflow-wrap: anywhere; }
+.acct-code { font-family: var(--mono); font-size: 30px; font-weight: 600; letter-spacing: 0.08em; text-align: center; padding: 10px; margin: 6px 0 8px; background: var(--ground); border-radius: var(--r); font-variant-numeric: tabular-nums; user-select: all; }
+.acct-choice { display: flex; align-items: center; gap: 8px; font-size: 13px; margin: 8px 0 4px; cursor: pointer; }
+.acct-choice input { margin: 0; }
+
+.acct-gate { z-index: 90; }
+.acct-gate[hidden] { display: none; }
+.acct-gate-box { width: min(560px, 100%); padding: 22px 24px 18px; display: block; overflow: auto; }
+.acct-gate-title { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+.acct-only { font-size: 14px; font-weight: 600; color: var(--err); margin: 0 0 12px; }
+.acct-recovery { font-size: 19px; font-weight: 600; line-height: 1.5; letter-spacing: 0.03em; padding: 14px 16px; background: var(--ground); border: 1px solid var(--line-2); border-radius: var(--r); overflow-wrap: anywhere; user-select: all; text-align: center; font-family: var(--mono); }
+.acct-gate-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+.acct-gate-row .rm-note { margin: 0; }
+.acct-gate-box .ap-bar { flex-wrap: wrap; margin-top: 12px; }
+.acct-gate-box .ap-bar .btn { min-width: 0; }
+.acct-forget { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line-2); }
+.btn.danger { background: var(--err); border-color: var(--err); color: #ffffff; font-weight: 600; }
+.btn.danger:hover { background: var(--err); opacity: 0.88; }
+
+.acct-field { display: grid; gap: 3px; font-size: 12.5px; color: var(--muted); }
+.acct-devices { display: grid; }
+.acct-device { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.acct-device-main { flex: 1; min-width: 0; font-size: 13.5px; }
+.acct-device-main .machine-dot { margin-right: 7px; }
+.acct-device-main b { font-weight: 500; overflow-wrap: anywhere; }
+.acct-self { margin-left: 8px; color: var(--muted); font-size: 12px; }
+.acct-device-sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.acct-audit { max-height: 280px; overflow: auto; margin-bottom: 8px; }
+.acct-audit-row { display: grid; grid-template-columns: 138px minmax(70px, 130px) 52px minmax(0, 1fr); gap: 8px; font-size: 12px; padding: 4px 0; border-bottom: 1px solid var(--line); align-items: baseline; }
+.acct-audit-when, .acct-audit-who { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct-audit-method, .acct-audit-path { font-size: 11.5px; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  body.on-remote .brand .word, body.on-remote #top > .top-title, body.on-remote .machine-back { display: none; }
+  .machine-wrap { margin-left: 4px; }
+  .machine-btn { max-width: 52vw; }
+  body:not(.on-remote) .machine-btn .machine-name { max-width: 28vw; }
+  .acct-banner { flex-direction: column; align-items: stretch; padding: 8px 14px; gap: 6px; }
+  .acct-audit-row { grid-template-columns: 1fr auto; }
+  .acct-audit-path { grid-column: 1 / -1; }
+  .acct-gate-box { padding: 18px 16px 14px; }
+  .acct-recovery { font-size: 16px; }
+}

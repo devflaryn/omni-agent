@@ -22,6 +22,7 @@
  */
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
+import { AccountError } from "./account-error.mjs";
 
 export const RECOVERY_CODE_FILE = "recovery-code.json";
 
@@ -127,11 +128,11 @@ export class RecoveryStore {
 
   async #prepare({ kind, email, code, entries }) {
     const event = this.state === "none" ? "prepare" : "resent";
-    if (TRANSITIONS[this.state][event] === undefined) throw new Error(`a recovery code is held (${this.state}) and may be live: only the person may discard it`);
+    if (TRANSITIONS[this.state][event] === undefined) throw new AccountError(409, "recovery-code-pending", `a recovery code is held (${this.state}) and may be live: only the person may discard it`);
     if (event === "resent") {
       let held = null;
       try { held = await this.code(); } catch { /* cannot be read, so cannot be shown to be the same */ }
-      if (held === null || held !== code || this.#kind !== kind) throw new Error(`a recovery code is held (${this.state}) and may be live: only the same code may be sent again`);
+      if (held === null || held !== code || this.#kind !== kind) throw new AccountError(409, "recovery-code-pending", `a recovery code is held (${this.state}) and may be live: only the same code may be sent again`);
     }
     const since = this.io.now();
     await this.io.writeSecret(RECOVERY_CODE_FILE, { state: "in-doubt", since, kind, email, entries }, Buffer.from(code));
