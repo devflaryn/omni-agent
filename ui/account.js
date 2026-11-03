@@ -4,7 +4,7 @@
    Everything a device or the hub supplies is shown as text, through cleanName: device names are hostile input. */
 import { el, ago } from "./lib.js";
 import { checkPassword } from "./account-core.js";
-import { cleanName, isRemote, local, machine, setMachine } from "./transport.js";
+import { cleanName, isRemote, local, machine, onStillWaiting, setMachine } from "./transport.js";
 
 const NOTICE_KEY = "omni.machineNotice";
 const HUB_SEES = "The hub routes encrypted frames between your devices. It cannot read your actions, results, file contents, chat text or session titles, and it cannot forge an action. It can still see which devices are on the account, when they connect, IP addresses and the size and timing of frames, plus your email address and login verifiers. Someone who hacked the hub could try to guess your password offline; a correct guess only gets a pending sign-in, which one of your devices must still approve.";
@@ -151,6 +151,7 @@ export function createAccount({ toast, openSettings }) {
   }
 
   async function init() {
+    onStillWaiting((count) => { A.stillWaiting = count > 0; renderBanners(); });
     await refresh();
     listen();
     clearInterval(tick);
@@ -259,6 +260,7 @@ export function createAccount({ toast, openSettings }) {
     box.textContent = "";
     const add = (b) => { if (b) box.appendChild(b); };
     add(linkBanner());
+    if (A.stillWaiting && machine()) add(banner("", "", `Still waiting for ${machine().name}...`));
     const s = A.status;
     if (!s) { box.hidden = !box.childElementCount; return; }
     const alerts = s.alerts ?? [];

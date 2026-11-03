@@ -2,7 +2,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { api, cleanName, eventSource, isRemote, local, machine, machineName, machineTitle, mode, rawUrl, setChannelTransport, setMachine, setTransportEnv, streamEvents } from "../ui/transport.js";
+import { api, cleanName, eventSource, isRemote, local, machine, machineName, machineTitle, mode, onStillWaiting, rawUrl, setChannelTransport, setMachine, setStillWaitingAfter, setTransportEnv, streamEvents } from "../ui/transport.js";
 import { alertTitle, gateKey, linkNews } from "../ui/account.js";
 import { createRemote } from "../ui/remote.js";
 import { esc, md } from "../ui/lib.js";
@@ -117,6 +117,45 @@ test("an error names the machine, carries the code, and a dropped answer never l
   globalThis.fetch = async () => answer(401, { error: "signed out there", login: true });
   await assert.rejects(api("GET", "/api/x"), /signed out there/);
   assert.equal(reloads, 1, "only the switch itself reloaded");
+});
+
+test("past the wait the window says so, once, and clears on the answer: good or bad", async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  setStillWaitingAfter(30);
+  const heard = [];
+  const off = onStillWaiting((n) => heard.push(n));
+  let answer_;
+  globalThis.fetch = () => new Promise((r) => { answer_ = r; });
+  try {
+    // On this computer nothing is said.
+    const here = api("GET", "/a");
+    await sleep(60);
+    assert.deepEqual(heard, []);
+    answer_(answer(200, {}));
+    await here;
+
+    setMachine(ID, { name: "Ubuntu" });
+    const quick = api("GET", "/quick");
+    answer_(answer(200, {}));
+    await quick;
+    await sleep(60);
+    assert.deepEqual(heard, [], "an answer in time says nothing");
+
+    const slow = api("POST", "/slow", {});
+    await sleep(60);
+    assert.deepEqual(heard, [1]);
+    await sleep(60);
+    assert.deepEqual(heard, [1], "once, not over and over");
+    answer_(answer(200, { ok: true }));
+    assert.deepEqual(await slow, { ok: true });
+    assert.deepEqual(heard, [1, 0]);
+
+    const failing = api("POST", "/slow", {});
+    await sleep(60);
+    answer_(answer(502, { error: "lost" }));
+    await assert.rejects(failing);
+    assert.deepEqual(heard, [1, 0, 1, 0]);
+  } finally { off(); setStillWaitingAfter(30_000); }
 });
 
 test("an empty answer from a far machine is still an answer", async () => {

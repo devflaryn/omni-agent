@@ -7,6 +7,10 @@
  * machine, inside `deadAfterMs`, and a new request starts over with a fresh handshake. Nothing is ever queued or retried: a
  * dropped action may or may not have run, and only the person can say whether to send it again.
  *
+ * The promise to a person: 30 s from request(), a request is rejected, naming the machine, if the channel is not up, or if
+ * nothing has been heard on it since the request went. A link that answers pings may take as long as the route takes: a
+ * false failure could make someone send a prompt again and run it twice. The window says it is still waiting.
+ *
  * What crosses is built here, field by field, in both directions. The window's cookie and everything else about this
  * computer stay on this side, and a far machine's reply can set nothing and run nothing in the window's origin.
  */
@@ -18,7 +22,7 @@ import { cleanName } from "../ui/transport.js";
 
 const SECOND = 1000;
 const DEFAULTS = Object.freeze({
-  responseTimeoutMs: 30 * SECOND,  // from request() to the response's head, connecting included: what a person is promised
+  budgetMs: 30 * SECOND,           // from request(): connecting, plus proof that the link is alive. Not a limit on a slow route
   connectTimeoutMs: 28 * SECOND,   // one attempt to connect, which goes on for later requests after one has given up
   pingEveryMs: 8 * SECOND,
   stallAfterMs: 12 * SECOND,       // shown as stalled from here
@@ -139,6 +143,7 @@ export class MachineLinks extends EventEmitter {
   #heard(link, channel) {
     if (link.channel !== channel) return;
     link.lastHeard = Date.now();
+    link.heard = (link.heard ?? 0) + 1; // counted, not timed: a handshake in the same millisecond as a request proves nothing about after it
     if (link.state === "stalled") {
       link.state = "open";
       this.#changed();
@@ -185,7 +190,7 @@ export class MachineLinks extends EventEmitter {
     const link = this.#link(device);
     const name = link.name;
     const started = Date.now();
-    const left = () => this.options.responseTimeoutMs - (Date.now() - started);
+    const left = () => this.options.budgetMs - (Date.now() - started);
     const connected = this.account.status().hub.connected;
     if (!link.client && connected && !device.online) throw new MachineError(503, "machine-offline", `${name} is offline. Nothing was sent to it.`, { id, name });
     let client;
@@ -204,22 +209,31 @@ export class MachineLinks extends EventEmitter {
       link.inflight--;
       link.lastUsed = Date.now();
     };
-    // No head inside the budget, however alive the link: the action is given up on, and the far machine is told. A response
-    // already streaming is past this: from its head on it follows the liveness rule alone, so a long event stream or a slow
-    // download is not cut off by a clock.
-    const budget = new AbortController();
-    let late = false;
-    const timer = setTimeout(() => { late = true; budget.abort(new Error("no answer in time")); }, Math.max(0, left()));
-    timer.unref?.();
+    // Asked now, so that an alive link has proved it long before the budget ends, however late the channel came up. Nothing
+    // heard since the request went, when the budget ends, means silence: it is given up on. After that, and for a response
+    // already streaming, the liveness rule alone decides. `responseTimeoutMs` is a per-call limit for a caller that wants one:
+    // none by default, because a slow route is not a failure.
+    const { responseTimeoutMs, ...call } = options;
+    const heardAtSend = link.heard ?? 0;
+    link.lastPing = Date.now();
+    client.ping().catch(() => {});
+    const giveUp = new AbortController();
+    let why = null;
+    const silence = setTimeout(() => { if ((link.heard ?? 0) === heardAtSend) { why = "silent"; giveUp.abort(new Error("silence")); } }, Math.max(0, left()));
+    const limit = responseTimeoutMs ? setTimeout(() => { why = "limit"; giveUp.abort(new Error("the limit")); }, responseTimeoutMs) : null;
+    silence.unref?.();
+    limit?.unref?.();
+    const settled = () => { clearTimeout(silence); clearTimeout(limit); };
     try {
-      const response = await client.request({ ...options, signal: options.signal ? AbortSignal.any([options.signal, budget.signal]) : budget.signal });
-      clearTimeout(timer);
+      const response = await client.request({ ...call, signal: options.signal ? AbortSignal.any([options.signal, giveUp.signal]) : giveUp.signal });
+      settled();
       response.body.once("close", release);
       return response;
     } catch (error) {
-      clearTimeout(timer);
+      settled();
       release();
-      if (late) throw new MachineError(504, "machine-slow", `${name} did not answer within ${Math.round(this.options.responseTimeoutMs / SECOND)} seconds. This action may or may not have run there.`, { id, name });
+      if (why === "silent") throw new MachineError(502, "machine-lost", `${name} stopped answering. This action may or may not have run there.`, { id, name });
+      if (why === "limit") throw new MachineError(504, "machine-slow", `${name} did not answer within ${Math.round(responseTimeoutMs / SECOND)} seconds. This action may or may not have run there.`, { id, name });
       if (options.signal?.aborted || error instanceof BodyTooLarge) throw error;
       throw new MachineError(502, "machine-lost", `The connection to ${name} was lost (${error.message}). This action may or may not have run there.`, { id, name });
     }

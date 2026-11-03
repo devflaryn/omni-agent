@@ -12,6 +12,7 @@ import { runInNewContext } from "node:vm";
 import { join } from "node:path";
 import { startHub } from "../hub/server.mjs";
 import { Account } from "../server/account.mjs";
+import { MachineLinks } from "../server/channel-client.mjs";
 import { serveChannel } from "../server/channel-host.mjs";
 import { createApp } from "../server/index.mjs";
 import { FRAME, decodeFrame, decodeHead } from "../ui/channel-frames.js";
@@ -519,28 +520,55 @@ test("a machine that goes silent with no goodbye: rejects within 30 s, named, an
   assert.match(j.error, /Silent box/);
 });
 
-test("no head within the budget is given up on, naming the machine, however alive the link", async () => {
-  let aborted = false;
+test("a slow route on a link that answers may take as long as it takes, well past the budget", async () => {
   const { remote, window } = await pair({
-    farName: "Busy box",
-    links: { responseTimeoutMs: 600 },
-    handle: (req, res) => { res.once("close", () => { aborted = true; }); },
+    // No regular ping in this time: the one sent with the request is the only proof the link has, and it is enough.
+    links: { budgetMs: 300, pingEveryMs: 60_000, stallAfterMs: 60_000, deadAfterMs: 60_000 },
+    handle: async (req, res) => { await sleep(1500); res.writeHead(200, { "Content-Type": "application/json" }); res.end('{"late":true}'); },
   });
+  const r = await fetch(remote("/compacting"), { method: "POST", headers: { cookie: window.cookie, origin: window.origin, "content-type": "application/json" }, body: "{}" });
+  assert.equal(r.status, 200, "a false failure could make someone send a prompt twice");
+  assert.deepEqual(await r.json(), { late: true });
+});
+
+test("nothing heard since the request went, when the budget ends: rejected, named, without waiting out the rest", async () => {
+  const silence = { dead: false };
+  let hung = false;
+  const { remote, window } = await pair({ farName: "Went quiet", farWs: silencing(silence), links: { budgetMs: 700, deadAfterMs: 60_000, stallAfterMs: 60_000, pingEveryMs: 60_000 }, handle: (req) => { hung = req.url === "/hang"; if (req.url !== "/hang") throw new Error("no"); } });
+  // A channel up first, then silence, then the request: the worst of the stacking once connecting has used the time.
+  await fetch(remote("/open"), { headers: { cookie: window.cookie } }).then((r) => r.text()).catch(() => {});
+  silence.dead = true;
   const started = Date.now();
-  const r = await fetch(remote("/never"), { method: "POST", headers: { cookie: window.cookie, origin: window.origin, "content-type": "application/json" }, body: "{}" });
+  const r = await fetch(remote("/hang"), { method: "POST", headers: { cookie: window.cookie, origin: window.origin, "content-type": "application/json" }, body: "{}" });
   const took = Date.now() - started;
-  assert.equal(r.status, 504);
+  assert.equal(r.status, 502);
   const j = await r.json();
-  assert.equal(j.code, "machine-slow");
-  assert.match(j.error, /Busy box/);
-  assert.match(j.error, /may or may not/);
+  assert.equal(j.code, "machine-lost");
+  assert.match(j.error, /Went quiet/);
   assert.ok(took < 5000, `took ${took}`);
+  assert.equal(hung, false);
+});
+
+test("a per-call limit exists for a caller that wants one, and the far machine is told", async () => {
+  let aborted = false;
+  const { here, farId } = await pair({ farName: "Busy box", handle: (req, res) => { res.once("close", () => { aborted = true; }); } });
+  const links = new MachineLinks({ account: here.app.account });
+  await assert.rejects(links.request(farId, { method: "POST", path: "/never", responseTimeoutMs: 300 }), (e) => e.code === "machine-slow" && /Busy box/.test(e.message) && /may or may not/.test(e.message));
   await until(() => aborted, "the far machine to be told");
+  links.close();
+});
+
+test("a per-call limit ends at the response's head: what is already streaming is not cut off by it", async () => {
+  const { here, farId } = await pair({ handle: async (req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.write("start "); await sleep(800); res.end("end"); } });
+  const links = new MachineLinks({ account: here.app.account });
+  const response = await links.request(farId, { method: "GET", path: "/stream", responseTimeoutMs: 200 });
+  assert.equal(await response.text(), "start end");
+  links.close();
 });
 
 test("the budget counts the time spent connecting: a machine that never finishes the handshake is rejected inside it", async () => {
   const silence = { dead: false };
-  const { remote, window } = await pair({ farName: "Half there", farWs: silencing(silence), links: { responseTimeoutMs: 900 } });
+  const { remote, window } = await pair({ farName: "Half there", farWs: silencing(silence), links: { budgetMs: 900 } });
   silence.dead = true; // online by the hub's word, and no channel open yet
   const started = Date.now();
   const r = await fetch(remote("/x"), { headers: { cookie: window.cookie } });
@@ -552,7 +580,7 @@ test("the budget counts the time spent connecting: a machine that never finishes
 
 test("a response already streaming is past the budget: it follows the liveness rule alone", async () => {
   const { remote, window } = await pair({
-    links: { responseTimeoutMs: 200, pingEveryMs: 50, stallAfterMs: 150, deadAfterMs: 400 },
+    links: { budgetMs: 200, pingEveryMs: 50, stallAfterMs: 150, deadAfterMs: 400 },
     handle: async (req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.write("start "); await sleep(1000); res.end("end"); },
   });
   const r = await fetch(remote("/stream"), { headers: { cookie: window.cookie } });

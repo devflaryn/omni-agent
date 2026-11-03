@@ -76,8 +76,29 @@ export function setMachine(id, { name, reload = true } = {}) {
   return next;
 }
 
+// A link that answers pings may wait for a slow route for as long as it takes, so the window says it is waiting.
+let stillWaitingAfterMs = 30_000;
+let waiting = 0;
+const waitingListeners = new Set();
+const announceWaiting = () => { for (const listener of waitingListeners) listener(waiting); };
+/** `listener(count)`: how many actions have gone unanswered past the wait. 0 when the last has its answer. */
+export function onStillWaiting(listener) { waitingListeners.add(listener); return () => waitingListeners.delete(listener); }
+/** For tests. */
+export function setStillWaitingAfter(ms) { stillWaitingAfterMs = ms; }
+
 /** One request. Throws an Error with `.status` and `.code`, whose message names the machine when another was asked. */
 export async function api(method, path, body) {
+  if (!read()) return ask(method, path, body);
+  let late = false;
+  const timer = setTimeout(() => { late = true; waiting++; announceWaiting(); }, stillWaitingAfterMs);
+  try { return await ask(method, path, body); }
+  finally {
+    clearTimeout(timer);
+    if (late) { waiting--; announceWaiting(); }
+  }
+}
+
+async function ask(method, path, body) {
   if (mode() === "channel") return channelImpl.api(method, path, body);
   const m = read();
   const options = method !== "GET"
