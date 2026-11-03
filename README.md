@@ -56,6 +56,20 @@ starts its own), but to end it: on Windows, in PowerShell,
 
 ### Use it from another device or another network
 
+Use an account. **The full guide is [docs/accounts.md](docs/accounts.md):** first use, adding a device, recovery, a stolen device, what the VPS can see, and how to run the hub.
+
+- **One account, every computer signed in to it.** Each desktop app is a host for its own machine and a client for your others, with a machine switcher in the top bar. Signing in is optional, under **Settings → Account**, and local use never depends on the VPS.
+- **Other clients.** A web page at `https://tomcamp.tech/`, opened by that link with the `https://`. An iPhone app is planned and not built yet.
+- **A new sign-in needs your password and approval** from a device already signed in, with a 6-digit code you compare on both screens. After that a device needs no per-action approval.
+- **The VPS cannot read your actions, results, files or chats, or forge an action,** through the desktop app. The web page is served by the VPS, so a hacked VPS could change it: see [the web page's risk](docs/accounts.md#the-web-pages-risk), and turn **Allow web page access** off on any machine this matters for.
+- **There is no password reset by email.** Keep the recovery code you get when you create the account.
+
+**The old relay is still running until it is removed,** and its password page stays reachable until then. [The steps to remove it](docs/accounts.md#removing-the-old-relay) are for after a week of real use.
+
+#### The old way: password and VPS relay
+
+**Being replaced by accounts. This all still runs until the relay is removed, and these instructions go with it.**
+
 Omni then runs as a small server: this computer is **the host**, everything else is **a remote browser**.
 
 | | the host (this computer's window, `http://127.0.0.1:4400`) | a remote browser (`https://<address>:4443`) |
@@ -82,7 +96,7 @@ Omni then runs as a small server: this computer is **the host**, everything else
    asks for (the message text, the command an MCP server would run; secrets hidden) with **Approve** and
    **Deny**. It waits up to `remoteApprovalTimeoutSec` (300 s), then is refused.
 
-#### From anywhere, without touching the router (VPS relay)
+##### From anywhere, without touching the router (VPS relay)
 
 With `"relay": { "host": "<vps>" }` in `omni.config.json`, this PC keeps an outgoing SSH connection to
 the VPS (`server/tunnel.mjs`), and `https://<vps>:4443/` reaches Omni from anywhere:
@@ -434,4 +448,5 @@ server/memory.mjs     the vault                     server/tokens.mjs        tal
 server/providers.mjs  presets + custom providers     server/zip.mjs           .zip/.apk listing + entry read
 ui/                   index.html, styles.css, app.js + lib/transcript/composer/explorer/settings/sidebar/panel
 desktop/              pywebview launcher            integrations/            OpenCode plugin, Claude Code hook, personas
+hub/                  the VPS hub: accounts, routing relay/                   the old relay, until removed
 ```
