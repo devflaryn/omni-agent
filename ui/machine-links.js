@@ -11,7 +11,7 @@
  * nothing has been heard on it since the request went. A link that answers pings may take as long as the route takes: a
  * false failure could make someone send a prompt again and run it twice. The window says it is still waiting.
  *
- * `account` needs devices(), status().hub.connected and openChannel(id).
+ * `account` needs devices(), status() and openChannel(id). `selfName` is what its messages call this device.
  */
 import { Emitter } from "./emitter.js";
 import { channelClient } from "./channel-client.js";
@@ -30,6 +30,14 @@ const DEFAULTS = Object.freeze({
 });
 const DIFFERENT_VERSION = /different version/;
 const SELF = "That is this computer: there is nothing to connect to.";
+/** Why a device that is not `approved` asks nothing of a machine. */
+const NOT_APPROVED = {
+  recovering: "is still finishing a recovery",
+  pending: "is still waiting for approval",
+  removed: "is no longer on the account",
+  "log-damaged": "holds a damaged device list",
+  "key-unavailable": "cannot open its device key",
+};
 
 export class MachineError extends Error {
   constructor(status, code, message, machine) {
@@ -44,10 +52,11 @@ export class MachineLinks extends Emitter {
   #links = new Map();
   #closed = false;
 
-  constructor({ account, client = channelClient, ...options }) {
+  constructor({ account, client = channelClient, selfName = "this computer", ...options }) {
     super();
     this.account = account;
     this.makeClient = client;
+    this.selfName = selfName;
     this.options = { ...DEFAULTS, ...options };
   }
 
@@ -94,8 +103,10 @@ export class MachineLinks extends Emitter {
 
   async #whenConnected(ms) {
     const end = Date.now() + ms;
-    while (!this.account.status().hub.connected) {
-      if (this.#closed || Date.now() >= end) return false;
+    for (;;) {
+      const { hub } = this.account.status();
+      if (hub.connected) break;
+      if (hub.gaveUp || this.#closed || Date.now() >= end) return false;
       await new Promise((r) => { const t = setTimeout(r, 100); t.unref?.(); });
     }
     return true;
@@ -107,7 +118,10 @@ export class MachineLinks extends Emitter {
     try {
       const { connectTimeoutMs } = this.options;
       const started = Date.now();
-      if (!(await this.#whenConnected(connectTimeoutMs))) throw new Error("this computer is not connected to the hub");
+      if (!(await this.#whenConnected(connectTimeoutMs))) {
+        const { hub } = this.account.status();
+        throw new Error(hub.gaveUp && hub.lastError ? hub.lastError.replace(/\.$/, "") : `${this.selfName} is not connected to the hub`);
+      }
       const channel = await deadline(this.account.openChannel(link.id), connectTimeoutMs - (Date.now() - started), `${link.name} did not finish connecting`);
       link.channel = channel;
       link.lastHeard = Date.now();
@@ -179,13 +193,13 @@ export class MachineLinks extends Emitter {
     const started = Date.now();
     const left = () => this.options.budgetMs - (Date.now() - started);
     const { hub: { connected }, phase } = this.account.status();
-    if (phase !== undefined && phase !== "approved") throw new MachineError(503, "machine-unreachable", `Could not reach ${name}: this device is not signed in to the account. Nothing was sent to it.`, { id, name });
+    if (phase !== undefined && phase !== "approved") throw new MachineError(503, "machine-unreachable", `Could not reach ${name}: ${this.selfName} ${Object.hasOwn(NOT_APPROVED, phase) ? NOT_APPROVED[phase] : "is not signed in to the account"}. Nothing was sent to it.`, { id, name });
     if (!link.client && connected && !device.online) throw new MachineError(503, "machine-offline", `${name} is offline. Nothing was sent to it.`, { id, name });
     let client;
     try {
       client = link.client ?? await deadline(link.opening ??= this.#connect(link).finally(() => { link.opening = null; }), left(), `${name} did not finish connecting`);
     } catch (error) {
-      if (DIFFERENT_VERSION.test(error.message)) throw new MachineError(502, "machine-version", `${name} runs a different version of Omni. Update Omni on ${name} and on this computer. Nothing was sent to it.`, { id, name });
+      if (DIFFERENT_VERSION.test(error.message)) throw new MachineError(502, "machine-version", `${name} runs a different version of Omni. Update Omni on ${name} and on ${this.selfName}. Nothing was sent to it.`, { id, name });
       throw new MachineError(504, "machine-unreachable", `Could not reach ${name}: ${error.message}. Nothing was sent to it.`, { id, name });
     }
     link.lastUsed = Date.now();

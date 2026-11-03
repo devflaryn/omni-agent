@@ -53,12 +53,38 @@ const PHASE_TEXT = {
   "log-damaged": "The device list on this computer is damaged.",
 };
 
-/** What to do about an alert, for the web page's own screens. */
-export const alertAdvice = (kind) => (ALERT_ADVICE[kind] ?? "").replace(/[Tt]his computer/g, (w) => (w[0] === "T" ? "This page" : "this page"));
+/**
+ * The one place these texts become a web page's. A page is not a computer, and has nothing that works on its own. As it stands on a
+ * desktop or a phone.
+ */
+export function deviceWords(text) {
+  if (!webPage()) return text;
+  return String(text)
+    .replace(/ It still works on its own\.| Local use still works\.| This computer works on its own as usual\.|, and this computer still works on its own/g, "")
+    .replace("Check the hub address in this computer's settings.", "Check the address of this page.")
+    .replace(/\bThis computer\b/g, "This page")
+    .replace(/\bthis computer\b/g, "this page");
+}
+
+/** What to do about an alert. */
+export const alertAdvice = (kind) => deviceWords(ALERT_ADVICE[kind] ?? "");
+
+/** What a phase means to the person. */
+export const phaseText = (phase) => deviceWords(PHASE_TEXT[phase] ?? phase);
+
+/**
+ * The banner's words when the hub is gone, naming why if the account knows. Only with no reason known does it promise a reconnect:
+ * a page another tab has replaced will not reconnect at all.
+ */
+export function hubLostText(status) {
+  const why = status?.hub?.lastError;
+  const nothing = "Nothing you send now will arrive, and nothing is queued.";
+  return why ? `${why} ${nothing}` : deviceWords(`this computer has lost the hub. ${nothing} It reconnects by itself.`);
+}
 
 /** The banner's title, unless the message already opens with those words. */
 export function alertTitle(alert) {
-  const title = ALERT_TITLE[alert.kind] ?? "Security notice";
+  const title = deviceWords(ALERT_TITLE[alert.kind] ?? "Security notice");
   return String(alert.message ?? "").startsWith(title) ? "" : title;
 }
 
@@ -94,9 +120,9 @@ async function acting(b, work, out) {
   finally { if (b) b.disabled = false; }
 }
 
-function explain(e) {
+export function explain(e) {
   if (e.code === "locked") return "Too many tries. This lock is temporary: wait a while, then try again.";
-  if (e.code === "hub-unreachable") return `The hub cannot be reached: ${e.message} Nothing here changed, and this computer still works on its own.`;
+  if (e.code === "hub-unreachable") return deviceWords(`The hub cannot be reached: ${e.message} Nothing here changed, and this computer still works on its own.`);
   return e.message;
 }
 
@@ -116,7 +142,7 @@ export function createAccount({ toast, openSettings }) {
   /** A web page has no computer of its own: its way back is the list of machines. */
   const here = () => (webPage() ? "Your machines" : "This computer");
   const backText = () => (webPage() ? "All machines" : "Back to this computer");
-  const hereWords = () => (webPage() ? "this page" : "this computer");
+  const hereWords = () => deviceWords("this computer");
 
   // ---------------------------------------------------------------------------------- loading and news
   async function refresh() {
@@ -177,7 +203,7 @@ export function createAccount({ toast, openSettings }) {
     const signedOut = !A.available || !A.status || A.status.phase !== "approved";
     const known = A.machines.find((x) => x.id === m.id);
     if (signedOut || !known) {
-      try { sessionStorage.setItem(NOTICE_KEY, `This window was on ${m.name}, which ${signedOut ? "this computer can no longer reach without signing in" : "is no longer on the account"}. It is back on this computer.`); } catch { /* */ }
+      try { sessionStorage.setItem(NOTICE_KEY, deviceWords(`This window was on ${m.name}, which ${signedOut ? "this computer can no longer reach without signing in" : "is no longer on the account"}. It is back on this computer.`)); } catch { /* */ }
       setMachine(null);
       return;
     }
@@ -201,7 +227,7 @@ export function createAccount({ toast, openSettings }) {
     wrap.hidden = !m && !usable;
     if (m) {
       name.textContent = `On ${m.name}`;
-      btn.title = `Everything in this window, chats and commands included, runs on ${m.name} (${shortId(m.id)}), not on this computer.`;
+      btn.title = deviceWords(`Everything in this window, chats and commands included, runs on ${m.name} (${shortId(m.id)}), not on this computer.`);
       $("#machineId").textContent = shortId(m.id);
       $("#machineId").hidden = false;
     } else {
@@ -256,7 +282,7 @@ export function createAccount({ toast, openSettings }) {
     if (!m) return null;
     const back = () => button(backText(), "small", () => setMachine(null));
     if (A.machineDown) return banner("danger", `Could not load ${m.name}.`, A.machineDown, [button("Try again", "small", () => location.reload()), back()]);
-    if (!A.status?.hub?.connected) return banner("danger", `${m.name} cannot be reached:`, `${hereWords()} has lost the hub. Nothing you send now will arrive, and nothing is queued. It reconnects by itself.`, [back()]);
+    if (!A.status?.hub?.connected) return banner("danger", `${m.name} cannot be reached:`, hubLostText(A.status), [back()]);
     const x = A.machines.find((y) => y.id === m.id);
     if (!x) return null;
     if (!x.online || x.link.state === "offline") return banner("danger", `${x.name} is offline.`, "Nothing you send will reach it, and nothing is queued for later.", [back()]);
@@ -277,10 +303,10 @@ export function createAccount({ toast, openSettings }) {
       const count = a.count > 1 ? ` (${a.count} times, last ${ago(a.lastAt)})` : ` (${ago(a.at)})`;
       const actions = [devicesLink()];
       if (i === alerts.length - 1) actions.push(button(alerts.length > 1 ? "I have read these" : "I have read this", "small quiet", () => { call("POST", "alerts/clear").then(refresh).catch((e) => toast(e.message, true)); }));
-      add(banner("danger", alertTitle(a), `${a.message}${count} ${webPage() ? alertAdvice(a.kind) : ALERT_ADVICE[a.kind] ?? ""}`, actions));
+      add(banner("danger", alertTitle(a), `${a.message}${count} ${alertAdvice(a.kind)}`, actions));
     });
     if (s.recoveryContested && s.hub?.lastError) add(banner("danger", "A recovery code is in question.", s.hub.lastError, [devicesLink()]));
-    if (s.recoveryUnconfirmed) add(banner("", "Keep your old recovery code for now.", "This computer recovered the account. Keep the old code until another device confirms the recovery, then discard it.", [devicesLink()]));
+    if (s.recoveryUnconfirmed) add(banner("", "Keep your old recovery code for now.", deviceWords("This computer recovered the account. Keep the old code until another device confirms the recovery, then discard it."), [devicesLink()]));
     if (s.recoveryCodePending && A.codeHidden) add(banner("danger", "A recovery code is waiting to be saved.", "It is the only copy.", [button("Show it", "small primary", () => { A.codeHidden = false; renderGate(); renderBanners(); })]));
     for (const w of s.warnings ?? []) {
       if (A.hiddenWarnings.has(w)) continue;
@@ -662,7 +688,7 @@ export function createAccount({ toast, openSettings }) {
     if (!s) { wrap.appendChild(el("p", "rm-note", "Loading…")); return; }
 
     const thisDevice = section(wrap, webPage() ? "This page" : "This device");
-    thisDevice.appendChild(el("p", "rm-note", PHASE_TEXT[s.phase] ?? s.phase));
+    thisDevice.appendChild(el("p", "rm-note", phaseText(s.phase)));
     if (s.email) thisDevice.appendChild(el("div", "acct-device-sub", cleanName(s.email, 254)));
     if (s.device) thisDevice.appendChild(el("div", "acct-device-sub", `${cleanName(s.device.name)} · ${cleanName(s.device.kind, 32, "unknown")} · ${webPage() || s.device.role === "client" ? "limited web page" : s.device.role === "full" ? "full control" : "not on an account"} · ${shortId(s.device.id)}`));
     thisDevice.appendChild(el("div", "acct-device-sub", `Hub: ${cleanName(s.hub?.url, 200)} · ${s.hub?.connected ? "connected" : "not connected"}`));

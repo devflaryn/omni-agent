@@ -8,7 +8,7 @@ import { createPageTransport } from "./page-transport.js";
 import { appMarkup, cleanName, machine, setChannelTransport, setMachine } from "./transport.js";
 import { alertAdvice, alertTitle } from "./account.js";
 
-const SERVER_NOTICE = "This page comes from the server it connects to. If that server were hacked, it could serve a changed page, which could capture your password and act on your machines while it is open. For anything sensitive, prefer the installed apps.";
+const SERVER_NOTICE = "This page comes from the server it connects to. If that server were hacked, it could serve a changed page, which could capture your password and, while open and signed in, run commands on your machines as you, up to reading a machine's keys. Use it for trusted moments. For anything sensitive, prefer the installed apps, and turn Allow web page access off on any machine where this matters.";
 const NO_ACCOUNT = "An account is created in the Omni desktop app, on your computer. This page cannot create one, and it has no recovery: a web page signs no changes to your account.";
 const LOG_TEXT = "Your password alone does not get in: one of your devices must also approve this page, with a code you compare. It can then control your machines for 30 days, and cannot approve or remove devices.";
 const PHASE_NOTE = {
@@ -218,7 +218,6 @@ function render() {
 async function loadApp() {
   appLoaded = true;
   try {
-    setChannelTransport(createPageTransport({ links: account.links, machine, local: account.routes() }));
     const parsed = new DOMParser().parseFromString(await appMarkup(), "text/html");
     shell.remove();
     document.body.classList.remove("web-shell");
@@ -263,6 +262,7 @@ async function boot() {
   }
   const store = await openPageStore();
   account = new PageAccount({ store, hubUrl: location.origin, hubOrigin: location.origin, name: guessName(), deriveLoginKey: loginKeyInWorker });
+  setChannelTransport(createPageTransport({ links: account.links, machine, local: account.routes() })); // from here on, words are this page's too
   account.on("status", (s) => {
     if (appLoaded) { if (s.phase !== "approved") location.reload(); return; }
     render();

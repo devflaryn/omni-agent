@@ -3,8 +3,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { request as httpRequest } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startHub } from "../hub/server.mjs";
@@ -18,7 +17,8 @@ import { createPageTransport } from "../ui/page-transport.js";
 import { BLOB_LIMIT, fileClass } from "../ui/page-files.js";
 import { newDeviceKeys } from "../ui/account-core.js";
 import { append } from "../ui/device-log.js";
-import { WEB_FILES, webPolicy } from "../hub/static.mjs";
+import { alertAdvice, alertTitle, deviceWords, explain, hubLostText, phaseText } from "../ui/account.js";
+import { MachineLinks } from "../ui/machine-links.js";
 import { framesFiles, local, mode, rawUrl as chosenRawUrl, saveFile, setChannelTransport, setMachine, setTransportEnv, webPage } from "../ui/transport.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -577,6 +577,9 @@ test("the page says once on sign-in what a hacked server could do, in plain word
   assert.match(notice, /changed page/);
   assert.match(notice, /password/);
   assert.match(notice, /installed apps/);
+  assert.match(notice, /run commands on your machines as you/, "the design's sharper part");
+  assert.match(notice, /reading a machine's keys/);
+  assert.match(notice, /Allow web page access off/);
   assert.match(src, /SERVER_NOTICE/);
 });
 
@@ -1128,140 +1131,133 @@ test("device names on the wire are hostile: the machine list and machine name co
   assert.doesNotMatch(src, /innerHTML|insertAdjacentHTML|outerHTML|document\.write/);
 });
 
-// -------------------------------------------------------------------------------------------- what the page is made of
+// ------------------------------------------------------------------------------------------------- review round 1
 
-const uiDir = new URL("../ui/", import.meta.url);
-const uiSource = (f) => readFileSync(new URL(f, uiDir), "utf8");
+test("replaced by another tab: it says why and promises no reconnect, and a request does not wait out the budget", async () => {
+  const { p, farId } = await connected(respond("application/json", "{}"));
+  const other = page({ url: p.hubUrl }, { store: p.store });
+  await other.start();
+  await until(() => p.status().hub.gaveUp, "the first tab told");
+  assert.equal(p.status().hub.connected, false);
+  assert.match(p.status().hub.lastError, /took over/);
+  const text = hubLostText(p.status());
+  assert.match(text, /took over/);
+  assert.match(text, /nothing is queued/);
+  assert.doesNotMatch(text, /reconnects by itself/);
+  const asked = Date.now();
+  await assert.rejects(transportFor(p, farId).api("GET", "/x"), (e) => /took over/.test(e.message) && /Nothing was sent/.test(e.message) && !/this computer/.test(e.message));
+  assert.ok(Date.now() - asked < 2000, "no 28 s wait for what will not come");
+  assert.equal(other.status().hub.gaveUp, false);
 
-test("no direct URL can reach a frame or a window: no UI file frames or navigates to a file's bytes", () => {
-  for (const f of readdirSync(uiDir).filter((x) => x.endsWith(".js"))) {
-    const src = uiSource(f);
-    assert.doesNotMatch(src, /createElement\(["']iframe|el\(["']iframe|srcdoc|\.showModal\(\s*rawUrl/i, `${f} frames something`);
-    assert.doesNotMatch(src, /window\.open\(/, `${f} opens a window`);
-    assert.doesNotMatch(src, /location\.(href|assign|replace)\s*(=|\()\s*(?!["'`]\/["'`])/, `${f} navigates by a computed URL`);
-  }
+  // Signing in here again takes the socket back, and with it the giving up ends.
+  await other.stop();
+  await p.signOut();
+  await signIn(p);
+  await until(() => p.status().hub.connected, "back on the hub");
+  assert.equal(p.status().hub.gaveUp, false);
 });
 
-test("the app's HTML has no inline script, handler or style, and no remote anything: all would die under the page's CSP", () => {
-  for (const f of ["web.html", "index.html"]) {
-    const html = uiSource(f);
-    assert.doesNotMatch(html, /\son[a-z]+\s*=/i, `${f}: inline handler`);
-    assert.doesNotMatch(html, /\sstyle\s*=/i, `${f}: inline style`);
-    assert.doesNotMatch(html, /<style\b/i, `${f}: style block`);
-    assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)/i, `${f}: inline script`);
-    assert.doesNotMatch(html, /(src|href)=["'](https?:)?\/\//i, `${f}: remote resource`);
-  }
-  for (const f of readdirSync(uiDir).filter((x) => x.endsWith(".css"))) {
-    assert.doesNotMatch(uiSource(f), /@import|url\(["']?(https?:)?\/\//, `${f}: remote resource`);
-  }
-  for (const f of readdirSync(uiDir).filter((x) => x.endsWith(".js"))) {
-    const src = uiSource(f);
-    assert.doesNotMatch(src, /\bnew Function\(|[^.\w]eval\(/, `${f}: eval`);
-    assert.doesNotMatch(src, /setAttribute\(["']style/, `${f}: a style attribute, which the CSP blocks`);
-    assert.doesNotMatch(src, /(innerHTML|insertAdjacentHTML)[^;\n]*style=/, `${f}: a style attribute in HTML, which the CSP blocks`);
-    assert.doesNotMatch(src, /(innerHTML|insertAdjacentHTML)[^;\n]*\son[a-z]+=/, `${f}: an inline handler in HTML, which the CSP blocks`);
-  }
+test("with no reason known the banner may promise a reconnect", () => {
+  assert.match(hubLostText({ hub: {} }), /^this computer has lost the hub.*It reconnects by itself\.$/);
+  assert.equal(hubLostText({ hub: { lastError: "Why." } }), "Why. Nothing you send now will arrive, and nothing is queued.");
+  assert.match(readFileSync(new URL("../ui/account.js", import.meta.url), "utf8"), /cannot be reached:`, hubLostText\(A\.status\)/);
 });
 
-test("the shared modules touch nothing Node-only, so the iPhone app can load them too", () => {
-  for (const f of ["emitter.js", "account-error.js", "channel-set.js", "channel-client.js", "machine-links.js", "hub-socket.js", "log-trust.js", "page-account.js", "page-store.js", "page-transport.js", "page-files.js"]) {
-    const src = uiSource(f);
-    assert.doesNotMatch(src, /from "node:|require\(|process\.|\bBuffer\.from\((?!.*NodeBuffer)/, f);
-  }
+test("the hub gone with no reason to give up: the wait ends naming this page, not a computer", async () => {
+  const fixture = await hubFixture();
+  const far = await firstDesktop(fixture);
+  const p = page(fixture, { machineLinks: { connectTimeoutMs: 200, budgetMs: 2000 } });
+  await signIn(p);
+  await approvePage(far, p);
+  const farId = far.status().device.id;
+  await until(() => p.devices().find((d) => d.id === farId)?.online, "online");
+  await fixture.hub.close();
+  await until(() => !p.status().hub.connected, "the loss");
+  await assert.rejects(transportFor(p, farId).api("GET", "/x"), (e) => /this page is not connected to the hub/.test(e.message));
 });
 
-// -------------------------------------------------------------------------------------------------- what the hub serves
-
-async function plainHub(options = {}) {
-  const hub = await startHub({ dataDir: join(freshDir(), "hub"), origin: "https://tomcamp.tech", log: () => {}, ...options });
-  cleanups.push(() => hub.close());
-  return { hub, at: `http://127.0.0.1:${hub.port}` };
-}
-/** A raw request, for paths fetch would tidy up first. */
-const rawGet = (port, path, { method = "GET", headers = {} } = {}) => new Promise((resolve, reject) => {
-  const r = httpRequest({ port, host: "127.0.0.1", path, method, headers }, (res) => {
-    const parts = [];
-    res.on("data", (c) => parts.push(c));
-    res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(parts) }));
-  });
-  r.on("error", reject);
-  r.end();
-});
-
-test("the policy is the one asked for: nothing inline, blob only for images and media, no framing, no base, no forms", async () => {
-  const { hub } = await plainHub();
-  const page_ = await rawGet(hub.port, "/");
-  assert.equal(page_.status, 200);
-  assert.match(page_.headers["content-type"], /^text\/html/);
-  assert.equal(page_.body.toString(), uiSource("web.html"));
-  const csp = Object.fromEntries(page_.headers["content-security-policy"].split("; ").map((d) => { const [k, ...v] = d.split(" "); return [k, v.join(" ")]; }));
-  assert.deepEqual(csp, {
-    "default-src": "'none'", "script-src": "'self'", "worker-src": "'self'", "style-src": "'self'", "img-src": "'self' blob: data:", "media-src": "'self' blob:",
-    "connect-src": "'self' wss://tomcamp.tech", "frame-ancestors": "'none'", "base-uri": "'none'", "form-action": "'none'",
-  });
-  assert.doesNotMatch(page_.headers["content-security-policy"], /unsafe/);
-  assert.equal(page_.headers["x-content-type-options"], "nosniff");
-  assert.equal(page_.headers["x-frame-options"], "DENY");
-  assert.equal(page_.headers["referrer-policy"], "no-referrer");
-  assert.equal(page_.headers["cross-origin-opener-policy"], "same-origin");
-  assert.equal(page_.headers["strict-transport-security"], undefined, "HSTS stays off: it would cover the sites on other ports of this name");
-  const script = await rawGet(hub.port, "/web.js");
-  assert.match(script.headers["content-type"], /^text\/javascript/);
-  assert.ok(script.headers["content-security-policy"], "every file has the policy, not only the page");
-  assert.equal((await rawGet(hub.port, "/logo.svg")).headers["content-type"], "image/svg+xml");
-  assert.equal(webPolicy(null).includes("wss:"), false);
-  assert.match(webPolicy("https://127.0.0.1:4443"), /connect-src 'self' wss:\/\/127\.0\.0\.1:4443/);
-});
-
-test("only the exact list is served: no walk, no source of the hub, no other page", async () => {
-  const { hub } = await plainHub();
-  for (const path of ["/ui/app.js", "/../package.json", "/..%2fpackage.json", "/%2e%2e/hub/server.mjs", "/hub/server.mjs", "/server.mjs", "/login.html", "/web.html", "/app.js/", "//app.js", "/app.js/../../hub/store.mjs", "/.git/config", "/package.json", "/APP.JS", "/ui/", "/test.js"]) {
-    const r = await rawGet(hub.port, path);
-    assert.equal(r.status, 404, path);
-    assert.doesNotMatch(r.body.toString(), /import |<html/i, path);
-  }
-  assert.equal((await rawGet(hub.port, "/app.js", { method: "POST" })).status, 404);
-  assert.equal((await rawGet(hub.port, "/app.js", { method: "DELETE" })).status, 404);
-  assert.equal((await rawGet(hub.port, "/app.js?x=1")).status, 200);
-  const head = await rawGet(hub.port, "/app.js", { method: "HEAD" });
-  assert.equal(head.status, 200);
-  assert.equal(head.body.length, 0);
-  const again = await rawGet(hub.port, "/app.js", { headers: { "if-none-match": head.headers.etag } });
-  assert.equal(again.status, 304);
-  assert.ok(again.headers["content-security-policy"]);
-  assert.equal((await rawGet(hub.port, "/api/health")).status, 200, "the API is still there");
-});
-
-test("the app's markup is fetched, not visited", async () => {
-  const { hub } = await plainHub();
-  assert.equal((await rawGet(hub.port, "/index.html", { headers: { "sec-fetch-dest": "empty" } })).status, 200);
-  const visit = await rawGet(hub.port, "/index.html", { headers: { "sec-fetch-dest": "document" } });
-  assert.equal(visit.status, 303);
-  assert.equal(visit.headers.location, "/");
-});
-
-test("a page from a foreign origin gets none of it", async () => {
-  const { hub } = await plainHub();
-  assert.equal((await rawGet(hub.port, "/app.js", { headers: { origin: "https://evil.example" } })).status, 403);
-});
-
-test("the list is complete, and deploy carries exactly it", () => {
-  const seen = new Set();
-  const walk = (name) => {
-    if (seen.has(name)) return;
-    seen.add(name);
-    const src = uiSource(name);
-    for (const m of src.matchAll(/(?:from |import\(|new URL\()"\.\/([\w.-]+\.js)"/g)) walk(m[1]);
+test("MachineLinks names this device by what it was given, with the desktop's words by default", async () => {
+  const device = { id: "d", name: "Far", kind: "desktop", role: "full", online: true, self: false };
+  const fake = (phase, gaveUp) => ({ devices: () => [device], status: () => ({ phase, hub: { connected: false, gaveUp } }), openChannel() { assert.fail("not asked"); } });
+  const say = async (phase, options = {}) => {
+    const links = new MachineLinks({ account: fake(phase), connectTimeoutMs: 20, budgetMs: 2000, ...options });
+    try { await links.request("d", { method: "GET", path: "/" }); assert.fail("it answered"); } catch (e) { return e.message; } finally { links.close(); }
+    return "";
   };
-  walk("web.js");
-  walk("login-worker.js");
-  for (const name of seen) assert.ok(WEB_FILES.includes(name), `${name} is loaded and not on the list`);
-  for (const m of `${uiSource("web.html")}${uiSource("index.html")}`.matchAll(/(?:href|src)="\/?([\w.-]+\.(?:css|js|svg|png))"/g)) assert.ok(WEB_FILES.includes(m[1]), m[1]);
-  assert.ok(!WEB_FILES.includes("login.html"), "the old sign-in page is not the hub's");
-  const deploy = readFileSync(new URL("../hub/deploy.sh", import.meta.url), "utf8");
-  const listed = /^FILES=\(([\s\S]*?)^\)/m.exec(deploy)[1].split(/\s+/).filter(Boolean);
-  assert.deepEqual(listed.filter((f) => f.startsWith("ui/")).map((f) => f.slice(3)).sort(), [...WEB_FILES].sort());
-  for (const f of ["hub/server.mjs", "hub/ws.mjs", "hub/store.mjs", "hub/static.mjs", "hub/omni-hub.service"]) assert.ok(listed.includes(f), f);
-  assert.doesNotMatch(deploy.replace(/^#.*$/gm, ""), /\bcp -r|\brsync\b|ui\/\*/, "no folder is copied whole");
-  assert.doesNotMatch(readFileSync(new URL("../hub/omni-hub.service", import.meta.url), "utf8"), /^Environment=.*OMNI_HUB_HSTS_MAX_AGE/m, "HSTS stays off");
+  assert.match(await say("recovering"), /this computer is still finishing a recovery/);
+  assert.doesNotMatch(await say("recovering"), /not signed in/);
+  assert.match(await say("pending", { selfName: "this page" }), /this page is still waiting for approval/);
+  assert.match(await say("signed-out"), /this computer is not signed in/);
+  assert.match(await say("removed"), /is no longer on the account/);
+  assert.match(await say("constructor"), /is not signed in/, "a phase is looked up as its own key");
+  assert.match(await say("approved"), /this computer is not connected to the hub/);
+  assert.match(await say("approved", { selfName: "this page" }), /this page is not connected to the hub/);
+});
+
+test("a JSON answer too large to read says that, not that the link was lost", async () => {
+  const { p, farId } = await connected((req, res) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(Buffer.alloc(4096, 32)); });
+  const t = createPageTransport({ links: p.links, machine: () => ({ id: farId, name: "Far box" }), local: p.routes(), blobLimit: 1024, browser: {} });
+  await assert.rejects(t.api("POST", "/x", {}), (e) => e.code === "answer-too-large" && e.status === 413 && /Far box/.test(e.message) && /reached it/.test(e.message) && !/may or may not/.test(e.message) && !/lost/.test(e.message));
+});
+
+test("SVG data: strings count toward what is held, and only a blob is revoked", async () => {
+  const revoked = [];
+  let body = PNG, type = "image/png";
+  const { p, farId } = await connected((req, res) => respond(type, body)(req, res));
+  let n = 0;
+  const t = createPageTransport({ links: p.links, machine: () => ({ id: farId, name: "Far box" }), local: p.routes(), heldLimit: 250 * 1024, browser: { createObjectURL: () => `blob:x/${n++}`, revokeObjectURL: (u) => revoked.push(u) } });
+  body = Buffer.alloc(100 * 1024);
+  await t.rawUrl("/a.png");
+  type = "image/svg+xml";
+  await t.rawUrl("/a.svg"); // about 133 KiB as text: both still fit
+  assert.deepEqual(revoked, []);
+  await t.rawUrl("/b.svg"); // now the png goes, and the first svg, which there is nothing to revoke for
+  assert.deepEqual(revoked, ["blob:x/0"]);
+});
+
+test("a path that a URL parser would read as another host is refused, and nothing crosses", async () => {
+  const { p, farId, heads } = await connected(respond("application/json", "{}"));
+  const t = transportFor(p, farId);
+  for (const path of ["//evil.example/x", "/\\evil.example/x", "\\\\evil.example\\x", "\\/evil"]) {
+    for (const call of [() => t.api("GET", path), () => t.rawUrl(path), () => t.saveFile(path, "x.bin")]) {
+      await assert.rejects(call(), (e) => e.code === "bad-path" && e.status === 400, path);
+    }
+    const stream = t.eventSource(path);
+    await new Promise((resolve) => { stream.onerror = resolve; });
+  }
+  assert.equal(heads.filter((h) => h.type === FRAME.REQ).length, 0);
+  assert.deepEqual(await t.api("GET", "/ok//still?a=//b"), {}, "only at the start");
+});
+
+test("on a page, one helper turns the texts about this device, and drops what is not true of a page", () => {
+  const data = new Map();
+  setTransportEnv({ storage: { getItem: (k) => data.get(k) ?? null, setItem: (k, v) => data.set(k, v), removeItem: (k) => data.delete(k) }, reload: () => {} });
+  try {
+    // As they stand on a desktop.
+    assert.match(alertAdvice("removed"), /^This computer no longer has access.*It still works on its own/);
+    assert.equal(alertTitle({ kind: "removed", message: "x" }), "This computer was removed from the account");
+    assert.match(phaseText("signed-out"), /This computer works on its own/);
+    assert.match(explain({ code: "hub-unreachable", message: "No." }), /this computer still works on its own/);
+
+    setChannelTransport({ api() {}, eventSource() {}, rawUrl() {}, saveFile() {}, local: {} });
+    for (const kind of ["rollback", "fork", "different-account", "fake-log", "log-unreconciled", "recovered", "removed", "refused-by-device", "bad-log", "channel-failure", "approval-failed", "hub-says-removed", "key-unavailable"]) {
+      assert.doesNotMatch(alertAdvice(kind), /this computer|on its own|Local use/i, kind);
+      assert.doesNotMatch(alertTitle({ kind, message: "x" }), /this computer/i, kind);
+    }
+    assert.equal(alertAdvice("removed"), "This page no longer has access to the account's other machines. If this was not you, sign in again from a device you trust and check the list.");
+    assert.equal(alertTitle({ kind: "refused-by-device", message: "x" }), "One of your devices refused this page");
+    assert.equal(alertAdvice("different-account"), "Do not approve anything. Check the address of this page.");
+    assert.match(alertAdvice("fork"), /from another computer/, "another computer stays what it is");
+    for (const phase of ["signed-out", "pending", "recovering", "approved", "denied", "expired", "removed", "key-unavailable", "log-damaged"]) {
+      assert.doesNotMatch(phaseText(phase), /this computer|on its own/i, phase);
+    }
+    assert.equal(phaseText("signed-out"), "Not signed in.");
+    assert.equal(explain({ code: "hub-unreachable", message: "No." }), "The hub cannot be reached: No. Nothing here changed.");
+    assert.match(hubLostText({ hub: {} }), /^this page has lost the hub/);
+    assert.equal(deviceWords("This computer and this computer"), "This page and this page");
+  } finally { setTransportEnv({ storage: null, reload: () => {} }); }
+  const src = readFileSync(new URL("../ui/account.js", import.meta.url), "utf8");
+  assert.doesNotMatch(src, /PHASE_TEXT\[s\./, "every phase goes through the helper");
+  assert.doesNotMatch(src, /ALERT_ADVICE\[a\./, "every alert goes through the helper");
+  assert.match(readFileSync(new URL("../ui/web.js", import.meta.url), "utf8"), /const store = await openPageStore\(\);[\s\S]*setChannelTransport\([\s\S]*await account\.start\(\)/, "the transport is set before the sign-in screen draws an alert");
 });

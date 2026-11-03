@@ -12,6 +12,8 @@ const MAX_EVENT_BUFFER = 64 * 1024 * 1024; // one event a far machine never ends
 
 /** A browser would send this path normalised and percent-encoded, and the far side refuses anything else. */
 function target(path) {
+  // The URL parser would read these as another host and drop it, leaving a path nobody asked for.
+  if (/^[\\/]{2}/.test(path)) throw failure("That is not a path on a machine.", 400, "bad-path");
   const url = new URL(path, "http://omni.invalid");
   return `${url.pathname}${url.search}`;
 }
@@ -162,7 +164,7 @@ export function createPageTransport({ links, machine, local, browser = {}, blobL
     while (heldBytes > heldLimit && held.length > 1) {
       const oldest = held.shift();
       heldBytes -= oldest.size;
-      revokeObjectURL(oldest.url);
+      if (oldest.url.startsWith("blob:")) revokeObjectURL(oldest.url); // a data: URL is only let go of by whoever holds the string
     }
   }
 
@@ -178,10 +180,16 @@ export function createPageTransport({ links, machine, local, browser = {}, blobL
       try {
         for await (const chunk of checkedBody(response)) {
           size += chunk.length;
-          if (size > blobLimit) { response.abort(); throw new Error("too much"); }
+          if (size > blobLimit) {
+            response.abort();
+            throw failure(`${machine().name} answered, with more than the web page can read. The action reached it, and this page cannot say what came of it.`, 413, "answer-too-large");
+          }
           parts.push(chunk);
         }
-      } catch { throw lost(); }
+      } catch (error) {
+        if (error.code === "answer-too-large") throw error;
+        throw lost();
+      }
       return answerFrom(response.status, new TextDecoder().decode(joined(parts)), machine());
     },
 
@@ -214,7 +222,11 @@ export function createPageTransport({ links, machine, local, browser = {}, blobL
         if (error.code === "too-large-for-page") throw error;
         throw lost();
       }
-      if (kind === "svg") return `data:${type};base64,${bytesToB64(joined(parts))}`;
+      if (kind === "svg") {
+        const data = `data:${type};base64,${bytesToB64(joined(parts))}`;
+        keep(data, data.length);
+        return data;
+      }
       const url = createObjectURL(new Blob(parts, { type }));
       keep(url, size);
       return url;

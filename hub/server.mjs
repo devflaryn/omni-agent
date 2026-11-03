@@ -493,7 +493,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   function reply(res, status, body) {
     const text = JSON.stringify(body);
-    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...securityHeaders });
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), "Cache-Control": "no-store", ...pageHeaders });
     res.end(text);
   }
 

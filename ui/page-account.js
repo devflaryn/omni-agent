@@ -79,6 +79,7 @@ export class PageAccount extends Emitter {
   #approverOnline = null;
   #hubError = null;
   #hubClaimedRemoved = false;
+  #hubGaveUp = false; // replaced by another tab: nothing here will reconnect, so nothing should wait for it
   #logLock = Promise.resolve();
   #syncing = null;
   #started = null;
@@ -141,7 +142,7 @@ export class PageAccount extends Emitter {
       changed: () => this.#changed(),
       peerHeadSigned: () => {},
     });
-    this.links = new MachineLinks({ account: this, ...machineLinks });
+    this.links = new MachineLinks({ account: this, selfName: "this page", ...machineLinks });
     this.links.on("links", (list) => this.emit("links", list));
   }
 
@@ -156,7 +157,7 @@ export class PageAccount extends Emitter {
       email: this.#email,
       accountId: this.#verified?.accountId ?? null,
       device: this.#keys ? { id: this.#keys.signPub, name: this.#name, kind: this.#kind, role: me?.role ?? null, expiresAt: me ? deviceExpiresAt(me) : null } : null,
-      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#hubError },
+      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#hubError, gaveUp: this.#hubGaveUp },
       logHead: this.#hashes.at(-1) ?? null,
       logVersion: this.#hashes.length,
       pending: this.#phase === "pending" ? { code: this.#exchange.current?.code ?? null, attempts: this.#exchange.attempts, failed: this.#exchange.failed, confirmed: !!this.#exchange.current?.confirmed, approvedByHub: this.#approvedByHub, approverOnline: this.#approverOnline } : null,
@@ -368,6 +369,7 @@ export class PageAccount extends Emitter {
   #onAuthOk({ state }) {
     this.#hubError = null;
     this.#hubClaimedRemoved = false;
+    this.#hubGaveUp = false;
     this.#changed();
     if (this.#phase === "approved") {
       this.syncLog().then(() => this.#hub.sendNow({ type: "presence" })).catch(() => {});
@@ -404,6 +406,7 @@ export class PageAccount extends Emitter {
     switch (code) {
       case CLOSE_REPLACED:
         this.#hubError = "Another tab or window of this page took over. This one will not reconnect, so the two do not fight. Reload to use this one.";
+        this.#hubGaveUp = true;
         this.#changed();
         return;
       case CLOSE_DENIED:
