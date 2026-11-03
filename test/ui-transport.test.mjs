@@ -2,7 +2,9 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { api, cleanName, eventSource, isRemote, local, machine, machineName, mode, rawUrl, setChannelTransport, setMachine, setTransportEnv } from "../ui/transport.js";
+import { api, cleanName, eventSource, isRemote, local, machine, machineName, machineTitle, mode, rawUrl, setChannelTransport, setMachine, setTransportEnv, streamEvents } from "../ui/transport.js";
+import { alertTitle, gateKey, linkNews } from "../ui/account.js";
+import { createRemote } from "../ui/remote.js";
 import { esc, md } from "../ui/lib.js";
 
 const ID = "a/b+c==";
@@ -139,6 +141,11 @@ test("channel mode hands everything to the page's own channel (Task 8's seam)", 
   assert.equal(calls.length, 0, "not one request through a server");
 });
 
+test("cleanName takes its fallback, so a missing kind is not an Unnamed device", () => {
+  assert.equal(cleanName("", 32, "unknown"), "unknown");
+  assert.doesNotMatch(read("account.js"), /cleanName\([\w.?]*kind, 32\)/);
+});
+
 test("cleanName: controls, direction marks and zero-width characters go; the text stays text", () => {
   assert.equal(cleanName(`Good${String.fromCodePoint(0x202e)}doog`), "Gooddoog");
   assert.equal(cleanName(`a${String.fromCodePoint(0x200b)}b${String.fromCodePoint(0x2066)}c${String.fromCodePoint(0x061c)}d`), "abcd");
@@ -168,9 +175,62 @@ test("every direct URL to a file's bytes goes through the one helper", () => {
 test("only transport.js calls fetch or opens an EventSource, so nothing can miss the machine", () => {
   for (const f of uiFiles()) {
     if (f === "transport.js") continue;
-    assert.doesNotMatch(read(f), /(^|[^.\w])fetch\(/m, `${f} calls fetch`);
-    assert.doesNotMatch(read(f), /new (globalThis\.)?EventSource\(/, `${f} opens an EventSource`);
+    assert.doesNotMatch(read(f), /(^|[^.\w])fetch\(|\b(window|globalThis|self)\.fetch\(/m, `${f} calls fetch`);
+    assert.doesNotMatch(read(f), /new\s+((window|globalThis|self)\.)?EventSource\(/, `${f} opens an EventSource`);
   }
+});
+
+test("another machine's stream cannot paint this computer's approval cards", () => {
+  const handlers = { approvals: () => "approvals", resync: () => "resync" };
+  assert.deepEqual(Object.keys(streamEvents(handlers)).sort(), ["approvals", "resync"], "this computer's own stream carries them");
+  setMachine(ID, { name: "Ubuntu" });
+  assert.deepEqual(Object.keys(streamEvents(handlers)), ["resync"]);
+  const app = read("app.js");
+  assert.match(app, /const stream = createStream\(\{[\s\S]*?on: streamEvents\(\{/, "app.js uses it for the machine's stream");
+  assert.match(app, /const hereStream = isRemote\(\) \? createStream\(\{[\s\S]*?on: \{ approvals:/, "and this computer's own stream carries the real ones");
+});
+
+test("an approval card keeps the machine in the title, whenever it renders", () => {
+  setMachine(ID, { name: "Ubuntu" });
+  class Node { constructor() { this.children = []; this.dataset = {}; } appendChild() {} setAttribute() {} querySelectorAll() { return []; } }
+  const box = new Node();
+  const fake = { title: "stale", querySelector: () => box, createElement: () => new Node(), hidden: false };
+  const real = globalThis.document;
+  globalThis.document = fake;
+  try {
+    const remote = createRemote({ api: async () => ({}), toast: () => {} });
+    fake.title = "[Ubuntu] A chat · Omni Agent";
+    remote.setApprovals([{ id: "a", ip: "1.2.3.4", title: "t", path: "/x", method: "POST", expiresAt: Date.now() + 1000 }]);
+    assert.match(fake.title, /^\(1\) Approve\? · \[Ubuntu\] /);
+    remote.setApprovals([]);
+    assert.equal(fake.title, machineTitle());
+    assert.equal(fake.title, "[Ubuntu] Omni Agent");
+  } finally { globalThis.document = real; clearInterval(0); }
+});
+
+test("a banner does not say the same thing twice", () => {
+  assert.equal(alertTitle({ kind: "hub-says-removed", message: "The hub says this device was removed from the account." }), "");
+  assert.equal(alertTitle({ kind: "fork", message: "Two logs exist." }), "Two different device lists exist");
+  assert.equal(alertTitle({ kind: "made-up", message: "x" }), "Security notice");
+});
+
+test("the stored code is only asked for again when something about it can have changed", () => {
+  const base = { recoveryCodePending: true, recoveryContested: false, logHead: "a", alerts: [], hub: { attempts: 1, connected: true } };
+  assert.equal(gateKey(base), gateKey({ ...base, alerts: [1], hub: { attempts: 9, connected: false } }), "news about something else asks nothing");
+  assert.notEqual(gateKey(base), gateKey({ ...base, recoveryContested: true }));
+  assert.notEqual(gateKey(base), gateKey({ ...base, recoveryCodePending: false }));
+  assert.notEqual(gateKey(base), gateKey({ ...base, logHead: "b" }), "a code settles by a log being adopted");
+});
+
+test("the link's news: back up is said once, and only after it was down", () => {
+  const up = { online: true, link: { state: "open" } };
+  assert.deepEqual(linkNews(false, up, true), { down: false, reconnected: false });
+  assert.equal(linkNews(false, { online: true, link: { state: "stalled" } }, true).down, true);
+  assert.equal(linkNews(false, { online: false, link: { state: "offline" } }, true).down, true);
+  assert.equal(linkNews(false, up, false).down, true, "no hub, no link");
+  const idle = linkNews(true, { online: true, link: { state: "idle" } }, true);
+  assert.deepEqual(idle, { down: true, reconnected: false }, "not back until a channel is open again");
+  assert.deepEqual(linkNews(true, up, true), { down: false, reconnected: true });
 });
 
 test("account.js speaks to this computer only, and shows supplied text as text", () => {

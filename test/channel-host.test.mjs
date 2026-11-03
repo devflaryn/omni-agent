@@ -131,9 +131,9 @@ test("frames: round trip, a known version only, nothing malformed", () => {
   assert.equal(f.type, FRAME.RES_BODY);
   assert.equal(f.stream, 7);
   assert.deepEqual([...f.payload], [1, 2, 3]);
-  assert.equal(FRAME_VERSION, 1);
+  assert.equal(FRAME_VERSION, 2);
   const wrongVersion = encodeFrame(FRAME.RES_BODY, 7, new Uint8Array(0));
-  wrongVersion[0] = 2;
+  wrongVersion[0] = 99;
   assert.throws(() => decodeFrame(wrongVersion), /version/);
   assert.throws(() => decodeFrame(new Uint8Array(3)), /short/);
   const wrongType = encodeFrame(FRAME.RES_BODY, 7, new Uint8Array(0));

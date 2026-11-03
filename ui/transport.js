@@ -16,9 +16,9 @@ const CONTROL_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu; // controls, direction mar
  * text around, no zero-width characters that make two names look alike, and not so long it pushes the rest off the screen.
  * The caller still renders it as text.
  */
-export function cleanName(name, max = 64) {
+export function cleanName(name, max = 64, fallback = "Unnamed device") {
   const text = String(name ?? "").replace(/\s+/g, " ").replace(CONTROL_CHARS, "").trim();
-  return [...text].slice(0, max).join("") || "Unnamed device";
+  return [...text].slice(0, max).join("") || fallback;
 }
 
 let env = {
@@ -47,6 +47,15 @@ export const isRemote = () => read() !== null;
 export const machineName = () => read()?.name ?? "this computer";
 export const mode = () => (!read() ? "local" : channelImpl ? "channel" : "proxied");
 const prefix = () => (read() ? `/remote/${encodeURIComponent(read().id)}` : "");
+
+/** The window's title, saying which machine it is on. Everything that sets the title goes through here. */
+export const machineTitle = (title = "Omni Agent") => (read() ? `[${read().name}] ${title}` : title);
+
+/**
+ * The named events to take from the chosen machine's stream. Old-style approval cards act on this computer, so another
+ * machine's stream must not be able to paint them: on another machine they come from this computer's own stream alone.
+ */
+export const streamEvents = ({ approvals, resync }) => (read() ? { resync } : { approvals, resync });
 
 /** Task 8: a page with no server of its own hands in its channel here. */
 export function setChannelTransport(impl) { channelImpl = impl; }

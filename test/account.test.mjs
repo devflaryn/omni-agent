@@ -13,7 +13,7 @@ import { Account, keychainProtector, plainProtector, windowsProtector } from "..
 import { RecoveryStore } from "../server/account-recovery.mjs";
 import { channelClient, serveChannel } from "../server/channel-host.mjs";
 import { createApp } from "../server/index.mjs";
-import { FRAME, encodeFrame, encodeJson, encodeOuter } from "../ui/channel-frames.js";
+import { FRAME, FRAME_VERSION, encodeFrame, encodeJson, encodeOuter } from "../ui/channel-frames.js";
 import { fromB64, newDeviceKeys, recoveryKeysFrom, sign, startHandshake, toB64 } from "../ui/account-core.js";
 import { append, canRecover, createLog, entryBytes, verifyLog } from "../ui/device-log.js";
 
@@ -891,8 +891,8 @@ test("approval: a review that fails late does not wipe another review, and hints
 
   // A hub's hints: an id with no card is dropped, however many.
   const from = second.status().device.id;
-  for (let i = 0; i < 200; i++) inject(approver, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, t: "review", id: `made-up-${i}` }) });
-  inject(approver, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, t: "review", id: rowC.id }) });
+  for (let i = 0; i < 200; i++) inject(approver, { type: "channel.msg", from, opaque: JSON.stringify({ v: FRAME_VERSION, t: "review", id: `made-up-${i}` }) });
+  inject(approver, { type: "channel.msg", from, opaque: JSON.stringify({ v: FRAME_VERSION, t: "review", id: rowC.id }) });
   assert.equal(approver.pendingSignIns().find((r) => r.id === rowC.id).reviewedBy, "Second");
   // A hint is not kept for a card that may come later: nothing is held for an id the hub made up.
   inject(approver, { type: "pending.list", pending: [{ ...rowC, id: "made-up-7" }] });
@@ -1069,12 +1069,12 @@ test("hacked hub: a reveal that does not match the commit ends that exchange, an
   // The hub tries again: nothing happens until the person asks.
   const stranger = await newDeviceKeys({ extractable: true });
   const commit = toB64(new Uint8Array(32).fill(4));
-  inject(newcomer, { type: "approval.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, t: "commit", commit, logHead: "head" }) });
+  inject(newcomer, { type: "approval.msg", from: stranger.signPub, opaque: JSON.stringify({ v: FRAME_VERSION, t: "commit", commit, logHead: "head" }) });
   await sleep(50);
   assert.equal(newcomer.status().pending.attempts, 1);
   newcomer.restartExchange();
   assert.equal(newcomer.status().pending.failed, false);
-  inject(newcomer, { type: "approval.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, t: "commit", commit, logHead: "head" }) });
+  inject(newcomer, { type: "approval.msg", from: stranger.signPub, opaque: JSON.stringify({ v: FRAME_VERSION, t: "commit", commit, logHead: "head" }) });
   await until(() => newcomer.status().pending.attempts === 2, "the person's new attempt");
 });
 
@@ -1106,7 +1106,7 @@ test("hacked hub: more commits while one exchange runs are ignored, and cannot r
   newcomer.confirmCode(code);
   const stranger = await newDeviceKeys({ extractable: true });
   const commit = toB64(new Uint8Array(32).fill(4));
-  for (let i = 0; i < 6; i++) inject(newcomer, { type: "approval.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, t: "commit", commit, logHead: "head" }) });
+  for (let i = 0; i < 6; i++) inject(newcomer, { type: "approval.msg", from: stranger.signPub, opaque: JSON.stringify({ v: FRAME_VERSION, t: "commit", commit, logHead: "head" }) });
   await sleep(50);
   assert.equal(newcomer.status().pending.attempts, 1);
   assert.equal(newcomer.status().pending.code, code);
@@ -1239,8 +1239,8 @@ test("hacked hub: a flood of forgeable alerts evicts nothing that matters, and s
   second.limits.maxChannels = 1000;
   for (let round = 0; round < 60; round++) {
     const c = toB64(new Uint8Array(16).fill(round, 0, 8).fill(++order, 8));
-    inject(second, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, c, t: "hello", eph, logHead: second.status().logHead }) });
-    inject(second, { type: "channel.msg", from, opaque: JSON.stringify({ v: 1, c, t: "proof", proof }) });
+    inject(second, { type: "channel.msg", from, opaque: JSON.stringify({ v: FRAME_VERSION, c, t: "hello", eph, logHead: second.status().logHead }) });
+    inject(second, { type: "channel.msg", from, opaque: JSON.stringify({ v: FRAME_VERSION, c, t: "proof", proof }) });
     await sleep(1);
   }
   const flood = await until(() => { const row = second.status().alerts.find((a) => a.kind === "channel-failure"); return row?.count >= 60 ? row : null; }, "the flood counted");
@@ -1400,7 +1400,7 @@ test("a device that is not on the log is refused, and told so", async () => {
   const channels = [];
   first.on("channel", (c) => channels.push(c));
   const stranger = await newDeviceKeys({ extractable: true });
-  inject(first, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, c: toB64(new Uint8Array(16).fill(1)), t: "hello", eph: stranger.boxPub, logHead: "x" }) });
+  inject(first, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: FRAME_VERSION, c: toB64(new Uint8Array(16).fill(1)), t: "hello", eph: stranger.boxPub, logHead: "x" }) });
   await sleep(100);
   assert.equal(channels.length, 0);
   assert.equal(first.status().channels.length, 0);
@@ -1689,7 +1689,7 @@ test("a handshake that never finishes is dropped, and there is a limit on how ma
   const from = second.status().device.id;
   const eph = (await newDeviceKeys({ extractable: true })).boxPub;
   first.tap.outgoing = (m) => (m.type === "channel.msg" ? null : m); // nobody ever answers these handshakes
-  const hello = (i) => ({ type: "channel.msg", from, opaque: JSON.stringify({ v: 1, c: toB64(new Uint8Array(16).fill(i)), t: "hello", eph, logHead: first.status().logHead }) });
+  const hello = (i) => ({ type: "channel.msg", from, opaque: JSON.stringify({ v: FRAME_VERSION, c: toB64(new Uint8Array(16).fill(i)), t: "hello", eph, logHead: first.status().logHead }) });
   for (let i = 0; i < 5; i++) inject(account, hello(i));
   await until(() => account.status().handshakes <= 2 && account.status().handshakes > 0, "only two waiting");
   await until(() => account.status().handshakes === 0, "dropped when they time out");
@@ -2488,7 +2488,7 @@ test("refused by a device on this log: a visible alert, and the log is checked; 
     tap.outgoing = (m) => { if (m.type === "log.get") fetched++; return m; };
     first.tap.outgoing = (m) => {
       if (m.type !== "channel.msg" || JSON.parse(m.opaque).t !== "hello") return m;
-      return { ...m, opaque: JSON.stringify({ v: 1, c: JSON.parse(m.opaque).c, t: "close", reason }) };
+      return { ...m, opaque: JSON.stringify({ v: FRAME_VERSION, c: JSON.parse(m.opaque).c, t: "close", reason }) };
     };
     await assert.rejects(second.openChannel(firstId), /refused/);
     assert.ok(second.status().alerts.some((a) => a.kind === "refused-by-device" && a.key.endsWith(reason)), reason);
@@ -2501,7 +2501,7 @@ test("refused by a device on this log: a visible alert, and the log is checked; 
   for (const reason of ["busy", "unavailable", "web-access-off"]) {
     first.tap.outgoing = (m) => {
       if (m.type !== "channel.msg" || JSON.parse(m.opaque).t !== "hello") return m;
-      return { ...m, opaque: JSON.stringify({ v: 1, c: JSON.parse(m.opaque).c, t: "close", reason }) };
+      return { ...m, opaque: JSON.stringify({ v: FRAME_VERSION, c: JSON.parse(m.opaque).c, t: "close", reason }) };
     };
     await assert.rejects(second.openChannel(firstId), /refused/);
   }
@@ -2509,8 +2509,8 @@ test("refused by a device on this log: a visible alert, and the log is checked; 
   // A stranger's refusal says nothing about this log.
   const stranger = await newDeviceKeys({ extractable: true });
   // Its hello opens a channel entry while the log is checked, so a close can land on one.
-  inject(second, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, c: "x", t: "hello", eph: stranger.boxPub, logHead: "h" }) });
-  inject(second, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: 1, c: "x", t: "close", reason: "removed" }) });
+  inject(second, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: FRAME_VERSION, c: "x", t: "hello", eph: stranger.boxPub, logHead: "h" }) });
+  inject(second, { type: "channel.msg", from: stranger.signPub, opaque: JSON.stringify({ v: FRAME_VERSION, c: "x", t: "close", reason: "removed" }) });
   await sleep(20);
   assert.equal(second.alerts.length, 0);
 });

@@ -11,7 +11,7 @@ import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
 import { createRemote } from "./remote.js";
 import { createStream } from "./stream.js";
 import { createMissionView } from "./mission.js";
-import { api as machineApi, eventSource, isRemote, local, machineName, setMachine } from "./transport.js";
+import { api as machineApi, eventSource, isRemote, local, machineName, machineTitle, setMachine, streamEvents } from "./transport.js";
 import { createAccount } from "./account.js";
 
 const $ = (s) => document.querySelector(s);
@@ -392,8 +392,7 @@ function updateTitle() {
   // An agent's chat goes by the title its parent gave the job, not the first line of its task prompt.
   const title = S.page === "chat" && s ? agentFor(s.sid)?.title || s.title || "" : "";
   $("#topTitle").textContent = title;
-  const where = isRemote() ? `[${machineName()}] ` : "";
-  document.title = title ? `${where}${title} · Omni Agent` : `${where}Omni Agent`;
+  document.title = machineTitle(title ? `${title} · Omni Agent` : "Omni Agent");
 }
 
 // ---------------------------------------------------------------- home
@@ -654,13 +653,13 @@ const stream = createStream({
   url: () => `/events?since=${S.seq}${S.boot ? `&boot=${encodeURIComponent(S.boot)}` : ""}`,
   EventSource: function MachineEvents(url) { return eventSource(url); }, // called with new: what it returns is the stream
   onMessage: (m) => { let ev; try { ev = JSON.parse(m.data); } catch { return; } handle(ev); },
-  on: {
+  on: streamEvents({
     // Only the host's own window receives these: remote changes waiting for Approve/Deny.
     approvals: (m) => { try { remote.setApprovals(JSON.parse(m.data)); } catch { /* */ } },
     // What this page missed is gone (the ring wrapped, or the server restarted and its seq began again): count
     // from the replay that follows this, and reload the state and the open chat.
     resync: (m) => { let r = {}; try { r = JSON.parse(m.data); } catch { /* */ } S.boot = r.boot || ""; S.seq = 0; resync(); },
-  },
+  }),
   onUp: () => { $("#connStatus").hidden = true; updateHeader(); },
   onDown: () => { $("#connStatus").hidden = false; checkSignedIn(); },
 });

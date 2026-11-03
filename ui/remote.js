@@ -2,13 +2,13 @@
    The host (this computer's own window): approval cards for every change a remote browser asks for, and
    Settings → Remote (password, address, who is signed in). A remote browser: a read-only chip and Sign out. */
 import { el, fmtDuration } from "./lib.js";
+import { machineTitle } from "./transport.js";
 
 export function createRemote({ api, toast }) {
   const $ = (s) => document.querySelector(s);
   let role = "host";
   let pending = [];
   let tick = null;
-  const baseTitle = document.title;
 
   // ------------------------------------------------------------- remote browser
   function initViewer() {
@@ -38,7 +38,7 @@ export function createRemote({ api, toast }) {
   function render() {
     const box = $("#approvals");
     box.innerHTML = "";
-    document.title = pending.length ? `(${pending.length}) Approve? · ${baseTitle}` : baseTitle;
+    document.title = pending.length ? `(${pending.length}) Approve? · ${machineTitle()}` : machineTitle();
     clearInterval(tick); tick = null;
     if (!pending.length) { box.hidden = true; return; }
     box.hidden = false;

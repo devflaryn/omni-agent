@@ -297,6 +297,22 @@ test("the proxy builds a clean request: no cookie, no Origin, nothing local cros
   for (const local of ["secret", "omni_window", window.origin, "Local UA", "Bearer", "x-omni-local"]) assert.ok(!sent.includes(local), `${local} crossed: ${sent}`);
 });
 
+test("a read from another page on this site is refused, whatever cookie came with it", async () => {
+  const { here, farId, window, seen } = await pair();
+  const url = new URL(here.at);
+  const get = (site) => new Promise((resolve, reject) => {
+    const req = httpRequest({ host: url.hostname, port: url.port, path: `/remote/${encodeURIComponent(farId)}/x`, headers: { cookie: window.cookie, ...(site ? { "sec-fetch-site": site } : {}) } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on("error", reject);
+    req.end();
+  });
+  assert.equal(await get("cross-site"), 403);
+  assert.equal(await get("same-site"), 403, "another port on this name is same-site");
+  assert.equal(seen.length, 0);
+  assert.equal(await get("same-origin"), 200);
+  assert.equal(await get("none"), 200, "a person's own navigation");
+  assert.equal(await get(null), 200, "not sent by everything");
+});
+
 test("what comes back is cleaned too: cookies dropped, active content sandboxed, odd statuses refused", async () => {
   const replies = {
     "/cookie": { status: 200, headers: { "Set-Cookie": "omni_window=stolen; Path=/", Location: "http://evil.example/", "Content-Type": "text/plain", "X-Custom": "1", "Access-Control-Allow-Origin": "*", "Clear-Site-Data": "*", Refresh: "0; url=http://evil.example" }, body: "hi" },
@@ -335,7 +351,9 @@ test("what comes back is cleaned too: cookies dropped, active content sandboxed,
     await r.text();
   }
   const bad = await get("/bad-value");
-  assert.ok(bad.headers.get("set-cookie") === null);
+  assert.equal(bad.status, 200);
+  assert.equal(bad.headers.get("set-cookie"), null);
+  assert.equal(bad.headers.get("content-type"), null, "a value that could break the header block is no header");
   await bad.text();
 });
 
@@ -345,6 +363,7 @@ test("a far machine that lies about Content-Length cannot smuggle a second respo
     handle: (req, res) => {
       if (req.url === "/long") { res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": "2" }); res.end(`ok${smuggled}`); return; }
       if (req.url === "/short") { res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": "100" }); res.end("ok"); return; }
+      if (req.url.startsWith("/odd")) { res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": new URL(req.url, "http://x").searchParams.get("v") }); res.end("whole body"); return; }
       res.writeHead(200, { "Content-Type": "text/plain" }); res.end("fine");
     },
   });
@@ -364,6 +383,15 @@ test("a far machine that lies about Content-Length cannot smuggle a second respo
   assert.equal(long.closed, true, "a far machine that lied loses the connection");
   const short = await raw("/short");
   assert.equal(short.closed, true, "a body shorter than promised is a failure: the socket closes, nothing waits on it");
+
+  // Lengths a browser and Number() would read differently, or not at all: dropped, so chunked frames the body.
+  for (const odd of ["abc", "1e3", "0x10", " 5", "-1", "5, 5", "+5", "1234567890123456"]) {
+    const r = await raw(`/odd?v=${encodeURIComponent(odd)}`);
+    assert.doesNotMatch(r.text, /content-length/i, JSON.stringify(odd));
+    assert.match(r.text, /transfer-encoding: chunked/i, JSON.stringify(odd));
+    assert.match(r.text, /whole body/, JSON.stringify(odd));
+    assert.doesNotMatch(r.text.split("\r\n\r\n").slice(1).join(""), /HTTP\/1\.1/, JSON.stringify(odd));
+  }
 });
 
 test("deviceId is checked against the log: unknown, malformed, this computer and a web page are refused", async () => {
@@ -489,6 +517,106 @@ test("a machine that goes silent with no goodbye: rejects within 30 s, named, an
   assert.equal(r.status, 502);
   const j = await r.json();
   assert.match(j.error, /Silent box/);
+});
+
+test("no head within the budget is given up on, naming the machine, however alive the link", async () => {
+  let aborted = false;
+  const { remote, window } = await pair({
+    farName: "Busy box",
+    links: { responseTimeoutMs: 600 },
+    handle: (req, res) => { res.once("close", () => { aborted = true; }); },
+  });
+  const started = Date.now();
+  const r = await fetch(remote("/never"), { method: "POST", headers: { cookie: window.cookie, origin: window.origin, "content-type": "application/json" }, body: "{}" });
+  const took = Date.now() - started;
+  assert.equal(r.status, 504);
+  const j = await r.json();
+  assert.equal(j.code, "machine-slow");
+  assert.match(j.error, /Busy box/);
+  assert.match(j.error, /may or may not/);
+  assert.ok(took < 5000, `took ${took}`);
+  await until(() => aborted, "the far machine to be told");
+});
+
+test("the budget counts the time spent connecting: a machine that never finishes the handshake is rejected inside it", async () => {
+  const silence = { dead: false };
+  const { remote, window } = await pair({ farName: "Half there", farWs: silencing(silence), links: { responseTimeoutMs: 900 } });
+  silence.dead = true; // online by the hub's word, and no channel open yet
+  const started = Date.now();
+  const r = await fetch(remote("/x"), { headers: { cookie: window.cookie } });
+  const took = Date.now() - started;
+  assert.equal(r.status, 504);
+  assert.equal((await r.json()).code, "machine-unreachable");
+  assert.ok(took < 2500, `took ${took}, past a 900 ms budget`);
+});
+
+test("a response already streaming is past the budget: it follows the liveness rule alone", async () => {
+  const { remote, window } = await pair({
+    links: { responseTimeoutMs: 200, pingEveryMs: 50, stallAfterMs: 150, deadAfterMs: 400 },
+    handle: async (req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.write("start "); await sleep(1000); res.end("end"); },
+  });
+  const r = await fetch(remote("/stream"), { headers: { cookie: window.cookie } });
+  assert.equal(await r.text(), "start end");
+});
+
+test("a far machine that answers early cannot turn an upload's 413 into a reset", async () => {
+  const { remote, window } = await pair({
+    links: { maxBodyBytes: 1024 * 1024 },
+    // Hostile: a head at once, then it reads on and never finishes the reply.
+    handle: async (req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); try { for await (const chunk of req) void chunk; } catch { /* */ } },
+  });
+  const url = new URL(remote("/up"));
+  const status = await new Promise((resolve) => {
+    const req = httpRequest({ host: url.hostname, port: url.port, path: url.pathname, method: "POST", headers: { cookie: window.cookie, origin: window.origin, "content-type": "application/octet-stream" } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on("error", (e) => resolve(e));
+    const piece = Buffer.alloc(256 * 1024);
+    let left = 24;
+    const more = () => { while (left-- > 0) { if (!req.write(piece)) { req.once("drain", more); return; } } req.end(); };
+    more();
+  });
+  assert.equal(status, 413);
+});
+
+test("a machine of another frame version is refused at open, naming it and saying to update", async () => {
+  // It speaks another version in everything it sends, and hears ours: the opener's own check catches its hello.
+  const rewrite = (text, v) => { const m = JSON.parse(text); if (typeof m.opaque === "string") { const o = JSON.parse(m.opaque); o.v = v; m.opaque = JSON.stringify(o); } return JSON.stringify(m); };
+  const speaksOld = class extends WebSocket { send(text) { super.send(JSON.parse(text).type === "channel.msg" ? rewrite(text, 1) : text); } };
+  const started = Date.now();
+  const { here, remote, window } = await pair({ farName: "Old box", farWs: speaksOld });
+  const opener = await fetch(remote("/x"), { headers: { cookie: window.cookie } });
+  const j = await opener.json();
+  assert.equal(opener.status, 502, JSON.stringify(j));
+  assert.equal(j.code, "machine-version");
+  assert.match(j.error, /Old box/);
+  assert.match(j.error, /Update Omni/);
+  assert.ok(Date.now() - started < 28_000, "no waiting out the handshake");
+  assert.equal(here.app.account.status().channels.length, 0);
+});
+
+test("the far side of a version mismatch says so too: a hello it cannot read is answered, not dropped", async () => {
+  // Now the far machine hears another version: its check answers the opener's hello with a close.
+  const hearsOld = class {
+    constructor(url) {
+      this.real = new WebSocket(url);
+      this.real.onopen = (e) => this.onopen?.(e);
+      this.real.onclose = (e) => this.onclose?.(e);
+      this.real.onerror = (e) => this.onerror?.(e);
+      this.real.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        if (m.type === "channel.msg" && typeof m.opaque === "string") { const o = JSON.parse(m.opaque); o.v = 1; m.opaque = JSON.stringify(o); }
+        this.onmessage?.({ data: JSON.stringify(m) });
+      };
+    }
+    get readyState() { return this.real.readyState; }
+    get bufferedAmount() { return this.real.bufferedAmount; }
+    send(text) { this.real.send(text); }
+    close(...a) { this.real.close(...a); }
+  };
+  const { remote, window } = await pair({ farName: "Old box", farWs: hearsOld });
+  const r = await fetch(remote("/x"), { headers: { cookie: window.cookie } });
+  const j = await r.json();
+  assert.equal(j.code, "machine-version", JSON.stringify(j));
+  assert.match(j.error, /Old box/);
 });
 
 test("a slow answer from a machine still answering is not given up on: silence is what counts", async () => {

@@ -18,7 +18,8 @@ import { cleanName } from "../ui/transport.js";
 
 const SECOND = 1000;
 const DEFAULTS = Object.freeze({
-  connectTimeoutMs: 28 * SECOND,   // inside the 30 s a person is promised, which the handshake's own 35 s is not
+  responseTimeoutMs: 30 * SECOND,  // from request() to the response's head, connecting included: what a person is promised
+  connectTimeoutMs: 28 * SECOND,   // one attempt to connect, which goes on for later requests after one has given up
   pingEveryMs: 8 * SECOND,
   stallAfterMs: 12 * SECOND,       // shown as stalled from here
   deadAfterMs: 25 * SECOND,        // given up from here
@@ -26,6 +27,7 @@ const DEFAULTS = Object.freeze({
   slowReaderMs: 20 * SECOND,       // a browser that stops reading holds the channel's shared window, so it is let go of
   maxBodyBytes: 32 * 1024 * 1024,  // as for a signed-in remote browser
 });
+const DIFFERENT_VERSION = /different version/;
 const DRAIN_MS = 2 * SECOND;
 const SELF = "That is this computer: there is nothing to connect to.";
 const REPLY_HEADERS = ["content-type", "content-length", "content-range", "accept-ranges", "cache-control", "etag", "last-modified", "content-disposition", "content-encoding", "x-accel-buffering"];
@@ -182,12 +184,15 @@ export class MachineLinks extends EventEmitter {
     const device = this.#hostFor(id);
     const link = this.#link(device);
     const name = link.name;
+    const started = Date.now();
+    const left = () => this.options.responseTimeoutMs - (Date.now() - started);
     const connected = this.account.status().hub.connected;
     if (!link.client && connected && !device.online) throw new MachineError(503, "machine-offline", `${name} is offline. Nothing was sent to it.`, { id, name });
     let client;
     try {
-      client = link.client ?? await (link.opening ??= this.#connect(link).finally(() => { link.opening = null; }));
+      client = link.client ?? await deadline(link.opening ??= this.#connect(link).finally(() => { link.opening = null; }), left(), `${name} did not finish connecting`);
     } catch (error) {
+      if (DIFFERENT_VERSION.test(error.message)) throw new MachineError(502, "machine-version", `${name} runs a different version of Omni. Update Omni on ${name} and on this computer. Nothing was sent to it.`, { id, name });
       throw new MachineError(504, "machine-unreachable", `Could not reach ${name}: ${error.message}. Nothing was sent to it.`, { id, name });
     }
     link.lastUsed = Date.now();
@@ -199,12 +204,22 @@ export class MachineLinks extends EventEmitter {
       link.inflight--;
       link.lastUsed = Date.now();
     };
+    // No head inside the budget, however alive the link: the action is given up on, and the far machine is told. A response
+    // already streaming is past this: from its head on it follows the liveness rule alone, so a long event stream or a slow
+    // download is not cut off by a clock.
+    const budget = new AbortController();
+    let late = false;
+    const timer = setTimeout(() => { late = true; budget.abort(new Error("no answer in time")); }, Math.max(0, left()));
+    timer.unref?.();
     try {
-      const response = await client.request(options);
+      const response = await client.request({ ...options, signal: options.signal ? AbortSignal.any([options.signal, budget.signal]) : budget.signal });
+      clearTimeout(timer);
       response.body.once("close", release);
       return response;
     } catch (error) {
+      clearTimeout(timer);
       release();
+      if (late) throw new MachineError(504, "machine-slow", `${name} did not answer within ${Math.round(this.options.responseTimeoutMs / SECOND)} seconds. This action may or may not have run there.`, { id, name });
       if (options.signal?.aborted || error instanceof BodyTooLarge) throw error;
       throw new MachineError(502, "machine-lost", `The connection to ${name} was lost (${error.message}). This action may or may not have run there.`, { id, name });
     }
@@ -238,6 +253,9 @@ function replyHeaders(given) {
   for (const name of REPLY_HEADERS) {
     const value = given?.[name];
     if (typeof value !== "string" && typeof value !== "number") continue;
+    // The defence against a second response on this connection rests on the proxy and the browser reading this number alike.
+    // Anything else goes, and chunked takes over.
+    if (name === "content-length" && !/^\d{1,15}$/.test(String(value))) continue;
     try { validateHeaderValue(name, value); out[name] = String(value); } catch { /* a value that could break the header block is no header */ }
   }
   return out;
@@ -269,6 +287,10 @@ export async function proxyToMachine(req, res, { links, send }) {
   const fail = (e) => send(res, e.status, { error: e.message, code: e.code, ...(e.machine ? { machine: e.machine } : {}) });
   const { maxBodyBytes, slowReaderMs } = links.options;
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
+
+  // The cookie is SameSite and a change must name this page, which leaves a read from another page on this site: another port.
+  const site = req.headers["sec-fetch-site"];
+  if (site !== undefined && site !== "same-origin" && site !== "none") return send(res, 403, { error: "that request did not come from the Omni window" });
 
   if (target.path === null) {
     if (links.isSelf(target.id)) return send(res, 400, { error: SELF, code: "self" });
@@ -326,8 +348,14 @@ async function relay(req, res, response, { slowReaderMs, send, hasBody }) {
   if (pdf) res.removeHeader("X-Frame-Options");
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
-  res.writeHead(response.status, headers);
-  res.flushHeaders(); // an event stream's head goes now, not with its first event
+  // An event stream's head goes now, not with its first event. While an upload may still be running it waits for the first
+  // byte of the answer: a far side that answers early must not be able to turn the 413 for that upload into a reset.
+  const sendHead = () => {
+    if (res.headersSent) return;
+    res.writeHead(response.status, headers);
+    res.flushHeaders();
+  };
+  if (!hasBody) sendHead();
 
   // Counted here: passed on as it stands, a false length would let the rest be read as another response on this connection.
   const declared = headers["content-length"] === undefined || req.method === "HEAD" || response.status === 204 || response.status === 304 ? null : Number(headers["content-length"]);
@@ -337,15 +365,18 @@ async function relay(req, res, response, { slowReaderMs, send, hasBody }) {
       if (req.method === "HEAD") continue;
       sent += chunk.length;
       if (declared !== null && sent > declared) { stop(); return undefined; }
+      sendHead();
       if (!res.write(chunk)) await drained(res, slowReaderMs);
     }
-  } catch {
+  } catch (error) {
+    if (error instanceof BodyTooLarge && !res.headersSent) return refuseTooLarge(req, res, send);
     // The channel went, or the reader did. Ended cleanly, a part of an answer would pass for all of it.
     stop();
     return undefined;
   }
   if (declared !== null && sent < declared) { stop(); return undefined; }
   if (hasBody) req.resume(); // the far machine has answered: whatever is left of an upload goes nowhere
+  sendHead();
   res.end();
   return undefined;
 }

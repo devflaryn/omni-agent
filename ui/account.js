@@ -7,7 +7,7 @@ import { checkPassword } from "./account-core.js";
 import { cleanName, isRemote, local, machine, setMachine } from "./transport.js";
 
 const NOTICE_KEY = "omni.machineNotice";
-const HUB_SEES = "The hub routes encrypted frames between your devices. It cannot read your actions, results, file contents, chat text or session titles, and it cannot forge an action. It can still see which devices are on the account, when they connect, IP addresses and the size and timing of frames, plus your email address and login verifiers. Using a hacked hub to guess your password offline only gets a pending sign-in, which one of your devices must still approve.";
+const HUB_SEES = "The hub routes encrypted frames between your devices. It cannot read your actions, results, file contents, chat text or session titles, and it cannot forge an action. It can still see which devices are on the account, when they connect, IP addresses and the size and timing of frames, plus your email address and login verifiers. Someone who hacked the hub could try to guess your password offline; a correct guess only gets a pending sign-in, which one of your devices must still approve.";
 const FORGET_WARNING = "This deletes the recovery code held on this computer and this device's identity. If that code is the live one and you have not written it down, the account may become unrecoverable.";
 
 /** What to do about each alert. The server's own text says what happened. */
@@ -52,6 +52,25 @@ const PHASE_TEXT = {
   "key-unavailable": "This computer's device key cannot be opened.",
   "log-damaged": "The device list on this computer is damaged.",
 };
+
+/** The banner's title, unless the message already opens with those words. */
+export function alertTitle(alert) {
+  const title = ALERT_TITLE[alert.kind] ?? "Security notice";
+  return String(alert.message ?? "").startsWith(title) ? "" : title;
+}
+
+/**
+ * When to ask the server for the stored code again, which decrypts it: only when something about it can have changed. The
+ * log head is here because a code settles by a log being adopted, with no other field moving: without it, "I saved it" would
+ * stay hidden after the hub confirmed.
+ */
+export const gateKey = (s) => JSON.stringify([s?.recoveryCodePending, s?.recoveryContested, s?.logHead]);
+
+/** Whether the chosen machine's link is down, and whether this news means it just came back. Pure, so it can be tested. */
+export function linkNews(wasDown, row, hubConnected) {
+  const down = !hubConnected || !row || !row.online || row.link?.state === "offline" || row.link?.state === "stalled";
+  return { down: down || (wasDown && row?.link?.state !== "open"), reconnected: wasDown && !down && row?.link?.state === "open" };
+}
 
 const groupCode = (code) => String(code ?? "").replace(/(\d{3})(\d{3})/, "$1 $2");
 const shortId = (id) => String(id ?? "").slice(0, 6);
@@ -109,13 +128,22 @@ export function createAccount({ toast, openSettings }) {
     renderAll();
   }
 
+  /** A link back up is good news, said once and quietly. Down stays red in the banner: pending actions will fail. */
+  function noteLink() {
+    const m = machine();
+    if (!m || !A.status) return;
+    const news = linkNews(A.linkDown, A.machines.find((x) => x.id === m.id), !!A.status.hub?.connected);
+    A.linkDown = news.down;
+    if (news.reconnected) toast(`Reconnected to ${m.name}`);
+  }
+
   function listen() {
     if (events || !A.available) return;
     events = local.eventSource("/api/account/events");
     const on = (name, fn) => events.addEventListener(name, (m) => { let data; try { data = JSON.parse(m.data); } catch { return; } fn(data); renderAll(); });
-    on("status", (s) => { A.status = s; });
+    on("status", (s) => { A.status = s; noteLink(); });
     on("approval", (list) => { A.pending = list; });
-    on("links", (list) => { A.machines = list; });
+    on("links", (list) => { A.machines = list; noteLink(); });
     on("devices", () => { call("GET", "machines").then((r) => { A.machines = r.machines; renderAll(); }).catch(() => {}); if (settingsShown()) renderSettings(true); });
     on("alert", () => {});
     // After a drop the browser reconnects by itself, and the stream's first message is the status.
@@ -238,7 +266,7 @@ export function createAccount({ toast, openSettings }) {
       const count = a.count > 1 ? ` (${a.count} times, last ${ago(a.lastAt)})` : ` (${ago(a.at)})`;
       const actions = [devicesLink()];
       if (i === alerts.length - 1) actions.push(button(alerts.length > 1 ? "I have read these" : "I have read this", "small quiet", () => { call("POST", "alerts/clear").then(refresh).catch((e) => toast(e.message, true)); }));
-      add(banner("danger", ALERT_TITLE[a.kind] ?? "Security notice", `${a.message}${count} ${ALERT_ADVICE[a.kind] ?? ""}`, actions));
+      add(banner("danger", alertTitle(a), `${a.message}${count} ${ALERT_ADVICE[a.kind] ?? ""}`, actions));
     });
     if (s.recoveryContested && s.hub?.lastError) add(banner("danger", "A recovery code is in question.", s.hub.lastError, [devicesLink()]));
     if (s.recoveryUnconfirmed) add(banner("", "Keep your old recovery code for now.", "This computer recovered the account. Keep the old code until another device confirms the recovery, then discard it.", [devicesLink()]));
@@ -312,8 +340,8 @@ export function createAccount({ toast, openSettings }) {
     const facts = el("dl", "acct-facts");
     const fact = (k, v) => { facts.append(el("dt", null, k), el("dd", null, v)); };
     fact("It says its name is", cleanName(row.name));
-    fact("It says it is a", cleanName(row.kind, 32));
-    fact("Address the hub saw", cleanName(row.ip, 64));
+    fact("It says it is a", cleanName(row.kind, 32, "unknown"));
+    fact("Address the hub saw", cleanName(row.ip, 64, "unknown"));
     c.appendChild(facts);
     const out = el("div", "rm-note err");
     const failure = A.failures.get(row.id);
@@ -365,8 +393,10 @@ export function createAccount({ toast, openSettings }) {
     const gate = $("#accountGate");
     const s = A.status;
     if (!s?.recoveryCodePending || A.codeHidden) { gate.hidden = true; if (!s?.recoveryCodePending) { A.showing = null; A.forgetStep = false; } return; }
-    // Asked each time while it is in doubt: `confirmed` is what lets the person go.
-    if (!A.showing || !A.showing.confirmed) {
+    // `confirmed` is what lets the person go, so it is asked again when it can have changed, and not on every piece of news.
+    const key = gateKey(s);
+    if (!A.showing || (!A.showing.confirmed && key !== A.gateAsked)) {
+      A.gateAsked = key;
       try { A.showing = await call("POST", "recovery-code/show"); }
       catch (e) {
         if (e.status === 404) { A.showing = null; gate.hidden = true; return; }
@@ -523,7 +553,7 @@ export function createAccount({ toast, openSettings }) {
         if (d.self) top.appendChild(el("span", "acct-self", "this computer"));
         main.appendChild(top);
         const role = d.role === "full" ? "full control" : "limited web page";
-        main.appendChild(el("div", "acct-device-sub", [cleanName(d.kind, 32), role, shortId(d.id), d.addedAt ? `added ${when(d.addedAt)}` : "", d.expiresAt ? `ends ${when(d.expiresAt)}` : ""].filter(Boolean).join(" · ")));
+        main.appendChild(el("div", "acct-device-sub", [cleanName(d.kind, 32, "unknown"), role, shortId(d.id), d.addedAt ? `added ${when(d.addedAt)}` : "", d.expiresAt ? `ends ${when(d.expiresAt)}` : ""].filter(Boolean).join(" · ")));
         row.appendChild(main);
         if (fullDevice()) {
           const rm = button("Remove", "small", (e) => {
@@ -568,7 +598,7 @@ export function createAccount({ toast, openSettings }) {
     if (s.recoveryCodePending) sec.appendChild(button("Show the waiting code", "", () => { A.codeHidden = false; renderGate(); renderBanners(); }));
     if (s.recoveries?.length) {
       sec.appendChild(el("p", "rm-note", "This account has been recovered:"));
-      for (const r of s.recoveries) sec.appendChild(el("div", "acct-device-sub", `${when(r.addedAt)} · ${cleanName(r.name)} · ${cleanName(r.kind, 32)} · ${shortId(r.signPub)}`));
+      for (const r of s.recoveries) sec.appendChild(el("div", "acct-device-sub", `${when(r.addedAt)} · ${cleanName(r.name)} · ${cleanName(r.kind, 32, "unknown")} · ${shortId(r.signPub)}`));
     }
   }
 
@@ -623,7 +653,7 @@ export function createAccount({ toast, openSettings }) {
     const here = section(wrap, "This device");
     here.appendChild(el("p", "rm-note", PHASE_TEXT[s.phase] ?? s.phase));
     if (s.email) here.appendChild(el("div", "acct-device-sub", cleanName(s.email, 254)));
-    if (s.device) here.appendChild(el("div", "acct-device-sub", `${cleanName(s.device.name)} · ${cleanName(s.device.kind, 32)} · ${s.device.role === "full" ? "full control" : s.device.role === "client" ? "limited web page" : "not on an account"} · ${shortId(s.device.id)}`));
+    if (s.device) here.appendChild(el("div", "acct-device-sub", `${cleanName(s.device.name)} · ${cleanName(s.device.kind, 32, "unknown")} · ${s.device.role === "full" ? "full control" : s.device.role === "client" ? "limited web page" : "not on an account"} · ${shortId(s.device.id)}`));
     here.appendChild(el("div", "acct-device-sub", `Hub: ${cleanName(s.hub?.url, 200)} · ${s.hub?.connected ? "connected" : "not connected"}`));
     if (s.hub?.lastError) here.appendChild(el("p", "rm-note err", s.hub.lastError));
     if (A.note) here.appendChild(el("p", "rm-note", A.note));

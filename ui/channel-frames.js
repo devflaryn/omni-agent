@@ -1,4 +1,4 @@
-// What travels inside a channel, version 1. One file for Node 20+, browsers and iOS WKWebView.
+// What travels inside a channel, version 2 (added PING and PONG). One file for Node 20+, browsers and iOS WKWebView.
 // Design: docs/superpowers/specs/2026-11-02-omni-accounts-remote-design.md, section 7.
 //
 // Sealed frame, inside the channel's encryption:
@@ -22,7 +22,7 @@
 //   {v, c, t: "close", reason}          one of CLOSE_REASONS. A hub can forge this, but it can drop the channel anyway.
 //   {v, t: "review", id}                a hint for the other full devices' cards. A hub can forge it: it only changes a label.
 
-export const FRAME_VERSION = 1;
+export const FRAME_VERSION = 2;
 export const FRAME = Object.freeze({ REQ: 1, REQ_BODY: 2, REQ_END: 3, RES: 4, RES_BODY: 5, RES_END: 6, ABORT: 7, ACK: 8, READY: 9, PING: 10, PONG: 11 });
 export const MAX_CHUNK = 256 * 1024;      // base64 of this fits the hub's 1 MiB message with room to spare
 export const WINDOW = 2 * 1024 * 1024;    // unacknowledged body bytes per channel, in each direction
@@ -37,6 +37,7 @@ export const CLOSE_REASONS = Object.freeze({
   "frame-failed": "a frame failed its check, so the channel was closed: open a new one",
   busy: "refused: that machine has too many channels open",
   unavailable: "refused: that machine is not signed in",
+  version: "that machine runs a different version of Omni: update both computers",
 });
 
 const HEADER_BYTES = 6;
@@ -87,6 +88,17 @@ export function decodeAck(payload) {
 }
 
 export const encodeOuter = (fields) => JSON.stringify({ v: FRAME_VERSION, ...fields });
+
+/** The version of an outer message of another version, for saying so, or null. Nothing else in it is believed. */
+export function foreignOuter(text) {
+  try {
+    const value = JSON.parse(text);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    return value.v !== FRAME_VERSION && typeof value.c === "string" && typeof value.t === "string" ? { c: value.c, t: value.t } : null;
+  } catch {
+    return null;
+  }
+}
 
 /** The fields of an outer message of this version, or null. Each field's own shape is the caller's to check. */
 export function decodeOuter(text) {

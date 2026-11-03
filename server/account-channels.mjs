@@ -202,6 +202,20 @@ export class ChannelSet {
     if (!queued) channel.close("closed");
   }
 
+  /**
+   * A message of another version. All machines update together, so nothing tries to speak it: an opening is refused at once,
+   * saying why, rather than left to time out in silence. A hub can forge this, which only ends a channel it could drop anyway.
+   */
+  otherVersion(from, { c, t }) {
+    if (c.length > 64) return;
+    const channel = this.channels.get(this.#channelKey(from, c));
+    if (channel) {
+      channel.close("version", { notify: true });
+      return;
+    }
+    if (t === "hello") this.ctx.sendPaced({ type: "channel.msg", to: from, opaque: encodeOuter({ c, t: "close", reason: "version" }) }).catch(() => {});
+  }
+
   /** Another device opens a channel to this one. Checked before any key work is done for it. */
   #onHello(from, outer) {
     const refuse = (reason) => this.ctx.sendPaced({ type: "channel.msg", to: from, opaque: encodeOuter({ c: outer.c, t: "close", reason }) }).catch(() => {});

@@ -27,7 +27,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { approverExchange, checkPassword, fromB64, newDeviceExchange, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, toB64, verify } from "../ui/account-core.js";
 import { LogError, append, canRecover, compareLogs, createLog, deviceCurrent, deviceExpiresAt, entryHash, verifyLog } from "../ui/device-log.js";
-import { decodeOuter, encodeOuter } from "../ui/channel-frames.js";
+import { decodeOuter, encodeOuter, foreignOuter } from "../ui/channel-frames.js";
 import { AccountError } from "./account-error.mjs";
 import { ChannelSet } from "./account-channels.mjs";
 import { RecoveryStore } from "./account-recovery.mjs";
@@ -1701,7 +1701,11 @@ export class Account extends EventEmitter {
 
   #onChannelMessage(from, opaque) {
     const outer = decodeOuter(opaque);
-    if (!outer) return;
+    if (!outer) {
+      const foreign = foreignOuter(opaque);
+      if (foreign) this.#links.otherVersion(from, foreign);
+      return;
+    }
     if (outer.t === "review") {
       const device = this.#verified?.devices.get(from);
       if (device?.role === "full" && this.#rows.some((row) => row.id === outer.id)) {
