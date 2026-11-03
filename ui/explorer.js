@@ -1,7 +1,7 @@
 /* File explorer (left column) + preview column: tree with lazy folders, previews for text, markdown,
    images and zip-like archives (.zip/.apk/.jar: entries inside, text entries readable in place). */
 import { el, md, fileKind, fmtBytes, buildTree } from "./lib.js";
-import { rawUrl } from "./transport.js";
+import { rawUrl, saveFile } from "./transport.js";
 
 const ICONS = {
   folder: `<svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg>`,
@@ -89,13 +89,22 @@ export function createExplorer({ api, toast, insert, onClose }) {
     if (d.kind === "image") {
       if (d.tooBig) return pvBody.appendChild(el("div", "pv-note", `Image too large to preview (${fmtBytes(d.size)}).`));
       const img = el("img", "pv-img"); img.alt = current.path;
-      rawUrl(`/api/fs/raw?root=${encodeURIComponent(root)}&path=${encodeURIComponent(current.path)}`).then((url) => { img.src = url; }, (e) => { toast(e.message, true); });
+      rawUrl(`/api/fs/raw?root=${encodeURIComponent(root)}&path=${encodeURIComponent(current.path)}`).then((url) => { img.src = url; }, (e) => { img.replaceWith(fileProblem(e, current.path)); });
       return pvBody.appendChild(img);
     }
     if (d.kind === "archive") return renderArchive(d);
     if (d.kind === "markdown" && !rawMode) { const m = el("div", "pv-md text"); m.innerHTML = md(d.content); return pvBody.appendChild(m); }
     if (d.kind === "markdown" || d.kind === "text") { const pre = el("pre", "pv-text", d.content); return pvBody.appendChild(pre); }
     pvBody.appendChild(el("div", "pv-note", d.tooBig ? `Too large to show (${fmtBytes(d.size)}).` : `No preview for ${d.ext || "this file"} (binary).`));
+  }
+  /** A file this window will not show: why, and on a web page the way to have it anyway. */
+  function fileProblem(error, path) {
+    const box = el("div", "pv-note", error.message);
+    if (error.code !== "not-viewable" && error.code !== "too-large-for-page") return box;
+    const save = el("button", "btn small", "Download");
+    save.onclick = () => { saveFile(`/api/fs/raw?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}&download=1`, path).catch((e) => toast(e.message, true)); };
+    box.append(" ", save);
+    return box;
   }
   function renderArchive(d) {
     if (d.tooBig) return pvBody.appendChild(el("div", "pv-note", `Archive too large to read (${fmtBytes(d.size)}).`));

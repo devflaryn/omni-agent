@@ -145,7 +145,7 @@
     </div>
     <div class="row-tools">
       <input id="graphFilter" type="search" placeholder="Filter nodes (file or symbol)" />
-      <input id="graphLimit" type="number" value="150" min="20" max="600" title="Max nodes drawn" style="width:72px" />
+      <input id="graphLimit" type="number" value="150" min="20" max="600" title="Max nodes drawn" />
     </div>
     <div class="lead" id="graphTotals"></div>
     <canvas id="graphCanvas"></canvas>
@@ -178,7 +178,7 @@
     </div>
     <div class="dlg-body" id="provBody" role="tabpanel">
       <div class="prov-list" id="provList"></div>
-      <form class="prov-form" id="provForm" onsubmit="return false">
+      <form class="prov-form" id="provForm">
         <div class="pf-title" id="pfTitle">New provider</div>
         <label>Preset<select id="pfPreset"></select></label>
         <div class="pf-hint" id="pfHint"></div>
@@ -200,7 +200,7 @@
     </div>
     <div class="dlg-body" id="mcpBody" role="tabpanel" hidden>
       <div class="prov-list" id="mcpList"></div>
-      <form class="prov-form" id="mcpForm" onsubmit="return false">
+      <form class="prov-form" id="mcpForm">
         <div class="pf-title" id="mfTitle">New MCP server</div>
         <details class="mf-paste" id="mfPasteBox">
           <summary>Paste JSON from a server's README</summary>

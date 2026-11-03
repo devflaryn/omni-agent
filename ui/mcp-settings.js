@@ -172,6 +172,7 @@ export function createMcpSettings({ api, toast, onChanged }) {
   f.test.onclick = test;
   f.del.onclick = remove;
   f.pasteFill.onclick = fillFromPaste;
+  form.onsubmit = (e) => e.preventDefault();
   form.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.tagName === "INPUT") { e.preventDefault(); save(); } });
   return { load };
 }

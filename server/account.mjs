@@ -25,11 +25,13 @@ import { promises as fs } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { approverExchange, checkPassword, fromB64, newDeviceExchange, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, toB64, verify } from "../ui/account-core.js";
+import { approverExchange, checkPassword, fromB64, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, toB64, verify } from "../ui/account-core.js";
 import { LogError, append, canRecover, compareLogs, createLog, deviceCurrent, deviceExpiresAt, entryHash, verifyLog } from "../ui/device-log.js";
+import { HubSocket, hubPost } from "../ui/hub-socket.js";
+import { ALERT_TEXT, NewDeviceApproval, addAlert, checkApprovedLog, judgeLog, signedClaimBytes } from "../ui/log-trust.js";
 import { decodeOuter, encodeOuter, foreignOuter } from "../ui/channel-frames.js";
 import { AccountError } from "./account-error.mjs";
-import { ChannelSet } from "./account-channels.mjs";
+import { ChannelSet } from "../ui/channel-set.js";
 import { RecoveryStore } from "./account-recovery.mjs";
 import { PLAIN_WARNING, defaultProtector, plainProtector, runCommand, system32 } from "./account-keys.mjs";
 
@@ -55,19 +57,8 @@ const DEFAULT_LIMITS = Object.freeze({
   maxBufferedBytes: 4 * 1024 * 1024,    // what may sit in the socket before the sender waits
 });
 const SALT_BYTES = 16;
-/**
- * What the person must not miss: these are never pushed out by others. Every other kind can be raised by a hub at will
- * from public data, so each is one row with a count, whatever it is about.
- */
-const LASTING_ALERTS = new Set(["fork", "rollback", "fake-log", "different-account", "recovered", "removed", "log-unreconciled", "refused-by-device"]);
-/** A hub can make different-account or fake-log rows for ever by building new logs, so past this they count on the last row. */
-const MAX_ROWS_PER_KIND = 8;
 const MAX_PENDING_ROWS = 64;
-/** A hub's error code is shown to the person. */
-const safeCode = (code) => String(code ?? "").replace(/[^\w.-]/g, "").slice(0, 64) || "hub-error";
-const AUTH_DOMAIN = "omni-hub-auth-v1";
 const RECOVERY_DOMAIN = "omni-hub-recovery-v1";
-const CLAIM_DOMAIN = "omni-approval-claim-v1";
 const encoder = new TextEncoder();
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 const clip = (value, max) => String(value ?? "").trim().slice(0, max);
@@ -109,22 +100,6 @@ const mayRecover = (entries, recovery) => canRecover(entries, recovery.signPub);
 
 // ------------------------------------------------------------------------------ the account
 
-const ALERT_TEXT = {
-  rollback: "The hub offered an older copy of the device list than this computer already has. It was refused: someone may be hiding a removal.",
-  fork: "The hub showed a device list that differs from this computer's at the same position. It was refused: the hub may be showing different lists to different devices.",
-  "different-account": "The hub showed the device list of a different account. It was refused.",
-  "bad-log": "A device list failed its signature checks and was refused.",
-  "fake-log": "This computer was told it was approved, but the device list does not follow the approval code you confirmed. It was refused, and this computer stays out of the account.",
-  "log-unreconciled": "Another device has a device list this computer cannot get from the hub. The channel was refused: the hub may be hiding a change.",
-  removed: "This device is no longer on the account.",
-  recovered: "A device recovered this account with the recovery code. If that was not you, your recovery code is out and that device has full control.",
-  "channel-failure": "An encrypted channel failed its check and was closed. A frame was changed, lost or replayed on the way.",
-  "approval-failed": "An approval exchange failed its check and was abandoned. No code from it is shown.",
-  "refused-by-device": "A device on your account refused this computer, so the two hold different device lists. The hub may be hiding a change from one of them, or this computer may have been removed.",
-  "hub-says-removed": "The hub says this device was removed from the account. This computer's own device list does not show that, so do not forget this device on the hub's word alone. If it stays disconnected, sign in again.",
-  "key-unavailable": "This computer's account keys could not be opened. Nothing was changed. To start over, sign out and forget this device.",
-};
-
 /**
  * Events: approval (the pending sign-ins), devices (the devices list), alert ({kind, message, at}), channel (a Channel from
  * another device, ready to serve), channel-closed (a Channel), status (when anything status() shows has changed).
@@ -148,23 +123,15 @@ export class Account extends EventEmitter {
   #rows = [];
   #reviewHints = new Map();
   #review = null;
-  #exchange = null;       // on a new device: { from, core, head, code, confirmed }
-  #attempts = 0;
-  #exchangeFailed = false;
+  #exchange;              // on a new device: the approval, from log-trust.js
   #recoveryAt = null;     // the position of this device's own recover, until another device shows it holds that entry
-  #acceptExchange = true; // one exchange per press of the person's button: a hub cannot try again by itself
   #approvedByHub = false;
   #links;
   #dirReady = null;
   #started = null;
   #stopped = false;
-  #ws = null;
-  #connected = false;
-  #connectAttempts = 0;
+  #hub;
   #hubError = null;
-  #reconnectTimer = null;
-  #nonce = null;
-  #waiters = [];
   #syncing = null;
   #logLock = Promise.resolve();
   #approvalChain = Promise.resolve();
@@ -177,8 +144,6 @@ export class Account extends EventEmitter {
   #lastHubState = null;
   #settleTimer = null;
   #hubClaimedRemoved = false;
-  #sentInWindow = 0;
-  #windowStart = 0;
   #protector;
 
   constructor({ dir, hubUrl, hubOrigin, log = () => {}, now = Date.now, name, kind = "desktop", protector, deriveLoginKey, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = verifyLog }) {
@@ -210,17 +175,38 @@ export class Account extends EventEmitter {
       writeFile: (name, text) => this.#writeFile(name, text),
       warn: (text) => this.#warnings.add(text),
     });
+    this.#hub = new HubSocket({
+      hubUrl: this.hubUrl,
+      hubOrigin: this.hubOrigin,
+      WebSocketImpl: this.WebSocketImpl,
+      limits: this.limits,
+      reconnect: this.reconnect,
+      session: () => this.#session,
+      signKey: () => this.#keys?.sign.privateKey,
+      onAuthOk: (message) => { this.#onAuthOk(message); },
+      onMessage: (message) => this.#dispatch(message),
+      onGone: (code) => this.#onSocketGone(code),
+      onConnectTimeout: () => { this.#hubError = "The hub did not answer."; },
+      onChange: () => this.#changed(),
+    });
+    this.#exchange = new NewDeviceApproval({
+      device: () => ({ keys: this.#keys, name: this.#name, kind: this.#kind }),
+      send: (to, opaque) => this.#hub.sendNow({ type: "approval.msg", to, opaque }),
+      changed: () => this.#changed(),
+      alert: (kind, detail) => this.#alert(kind, detail),
+      persist: () => { this.#persistState().catch(() => {}); },
+    });
     this.#links = new ChannelSet({
       limits: this.limits,
       now: () => this.now(),
       keys: () => this.#keys,
       phase: () => this.#phase,
-      connected: () => this.#connected,
+      connected: () => this.#hub.connected,
       verified: () => this.#verified,
       hashes: () => this.#hashes,
       allowWebAccess: () => this.#settings.allowWebAccess,
       syncLog: () => this.syncLog(),
-      sendPaced: (message) => this.#sendPaced(message),
+      sendPaced: (message) => this.#hub.sendPaced(message),
       alert: (kind, detail) => this.#alert(kind, detail),
       emit: (name, ...args) => this.emit(name, ...args),
       changed: () => this.#changed(),
@@ -240,10 +226,10 @@ export class Account extends EventEmitter {
       email: this.#email,
       accountId: this.#verified?.accountId ?? null,
       device: this.#keys ? { id: this.#keys.signPub, name: this.#name, kind: this.#kind, role: me?.role ?? null } : null,
-      hub: { url: this.hubUrl, connected: this.#connected, attempts: this.#connectAttempts, lastError: this.#lastError() },
+      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#lastError() },
       logHead: this.#hashes.at(-1) ?? null,
       logVersion: this.#hashes.length,
-      pending: this.#phase === "pending" ? { code: this.#exchange?.code ?? null, attempts: this.#attempts, failed: this.#exchangeFailed, confirmed: !!this.#exchange?.confirmed, approvedByHub: this.#approvedByHub } : null,
+      pending: this.#phase === "pending" ? { code: this.#exchange.current?.code ?? null, attempts: this.#exchange.attempts, failed: this.#exchange.failed, confirmed: !!this.#exchange.current?.confirmed, approvedByHub: this.#approvedByHub } : null,
       review: this.#review ? { ...this.#reviewView() } : null,
       allowWebAccess: this.#settings.allowWebAccess,
       keyProtection,
@@ -291,21 +277,13 @@ export class Account extends EventEmitter {
   #changed() { this.emit("status", this.status()); }
 
   #alert(kind, detail) {
-    const key = LASTING_ALERTS.has(kind) ? `${kind}|${detail ?? ""}` : kind;
-    const sameKind = this.#alerts.filter((a) => a.kind === kind);
-    const repeat = sameKind.find((a) => a.key === key) ?? (sameKind.length >= MAX_ROWS_PER_KIND ? sameKind.at(-1) : null);
-    if (repeat) {
-      repeat.count = (repeat.count ?? 1) + 1;
-      repeat.lastAt = this.now();
-      this.#saveAlerts();
-      this.#changed();
-      return;
-    }
-    const alert = { kind, message: ALERT_TEXT[kind] ?? kind, at: this.now(), lastAt: this.now(), count: 1, key };
-    this.#alerts = [...this.#alerts, alert];
-    this.log(`account alert: ${kind}`);
+    const { alerts, fresh } = addAlert(this.#alerts, kind, detail, this.now());
+    this.#alerts = alerts;
     this.#saveAlerts();
-    this.emit("alert", alert);
+    if (fresh) {
+      this.log(`account alert: ${kind}`);
+      this.emit("alert", fresh);
+    }
     this.#changed();
   }
 
@@ -402,8 +380,7 @@ export class Account extends EventEmitter {
   }
 
   #persistState() {
-    const exchange = this.#exchange?.confirmed ? { head: this.#exchange.head, from: this.#exchange.from } : null;
-    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange, recoveryAt: this.#recoveryAt }));
+    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange: this.#exchange.saved, recoveryAt: this.#recoveryAt }));
   }
 
   async #ensureKeys() {
@@ -433,6 +410,7 @@ export class Account extends EventEmitter {
   /** Loads what is on disk and connects if signed in. Never needed before local use, and nothing waits for the hub. */
   start() {
     this.#stopped = false;
+    this.#hub.stopped = false;
     this.#started ??= this.#load().catch((error) => { this.log(`account: could not load: ${error.code ?? error.name}`); });
     return this.#started;
   }
@@ -463,8 +441,7 @@ export class Account extends EventEmitter {
       this.#email = state.email ?? this.#email;
       this.#name = state.name ?? this.#name;
       this.#recoveryAt = Number.isSafeInteger(state.recoveryAt) ? state.recoveryAt : null;
-      if (state.exchange?.head) this.#acceptExchange = false;
-      if (state.exchange?.head) this.#exchange = { from: state.exchange.from, head: state.exchange.head, code: null, core: null, confirmed: true };
+      if (state.exchange?.head) this.#exchange.resume(state.exchange);
     }
     const keyRecord = await this.#readJson("keys.json").catch(() => null);
     if (keyRecord) {
@@ -513,21 +490,16 @@ export class Account extends EventEmitter {
 
   async stop() {
     this.#stopped = true;
+    this.#hub.stopped = true;
     this.#dropConnection("the app is closing");
     await this.#auditChain.catch(() => {});
     await this.#alertsWrite.catch(() => {});
   }
 
   #dropConnection(reason) {
-    clearTimeout(this.#reconnectTimer);
     clearTimeout(this.#settleTimer);
-    this.#reconnectTimer = null;
-    const ws = this.#ws;
-    this.#ws = null;
-    this.#connected = false;
-    try { ws?.close(); } catch { /* it was not open */ }
+    this.#hub.drop(new AccountError(503, "hub-unreachable", "The hub connection was lost."));
     this.#closeAllChannels(reason);
-    this.#failWaiters(new AccountError(503, "hub-unreachable", "The hub connection was lost."));
   }
 
   #closeAllChannels(reason) {
@@ -536,22 +508,8 @@ export class Account extends EventEmitter {
 
   // ---------------------------------------------------------------------------- the hub over HTTP
 
-  async #post(path, body) {
-    let response;
-    try {
-      response = await this.fetchImpl(new URL(path, this.hubUrl), {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(this.limits.httpTimeoutMs),
-      });
-    } catch {
-      throw new AccountError(503, "hub-unreachable", "The hub cannot be reached.");
-    }
-    let parsed = {};
-    try { parsed = await response.json(); } catch { /* an error page: its status is enough */ }
-    if (!response.ok) {
-      const code = safeCode(parsed.error);
-      throw new AccountError(response.status, code, hubErrorText(code));
-    }
-    return parsed;
+  #post(path, body) {
+    return hubPost({ fetchImpl: this.fetchImpl, hubUrl: this.hubUrl, timeoutMs: this.limits.httpTimeoutMs }, path, body);
   }
 
   async #bootstrapToken() {
@@ -774,7 +732,7 @@ export class Account extends EventEmitter {
     this.#lastHubState = hubState;
     const entry = candidate.entries.at(-1);
     if (hubState === "approved") {
-      const reply = await this.#rpc({ type: "log.get" }, ["log"]);
+      const reply = await this.#hub.rpc({ type: "log.get" }, ["log"]);
       await this.#settleAgainst(candidate, reply.entries);
       return;
     }
@@ -783,7 +741,7 @@ export class Account extends EventEmitter {
     if (candidate.kind !== "recover") return this.#contest();
     let answer;
     try {
-      answer = await this.#rpc({ type: "log.append", prevHead: entry.prev, entry }, ["log.ok", "log.conflict"]);
+      answer = await this.#hub.rpc({ type: "log.append", prevHead: entry.prev, entry }, ["log.ok", "log.conflict"]);
     } catch (error) {
       if (error.code === "hub-unreachable" || error.code === "hub-timeout") throw error;
       return this.#contest();
@@ -827,7 +785,7 @@ export class Account extends EventEmitter {
   }
 
   async #settleAgain() {
-    if (!this.#recovery.candidate || !this.#connected) return;
+    if (!this.#recovery.candidate || !this.#hub.connected) return;
     try {
       await this.#resolveCandidate(this.#lastHubState);
     } catch {
@@ -836,14 +794,14 @@ export class Account extends EventEmitter {
     }
     if (this.#phase !== "approved") return;
     try {
-      this.#sendNow({ type: "presence" });
-      if (this.#role() === "full") this.#sendNow({ type: "pending.list" });
+      this.#hub.sendNow({ type: "presence" });
+      if (this.#role() === "full") this.#hub.sendNow({ type: "pending.list" });
     } catch { /* the next connection does this */ }
   }
 
   /** No answer in time, on a socket that may be fine: a new connection starts settling again from the top. */
   #reconnectToSettle() {
-    try { this.#ws?.close(); } catch { /* it has gone */ }
+    this.#hub.closeSocket();
   }
 
   async signIn({ email, password, name } = {}) {
@@ -870,10 +828,7 @@ export class Account extends EventEmitter {
       this.#phase = this.#verified?.devices.has(this.#keys.signPub) ? "approved" : "pending";
     } else {
       this.#phase = "pending";
-      this.#attempts = 0;
-      this.#exchangeFailed = false;
-      this.#acceptExchange = true;
-      this.#exchange = null;
+      this.#exchange.reset();
       this.#approvedByHub = false;
     }
     await this.#persistState();
@@ -892,7 +847,7 @@ export class Account extends EventEmitter {
     await this.#started;
     await this.#forgetSession();
     this.#phase = "signed-out";
-    this.#exchange = null;
+    this.#exchange.current = null;
     this.#review = null;
     this.#rows = [];
     this.#online = new Set();
@@ -925,41 +880,12 @@ export class Account extends EventEmitter {
   // ---------------------------------------------------------------------------- the hub connection
 
   #connect() {
-    if (this.#stopped || !this.#session || this.#ws) return;
-    clearTimeout(this.#reconnectTimer);
-    let ws;
-    try {
-      ws = new this.WebSocketImpl(`${this.hubUrl.replace(/^http/, "ws")}/ws`);
-    } catch {
-      this.#scheduleReconnect();
-      return;
-    }
-    this.#ws = ws;
-    const timeout = setTimeout(() => {
-      if (this.#ws === ws && !this.#connected) {
-        this.#hubError = "The hub did not answer.";
-        this.#onSocketGone(ws, 0);
-      }
-    }, this.limits.connectTimeoutMs);
-    timeout.unref?.();
-    ws.onopen = () => { if (this.#ws === ws) this.#sendNow({ type: "auth", session: this.#session }); };
-    ws.onmessage = (event) => {
-      if (this.#ws !== ws) return;
-      let message;
-      try { message = JSON.parse(event.data); } catch { return; }
-      if (typeof message === "object" && message !== null) this.#dispatch(message, timeout);
-    };
-    ws.onerror = () => {};
-    ws.onclose = (event) => { clearTimeout(timeout); this.#onSocketGone(ws, event?.code ?? 0); };
+    if (!this.#stopped) this.#hub.connect();
   }
 
-  #onSocketGone(ws, code) {
-    if (this.#ws !== ws) return;
-    this.#ws = null;
-    this.#connected = false;
-    try { ws.close(); } catch { /* */ }
+  #onSocketGone(code) {
     this.#closeAllChannels("the hub connection was lost");
-    this.#failWaiters(new AccountError(503, "hub-unreachable", "The hub connection was lost."));
+    this.#hub.failWaiters(new AccountError(503, "hub-unreachable", "The hub connection was lost."));
     this.#online = new Set();
     this.#rows = [];
     this.#changed();
@@ -981,14 +907,14 @@ export class Account extends EventEmitter {
         this.#alert("hub-says-removed");
         this.#hubClaimedRemoved = true;
         this.#hubError = HUB_CLAIMS_REMOVED;
-        this.#scheduleReconnect();
+        this.#hub.scheduleReconnect();
         return;
       case CLOSE_SESSION_GONE:
         this.#settle("signed-out", this.#hubClaimedRemoved ? HUB_CLAIMS_REMOVED : "The hub no longer knows this session. Sign in again.");
         return;
       default:
         this.#hubError ??= "The hub connection was lost.";
-        this.#scheduleReconnect();
+        this.#hub.scheduleReconnect();
     }
   }
 
@@ -1000,85 +926,8 @@ export class Account extends EventEmitter {
     this.#changed();
   }
 
-  #scheduleReconnect() {
-    if (this.#stopped || !this.#session || this.#reconnectTimer) return;
-    this.#connectAttempts++;
-    const ceiling = Math.min(this.reconnect.maxMs, this.reconnect.minMs * 2 ** Math.min(this.#connectAttempts - 1, 16));
-    const delay = ceiling / 2 + Math.random() * (ceiling / 2);
-    this.#reconnectTimer = setTimeout(() => {
-      this.#reconnectTimer = null;
-      this.#connect();
-    }, delay);
-    this.#reconnectTimer.unref?.();
-    this.#changed();
-  }
-
-  #sendNow(message) {
-    if (!this.#ws || this.#ws.readyState !== 1) throw new AccountError(503, "hub-unreachable", "The hub is not connected.");
-    this.#ws.send(JSON.stringify(message));
-  }
-
-  /** For traffic that can burst: stays under the hub's frame rate, and waits while the socket's own queue is high. */
-  async #sendPaced(message) {
-    for (;;) {
-      const now = Date.now();
-      if (now - this.#windowStart >= SECOND) {
-        this.#windowStart = now;
-        this.#sentInWindow = 0;
-      }
-      if (this.#sentInWindow < this.limits.messagesPerSecond) break;
-      await sleep(this.#windowStart + SECOND - now);
-    }
-    this.#sentInWindow++;
-    while ((this.#ws?.bufferedAmount ?? 0) > this.limits.maxBufferedBytes) await sleep(5);
-    this.#sendNow(message);
-  }
-
-  #rpc(message, replyTypes) {
-    return new Promise((resolve, reject) => {
-      const waiter = { replyTypes, for: message.type, resolve, reject, timer: null };
-      waiter.timer = setTimeout(() => {
-        this.#waiters = this.#waiters.filter((w) => w !== waiter);
-        reject(new AccountError(504, "hub-timeout", "The hub did not answer in time."));
-      }, this.limits.rpcTimeoutMs);
-      waiter.timer.unref?.();
-      this.#waiters.push(waiter);
-      try {
-        this.#sendNow(message);
-      } catch (error) {
-        clearTimeout(waiter.timer);
-        this.#waiters = this.#waiters.filter((w) => w !== waiter);
-        error.neverSent = true;
-        reject(error);
-      }
-    });
-  }
-
-  #failWaiters(error) {
-    for (const waiter of this.#waiters.splice(0)) {
-      clearTimeout(waiter.timer);
-      waiter.reject(error);
-    }
-  }
-
-  #answerWaiter(message) {
-    const isError = message.type === "error";
-    const at = this.#waiters.findIndex((w) => (isError ? w.for === message.for : w.replyTypes.includes(message.type)));
-    if (at < 0) return false;
-    const [waiter] = this.#waiters.splice(at, 1);
-    clearTimeout(waiter.timer);
-    if (isError) {
-      const code = safeCode(message.code);
-      waiter.reject(new AccountError(Object.hasOwn(HUB_CODE_STATUS, code) ? HUB_CODE_STATUS[code] : 502, code, hubErrorText(code)));
-    }
-    else waiter.resolve(message);
-    return true;
-  }
-
-  #dispatch(message, connectTimer) {
+  #dispatch(message) {
     switch (message.type) {
-      case "auth.challenge": return void this.#onChallenge(message);
-      case "auth.ok": clearTimeout(connectTimer); return void this.#onAuthOk(message);
       case "log.updated": return void this.#onLogUpdated(message);
       case "session.approved":
         this.#approvedByHub = true;
@@ -1089,7 +938,7 @@ export class Account extends EventEmitter {
           .map((r) => ({ ...r, name: clip(r.name, 128), kind: clip(r.kind, 32), ip: clip(r.ip, 64) }));
         for (const id of [...this.#reviewHints.keys()]) if (!this.#rows.some((r) => r.id === id)) this.#reviewHints.delete(id);
         if (this.#review && !this.#rows.some((r) => r.id === this.#review.id)) this.#review = null;
-        this.#answerWaiter(message);
+        this.#hub.answerWaiter(message);
         this.emit("approval", this.pendingSignIns());
         this.#changed();
         return undefined;
@@ -1098,7 +947,7 @@ export class Account extends EventEmitter {
         for (const channel of this.#links.all()) {
           if (channel.state === "open" && !this.#online.has(channel.peerId)) channel.close("the other device went offline", { notify: false });
         }
-        this.#answerWaiter(message);
+        this.#hub.answerWaiter(message);
         this.emit("devices", this.devices());
         return undefined;
       case "approval.msg":
@@ -1115,24 +964,15 @@ export class Account extends EventEmitter {
           }
           return undefined;
         }
-        this.#answerWaiter(message);
+        this.#hub.answerWaiter(message);
         return undefined;
       default:
-        this.#answerWaiter(message);
+        this.#hub.answerWaiter(message);
         return undefined;
     }
   }
 
-  async #onChallenge({ nonce }) {
-    if (typeof nonce !== "string" || !this.#keys) return;
-    this.#nonce = nonce;
-    const sig = await sign(this.#keys.sign.privateKey, encoder.encode(`${AUTH_DOMAIN} ${this.hubOrigin} ${nonce}`));
-    try { this.#sendNow({ type: "auth.proof", sig }); } catch { /* the socket went while signing */ }
-  }
-
   async #onAuthOk({ state }) {
-    this.#connected = true;
-    this.#connectAttempts = 0;
     this.#hubError = null;
     this.#hubClaimedRemoved = false;
     this.#changed();
@@ -1148,8 +988,8 @@ export class Account extends EventEmitter {
     if (this.#phase === "approved") {
       try {
         await this.syncLog();
-        this.#sendNow({ type: "presence" });
-        if (this.#role() === "full") this.#sendNow({ type: "pending.list" });
+        this.#hub.sendNow({ type: "presence" });
+        if (this.#role() === "full") this.#hub.sendNow({ type: "pending.list" });
       } catch { /* the socket went: the next connection does this again */ }
     } else if (this.#phase === "pending" && state === "approved" && !this.#recovery.candidate) {
       this.#approvedByHub = true;
@@ -1160,7 +1000,7 @@ export class Account extends EventEmitter {
   #socketWaiters = [];
 
   #whenConnected() {
-    if (this.#connected) return Promise.resolve();
+    if (this.#hub.connected) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new AccountError(503, "hub-unreachable", "The hub cannot be reached.")), this.limits.connectTimeoutMs);
       timer.unref?.();
@@ -1232,22 +1072,10 @@ export class Account extends EventEmitter {
   /** A log from outside against the one held here. Returns same, adopted, rollback, fork, different-account or bad-log. */
   #considerLog(entries) {
     const run = this.#logLock.then(async () => {
-      let verified;
-      try {
-        verified = await this.verifyLogImpl(entries, { now: this.now() });
-      } catch (error) {
-        if (!(error instanceof LogError)) throw error;
-        this.#alert("bad-log", error.message);
-        return "bad-log";
-      }
-      const verdict = await compareLogs(this.#log, entries);
-      switch (verdict) {
-        case "same": return "same";
-        case "b-newer": await this.#adopt(entries, verified); return "adopted";
-        case "a-newer": this.#alert("rollback", String(verified.head)); return "rollback";
-        case "fork": this.#alert("fork", String(verified.head)); return "fork";
-        default: this.#alert("different-account", String(verified.accountId)); return "different-account";
-      }
+      const { verdict, verified, alert } = await judgeLog(this.#log, entries, { now: this.now(), verifyLog: this.verifyLogImpl });
+      if (alert) this.#alert(...alert);
+      if (verdict === "adopted") await this.#adopt(entries, verified);
+      return verdict;
     });
     this.#logLock = run.catch(() => {});
     return run;
@@ -1257,7 +1085,7 @@ export class Account extends EventEmitter {
   syncLog() {
     this.#syncing ??= (async () => {
       try {
-        const reply = await this.#rpc({ type: "log.get" }, ["log"]);
+        const reply = await this.#hub.rpc({ type: "log.get" }, ["log"]);
         if (reply.head === this.#hashes.at(-1) && reply.version === this.#hashes.length) return "same";
         return await this.#considerLog(reply.entries);
       } finally {
@@ -1275,7 +1103,7 @@ export class Account extends EventEmitter {
   /** Adds an entry to the hub's log. Returns "ok", or "conflict" having taken in the newer log. */
   async #appendEntry(entries) {
     const entry = entries.at(-1);
-    const reply = await this.#rpc({ type: "log.append", prevHead: entry.prev, entry }, ["log.ok", "log.conflict"]);
+    const reply = await this.#hub.rpc({ type: "log.append", prevHead: entry.prev, entry }, ["log.ok", "log.conflict"]);
     if (reply.type === "log.conflict") {
       await this.#considerLog(reply.entries);
       return "conflict";
@@ -1311,12 +1139,12 @@ export class Account extends EventEmitter {
         this.#review.arrived = (fields) => { clearTimeout(timer); resolve(fields); };
       });
       this.#broadcastReview(id);
-      this.#sendNow({ type: "approval.msg", to: row.signPub, opaque: encodeOuter({ t: "commit", commit: exchange.commit, logHead: head }) });
+      this.#hub.sendNow({ type: "approval.msg", to: row.signPub, opaque: encodeOuter({ t: "commit", commit: exchange.commit, logHead: head }) });
       const { random, claim, sig } = await arrived;
       if (!this.#review || this.#review.id !== id) throw new AccountError(409, "review-ended", "This review was ended.");
       if (!await this.#claimVerifies(claim, sig, row.signPub, head)) throw new AccountError(502, "bad-claim", "The new device's details did not carry a valid signature, so this sign-in was not trusted.");
       exchange.receiveRandom(random);
-      this.#sendNow({ type: "approval.msg", to: row.signPub, opaque: encodeOuter({ t: "reveal", random: exchange.revealRandom() }) });
+      this.#hub.sendNow({ type: "approval.msg", to: row.signPub, opaque: encodeOuter({ t: "reveal", random: exchange.revealRandom() }) });
       const code = await exchange.code();
       if (!this.#review || this.#review.id !== id) throw new AccountError(409, "review-ended", "This sign-in went away during the review.");
       Object.assign(this.#review, { code, claim });
@@ -1333,18 +1161,14 @@ export class Account extends EventEmitter {
   #broadcastReview(id) {
     for (const device of this.devices()) {
       if (device.self || device.role !== "full" || !device.online) continue;
-      this.#sendPaced({ type: "channel.msg", to: device.id, opaque: encodeOuter({ t: "review", id }) }).catch(() => {});
+      this.#hub.sendPaced({ type: "channel.msg", to: device.id, opaque: encodeOuter({ t: "review", id }) }).catch(() => {});
     }
-  }
-
-  #claimBytes(claim, head, approverPub) {
-    return encoder.encode(JSON.stringify([CLAIM_DOMAIN, claim.name, claim.kind, claim.boxPub, approverPub, head]));
   }
 
   async #claimVerifies(claim, sig, signPub, head) {
     if (typeof claim !== "object" || claim === null) return false;
     for (const field of ["name", "kind", "boxPub"]) if (typeof claim[field] !== "string" || !claim[field]) return false;
-    return verify(signPub, this.#claimBytes(claim, head, this.#keys.signPub), sig);
+    return verify(signPub, signedClaimBytes(claim, head, this.#keys.signPub), sig);
   }
 
   /**
@@ -1384,7 +1208,7 @@ export class Account extends EventEmitter {
 
   async deny(id) {
     this.#requireFull("deny a sign-in");
-    await this.#rpc({ type: "pending.deny", id }, ["pending.denied"]);
+    await this.#hub.rpc({ type: "pending.deny", id }, ["pending.denied"]);
     if (this.#review?.id === id) this.#review = null;
     this.#changed();
     return { ok: true };
@@ -1420,59 +1244,13 @@ export class Account extends EventEmitter {
       return;
     }
     if (this.#phase !== "pending" || !this.#keys) return;
-    if (outer.t === "commit") return this.#onCommit(from, outer);
-    if (outer.t === "reveal" && this.#exchange?.from === from && this.#exchange.core) return this.#onReveal(outer);
-  }
-
-  async #onCommit(from, { commit, logHead }) {
-    // Only the person starts another exchange: otherwise a hub could keep trying values, and could replace one already confirmed.
-    if (!this.#acceptExchange) return;
-    this.#acceptExchange = false;
-    this.#attempts++;
-    this.#changed();
-    let core;
-    try {
-      core = await newDeviceExchange({ approverPub: from, newPub: this.#keys.signPub, logHead });
-      core.receiveCommit(commit);
-    } catch {
-      this.#failExchange();
-      return;
-    }
-    this.#exchange = { from, core, head: logHead, code: null, confirmed: false };
-    const random = core.releaseRandom();
-    const claim = { name: this.#name, kind: this.#kind, boxPub: this.#keys.boxPub };
-    const sig = await sign(this.#keys.sign.privateKey, encoder.encode(JSON.stringify([CLAIM_DOMAIN, claim.name, claim.kind, claim.boxPub, from, logHead])));
-    this.#sendNow({ type: "approval.msg", to: from, opaque: encodeOuter({ t: "random", random, claim, sig }) });
-  }
-
-  async #onReveal({ random }) {
-    const exchange = this.#exchange;
-    try {
-      await exchange.core.receiveReveal(random);
-      exchange.code = await exchange.core.code();
-      exchange.core = null;
-      this.#changed();
-    } catch {
-      this.#failExchange();
-    }
-  }
-
-  /** It ends here, visibly. No code from it is ever shown, and nothing starts again until the person says so. */
-  #failExchange() {
-    this.#exchange = null;
-    this.#exchangeFailed = true;
-    this.#alert("approval-failed", String(this.#attempts));
-    this.#changed();
+    return this.#exchange.onMessage(from, outer);
   }
 
   /** The person's button on a new device: after a failed exchange, or a code that did not match. Forgets any code held. */
   restartExchange() {
     if (this.#phase !== "pending") throw new AccountError(409, "not-pending", "This computer is not waiting for approval.");
-    this.#exchange = null;
-    this.#exchangeFailed = false;
-    this.#acceptExchange = true;
-    this.#persistState().catch(() => {});
-    this.#changed();
+    this.#exchange.restart();
     return this.status();
   }
 
@@ -1482,18 +1260,15 @@ export class Account extends EventEmitter {
    * the log would follow the head of an exchange that was real, just not with any device of the person's.
    */
   confirmCode(code) {
-    if (this.#phase !== "pending" || !this.#exchange?.code) throw new AccountError(409, "no-code", "There is no code to confirm yet.");
-    if (code !== this.#exchange.code) throw new AccountError(400, "wrong-code", "That is not the code shown on this computer.");
-    this.#exchange.confirmed = true;
-    this.#persistState().catch(() => {});
-    this.#changed();
+    if (this.#phase !== "pending") throw new AccountError(409, "no-code", "There is no code to confirm yet.");
+    this.#exchange.confirm(code);
     this.#tryFinishApproval();
     return this.status();
   }
 
   async #tryFinishApproval() {
     if (this.#phase !== "pending" || !this.#approvedByHub) return;
-    const exchange = this.#exchange;
+    const exchange = this.#exchange.current;
     if (!exchange?.code && !exchange?.confirmed) {
       this.#alert("fake-log", "no-code");
       return;
@@ -1501,44 +1276,26 @@ export class Account extends EventEmitter {
     if (!exchange.confirmed) return;
     let reply;
     try {
-      reply = await this.#rpc({ type: "log.get" }, ["log"]);
+      reply = await this.#hub.rpc({ type: "log.get" }, ["log"]);
     } catch {
       return; // the next connection tries again
     }
-    if (this.#phase !== "pending" || this.#exchange !== exchange) return;
+    if (this.#phase !== "pending" || this.#exchange.current !== exchange) return;
     const entries = reply.entries;
-    let verified;
-    try {
-      verified = await this.verifyLogImpl(entries, { now: this.now() });
-    } catch (error) {
-      if (!(error instanceof LogError)) throw error;
-      this.#alert("fake-log", "invalid");
+    const { verified, alert } = await checkApprovedLog(entries, { me: this.#keys.signPub, exchange, held: this.#log, now: this.now(), verifyLog: this.verifyLogImpl });
+    if (alert) {
+      this.#alert(...alert);
       return;
-    }
-    // The add naming this device, right after the head in the code and signed by the key in the code.
-    const me = this.#keys.signPub;
-    const added = entries.findIndex((entry) => entry.type === "add" && entry.body.signPub === me);
-    const follows = added > 0 && entries[added].prev === exchange.head && entries[added].signer === exchange.from;
-    if (!follows || !verified.devices.has(me)) {
-      this.#alert("fake-log", String(verified.head));
-      return;
-    }
-    if (this.#log) {
-      const verdict = await compareLogs(this.#log, entries);
-      if (verdict !== "b-newer" && verdict !== "same") {
-        this.#alert(verdict === "a-newer" ? "rollback" : verdict === "fork" ? "fork" : "different-account", String(verified.head));
-        return;
-      }
     }
     await this.#adoptLocked(entries, verified);
     this.#phase = "approved";
-    this.#exchange = null;
+    this.#exchange.current = null;
     this.#approvedByHub = false;
     await this.#persistState();
     this.#changed();
     try {
-      this.#sendNow({ type: "presence" });
-      if (this.#role() === "full") this.#sendNow({ type: "pending.list" });
+      this.#hub.sendNow({ type: "presence" });
+      if (this.#role() === "full") this.#hub.sendNow({ type: "pending.list" });
     } catch { /* the socket went: the next connection does this again */ }
   }
 
@@ -1581,13 +1338,13 @@ export class Account extends EventEmitter {
     let nextCode, sent = null;
     try {
       await this.#whenConnected();
-      const proof = await sign(recovery.sign.privateKey, encoder.encode(`${RECOVERY_DOMAIN} ${this.hubOrigin} ${this.#nonce}`));
+      const proof = await sign(recovery.sign.privateKey, encoder.encode(`${RECOVERY_DOMAIN} ${this.hubOrigin} ${this.#hub.nonce}`));
       nextCode = newRecoveryCode();
       const next = await recoveryKeysFrom(nextCode);
       for (let attempt = 0; attempt < 3; attempt++) {
         let reply;
         try {
-          reply = await this.#rpc({ type: "log.get", recoveryProof: proof }, ["log"]);
+          reply = await this.#hub.rpc({ type: "log.get", recoveryProof: proof }, ["log"]);
         } catch (error) {
           if (error.code === "forbidden") throw new AccountError(403, "wrong-code", "That recovery code does not belong to this account, or has been used.");
           throw error;
@@ -1601,7 +1358,7 @@ export class Account extends EventEmitter {
         sent = appended;
         let answer;
         try {
-          answer = await this.#rpc({ type: "log.append", prevHead: entries.at(-1) ? await entryHash(entries.at(-1)) : "", entry: appended.at(-1) }, ["log.ok", "log.conflict"]);
+          answer = await this.#hub.rpc({ type: "log.append", prevHead: entries.at(-1) ? await entryHash(entries.at(-1)) : "", entry: appended.at(-1) }, ["log.ok", "log.conflict"]);
         } catch (error) {
           // It never left this computer, and nothing earlier did: the old code stands and this one never counted.
           if (error.neverSent && attempt === 0) {
@@ -1635,8 +1392,8 @@ export class Account extends EventEmitter {
     await this.#settleCommitted(entries);
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
     try {
-      this.#sendNow({ type: "presence" });
-      this.#sendNow({ type: "pending.list" });
+      this.#hub.sendNow({ type: "presence" });
+      this.#hub.sendNow({ type: "pending.list" });
     } catch { /* the next connection does this */ }
     this.#changed();
     return { recoveryCode: nextCode, confirmed: true };
@@ -1656,8 +1413,8 @@ export class Account extends EventEmitter {
     this.#recoveryAt = appended.length - 1;
     await this.#tryLocal(() => this.#persistState(), LOG_NOT_SAVED);
     // Reconnecting says which: an approved session means the hub has the entry.
-    try { this.#ws?.close(); } catch { /* it has gone */ }
-    if (!this.#ws) this.#connect();
+    this.#hub.closeSocket();
+    if (!this.#hub.ws) this.#connect();
     this.#changed();
     return { recoveryCode: nextCode, confirmed: false };
   }
@@ -1692,7 +1449,7 @@ export class Account extends EventEmitter {
     const currentLoginKey = await this.#loginKey(current, oldSalt);
     const salt = globalThis.crypto.getRandomValues(new Uint8Array(SALT_BYTES));
     const verifierInput = await this.#loginKey(next, salt);
-    await this.#rpc({ type: "password.change", currentLoginKey, salt: toB64(salt), verifierInput }, ["password.changed"]);
+    await this.#hub.rpc({ type: "password.change", currentLoginKey, salt: toB64(salt), verifierInput }, ["password.changed"]);
     return { ok: true };
   }
 
@@ -1761,20 +1518,5 @@ export class Account extends EventEmitter {
   }
 }
 
-const HUB_ERROR_TEXT = {
-  "wrong-credentials": "Wrong email or password.",
-  locked: "Too many failed attempts. Try again later.",
-  "too-many-pending": "Too many sign-ins are waiting on this account.",
-  busy: "The hub is busy. Try again in a moment.",
-  "registration-closed": "This hub is not open for registration.",
-  "already-registered": "That email is already registered.",
-  "bad-email": "That does not look like an email address.",
-  conflict: "Another device changed the password first.",
-  forbidden: "The hub does not allow this device to do that.",
-  "not-found": "That sign-in is no longer waiting.",
-  "invalid-entry": "The hub refused the change to the device list.",
-};
 /** What a hub's reply to a registration says was not created. Anything else may have come after the account was made. */
 const NOTHING_CREATED = new Set(["bad-email", "bad-salt", "bad-verifier", "bad-log-entry", "bad-json", "json-only", "too-large", "origin", "locked", "too-many-pending", "busy", "registration-closed", "already-registered"]);
-const hubErrorText = (code) => (Object.hasOwn(HUB_ERROR_TEXT, code) ? HUB_ERROR_TEXT[code] : `The hub refused this (${code}).`);
-const HUB_CODE_STATUS = { "wrong-credentials": 401, locked: 429, busy: 503, conflict: 409, forbidden: 403, "not-found": 404, "invalid-entry": 400, "bad-message": 400 };

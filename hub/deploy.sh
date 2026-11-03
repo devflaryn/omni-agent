@@ -4,7 +4,7 @@
 #   bash hub/deploy.sh            from the top of the repository
 #
 # What it changes on the VPS, and nothing else:
-#   /opt/omni-hub/                 the hub's code, root-owned, read-only to the service
+#   /opt/omni-hub/                 the hub's code and the web page's files, root-owned, read-only to the service
 #   /etc/omni-hub/bootstrap.env    root-only 0600. Made once, never overwritten, never printed
 #   /etc/systemd/system/omni-hub.service
 # The service starts only once the certificate exists, so this can run before certbot. nginx and certbot are separate
@@ -18,13 +18,24 @@ remote() {
   "$SSH_EXE" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$KNOWN_HOSTS" -o GlobalKnownHostsFile=none "$TARGET" "$@"
 }
 
-# Exactly what the hub imports, in the same layout. A checkout on Windows can have CRLF, so it is stripped.
-FILES=(hub/server.mjs hub/ws.mjs hub/store.mjs ui/account-core.js ui/device-log.js hub/omni-hub.service)
+# Exactly what the hub imports and serves, in the same layout. A checkout on Windows can have CRLF, so it is stripped from text.
+# The web page's list is the one in hub/static.mjs, which a test holds this to. It is written out so no folder is ever copied whole.
+FILES=(
+  hub/server.mjs hub/ws.mjs hub/store.mjs hub/static.mjs hub/omni-hub.service
+  ui/web.html ui/web.js ui/web.css ui/login-worker.js
+  ui/account-core.js ui/account-error.js ui/channel-client.js ui/channel-frames.js ui/channel-set.js ui/device-log.js ui/emitter.js ui/hub-socket.js ui/log-trust.js ui/machine-links.js
+  ui/page-account.js ui/page-files.js ui/page-store.js ui/page-transport.js ui/transport.js
+  ui/index.html ui/styles.css ui/app.js ui/account.js ui/composer.js ui/explorer.js ui/lib.js ui/mcp-settings.js ui/mission.js ui/office-engine.js ui/office-font.js ui/office-props.js ui/office-worker.js ui/office.js ui/panel.js ui/plan.js ui/remote.js ui/resizer.js ui/settings.js ui/sidebar.js ui/stream.js ui/thinking.js ui/transcript.js
+  ui/logo.svg ui/icon-32.png ui/icon-180.png ui/icon-192.png ui/icon-512.png
+)
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 for file in "${FILES[@]}"; do
   mkdir -p "$staging/$(dirname "$file")"
-  tr -d '\r' < "$file" > "$staging/$file"
+  case "$file" in
+    *.png) cp "$file" "$staging/$file" ;;
+    *) tr -d '\r' < "$file" > "$staging/$file" ;;
+  esac
 done
 # ui/*.js are ES modules, and this is what says so.
 printf '{ "private": true, "type": "module" }\n' > "$staging/package.json"
