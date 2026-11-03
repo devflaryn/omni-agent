@@ -63,6 +63,24 @@ export function decodeFrame(bytes) {
   return { type: bytes[1], stream, payload: bytes.subarray(HEADER_BYTES) };
 }
 
+const NodeBuffer = globalThis.Buffer; // a sealed frame is up to 256 KiB, and this is on every one of them
+
+/** A sealed frame as text for the hub. Sealed already, so it does not need account-core's one-spelling rule. */
+export function bytesToB64(bytes) {
+  if (NodeBuffer) return NodeBuffer.from(bytes.buffer, bytes.byteOffset, bytes.length).toString("base64");
+  let binary = "";
+  for (let at = 0; at < bytes.length; at += 8192) binary += String.fromCharCode.apply(null, bytes.subarray(at, at + 8192));
+  return btoa(binary);
+}
+
+export function bytesFromB64(text) {
+  if (NodeBuffer) return new Uint8Array(NodeBuffer.from(text, "base64"));
+  const binary = atob(text);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
 export const encodeJson = (value) => encoder.encode(JSON.stringify(value));
 
 /** The object in a head frame, or null when it is too large or is not a JSON object. */

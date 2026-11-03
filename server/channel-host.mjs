@@ -7,38 +7,14 @@
  */
 import { Readable, Writable } from "node:stream";
 import { CHANNEL_HOST, channelAllowed } from "./access.mjs";
-import { FRAME, MAX_CHUNK, MAX_HEAD, WINDOW, decodeAck, decodeFrame, decodeHead, encodeAck, encodeFrame, encodeJson } from "../ui/channel-frames.js";
+import { Link, channelClient as sharedClient } from "../ui/channel-client.js";
+import { FRAME, MAX_CHUNK, MAX_HEAD, WINDOW, decodeAck, decodeFrame, decodeHead, encodeFrame, encodeJson } from "../ui/channel-frames.js";
 
 const MAX_BODY = 32 * 1024 * 1024; // as for a signed-in remote browser
 const MAX_STREAMS = 64;
 const MAX_AUDIT_PATH = 1024;
 export const SAFE_REQUEST_HEADERS = new Set(["accept", "accept-language", "content-type", "last-event-id", "if-none-match", "if-modified-since", "range"]);
 const DROPPED_RESPONSE_HEADERS = new Set(["set-cookie", "connection", "keep-alive", "transfer-encoding", "upgrade"]);
-
-/** How many body bytes may be on their way. A writer waits here, which is what pauses whatever feeds it. */
-class Credit {
-  #used = 0;
-  #waiting = [];
-  #failed = null;
-
-  constructor(window) { this.window = window; }
-
-  async take(bytes) {
-    while (!this.#failed && this.#used >= this.window) await new Promise((resolve) => { this.#waiting.push(resolve); });
-    if (this.#failed) throw this.#failed;
-    this.#used += bytes;
-  }
-
-  release(bytes) {
-    this.#used = Math.max(0, this.#used - bytes);
-    if (this.#used < this.window) for (const wake of this.#waiting.splice(0)) wake();
-  }
-
-  fail(error) {
-    this.#failed = error;
-    for (const wake of this.#waiting.splice(0)) wake();
-  }
-}
 
 /** A body arriving in frames. Bytes are acknowledged as the reader takes them, not as they arrive. */
 class IncomingBody extends Readable {
@@ -81,50 +57,6 @@ class IncomingBody extends Readable {
       this.#giveBack(left);
     }
     callback(error);
-  }
-}
-
-/** The bookkeeping both ends of a channel share: flow control over the shared window, and sending a body in chunks. */
-class Link {
-  #unacked = 0;
-
-  constructor(channel, window) {
-    this.channel = channel;
-    this.credit = new Credit(window);
-    this.window = window;
-    this.unconsumed = 0;
-  }
-
-  /** The reader has taken this many bytes. Acknowledged in batches, and never held back past a quarter of the window. */
-  consumed(bytes) {
-    this.unconsumed -= bytes;
-    this.#unacked += bytes;
-    if (this.#unacked >= Math.max(1, Math.floor(this.window / 4))) this.flushAcks();
-  }
-
-  flushAcks() {
-    if (!this.#unacked || this.channel.closed) return;
-    const bytes = this.#unacked;
-    this.#unacked = 0;
-    this.channel.sendFrame(encodeFrame(FRAME.ACK, 0, encodeAck(bytes))).catch(() => {});
-  }
-
-  /** A peer past its window is not following the protocol. Whatever it sent is still ours to hold, so it is cut off. */
-  received(bytes) {
-    this.unconsumed += bytes;
-    if (this.unconsumed > 2 * this.window) {
-      this.channel.close("closed");
-      return false;
-    }
-    return true;
-  }
-
-  async sendBody(type, stream, bytes) {
-    for (let at = 0; at < bytes.length; at += MAX_CHUNK) {
-      const piece = bytes.subarray(at, at + MAX_CHUNK);
-      await this.credit.take(piece.length);
-      await this.channel.sendFrame(encodeFrame(type, stream, piece));
-    }
   }
 }
 
@@ -339,123 +271,10 @@ export function serveChannel(channel, handle, { device, audit = () => {}, limits
 }
 
 /**
- * The client end: channelClient(channel).request({method, path, headers?, body?, signal?}) resolves when the response's head
- * arrives, to {status, headers, body: Readable, buffer(), text(), json(), abort()}. Fails, never hangs, if the channel closes.
- * `body` is bytes, or an async iterable of them, read only as the window allows. If it throws, the request is ended over there.
- * `onHeard` runs for every frame from the far side, and ping() asks for one.
+ * The client end, from ui/channel-client.js, with a response's body as a Node stream. Fails, never hangs, if the channel closes.
  */
-export function channelClient(channel, { window = WINDOW, onHeard = () => {} } = {}) {
-  const link = new Link(channel, window);
-  const calls = new Map();
-  let nextId = 1;
-  let closedWith = channel.closed ? new Error("the channel is closed") : null;
-
-  const end = (id) => calls.delete(id);
-
-  channel.onFrame((bytes) => {
-    let frame;
-    try { frame = decodeFrame(bytes); } catch { return channel.close("closed"); }
-    onHeard();
-    const call = calls.get(frame.stream);
-    switch (frame.type) {
-      case FRAME.PONG: return undefined;
-      case FRAME.ACK:
-        try { link.credit.release(decodeAck(frame.payload)); } catch { channel.close("closed"); }
-        return undefined;
-      case FRAME.RES: {
-        if (!call || call.body) return undefined;
-        const head = decodeHead(frame.payload);
-        if (!head || !Number.isInteger(head.status)) return channel.close("closed");
-        call.body = new IncomingBody((n) => link.consumed(n));
-        call.body.on("close", () => { if (calls.get(frame.stream) === call && call.ended) end(frame.stream); });
-        call.resolve({
-          status: head.status,
-          headers: head.headers ?? {},
-          body: call.body,
-          abort() {
-            call.stopped = true;
-            end(frame.stream);
-            if (!channel.closed) channel.sendFrame(encodeFrame(FRAME.ABORT, frame.stream)).catch(() => {});
-            call.body.destroy();
-          },
-          async buffer() {
-            const parts = [];
-            for await (const chunk of call.body) parts.push(chunk);
-            return Buffer.concat(parts);
-          },
-          async text() { return (await this.buffer()).toString(); },
-          async json() { return JSON.parse(await this.text()); },
-        });
-        return undefined;
-      }
-      case FRAME.RES_BODY:
-        if (!link.received(frame.payload.length)) return undefined;
-        if (!call?.body || call.body.destroyed) return link.consumed(frame.payload.length);
-        call.body.deliver(frame.payload);
-        return undefined;
-      case FRAME.RES_END:
-        if (!call) return undefined;
-        call.stopped = true; // the host has answered: the rest of an upload is not wanted
-        call.ended = true;
-        call.body?.push(null);
-        link.flushAcks();
-        return undefined;
-      case FRAME.ABORT:
-        if (!call) return undefined;
-        end(frame.stream);
-        call.fail(new Error("the host ended this request"));
-        return undefined;
-      default: return channel.close("closed");
-    }
-  });
-
-  channel.once("close", (reason) => {
-    closedWith = new Error(String(reason || "the channel closed"));
-    link.credit.fail(closedWith);
-    for (const call of [...calls.values()]) call.fail(closedWith);
-    calls.clear();
-  });
-
-  return {
-    ping() { return channel.closed ? Promise.reject(new Error("the channel is closed")) : channel.sendFrame(encodeFrame(FRAME.PING, 0)); },
-    request({ method, path, headers, body, signal }) {
-      if (closedWith || channel.closed) return Promise.reject(closedWith ?? new Error("the channel is closed"));
-      if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("aborted"));
-      const id = nextId++;
-      return new Promise((resolve, reject) => {
-        const call = {
-          resolve, body: null, stopped: false, ended: false,
-          fail(error) {
-            reject(error);
-            if (call.body && !call.body.destroyed) call.body.destroy(error);
-          },
-        };
-        calls.set(id, call);
-        const stop = (error) => {
-          if (calls.get(id) !== call) return;
-          call.stopped = true;
-          end(id);
-          if (!channel.closed) channel.sendFrame(encodeFrame(FRAME.ABORT, id)).catch(() => {});
-          call.fail(error);
-        };
-        signal?.addEventListener("abort", () => stop(signal.reason ?? new Error("aborted")), { once: true });
-        const send = async () => {
-          await channel.sendFrame(encodeFrame(FRAME.REQ, id, encodeJson({ method, path, headers })));
-          if (body) {
-            for await (const part of body instanceof Uint8Array ? [body] : body) {
-              for (let at = 0; at < part.length && !call.stopped; at += MAX_CHUNK) {
-                const piece = part.subarray(at, at + MAX_CHUNK);
-                await link.credit.take(piece.length);
-                await channel.sendFrame(encodeFrame(FRAME.REQ_BODY, id, piece));
-              }
-              if (call.stopped) break;
-            }
-          }
-          if (!call.stopped) await channel.sendFrame(encodeFrame(FRAME.REQ_END, id));
-        };
-        send().catch(stop);
-      });
-    },
-    close(reason) { channel.close(reason); },
-  };
-}
+export const channelClient = (channel, options = {}) => sharedClient(channel, {
+  ...options,
+  makeBody: (giveBack) => new IncomingBody(giveBack),
+  concat: (parts) => Buffer.concat(parts),
+});

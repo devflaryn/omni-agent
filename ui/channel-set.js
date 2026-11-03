@@ -1,19 +1,20 @@
 /**
  * Encrypted channels between this device and the account's others: the handshake, the checks against the verified log,
  * and closing a channel the moment its device leaves that log. The account owns the log and the hub connection, and
- * lends them here through `ctx`.
+ * lends them here through `ctx`. One file for the desktop, the web page and the iPhone app, so none of them has its own
+ * idea of who may hold a channel.
  */
-import { EventEmitter } from "node:events";
-import { startHandshake, toB64 } from "../ui/account-core.js";
-import { deviceCurrent, deviceExpiresAt } from "../ui/device-log.js";
-import { CLOSE_REASONS, FRAME, decodeFrame, encodeFrame, encodeOuter } from "../ui/channel-frames.js";
-import { AccountError } from "./account-error.mjs";
+import { Emitter } from "./emitter.js";
+import { startHandshake, toB64 } from "./account-core.js";
+import { deviceCurrent, deviceExpiresAt } from "./device-log.js";
+import { CLOSE_REASONS, FRAME, bytesFromB64, bytesToB64, decodeFrame, encodeFrame, encodeOuter } from "./channel-frames.js";
+import { AccountError } from "./account-error.js";
 
 const TIMER_MAX = 2 ** 31 - 1;
 const DISAGREEMENT_REASONS = new Set(["not-on-log", "removed", "expired", "log-mismatch"]);
 
 /** One encrypted channel to one device. sendFrame and onFrame carry sealed frames, in order. */
-class Channel extends EventEmitter {
+class Channel extends Emitter {
   closed = false;
   state = "handshake";
   #onFrame = null;
@@ -68,7 +69,7 @@ class Channel extends EventEmitter {
     if (this.closed || !this.core) return Promise.reject(new Error("the channel is closed"));
     const result = this.#outChain.then(async () => {
       if (this.closed) throw new Error("the channel is closed");
-      await this.#send(this, Buffer.from(await this.core.seal(bytes)).toString("base64"));
+      await this.#send(this, bytesToB64(await this.core.seal(bytes)));
     });
     this.#outChain = result.catch(() => {});
     return result;
@@ -87,7 +88,7 @@ class Channel extends EventEmitter {
 
 /**
  * ctx: { limits, now(), keys(), phase(), connected(), verified(), hashes(), allowWebAccess(), syncLog(), sendPaced(message),
- *        alert(kind, detail), emit(name, ...args), changed(), peerHeadSigned(head) }
+ *        alert(kind, detail), emit(name, ...args), changed(), peerHeadSigned(head), hostsNothing }
  */
 export class ChannelSet {
   channels = new Map();
@@ -219,7 +220,7 @@ export class ChannelSet {
   /** Another device opens a channel to this one. Checked before any key work is done for it. */
   #onHello(from, outer) {
     const refuse = (reason) => this.ctx.sendPaced({ type: "channel.msg", to: from, opaque: encodeOuter({ c: outer.c, t: "close", reason }) }).catch(() => {});
-    if (this.ctx.phase() !== "approved") return refuse("unavailable");
+    if (this.ctx.hostsNothing || this.ctx.phase() !== "approved") return refuse("unavailable");
     if (this.#countFor(from) >= this.ctx.limits.maxChannelsPerDevice || this.channels.size >= this.ctx.limits.maxChannels) return refuse("busy");
     const channel = this.#newChannel(outer.c, from, "in");
     this.#armHandshakeTimer(channel);
@@ -292,7 +293,7 @@ export class ChannelSet {
     if (!channel.core || typeof d !== "string") return;
     let plain;
     try {
-      plain = await channel.core.open(new Uint8Array(Buffer.from(d, "base64")));
+      plain = await channel.core.open(bytesFromB64(d));
     } catch {
       // The core has shut this channel for good: it is evidence of tampering, so it is shown, not retried.
       this.ctx.alert("channel-failure", channel.id);

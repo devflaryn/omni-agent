@@ -593,7 +593,7 @@ test("/api/health says 200 and nothing else; everything else is refused plainly"
   assert.equal(health.headers.server, undefined);
 
   assert.equal((await api(hub, "/api/nothing", {})).status, 404);
-  assert.equal((await api(hub, "/", undefined, { method: "GET" })).status, 404);
+  assert.equal((await api(hub, "/", {})).status, 404, "the page's files are for reading only: test/ui-web.test.mjs has the rest");
   assert.equal((await api(hub, "/ws", undefined, { method: "GET" })).status, 404);
   assert.equal((await api(hub, "/api/login", undefined, { method: "GET" })).status, 404);
   assert.equal((await api(hub, "/api/health", {})).status, 404);
@@ -2345,8 +2345,8 @@ test("loginKey, tokens and opaque payloads never reach the log output", async (t
 
 test("the hub imports only node: built-ins available on Node 20 and the two ui modules", () => {
   const allowedUi = new Set(["../ui/account-core.js", "../ui/device-log.js"]);
-  const allowedLocal = new Set(["./ws.mjs", "./store.mjs"]);
-  for (const file of ["server.mjs", "ws.mjs", "store.mjs"]) {
+  const allowedLocal = new Set(["./ws.mjs", "./store.mjs", "./static.mjs"]);
+  for (const file of ["server.mjs", "ws.mjs", "store.mjs", "static.mjs"]) {
     const source = readFileSync(new URL(`../hub/${file}`, import.meta.url), "utf8");
     const imports = [...source.matchAll(/^\s*import\b.*?from\s+"([^"]+)"/gm)].map((m) => m[1]);
     assert.ok(imports.length >= 1, file);

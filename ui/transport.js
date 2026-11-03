@@ -2,7 +2,7 @@
    there is one place that knows which machine they are for. Modes:
      local    this computer (no prefix): exactly what the app did before accounts
      proxied  another machine, through this computer's server at /remote/<id>, which holds the channel. The desktop window.
-     channel  another machine, over a channel this page holds itself (Task 8). See `setChannelTransport`.
+     channel  another machine, over a channel this page holds itself: the web page, and the iPhone app's web view. See `setChannelTransport`.
 
    Changing machine reloads the page, on purpose: nothing of the last machine's can then survive, not a chat, a path in a
    field, a seq, a half-typed message or an answer still on its way. The choice lives in sessionStorage, for this window only.
@@ -57,8 +57,14 @@ export const machineTitle = (title = "Omni Agent") => (read() ? `[${read().name}
  */
 export const streamEvents = ({ approvals, resync }) => (read() ? { resync } : { approvals, resync });
 
-/** Task 8: a page with no server of its own hands in its channel here. */
+/**
+ * A page with no server of its own hands in its channel here: {api, eventSource, rawUrl, saveFile, local}. `local` stands in for
+ * this computer's server, which it does not have. From ui/page-transport.js.
+ */
 export function setChannelTransport(impl) { channelImpl = impl; }
+
+/** Whether this is the web page or the iPhone's web view, which has no computer of its own and may not approve anything. */
+export const webPage = () => channelImpl !== null;
 
 /**
  * Points this window at a machine, or at this computer with null, and starts the page over on it. `name` is what the top
@@ -122,16 +128,25 @@ async function remoteAnswer(r, m) {
   let text;
   try { text = await r.text(); }
   catch { throw failure(`The connection to ${m.name} was lost during that answer. The action may or may not have run there.`, 502, "machine-lost"); }
+  return answerFrom(r.status, text, m);
+}
+
+/** What a far machine's whole answer means. Used by the proxied path above and by the page's own channel. */
+export function answerFrom(status, text, m) {
   let j = {};
   if (text) {
     try { j = JSON.parse(text); }
     catch { throw failure(`${m.name} sent an answer that could not be read. The action may or may not have run there.`, 502, "machine-lost"); }
   }
-  if (!r.ok || j.error) throw failure(j.error || `${m.name} answered ${r.status}`, r.status, j.code);
+  if (status < 200 || status > 299 || j.error) {
+    const e = failure(j.error || `${m.name} answered ${status}`, status, j.code);
+    e.body = j; // what the far machine said, whole: a file pane's conflict is in it
+    throw e;
+  }
   return j;
 }
 
-function failure(message, status, code) {
+export function failure(message, status, code) {
   const e = new Error(message);
   if (status) e.status = status;
   if (code) e.code = code;
@@ -145,17 +160,45 @@ export function eventSource(url) {
 }
 
 /**
- * A URL for a file's bytes, for an <img>, a <video> or a download. The one helper for direct URLs: a page in channel mode
- * has no server behind a URL and answers with a blob, which is why this is a promise everywhere.
+ * A URL for an <img>, a <video> or an <audio>, and for nothing else. The one helper for direct URLs: a page in channel mode has
+ * no server behind a URL and answers with a blob, which is why this is a promise everywhere. A blob carries the page's origin, so
+ * there it refuses, with code `not-viewable`, anything that could run, and with `too-large-for-page` anything over 200 MB. Both
+ * mean: offer saveFile. So a caller shows its error with a Download button, and never frames this or navigates to it.
  */
 export async function rawUrl(path) {
   if (mode() === "channel") return channelImpl.rawUrl(path);
   return `${prefix()}${path}`;
 }
 
+/** Saves a file's bytes on this device, whatever they are. To be called from a click: the page's way may open a file dialog. */
+export async function saveFile(path, name) {
+  if (mode() === "channel") return channelImpl.saveFile(path, name);
+  const a = globalThis.document.createElement("a");
+  a.href = `${prefix()}${path}`;
+  a.download = name;
+  globalThis.document.body.appendChild(a);
+  a.click();
+  a.remove();
+  return {};
+}
+
+/**
+ * Whether a file's URL may go in an <iframe> or a new window, as a PDF does on a desktop, where a server's sandbox header goes with
+ * it. A page has no such header to give a blob: it never does this, and offers saveFile.
+ */
+export const framesFiles = () => mode() !== "channel";
+
+/** The app's markup, for the web page to take its elements from. */
+export const appMarkup = async () => {
+  const r = await globalThis.fetch("index.html");
+  if (!r.ok) throw new Error(`the app's page answered ${r.status}`);
+  return r.text();
+};
+
 /** This computer, whichever machine the window is on: Settings → Account, Settings → Remote, their event streams. */
 export const local = Object.freeze({
   async api(method, path, body) {
+    if (channelImpl?.local) return channelImpl.local.api(method, path, body);
     const r = await globalThis.fetch(path, method !== "GET"
       ? { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}) }
       : { method: "GET" });
@@ -163,5 +206,5 @@ export const local = Object.freeze({
     if (!r.ok || j.error) throw failure(j.error || `${r.status}`, r.status, j.code);
     return j;
   },
-  eventSource(url) { return new globalThis.EventSource(url); },
+  eventSource(url) { return channelImpl?.local ? channelImpl.local.eventSource(url) : new globalThis.EventSource(url); },
 });

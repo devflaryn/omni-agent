@@ -205,7 +205,7 @@ test("every direct URL to a file's bytes goes through the one helper", () => {
   for (const f of uiFiles()) {
     for (const line of read(f).split(/\r?\n/)) {
       if (!line.includes("/api/fs/raw")) continue;
-      assert.match(line, /(?:^|[^.\w])rawUrl\(`\/api\/fs\/raw/, `${f} builds a raw URL by hand: ${line.trim()}`);
+      assert.match(line, /(?:^|[^.\w])(?:rawUrl|saveFile)\(`\/api\/fs\/raw/, `${f} builds a raw URL by hand: ${line.trim()}`);
     }
     if (f !== "transport.js") assert.doesNotMatch(read(f), /(const|let|function)\s+rawUrl\b/, `${f} has its own rawUrl`);
   }

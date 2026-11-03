@@ -327,6 +327,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   f.preset.addEventListener("change", applyPreset);
   f.save.onclick = save;
   f.del.onclick = remove;
+  form.onsubmit = (e) => e.preventDefault();
   form.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target !== f.models) { e.preventDefault(); save(); } });
   $("#settingsClose").onclick = close;
   modal.addEventListener("click", (e) => { if (e.target === modal) close(); });

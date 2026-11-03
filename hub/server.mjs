@@ -3,8 +3,8 @@
 //
 // It decides who may talk to whom, and nothing else. Clients verify the log and the channel for themselves.
 //
-// Runs on Node 20.19 with built-ins only. Deploy together: hub/server.mjs, hub/ws.mjs, hub/store.mjs,
-// ui/device-log.js, ui/account-core.js, keeping that hub/ and ui/ layout.
+// Runs on Node 20.19 with built-ins only. Deploy together: hub/server.mjs, hub/ws.mjs, hub/store.mjs, hub/static.mjs and the
+// web page's files, keeping that hub/ and ui/ layout: hub/deploy.sh has the list. The page's headers and files are in hub/static.mjs.
 //
 // For clients:
 // - Connect straight after /api/login. A session that has not proved its key on a socket shows no approval card, is
@@ -36,6 +36,7 @@ import { verify } from "../ui/account-core.js";
 import { entryBytes, verifyLog, LogError } from "../ui/device-log.js";
 import { CLOSE_POLICY, acceptUpgrade, refuseUpgrade } from "./ws.mjs";
 import { openStore } from "./store.mjs";
+import { loadWebFiles, serveWebFile, webHeaders } from "./static.mjs";
 
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
@@ -174,18 +175,20 @@ class FailureLog {
 /**
  * Starts a hub. Options: port, dataDir, tls ({cert, key}, without it the hub only listens on loopback), host, origin
  * (the hub's own browser origin, also bound into every proof), origins (more exact origins allowed to connect, for the
- * iPhone app), bootstrapToken (opens the first registration, once), allowSignup (opens later registrations), hstsMaxAge
+ * iPhone app), webRoot (the folder of the web page's files, ui/ by default), bootstrapToken (opens the first registration, once), allowSignup (opens later registrations), hstsMaxAge
  * (seconds of Strict-Transport-Security, TLS only, off by default: a browser applies it to every port of the name, so
  * it also turns plain sites on other ports of that name into failures), now, log(line), sweepMs, limits (overrides of DEFAULT_LIMITS).
  * Rejects with a StoreError if the data dir is damaged.
  */
-export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, origins = [], bootstrapToken = null, allowSignup = false, hstsMaxAge = null, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
+export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, origins = [], webRoot, bootstrapToken = null, allowSignup = false, hstsMaxAge = null, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
   const limits = { ...DEFAULT_LIMITS, ...limitOverrides };
   if (bootstrapToken !== null && (typeof bootstrapToken !== "string" || bootstrapToken.length < MIN_BOOTSTRAP_TOKEN || bootstrapToken.length > MAX_BOOTSTRAP_TOKEN)) {
     throw new Error(`hub: bootstrapToken must be text of ${MIN_BOOTSTRAP_TOKEN} to ${MAX_BOOTSTRAP_TOKEN} characters`);
   }
   if (hstsMaxAge !== null && (!Number.isSafeInteger(hstsMaxAge) || hstsMaxAge < 0)) throw new Error("hub: hstsMaxAge must be a whole number of seconds");
   const securityHeaders = tls && hstsMaxAge !== null ? { "Strict-Transport-Security": `max-age=${hstsMaxAge}` } : {};
+  const webFiles = loadWebFiles(webRoot);
+  const pageHeaders = { ...webHeaders(origin), ...securityHeaders };
   const store = openStore(dataDir);
   // Once an account exists the token has been spent, even if the setting is still there after a restart.
   if (bootstrapToken !== null && store.accounts.size === 0) store.setBootstrapHash(sha256(bootstrapToken));
@@ -490,7 +493,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   function reply(res, status, body) {
     const text = JSON.stringify(body);
-    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...securityHeaders });
+    res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text), "Cache-Control": "no-store", ...pageHeaders });
     res.end(text);
   }
 
@@ -523,6 +526,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
       const path = req.url.split("?", 1)[0];
       if (!originAllowed(req)) throw new HttpError(403, "origin");
       if (path === "/api/health" && req.method === "GET") { reply(res, 200, {}); return; }
+      if (serveWebFile(req, res, webFiles, pageHeaders)) return;
       const route = ROUTES.get(path);
       if (!route || req.method !== "POST") throw new HttpError(404, "not-found");
       if (!/^application\/json\b/i.test(req.headers["content-type"] ?? "")) throw new HttpError(415, "json-only");
@@ -780,7 +784,8 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
 
   function pendingList(conn, session) {
     if (!session.approved) {
-      return sendTo(conn, { type: "pending.list", pending: pendingRows(conn.accountId).filter((row) => row.signPub === session.signPub) });
+      // Whether anyone could approve it, so a sign-in can say so if nobody can. Someone holding the password learns only that.
+      return sendTo(conn, { type: "pending.list", pending: pendingRows(conn.accountId).filter((row) => row.signPub === session.signPub), approverOnline: fullConns(conn.accountId).length > 0 });
     }
     if (!isFullSession(conn.accountId, session)) return forbidden(conn, "pending.list");
     sendTo(conn, { type: "pending.list", pending: pendingRows(conn.accountId) });
