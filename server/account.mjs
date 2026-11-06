@@ -27,7 +27,7 @@ import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { approverExchange, checkPassword, fromB64, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, toB64, verify } from "../ui/account-core.js";
 import { LogError, append, canRecover, compareLogs, createLog, deviceCurrent, deviceExpiresAt, entryHash, verifyLog } from "../ui/device-log.js";
-import { HubSocket, hubPost } from "../ui/hub-socket.js";
+import { HUB_DROPPED, HUB_SILENT, HubSocket, hubPost } from "../ui/hub-socket.js";
 import { ALERT_TEXT, NewDeviceApproval, addAlert, checkApprovedLog, judgeLog, signedClaimBytes } from "../ui/log-trust.js";
 import { decodeOuter, encodeOuter, foreignOuter } from "../ui/channel-frames.js";
 import { AccountError } from "./account-error.mjs";
@@ -104,6 +104,9 @@ const mayRecover = (entries, recovery) => canRecover(entries, recovery.signPub);
  * Events: approval (the pending sign-ins), devices (the devices list), alert ({kind, message, at}), channel (a Channel from
  * another device, ready to serve), channel-closed (a Channel), status (when anything status() shows has changed).
  */
+const REPORTED_REMOVED = "The hub reports that this device was removed from the account, so it cannot be approved again. This computer's own device list does not show that: check under Settings → Account → Devices on another device. If it is gone from there, press Forget this device under Settings → Account → Leave here, and sign in again as a new device. Nothing here was deleted.";
+const PASSWORD_UNKNOWN = "The hub did not answer, so the change may or may not have taken effect. Try signing in with both passwords, the old and the new.";
+
 export class Account extends EventEmitter {
   #phase = "signed-out";
   #email = null;
@@ -132,6 +135,7 @@ export class Account extends EventEmitter {
   #stopped = false;
   #hub;
   #hubError = null;
+  #hubGaveUp = false; // replaced by another sign-in of this device: nothing here will reconnect, so nothing should wait for it
   #syncing = null;
   #logLock = Promise.resolve();
   #approvalChain = Promise.resolve();
@@ -186,7 +190,7 @@ export class Account extends EventEmitter {
       onAuthOk: (message) => { this.#onAuthOk(message); },
       onMessage: (message) => this.#dispatch(message),
       onGone: (code) => this.#onSocketGone(code),
-      onConnectTimeout: () => { this.#hubError = "The hub did not answer."; },
+      onConnectTimeout: () => { this.#hubError = HUB_SILENT; },
       onChange: () => this.#changed(),
     });
     this.#exchange = new NewDeviceApproval({
@@ -226,7 +230,7 @@ export class Account extends EventEmitter {
       email: this.#email,
       accountId: this.#verified?.accountId ?? null,
       device: this.#keys ? { id: this.#keys.signPub, name: this.#name, kind: this.#kind, role: me?.role ?? null } : null,
-      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#lastError() },
+      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#lastError(), connectionError: this.#hubError, gaveUp: this.#hubGaveUp, reconnecting: this.#hub.reconnecting },
       logHead: this.#hashes.at(-1) ?? null,
       logVersion: this.#hashes.length,
       pending: this.#phase === "pending" ? { code: this.#exchange.current?.code ?? null, attempts: this.#exchange.attempts, failed: this.#exchange.failed, confirmed: !!this.#exchange.current?.confirmed, approvedByHub: this.#approvedByHub } : null,
@@ -827,6 +831,16 @@ export class Account extends EventEmitter {
       }
       this.#phase = this.#verified?.devices.has(this.#keys.signPub) ? "approved" : "pending";
     } else {
+      // A key that has been on the log can never be approved again, so waiting could only end at the expiry. This log may still
+      // list it, since this computer was away for the removal. A hacked hub can say this falsely, so the keys stay: they anchor
+      // the log, and forgetting is the person's choice, after a look from another device.
+      if (state === "pending" && this.#everOnLog(this.#keys.signPub)) {
+        this.#alert("hub-says-removed");
+        await this.#forgetSession();
+        await this.#persistState();
+        this.#changed();
+        throw new AccountError(409, "removed", REPORTED_REMOVED);
+      }
       this.#phase = "pending";
       this.#exchange.reset();
       this.#approvedByHub = false;
@@ -853,6 +867,7 @@ export class Account extends EventEmitter {
     this.#online = new Set();
     this.#approvedByHub = false;
     this.#hubError = null;
+    this.#hubGaveUp = false;
     await this.#recovery.apply(forget ? "forgotten" : "signedOut");
     if (forget) {
       for (const file of ["keys.json", "log.json", "state.json"]) await fs.rm(join(this.dir, file), { force: true });
@@ -894,6 +909,7 @@ export class Account extends EventEmitter {
     switch (code) {
       case CLOSE_REPLACED:
         this.#hubError = "Replaced by another sign-in of this device. Not reconnecting, so the two do not fight.";
+        this.#hubGaveUp = true;
         this.#changed();
         return;
       case CLOSE_DENIED:
@@ -913,7 +929,7 @@ export class Account extends EventEmitter {
         this.#settle("signed-out", this.#hubClaimedRemoved ? HUB_CLAIMS_REMOVED : "The hub no longer knows this session. Sign in again.");
         return;
       default:
-        this.#hubError ??= "The hub connection was lost.";
+        this.#hubError ??= HUB_DROPPED;
         this.#hub.scheduleReconnect();
     }
   }
@@ -974,6 +990,7 @@ export class Account extends EventEmitter {
 
   async #onAuthOk({ state }) {
     this.#hubError = null;
+    this.#hubGaveUp = false;
     this.#hubClaimedRemoved = false;
     this.#changed();
     for (const waiter of this.#socketWaiters.splice(0)) waiter();
@@ -1449,7 +1466,13 @@ export class Account extends EventEmitter {
     const currentLoginKey = await this.#loginKey(current, oldSalt);
     const salt = globalThis.crypto.getRandomValues(new Uint8Array(SALT_BYTES));
     const verifierInput = await this.#loginKey(next, salt);
-    await this.#hub.rpc({ type: "password.change", currentLoginKey, salt: toB64(salt), verifierInput }, ["password.changed"]);
+    try {
+      await this.#hub.rpc({ type: "password.change", currentLoginKey, salt: toB64(salt), verifierInput }, ["password.changed"]);
+    } catch (error) {
+      // Sent, and no answer: the hub may have done it. Other errors are its answer, and neverSent means it cannot have.
+      if (!error.neverSent && (error.code === "hub-timeout" || error.code === "hub-unreachable")) throw new AccountError(error.status, error.code, PASSWORD_UNKNOWN);
+      throw error;
+    }
     return { ok: true };
   }
 

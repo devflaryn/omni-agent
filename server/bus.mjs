@@ -4,6 +4,7 @@
  */
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
+import { wireEvent, resultIn } from "./wire.mjs";
 
 /** Chat messages the session files hold: a page reads those through the history route, never from a replay. */
 const inFile = (ev) => ev.kind === "msg" && (ev.role === "assistant" || ev.role === "tool" || ev.role === "user");
@@ -25,7 +26,7 @@ export class Bus extends EventEmitter {
     ev.seq = ++this.seq;
     this.ring.push(ev);
     if (this.ring.length > this.ringSize) this.ring.splice(0, this.ring.length - this.ringSize);
-    const line = `data: ${JSON.stringify(ev)}\n\n`;
+    const line = `data: ${JSON.stringify(wireEvent(ev))}\n\n`;
     const CAP = 4 * 1024 * 1024;
     for (const res of this.clients) {
       try {
@@ -50,7 +51,18 @@ export class Bus extends EventEmitter {
     const lost = since > 0 && ((boot && boot !== this.boot) || since > this.seq || since < first - 1);
     if (lost) res.write(`event: resync\ndata: ${JSON.stringify({ boot: this.boot, seq: this.seq })}\n\n`);
     const fresh = since <= 0 || lost;
-    for (const ev of this.ring) if (fresh ? !inFile(ev) : ev.seq > since) res.write(`data: ${JSON.stringify(ev)}\n\n`);
+    for (const ev of this.ring) if (fresh ? !inFile(ev) : ev.seq > since) res.write(`data: ${JSON.stringify(wireEvent(ev))}\n\n`);
+  }
+
+  /** The full result of a tool call still in the ring (a live one the session file may not hold yet). */
+  toolResult(sid, toolId) {
+    for (let i = this.ring.length - 1; i >= 0; i--) {
+      const ev = this.ring[i];
+      if (ev.sid !== sid) continue;
+      const r = resultIn(ev, toolId);
+      if (r) return r;
+    }
+    return undefined;
   }
 
   removeClient(res) {

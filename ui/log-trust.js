@@ -25,7 +25,7 @@ export const ALERT_TEXT = Object.freeze({
   "channel-failure": "An encrypted channel failed its check and was closed. A frame was changed, lost or replayed on the way.",
   "approval-failed": "An approval exchange failed its check and was abandoned. No code from it is shown.",
   "refused-by-device": "A device on your account refused this computer, so the two hold different device lists. The hub may be hiding a change from one of them, or this computer may have been removed.",
-  "hub-says-removed": "The hub says this device was removed from the account. This computer's own device list does not show that, so do not forget this device on the hub's word alone. If it stays disconnected, sign in again.",
+  "hub-says-removed": "The hub says this device was removed from the account. This computer's own device list does not show that, so do not forget this device on the hub's word alone: check under Settings → Account → Devices on another device first.",
   "key-unavailable": "This computer's account keys could not be opened. Nothing was changed. To start over, sign out and forget this device.",
 });
 

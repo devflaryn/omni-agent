@@ -21,7 +21,9 @@ beforeEach(() => {
   calls = []; reloads = 0;
   storage = fakeStorage();
   realFetch = globalThis.fetch; realES = globalThis.EventSource;
-  setTransportEnv({ storage, reload: () => { reloads++; } });
+  // As a real reload does: the page is built again from what is stored.
+  const page = { storage, reload: () => { reloads++; setTransportEnv(page); } };
+  setTransportEnv(page);
   globalThis.fetch = async (url, options) => { calls.push({ url, options }); return answer(200, { ok: true }); };
   globalThis.EventSource = class { constructor(url) { this.url = url; } };
 });
@@ -63,7 +65,9 @@ test("setMachine starts the page over, and persists for this window only", () =>
   assert.deepEqual(JSON.parse(storage.data.get("omni.machine")), { id: ID, name: "Ubuntu" });
 
   // The reloaded page reads it back.
-  setTransportEnv({ storage, reload: () => { reloads++; } });
+  // As a real reload does: the page is built again from what is stored.
+  const page = { storage, reload: () => { reloads++; setTransportEnv(page); } };
+  setTransportEnv(page);
   assert.deepEqual(machine(), { id: ID, name: "Ubuntu" });
   assert.equal(mode(), "proxied");
 

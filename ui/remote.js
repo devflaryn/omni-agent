@@ -102,6 +102,12 @@ export function createRemote({ api, toast }) {
       if (st.https) where.appendChild(el("p", "rm-note", `HTTPS${st.selfSigned ? " with a self-signed certificate: the browser warns once. Check that it shows this SHA-256 fingerprint before you type the password:" : ". Certificate SHA-256:"}`));
       else where.appendChild(el("p", "rm-note err", "Plain HTTP: the password and everything you see cross the network readable. Install openssl, or set tlsCert/tlsKey, and restart."));
       if (st.fingerprint) where.appendChild(el("div", "rm-fp mono", st.fingerprint));
+      if (st.https && st.selfSigned) {
+        const p = el("p", "rm-note", "No warning at all on a phone: open "), a = el("a", null, "/omni-agent.crt");
+        a.href = "/omni-agent.crt"; a.setAttribute("download", "");
+        p.append(a, " there, install it (iPhone: Settings → General → VPN & Device Management) and trust it (Settings → General → About → Certificate Trust Settings).");
+        where.appendChild(p);
+      }
     }
 
     if (st.relay) {

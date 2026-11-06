@@ -91,7 +91,13 @@ Omni then runs as a small server: this computer is **the host**, everything else
 4. The remote listener speaks HTTPS with a self-signed certificate made by openssl on first start
    (`~/.omni-agent/tls/`; set `tlsCert`/`tlsKey` for your own). The browser warns once: check that it
    shows the SHA-256 fingerprint from Settings → Remote before typing the password. Without openssl it
-   falls back to plain HTTP and says so.
+   falls back to plain HTTP and says so. The certificate meets Apple's rules (serverAuth usage, at most
+   825 days, every address in its SAN): iOS refuses one that does not outright, with no "visit anyway",
+   in Safari and every other iPhone browser. One made by an older Omni, near its end, or missing an
+   address the listener answers on is made again at start (the fingerprint then changes). To lose the
+   warning on a phone, open `/omni-agent.crt` there (linked on the sign-in page), install it (iPhone:
+   Settings → General → VPN & Device Management) and trust it (Settings → General → About →
+   Certificate Trust Settings).
 5. Each message or change a remote browser sends appears in the host's window as a card saying what it
    asks for (the message text, the command an MCP server would run; secrets hidden) with **Approve** and
    **Deny**. It waits up to `remoteApprovalTimeoutSec` (300 s), then is refused.
@@ -108,7 +114,9 @@ the VPS (`server/tunnel.mjs`), and `https://<vps>:4443/` reaches Omni from anywh
 - **The tunnel key can do one thing.** User `omni-tunnel` has no password and no shell; its key may only open
   the remote forward on the VPS's `127.0.0.1:14443`, enforced in `authorized_keys` and an sshd `Match` block
   (`relay/setup-vps.sh`). The VPS host key is pinned in `~/.omni-agent/relay/known_hosts`.
-- **The relay drops** anything that does not start with a TLS handshake, more than 32 connections at once or
+- **Plain `http://` gets a redirect to `https://`** (an address typed without the scheme, which is what a
+  phone's browser opens), on the relay and on the LAN port alike; nothing else crosses without TLS.
+- **The relay drops** anything else that does not start with a TLS handshake, more than 32 connections at once or
   120 a minute from one address, and idle connections after 15 minutes. It runs as a throwaway systemd
   `DynamicUser` with a read-only system; it logs counts only.
 - **The visitor's real address** travels in the PROXY line, so the lockout below and the approval cards
@@ -253,10 +261,21 @@ icon in the top bar, or `/#missions`) and start one: a project folder, a goal, a
 - **Home**: one container. "What should we work on?", the composer, the working directory (recent
   folders as chips). Sending opens a chat on OpenCode in that folder.
 - **Chat**: a **file explorer** on the left rooted at the chat's folder, the transcript in the middle.
-  Click a file and a preview column opens beside the tree: text files as text, `.md` rendered (with a
-  Raw toggle), images as images, and `.zip` / `.apk` / `.jar` as the list of entries inside, where a
-  text or image entry opens in place. **Reference** drops `@path` into the prompt. The folder button
-  in the top bar hides or shows the explorer.
+  It works like VS Code's: folders open in place and stay open across refreshes, arrow keys walk the tree
+  (F2 renames, Delete moves to the trash), and a right click (a long press on a phone) offers open, open
+  as text, hex view, new file / folder, reference in prompt, copy path, download, reveal in the file
+  manager, rename, duplicate, move to trash and delete. New names and renames are typed in the tree; a
+  row dragged onto a folder moves there, onto the prompt it becomes `@path`.
+  Files open in **editor tabs** beside the tree (one click: a preview tab in italics that the next click
+  replaces; a double click or an edit keeps it). Text opens in a code editor with syntax colouring, line
+  numbers and Ctrl+S; a save writes the file back in its own encoding (UTF-8, with or without BOM,
+  UTF-16, Latin-1) and line endings, and a file changed on disk since it was opened (the agent edited it)
+  is not overwritten without asking. `.md` shows rendered or as source, images with fit / 100 %, video
+  and audio play (seeking works in Safari), PDFs in the browser's viewer, and `.zip` / `.apk` / `.jar`
+  list their entries. A binary offers **Open as Text** (UTF-8 or Latin-1) and a **Hex Viewer**: both
+  read-only, so looking never changes the file, and a save over a binary is refused. A remote browser's
+  saves and file changes wait for the host's approval like everything else. **Reference** drops `@path`
+  into the prompt. The folder button in the top bar hides or shows the explorer.
 - **Transcript**: Omni's chats stream token by token; chats run in a terminal appear whole. Each run of tool
   calls folds into one line such as "Edited files, ran commands"; open it for a row per tool and a
   row for its arguments and output. Images the model reads (a `read` of a PNG) appear as small boxes
@@ -446,7 +465,9 @@ server/opencode-*.mjs opencode serve, chats, config server/claude-runner.mjs cla
 server/watchers.mjs   discovery, tailing, digests   server/normalize.mjs     four sources -> one event
 server/memory.mjs     the vault                     server/tokens.mjs        tally + prices
 server/providers.mjs  presets + custom providers     server/zip.mjs           .zip/.apk listing + entry read
+server/files.mjs      file browser: read/save/trash  server/tls.mjs           the remote certificate (iOS-valid)
 ui/                   index.html, styles.css, app.js + lib/transcript/composer/explorer/settings/sidebar/panel
+ui/filepane.js        editor tabs + viewers          ui/editor.js, highlight.js  code editor, syntax colouring
 desktop/              pywebview launcher            integrations/            OpenCode plugin, Claude Code hook, personas
 hub/                  the VPS hub: accounts, routing relay/                   the old relay, until removed
 ```

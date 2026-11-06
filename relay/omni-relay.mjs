@@ -3,10 +3,11 @@
  * SSH tunnel that the Omni PC keeps open (the VPS's 127.0.0.1:TUNNEL_PORT), prefixed with one PROXY v1 line
  * naming the visitor so the PC can rate-limit sign-ins per real address.
  *
- * It never terminates TLS: it holds no certificate and cannot read or change the traffic. What it does refuse:
- * anything that does not open with a TLS handshake (scanners, plain HTTP), more than PER_IP connections at once
- * from one address, more than RATE new connections a minute from one address, more than MAX in all, and
- * connections idle for IDLE_MS. Node built-ins only.
+ * It never terminates TLS: it holds no certificate and cannot read or change the traffic. A plain-HTTP request
+ * (the address typed without https://, which is what a phone's browser then opens) gets a redirect to the
+ * https:// address and goes no further. What it refuses: anything else that does not open with a TLS handshake
+ * (scanners), more than PER_IP connections at once from one address, more than RATE new connections a minute
+ * from one address, more than MAX in all, and connections idle for IDLE_MS. Node built-ins only.
  *
  *   PUBLIC_PORT=4443 TUNNEL_PORT=14443 node omni-relay.mjs
  */
@@ -23,10 +24,23 @@ const HELLO_MS = 10_000;
 const open = new Map();     // ip -> live connections
 const recent = new Map();   // ip -> timestamps of new connections in the last minute
 let live = 0;
-const counts = { ok: 0, notTls: 0, perIp: 0, rate: 0, full: 0, tunnelDown: 0 };
+const counts = { ok: 0, redirected: 0, notTls: 0, perIp: 0, rate: 0, full: 0, tunnelDown: 0 };
 
 const norm = (a) => String(a || "").replace(/^::ffff:/, "");
 const isV4 = (a) => /^\d+\.\d+\.\d+\.\d+$/.test(a);
+
+/** The reply to a plain-HTTP request's first bytes: a redirect to the same host and path over https, or null
+ *  when they are not an HTTP request. `fallbackHost` ("addr:port") stands in for a missing or odd Host header.
+ *  (server/tls.mjs httpsRedirect is the same for the PC's LAN listener; this file is deployed on its own.) */
+function httpsRedirect(head, fallbackHost) {
+  const lines = head.toString("latin1").split("\r\n");
+  const req = /^[A-Z]{3,7} (\S+) HTTP\/1\.[01]$/.exec(lines[0]);
+  if (!req) return null;
+  const path = req[1].startsWith("/") ? req[1] : "/";
+  const host = (lines.find((l) => /^host:/i.test(l)) || "").slice(5).trim();
+  const where = /^([\w-]+(\.[\w-]+)*|\[[0-9a-fA-F:.]+\]):\d{1,5}$/.test(host) ? host : fallbackHost;
+  return `HTTP/1.1 301 Moved Permanently\r\nLocation: https://${where}${path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`;
+}
 
 function admit(ip) {
   const now = Date.now();
@@ -60,8 +74,15 @@ const server = createServer({ pauseOnConnect: true }, (client) => {
   client.on("close", close);
   client.setTimeout(HELLO_MS, close);
   client.once("data", (first) => {
-    // A TLS record starts with 0x16 (handshake). Anything else is not for us.
-    if (first[0] !== 0x16) { counts.notTls++; close(); return; }
+    // A TLS record starts with 0x16 (handshake). Plain HTTP is sent to https://; anything else is not for us.
+    if (first[0] !== 0x16) {
+      const local = norm(client.localAddress);
+      const reply = httpsRedirect(first, `${isV4(local) ? local : `[${local}]`}:${client.localPort}`);
+      if (!reply) { counts.notTls++; close(); return; }
+      counts.redirected++;
+      client.end(reply);
+      return;
+    }
     client.pause();
     const local = norm(client.localAddress);
     const v4 = isV4(ip) && isV4(local);

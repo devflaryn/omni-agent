@@ -192,6 +192,20 @@ test("a request and an event stream cross two real accounts and a real hub, and 
   await until(async () => (await there.call("GET", "audit")).json.lines.some((l) => l.path === "/api/state" && l.deviceName === "Here"), "the audit line");
 });
 
+test("a far machine does not name a download: the page does", async () => {
+  const body = "the bytes of the file";
+  const { remote, window } = await pair({ handle: (req, res) => {
+    res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": Buffer.byteLength(body), "Content-Disposition": 'attachment; filename="notes.txt.exe"', "Accept-Ranges": "bytes", "Last-Modified": new Date(0).toUTCString() });
+    res.end(body);
+  } });
+  const r = await fetch(remote("/api/fs/raw?root=x&path=notes.txt&download=1"), { headers: { cookie: window.cookie } });
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get("content-disposition"), null);
+  assert.equal(r.headers.get("content-type"), "application/octet-stream", "so it is still saved, not shown");
+  assert.equal(r.headers.get("accept-ranges"), "bytes");
+  assert.equal(await r.text(), body);
+});
+
 test("every action reuses one channel per machine, and each new one has a fresh handshake", async () => {
   const { fixture, here, far, remote, window } = await pair();
   const asked = await Promise.all(Array.from({ length: 12 }, (_, i) => fetch(remote(`/x?i=${i}`), { headers: { cookie: window.cookie } }).then((r) => r.json())));

@@ -34,24 +34,32 @@
   <aside id="explorer">
     <div class="ex-head">
       <span class="ex-title">Files</span>
+      <button class="icon-btn small" id="explorerNewFile" title="New File…"><svg viewBox="0 0 16 16"><path d="M4 2h5l3 3v4M9 2v3h3M4 2v12h4M11.5 10.5v4M9.5 12.5h4"/></svg></button>
+      <button class="icon-btn small" id="explorerNewFolder" title="New Folder…"><svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v1.5M2 4.5v7A1.5 1.5 0 0 0 3.5 13H8M11.5 9.5v4M9.5 11.5h4"/></svg></button>
+      <button class="icon-btn small" id="explorerCollapse" title="Collapse Folders"><svg viewBox="0 0 16 16"><path d="M3 3h10v10H3zM5.5 8h5"/></svg></button>
       <button class="icon-btn small" id="explorerRefresh" title="Refresh"><svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 3v2.8h-2.8"/></svg></button>
       <button class="icon-btn small" id="explorerClose" title="Hide"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
     <div class="ex-root mono" id="explorerRoot"></div>
     <input id="explorerFilter" type="search" placeholder="Filter files" />
-    <div id="tree"></div>
+    <div id="tree" tabindex="0" role="tree" aria-label="Files"></div>
     <div class="resizer" data-for="explorer" title="Drag to resize · double-click to reset"></div>
   </aside>
 
   <aside id="preview" hidden>
+    <div class="pv-tabbar">
+      <div class="pv-tabs" id="pvTabs" role="tablist"></div>
+      <button class="icon-btn small" id="pvMax" title="Maximize or restore the editor"><svg viewBox="0 0 16 16"><path d="M3 6V3h3M13 6V3h-3M3 10v3h3M13 10v3h-3"/></svg></button>
+      <button class="icon-btn small" id="pvClose" title="Hide the editor (open tabs are kept)"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+    </div>
     <div class="pv-head">
       <span class="pv-path mono" id="pvPath"></span>
       <span class="pv-meta" id="pvMeta"></span>
-      <button class="btn quiet small" id="pvRaw" hidden>Raw</button>
+      <div class="pv-actions" id="pvActions"></div>
       <button class="btn small" id="pvRef" title="Insert @path into the prompt">Reference</button>
-      <button class="icon-btn small" id="pvClose" title="Close preview"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
     <div id="pvBody"></div>
+    <div class="pv-status" id="pvStatus"></div>
     <div class="resizer" data-for="preview" title="Drag to resize · double-click to reset"></div>
   </aside>
 

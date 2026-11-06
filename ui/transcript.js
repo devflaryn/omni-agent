@@ -1,5 +1,6 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
-import { el, md, fmtN, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
+import { el, esc, md, showName, fmtN, fmtBytes, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, editDiff, diffCounts, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
+import { highlight, languageFor } from "./highlight.js";
 
 const active = { view: null, timer: null };
 const THINK_KEY = "omni.thinking.open";
@@ -26,11 +27,16 @@ const ICONS = {
 };
 const icon = (kind, cls = "ico") => `<span class="${cls}">${ICONS[kind] || ICONS.other}</span>`;
 
-/** `openAgent(id)`: what an agent report card's Open button does (the app opens that agent's chat or log). */
-export function newView(root, wrap, sid, { cwd, openAgent, keepFollow = false } = {}) {
+const makeView = (root, wrap, sid, { cwd, openAgent, loadToolOutput } = {}) =>
+  ({ sid, root, wrap, cwd: cwd || "", harness: sid.split(":")[0], tools: new Map(), turn: null, stream: null, lastTs: 0, empty: null, lastUser: null, openAgent: openAgent || null, loadToolOutput: loadToolOutput || null, older: null });
+/**
+ * `openAgent(id)`: what an agent report card's Open button does (the app opens that agent's chat or log).
+ * `loadToolOutput(toolId, at, max)`: fetches a tool's full output, which long ones arrive without.
+ */
+export function newView(root, wrap, sid, opts = {}) {
   root.innerHTML = "";
-  const f = followOf(wrap); if (f && !keepFollow) f.on = true;
-  const view = { sid, root, wrap, cwd: cwd || "", harness: sid.split(":")[0], tools: new Map(), turn: null, stream: null, lastTs: 0, empty: null, lastUser: null, openAgent: openAgent || null };
+  const f = followOf(wrap); if (f && !opts.keepFollow) f.on = true;
+  const view = makeView(root, wrap, sid, opts);
   active.view = view;
   if (!active.timer) active.timer = setInterval(() => {
     const v = active.view, t = v?.turn;
@@ -42,6 +48,43 @@ export function newView(root, wrap, sid, { cwd, openAgent, keepFollow = false } 
   return view;
 }
 export function finish(view) { closeTurn(view); }
+
+/**
+ * The marker above the oldest page shown: `state` "more" (an older page exists; `onLoad` loads it), "loading",
+ * "error", or null once the chat's start is on screen.
+ */
+export function setOlder(view, state, onLoad) {
+  if (!state) { view.older?.remove(); view.older = null; return; }
+  if (!view.older) {
+    view.older = el("button", "older-mark");
+    view.older.type = "button";
+    // Above the chat's first message, below a fork / agent note.
+    const notes = [...view.root.children].filter((n) => n.classList.contains("fork-note"));
+    if (notes.length) notes[notes.length - 1].after(view.older); else view.root.prepend(view.older);
+  }
+  view.older.disabled = state === "loading";
+  view.older.textContent = state === "loading" ? "Loading earlier messages…" : state === "error" ? "Could not load earlier messages · retry" : "Load earlier messages";
+  view.older.onclick = state === "loading" ? null : onLoad || null;
+}
+
+/**
+ * An older page of the chat (its events, oldest first) goes above what is shown. It renders on its own (its own
+ * turns and tool rows), then moves in under the marker; the caller keeps the scroll position.
+ */
+export function prependHistory(view, events) {
+  const box = el("div");
+  const shadow = { scrollHeight: 0, scrollTop: 0, clientHeight: 0 };
+  const v = makeView(box, shadow, view.sid, { cwd: view.cwd, openAgent: view.openAgent, loadToolOutput: view.loadToolOutput });
+  for (const ev of events) applyEvent(v, ev);
+  closeTurn(v);
+  for (const [id, c] of v.tools) if (!view.tools.has(id)) { c.view = view; view.tools.set(id, c); }
+  const nodes = [...box.childNodes];
+  if (view.older) view.older.after(...nodes);
+  else {
+    const notes = [...view.root.children].filter((n) => n.classList.contains("fork-note"));
+    if (notes.length) notes[notes.length - 1].after(...nodes); else view.root.prepend(...nodes);
+  }
+}
 export function emptyNote(view, text) { view.empty = el("div", "divider"); view.empty.appendChild(el("span", null, text)); view.root.appendChild(view.empty); }
 export function forkNote(view, { fromTitle, onOpen }) {
   const n = el("div", "fork-note");
@@ -159,9 +202,9 @@ function applyReason(t) {
 function workGroup(t) {
   if (t.curWork) return t.curWork;
   const d = el("details", "work on");
-  d.innerHTML = `<summary>${icon("work")}<span class="wlbl">Working…</span>${icon("chev", "chev")}</summary><div class="witems"></div>`;
+  d.innerHTML = `<summary>${icon("work")}<span class="wlbl">Working…</span><span class="tdiff" hidden></span>${icon("chev", "chev")}</summary><div class="witems"></div>`;
   t.body.appendChild(d);
-  const w = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".wlbl"), items: d.querySelector(".witems"), cards: [], imgs: null };
+  const w = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".wlbl"), diff: d.querySelector(".tdiff"), items: d.querySelector(".witems"), cards: [], imgs: null };
   t.workEls.push(w);
   t.curWork = w;
   t.sawTool = true;
@@ -204,7 +247,8 @@ function updateWorkLabels(t, final) {
     const live = s.open && !final;
     // A lone tool reads as its own row when collapsed; several fold into a verb summary.
     const single = w.cards.length === 1 && !live;
-    w.lbl.textContent = single ? w.cards[0].label.text : workSummary(kinds, live);
+    if (single) fillLabel(w.lbl, w.diff, w.cards[0].label);
+    else { w.lbl.textContent = workSummary(kinds, live); w.lbl.removeAttribute("title"); w.diff.hidden = true; }
     w.ico.innerHTML = ICONS[single ? w.cards[0].label.kind : kinds.length === 1 ? kinds[0] : "work"] || ICONS.work;
     w.el.classList.toggle("on", live);
     w.el.classList.toggle("err", w.cards.some((c) => c.el.classList.contains("err")));
@@ -216,11 +260,13 @@ function toolCard(view, t, { toolId, name, args, ts }) {
   let c = toolId ? view.tools.get(toolId) : null;
   if (c) return c;
   const d = el("details", "tool running");
-  d.innerHTML = `<summary>${icon("other")}<span class="tlbl"></span><span class="tdiff" hidden></span><span class="st">running</span>${icon("chev", "chev")}</summary><div class="io"><button class="io-copy icon-btn" title="Copy args + output">${ICONS.copy}</button><pre class="args"></pre><pre class="out" hidden></pre></div>`;
-  c = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".tlbl"), diff: d.querySelector(".tdiff"), args: d.querySelector(".args"), out: d.querySelector(".out"), st: d.querySelector(".st"), argText: "", call: { name: name || "tool", args: undefined }, label: { kind: "other", text: name || "tool" }, item: { kind: "tool", startTs: ts || Date.now(), endTs: null } };
+  d.innerHTML = `<summary>${icon("other")}<span class="tlbl"></span><span class="tdiff" hidden></span><span class="st">running</span>${icon("chev", "chev")}</summary><div class="io"><button class="io-copy icon-btn" title="Copy args + output">${ICONS.copy}</button><div class="dv" hidden></div><pre class="args"></pre><pre class="out" hidden></pre><button class="out-more" hidden></button></div>`;
+  c = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".tlbl"), diff: d.querySelector(".tdiff"), dv: d.querySelector(".dv"), args: d.querySelector(".args"), out: d.querySelector(".out"), more: d.querySelector(".out-more"), st: d.querySelector(".st"), argText: "", toolId: toolId || null, pending: null, call: { name: name || "tool", args: undefined }, label: { kind: "other", text: name || "tool" }, item: { kind: "tool", startTs: ts || Date.now(), endTs: null } };
   const ioCopy = d.querySelector(".io-copy");
   if (ioCopy) ioCopy.onclick = (e) => { e.preventDefault(); e.stopPropagation(); const parts = [c.args.textContent, c.out.hidden ? "" : c.out.textContent].filter(Boolean); navigator.clipboard?.writeText(parts.join("\n\n")).catch(() => {}); };
   c.view = view; c.turn = t;
+  d.addEventListener("toggle", () => { if (d.open && c.pending && !c.pending.loaded) loadOutput(c); });
+  c.more.onclick = () => loadOutput(c, 0);
   setToolArgs(c, args);
   const w = workGroup(t);
   c.work = w;
@@ -233,18 +279,90 @@ function toolCard(view, t, { toolId, name, args, ts }) {
   updateWorkLabels(t, false);
   return c;
 }
+/** A row label: a file tool's verb and file name in their own shades, an edit's +added −removed beside it. */
+function fillLabel(lbl, diffEl, label) {
+  if (label.target) lbl.replaceChildren(el("span", "tverb", label.verb), " ", el("span", "tfile", showName(label.target)));
+  else lbl.textContent = showName(label.text);
+  lbl.title = showName(label.path || label.text);
+  const show = label.kind === "edit" && !!(label.added || label.removed);
+  diffEl.hidden = !show;
+  if (show) diffEl.innerHTML = `${label.added ? `<b class="add">+${label.added}</b>` : ""}${label.removed ? `<b class="del">−${label.removed}</b>` : ""}`;
+}
+const DIFF_ROWS_MAX = 2000;
+/** An edit's expanded view: the changed lines GitHub-style (context, green added, red removed) in place of the call's JSON. */
+function renderDiff(c) {
+  const d = c.label.kind === "edit" ? editDiff(c.call.name, c.call.args, c.resultDiff) : null;
+  const rows = d?.rows.length ? d.rows : null;
+  c.dv.hidden = !rows;
+  // A file tool's row already says which file; its JSON stays only when there is nothing better to show.
+  c.args.hidden = !!rows || (c.label.kind === "read" && !!c.label.target);
+  if (!rows) return;
+  const lang = languageFor(d.path);
+  const sign = { add: "+", del: "−", ctx: " " };
+  let html = "";
+  for (const r of rows.slice(0, DIFF_ROWS_MAX)) {
+    if (r.t === "hunk") html += `<div class="dr d-hunk"><span class="ln"></span><span class="ln"></span><span class="sg"></span><span class="cd">⋯</span></div>`;
+    else if (r.t === "file") html += `<div class="dr d-file">${esc(showName(r.s))}</div>`;
+    else html += `<div class="dr d-${r.t}"><span class="ln">${esc(r.o ?? "")}</span><span class="ln">${esc(r.n ?? "")}</span><span class="sg">${sign[r.t]}</span><span class="cd">${highlight(r.s, lang) || " "}</span></div>`;
+  }
+  if (rows.length > DIFF_ROWS_MAX) html += `<div class="dr d-more">… ${fmtN(rows.length - DIFF_ROWS_MAX)} more lines</div>`;
+  c.dv.classList.toggle("nums", rows.some((r) => r.o != null || r.n != null));
+  c.dv.innerHTML = `<div class="dv-head">${esc(showName(c.label.path || d.path))}</div><div class="dv-body"><div class="dv-rows">${html}</div></div>`;
+}
+function relabel(c) {
+  c.label = toolLabel(c.call.name, c.call.args, c.view.cwd, c.resultDiff);
+  // A diff too long to send ahead still gives the row its true counts.
+  if (c.label.kind === "edit" && !c.resultDiff && c.diffStat) c.label = { ...c.label, ...diffCounts(c.diffStat) };
+  c.ico.innerHTML = ICONS[c.label.kind] || ICONS.other;
+  fillLabel(c.lbl, c.diff, c.label);
+  renderDiff(c);
+}
 function setToolArgs(c, args) {
   if (typeof args === "object" && args) c.call.args = args;
-  c.label = toolLabel(c.call.name, c.call.args, c.view.cwd);
-  c.ico.innerHTML = ICONS[c.label.kind] || ICONS.other;
-  c.lbl.textContent = c.label.text;
-  c.lbl.title = c.label.text;
-  if (c.label.kind === "edit" && (c.label.added || c.label.removed)) { c.diff.hidden = false; c.diff.innerHTML = `<b class="add">+${c.label.added}</b><b class="del">−${c.label.removed}</b>`; }
-  if (args === undefined) return;
-  c.args.textContent = (typeof args === "string" ? args : JSON.stringify(args, null, 2)) || "";
+  if (args !== undefined) c.args.textContent = (typeof args === "string" ? args : JSON.stringify(args, null, 2)) || "";
+  relabel(c);
 }
-function setToolResult(c, text, isError, ts, images) {
-  c.out.hidden = false; c.out.textContent = (text || "").slice(0, 30000);
+/** Characters of an output a row shows at first; "Show all" fetches the rest. */
+const OUT_SHOWN = 30000;
+function showOutput(c, text, isError, size = text.length, limit = OUT_SHOWN) {
+  const out = limit ? text.slice(0, limit) : text;
+  // A successful edit's own reply ("Edit applied successfully.") says nothing the diff does not; a longer one (diagnostics) stays.
+  c.out.hidden = c.label.kind === "edit" && !isError && !c.dv.hidden && size < 80;
+  c.out.textContent = out;
+  c.more.hidden = size <= out.length;
+  if (!c.more.hidden) c.more.textContent = `Show all ${fmtBytes(size)}`;
+}
+/**
+ * A long output stays on the server until its row is opened (`max` characters of it; 0 for all of it), so a long
+ * chat neither downloads nor holds every output it ever printed.
+ */
+async function loadOutput(c, max = OUT_SHOWN) {
+  const p = c.pending;
+  if (!p || p.busy || !c.view.loadToolOutput) return;
+  p.busy = true;
+  if (!p.loaded) { c.out.hidden = false; c.out.textContent = `Loading the output (${fmtBytes(p.size)})…`; }
+  try {
+    const r = await c.view.loadToolOutput(p.toolId, p.at, max);
+    if (r.diff && r.diff !== c.resultDiff) { c.resultDiff = r.diff; relabel(c); }
+    showOutput(c, r.text || "", r.isError, r.size ?? (r.text || "").length, max);
+    p.loaded = true;
+    if ((r.size ?? 0) <= (r.text || "").length) c.pending = null;
+  } catch (e) { c.out.hidden = false; c.out.textContent = `Could not load the output: ${e.message}`; }
+  finally { p.busy = false; }
+}
+/** `r`: a tool result as the page got it — `{ text, isError, images?, diff?, diffStat?, clipped?, at? }` (wire.mjs). */
+function setToolResult(c, r, ts) {
+  const { text, isError, images, diff } = r;
+  if (diff && diff !== c.resultDiff) c.resultDiff = diff;
+  c.diffStat = r.diffStat || null;
+  relabel(c);
+  if (r.clipped) {
+    c.pending = { toolId: c.toolId, at: r.at, size: r.clipped, loaded: false };
+    c.out.hidden = c.label.kind === "edit" && !isError && !c.dv.hidden;
+    c.out.textContent = `Output: ${fmtBytes(r.clipped)} (loads when opened)`;
+    c.more.hidden = true;
+    if (c.el.open) loadOutput(c);
+  } else { c.pending = null; showOutput(c, text || "", isError); }
   c.el.classList.remove("running"); c.el.classList.add(isError ? "err" : "ok");
   if (images?.length && !c.gotImages) { c.gotImages = true; addImages(c, images); }
   if (c.item.endTs == null) c.item.endTs = ts || Date.now();
@@ -267,7 +385,7 @@ function renderBlocks(view, t, blocks, ts) {
     if (b.type === "text") { breakWork(t); const d = el("div", "text"); d.innerHTML = md(b.text); t.body.appendChild(d); markStarted(t); }
     else if (b.type === "thinking") { if (String(b.text || "").trim()) reasonBlock(t).textContent = b.text; markStarted(t); }
     else if (b.type === "tool_call") { const c = toolCard(view, t, { ...b, ts }); if (b.args !== undefined) setToolArgs(c, b.args); }
-    else if (b.type === "tool_result") { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts }); setToolResult(c, b.text, b.isError, ts, b.images); }
+    else if (b.type === "tool_result") { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts }); setToolResult(c, b, ts); }
     else if (b.type === "image") { breakWork(t); const i = el("img"); i.src = `data:${b.mimeType};base64,${b.data}`; i.style.maxWidth = "100%"; t.body.appendChild(i); }
   }
 }
@@ -384,7 +502,7 @@ export function applyEvent(view, ev) {
         if (!ev.live) renderMeter(t);
       } else if (ev.role === "tool") {
         const t = turnOf(view, ev.ts, ev.live);
-        for (const b of ev.blocks) { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts: ev.ts }); setToolResult(c, b.text, b.isError, ev.ts, b.images); }
+        for (const b of ev.blocks) { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts: ev.ts }); setToolResult(c, b, ev.ts); }
         t.lastMsgTs = Math.max(t.lastMsgTs, ev.ts || 0);
       } else if (ev.role === "user") {
         closeTurn(view);
@@ -426,7 +544,7 @@ export function applyEvent(view, ev) {
       const c = toolCard(view, t, ev);
       if (ev.phase === "start" && ev.args !== undefined) setToolArgs(c, ev.args);
       if (ev.phase === "update") { c.out.hidden = false; c.out.textContent = (ev.text || "").slice(-30000); }
-      if (ev.phase === "end") setToolResult(c, ev.text, ev.isError, ev.ts, ev.images);
+      if (ev.phase === "end") setToolResult(c, ev, ev.ts);
       scrollBottom(view);
       break;
     }

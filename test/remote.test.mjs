@@ -1,8 +1,8 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, existsSync, symlinkSync, writeFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
-import { connect as netConnect } from "node:net";
+import { connect as netConnect, createServer as createNetServer } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -10,7 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Approvals, RemoteAuth, classify, describe, isHostRequest, parseCookies, parseProxyLine, redact } from "../server/access.mjs";
 import { SshTunnel, sshArgs } from "../server/tunnel.mjs";
-import { loadOrCreateCert } from "../server/tls.mjs";
+import { httpsRedirect, loadOrCreateCert } from "../server/tls.mjs";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { createApp } from "../server/index.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -34,6 +36,9 @@ test("classify: reads pass, changes need approval, host controls never run remot
   assert.equal(classify("GET", "/api/state"), "read");
   assert.equal(classify("GET", "/api/sessions/pi%3Aabc/history"), "read");
   assert.equal(classify("GET", "/api/fs/read"), "read");
+  for (const r of ["text", "hex", "raw"]) assert.equal(classify("GET", `/api/fs/${r}`), "read");
+  for (const r of ["write", "create", "rename", "duplicate", "delete"]) assert.equal(classify("POST", `/api/fs/${r}`), "write", r);
+  assert.equal(classify("POST", "/api/fs/reveal"), "host", "it opens a window on the host's screen");
   assert.equal(classify("POST", "/api/graph/query"), "read");
   assert.equal(classify("POST", "/api/sessions/x/continue"), "write");
   assert.equal(classify("POST", "/api/pi/prompt"), "write");
@@ -212,6 +217,35 @@ test("remote: an approved device signs straight in; a denied or duplicate one is
   const st = await (await fetch(`${hostUrl}/api/remote/status`)).json();
   assert.equal(st.devices.length, 1);
   assert.equal(st.deviceApproval, true);
+});
+
+test("remote: a link inside an allowed folder does not lead a password viewer out of it; the host is as it was", async (t) => {
+  const outside = join(base, "outside");
+  mkdirSync(join(outside, "deep"), { recursive: true });
+  writeFileSync(join(outside, "secret.txt"), "OUTSIDE-SECRET");
+  writeFileSync(join(outside, "deep", "s.png"), "x");
+  writeFileSync(join(work, "plain.txt"), "fine");
+  mkdirSync(join(work, "real"), { recursive: true });
+  writeFileSync(join(work, "real", "in.txt"), "inside");
+  try { symlinkSync(outside, join(work, "outlink"), "junction"); symlinkSync(join(work, "real"), join(work, "inlink"), "junction"); } catch { return t.skip("no links here"); }
+  const q = (route, path, extra = "") => `${route}?root=${encodeURIComponent(work)}&path=${encodeURIComponent(path)}${extra}`;
+  for (const route of ["/api/fs/list", "/api/fs/read", "/api/fs/text", "/api/fs/hex", "/api/fs/raw", "/api/fs/archive-entry"]) {
+    for (const path of ["outlink", "outlink/secret.txt", "/outlink/secret.txt", "//outlink/secret.txt", "outlink/deep/s.png", "outlink/not-there.txt", "real/../outlink/secret.txt"]) {
+      const r = await remoteFetch(q(route, path));
+      const text = await r.text();
+      assert.equal(r.status, 403, `${route} ${path}: ${text}`);
+      assert.ok(!text.includes("OUTSIDE-SECRET"), `${route} ${path}`);
+    }
+  }
+  const dl = await remoteFetch(q("/api/fs/raw", "outlink/secret.txt", "&download=1"));
+  assert.equal(dl.status, 403);
+  await dl.text();
+  // What stays inside still opens, by a link too, and the listing still shows the link itself.
+  assert.match(await (await remoteFetch(q("/api/fs/read", "plain.txt"))).text(), /fine/);
+  assert.match(await (await remoteFetch(q("/api/fs/read", "inlink/in.txt"))).text(), /inside/);
+  assert.match(await (await remoteFetch(q("/api/fs/list", ""))).text(), /outlink/);
+  // The person at the machine browses as before.
+  assert.match(await (await fetch(`${hostUrl}${q("/api/fs/read", "outlink/secret.txt")}`)).text(), /OUTSIDE-SECRET/);
 });
 
 test("remote: oversized bodies are refused before sign-in, and every answer carries the anti-framing headers", async () => {
@@ -421,6 +455,9 @@ test("relay listener: loopback only, HTTPS only, needs the PROXY line, and the v
       raw.on("error", () => resolve("reset"));
     });
     assert.match(await viaRelay("PROXY TCP4 9.8.7.6 10.0.0.1 51234 4443\r\n", "/api/state"), /^HTTP\/1\.1 401/);
+    const cert = await viaRelay("PROXY TCP4 9.8.7.6 10.0.0.1 51234 4443\r\n", "/omni-agent.crt");
+    assert.match(cert, /^HTTP\/1\.1 200/, "the certificate downloads before sign-in, for a phone to trust it");
+    assert.match(cert, /application\/x-x509-ca-cert[\s\S]*-----BEGIN CERTIFICATE-----/);
     assert.doesNotMatch(await viaRelay(null, "/api/state"), /HTTP/, "no PROXY line, no service");
     assert.doesNotMatch(await viaRelay("PROXY TCP4 garbage\r\n", "/api/state"), /HTTP/);
     const waiting = viaRelay("PROXY TCP4 9.8.7.6 10.0.0.1 51234 4443\r\n", "/api/remote/login", { password: "relay password!" });
@@ -438,4 +475,55 @@ test("relay listener: loopback only, HTTPS only, needs the PROXY line, and the v
     assert.equal(st.relay.url, "https://relay.example:4443/");
     assert.equal(st.relay.listening, true);
   } finally { rapp.close(); }
+});
+
+// --------------------------------------------------------------- plain http:// typed at an HTTPS port
+const rawExchange = (port, bytes) => new Promise((resolve) => {
+  const s = netConnect(port, "127.0.0.1", () => s.write(bytes));
+  let out = "";
+  s.on("data", (d) => { out += d; });
+  s.on("error", () => resolve(out));
+  s.on("close", () => resolve(out));
+});
+
+test("httpsRedirect: same host and path over https; a missing or odd Host uses the fallback; not HTTP → null", () => {
+  const r = (head) => httpsRedirect(Buffer.from(head), "10.0.0.1:4443");
+  assert.match(r("GET /login.html?x=1 HTTP/1.1\r\nHost: 72.62.59.232:4443\r\n\r\n"), /^HTTP\/1\.1 301 [^\r]*\r\nLocation: https:\/\/72\.62\.59\.232:4443\/login\.html\?x=1\r\n/);
+  assert.match(r("GET / HTTP/1.1\r\nhost: [fe80::1]:4443\r\n\r\n"), /Location: https:\/\/\[fe80::1\]:4443\/\r\n/);
+  assert.match(r("GET / HTTP/1.1\r\n\r\n"), /Location: https:\/\/10\.0\.0\.1:4443\/\r\n/, "no Host");
+  assert.match(r("GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n"), /Location: https:\/\/10\.0\.0\.1:4443\//, "a Host without the port would send the browser to 443");
+  assert.match(r("GET http://x/ HTTP/1.1\r\nHost: a:1\r\n\r\n"), /Location: https:\/\/a:1\/\r\n/, "absolute-form target → /");
+  assert.equal(r("SSH-2.0-OpenSSH\r\n"), null);
+  assert.equal(r("\x16\x03\x01"), null);
+});
+
+test("LAN listener with TLS: http:// gets a redirect to https://, TLS still serves the page, junk is dropped", { skip: !loadOrCreateCert({ dir: join(base, "tls-probe") }).cert && "no openssl" }, async () => {
+  const lapp = await createApp({ port: 0, lan: true, relay: { host: "" }, remotePort: 0, remoteHost: "127.0.0.1", tlsDir: join(base, "tls"), remoteAuth: new RemoteAuth({ failDelayMs: 0 }), vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: work, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
+  await lapp.listen();
+  try {
+    const port = lapp.remote.port;
+    const plain = await rawExchange(port, `GET /x?y=1 HTTP/1.1\r\nHost: 192.168.0.15:${port}\r\n\r\n`);
+    assert.ok(plain.startsWith(`HTTP/1.1 301 Moved Permanently\r\nLocation: https://192.168.0.15:${port}/x?y=1\r\n`), plain);
+    assert.equal(await rawExchange(port, "SSH-2.0-x\r\n"), "", "not HTTP, not TLS: closed");
+    const page = await new Promise((resolve, reject) => {
+      const t = tlsConnect({ port, host: "127.0.0.1", rejectUnauthorized: false }, () => t.write(`GET / HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`));
+      let out = "";
+      t.on("data", (d) => { out += d; });
+      t.on("error", reject);
+      t.on("close", () => resolve(out));
+    });
+    assert.match(page, /^HTTP\/1\.1 (200|302)/);
+  } finally { lapp.close(); }
+});
+
+test("the VPS relay: http:// gets a redirect to https://, junk is dropped", async () => {
+  const port = await new Promise((r) => { const s = createNetServer().listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => r(p)); }); });
+  const child = spawn(process.execPath, [fileURLToPath(new URL("../relay/omni-relay.mjs", import.meta.url))], { env: { ...process.env, PUBLIC_PORT: String(port), TUNNEL_PORT: "1" }, stdio: ["ignore", "pipe", "inherit"] });
+  try {
+    await new Promise((r) => child.stdout.on("data", (d) => { if (/omni-relay: public/.test(d)) r(); }));
+    const plain = await rawExchange(port, "GET /login HTTP/1.1\r\nHost: 72.62.59.232:4443\r\nUser-Agent: Safari\r\n\r\n");
+    assert.ok(plain.startsWith("HTTP/1.1 301 Moved Permanently\r\nLocation: https://72.62.59.232:4443/login\r\n"), plain);
+    assert.match(await rawExchange(port, "GET / HTTP/1.1\r\n\r\n"), new RegExp(`Location: https://(127\\.0\\.0\\.1|\\[::1\\]):${port}/\r\n`), "no Host: its own address");
+    assert.equal(await rawExchange(port, "SSH-2.0-x\r\n"), "");
+  } finally { child.kill(); }
 });

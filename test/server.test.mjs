@@ -234,7 +234,7 @@ function makeFakePi({ cwd, model, provider, thinking }) {
   return fakePi;
 }
 const oc2 = new FakeServer();
-const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false, opencodeServer: oc2, opencodeConfigDir: join(base, "oc2-config"), opencodeProvidersFile: join(base, "omni", "opencode-providers.json") });
+const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false, piThinking: "", opencodeServer: oc2, opencodeConfigDir: join(base, "oc2-config"), opencodeProvidersFile: join(base, "omni", "opencode-providers.json") });
 const disposes = () => oc2.calls.filter((c) => c.method === "POST" && c.path === "/global/dispose").length;
 const app2Logs = [];
 app2.bus.on("event", (ev) => { if (ev.kind === "log") app2Logs.push(ev); });
@@ -677,7 +677,7 @@ mkdirSync(personasDir, { recursive: true });
 writeFileSync(join(personasDir, "scout.md"), "---\nname: scout\ndescription: Recon.\ntools: read, find\n---\nYou scout.\n");
 const oc = new FakeServer({ catalog: OC_CATALOG, up: false, reply: (m, p) => (m === "POST" && /^\/session\/[^/]+\/message$/.test(p) ? { info: { id: "msg_side" }, parts: [{ type: "text", text: "side answer" }] } : undefined) });
 const ocLogs = [];
-const app4 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(ocBase, "vault"), piSessionsDir: join(ocBase, "pi-sessions"), claudeProjectsDir: join(ocBase, "claude-projects"), autoStartPi: false, cwd: ocBase, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeServer: oc, opencodeConfigDir: join(ocBase, "oc-config"), piExtConfigFile: join(ocBase, "pi-agent", "omni-agent.json"), piModelsFile: join(ocBase, "pi-agent", "models.json"), statusSessionsDir: join(ocBase, "status"), personasDir, piModels: ["anthropic/x"], piProvider: "opencode", piModel: "gone", piThinking: "high", context: { compactAt: 300000 } });
+const app4 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(ocBase, "vault"), piSessionsDir: join(ocBase, "pi-sessions"), claudeProjectsDir: join(ocBase, "claude-projects"), autoStartPi: false, cwd: ocBase, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeServer: oc, opencodeConfigDir: join(ocBase, "oc-config"), piExtConfigFile: join(ocBase, "pi-agent", "omni-agent.json"), piModelsFile: join(ocBase, "pi-agent", "models.json"), statusSessionsDir: join(ocBase, "status"), personasDir, piModels: ["anthropic/x"], piProvider: "opencode", piModel: "gone", piThinking: "high", context: { compactAt: 300000 }, opencodeAuthFile: join(ocBase, "oc-data", "opencode", "auth.json"), opencodeAuthWatch: { interval: 20, debounceMs: 30 } });
 app4.bus.on("event", (ev) => { if (ev.kind === "log") ocLogs.push(ev); });
 await app4.listen();
 const port4 = app4.server.address().port;
@@ -794,6 +794,18 @@ test("opencode: a provider or MCP change rewrites opencode.json and disposes the
   const j = await r.json();
   assert.equal(j.restarted, true);
   assert.ok(oc.calls.slice(before).some((c) => c.method === "POST" && c.path === "/global/dispose"));
+  assert.equal(app4.pis.find((c) => c.sid === ocSid), chat, "the chat keeps going on the same server");
+});
+
+test("opencode: a login made outside Omni (OpenCode's auth.json changed) reloads the running server", async () => {
+  const chat = app4.pis.find((c) => c.sid === ocSid);
+  chat.streaming = false; chat.inFlight = 0;
+  const before = oc.calls.length;
+  mkdirSync(join(ocBase, "oc-data", "opencode"), { recursive: true });
+  writeFileSync(join(ocBase, "oc-data", "opencode", "auth.json"), JSON.stringify({ "opencode-go": { type: "api", key: "k" } }));
+  let reloaded = false;
+  for (let i = 0; i < 150 && !reloaded; i++) { await sleep(20); reloaded = oc.calls.slice(before).some((c) => c.method === "POST" && c.path === "/global/dispose"); }
+  assert.ok(reloaded, "the server's instances were disposed, so they read the new login");
   assert.equal(app4.pis.find((c) => c.sid === ocSid), chat, "the chat keeps going on the same server");
 });
 

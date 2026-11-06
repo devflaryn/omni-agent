@@ -8,7 +8,7 @@
  *   msg      { id, groupId?, role: user|assistant|tool|system, blocks[], usage?, model?, cost?, live }
  *   delta    { index, part: text|thinking|tool_args, delta, toolId? }
  *   block    { index, phase: start|end, part, toolId?, name?, text? }
- *   tool     { toolId, name, phase: start|update|end, args?, text?, isError?, details? }   (details: the plan tool's state only)
+ *   tool     { toolId, name, phase: start|update|end, args?, text?, isError?, details?, diff? }   (details: the plan tool's state only; diff: an edit's unified diff)
  *   status   { streaming }
  *   usage    { usage }
  *   compaction { summary }
@@ -80,9 +80,21 @@ function toolResultBlock(toolId, name, content, isError) {
   return b;
 }
 
-/** The plan tool's state rides along on its result (the goal hook and the status box read it); other tools' details are dropped. */
+const DIFF_TOOLS = /^(edit|write|multiedit|apply_patch|patch)$/i;
+const DIFF_MAX = 256 * 1024;
+/**
+ * The plan tool's state rides along on its result (the goal hook and the status box read it), and an edit's
+ * unified diff (OpenCode's `metadata.diff`, or each patched file's) as `diff` for the row's diff view;
+ * other details are dropped.
+ */
 function planDetails(out, name, details) {
-  if (name === PLAN_TOOL && details && typeof details === "object" && details.plan) out.details = { plan: details.plan, events: details.events || [], ok: details.ok !== false };
+  if (!details || typeof details !== "object") return out;
+  if (name === PLAN_TOOL && details.plan) out.details = { plan: details.plan, events: details.events || [], ok: details.ok !== false };
+  if (DIFF_TOOLS.test(String(name || ""))) {
+    const diff = typeof details.diff === "string" && details.diff ? details.diff
+      : Array.isArray(details.files) ? details.files.map((f) => (typeof f?.diff === "string" ? f.diff : "")).filter(Boolean).join("\n") : "";
+    if (diff && diff.length <= DIFF_MAX) out.diff = diff;
+  }
   return out;
 }
 

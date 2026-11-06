@@ -146,7 +146,7 @@ export class ChannelSet {
   /** Opens a channel to another machine on the account. */
   async open(deviceId) {
     if (this.ctx.phase() === "log-damaged") throw new AccountError(409, "log-damaged", "The device log on this computer is damaged.");
-    if (this.ctx.phase() !== "approved" || !this.ctx.connected()) throw new AccountError(409, "not-connected", "This computer is not connected to the account.");
+    if (this.ctx.phase() !== "approved" || !this.ctx.connected()) throw new AccountError(409, "not-connected", "This device is not connected to the account.");
     const peerDevice = await this.#currentDevice(deviceId);
     if (!peerDevice) throw new AccountError(404, "no-such-device", "That device is not on the account.");
     if (deviceId === this.ctx.keys().signPub) throw new AccountError(400, "self", "This is this computer.");

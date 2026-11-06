@@ -14,7 +14,11 @@ const MAX_EVENT_BUFFER = 64 * 1024 * 1024; // one event a far machine never ends
 function target(path) {
   // The URL parser would read these as another host and drop it, leaving a path nobody asked for.
   if (/^[\\/]{2}/.test(path)) throw failure("That is not a path on a machine.", 400, "bad-path");
+  // Nor is anything with a scheme of its own, as the parser would read it: it drops tabs and newlines and leading spaces, and takes
+  // "http:/x" as a path of this same scheme, so looking at the parsed origin alone is not enough.
+  if (/^[a-z][a-z0-9+.-]*:/i.test(String(path).replace(/[\t\r\n]/g, "").replace(/^[\u0000-\u0020]+/, ""))) throw failure("That is not a path on a machine.", 400, "bad-path");
   const url = new URL(path, "http://omni.invalid");
+  if (url.origin !== "http://omni.invalid") throw failure("That is not a path on a machine.", 400, "bad-path");
   return `${url.pathname}${url.search}`;
 }
 

@@ -14,7 +14,7 @@ export const WEB_FILES = Object.freeze([
   "web.html", "web.js", "web.css", "login-worker.js",
   "account-core.js", "account-error.js", "channel-client.js", "channel-frames.js", "channel-set.js", "device-log.js", "emitter.js", "hub-socket.js", "log-trust.js", "machine-links.js",
   "page-account.js", "page-files.js", "page-store.js", "page-transport.js", "transport.js",
-  "index.html", "styles.css", "app.js", "account.js", "composer.js", "explorer.js", "lib.js", "mcp-settings.js", "mission.js", "office-engine.js", "office-font.js", "office-props.js", "office-worker.js", "office.js", "panel.js", "plan.js", "remote.js", "resizer.js", "settings.js", "sidebar.js", "stream.js", "thinking.js", "transcript.js",
+  "index.html", "styles.css", "app.js", "account.js", "composer.js", "contextmenu.js", "editor.js", "explorer.js", "fileicons.js", "filepane.js", "highlight.js", "lib.js", "mcp-settings.js", "mission.js", "office-engine.js", "office-font.js", "office-props.js", "office-worker.js", "office.js", "panel.js", "plan.js", "remote.js", "resizer.js", "settings.js", "sidebar.js", "stream.js", "thinking.js", "transcript.js",
   "logo.svg", "icon-32.png", "icon-180.png", "icon-192.png", "icon-512.png",
 ]);
 

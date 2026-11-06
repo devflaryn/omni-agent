@@ -24,12 +24,15 @@ export function cleanName(name, max = 64, fallback = "Unnamed device") {
 let env = {
   get storage() { try { return globalThis.sessionStorage ?? null; } catch { return null; } },
   reload: () => globalThis.location?.reload(),
+  confirm: (text) => globalThis.confirm(text),
 };
 /** For tests. */
-export function setTransportEnv(replacement) { env = replacement; current = undefined; channelImpl = null; }
+export function setTransportEnv(replacement) { env = replacement; current = undefined; channelImpl = null; leaveChecks.clear(); leaving = false; }
 
 let current; // undefined until first read: { id, name } | null
 let channelImpl = null;
+const leaveChecks = new Set();
+let leaving = false;
 
 function read() {
   if (current !== undefined) return current;
@@ -66,19 +69,33 @@ export function setChannelTransport(impl) { channelImpl = impl; }
 /** Whether this is the web page or the iPhone's web view, which has no computer of its own and may not approve anything. */
 export const webPage = () => channelImpl !== null;
 
+/** `check()` says why this window should not leave its machine (unsaved files), or nothing. Returns the way to remove it. */
+export function onLeaveCheck(check) { leaveChecks.add(check); return () => leaveChecks.delete(check); }
+/** A switch has been agreed and the page is about to go: it asks nothing more of the person. */
+export const isLeaving = () => leaving;
+
 /**
  * Points this window at a machine, or at this computer with null, and starts the page over on it. `name` is what the top
  * bar shows. Nothing is sent to the machine by this: the reloaded page asks for its state, and says so if it cannot.
+ *
+ * The person is asked here, before anything changes, so that No leaves the window exactly where it was and a later refresh
+ * does not jump machines. This page stays on its machine until it is gone: what it shows and what it sends never differ.
+ * `whenClean`: not the person's own choice, so it does not ask, and waits to be tried again.
  */
-export function setMachine(id, { name, reload = true } = {}) {
+export function setMachine(id, { name, reload = true, whenClean = false } = {}) {
   const next = id ? { id: String(id), name: cleanName(name) } : null;
   const unchanged = (read()?.id ?? null) === (next?.id ?? null);
-  current = next;
+  const switching = reload && !unchanged;
+  if (switching) {
+    const reasons = [...leaveChecks].map((check) => check()).filter(Boolean);
+    if (reasons.length && (whenClean || !env.confirm(`${reasons.join("\n")}\n\nSwitch machine and lose them?`))) return read();
+    leaving = true;
+  } else current = next;
   try {
     if (next) env.storage?.setItem(STORE_KEY, JSON.stringify(next));
     else env.storage?.removeItem(STORE_KEY);
   } catch { /* in memory only, for this page */ }
-  if (reload && !unchanged) env.reload();
+  if (switching) env.reload();
   return next;
 }
 
@@ -92,7 +109,7 @@ export function onStillWaiting(listener) { waitingListeners.add(listener); retur
 /** For tests. */
 export function setStillWaitingAfter(ms) { stillWaitingAfterMs = ms; }
 
-/** One request. Throws an Error with `.status` and `.code`, whose message names the machine when another was asked. */
+/** One request. Throws an Error with `.status`, `.code` and the answer as `.body` (a file save tells a conflict or a binary from other failures), whose message names the machine when another was asked. */
 export async function api(method, path, body) {
   if (!read()) return ask(method, path, body);
   let late = false;
@@ -119,7 +136,7 @@ async function ask(method, path, body) {
 async function localAnswer(r) {
   const j = await r.json().catch(() => ({}));
   if (r.status === 401 && j.login) { globalThis.location?.reload(); throw new Error("signed out"); }
-  if (!r.ok || j.error) throw failure(j.error || `${r.status}`, r.status, j.code);
+  if (!r.ok || j.error) throw failure(j.error || `${r.status}`, r.status, j.code, j);
   return j;
 }
 
@@ -138,18 +155,16 @@ export function answerFrom(status, text, m) {
     try { j = JSON.parse(text); }
     catch { throw failure(`${m.name} sent an answer that could not be read. The action may or may not have run there.`, 502, "machine-lost"); }
   }
-  if (status < 200 || status > 299 || j.error) {
-    const e = failure(j.error || `${m.name} answered ${status}`, status, j.code);
-    e.body = j; // what the far machine said, whole: a file pane's conflict is in it
-    throw e;
-  }
+  // What the far machine said goes along whole: a file pane's conflict is in it.
+  if (status < 200 || status > 299 || j.error) throw failure(j.error || `${m.name} answered ${status}`, status, j.code, j);
   return j;
 }
 
-export function failure(message, status, code) {
+export function failure(message, status, code, body) {
   const e = new Error(message);
   if (status) e.status = status;
   if (code) e.code = code;
+  if (body) e.body = body;
   return e;
 }
 
@@ -203,7 +218,7 @@ export const local = Object.freeze({
       ? { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body ?? {}) }
       : { method: "GET" });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.error) throw failure(j.error || `${r.status}`, r.status, j.code);
+    if (!r.ok || j.error) throw failure(j.error || `${r.status}`, r.status, j.code, j);
     return j;
   },
   eventSource(url) { return channelImpl?.local ? channelImpl.local.eventSource(url) : new globalThis.EventSource(url); },

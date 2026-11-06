@@ -120,7 +120,8 @@ export class MachineLinks extends Emitter {
       const started = Date.now();
       if (!(await this.#whenConnected(connectTimeoutMs))) {
         const { hub } = this.account.status();
-        throw new Error(hub.gaveUp && hub.lastError ? hub.lastError.replace(/\.$/, "") : `${this.selfName} is not connected to the hub`);
+        const why = hub.connectionError ?? hub.lastError; // the connection's, not a recovery code's
+        throw new Error(hub.gaveUp && why ? why.replace(/\.$/, "") : `${this.selfName} is not connected to the hub`);
       }
       const channel = await deadline(this.account.openChannel(link.id), connectTimeoutMs - (Date.now() - started), `${link.name} did not finish connecting`);
       link.channel = channel;

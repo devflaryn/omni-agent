@@ -52,6 +52,11 @@ export async function hubPost({ fetchImpl, hubUrl, timeoutMs }, path, body) {
  * Callbacks: session(), signKey() the private key to prove with, onAuthOk(message), onMessage(message), onGone(code),
  * onConnectTimeout(), onChange().
  */
+/** The connection's reasons that are only that it went: a reconnect answers them. Any other reason says something more. */
+export const HUB_DROPPED = "The hub connection was lost.";
+export const HUB_SILENT = "The hub did not answer.";
+export const ORDINARY_DROP = new Set([HUB_DROPPED, HUB_SILENT]);
+
 export class HubSocket {
   connected = false;
   attempts = 0;
@@ -66,6 +71,9 @@ export class HubSocket {
   constructor({ hubUrl, hubOrigin, WebSocketImpl, limits, reconnect, session, signKey, onAuthOk, onMessage, onGone, onConnectTimeout, onChange }) {
     Object.assign(this, { hubUrl, hubOrigin, WebSocketImpl, limits, reconnect, session, signKey, onAuthOk, onMessage, onGone, onConnectTimeout, onChange });
   }
+
+  /** Whether a new connection is on its way or has a time set. */
+  get reconnecting() { return !this.connected && !this.stopped && (this.#reconnectTimer !== null || this.ws !== null); }
 
   connect() {
     if (this.stopped || !this.session() || this.ws) return;

@@ -15,7 +15,8 @@ export { MachineError };
 const SECOND = 1000;
 const DRAIN_MS = 2 * SECOND;
 const SELF = "That is this computer: there is nothing to connect to.";
-const REPLY_HEADERS = ["content-type", "content-length", "content-range", "accept-ranges", "cache-control", "etag", "last-modified", "content-disposition", "content-encoding", "x-accel-buffering"];
+// Not content-disposition: it beats the page's a.download, so a far machine could save notes.txt as notes.txt.exe.
+const REPLY_HEADERS = ["content-type", "content-length", "content-range", "accept-ranges", "cache-control", "etag", "last-modified", "content-encoding", "x-accel-buffering"];
 
 /** Nothing a far machine sends may run in this window's origin, which holds the account's cookie. */
 const SANDBOX = "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'";

@@ -2595,7 +2595,7 @@ test("hacked hub: a close claiming removal does not make this device removed; th
   assert.equal(first.status().hub.lastError, null);
 });
 
-test("hub says removed for real: sign-in is still allowed, and the person is not told to forget the device", async () => {
+test("hub says removed for real: signing in says so rather than waiting, and forgetting stays the person's choice", async () => {
   const fixture = await hubFixture();
   const { first, second } = await pairWithTap(fixture);
   await first.remove(second.status().device.id);
@@ -2603,8 +2603,10 @@ test("hub says removed for real: sign-in is still allowed, and the person is not
   await until(() => second.status().phase === "signed-out", "the session is gone");
   assert.match(second.status().hub.lastError, /hub says/i);
   assert.ok(!second.alerts.some((a) => a.kind === "removed"), "this device has not seen a log saying so");
-  const out = await second.signIn({ email: EMAIL, password: PASSWORD });
-  assert.equal(out.phase, "pending", "it may ask");
+  await assert.rejects(second.signIn({ email: EMAIL, password: PASSWORD }), (e) => e.code === "removed" && /hub reports/.test(e.message) && /another device/.test(e.message));
+  assert.equal(second.status().phase, "signed-out", "no wait for an approval that cannot come");
+  assert.ok(!second.alerts.some((a) => a.kind === "removed"), "still only the hub's word");
+  assert.ok(second.status().device, "the keys are still here, until the person forgets them");
 });
 
 test("a session the hub replaced, removed or expired does not loop reconnecting", async () => {
@@ -2619,6 +2621,133 @@ test("a session the hub replaced, removed or expired does not loop reconnecting"
   assert.equal(first.status().hub.attempts, 0, "not even an attempt");
   assert.equal(twin.status().hub.connected, true);
   assert.match(first.status().hub.lastError, /replaced/i);
+  // It says so, and what is waiting for the hub fails at once rather than waiting for what will not come.
+  assert.equal(first.status().hub.gaveUp, true);
+  assert.equal(first.status().hub.reconnecting, false);
+  assert.equal(twin.status().hub.gaveUp, false);
+  const { hubLostText } = await import("../ui/account.js");
+  assert.match(hubLostText(first.status()), /^Replaced by another sign-in/);
+  assert.doesNotMatch(hubLostText(first.status()), /reconnects by itself/);
+  const { MachineLinks } = await import("../ui/machine-links.js");
+  const far = { id: "far", name: "Far", kind: "desktop", role: "full", online: true };
+  const links = new MachineLinks({ account: { status: () => first.status(), devices: () => [far], openChannel: () => assert.fail("nothing to open"), on() {}, off() {} } });
+  const asked = Date.now();
+  await assert.rejects(links.request("far", { method: "GET", path: "/x" }), /Replaced by another sign-in/);
+  assert.ok(Date.now() - asked < 2000, "no wait");
+  links.close?.();
+  // Signing out ends the giving up.
+  await first.signOut();
+  assert.equal(first.status().hub.gaveUp, false);
+});
+
+test("a removed desktop that signs in again is told so, rather than waiting for an approval that cannot come", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture);
+  const gone = await joined(fixture, first);
+  const id = gone.status().device.id, dir = gone.dir;
+  // Removed while it is away, so its own log still lists it.
+  await gone.stop();
+  await first.remove(id);
+  const again = makeAccount(fixture, { dir });
+  await again.start();
+  await until(() => again.status().phase === "signed-out", "it settles to signed out");
+  assert.equal(again.status().device.role, "full", "its own log does not show the removal");
+  // What anchors this device: its keys and its log. state.json and the like are rewritten as they should be.
+  const files = () => Object.fromEntries(["keys.json", "log.json"].map((f) => [f, readFileSync(join(dir, f)).toString("base64")]));
+  const before = files();
+
+  await assert.rejects(again.signIn({ email: EMAIL, password: PASSWORD }), (e) => {
+    assert.equal(e.status, 409);
+    assert.equal(e.code, "removed");
+    assert.match(e.message, /hub reports/);
+    assert.match(e.message, /another device/);
+    assert.match(e.message, /Forget this device/);
+    return true;
+  });
+  assert.equal(again.status().phase, "signed-out", "not pending");
+  assert.equal(again.status().hub.connected, false);
+  assert.ok(again.alerts.some((a) => a.kind === "hub-says-removed"));
+  await sleep(100);
+  assert.equal(again.status().hub.connected, false, "no socket behind its back");
+  assert.deepEqual(files(), before, "nothing was deleted");
+  assert.equal(again.status().device.id, id, "the same keys");
+  assert.equal(again.status().device.role, "full", "the same log");
+  // It never connected, so the other device is not shown a card it could not approve.
+  await sleep(150);
+  assert.equal(first.pendingSignIns().find((r) => r.signPub === id), undefined);
+
+  // The person's choice, then a new device like any other.
+  await again.signOut({ forget: true });
+  await again.signIn({ email: EMAIL, password: PASSWORD, name: "Back" });
+  assert.equal(again.status().phase, "pending");
+  assert.notEqual(again.status().device.id, id);
+  await approveNewDevice(first, again);
+  assert.equal(again.status().phase, "approved");
+});
+
+test("a hub that says pending falsely costs nothing: the keys and the log are still good", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture);
+  const member = await joined(fixture, first);
+  const id = member.status().device.id;
+  await member.signOut();
+  let lying = true;
+  const fetchImpl = async (url, init) => {
+    const r = await fetch(url, init);
+    if (!lying || !String(url).endsWith("/api/login")) return r;
+    return new Response(JSON.stringify({ ...(await r.json()), state: "pending" }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  const again = makeAccount(fixture, { dir: member.dir, fetchImpl });
+  await again.start();
+  await assert.rejects(again.signIn({ email: EMAIL, password: PASSWORD }), (e) => e.code === "removed" && /hub reports/.test(e.message));
+  assert.equal(again.status().phase, "signed-out");
+  lying = false;
+  await again.signIn({ email: EMAIL, password: PASSWORD });
+  assert.equal(again.status().phase, "approved", "the same device, still on the account");
+  assert.equal(again.status().device.id, id);
+  assert.equal(first.status().device.role, "full");
+});
+
+test("a new device still waits: the check is only for a key that has been on the log", async () => {
+  const fixture = await hubFixture();
+  await registered(fixture);
+  const fresh = makeAccount(fixture);
+  await fresh.signIn({ email: EMAIL, password: PASSWORD });
+  assert.equal(fresh.status().phase, "pending");
+  assert.equal(fresh.alerts.filter((a) => a.kind === "hub-says-removed").length, 0);
+});
+
+test("changing the password: sent with no answer says it may or may not have happened", async () => {
+  const fixture = await hubFixture();
+  const first = await registered(fixture, { limits: { rpcTimeoutMs: 80 } });
+  first.tap.outgoing = (m) => (m.type === "password.change" ? null : m);
+  await assert.rejects(first.changePassword({ current: PASSWORD, next: "another long password" }), (e) => {
+    assert.equal(e.code, "hub-timeout");
+    assert.match(e.message, /may or may not have taken effect/);
+    assert.match(e.message, /both passwords/);
+    return true;
+  });
+  // The socket going after it was sent is the same doubt.
+  const pending = first.changePassword({ current: PASSWORD, next: "another long password" });
+  first.tap.outgoing = (m) => { if (m.type === "password.change") setImmediate(() => first.tap.sockets.at(-1).close()); return m.type === "password.change" ? null : m; };
+  await assert.rejects(pending, /may or may not have taken effect/);
+  // The hub's own answer stays what it is, and so does a change that was never sent.
+  first.tap.outgoing = null;
+  await until(() => first.status().hub.connected, "back");
+  await assert.rejects(first.changePassword({ current: "wrong password here", next: "another long password" }), (e) => e.status === 401 && !/may or may not/.test(e.message));
+  await first.stop();
+});
+
+test("an ordinary drop: a reconnect is set, and the banner may say so", async () => {
+  const fixture = await hubFixture();
+  const a = await registered(fixture);
+  const { hubLostText } = await import("../ui/account.js");
+  await fixture.hub.close();
+  await until(() => !a.status().hub.connected, "the loss");
+  await until(() => a.status().hub.reconnecting, "a reconnect set");
+  assert.equal(a.status().hub.gaveUp, false);
+  assert.match(a.status().hub.connectionError, /connection was lost/);
+  assert.match(hubLostText(a.status()), /^this computer has lost the hub.*It reconnects by itself\.$/);
 });
 
 // ------------------------------------------------------------------------------- secrets

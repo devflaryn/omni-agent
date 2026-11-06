@@ -18,7 +18,7 @@ import { decodeOuter, foreignOuter } from "./channel-frames.js";
 import { AccountError } from "./account-error.js";
 import { ChannelSet } from "./channel-set.js";
 import { Emitter } from "./emitter.js";
-import { HubSocket, hubPost } from "./hub-socket.js";
+import { HUB_DROPPED, HUB_SILENT, HubSocket, hubPost } from "./hub-socket.js";
 import { NewDeviceApproval, addAlert, checkApprovedLog, judgeLog } from "./log-trust.js";
 import { MachineLinks } from "./machine-links.js";
 
@@ -115,7 +115,7 @@ export class PageAccount extends Emitter {
       onAuthOk: (message) => { this.#onAuthOk(message); },
       onMessage: (message) => this.#dispatch(message),
       onGone: (code) => this.#onSocketGone(code),
-      onConnectTimeout: () => { this.#hubError = "The hub did not answer."; },
+      onConnectTimeout: () => { this.#hubError = HUB_SILENT; },
       onChange: () => this.#changed(),
     });
     this.#exchange = new NewDeviceApproval({
@@ -157,7 +157,7 @@ export class PageAccount extends Emitter {
       email: this.#email,
       accountId: this.#verified?.accountId ?? null,
       device: this.#keys ? { id: this.#keys.signPub, name: this.#name, kind: this.#kind, role: me?.role ?? null, expiresAt: me ? deviceExpiresAt(me) : null } : null,
-      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#hubError, gaveUp: this.#hubGaveUp },
+      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#hubError, connectionError: this.#hubError, gaveUp: this.#hubGaveUp, reconnecting: this.#hub.reconnecting },
       logHead: this.#hashes.at(-1) ?? null,
       logVersion: this.#hashes.length,
       pending: this.#phase === "pending" ? { code: this.#exchange.current?.code ?? null, attempts: this.#exchange.attempts, failed: this.#exchange.failed, confirmed: !!this.#exchange.current?.confirmed, approvedByHub: this.#approvedByHub, approverOnline: this.#approverOnline } : null,
@@ -425,7 +425,7 @@ export class PageAccount extends Emitter {
         this.#settle("signed-out", this.#hubClaimedRemoved ? "The hub says this page is no longer on the account. Sign in again to check." : "The hub no longer knows this session. Sign in again.");
         return;
       default:
-        this.#hubError ??= "The hub connection was lost.";
+        this.#hubError ??= HUB_DROPPED;
         this.#hub.scheduleReconnect();
     }
   }

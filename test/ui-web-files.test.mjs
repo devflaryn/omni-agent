@@ -8,7 +8,12 @@ const uiSource = (f) => readFileSync(new URL(f, uiDir), "utf8");
 
 test("no direct URL can reach a frame or a window: no UI file frames or navigates to a file's bytes", () => {
   for (const f of readdirSync(uiDir).filter((x) => x.endsWith(".js"))) {
-    const src = uiSource(f);
+    let src = uiSource(f);
+    if (f === "filepane.js") {
+      // A desktop's PDF, where the server's headers go with it, and only where framesFiles() says so.
+      const guarded = [/if \(t\.mode === "pdf" && framesFiles\(\)\) actions\.appendChild\(button\("Open in new tab", \(\) => fileUrl\(t\)\.then\(\(u\) => window\.open\(/, /if \(!framesFiles\(\)\) return t\.view\.appendChild\(binaryCard\([^\n]*\r?\n\s*const f = el\("iframe"/];
+      for (const line of guarded) { assert.match(src, line, "filepane.js frames only where framesFiles() allows"); src = src.replace(line, ""); }
+    }
     assert.doesNotMatch(src, /createElement\(["']iframe|el\(["']iframe|srcdoc|\.showModal\(\s*rawUrl/i, `${f} frames something`);
     assert.doesNotMatch(src, /window\.open\(/, `${f} opens a window`);
     assert.doesNotMatch(src, /location\.(href|assign|replace)\s*(=|\()\s*(?!["'`]\/["'`])/, `${f} navigates by a computed URL`);

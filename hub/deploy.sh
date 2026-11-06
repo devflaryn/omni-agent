@@ -25,7 +25,7 @@ FILES=(
   ui/web.html ui/web.js ui/web.css ui/login-worker.js
   ui/account-core.js ui/account-error.js ui/channel-client.js ui/channel-frames.js ui/channel-set.js ui/device-log.js ui/emitter.js ui/hub-socket.js ui/log-trust.js ui/machine-links.js
   ui/page-account.js ui/page-files.js ui/page-store.js ui/page-transport.js ui/transport.js
-  ui/index.html ui/styles.css ui/app.js ui/account.js ui/composer.js ui/explorer.js ui/lib.js ui/mcp-settings.js ui/mission.js ui/office-engine.js ui/office-font.js ui/office-props.js ui/office-worker.js ui/office.js ui/panel.js ui/plan.js ui/remote.js ui/resizer.js ui/settings.js ui/sidebar.js ui/stream.js ui/thinking.js ui/transcript.js
+  ui/index.html ui/styles.css ui/app.js ui/account.js ui/composer.js ui/contextmenu.js ui/editor.js ui/explorer.js ui/fileicons.js ui/filepane.js ui/highlight.js ui/lib.js ui/mcp-settings.js ui/mission.js ui/office-engine.js ui/office-font.js ui/office-props.js ui/office-worker.js ui/office.js ui/panel.js ui/plan.js ui/remote.js ui/resizer.js ui/settings.js ui/sidebar.js ui/stream.js ui/thinking.js ui/transcript.js
   ui/logo.svg ui/icon-32.png ui/icon-180.png ui/icon-192.png ui/icon-512.png
 )
 staging="$(mktemp -d)"

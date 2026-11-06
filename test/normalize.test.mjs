@@ -173,3 +173,16 @@ test("the plan tool's state rides on its result (live tool event and tool-result
   const [msg] = normalizePiEntry({ type: "message", id: "e1", timestamp: 1, message: { role: "toolResult", toolCallId: "c1", toolName: "plan", content: [{ type: "text", text: "ok" }], details: { plan, events: ["created"] } } }, ctx);
   assert.deepEqual(msg.blocks[0].details, { plan, events: ["created"], ok: true });
 });
+
+test("an edit's unified diff (OpenCode metadata.diff or apply_patch's per-file diffs) rides on its result as `diff`", () => {
+  const diff = "@@ -1,1 +1,1 @@\n-a\n+b\n";
+  const [live] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c1", toolName: "edit", result: { content: [{ type: "text", text: "Edit applied successfully." }], details: { diff, filediff: { additions: 1 } } } }, ctx);
+  assert.equal(live.diff, diff);
+  assert.equal(live.details, undefined);
+  const [patch] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c2", toolName: "apply_patch", result: { content: [], details: { files: [{ diff: "x" }, { diff: "y" }] } } }, ctx);
+  assert.equal(patch.diff, "x\ny");
+  const [msg] = normalizePiEntry({ type: "message", id: "e1", timestamp: 1, message: { role: "toolResult", toolCallId: "c1", toolName: "edit", content: [], details: { diff } } }, ctx);
+  assert.equal(msg.blocks[0].diff, diff);
+  const [bash] = normalizeRpcEvent({ type: "tool_execution_end", toolCallId: "c3", toolName: "bash", result: { content: [], details: { diff } } }, ctx);
+  assert.equal(bash.diff, undefined);
+});

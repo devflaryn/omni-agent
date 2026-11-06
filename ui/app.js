@@ -1,6 +1,6 @@
 /* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only. */
 import { el, baseName, cleanTitle, applyStatus, AGENT_ACTIVE, agentTone, agentKindLabel, harnessLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
-import { newView, applyEvent, finish, forkNote, agentNote, emptyNote, isFollowing } from "./transcript.js";
+import { newView, applyEvent, finish, forkNote, agentNote, emptyNote, setOlder, prependHistory, isFollowing } from "./transcript.js";
 import { createComposer } from "./composer.js";
 import { createHistory } from "./sidebar.js";
 import { createPanel } from "./panel.js";
@@ -80,7 +80,8 @@ function loadAgents(list, rev = agentRev) {
 const openChat = (sid) => { selectSession(sid); showView("chat"); if (window.innerWidth < 1100) panel.setOpen(false); };
 const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat, agentFor });
 const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => history.render() });
-const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat") });
+// Reveal opens a window on the screen of the computer serving the files: never from a remote browser, or from a window on another machine.
+const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat"), isRemote: () => remote.role === "remote" || isRemote() });
 const account = createAccount({ toast, openSettings: () => settings.open("account") });
 const settings = createSettings({ api, toast, onChanged: () => { loadPiChoices(); refreshState(); }, loadRemote: () => remote.loadSettings(), loadAccount: () => account.renderSettings(), getContext: () => S.config?.context, onContext: (context) => { S.config = { ...(S.config || {}), context }; } });
 const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => settings.open(), onHook: setHook };
@@ -149,7 +150,7 @@ async function setHook(patch) {
 
 // --------------------------------------------------------------- views
 /** `persist` only for a deliberate toggle; leaving the chat view must not remember "closed". */
-function setExplorer(open, persist = false) { document.body.classList.toggle("explorer-open", open); if (!open) explorer.closePreview(); if (persist) { try { localStorage.setItem("omni.explorer", open ? "1" : "0"); } catch { /* */ } } }
+function setExplorer(open, persist = false) { document.body.classList.toggle("explorer-open", open); if (!open) explorer.closePreview(); else explorer.restorePreview(); if (persist) { try { localStorage.setItem("omni.explorer", open ? "1" : "0"); } catch { /* */ } } }
 function explorerPreferred() { try { return localStorage.getItem("omni.explorer") !== "0"; } catch { return true; } }
 // The goal box pinned above a chat: the goal, the agent's plan (live from `plan` events, so it is always
 // current with no model call) and the status written by the separate summarizer at each milestone.
@@ -559,8 +560,10 @@ async function selectSession(sid, { reload = false } = {}) {
   S.forceFork = false;
   history.render();
   const s0 = S.sessions.get(sid);
+  const enc = encodeURIComponent(sid);
+  const loadToolOutput = (id, at, max) => api(`/api/sessions/${enc}/tool-output?id=${encodeURIComponent(id || "")}${at != null ? `&at=${at}` : ""}${max ? `&max=${max}` : ""}`);
   const wrap = $("#transcriptWrap"), follow = isFollowing(wrap);
-  const view = newView(reload ? document.createElement("div") : $("#transcript"), wrap, sid, { cwd: s0?.cwd, openAgent, keepFollow: reload });
+  const view = newView(reload ? document.createElement("div") : $("#transcript"), wrap, sid, { cwd: s0?.cwd, openAgent, loadToolOutput, keepFollow: reload });
   S.view = view;
   updateHeader(); updateComposer(); renderAgents();
   if (s0?.cwd) explorer.setRoot(s0.cwd);
@@ -594,19 +597,53 @@ async function selectSession(sid, { reload = false } = {}) {
       const parent = s.parentSid || agentFor(sid)?.parentSid;
       agentNote(view, { kind: s.agentKind || agentFor(sid)?.kind, parentTitle: S.sessions.get(parent)?.title, onOpen: parent && S.sessions.has(parent) ? () => openChat(parent) : null });
     }
-    if (!events.length) emptyNote(view, "nothing here yet");
+    // The chat's file is read a page at a time: the newest now, older ones as the transcript is scrolled up.
+    view.olderAt = h.more ? h.start : null;
+    if (view.olderAt != null) setOlder(view, "more", () => loadOlder(view));
+    if (!events.length && view.olderAt == null) emptyNote(view, "nothing here yet");
     if (reload) {
-      const top = wrap.scrollTop, shown = $("#transcript");
+      // Measured from the bottom: the reload holds only the newest page, so what was above it may be gone until it loads again.
+      const fromBottom = wrap.scrollHeight - wrap.scrollTop, shown = $("#transcript");
       shown.replaceChildren(...view.root.childNodes);
       view.root = shown;
-      wrap.scrollTop = follow ? wrap.scrollHeight : top;
+      wrap.scrollTop = follow ? wrap.scrollHeight : wrap.scrollHeight - fromBottom;
     } else wrap.scrollTop = wrap.scrollHeight;
+    maybeLoadOlder();
   } catch (e) {
     toast(`Could not load history: ${e.message}`, true);
     if (reload && S.selected === sid) S.view = previous; // what is on the screen stays, and stays live
   }
   updateHeader(); updateComposer();
   if (document.body.classList.contains("panel-open")) panel.renderStats();
+}
+/** Scrolled near the top of a chat whose start is not shown yet: load the next older page. */
+const OLDER_AT_PX = 600;
+function maybeLoadOlder() {
+  const view = S.view;
+  if (view?.olderAt == null || view.loadingOlder || view.olderFailed) return;
+  if ($("#transcriptWrap").scrollTop < OLDER_AT_PX) loadOlder(view);
+}
+async function loadOlder(view) {
+  if (view.olderAt == null || view.loadingOlder) return;
+  view.loadingOlder = true; view.olderFailed = false;
+  setOlder(view, "loading");
+  try {
+    const h = await api(`/api/sessions/${encodeURIComponent(view.sid)}/history?before=${view.olderAt}`);
+    if (S.view !== view) return;
+    const wrap = $("#transcriptWrap");
+    // Keep what is on screen where it is: the page goes in above it.
+    const fromBottom = wrap.scrollHeight - wrap.scrollTop;
+    prependHistory(view, h.events || []);
+    view.olderAt = h.more ? h.start : null;
+    setOlder(view, view.olderAt != null ? "more" : null, () => loadOlder(view));
+    wrap.scrollTop = wrap.scrollHeight - fromBottom;
+  } catch (e) {
+    view.olderFailed = true;
+    if (S.view === view) setOlder(view, "error", () => loadOlder(view));
+    toast(`Could not load earlier messages: ${e.message}`, true);
+  } finally { view.loadingOlder = false; }
+  // A short page may leave the top still in view.
+  if (S.view === view) maybeLoadOlder();
 }
 function updateHeader() {
   const s = S.page === "chat" ? S.sessions.get(S.selected) : null;
@@ -631,7 +668,8 @@ function renderChatMenu() {
   item("Delete this chat", () => deleteChat(s.sid));
   m.appendChild(el("div", "mh", `${harnessLabel(s.harness)} · ${s.cwd || ""}`));
 }
-$("#btnChatMenu").onclick = (e) => { e.stopPropagation(); const m = $("#chatMenu"); if (m.hidden) renderChatMenu(); m.hidden = !m.hidden; };
+$("#transcriptWrap").addEventListener("scroll", maybeLoadOlder, { passive: true });
+$("#btnChatMenu").onclick =(e) => { e.stopPropagation(); const m = $("#chatMenu"); if (m.hidden) renderChatMenu(); m.hidden = !m.hidden; };
 document.addEventListener("click", (e) => { if (!e.target.closest("#chatMenu, #btnChatMenu")) $("#chatMenu").hidden = true; });
 $("#btnExplorer").onclick = () => { explorer.setRoot(currentDir()); setExplorer(!document.body.classList.contains("explorer-open"), true); };
 $("#btnSummary").onclick = () => { try { localStorage.setItem("omni.summary", summaryOn() ? "off" : "on"); } catch { /* */ } renderSummary(); };

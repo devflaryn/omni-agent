@@ -71,12 +71,14 @@ const READ = [
   ["GET", /^\/[\w.-]+\.(js|mjs|css|svg|png|ico)$/],
   ["GET", /^\/events$/],
   ["GET", /^\/api\/state$/],
-  ["GET", /^\/api\/sessions\/[^/]+\/history$/],
+  ["GET", /^\/api\/sessions\/[^/]+\/(history|tool-output)$/],
   ["GET", /^\/api\/(hook|goal|providers|mcp)$/],
   ["GET", /^\/api\/memory\/(list|search|note|pack|graph)$/],
   ["GET", /^\/api\/graph\/(list|data)$/],
   ["POST", /^\/api\/graph\/(query|explain)$/],
-  ["GET", /^\/api\/fs\/(list|read|raw|archive-entry)$/],
+  ["GET", /^\/api\/fs\/(list|read|text|hex|raw|archive-entry)$/],
+  ["HEAD", /^\/api\/fs\/raw$/],
+  ["GET", /^\/omni-agent\.crt$/],
   ["GET", /^\/api\/pi\/(state|stats|models|thinking-levels)$/],
   ["GET", /^\/api\/agents(\/(undelivered|[^/]+(\/log)?))?$/],
   ["GET", /^\/api\/context$/],
@@ -92,6 +94,7 @@ const HOST_ONLY = [
   /^\/api\/missions\/tool$/,
   /^\/api\/missions\/m-[0-9a-f]{8}\/kg\/load$/,
   /^\/mcp$/,
+  /^\/api\/fs\/reveal$/, // opens a window on the host's screen
   /^\/api\/remote\/(password|approvals|sessions|status|devices)(\/.*)?$/,
   // The account, and the proxy to other machines: only the desktop window, see WindowGate.
   /^\/api\/account(\/.*)?$/,
@@ -112,8 +115,8 @@ const CHANNEL_BASE = `http://${CHANNEL_HOST}`;
 const CHANNEL_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
 const MAX_DECODES = 5;
 /** Never over a channel, matched on a canonical path. Acting as an agent is not a user's request; nobody strands a
- *  machine they cannot restart; account actions need the desktop window. */
-const NEVER_OVER_CHANNEL = /^\/(mcp|remote|api\/(account|remote|shutdown|claude\/task|missions\/tool|missions\/[^/]+\/kg\/load))(\/|$)/;
+ *  machine they cannot restart; account actions need the desktop window; reveal opens a window on that machine's screen. */
+const NEVER_OVER_CHANNEL = /^\/(mcp|remote|api\/(account|remote|shutdown|claude\/task|missions\/tool|missions\/[^/]+\/kg\/load|fs\/reveal))(\/|$)/;
 
 /** A request target's path as a route would have to see it to be reached by any spelling, or null when it cannot be trusted. */
 function canonicalChannelPath(target) {
@@ -197,11 +200,12 @@ const statOf = async (path) => { try { return await fsp.stat(path, { bigint: tru
 const sameFolder = (a, b) => a && b && a.ino === b.ino && (WINDOWS || a.dev === b.dev);
 
 /**
- * Whether a path is in one of the account folders or their `account*` siblings, by any spelling: `..`, case, 8.3 names, links, streams, device paths and
+ * Whether a path is in one of the account folders or their `account*` siblings (`family: false`: only in those folders), by any spelling: `..`, case, 8.3 names, links, streams, device paths and
  * shares. Without `containing` a parent of the folder is fine to read. With it, a parent counts too: renaming or copying
  * a parent would take the folder along.
  */
-export async function inAccountFolder(path, dirs, { containing = false } = {}) {
+export async function inAccountFolder(path, dirs, { containing = false, family = true } = {}) {
+  const isIn = family ? inFamily : within;
   const text = String(path);
   if (text.includes("\0")) return true;
   if (WINDOWS && /^[\\/]{2}[?.][\\/]/.test(text)) return true; // \\?\ and \\.\ reach everything without normal path rules
@@ -213,7 +217,7 @@ export async function inAccountFolder(path, dirs, { containing = false } = {}) {
       const lexical = resolvePath(dir);
       const realDir = await realPathOf(lexical);
       for (const candidate of [spelling, real]) {
-        if (inFamily(candidate, lexical) || inFamily(candidate, realDir)) return true;
+        if (isIn(candidate, lexical) || isIn(candidate, realDir)) return true;
         if (containing && (within(lexical, candidate) || within(realDir, candidate))) return true;
       }
       // The same folder seen some other way (another share, a mount): ask the file system.
@@ -235,8 +239,9 @@ const MAX_WALK_DEPTH = 6;
 function pathValues(value, out, depth = 0) {
   if (depth > MAX_WALK_DEPTH || typeof value !== "object" || value === null) return out;
   for (const [key, inner] of Object.entries(value)) {
-    if (typeof inner === "string" && PATH_KEYS.has(key)) out.push([key, inner]);
-    else pathValues(inner, out, depth + 1);
+    // A route may turn what it is given into text, so a list of one path is that path.
+    if (PATH_KEYS.has(key) && (typeof inner === "string" || Array.isArray(inner))) out.push([key, String(inner)]);
+    if (typeof inner !== "string") pathValues(inner, out, depth + 1);
   }
   return out;
 }
@@ -246,7 +251,7 @@ function pathValues(value, out, depth = 0) {
  * and every caller, the person at the machine included, since an agent on this machine counts as that person.
  * `bases` are folders a relative path might be taken from. A change to files also may not touch a parent of the folder.
  */
-export async function requestTouchesAccountFolder({ method, path: route, query, body, bases, dirs }) {
+export async function requestTouchesAccountFolder({ method, path: route, query, body, bases, dirs, family = true }) {
   const values = [...query.entries()].filter(([key]) => PATH_KEYS.has(key));
   pathValues(body, values);
   const fileRoute = route.startsWith("/api/fs/");
@@ -257,9 +262,13 @@ export async function requestTouchesAccountFolder({ method, path: route, query, 
   const candidates = fileRoute && !givenRoots.length ? [...bases] : [];
   for (const [key, value] of values) {
     if (key === "root") candidates.push(value);
-    else for (const root of roots) candidates.push(/^[\\/]{2}/.test(value) ? value : resolvePath(root, value));
+    else for (const root of roots) {
+      candidates.push(/^[\\/]{2}/.test(value) ? value : resolvePath(root, value));
+      // What server/files.mjs opens: it takes a leading slash as its root rather than the disk, and a backslash as a separator.
+      if (fileRoute) candidates.push(resolvePath(root, value.replace(/\\/g, "/").replace(/^\/+/, "") || "."));
+    }
   }
-  for (const candidate of candidates) if (await inAccountFolder(candidate, dirs, { containing })) return true;
+  for (const candidate of candidates) if (await inAccountFolder(candidate, dirs, { containing, family })) return true;
   return false;
 }
 
@@ -336,6 +345,14 @@ export function describe(method, path, body = {}, { titleOf = () => "" } = {}) {
   const chat = (sid) => { const t = titleOf(sid); return t ? `“${clip(t, 60)}”` : "a chat"; };
   if ((m = /^\/api\/sessions\/([^/]+)\/continue$/.exec(path))) return { title: `Send a message to ${chat(decodeURIComponent(m[1]))}${body.fork ? " (as a fork)" : ""}`, text: body.message || "" };
   if (method === "DELETE" && (m = /^\/api\/sessions\/([^/]+)$/.exec(path))) return { title: `Delete ${chat(decodeURIComponent(m[1]))}` };
+  if (path.startsWith("/api/fs/")) {
+    const f = `“${clip(body.path, 120) || "?"}”`;
+    if (path === "/api/fs/write") return { title: `${body.create ? "Create" : "Save"} the file ${f}${body.force ? " (overwriting changes made on disk)" : ""}`, text: typeof body.content === "string" ? body.content : "" };
+    if (path === "/api/fs/create") return { title: `Create the ${body.dir ? "folder" : "file"} ${f}` };
+    if (path === "/api/fs/rename") return { title: `Rename ${f} to “${clip(body.to, 120)}”` };
+    if (path === "/api/fs/duplicate") return { title: `Duplicate ${f}` };
+    if (path === "/api/fs/delete") return { title: `${body.permanent ? "Permanently delete" : "Move to the trash"} ${f}` };
+  }
   if (path === "/api/pi/prompt") return { title: body.sid ? `Send a message to ${chat(body.sid)}` : "Send a message to the agent", text: body.message || "" };
   if (path === "/api/pi/open") return { title: `Open a new chat${body.cwd ? ` in ${body.cwd}` : ""}` };
   if (path === "/api/pi/send") return { title: `Start a new chat${body.cwd ? ` in ${body.cwd}` : ""}`, text: body.message || "" };

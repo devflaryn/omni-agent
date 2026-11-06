@@ -5,7 +5,8 @@
  */
 import { promises as fs, existsSync, watch } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import { JsonlTail, readAppended, readTail } from "./tailer.mjs";
+import { JsonlTail, readAppended, readTail, readWindow, readLineAt, scanBack } from "./tailer.mjs";
+import { resultIn } from "./wire.mjs";
 import { normalizePiEntry, normalizeClaudeEntry } from "./normalize.mjs";
 import { createTally } from "./tokens.mjs";
 import { cleanTitle } from "../ui/lib.js";
@@ -230,32 +231,58 @@ export class SessionWatcher {
     s.mtime = Date.now();
   }
 
-  /** Full normalized history for a session (from its file). */
-  async history(sid, { maxBytes = 8 * 1024 * 1024 } = {}) {
+  /**
+   * One page of a session's normalized history, read from its file: the newest ~`maxBytes` (or those ending
+   * at byte `before`, the `start` an earlier page returned). A page that does not reach the file's start begins
+   * at a user message, so a turn is never split across pages; `more` says an older page exists. Each tool
+   * result carries `at`, its line's offset, so its full output can be read back later (toolOutput).
+   */
+  async history(sid, { before, maxBytes = 2 * 1024 * 1024 } = {}) {
     const s = this.registry.get(sid);
-    if (!s?.file) return { events: [], tally: null };
+    if (!s?.file) return { events: [], tally: null, start: 0, more: false };
     const harness = s.harness;
     const ctx = { sid, harness };
     let r;
-    try { r = await readTail(s.file, { maxBytes }); } catch (e) { if (e?.code === "ENOENT") return { events: [], tally: this.tally.has(sid) ? this.tally.get(sid) : null }; throw e; }
+    try { r = await readWindow(s.file, { before, maxBytes }); } catch (e) { if (e?.code === "ENOENT") return { events: [], tally: this.tally.has(sid) ? this.tally.get(sid) : null, start: 0, more: false }; throw e; }
+    const lines = r.lines.map(({ at, obj }) => ({ at, evs: normalizeEntry(harness, obj, ctx) }));
+    let from = 0;
+    if (r.start > 0) { const i = lines.findIndex((l) => l.evs.some((ev) => ev.kind === "msg" && ev.role === "user")); if (i > 0) from = i; }
+    const start = from < lines.length ? lines[from].at : r.start;
     const events = [];
-    const tally = createTally();
-    for (const o of r.objects) {
-      for (const ev of normalizeEntry(harness, o, ctx)) {
+    for (const l of lines.slice(from)) {
+      for (const ev of l.evs) {
+        if (ev.kind === "msg" && Array.isArray(ev.blocks)) for (const b of ev.blocks) if (b.type === "tool_result") b.at = l.at;
         events.push(ev);
-        if (ev.kind === "msg" && ev.usage) tally.add(sid, { groupId: ev.groupId || ev.id, usage: ev.usage, model: ev.model, cost: ev.cost, ts: ev.ts });
       }
     }
-    this.tally.reset(sid);
-    for (const ev of events) if (ev.kind === "msg" && ev.usage) this.tally.add(sid, { groupId: ev.groupId || ev.id, usage: ev.usage, model: ev.model, cost: ev.cost, ts: ev.ts });
-    return { events, tally: tally.get(sid), truncated: r.truncated };
+    // The newest page resets the chat's running tally (as a full read did); an older page leaves it alone.
+    let pageTally = null;
+    if (before == null) {
+      const tally = createTally();
+      this.tally.reset(sid);
+      for (const ev of events) if (ev.kind === "msg" && ev.usage) { const u = { groupId: ev.groupId || ev.id, usage: ev.usage, model: ev.model, cost: ev.cost, ts: ev.ts }; tally.add(sid, u); this.tally.add(sid, u); }
+      pageTally = tally.get(sid);
+    }
+    return { events, tally: pageTally, start, more: start > 0, truncated: start > 0 };
+  }
+
+  /** The full result of tool call `toolId`: from the line at byte `at` when given, else the newest line naming it. */
+  async toolOutput(sid, toolId, { at } = {}) {
+    const s = this.registry.get(sid);
+    if (!s?.file || !toolId) return undefined;
+    const ctx = { sid, harness: s.harness };
+    const find = (obj) => { for (const ev of normalizeEntry(s.harness, obj, ctx)) { const r = resultIn(ev, toolId); if (r) return r; } return undefined; };
+    try {
+      if (at != null && at !== "") { const obj = await readLineAt(s.file, Number(at)); const r = obj === undefined ? undefined : find(obj); if (r) return r; }
+      return await scanBack(s.file, JSON.stringify(String(toolId)), find);
+    } catch (e) { if (e?.code === "ENOENT") return undefined; throw e; }
   }
 
   /** Build the digest input for the vault from a session's history. */
   async digestData(sid) {
     const s = this.registry.get(sid);
     if (!s) return null;
-    const { events, tally } = await this.history(sid);
+    const { events, tally } = await this.history(sid, { maxBytes: 8 * 1024 * 1024 });
     const prompts = [];
     const tools = {};
     let lastAssistant = "";

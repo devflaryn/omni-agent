@@ -12,15 +12,17 @@ import { promises as fs, createReadStream, existsSync, mkdirSync, mkdtempSync, r
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
-import { CONFIG, ROOT, contextConfig, hookConfig, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { CONFIG, CONFIG_FILE, ROOT, contextConfig, hookConfig, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
 import { AgentManager } from "./agents.mjs";
 import { handleAgentRoutes } from "./agent-routes.mjs";
 import * as graph from "./graph.mjs";
 import { Bus } from "./bus.mjs";
+import { wireEvent } from "./wire.mjs";
 import { OpencodeServer, guardOpencodeExit } from "./opencode-server.mjs";
 import { OpencodeRpc, allowTools, findModel, inCatalog, modelPick, modelThinking, pickerModels, runOnce } from "./opencode-rpc.mjs";
 import { omniShim, writeOpencodeConfig } from "./opencode-config.mjs";
+import { opencodeAuthFile, watchAuthStore } from "./auth-watch.mjs";
 import { GoalKeeper, JUDGE_SYSTEM, SUMMARY_SYSTEM } from "./hook.mjs";
 import { ClaudeRunner } from "./claude-runner.mjs";
 import { planContinue } from "./continue.mjs";
@@ -28,17 +30,17 @@ import { filterPiModels } from "./pi-models.mjs";
 import { listMcpServers, upsertMcpServer, removeMcpServer, testMcpServer } from "./mcp.mjs";
 import { PRESETS, readModelsFile, listProviders, saveCustomProvider, removeProvider, reorderProviders, customProviderConfig, migratePiProviders, migrationMarker, modelEntry } from "./providers.mjs";
 import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.js";
-import { isArchiveName, listZipEntries, readZipEntry } from "./zip.mjs";
+import * as files from "./files.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
 import { applyStatus } from "../ui/lib.js";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
 import { createServer as createNetServer } from "node:net";
-import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, WindowGate, channelAllowed, classify, clientIp, describe, isHostRequest, parseCookies, parseProxyLine, redact, requestTouchesAccountFolder } from "./access.mjs";
+import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, WindowGate, channelAllowed, classify, clientIp, describe, inAccountFolder, isHostRequest, parseCookies, parseProxyLine, redact, requestTouchesAccountFolder } from "./access.mjs";
 import { Account, AccountError, handleAccountRoutes } from "./account.mjs";
 import { MachineLinks, proxyToMachine } from "./channel-client.mjs";
 import { serveChannel } from "./channel-host.mjs";
-import { loadOrCreateCert } from "./tls.mjs";
+import { httpsRedirect, loadOrCreateCert } from "./tls.mjs";
 import { SshTunnel } from "./tunnel.mjs";
 import { ProjectStore } from "./projects.mjs";
 import { MissionManager } from "./missions.mjs";
@@ -64,6 +66,10 @@ export async function createApp(overrides = {}) {
     if (!("piModelsFile" in overrides)) cfg.migratePiProviders = false;
     if (!("persistContext" in overrides)) cfg.persistContext = false;
     for (const k of ["opencodeConfigDir", "statusSessionsDir", "projectsDir", "accountDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
+    // Nor the real certificate (a renewal would change the fingerprint phones trust) or the real remote port:
+    // a test that wants the LAN listener says so.
+    if (!("tlsDir" in overrides)) cfg.tlsDir = join(tmp, "tls");
+    if (!("lan" in overrides)) cfg.lan = false;
   }
   cfg.opencodeMirrorDir ||= join(cfg.piSessionsDir, "opencode");
   // Another Omni on another port (headless.mjs, a scratch instance) keeps its own registry and goals: each server
@@ -94,7 +100,7 @@ export async function createApp(overrides = {}) {
   const auth = cfg.remoteAuth || new RemoteAuth({ file: cfg.remoteAuthFile, sessionTtlMs: (cfg.remoteSessionDays || 7) * 86_400_000 });
   const approvals = new Approvals({ timeoutMs: (cfg.remoteApprovalTimeoutSec || 300) * 1000 });
   /** The remote listener, once it listens: { server, port, tls: { fingerprint, selfSigned } | null, error }. */
-  const remote = { server: null, port: null, tls: null, error: null };
+  const remote = { server: null, front: null, port: null, tls: null, error: null };
   /** The VPS relay's loopback listener: { server, front, port, fingerprint, selfSigned, error }. */
   const relay = { server: null, front: null, port: null, fingerprint: null, selfSigned: false, error: null };
   let tunnel = null;
@@ -266,6 +272,14 @@ export async function createApp(overrides = {}) {
     await disposeOpencode();
     return { restarted: true, pending: false };
   }
+  // A login made outside Omni (`opencode auth login`, OpenCode's /connect) reaches the running server only with a
+  // reload: until then it answers "Model not found" for the new provider's models. Under node --test only a given file.
+  const authFile = cfg.opencodeAuthFile || (underTest ? "" : opencodeAuthFile({ ...process.env, ...piChildEnv(cfg) }));
+  const authWatch = authFile ? watchAuthStore(authFile, () => {
+    if (!opencode.up) return; // a server that is not running reads the store when it starts
+    log("OpenCode's logins changed: reloading OpenCode");
+    reloadOpencode().catch((e) => log("opencode reload failed", e.message));
+  }, cfg.opencodeAuthWatch) : null;
 
   // ---------------------------------------------------------------- side calls (judge, status box)
   /** Status-box conversation id (one per goal) → `{id, at}` of its OpenCode session, kept across Omni restarts. */
@@ -568,13 +582,7 @@ export async function createApp(overrides = {}) {
     }
   }, 30000);
 
-  // ------------------------------------------------------------- file browser
-  function safeResolve(root, rel) {
-    const abs = resolve(root, rel || ".");
-    const r = relative(root, abs);
-    if (r.startsWith("..") || (r.length && r.split(sep)[0] === "..")) return null;
-    return abs;
-  }
+  // ------------------------------------------------------------- file browser (server/files.mjs)
   /** The host browses any folder. A remote viewer only the folders Omni works in (the chats' working
    *  directories, the default one and the vault), never the rest of the disk. */
   const normDir = (d) => { const r = resolve(String(d)); return process.platform === "win32" ? r.toLowerCase() : r; };
@@ -583,51 +591,6 @@ export async function createApp(overrides = {}) {
     if (req.omniHost || req.omniChannel) return true;
     const allowed = new Set([cfg.cwd, cfg.vaultDir, ...[...pis].map((c) => c.cwd), ...registry.list().map((s) => s.cwd)].filter(Boolean).map(normDir));
     return allowed.has(normDir(root));
-  }
-  const TEXT_EXT = new Set([".txt", ".md", ".ts", ".tsx", ".js", ".mjs", ".cjs", ".json", ".py", ".sh", ".bash", ".ps1", ".cmd", ".bat", ".html", ".css", ".xml", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf", ".log", ".java", ".kt", ".c", ".h", ".cpp", ".rs", ".go", ".rb", ".php", ".sql", ".smali", ".gradle", ".properties", ".env", ".gitignore", ".csv", ".jsonl"]);
-  async function listDir(root, rel) {
-    const abs = safeResolve(root, rel);
-    if (!abs) throw new Error("path outside root");
-    const entries = await fs.readdir(abs, { withFileTypes: true });
-    return entries
-      .filter((e) => !e.name.startsWith(".git") && e.name !== "node_modules")
-      .map((e) => ({ name: e.name, dir: e.isDirectory(), path: relative(root, join(abs, e.name)).split(sep).join("/") }))
-      .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
-  }
-  const IMAGE_MIME = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".bmp": "image/bmp", ".ico": "image/x-icon", ".avif": "image/avif" };
-  const TEXT_MAX = 2 * 1024 * 1024, ARCHIVE_MAX = 400 * 1024 * 1024, IMAGE_MAX = 20 * 1024 * 1024;
-  const looksText = (buf) => !buf.subarray(0, 8000).includes(0);
-  /** What the explorer preview needs: `kind` decides the renderer. */
-  async function readFileSafe(root, rel) {
-    const abs = safeResolve(root, rel);
-    if (!abs) throw new Error("path outside root");
-    const st = await fs.stat(abs);
-    const ext = extname(abs).toLowerCase(), size = st.size;
-    if (IMAGE_MIME[ext]) return { kind: "image", ext, size, mime: IMAGE_MIME[ext], tooBig: size > IMAGE_MAX };
-    if (isArchiveName(abs)) {
-      if (size > ARCHIVE_MAX) return { kind: "archive", ext, size, tooBig: true, entries: [] };
-      const entries = listZipEntries(await fs.readFile(abs)).map(({ offset: _o, ...e }) => e);
-      return { kind: "archive", ext, size, entries };
-    }
-    if (size > TEXT_MAX) return { kind: "binary", ext, size, tooBig: true };
-    if (!(TEXT_EXT.has(ext) || !ext)) return { kind: "binary", ext, size, binary: true };
-    const buf = await fs.readFile(abs);
-    if (!looksText(buf)) return { kind: "binary", ext, size, binary: true };
-    return { kind: ext === ".md" ? "markdown" : "text", content: buf.toString("utf8"), ext, size };
-  }
-  async function readArchiveEntry(root, rel, entryPath) {
-    const abs = safeResolve(root, rel);
-    if (!abs || !isArchiveName(abs)) throw new Error("not an archive");
-    const buf = await fs.readFile(abs);
-    const entry = listZipEntries(buf, { limit: Infinity }).find((e) => e.path === entryPath);
-    if (!entry) throw Object.assign(new Error("no such entry in the archive"), { status: 404 });
-    if (entry.dir) return { kind: "binary", path: entry.path, size: 0 };
-    if (entry.size > TEXT_MAX) return { kind: "binary", path: entry.path, size: entry.size, tooBig: true };
-    const data = readZipEntry(buf, entry);
-    const ext = extname(entry.path).toLowerCase();
-    if (IMAGE_MIME[ext]) return { kind: "image", path: entry.path, size: entry.size, mime: IMAGE_MIME[ext], data: data.toString("base64") };
-    if (!looksText(data)) return { kind: "binary", path: entry.path, size: entry.size, binary: true };
-    return { kind: ext === ".md" ? "markdown" : "text", path: entry.path, size: entry.size, content: data.toString("utf8") };
   }
 
   // ------------------------------------------------------------------ http
@@ -805,6 +768,16 @@ export async function createApp(overrides = {}) {
     send(res, 200, { ok: true });
   }
 
+  /** The self-signed certificate as a file iOS installs as a profile (Settings → General → VPN & Device
+   *  Management, then Settings → General → About → Certificate Trust Settings): the warning is then gone. */
+  const CERT_PATH = "/omni-agent.crt";
+  function sendCert(res) {
+    const c = remote.tls || relay.server ? loadCert() : null;
+    if (!c?.cert) return send(res, 404, { error: "this listener has no certificate" });
+    res.writeHead(200, { "Content-Type": "application/x-x509-ca-cert", "Content-Disposition": 'attachment; filename="omni-agent.crt"', "Cache-Control": "no-store" });
+    res.end(c.cert);
+  }
+
   /** Everything a request from anywhere but the host's own browser goes through first. Answers the
    *  request itself (login page, 401, refusal) and returns true, or returns false to let the route run. */
   async function remoteGate(req, res, p) {
@@ -820,6 +793,8 @@ export async function createApp(overrides = {}) {
       send(res, 200, { ok: true });
       return true;
     }
+    // The certificate is public (every visitor's browser is sent it): a phone downloads it to trust it.
+    if (req.method === "GET" && p === CERT_PATH) { sendCert(res); return true; }
     const session = auth.session(token);
     if (!session) {
       if (req.method === "GET" && (p === "/" || p === "/index.html" || p === "/login")) { send(res, 200, await fs.readFile(join(ROOT, "ui", "login.html")), MIME[".html"]); return true; }
@@ -875,6 +850,18 @@ export async function createApp(overrides = {}) {
     return requestTouchesAccountFolder({ method: req.method, path: p, query: q, body, bases: [cfg.cwd, cfg.vaultDir].filter(Boolean), dirs: accountDirs });
   }
 
+  /**
+   * A `client` device (the web page) changing Omni's own code or config: the next start would run it as the host, which
+   * would undo the role's limit. Reading is its to do. A `full` device keeps this, as the design gives.
+   */
+  async function appFilesChanged(req, p, q) {
+    if (req.omniChannel?.role !== "client" || !p.startsWith("/api/fs/") || req.method === "GET" || req.method === "HEAD") return false;
+    let body = {};
+    try { body = await readBody(req); } catch (e) { if (e.status === 413) throw e; }
+    // Only what the route will use: another base would refuse a project's own `server/x` because Omni has one too.
+    return requestTouchesAccountFolder({ method: req.method, path: p, query: q, body, bases: body?.root || q.get("root") ? [] : [cfg.cwd].filter(Boolean), dirs: cfg.appFiles || [ROOT, CONFIG_FILE], family: false });
+  }
+
   /** The account routes and the proxy to other machines: only for the desktop window, see WindowGate. */
   async function accountRoute(req, res, p, q) {
     const refusal = windowGate.refusal(req);
@@ -908,6 +895,7 @@ export async function createApp(overrides = {}) {
       if (p === "/remote" || p.startsWith("/remote/")) return await accountRoute(req, res, p, q);
       // Whoever asks, by whatever route: the keys are not reachable through this server.
       if (await accountFolderAsked(req, p, q)) return send(res, 403, { error: "the account folder cannot be opened through Omni" });
+      if (await appFilesChanged(req, p, q)) return send(res, 403, { error: "a web page device cannot change Omni's own files" });
       if (req.method === "GET" && (p === "/" || p === "/index.html") && q.has("token") && req.omniHost) {
         const swap = windowGate.swap(req, url);
         res.writeHead(302, { Location: swap.location, "Cache-Control": "no-store", ...(swap.cookie ? { "Set-Cookie": swap.cookie } : {}) });
@@ -916,6 +904,7 @@ export async function createApp(overrides = {}) {
       if (p === "/api/account" || p.startsWith("/api/account/")) return await accountRoute(req, res, p, q);
       if (req.method === "GET" && p === "/api/remote/me") return send(res, 200, { role: req.omniHost ? "host" : "remote" });
       if (p.startsWith("/api/remote/")) return remoteAdmin(req, res, p);
+      if (req.method === "GET" && p === CERT_PATH) return sendCert(res);
       // static UI
       if (req.method === "GET" && (p === "/" || p === "/index.html")) return send(res, 200, await fs.readFile(join(ROOT, "ui", "index.html")), MIME[".html"]);
       if (req.method === "GET" && /^\/[\w.-]+\.(js|mjs|css|svg|png|ico)$/.test(p)) {
@@ -956,8 +945,18 @@ export async function createApp(overrides = {}) {
       let m;
       if (req.method === "GET" && (m = /^\/api\/sessions\/([^/]+)\/history$/.exec(p))) {
         const sid = decodeURIComponent(m[1]);
-        const h = await watcher.history(sid);
-        return send(res, 200, { ...h, session: registry.get(sid) || null });
+        const before = q.get("before");
+        const h = await watcher.history(sid, { before: before == null || before === "" ? undefined : Number(before) });
+        return send(res, 200, { ...h, events: h.events.map(wireEvent), session: registry.get(sid) || null });
+      }
+      // A tool's full output (a page gets long ones clipped): the event ring holds a live one the file may not have yet.
+      if (req.method === "GET" && (m = /^\/api\/sessions\/([^/]+)\/tool-output$/.exec(p))) {
+        const sid = decodeURIComponent(m[1]), id = q.get("id") || "";
+        const r = bus.toolResult(sid, id) || await watcher.toolOutput(sid, id, { at: q.get("at") });
+        if (!r) return send(res, 404, { error: "that tool output is not in the chat's file" });
+        const max = Number(q.get("max") || 0);
+        const size = r.text.length;
+        return send(res, 200, { ...r, text: max > 0 && size > max ? r.text.slice(0, max) : r.text, size });
       }
       if (req.method === "POST" && (m = /^\/api\/sessions\/([^/]+)\/continue$/.exec(p))) {
         return send(res, 200, await continueSession(decodeURIComponent(m[1]), await readBody(req)));
@@ -1286,43 +1285,48 @@ export async function createApp(overrides = {}) {
         }
       }
       // files
-      if (req.method === "GET" && p === "/api/fs/list") {
-        const root = q.get("root") || cfg.cwd;
+      if (p.startsWith("/api/fs/")) {
+        const isGet = req.method === "GET" || req.method === "HEAD";
+        const b = isGet ? {} : await readBody(req);
+        const root = (isGet ? q.get("root") : b.root) || cfg.cwd;
+        const path = (isGet ? q.get("path") : b.path) || "";
+        // files.mjs reads what it is given as text: only text is a path here.
+        if ([root, path, b.to].some((v) => v != null && typeof v !== "string")) return send(res, 400, { error: "root, path and to must be text" });
         if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
-        return send(res, 200, { entries: await listDir(root, q.get("path") || "") });
-      }
-      if (req.method === "GET" && p === "/api/fs/read") {
-        const root = q.get("root") || cfg.cwd;
-        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
-        return send(res, 200, await readFileSafe(root, q.get("path") || ""));
-      }
-      if (req.method === "GET" && p === "/api/fs/raw") {
-        const root = q.get("root") || cfg.cwd;
-        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
-        const abs = safeResolve(root, q.get("path") || "");
-        const mime = abs ? IMAGE_MIME[extname(abs).toLowerCase()] : null;
-        if (!abs || !mime) return send(res, 404, { error: "not an image" });
-        const st = await fs.stat(abs);
-        if (st.size > IMAGE_MAX) return send(res, 413, { error: "image too large to preview" });
-        res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-store", "Content-Length": st.size });
-        return await pipeline(createReadStream(abs), res).catch(() => {}); // read as it is taken, so a stalled device stops the reading
-      }
-      if (req.method === "GET" && p === "/api/fs/archive-entry") {
-        const root = q.get("root") || cfg.cwd;
-        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
-        return send(res, 200, await readArchiveEntry(root, q.get("path") || "", q.get("entry") || ""));
+        // A password viewer is kept to the folders above, so a link in one does not lead out. The host and a device may browse anywhere.
+        if (!req.omniHost && !req.omniChannel) for (const rel of [path, b.to]) if (rel != null && files.safeResolve(root, rel) && !(await files.staysInside(root, rel))) return send(res, 403, { error: "that link leads outside the folder" });
+        if (isGet) switch (p) {
+          case "/api/fs/list": return send(res, 200, { entries: await files.listDir(root, path) });
+          case "/api/fs/read": return send(res, 200, await files.readFileInfo(root, path));
+          case "/api/fs/text": return send(res, 200, await files.readAsText(root, path, { encoding: q.get("encoding") === "latin1" ? "latin1" : "utf8" }));
+          case "/api/fs/hex": return send(res, 200, await files.readHex(root, path, q.get("offset"), q.get("length")));
+          case "/api/fs/raw": return await files.serveRaw(req, res, root, path, { download: q.get("download") === "1" });
+          case "/api/fs/archive-entry": return send(res, 200, await files.readArchiveEntry(root, path, q.get("entry") || ""));
+        }
+        if (req.method === "POST") switch (p) {
+          case "/api/fs/write": return send(res, 200, await files.writeText(root, path, { content: b.content, encoding: b.encoding, eol: b.eol, baseHash: b.baseHash, force: !!b.force, create: !!b.create }));
+          case "/api/fs/create": return send(res, 200, await files.createEntry(root, path, { dir: !!b.dir }));
+          case "/api/fs/rename": return send(res, 200, await files.renameEntry(root, path, b.to));
+          case "/api/fs/duplicate": return send(res, 200, await files.duplicateEntry(root, path));
+          case "/api/fs/delete": return send(res, 200, await files.deleteEntry(root, path, { permanent: !!b.permanent, ...(cfg.fsTrash ? { trash: cfg.fsTrash } : {}) }));
+          case "/api/fs/reveal": return send(res, 200, files.reveal(root, path));
+        }
+        return send(res, 404, { error: "unknown file route" });
       }
       return send(res, 404, { error: "not found" });
     } catch (e) {
       if (res.headersSent) { try { res.end(); } catch { /* */ } return; }
-      return send(res, e?.status || 500, { error: String(e?.message || e) });
+      // What a file save or delete needs to tell apart: a conflict, a binary, a trash that failed.
+      const extra = Object.fromEntries(["conflict", "hash", "gone", "binary", "trashFailed"].filter((k) => e?.[k] != null).map((k) => [k, e[k]]));
+      const status = e?.status || (e?.code === "ENOENT" ? 404 : e?.code === "EEXIST" ? 409 : 500);
+      return send(res, status, { error: String(e?.message || e), ...extra });
     }
   }
 
   const server = createServer((req, res) => handle(req, res));
 
   let certCache = null;
-  const loadCert = () => (certCache ||= loadOrCreateCert({ dir: cfg.tlsDir, certFile: cfg.tlsCert, keyFile: cfg.tlsKey, altNames: [...lanAddresses().map((a) => a.address), ...(cfg.relay?.host ? [cfg.relay.host] : [])] }));
+  const loadCert = () => (certCache ||= loadOrCreateCert({ dir: cfg.tlsDir, certFile: cfg.tlsCert, keyFile: cfg.tlsKey, altNames: [...lanAddresses().map((a) => a.address), ...(cfg.relay?.host ? [cfg.relay.host] : [])], log: (t) => log(`  ${t}`) }));
   /** Limits for a listener strangers reach: slow or idle clients are cut off, and connections are capped.
    *  requestTimeout covers receiving a request, not the wait for an approval after it. */
   function harden(srv) {
@@ -1343,10 +1347,28 @@ export async function createApp(overrides = {}) {
     }
     const onReq = (req, res) => handle(req, res, { remoteListener: true });
     const srv = harden(tls ? createHttpsServer({ key: tls.key, cert: tls.cert }, onReq) : createServer(onReq));
+    // With TLS a front sorts each connection by its first byte: a TLS handshake goes to the HTTPS server, a
+    // plain-HTTP request (the address typed without https://, which is what a phone's browser then opens)
+    // gets a redirect to https:// instead of a dropped connection.
+    const front = tls ? createNetServer((sock) => {
+      sock.on("error", () => {});
+      const drop = setTimeout(() => sock.destroy(), 10_000);
+      const first = () => {
+        const c = sock.read();
+        if (c === null) return void sock.once("readable", first);
+        clearTimeout(drop);
+        if (c[0] === 0x16) { sock.unshift(c); srv.emit("connection", sock); return; }
+        const local = String(sock.localAddress || "").replace(/^::ffff:/, "");
+        const reply = httpsRedirect(c, `${local.includes(":") ? `[${local}]` : local}:${sock.localPort}`);
+        if (reply) sock.end(reply); else sock.destroy();
+      };
+      sock.once("readable", first);
+    }) : srv;
+    if (tls) front.maxConnections = 256;
     try {
-      await new Promise((r, j) => { srv.once("error", j); srv.listen(cfg.remotePort, cfg.remoteHost || "0.0.0.0", () => { srv.off("error", j); r(); }); });
+      await new Promise((r, j) => { front.once("error", j); front.listen(cfg.remotePort, cfg.remoteHost || "0.0.0.0", () => { front.off("error", j); r(); }); });
     } catch (e) { remote.error = e.message; log(`  remote listener could not start on port ${cfg.remotePort}: ${e.message}`); return; }
-    Object.assign(remote, { server: srv, port: srv.address().port, tls: tls ? { fingerprint: tls.fingerprint, selfSigned: tls.selfSigned } : null });
+    Object.assign(remote, { server: srv, front, port: front.address().port, tls: tls ? { fingerprint: tls.fingerprint, selfSigned: tls.selfSigned } : null });
     const proto = tls ? "https" : "http";
     for (const a of lanAddresses()) log(`  other devices: ${proto}://${a.address}:${remote.port}/   (${a.name})`);
     log(`  from another network: forward TCP ${remote.port} on your router to this PC, then open ${proto}://<your public IP>:${remote.port}/`);
@@ -1441,6 +1463,7 @@ export async function createApp(overrides = {}) {
     saveGoals(); // before keeper.dispose(), which forgets every goal
     keeper.dispose();
     watcher.stop();
+    authWatch?.stop();
     clearInterval(trimTimer);
     clearTimeout(pisTimer);
     for (const c of [...pis]) c.stop();
@@ -1459,7 +1482,8 @@ export async function createApp(overrides = {}) {
     for (const res of accountStreams) { try { res.end(); } catch { /* */ } }
     for (const res of hostStreams) { try { res.end(); } catch { /* */ } }
     server.close();
-    remote.server?.close();
+    remote.front?.close();
+    if (remote.front !== remote.server) remote.server?.closeAllConnections?.();
     tunnel?.stop();
     relay.front?.close();
     relay.server?.closeAllConnections?.();

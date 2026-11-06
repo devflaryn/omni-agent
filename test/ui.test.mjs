@@ -1,7 +1,7 @@
 // test/ui.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, isDuplicateUserMessage, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage, applyStatus } from "../ui/lib.js";
+import { fmtDuration, tokRate, estimateTokens, editStats, editedFiles, editDiff, lineDiff, parseDiff, groupToolRuns, relPath, md, groupLabel, splitAttachments, toolKind, toolLabel, workSummary, isDuplicateUserMessage, fileKind, fmtBytes, buildTree, rollingRate, hookInfo, hookMessage, applyStatus } from "../ui/lib.js";
 import { parsePairs, formatPairs, parsePastedServer } from "../ui/mcp-settings.js";
 import { titleFrom } from "../server/watchers.mjs";
 
@@ -48,11 +48,13 @@ test("tokRate", () => {
 
 test("estimateTokens", () => { assert.equal(estimateTokens("abcdefgh"), 2); assert.equal(estimateTokens(""), 0); });
 
-test("editStats counts lines for Edit, Write, MultiEdit and pi's edit/write; ignores other tools", () => {
-  assert.deepEqual(editStats("Edit", { file_path: "a.js", old_string: "x\ny", new_string: "x\ny\nz" }), { path: "a.js", added: 3, removed: 2 });
+test("editStats counts changed lines for Edit, Write, MultiEdit, pi's and OpenCode's edit/write/apply_patch; ignores other tools", () => {
+  assert.deepEqual(editStats("Edit", { file_path: "a.js", old_string: "x\ny", new_string: "x\ny\nz" }), { path: "a.js", added: 1, removed: 0 });
   assert.deepEqual(editStats("Write", { file_path: "b.js", content: "1\n2\n3" }), { path: "b.js", added: 3, removed: 0 });
   assert.deepEqual(editStats("MultiEdit", { file_path: "c.js", edits: [{ old_string: "a", new_string: "b\nc" }, { old_string: "", new_string: "d" }] }), { path: "c.js", added: 3, removed: 1 });
-  assert.deepEqual(editStats("edit", { path: "d.py", oldText: "a\nb", newText: "a" }), { path: "d.py", added: 1, removed: 2 });
+  assert.deepEqual(editStats("edit", { path: "d.py", oldText: "a\nb", newText: "a" }), { path: "d.py", added: 0, removed: 1 });
+  assert.deepEqual(editStats("edit", { filePath: "C:/p/f.py", oldString: "a\nb\nc", newString: "a\nB\nc" }), { path: "C:/p/f.py", added: 1, removed: 1 });
+  assert.deepEqual(editStats("apply_patch", { patchText: "*** Begin Patch\n*** Update File: g.py\n@@ def f\n x\n-y\n+z\n+w\n*** End Patch" }), { path: "g.py", added: 2, removed: 1 });
   assert.deepEqual(editStats("write", { path: "e.py", content: "q" }), { path: "e.py", added: 1, removed: 0 });
   assert.equal(editStats("Bash", { command: "ls" }), null);
   assert.equal(editStats("Edit", null), null);
@@ -65,8 +67,8 @@ test("editedFiles aggregates per path and totals", () => {
     { name: "Write", args: { file_path: "b.js", content: "n\nm" } },
     { name: "Read", args: { file_path: "c.js" } },
   ]);
-  assert.deepEqual(r.files, [{ path: "a.js", added: 3, removed: 4 }, { path: "b.js", added: 2, removed: 0 }]);
-  assert.equal(r.added, 5); assert.equal(r.removed, 4);
+  assert.deepEqual(r.files, [{ path: "a.js", added: 1, removed: 2 }, { path: "b.js", added: 2, removed: 0 }]);
+  assert.equal(r.added, 3); assert.equal(r.removed, 2);
 });
 
 test("groupToolRuns folds consecutive tools into work groups and text breaks them", () => {
@@ -131,9 +133,13 @@ test("toolKind classifies Claude Code, pi and MCP tool names", () => {
 
 test("toolLabel gives a one-line Claude-Code-style row label", () => {
   assert.deepEqual(toolLabel("Bash", { command: "git  status\n  --short" }), { kind: "shell", text: "Ran git status --short" });
-  assert.deepEqual(toolLabel("Edit", { file_path: "C:/p/ui/cli.py", old_string: "a", new_string: "b\nc" }, "C:/p"), { kind: "edit", text: "Edited cli.py", added: 2, removed: 1 });
-  assert.deepEqual(toolLabel("Write", { file_path: "x/new.css", content: "a\nb" }), { kind: "edit", text: "Wrote new.css", added: 2, removed: 0 });
-  assert.deepEqual(toolLabel("Read", { file_path: "C:/p/ui/app.js" }, "C:/p"), { kind: "read", text: "Read ui/app.js" });
+  assert.deepEqual(toolLabel("Edit", { file_path: "C:/p/ui/cli.py", old_string: "a", new_string: "b\nc" }, "C:/p"), { kind: "edit", text: "Edited cli.py", verb: "Edited", target: "cli.py", path: "ui/cli.py", added: 2, removed: 1 });
+  assert.deepEqual(toolLabel("Write", { file_path: "x/new.css", content: "a\nb" }), { kind: "edit", text: "Wrote new.css", verb: "Wrote", target: "new.css", path: "x/new.css", added: 2, removed: 0 });
+  assert.deepEqual(toolLabel("Read", { file_path: "C:/p/ui/app.js" }, "C:/p"), { kind: "read", text: "Read app.js", verb: "Read", target: "app.js", path: "ui/app.js" });
+  // OpenCode's camelCase arguments name the file too.
+  assert.equal(toolLabel("read", { filePath: "C:/p/server/index.mjs" }, "C:/p").text, "Read index.mjs");
+  assert.equal(toolLabel("edit", { filePath: "C:/p/a.py", oldString: "x", newString: "y" }, "C:/p").text, "Edited a.py");
+  assert.deepEqual(toolLabel("Read", {}), { kind: "read", text: "Read a file" });
   assert.deepEqual(toolLabel("Grep", { pattern: "foo.*bar" }), { kind: "search", text: "Searched foo.*bar" });
   assert.deepEqual(toolLabel("Agent", { description: "Diagnose panel visibility", prompt: "long..." }), { kind: "agent", text: "Diagnose panel visibility" });
   assert.deepEqual(toolLabel("mcp__claude-in-chrome__computer", { action: "screenshot" }), { kind: "browser", text: "Used the browser" });
@@ -259,4 +265,31 @@ test("applyStatus: a compaction status says nothing about streaming, so it leave
   applyStatus(s, { kind: "status", compacting: true });
   applyStatus(s, { kind: "status", streaming: false });
   assert.equal(s.compacting, false);
+});
+
+test("lineDiff keeps unchanged lines as context between removed and added ones", () => {
+  assert.deepEqual(lineDiff("a\nb\nc\nd", "a\nB\nc\nd\ne"), [
+    { t: "ctx", s: "a" }, { t: "del", s: "b" }, { t: "add", s: "B" }, { t: "ctx", s: "c" }, { t: "ctx", s: "d" }, { t: "add", s: "e" },
+  ]);
+  assert.deepEqual(lineDiff("", "x"), [{ t: "add", s: "x" }]);
+  assert.deepEqual(lineDiff("x\r\ny\r\n", "x\ny"), [{ t: "ctx", s: "x" }, { t: "ctx", s: "y" }]);
+});
+
+test("parseDiff reads OpenCode's unified diff with line numbers and hunk breaks", () => {
+  const diff = "Index: C:/p/a.py\n===================================================================\n--- C:/p/a.py\n+++ C:/p/a.py\n@@ -3,3 +3,3 @@\n x\n-y\n+z\n w\n@@ -20,1 +20,2 @@\n q\n+r\n";
+  assert.deepEqual(parseDiff(diff), [
+    { t: "ctx", s: "x", o: 3, n: 3 }, { t: "del", s: "y", o: 4 }, { t: "add", s: "z", n: 4 }, { t: "ctx", s: "w", o: 5, n: 5 },
+    { t: "hunk" }, { t: "ctx", s: "q", o: 20, n: 20 }, { t: "add", s: "r", n: 21 },
+  ]);
+  // A removed line that itself starts with "--" is still a removed line.
+  assert.deepEqual(parseDiff("@@ -1,1 +1,1 @@\n--- x\n+++ y\n"), [{ t: "del", s: "-- x", o: 1 }, { t: "add", s: "++ y", n: 1 }]);
+});
+
+test("editDiff prefers the harness's diff over the call's arguments", () => {
+  const args = { filePath: "C:/p/a.py", oldString: "y", newString: "z" };
+  assert.deepEqual(editDiff("edit", args).rows, [{ t: "del", s: "y" }, { t: "add", s: "z" }]);
+  const d = editDiff("edit", args, "@@ -4,2 +4,2 @@\n-y\n+z\n w\n");
+  assert.equal(d.path, "C:/p/a.py"); assert.equal(d.added, 1); assert.equal(d.removed, 1); assert.equal(d.rows[2].o, 5);
+  assert.deepEqual(editDiff("write", { filePath: "n.txt", content: "1\n2" }).rows, [{ t: "add", s: "1", n: 1 }, { t: "add", s: "2", n: 2 }]);
+  assert.equal(editDiff("bash", { command: "ls" }), null);
 });

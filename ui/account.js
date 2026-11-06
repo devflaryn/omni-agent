@@ -3,6 +3,7 @@
    it talks to this computer's server only (transport's `local`).
    Everything a device or the hub supplies is shown as text, through cleanName: device names are hostile input. */
 import { el, ago } from "./lib.js";
+import { ORDINARY_DROP } from "./hub-socket.js";
 import { checkPassword } from "./account-core.js";
 import { cleanName, isRemote, local, machine, onStillWaiting, setMachine, webPage } from "./transport.js";
 
@@ -77,9 +78,13 @@ export const phaseText = (phase) => deviceWords(PHASE_TEXT[phase] ?? phase);
  * a page another tab has replaced will not reconnect at all.
  */
 export function hubLostText(status) {
-  const why = status?.hub?.lastError;
+  const hub = status?.hub ?? {};
   const nothing = "Nothing you send now will arrive, and nothing is queued.";
-  return why ? `${why} ${nothing}` : deviceWords(`this computer has lost the hub. ${nothing} It reconnects by itself.`);
+  // The connection's own reason: a contested recovery code has its own banner, with its own words.
+  const why = hub.connectionError;
+  if (hub.gaveUp) return `${why ?? deviceWords("this computer has lost the hub.")} ${nothing}`;
+  if (why && !ORDINARY_DROP.has(why)) return `${why} ${nothing}`;
+  return deviceWords(`this computer has lost the hub. ${nothing}${hub.reconnecting ? " It reconnects by itself." : ""}`);
 }
 
 /** The banner's title, unless the message already opens with those words. */
@@ -204,7 +209,7 @@ export function createAccount({ toast, openSettings }) {
     const known = A.machines.find((x) => x.id === m.id);
     if (signedOut || !known) {
       try { sessionStorage.setItem(NOTICE_KEY, deviceWords(`This window was on ${m.name}, which ${signedOut ? "this computer can no longer reach without signing in" : "is no longer on the account"}. It is back on this computer.`)); } catch { /* */ }
-      setMachine(null);
+      setMachine(null, { whenClean: true });
       return;
     }
     if (known.name !== m.name) { setMachine(m.id, { name: known.name }); renderMachine(); }

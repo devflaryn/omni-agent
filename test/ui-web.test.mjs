@@ -1074,7 +1074,8 @@ test("past what a browser with no file dialog can hold it says so, and does not 
 
 // --------------------------------------------------------------------------------------------- the transport's seam
 
-test("transport.js in channel mode: local goes to the page's own account, the helpers to the channel, and files cannot frame", async () => {
+test("transport.js in channel mode: local goes to the page's own account, the helpers to the channel, and files cannot frame", async (t) => {
+  t.after(() => setChannelTransport(null));
   const data = new Map();
   setTransportEnv({ storage: { getItem: (k) => data.get(k) ?? null, setItem: (k, v) => data.set(k, v), removeItem: (k) => data.delete(k) }, reload: () => {} });
   assert.equal(webPage(), false);
@@ -1157,9 +1158,22 @@ test("replaced by another tab: it says why and promises no reconnect, and a requ
   assert.equal(p.status().hub.gaveUp, false);
 });
 
-test("with no reason known the banner may promise a reconnect", () => {
-  assert.match(hubLostText({ hub: {} }), /^this computer has lost the hub.*It reconnects by itself\.$/);
-  assert.equal(hubLostText({ hub: { lastError: "Why." } }), "Why. Nothing you send now will arrive, and nothing is queued.");
+test("the banner promises a reconnect only when one is set and nothing else is wrong", () => {
+  const nothing = "Nothing you send now will arrive, and nothing is queued.";
+  const promise = `this computer has lost the hub. ${nothing} It reconnects by itself.`;
+  assert.equal(hubLostText({ hub: { reconnecting: true } }), promise);
+  for (const connectionError of ["The hub connection was lost.", "The hub did not answer."]) assert.equal(hubLostText({ hub: { reconnecting: true, connectionError } }), promise, "an ordinary drop keeps it");
+  assert.equal(hubLostText({ hub: {} }), `this computer has lost the hub. ${nothing}`, "none set, none promised");
+  assert.equal(hubLostText({ hub: { reconnecting: true, connectionError: "Why." } }), `Why. ${nothing}`, "another reason says that instead");
+  assert.equal(hubLostText({ hub: { gaveUp: true, reconnecting: true, connectionError: "Replaced." } }), `Replaced. ${nothing}`, "gaveUp decides");
+  assert.equal(hubLostText({ hub: { gaveUp: true } }), `this computer has lost the hub. ${nothing}`);
+  // Given up, nothing is promised even if a reason looks ordinary or a timer is somehow set.
+  assert.equal(hubLostText({ hub: { gaveUp: true, reconnecting: true } }), `this computer has lost the hub. ${nothing}`);
+  assert.equal(hubLostText({ hub: { gaveUp: true, reconnecting: true, connectionError: "The hub connection was lost." } }), `The hub connection was lost. ${nothing}`);
+  // A contested recovery code is in lastError, and has its own banner: never here too.
+  const text = hubLostText({ recoveryContested: true, hub: { reconnecting: true, lastError: "Keep every recovery code. The hub connection was lost.", connectionError: "The hub connection was lost." } });
+  assert.equal(text, promise);
+  assert.doesNotMatch(hubLostText({ hub: { lastError: "Keep every recovery code.", connectionError: null } }), /recovery code/);
   assert.match(readFileSync(new URL("../ui/account.js", import.meta.url), "utf8"), /cannot be reached:`, hubLostText\(A\.status\)/);
 });
 
@@ -1227,6 +1241,11 @@ test("a path that a URL parser would read as another host is refused, and nothin
   }
   assert.equal(heads.filter((h) => h.type === FRAME.REQ).length, 0);
   assert.deepEqual(await t.api("GET", "/ok//still?a=//b"), {}, "only at the start");
+  // Nor anything with a scheme of its own, however it is spelled.
+  for (const absolute of ["http://evil.test/x", "https://evil.test/x", "HTTP://evil.test/x", "http:/evil.test/x", "http:evil", "data:text/html,x", "javascript:alert(1)", "blob:http://evil.test/x", "file:///c:/x", "ws://evil.test/x", "h\ttp://evil.test/x", " http://evil.test/x", "\thttp://evil.test/x", "\\\\evil.test/x", "/\\evil.test/x"]) {
+    await assert.rejects(t.api("GET", absolute), (e) => e.code === "bad-path", JSON.stringify(absolute));
+  }
+  assert.equal(heads.filter((h) => h.type === FRAME.REQ).length, 1, "only the one above crossed");
 });
 
 test("on a page, one helper turns the texts about this device, and drops what is not true of a page", () => {
@@ -1254,8 +1273,9 @@ test("on a page, one helper turns the texts about this device, and drops what is
     assert.equal(phaseText("signed-out"), "Not signed in.");
     assert.equal(explain({ code: "hub-unreachable", message: "No." }), "The hub cannot be reached: No. Nothing here changed.");
     assert.match(hubLostText({ hub: {} }), /^this page has lost the hub/);
+    assert.match(hubLostText({ hub: { reconnecting: true } }), /^this page has lost the hub.*It reconnects by itself\.$/);
     assert.equal(deviceWords("This computer and this computer"), "This page and this page");
-  } finally { setTransportEnv({ storage: null, reload: () => {} }); }
+  } finally { setChannelTransport(null); setTransportEnv({ storage: null, reload: () => {} }); }
   const src = readFileSync(new URL("../ui/account.js", import.meta.url), "utf8");
   assert.doesNotMatch(src, /PHASE_TEXT\[s\./, "every phase goes through the helper");
   assert.doesNotMatch(src, /ALERT_ADVICE\[a\./, "every alert goes through the helper");

@@ -3,6 +3,8 @@ export const el = (tag, cls, text) => { const e = document.createElement(tag); i
 export const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 export const fmtN = (n) => (n == null ? "–" : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n));
 export const ago = (ts) => { if (!ts) return ""; const d = Date.now() - ts; if (d < 60e3) return "just now"; if (d < 3600e3) return `${Math.floor(d / 60e3)} min ago`; if (d < 86400e3) return `${Math.floor(d / 3600e3)} h ago`; return `${Math.floor(d / 86400e3)} d ago`; };
+/** A name as shown: without what would turn it around or hide part of it, so "gpj.exe" with a direction mark cannot read as "exe.jpg". For display only: requests keep the real name. */
+export const showName = (s) => String(s ?? "").replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "") || "?";
 export const baseName = (p) => String(p || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop();
 export const fmtBytes = (n) => (n == null ? "" : n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`);
 
@@ -113,22 +115,90 @@ export function relPath(path, cwd) {
 }
 
 // ------------------------------------------------------------ edits
-const EDIT_TOOLS = /^(edit|write|multiedit|notebookedit|str_replace_editor|str_replace_based_edit_tool)$/i;
-const lines = (t) => { const s = String(t ?? ""); return s ? s.split("\n").length : 0; };
-export function editStats(name, args) {
-  if (!EDIT_TOOLS.test(String(name || "")) || !args || typeof args !== "object") return null;
-  const path = args.file_path || args.path || args.notebook_path || args.file || "";
-  if (!path) return null;
-  if (Array.isArray(args.edits)) {
-    let added = 0, removed = 0;
-    for (const e of args.edits) { added += lines(e.new_string ?? e.newText); removed += lines(e.old_string ?? e.oldText); }
-    return { path, added, removed };
+const EDIT_TOOLS = /^(edit|write|multiedit|notebookedit|str_replace_editor|str_replace_based_edit_tool|apply_patch|patch)$/i;
+/** The file a tool call names: Claude's file_path, OpenCode's filePath, pi's path. */
+const argFile = (a) => a?.file_path || a?.filePath || a?.path || a?.notebook_path || a?.file || "";
+const splitLines = (t) => { const s = String(t ?? "").replace(/\r\n?/g, "\n"); return s ? s.replace(/\n$/, "").split("\n") : []; };
+
+/**
+ * Line diff of two texts → rows `{ t: "ctx"|"add"|"del", s }` (LCS between the common head and tail;
+ * a pair too big for that reads as all removed then all added).
+ */
+export function lineDiff(oldText, newText) {
+  const a = splitLines(oldText), b = splitLines(newText);
+  let h = 0; while (h < a.length && h < b.length && a[h] === b[h]) h++;
+  let ta = a.length, tb = b.length; while (ta > h && tb > h && a[ta - 1] === b[tb - 1]) { ta--; tb--; }
+  const rows = a.slice(0, h).map((s) => ({ t: "ctx", s }));
+  const ma = a.slice(h, ta), mb = b.slice(h, tb), n = ma.length, m = mb.length;
+  if (n * m > 4e6) { rows.push(...ma.map((s) => ({ t: "del", s })), ...mb.map((s) => ({ t: "add", s }))); }
+  else {
+    const L = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = ma[i] === mb[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+    let i = 0, j = 0;
+    while (i < n || j < m) {
+      if (i < n && j < m && ma[i] === mb[j]) { rows.push({ t: "ctx", s: ma[i] }); i++; j++; }
+      else if (i < n && (j >= m || L[i + 1][j] >= L[i][j + 1])) rows.push({ t: "del", s: ma[i++] });
+      else rows.push({ t: "add", s: mb[j++] });
+    }
   }
-  const oldT = args.old_string ?? args.oldText ?? args.old_str;
-  const newT = args.new_string ?? args.newText ?? args.new_str ?? args.new_source;
-  if (oldT != null || newT != null) return { path, added: lines(newT), removed: lines(oldT) };
-  if (args.content != null || args.text != null) return { path, added: lines(args.content ?? args.text), removed: 0 };
-  return { path, added: 0, removed: 0 };
+  rows.push(...a.slice(ta).map((s) => ({ t: "ctx", s })));
+  return rows;
+}
+
+/**
+ * A unified diff (OpenCode's edit result) or an apply_patch body → rows `{ t, s, o?, n? }` with old/new
+ * line numbers when the hunk headers give them, `{ t: "hunk" }` between hunks, `{ t: "file", s }` per patched file.
+ */
+export function parseDiff(text) {
+  const rows = [];
+  let o = 0, n = 0, inHunk = false;
+  for (const line of String(text || "").replace(/\r\n?/g, "\n").split("\n")) {
+    const hk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hk) { o = +hk[1]; n = +hk[2]; if (rows.length && rows[rows.length - 1].t !== "file") rows.push({ t: "hunk" }); inHunk = true; continue; }
+    const pf = /^\*\*\* (?:Update|Add|Delete) File: (.+)$/.exec(line);
+    if (pf) { rows.push({ t: "file", s: pf[1].trim() }); o = 0; n = /^\*\*\* Add/.test(line) ? 1 : 0; inHunk = true; continue; }
+    if (/^@@/.test(line)) { if (rows.length && rows[rows.length - 1].t !== "file") rows.push({ t: "hunk" }); inHunk = true; continue; }
+    if (/^(Index: |diff )/.test(line)) { inHunk = false; continue; }
+    if (!inHunk || !line || /^(\*\*\* |\\ No newline)/.test(line)) continue;
+    const c = line[0], s = line.slice(1);
+    if (c === "+") rows.push({ t: "add", s, ...(n ? { n: n++ } : {}) });
+    else if (c === "-") rows.push({ t: "del", s, ...(o ? { o: o++ } : {}) });
+    else if (c === " ") rows.push({ t: "ctx", s, ...(o ? { o: o++, n: n++ } : {}) });
+  }
+  return rows;
+}
+
+/** A row's counts as another machine reported them: numbers, whatever it sent, since the row draws them as HTML. */
+export const diffCounts = (stat) => ({ added: Math.max(0, Math.trunc(Number(stat?.added)) || 0), removed: Math.max(0, Math.trunc(Number(stat?.removed)) || 0) });
+
+const countRows = (rows) => rows.reduce((c, r) => { if (r.t === "add") c.added++; else if (r.t === "del") c.removed++; return c; }, { added: 0, removed: 0 });
+
+/**
+ * What an edit-like tool call changed: `{ path, rows, added, removed }`. `resultDiff` (the unified diff the
+ * harness returned, with real line numbers and context) wins over what the call's arguments say.
+ */
+export function editDiff(name, args, resultDiff) {
+  if (!EDIT_TOOLS.test(String(name || "")) || !args || typeof args !== "object") return null;
+  const patch = args.patchText ?? args.patch ?? args.input;
+  let path = argFile(args);
+  let rows;
+  if (resultDiff) rows = parseDiff(resultDiff);
+  else if (Array.isArray(args.edits)) rows = args.edits.flatMap((e, i) => [...(i ? [{ t: "hunk" }] : []), ...lineDiff(e.old_string ?? e.oldText ?? e.oldString, e.new_string ?? e.newText ?? e.newString)]);
+  else {
+    const oldT = args.old_string ?? args.oldText ?? args.oldString ?? args.old_str;
+    const newT = args.new_string ?? args.newText ?? args.newString ?? args.new_str ?? args.new_source;
+    if (oldT != null || newT != null) rows = lineDiff(oldT, newT);
+    else if (args.content != null || args.text != null) rows = splitLines(args.content ?? args.text).map((s, i) => ({ t: "add", s, n: i + 1 }));
+    else if (typeof patch === "string") rows = parseDiff(patch);
+    else rows = [];
+  }
+  if (!path) path = rows.find((r) => r.t === "file")?.s || (typeof patch === "string" && /^\*\*\* (?:Update|Add|Delete) File: (.+)$/m.exec(patch)?.[1]?.trim()) || "";
+  if (!path) return null;
+  return { path, rows, ...countRows(rows) };
+}
+export function editStats(name, args) {
+  const d = editDiff(name, args);
+  return d && { path: d.path, added: d.added, removed: d.removed };
 }
 export function editedFiles(calls) {
   const byPath = new Map();
@@ -248,14 +318,24 @@ export function toolKind(name) {
   if (/^mcp__/i.test(n)) return "mcp";
   return "other";
 }
-export function toolLabel(name, args, cwd) {
+/**
+ * A tool call's row label `{ kind, text, verb?, target?, path?, added?, removed? }`: a file tool also gives its
+ * verb and file name apart (the row colours them), and `path`, the file relative to `cwd`, for a tooltip.
+ */
+export function toolLabel(name, args, cwd, resultDiff) {
   const kind = toolKind(name), a = args && typeof args === "object" ? args : {};
   if (AGENT_TOOLS.test(String(name || ""))) return { kind, text: agentToolLabel(name, a) };
-  const file = a.file_path || a.path || a.notebook_path || a.file;
+  const file = argFile(a);
   switch (kind) {
     case "shell": { const c = one(a.command || a.cmd); return { kind, text: c ? `Ran ${c}` : "Ran a command" }; }
-    case "edit": { const st = editStats(name, a); const verb = /^write$/i.test(name) ? "Wrote" : "Edited"; return { kind, text: `${verb} ${baseName(file) || "a file"}`, added: st?.added || 0, removed: st?.removed || 0 }; }
-    case "read": return { kind, text: file ? `Read ${relPath(file, cwd)}` : "Read a file" };
+    case "edit": {
+      const d = editDiff(name, a, resultDiff);
+      const verb = /^write$/i.test(name) ? "Wrote" : "Edited";
+      const files = d ? d.rows.filter((r) => r.t === "file").length : 0;
+      const target = d ? `${baseName(d.path)}${files > 1 ? ` and ${files - 1} more` : ""}` : "";
+      return target ? { kind, text: `${verb} ${target}`, verb, target, path: relPath(d.path, cwd), added: d.added, removed: d.removed } : { kind, text: `${verb} a file`, added: 0, removed: 0 };
+    }
+    case "read": return file ? { kind, text: `Read ${baseName(file)}`, verb: "Read", target: baseName(file), path: relPath(file, cwd) } : { kind, text: "Read a file" };
     case "search": { const q = one(a.pattern || a.query || a.glob || a.path || a.command, 80); return { kind, text: q ? `Searched ${q}` : "Searched files" }; }
     case "agent": return { kind, text: one(a.description || a.task || a.prompt, 100) || "Ran a subagent" };
     case "browser": return { kind, text: "Used the browser" };
