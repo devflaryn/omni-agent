@@ -28,6 +28,7 @@ import {
 } from "../pi/omni-agents-lib.mjs";
 import { McpHttpClient, McpStdioClient, waitDeviceVerdict } from "../pi/omni-mcp-lib.mjs";
 import { Vault } from "../../server/memory.mjs";
+import { SOURCES as WEB_SOURCES, readPages, search as webSearch } from "./web-search-lib.mjs";
 
 /** A user message starting with this is a background agent's report (server/opencode-events.mjs shows it as one). */
 export const AGENT_RESULT = "[omni-agent-result]";
@@ -88,6 +89,8 @@ const AGENT_GUIDELINES = [
 ];
 
 const graphNote = (dir) => `Repo graph tools (graph_build / graph_query / graph_explain): A knowledge graph of ${dir} already exists. For questions about the structure of this repository (what talks to what, where something is used, what a module depends on), call graph_query first and graph_explain for one file or symbol; only read the source when you need the exact code. Call graph_build to refresh the graph after large changes.`;
+
+const WEB_NOTE = "## Internet\nYou can search the internet with web_search (sources: web, wikipedia, github, stackoverflow, hackernews, arxiv) and read pages with web_read. Use them for anything current or outside the repo (docs, release notes, error messages, prices, news) instead of guessing; cite the URLs you used.";
 
 const P = `${OMNIDROID}_`;
 const OMNIDROID_NOTE = `omnidroid tools (${P}*) drive omnidroid -- real Android 15 running on its own Linux layer, arm64 translated, no VM -- through its MCP server. The tools are the omnidroid app's (it must be open, with \`mcp on\` set in it, or \`omnidroid serve\` running; an "is not reachable" error means it is not). Every omnidroid window on the computer shares that one pool: what the person launches you see too. Any APK: ${P}start_instance {apk, count} launches it as count instances and answers their ids at once -- each runs in a window of its own on one of the app's warm Androids, as an Android user of its own (the same APK file again shares an Android, another package goes in beside it, another build of a running package gets an Android of its own); \`options\` passes an installed plugin's options as on the command line (e.g. "--cookie <file or saved name> --place <id>": each instance signed in as that account, then the link opened; follow it in ${P}pool_log); ${P}wait_instance {instance_id} waits until it runs; ${P}screenshot {instance_id} and ${P}input {instance_id, action: tap|swipe|text|key} see and drive it; ${P}list_instances / ${P}list_devices show the state (a device is still "booting"? call ${P}wait_device to block until it is ready instead of polling ${P}list_devices in a loop); ${P}shell runs a command on an Android (root with uid 0); ${P}stop_instance closes one; ${P}web_pages / web_dom / web_click / web_type / web_eval / web_screenshot drive an instance's WebViews (sign-in pages, captchas). Native code: ${P}lab_load + ${P}call_function / ${P}intercept / ${P}read_mem / ${P}dump_module are a Frida-style debugger for one arm64 .so at the emulation layer (not attached to a live app; there is no frida-server here). RE workbench (reverse-engineer a .so and prove a rebuilt one matches): ${P}lab_load_apk (load a target + its siblings, report unresolved imports), ${P}lab_trace (call via an arg_spec of scalars/buffers), ${P}lab_corpus (a reproducible input corpus), ${P}lab_diff (differential-test original vs candidate over the corpus), ${P}lab_build (compile candidate C to an arm64 .so; needs an arm64 clang/NDK on the host). Read the omnidroid skill (devices, apps) or the omnidroid-frida skill (the lab + the workbench) before using them. Addresses are strings ("0x…"). The omni_* tools, if present, are the retired QEMU manager: only when asked for it by name.`;
@@ -773,9 +776,42 @@ export function createOmniPlugin({ tool, root, env = process.env } = {}) {
       });
     }
 
+    // ------------------------------------------------------------ internet search (integrations/opencode/web-search-lib.mjs)
+    tools.web_search = tool({
+      description: "Search the internet. source \"web\" (default) asks Exa, a search engine built for AI agents (no captcha, no key), falling back to the Brave Search API (when BRAVE_API_KEY is set) and Marginalia. For focused questions pick a source: wikipedia (facts, background), github (repositories), stackoverflow (programming errors and how-tos), hackernews (tech news and discussion), arxiv (papers). Then read the best hits with web_read.",
+      args: {
+        query: z.string().describe("What to search for. For source web, a natural description of the ideal page works best, e.g. 'tokio vs async-std benchmark 2026'"),
+        source: z.enum(WEB_SOURCES).optional().describe("web (default) | wikipedia | github | stackoverflow | hackernews | arxiv"),
+        count: z.number().optional().describe("Number of results, 1-20 (default 8)"),
+        lang: z.string().optional().describe("Wikipedia language code (default en)"),
+      },
+      async execute(args, ctx) {
+        progress(ctx, `searching ${args.source || "web"}: ${args.query}`);
+        try {
+          const r = await webSearch(args, { env, signal: ctx.abort });
+          return reply(clipText(r.text), { engine: r.engine, failed: r.failed || [] });
+        } catch (e) { return reply(`web_search failed: ${e?.message || e}`, { error: true }); }
+      },
+    });
+
+    tools.web_read = tool({
+      description: "Read web pages as clean text/markdown (up to 10 URLs per call): Exa's reader, falling back to Jina Reader, then a plain fetch. Use after web_search to read the pages that look relevant.",
+      args: {
+        urls: z.array(z.string()).describe("http(s) URLs to read"),
+        maxChars: z.number().optional().describe("Max characters per page, 500-20000 (default 8000)"),
+      },
+      async execute(args, ctx) {
+        progress(ctx, `reading ${args.urls?.length || 0} page(s)`);
+        try {
+          const r = await readPages(args, { env, signal: ctx.abort });
+          return reply(r.text.length > 60000 ? `${r.text.slice(0, 60000)}\n… (truncated)` : r.text, { engine: r.engine });
+        } catch (e) { return reply(`web_read failed: ${e?.message || e}`, { error: true }); }
+      },
+    });
+
     // ------------------------------------------------------------ hooks
     const notes = () => {
-      const out = [CONTEXT_GUIDANCE, `## Planning\n${PLAN_GUIDELINES.map((l) => `- ${l}`).join("\n")}`, `## Background agents and jobs\n${AGENT_GUIDELINES.map((l) => `- ${l}`).join("\n")}`];
+      const out = [CONTEXT_GUIDANCE, WEB_NOTE, `## Planning\n${PLAN_GUIDELINES.map((l) => `- ${l}`).join("\n")}`, `## Background agents and jobs\n${AGENT_GUIDELINES.map((l) => `- ${l}`).join("\n")}`];
       if (existsSync(join(directory, "graphify-out", "graph.json"))) out.push(graphNote(resolve(directory)));
       if (droidEntry) out.push(OMNIDROID_NOTE);
       return out.join("\n\n");

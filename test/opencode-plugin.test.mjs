@@ -393,3 +393,15 @@ test("memory tools of a mission chat use the project's vault, other chats the gl
   assert.ok(ex(join(base, "global-vault", "Memory")) && rd(join(base, "global-vault", "Memory")).some((f) => /pref/.test(f)));
   assert.match((await hooks.tool.memory_search.execute({ query: "xor" }, ctxFor("ses_mw"))).output, /xor-key/);
 });
+
+test("web_search / web_read are registered and the system prompt mentions them", async () => {
+  const { hooks } = await plugin();
+  assert.equal(typeof hooks.tool.web_search?.execute, "function");
+  assert.equal(typeof hooks.tool.web_read?.execute, "function");
+  const output = { system: [] };
+  await hooks["experimental.chat.system.transform"]({ sessionID: "ses_web" }, output);
+  assert.match(output.system.join("\n"), /web_search.*web_read/s);
+  const bad = await hooks.tool.web_read.execute({ urls: ["file:///etc/passwd"] }, ctxFor("ses_web"));
+  assert.match(bad.output, /web_read failed: not a web URL/);
+  assert.equal(bad.metadata.error, true);
+});
