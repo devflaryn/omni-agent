@@ -453,7 +453,7 @@ export async function createApp(overrides = {}) {
 
   // Owned sessions also need registry + tally bookkeeping from their live events.
   bus.on("event", (ev) => {
-    if (ev.kind === "log" || ev.kind === "removed" || ev.kind === "agent" || ev.kind === "pis" || ev.kind === "mission" || ev.kind === "notify") return;
+    if (ev.kind === "log" || ev.kind === "removed" || ev.kind === "agent" || ev.kind === "pis" || ev.kind === "mission" || ev.kind === "mission-removed" || ev.kind === "notify") return;
     const s = registry.upsert(ev.sid, {});
     if (ev.kind === "session") registry.upsert(ev.sid, { cwd: ev.cwd, title: ev.title, model: ev.model, file: ev.file, owned: ev.owned, streaming: ev.streaming, forkedFrom: ev.forkedFrom, ...(ev.parentSid ? { parentSid: ev.parentSid, agentId: ev.agentId, agentKind: ev.agentKind } : {}), ...(ev.missionId ? { missionId: ev.missionId, missionRole: ev.missionRole } : {}) });
     // Invariant: run.json.sessionFile always names pi's current session file, and the child's resumeFile mirrors it.

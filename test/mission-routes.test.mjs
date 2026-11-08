@@ -34,6 +34,20 @@ async function serve() {
   return { call, missions, agents, bf, dir };
 }
 
+test("mission routes: remove is for a person, and the mission is gone afterwards", async () => {
+  const { call, dir } = await serve();
+  const id = (await call("POST", "/api/missions", { dir, goal: "Remove me", orchestratorModel: "a/b" })).body.mission.id;
+  await flush(); await flush();
+  assert.equal((await call("POST", `/api/missions/${id}/remove`, {}, { "x-remote": "1" })).status, 403, "an agent on the machine cannot delete a mission");
+  assert.equal((await call("GET", `/api/missions/${id}`)).status, 200);
+  const r = await call("POST", `/api/missions/${id}/remove`, {});
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
+  assert.equal((await call("GET", `/api/missions/${id}`)).status, 404);
+  assert.ok(!(await call("GET", "/api/missions")).body.missions.some((m) => m.id === id));
+  assert.equal((await call("POST", `/api/missions/${id}/remove`, {})).status, 404);
+});
+
 test("mission routes: create, list, get, message, tool, scope, notifications, stop/resume", async () => {
   const { call, bf, dir, agents } = await serve();
   assert.equal((await call("POST", "/api/missions", { dir, goal: "" })).status, 400);

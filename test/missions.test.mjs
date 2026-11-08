@@ -27,6 +27,69 @@ function setup({ orchestrator = true, config = {}, clock = null } = {}) {
 }
 const spec = (dir, x = {}) => ({ dir, goal: "Map the auth flow of app.apk", orchestratorModel: "opencode-go/kimi", fallbackModel: "opencode/free", ...x });
 
+// ------------------------------------------------------------------ remove
+test("remove stops the mission, deletes its folder, keeps the project's own data, and stays gone after a restart", async () => {
+  const s = setup();
+  const m = s.mm.create(spec(s.dir));
+  const other = s.mm.create(spec(s.dir, { goal: "another job" }));
+  await flush(); await flush();
+  const orchestrator = s.bf.made.find((b) => b.opts.meta.missionId === m.id);
+  const w = s.mm.spawnWorker(m, { task: "scan the dex" });
+  const p = s.store.project(s.dir);
+  const folder = join(p.missionsDir, m.id);
+  writeFileSync(join(p.memoryDir, "kept.md"), "the project's memory");
+  assert.ok(existsSync(join(folder, "mission.json")));
+
+  await s.mm.remove(m);
+
+  assert.equal(s.agents.get(w.id).status, "cancelled", "its workers are stopped");
+  assert.ok(orchestrator.stops >= 1, "its orchestrator is stopped");
+  assert.equal(s.mm.get(m.id), null);
+  assert.equal(s.mm.bySession(orchestrator.sid), null, "its chat no longer belongs to a mission");
+  assert.equal(existsSync(folder), false, "its folder is gone");
+  assert.ok(existsSync(join(p.memoryDir, "kept.md")), "the project's memory stays");
+  assert.ok(existsSync(join(p.missionsDir, other.id, "mission.json")), "another mission of the project stays");
+  assert.deepEqual(s.mm.list().map((x) => x.id), [other.id]);
+  const gone = s.events.at(-1);
+  assert.equal(gone.kind, "mission-removed");
+  assert.equal(gone.missionId, m.id);
+
+  // Anything still holding the record must neither bring the folder back nor tell the pages it exists.
+  const before = s.events.length;
+  s.mm.save(m, { kind: "late" });
+  s.mm.ledger(m, "late");
+  s.mm.enqueue(m, { type: "event", text: "late" });
+  s.agents.end(w.id, "done", "## Status\ndone");
+  await flush();
+  assert.equal(existsSync(folder), false, "a late write does not recreate it");
+  assert.deepEqual(s.events.slice(before).filter((e) => e.kind === "mission"), [], "a late save is not announced");
+
+  const again = new MissionManager({ bus: new Bus(), store: s.store, agents: new FakeAgents(), createOrchestrator: null, config: { heartbeatMs: 0 } });
+  assert.deepEqual(again.reconcile().map((x) => x.id), [other.id], "a restart does not bring it back");
+});
+
+test("remove clears a pending retry, and answers a question nobody can answer any more", async () => {
+  const s = setup({ config: { retryBaseMs: 1000 } });
+  const m = s.mm.create(spec(s.dir));
+  await flush(); await flush();
+  const asked = s.mm.askOrchestrator(m, "a-00000000", "which account?");
+  s.bf.made[0].turn({ error: "429" });
+  assert.ok(s.clock.pending().length, "a retry is pending");
+  await s.mm.remove(m);
+  assert.equal(await asked, null, "the waiting question ends");
+  await s.clock.tick(10_000_000);
+  assert.equal(s.bf.made.length, 1, "no orchestrator is started for a removed mission");
+});
+
+test("a mission that cannot be deleted stays listed, and the failure is reported", async () => {
+  const s = setup({ orchestrator: false });
+  const m = s.mm.create(spec(s.dir));
+  s.mm.files.get(m.id).remove = () => { throw new Error("EBUSY"); };
+  await assert.rejects(() => s.mm.remove(m), /EBUSY/);
+  assert.equal(s.mm.get(m.id)?.id, m.id);
+  assert.notEqual(s.events.at(-1).kind, "mission-removed");
+});
+
 // ------------------------------------------------------------------ model
 test("create validates and persists", () => {
   const { mm, dir, store } = setup({ orchestrator: false });

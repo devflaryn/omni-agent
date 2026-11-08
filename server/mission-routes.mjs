@@ -13,6 +13,7 @@
  *   POST /api/missions/:id/workers/:wid/cancel           → { agent }
  *   POST /api/missions/:id/notifications/:nid { read?, answer? } → { notification }
  *   POST /api/missions/:id/stop | /resume                → { mission }
+ *   POST /api/missions/:id/remove                        → { ok }    (a person only; stops it and deletes its folder)
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -74,6 +75,12 @@ export async function handleMissionRoutes(req, res, { p, q, missions, send, read
     if (rest === "/message") { missions.messageOrchestrator(m, body.text); send(res, 200, { ok: true }); return true; }
     if (rest === "/stop") { await missions.stop(m); send(res, 200, { mission: missions.pub(m) }); return true; }
     if (rest === "/resume") { await missions.resume(m); send(res, 200, { mission: missions.pub(m) }); return true; }
+    if (rest === "/remove") {
+      if (!isPerson(req)) { send(res, 403, { error: "local only" }); return true; }
+      await missions.remove(m);
+      send(res, 200, { ok: true });
+      return true;
+    }
     if ((r = /^\/workers\/(a-[0-9a-f]{8})\/(message|summary|cancel)$/.exec(rest))) {
       if (r[2] === "message") { const x = await missions.messageWorker(m, r[1], body.text, { from: "user" }); send(res, 200, { ok: true, how: x?.how }); return true; }
       if (r[2] === "summary") { send(res, 200, { text: await missions.workerSummary(m, r[1], { timeoutMs: 240000 }) }); return true; }

@@ -56,6 +56,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   shell.append(side, main);
   root.appendChild(shell);
   const badgeListeners = new Set();
+  const removed = new Set();
   // The scrolling panels live as long as the view. A live update only swaps what changed inside them: replacing a
   // panel would end a scroll in progress (a wheel's glide, a finger's fling, a dragged scrollbar) every time an event came.
   const headSlot = el("div", "ms-head-slot"), bodyEl = el("div", "ms-body"), col = el("div", "ms-col");
@@ -76,7 +77,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     try {
       const r = await api("/api/missions");
       M.list = new Map(r.missions.map((m) => [m.id, m]));
-      if (!M.open && r.missions[0]) M.open = r.missions[0].id;
+      if (!M.list.has(M.open)) M.open = r.missions[0]?.id || null;
       if (M.open) await loadOne(M.open);
     } catch (e) { toast(`Missions: ${e.message}`, true); }
     emitBadge();
@@ -84,12 +85,27 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   }
   async function loadOne(id) {
     const r = await api(`/api/missions/${id}`);
+    if (removed.has(id)) return;
     M.list.set(id, r.mission);
     for (const a of r.workers || []) M.agents.set(a.id, a);
   }
 
   // ---------------------------------------------------------------- live
-  function onMission(m) { if (!m?.id) return; M.list.set(m.id, m); if (!M.open) M.open = m.id; emitBadge(); schedule(); }
+  function onMission(m) { if (!m?.id || removed.has(m.id)) return; M.list.set(m.id, m); if (!M.open) M.open = m.id; emitBadge(); schedule(); }
+  /** Gone from the server. Its last events can still arrive after this, so its id is remembered. */
+  function onRemoved(id) {
+    if (!id) return;
+    removed.add(id);
+    M.list.delete(id);
+    for (const a of M.agents.values()) if (a.missionId === id) M.agents.delete(a.id);
+    if (M.open === id) {
+      M.open = [...M.list.values()].sort((a, b) => b.createdAt - a.createdAt)[0]?.id || null;
+      M.selected = "orchestrator";
+      if (M.open) loadOne(M.open).then(schedule, () => { /* live events fill it */ });
+    }
+    emitBadge();
+    schedule();
+  }
   function onAgent(a) { if (!a?.missionId) return; M.agents.set(a.id, { ...(M.agents.get(a.id) || {}), ...a }); schedule(); }
   function onNotify(ev) {
     const n = ev.notification;
@@ -197,8 +213,15 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     const acts = el("div", "ms-head-acts");
     if (m.status === "paused" || m.status === "error") { const b = el("button", "btn small", "Resume"); b.onclick = () => act(`/api/missions/${m.id}/resume`, "Mission resumed"); acts.append(b); }
     else if (m.status !== "done") { const b = el("button", "btn small", "Pause"); b.title = "Stops the orchestrator and every worker; resume continues from the ledger"; b.onclick = () => { if (window.confirm("Pause this mission? Every worker is stopped; Resume continues from the ledger.")) act(`/api/missions/${m.id}/stop`, "Mission paused"); }; acts.append(b); }
+    const rm = el("button", "btn small quiet", "Remove"); rm.title = "Stops this mission and deletes its ledger, reports and inbox"; rm.onclick = () => removeMission(m); acts.append(rm);
     h.append(left, acts);
     return h;
+  }
+
+  async function removeMission(m) {
+    const running = m.status === "running" || m.status === "starting";
+    if (!window.confirm(`Remove "${one(m.title, 60)}"?${running ? " It is still running: the orchestrator and every worker are stopped." : ""} Its ledger, reports and inbox are deleted and cannot be restored. The project's memory and knowledge graph stay.`)) return;
+    try { await api(`/api/missions/${m.id}/remove`, {}); onRemoved(m.id); toast("Mission removed"); render(); } catch (e) { toast(e.message, true); }
   }
 
   async function act(path, ok, body = {}) { try { await api(path, body); if (ok) toast(ok); if (M.open) await loadOne(M.open); render(); } catch (e) { toast(e.message, true); } }
@@ -445,5 +468,5 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     goal.focus();
   }
 
-  return { load, render, onMission, onAgent, onNotify, onStatus, openNew, onBadge: (f) => { badgeListeners.add(f); f(unreadCount(M.list.values())); }, get state() { return M; } };
+  return { load, render, onMission, onRemoved, onAgent, onNotify, onStatus, openNew, onBadge: (f) => { badgeListeners.add(f); f(unreadCount(M.list.values())); }, get state() { return M; } };
 }

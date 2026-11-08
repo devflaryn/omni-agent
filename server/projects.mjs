@@ -11,7 +11,7 @@
  * Nothing here ever writes into the project directory itself.
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
 /** Atomic JSON write: a temp file next to it, then rename. */
@@ -62,6 +62,8 @@ export class MissionFiles {
   get file() { return join(this.dir, "mission.json"); }
   read() { return readJson(this.file); }
   write(obj) { writeJsonAtomic(this.file, obj); }
+  /** Deletes the mission's folder. The project's memory, graph and artifacts are outside it. */
+  remove() { rmSync(this.dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); }
   append(ev) {
     mkdirSync(this.dir, { recursive: true });
     appendFileSync(join(this.dir, "events.jsonl"), `${JSON.stringify({ ts: Date.now(), ...ev })}\n`);

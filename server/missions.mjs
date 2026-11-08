@@ -145,6 +145,7 @@ export class MissionManager extends EventEmitter {
   projectOf(m) { let p = this.paths.get(m.id); if (!p) { p = this.store.project(m.dir); this.paths.set(m.id, p); } return p; }
 
   save(m, ev = null) {
+    if (this.missions.get(m.id) !== m) return; // removed: a timer or a chat still holding it must not announce it again
     m.updatedAt = this.now();
     const f = this.files.get(m.id);
     try { f?.write(m); if (ev) f?.append(ev); } catch (e) { this.log("missions: could not save", m.id, e.message); }
@@ -693,6 +694,22 @@ export class MissionManager extends EventEmitter {
     this.armHeartbeat(m);
     if (this.createOrchestrator) await this.startOrchestrator(m);
     return m;
+  }
+  /**
+   * Stop the mission and delete its folder (state, ledger, reports, briefs). The project's memory, knowledge graph and
+   * artifacts are shared with its other missions and stay; so do the chats. A folder that cannot be deleted throws, and
+   * the mission stays listed (paused).
+   */
+  async remove(m) {
+    await this.stop(m);
+    // The orchestrator could still start a worker while stop() waited for the others.
+    for (const w of this.workersOf(m)) if (ACTIVE.has(w.status)) { try { await this.agents.cancel(w.id); } catch { /* gone */ } }
+    this.files.get(m.id)?.remove();
+    const rt = this.rt.get(m.id);
+    for (const answer of [...(rt?.questions.values() || [])]) answer(null);
+    for (const [sid, id] of this.orchestratorSids) if (id === m.id) this.orchestratorSids.delete(sid);
+    this.missions.delete(m.id); this.files.delete(m.id); this.paths.delete(m.id); this.rt.delete(m.id);
+    this.bus?.emit?.({ sid: `mission:${m.id}`, harness: "omni", kind: "mission-removed", ts: this.now(), missionId: m.id });
   }
 
   // ------------------------------------------------------------------ boot

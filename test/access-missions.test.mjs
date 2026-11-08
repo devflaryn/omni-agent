@@ -7,6 +7,8 @@ test("remote access: mission reads are reads, agent tool endpoints are host-only
   for (const p of ["/api/missions/tool", "/mcp", "/api/missions/m-0123abcd/kg/load"]) assert.equal(classify("POST", p), "host", p);
   for (const p of ["/api/missions", "/api/missions/m-0123abcd/message", "/api/missions/m-0123abcd/stop", "/api/missions/m-0123abcd/workers/a-0123abcd/message"]) assert.equal(classify("POST", p), "write", p);
   assert.match(describe("POST", "/api/missions/m-0123abcd/stop").title, /Pause mission m-0123abcd .*stops every worker/);
+  assert.equal(classify("POST", "/api/missions/m-0123abcd/remove"), "write");
+  assert.match(describe("POST", "/api/missions/m-0123abcd/remove").title, /Remove mission m-0123abcd .*stops every worker.*deletes/);
   assert.equal(describe("POST", "/api/missions/m-0123abcd/message", { text: "hi" }).text, "hi");
   assert.match(describe("POST", "/api/missions", { dir: "C:/x", goal: "g", orchestratorModel: "a/b" }).title, /Start a mission in C:\/x \(orchestrator a\/b\)/);
 });

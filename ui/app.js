@@ -732,6 +732,7 @@ function handle(ev) {
   // A background agent's record changed (`sid` is its parent chat, or "agents"): no chat of its own to update.
   if (ev.kind === "agent") { onAgent(ev.agent); if (ev.agent?.missionId) missionView.onAgent(ev.agent); return; }
   if (ev.kind === "mission") { missionView.onMission(ev.mission); return; }
+  if (ev.kind === "mission-removed") { missionView.onRemoved(ev.missionId); return; }
   if (ev.kind === "notify") { if ((ev.ts || 0) >= BOOT_TS) missionView.onNotify(ev); return; }
   // Which chats have a pi child right now (one per chat that runs at once).
   if (ev.kind === "pis") { setPiChats(ev.pis); if (S.page === "chat") updateComposer(); return; }
