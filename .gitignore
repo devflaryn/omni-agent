@@ -9,3 +9,9 @@ openrouter.txt
 .DS_Store
 workspace/
 vault/
+
+# local runtime data, never commit
+__pycache__/
+/memory/
+/llm_config.json
+/agent_workspaces.json
