@@ -41,6 +41,19 @@ const PUNCT = /[\p{P}\p{S}]/u;
 const WS = /\s/u;
 const isWs = (c) => c === "" || WS.test(c);
 const isPunct = (c) => c !== "" && PUNCT.test(c);
+const isSpace = (c) => c === " " || c === "\t";
+// Each newline as <br>, the spaces and tabs around it dropped. By hand, because the regex for it (optional spaces, a
+// newline, optional spaces) rescans a long run of spaces from every one of them.
+function softBreaks(h) {
+  if (!h.includes("\n")) return h;
+  const parts = h.split("\n");
+  return parts.map((p, i) => {
+    let a = 0, b = p.length;
+    if (i > 0) while (a < b && isSpace(p[a])) a++;
+    if (i < parts.length - 1) while (b > a && isSpace(p[b - 1])) b--;
+    return p.slice(a, b);
+  }).join("<br>");
+}
 const ESCAPABLE = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/;
 const LINK_SCAN = 2000; // how far a [ looks for its ]: bounded, so a line of [[[[ stays linear
 
@@ -120,7 +133,7 @@ export function inline(src, links = true) {
   const runs = tickRuns(s);
   const toks = []; // { t: "html", h } | { t: "delim", ch, n, orig, open, close, pre, post, active }
   let text = "";
-  const flush = () => { if (text) { toks.push({ t: "html", h: esc(text).replace(/[ \t]*\n[ \t]*/g, "<br>") }); text = ""; } };
+  const flush = () => { if (text) { toks.push({ t: "html", h: softBreaks(esc(text)) }); text = ""; } };
   const push = (h) => { flush(); toks.push({ t: "html", h }); };
   let i = 0;
   while (i < s.length) {
@@ -187,45 +200,90 @@ export function inline(src, links = true) {
   return out;
 }
 
-/** CommonMark's delimiter pass, on a flat token list: a match adds tags to the opener's end and the closer's start. */
+/**
+ * CommonMark's delimiter pass, on a flat token list: a match adds tags to the opener's end and the closer's start.
+ * The openers still in play are a stack (token indices, oldest first); a match drops everything above its opener, so each
+ * delimiter leaves the stack once and a long run of closers stays linear.
+ */
 function emphasis(toks) {
-  const bottom = new Map(); // (char, can-open, length % 3) → the lowest index still worth searching
+  const bottom = new Map(); // (char, can-open, length % 3) → the lowest token index still worth searching
+  const stack = [];
   for (let k = 0; k < toks.length; k++) {
     const cl = toks[k];
-    if (cl.t !== "delim" || !cl.close || !cl.active) continue;
-    while (cl.n > 0) {
+    if (cl.t !== "delim") continue;
+    while (cl.close && cl.n > 0) {
       const key = `${cl.ch}${cl.open ? 1 : 0}${cl.orig % 3}`;
       const floor = bottom.get(key) ?? -1;
-      let o = -1;
-      for (let m = k - 1; m > floor; m--) {
-        const op = toks[m];
-        if (op.t !== "delim" || !op.active || !op.open || op.ch !== cl.ch || op.n === 0) continue;
+      let at = -1;
+      for (let p = stack.length - 1; p >= 0 && stack[p] > floor; p--) {
+        const op = toks[stack[p]];
+        if (op.ch !== cl.ch) continue;
         if ((op.close || cl.open) && (op.orig + cl.orig) % 3 === 0 && !(op.orig % 3 === 0 && cl.orig % 3 === 0)) continue;
-        o = m;
+        at = p;
         break;
       }
-      if (o < 0) { bottom.set(key, k - 1); break; }
-      const op = toks[o];
+      if (at < 0) { bottom.set(key, k - 1); break; }
+      const op = toks[stack[at]];
       const use = cl.ch === "~" ? 2 : op.n >= 2 && cl.n >= 2 ? 2 : 1;
       const tag = cl.ch === "~" ? "del" : use === 2 ? "strong" : "em";
       op.n -= use; cl.n -= use;
       op.post = `<${tag}>${op.post}`;
       cl.pre = `${cl.pre}</${tag}>`;
-      for (let m = o + 1; m < k; m++) if (toks[m].t === "delim") toks[m].active = false;
+      // What opened inside the match can no longer close anything; a used-up opener leaves too.
+      stack.length = op.n > 0 ? at + 1 : at;
     }
+    if (cl.open && cl.n > 0) stack.push(k);
   }
 }
 
 // ------------------------------------------------------------------ blocks
+// Every pattern here is linear: none has two runs of the same characters next to each other, so none backtracks across a
+// long line. The heading's text and a table's delimiter row are read by hand (below) for that reason.
 const RE = {
   blank: /^\s*$/,
   fence: /^( {0,3})(`{3,}|~{3,})(.*)$/,
   hr: /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/,
-  heading: /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/,
+  heading: /^ {0,3}(#{1,6})(?:[ \t]|$)/,
   quote: /^ {0,3}>/,
   item: /^( {0,3})([-*+]|\d{1,9}[.)])([ \t]+|$)(.*)$/,
-  sep: /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/,
 };
+/** A heading's level and text, or null: `## Title ##` → { level: 2, text: "Title" }. */
+function headingOf(line) {
+  const m = RE.heading.exec(line);
+  if (!m) return null;
+  let a = m[0].length, b = line.length;
+  while (a < b && isSpace(line[a])) a++;
+  while (b > a && isSpace(line[b - 1])) b--;
+  // A closing run of #, when a space (or nothing) comes before it.
+  let k = b;
+  while (k > a && line[k - 1] === "#") k--;
+  if (k < b && (k === a || isSpace(line[k - 1]))) { b = k; while (b > a && isSpace(line[b - 1])) b--; }
+  return { level: m[1].length, text: line.slice(a, b).trim() };
+}
+/** A table's delimiter row: `| :-- | :-: | --: |`, the outer pipes optional. */
+function isSepRow(line) {
+  const n = line.length;
+  let i = 0;
+  while (i < n && isSpace(line[i])) i++;
+  if (line[i] === "|") {
+    if (i > 3 || line.slice(0, i).includes("\t")) return false; // indented four or more, it is not a table
+    i++;
+  }
+  let cols = 0;
+  for (;;) {
+    while (i < n && isSpace(line[i])) i++;
+    if (i === n) return cols > 0;
+    if (line[i] === ":") i++;
+    if (line[i] !== "-") return false;
+    while (line[i] === "-") i++;
+    if (line[i] === ":") i++;
+    cols++;
+    while (i < n && isSpace(line[i])) i++;
+    if (i === n) return true;
+    if (line[i] !== "|") return false;
+    i++;
+  }
+}
 const indentOf = (line) => { let n = 0; for (const c of line) { if (c === " ") n++; else if (c === "\t") n += 4 - (n % 4); else break; } return n; };
 /** The line without its first `n` columns of indent (tabs count to the next stop of 4). */
 function dedent(line, n) {
@@ -255,7 +313,7 @@ function cells(line) {
 function isTableStart(lines, i) {
   const head = lines[i], sep = lines[i + 1];
   // The delimiter row needs a pipe of its own, so "text\n---" stays a paragraph and a rule.
-  if (sep == null || !head.includes("|") || !sep.includes("|") || !sep.includes("-") || !RE.sep.test(sep)) return false;
+  if (sep == null || !head.includes("|") || !sep.includes("|") || !sep.includes("-") || !isSepRow(sep)) return false;
   return cells(head).length === cells(sep).length;
 }
 const startsBlock = (lines, i) => {
@@ -293,8 +351,8 @@ function blocks(lines, depth) {
       continue;
     }
     if (RE.hr.test(line)) { out.push("<hr>"); i++; continue; }
-    const h = RE.heading.exec(line);
-    if (h) { const lvl = h[1].length; out.push(`<h${lvl}>${inline((h[2] || "").trim())}</h${lvl}>`); i++; continue; }
+    const h = headingOf(line);
+    if (h) { out.push(`<h${h.level}>${inline(h.text)}</h${h.level}>`); i++; continue; }
     if (RE.quote.test(line)) {
       const inner = [];
       let lastText = false;
@@ -434,7 +492,7 @@ export function closeOpen(src) {
   while (t > 0 && /^\s*\|/.test(lines[t - 1])) t--;
   if (t < e) {
     const sepDone = t + 2 < e || (t + 2 === e && e < lines.length);
-    if (!(t + 1 < e && RE.sep.test(lines[t + 1]) && sepDone)) end = t;
+    if (!(t + 1 < e && isSepRow(lines[t + 1]) && sepDone)) end = t;
   }
   const kept = lines.slice(0, end);
   // The last paragraph's inline spans (trailing empty lines stay where they are).
@@ -450,7 +508,9 @@ export function closeOpen(src) {
 
 /** Closes the inline spans the end of `src` leaves open, and drops a delimiter that nothing follows yet. */
 function closeInline(src, depth = 0) {
-  let s = src.replace(/[*_~`]+$/, "");
+  let cut = src.length;
+  while (cut > 0 && "*_~`".includes(src[cut - 1])) cut--;
+  let s = src.slice(0, cut);
   // An open code span: closed, or dropped when nothing is in it yet.
   let open = null;
   for (let i = 0; i < s.length;) {
@@ -464,7 +524,7 @@ function closeInline(src, depth = 0) {
   const plain = open ? s.slice(0, open[0]) : s;
   const code = open ? `${s.slice(open[0])}${"`".repeat(open[1])}` : "";
   // A link still being written shows as its text.
-  const fixed = plain.replace(/!?\[([^\]\n]*)\]\([^)\n]*$/, "$1").replace(/!?\[([^\]\n]*)$/, "$1");
+  const fixed = openBracketText(openLinkText(plain));
   if (fixed !== plain && depth < 4) return closeInline(fixed + (open ? s.slice(open[0]) : ""), depth + 1);
   // Emphasis and strike still open: closed, innermost first. Code spans and escapes are masked out.
   const masked = plain.replace(/(`+)[\s\S]*?\1/g, (m) => " ".repeat(m.length)).replace(/\\./g, "  ");
@@ -492,5 +552,53 @@ function closeInline(src, depth = 0) {
   }
   let marks = "";
   for (let k = stack.length - 1; k >= 0; k--) marks += stack[k].ch.repeat(stack[k].n);
-  return open ? `${plain}${code}${marks}` : `${plain}${marks}`;
+  if (open) return `${plain}${code}${marks}`;
+  // The marks go before trailing whitespace: a closer after a space is not right-flanking, and would show as asterisks.
+  let end = plain.length;
+  while (end > 0 && isWs(plain[end - 1])) end--;
+  return `${plain.slice(0, end)}${marks}${plain.slice(end)}`;
+}
+
+/**
+ * `[label](url` whose target has not closed yet, as its label: the first such link on the last line, as the regex
+ * /!?\[([^\]\n]*)\]\(([^)\n]*)$/ found it, except that parentheses in the url itself (up to its first space) may nest, as
+ * in `a_(b)`. After a space (a title on its way) any `)` still ends it. One pass from each end.
+ */
+function openLinkText(s) {
+  const n = s.length;
+  // open[p]: a target that starts at p is still open. Its url (to the first whitespace) closes no parenthesis it did not
+  // open, nothing after that whitespace is a `)`, and no newline comes.
+  const open = new Uint8Array(n + 1);
+  open[n] = 1;
+  let low = 0, nl = false, closeAfterWs = false, closeSince = false;
+  for (let p = n - 1; p >= 0; p--) {
+    const c = s[p];
+    if (c === "\n") nl = true;
+    if (c === ")") closeSince = true;
+    if (WS.test(c)) { low = 0; closeAfterWs = closeSince; }
+    else low = Math.min(0, (c === "(" ? 1 : c === ")" ? -1 : 0) + low);
+    open[p] = !nl && low >= 0 && !closeAfterWs ? 1 : 0;
+  }
+  let first = -1; // the first [ since the last ] or newline: a label holds neither
+  for (let j = 0; j < n; j++) {
+    const c = s[j];
+    if (c === "\n") { first = -1; continue; }
+    if (c === "[") { if (first < 0) first = j; continue; }
+    if (c !== "]") continue;
+    if (first >= 0 && s[j + 1] === "(" && open[j + 2]) {
+      const start = first > 0 && s[first - 1] === "!" ? first - 1 : first;
+      return s.slice(0, start) + s.slice(first + 1, j);
+    }
+    first = -1;
+  }
+  return s;
+}
+/** A `[` with no `]` after it on its line yet, dropped (its text stays): /!?\[([^\]\n]*)$/ → "$1", in one pass. */
+function openBracketText(s) {
+  let i = s.length - 1;
+  while (i >= 0 && s[i] !== "]" && s[i] !== "\n") i--;
+  const first = s.indexOf("[", i + 1);
+  if (first < 0) return s;
+  const start = first > 0 && s[first - 1] === "!" ? first - 1 : first;
+  return s.slice(0, start) + s.slice(first + 1);
 }

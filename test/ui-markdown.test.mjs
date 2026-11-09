@@ -190,6 +190,35 @@ test("a long hostile input renders in linear time", () => {
   assert.ok(performance.now() - t0 < 1500, `took ${performance.now() - t0} ms`);
 });
 
+test("long runs of spaces in a heading or a table row, and runs of unclosed [, render in linear time", () => {
+  // Each input took 6-12 s here when the grammar backtracked (quadratic); linear, each is a few milliseconds. The bound is
+  // loose for a slow machine and still far below the old cost.
+  const N = 60000, LIMIT = 1500;
+  const timed = (what, fn) => { const t0 = performance.now(); fn(); const ms = performance.now() - t0; assert.ok(ms < LIMIT, `${what}: ${ms.toFixed(0)} ms`); };
+  timed("table delimiter row", () => md(`a|b\n|-${" ".repeat(N)}x`));
+  timed("table delimiter row, spaces between cells", () => md(`a|b\n|-${" ".repeat(N)}|${" ".repeat(N)}-`));
+  timed("heading", () => md(`# a${" ".repeat(N)}x`));
+  timed("heading, no text", () => md(`#${" ".repeat(N)}x`));
+  timed("heading, closing hashes", () => md(`# a${" ".repeat(N)}#${" ".repeat(N)}x`));
+  timed("a paragraph", () => md(`a${" ".repeat(N)}x`));
+  timed("unclosed [ while streaming", () => closeOpen("[a".repeat(N / 2)));
+  timed("unclosed [( while streaming", () => closeOpen("[a](".repeat(N / 4)));
+  timed("a run of markers at the end of a stream", () => closeOpen(`${"*".repeat(N)}a`));
+  timed("spaces before the end of a stream", () => closeOpen(`**a${" ".repeat(N)}b`));
+  timed("emphasis openers and one long closer", () => md("*a _".repeat(N / 4) + "*".repeat(N / 4)));
+  // The faster grammar reads the same.
+  assert.equal(md("# a   x"), "<h1>a   x</h1>");
+  assert.equal(md("#   "), "<h1></h1>");
+  assert.equal(md("# #"), "<h1></h1>", "only a closing sequence: an empty heading");
+  assert.equal(md("## a ## b"), "<h2>a ## b</h2>");
+  assert.equal(md("## a #b"), "<h2>a #b</h2>");
+  assert.equal(md("### a\t###\t"), "<h3>a</h3>");
+  assert.equal(md("    # four spaces"), "<p># four spaces</p>");
+  assert.match(md("a | b\n :-: | -: \nc | d"), /<th class="al-c">a<\/th><th class="al-r">b<\/th>/);
+  assert.match(md("| a |\n|---|\n| b |"), /<tbody>/);
+  for (const sep of ["| - | |", "|", "a|b", "| -- x |", "-:-|-", "    | - | - |"]) assert.doesNotMatch(md(`a | b\n${sep}`), /<table>/, sep);
+});
+
 // ------------------------------------------------------------------ streaming
 test("closeOpen: a stream never shows raw syntax for what has not closed yet", () => {
   assert.equal(closeOpen("```js\nlet a"), "```js\nlet a\n```");
@@ -213,6 +242,32 @@ test("closeOpen: a stream never shows raw syntax for what has not closed yet", (
   // A list bullet is not emphasis.
   assert.equal(closeOpen("* item"), "* item");
   assert.equal(closeOpen("2 * 3"), "2 * 3");
+});
+
+test("closeOpen: a chunk that ends on a space inside bold or italic text still closes it", () => {
+  // A closer after a space is not right-flanking: "**1 s **" would show its asterisks. The marks go before the space.
+  assert.equal(closeOpen("from **1 s "), "from **1 s** ");
+  assert.equal(closeOpen("a *small and "), "a *small and* ");
+  assert.equal(closeOpen("x ~~old and\t"), "x ~~old and~~\t");
+  assert.equal(closeOpen("**bold `co "), "**bold `co `**", "an open code span still closes first");
+  for (const s of ["from **1 s ", "**without ", "a *small and ", "**a _b c "]) assert.doesNotMatch(md(closeOpen(s)).replace(/<[^>]+>/g, ""), /[*_]/, s);
+  // Word by word, the way a model streams it: no frame shows a raw marker.
+  const text = "Each attempt doubles the wait, from **1 s up to a 30 s cap**, and `retryDelay` stays *small and simple* overall.";
+  const words = text.match(/\S*\s?/g).filter(Boolean);
+  let sofar = "";
+  for (const w of words) {
+    sofar += w;
+    const shown = md(closeOpen(sofar)).replace(/<code>[\s\S]*?<\/code>/g, "").replace(/<[^>]+>/g, "");
+    assert.doesNotMatch(shown, /\*/, `after ${JSON.stringify(sofar)}: ${shown}`);
+  }
+});
+
+test("closeOpen: a link whose url has parentheses shows as its text until it closes", () => {
+  assert.equal(closeOpen("see [docs](https://x/a_(b)"), "see docs");
+  assert.equal(closeOpen("see [docs](https://x/a_(b"), "see docs");
+  assert.equal(closeOpen("see [docs](https://x/a_(b))"), "see [docs](https://x/a_(b))", "a closed link is left alone");
+  assert.equal(closeOpen("![pic](https://x/p"), "pic");
+  assert.equal(closeOpen("a [x] b [c"), "a [x] b c");
 });
 
 test("what a stream renders is what the finished message renders, frame after frame", () => {
