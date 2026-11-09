@@ -580,7 +580,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 //
 // Off unless OMNI_SHELL_AUTOMATION names a folder at launch. Then the app writes window.json there ({ "pid", "window" }: the
 // window number for `screencapture -l`), runs each <name>.js dropped in it as an async function body in the page, and writes
-// <name>.out with { "ok", "value" | "error" }. <name>.cmd holds one native word: show, hide (as the close button does) or quit (as Cmd-Q does).
+// <name>.out with { "ok", "value" | "error" }. <name>.cmd holds one native word: show, hide (as the close button does), quit (as Cmd-Q does), or snapshot (the window as
+// the app draws it, into <name>.png).
 // Anyone who can set an app's environment at launch can already run code as this user, so this opens nothing new.
 
 final class Automation {
@@ -625,6 +626,7 @@ final class Automation {
                 case "show": app.showWindow()
                 case "hide": app.controller.window.performClose(nil)
                 case "quit": NSApp.terminate(nil)
+                case "snapshot": snapshot(name); continue
                 default: break
                 }
                 writeInfo()
@@ -637,6 +639,32 @@ final class Automation {
                 case .failure(let e): self?.write(name, ["ok": false, "error": "\(e)"])
                 }
             }
+        }
+    }
+
+    /// The window as the app itself draws it, title bar and traffic lights included, into <name>.png. For when `screencapture -l`
+    /// cannot see the window (it is in a Space that is not on screen), which needs no Screen Recording permission either.
+    func snapshot(_ name: String) {
+        guard let app, let frameView = app.controller.window.contentView?.superview else { return }
+        let webView = app.controller.webView
+        let config = WKSnapshotConfiguration()
+        config.afterScreenUpdates = true
+        webView.takeSnapshot(with: config) { [weak self] page, error in
+            guard let self, let page else { self?.write(name, ["ok": false, "error": "\(String(describing: error))"]); return }
+            let bounds = frameView.bounds
+            let scale = app.controller.window.backingScaleFactor
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(bounds.width * scale), pixelsHigh: Int(bounds.height * scale), bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return }
+            rep.size = bounds.size
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).addClip()
+            app.controller.window.backgroundColor.setFill()
+            bounds.fill()
+            frameView.displayIgnoringOpacity(bounds, in: NSGraphicsContext.current!) // the title bar and its buttons
+            page.draw(in: webView.convert(webView.bounds, to: frameView))
+            NSGraphicsContext.restoreGraphicsState()
+            try? rep.representation(using: .png, properties: [:])?.write(to: self.dir.appendingPathComponent("\(name).png"))
+            self.write(name, ["ok": true])
         }
     }
 }
