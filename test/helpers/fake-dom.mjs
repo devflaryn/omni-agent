@@ -43,7 +43,13 @@ export class FakeEl {
   get isConnected() { let n = this; while (n) { if (n === this.ownerDocument.body) return true; n = n.parentNode; } return false; }
   set textContent(v) { this.text = String(v ?? ""); this.children = []; }
   get textContent() { return this.text + this.children.map((c) => c.textContent).join(""); }
-  set innerHTML(v) { this.html = String(v); this.text = ""; for (const c of this.children) c.parentNode = null; this.children = []; }
+  set innerHTML(v) {
+    const doc = this.ownerDocument;
+    if (doc.activeElement !== this && this.contains(doc.activeElement)) doc.activeElement = doc.body;
+    this.html = String(v); this.text = "";
+    for (const c of this.children) c.parentNode = null;
+    this.children = [];
+  }
   get innerHTML() { return this.html; }
   appendChild(c) { if (typeof c === "string") { this.text += c; return c; } c.remove(); c.parentNode = this; this.children.push(c); return c; }
   append(...cs) { for (const c of cs) this.appendChild(c); }

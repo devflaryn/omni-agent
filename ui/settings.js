@@ -3,6 +3,7 @@
    Its Long runs tab holds the context policy (compaction cap, keep going on context stops): PUT /api/context. */
 import { el, esc, compactAtFromField, compactAtK } from "./lib.js";
 import { createMcpSettings } from "./mcp-settings.js";
+import { renderThemeChoice } from "./appearance.js";
 
 /** `getContext()` → the saved context policy (`/api/state.config.context`); `onContext(policy)` after a save. */
 /**
@@ -43,32 +44,8 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   for (const [k, t] of Object.entries(tabs)) t.btn.onclick = () => showTab(k);
 
   // ------------------------------------------------------------ appearance
-  /** Dark (the default), Light, or System. ui/theme.js applies it before the first paint; this is only the control. */
-  function renderAppearance() {
-    const body = tabs.appearance.body;
-    const theme = globalThis.omniTheme;
-    body.innerHTML = "";
-    const wrap = el("div", "rm-wrap");
-    const sec = el("section", "rm-sec");
-    sec.appendChild(el("h3", null, "Theme"));
-    const row = el("div", "dlg-tabs");
-    row.setAttribute("role", "radiogroup");
-    row.setAttribute("aria-label", "Theme");
-    const now = theme?.get() ?? "dark";
-    for (const [value, label] of [["dark", "Dark"], ["light", "Light"], ["system", "System"]]) {
-      const b = el("button", `seg-btn${now === value ? " active" : ""}`, label);
-      b.type = "button";
-      b.dataset.theme = value;
-      b.setAttribute("role", "radio");
-      b.setAttribute("aria-checked", String(now === value));
-      b.onclick = () => { theme?.set(value); renderAppearance(); };
-      row.appendChild(b);
-    }
-    sec.appendChild(row);
-    sec.appendChild(el("p", "rm-note", "System follows this device's light or dark setting."));
-    wrap.appendChild(sec);
-    body.appendChild(wrap);
-  }
+  /** Dark (the default), Light, or System (ui/appearance.js). */
+  function renderAppearance() { renderThemeChoice(tabs.appearance.body, globalThis.omniTheme); }
 
   // ------------------------------------------------------------ long runs
   function renderLong() {
