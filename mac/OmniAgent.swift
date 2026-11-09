@@ -592,6 +592,13 @@ final class Automation {
         self.dir = dir
         self.app = app
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        // A test drives the window while the Mac's person works in another Space: keep the page painting and counted as visible
+        // (WebKit's own switch). Never done outside automation, where a hidden window should rest.
+        let sel = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
+        if let view = app.controller?.webView, view.responds(to: sel) {
+            typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+            unsafeBitCast(view.method(for: sel), to: Setter.self)(view, sel, false)
+        }
         writeInfo()
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in self?.poll() }
     }
