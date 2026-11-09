@@ -25,6 +25,16 @@ test("buildTree: workers, their subagents (recursively) and orphans; other missi
   assert.deepEqual(withSubs.workers[0].children.map((c) => [c.id, c.kind, c.status]), [["a-7/toolu_1", "claude-sub", "running"]]);
 });
 
+test("the New mission dialog closes on Esc, like every other dialog, and lets go of its key listener", async () => {
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../ui/mission.js", import.meta.url), "utf8");
+  const fn = src.slice(src.indexOf("async function openNew"), src.indexOf("function reset()"));
+  assert.match(fn, /e\.key === "Escape"/);
+  assert.match(fn, /document\.addEventListener\("keydown", onKey\)/);
+  assert.match(fn, /document\.removeEventListener\("keydown", onKey\)/);
+  assert.equal(fn.match(/wrap\.remove\(\)/g)?.length, 1, "every way out goes through close(), which drops the listener");
+});
+
 test("orchestratorState and unreadCount", () => {
   assert.equal(orchestratorState({ ...m, status: "paused" }).text, "paused");
   assert.equal(orchestratorState({ ...m, errors: { consecutive: 2, lastError: "429" } }).tone, "err");

@@ -1,6 +1,6 @@
 {
  "format": 1,
- "version": "e88ebb4aaa64573f",
+ "version": "4c8dd13d9df28cc7",
  "esbuild": "0.25.12",
  "inputs": {
   "scripts/build-ui.mjs": "b78948ea50673d89ded33cd43ccf16c7e1497f1659761114ff75371ab8344310",
@@ -39,7 +39,7 @@
   "ui/manifest.webmanifest": "4636baff9d384fa9cb84b593cc14a207a374c6cf6ada1c444fec56dca1904202",
   "ui/markdown.js": "c565e9d5d4cfc09ebd8124b0b209d9e9d1f86f3276d0047a012979ee300f6ba0",
   "ui/mcp-settings.js": "dc6664b333ad90f3c686614b8949ca57429aaa39dd71bc6996f2d2791450a0b3",
-  "ui/mission.js": "ff839159d53d77ad648f69346a9039f5c2fde203df32178f9d632d590a7d82d0",
+  "ui/mission.js": "722d1ae2ab4c5d0c718d4f031c4f594ced311c329d2a3e3d9febf03d090bdeaa",
   "ui/model-cache.js": "fefab3b2af6694cc0fc73e88dbe3df23dcba83972c8fd4282b76d3034eaf15f0",
   "ui/office-engine.js": "e0f45006eead42522dd707c06156f342aa1ffe32ffd33f6ab496bde508f15800",
   "ui/office-font.js": "1a424c848b0b75598712a482b40d299172d37ecf24d0e1ba4f253bd1133c1b3f",
@@ -72,13 +72,13 @@
  },
  "imports": {
   "theme-U2WP3QSA.js": [],
-  "app-TACO3EOY.js": [
+  "app-HBC33EH5.js": [
    "chunk-PL2O2EJE.js",
    "chunk-VBW5D5PY.js",
    "chunk-4PDXQ3AT.js",
    "chunk-KMK6UWFW.js"
   ],
-  "web-RBVPHV54.js": [
+  "web-DEDZZZT2.js": [
    "chunk-PL2O2EJE.js",
    "chunk-4PDXQ3AT.js",
    "chunk-KMK6UWFW.js"
@@ -104,15 +104,15 @@
   "chunk-XTPJQXHW.js": [
    "chunk-KMK6UWFW.js"
   ],
-  "chunk-JPI3T4NF.js": [
+  "chunk-NB7FKDFT.js": [
    "chunk-KMK6UWFW.js"
   ],
   "chunk-KMK6UWFW.js": []
  },
  "files": {
-  "app-TACO3EOY.js": {
-   "sha256": "ea12d7c98a5afdebc86358aa161d9bb4f6d4bd2f84d9df3ef500bad5f3f1f196",
-   "integrity": "sha256-6hLXyYpa/evIY1iqFh2btPbUvS+E2d8+9QC61fPx8ZY=",
+  "app-HBC33EH5.js": {
+   "sha256": "b01cd4752fb9fb3d33f117e72d5871cbb21a3b06b5ad50270355a073b59e4959",
+   "integrity": "sha256-sBzUdS+5+z0z8RfnLVhxy7IaOwa1rVAnA1Wgc7WeSVk=",
    "immutable": true,
    "br": true,
    "gz": true
@@ -131,13 +131,6 @@
    "br": true,
    "gz": true
   },
-  "chunk-JPI3T4NF.js": {
-   "sha256": "01415b4cea79ff719813af2fb19a56bd2ce7143de8c3475a3975b76694b6b571",
-   "integrity": "sha256-AUFbTOp5/3GYE68vsZpWvSznFD3ow0daOXW3ZpS2tXE=",
-   "immutable": true,
-   "br": true,
-   "gz": true
-  },
   "chunk-KMK6UWFW.js": {
    "sha256": "50fc234f58cf563603a26c828fefe24087b59a5a1509c9dc28828be16aa09bbf",
    "integrity": "sha256-UPwjT1jPVjYDomyCj+/iQIe1mloVCcncKIKL4Wqgm78=",
@@ -148,6 +141,13 @@
   "chunk-N2NDXIBG.js": {
    "sha256": "0898a2edad94b4758fc22378e5a408af0091b0c7722d14b3e9a3ebe794e753f9",
    "integrity": "sha256-CJii7a2UtHWPwiN45aQIrwCRsMdyLRSz6aPr55TnU/k=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-NB7FKDFT.js": {
+   "sha256": "a8ffe56529f7cdc3652b54ad382d622910637ba53bc85ccf3f700ee421af5d1f",
+   "integrity": "sha256-qP/lZSn3zcNlK1StOC1iKRBje6U7yFzPP3AO5CGvXR8=",
    "immutable": true,
    "br": true,
    "gz": true
@@ -194,8 +194,8 @@
    "immutable": true
   },
   "index.html": {
-   "sha256": "d3c246a6c30c69fb23b2947b5f1ba3989ff52355e9c466c3c1f1f4c09b487d4b",
-   "integrity": "sha256-08JGpsMMafsjspR7XxujmJ/1I1XpxGbDwfH0wJtIfUs=",
+   "sha256": "1a1a7b21e91ec122cef07747febe1062c254395950fd274523ad8f648cb0d827",
+   "integrity": "sha256-Ghp7IekewSLO8HdH/r4QYsJUOVlQ/SdFI62PZIyw2Cc=",
    "immutable": false,
    "br": true,
    "gz": true
@@ -236,8 +236,8 @@
    "gz": true
   },
   "sw.js": {
-   "sha256": "393fba45ef6bcc407ff315e6dc15c523f1316b8153f7d3a7139847812e20ef0b",
-   "integrity": "sha256-OT+6Re9rzEB/8xXm3BXFI/Exa4FT99OnE5hHgS4g7ws=",
+   "sha256": "52649f2da34c7bae3ae24f8252e6507208f5e0c50e0ff97c6c856a4407ba97ea",
+   "integrity": "sha256-UmSfLaNMe6464k+CUuZQcgj14MUOD/l8bIVqRAe6l+o=",
    "immutable": false,
    "br": true,
    "gz": true
@@ -249,6 +249,13 @@
    "br": true,
    "gz": true
   },
+  "web-DEDZZZT2.js": {
+   "sha256": "311599a1eaa14a3e94a335c084315fab1c643595cfce30cc405f6a21a50717eb",
+   "integrity": "sha256-MRWZoeqhSj6UozXAhDFfqxxkNZXPzjDMQF9qIaUHF+s=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
   "web-EVP7N4LU.css": {
    "sha256": "0ae516e2dc277e682bf67500a3edc109c0096c6d73101e6ab09a8ca0953311cc",
    "integrity": "sha256-CuUW4twnfmgr9nUAo+3BCcAJbG1zEB5qsJqMoJUzEcw=",
@@ -256,16 +263,9 @@
    "br": true,
    "gz": true
   },
-  "web-RBVPHV54.js": {
-   "sha256": "0a53ca105edae2532ddd2096e91307c101b0cf310ff58058213c63df2aa06c8c",
-   "integrity": "sha256-ClPKEF7a4lMt3SCW6RMHwQGwzzEP9YBYITxj3yqgbIw=",
-   "immutable": true,
-   "br": true,
-   "gz": true
-  },
   "web.html": {
-   "sha256": "80efc3faa50768181e04dabcb546795ef1eca16b37048200e9fcedcd8b220edb",
-   "integrity": "sha256-gO/D+qUHaBgeBNq8tUZ5XvHsoWs3BIIA6fztzYsiDts=",
+   "sha256": "8de0ffc4fdb4b4d09078f7e73d89eb0b13f185e3dc8f03fe21bfbdfa6025f61a",
+   "integrity": "sha256-jeD/xP20tNCQePfnPYnrCxPxhePcjwP+Ib+9+mAl9ho=",
    "immutable": false,
    "br": true,
    "gz": true

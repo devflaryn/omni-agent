@@ -444,6 +444,10 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
   }
   async function openNew() {
     const wrap = el("div", "ms-dlg-wrap");
+    // Every way out (Cancel, Esc, a click outside, a mission started) closes it the same way, and the focus goes back.
+    const prev = document.activeElement;
+    const onKey = (e) => { if (e.key === "Escape" && !e.defaultPrevented) { e.preventDefault(); close(); } };
+    const close = () => { wrap.remove(); document.removeEventListener("keydown", onKey); if (prev?.isConnected) prev.focus?.({ preventScroll: true }); };
     const dlg = el("form", "ms-dlg");
     dlg.append(el("div", "ms-dlg-title", "New mission"));
     dlg.append(el("div", "ms-dlg-sub", "An orchestrator plans the work and workers do it."));
@@ -466,7 +470,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     how.append(el("summary", null, "How this works"), el("p", null, "The orchestrator only plans and delegates. Workers (OpenCode or Claude Code) do the work and report back. Project memory, the knowledge graph and the ledger live in Omni's own folder for the project, not in the project, so a mission can run for days."));
     dlg.append(how);
     const acts = el("div", "ms-dlg-acts");
-    const cancel = el("button", "btn quiet", "Cancel"); cancel.type = "button"; cancel.onclick = () => wrap.remove();
+    const cancel = el("button", "btn quiet", "Cancel"); cancel.type = "button"; cancel.onclick = close;
     const go = el("button", "btn primary", "Start mission"); go.type = "submit";
     acts.append(cancel, go);
     dlg.append(acts);
@@ -476,12 +480,13 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       try {
         const r = await api("/api/missions", { dir: dir.value.trim(), goal: goal.value.trim(), title: title.value.trim() || undefined, orchestratorModel: orchestrator.value, fallbackModel: fb.value || undefined, workerKind: kind, workerModel: wm.value.trim() || undefined, startMessage: sm.value.trim() || undefined });
         M.list.set(r.mission.id, r.mission); M.open = r.mission.id; M.selected = "orchestrator";
-        wrap.remove(); render();
+        close(); render();
       } catch (err) { toast(err.message, true); go.disabled = false; }
     };
-    wrap.onclick = (e) => { if (e.target === wrap) wrap.remove(); };
+    wrap.onclick = (e) => { if (e.target === wrap) close(); };
     wrap.append(dlg);
     document.body.append(wrap);
+    document.addEventListener("keydown", onKey);
     goal.focus();
   }
 
