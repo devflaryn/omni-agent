@@ -33,6 +33,8 @@ import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.
 import * as files from "./files.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
 import { applyStatus } from "../ui/lib.js";
+import { openUiBuild } from "./ui-build.mjs";
+import { serveWebFile } from "../hub/static.mjs";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
 import { createServer as createNetServer } from "node:net";
@@ -594,6 +596,10 @@ export async function createApp(overrides = {}) {
   }
 
   // ------------------------------------------------------------------ http
+  // The UI: dist/ui while it is what ui/ makes, ui/ itself the moment it is not (server/ui-build.mjs).
+  const UI_ROOT = cfg.uiRoot || ROOT;
+  const uiBuild = openUiBuild({ root: UI_ROOT, log: cfg.log || log, fromSource: !!cfg.uiFromSource || process.env.OMNI_UI_SOURCE === "1" });
+  const NO_FILES = new Map(), NOTHING_FETCH_ONLY = new Set();
   const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
   function send(res, code, body, type = "application/json") {
     res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
@@ -906,10 +912,17 @@ export async function createApp(overrides = {}) {
       if (p.startsWith("/api/remote/")) return remoteAdmin(req, res, p);
       if (req.method === "GET" && p === CERT_PATH) return sendCert(res);
       // static UI
-      if (req.method === "GET" && (p === "/" || p === "/index.html")) return send(res, 200, await fs.readFile(join(ROOT, "ui", "index.html")), MIME[".html"]);
+      if (req.method === "GET" && (p === "/" || p === "/index.html")) {
+        const built = uiBuild.current();
+        if (built) { serveWebFile(req, res, built.files, {}, { fetchOnly: NOTHING_FETCH_ONLY }); return; }
+        res.setHeader("X-Omni-Ui", "source");
+        return send(res, 200, await fs.readFile(join(UI_ROOT, "ui", "index.html")), MIME[".html"]);
+      }
       if (req.method === "GET" && /^\/[\w.-]+\.(js|mjs|css|svg|png|ico)$/.test(p)) {
-        const f = join(ROOT, "ui", p.slice(1));
-        if (!existsSync(f)) return send(res, 404, { error: "not found" });
+        if (serveWebFile(req, res, uiBuild.files() ?? NO_FILES, {}, { fetchOnly: NOTHING_FETCH_ONLY })) return;
+        const f = join(UI_ROOT, "ui", p.slice(1));
+        if (p === "/sw.js" || !existsSync(f)) return send(res, 404, { error: "not found" }); // the worker is the web page's, and its source a template
+
         return send(res, 200, await fs.readFile(f), MIME[extname(f)] || "application/octet-stream");
       }
       // events

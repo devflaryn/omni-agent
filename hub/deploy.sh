@@ -18,27 +18,30 @@ remote() {
   "$SSH_EXE" -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$KNOWN_HOSTS" -o GlobalKnownHostsFile=none "$TARGET" "$@"
 }
 
-# Exactly what the hub imports and serves, in the same layout. A checkout on Windows can have CRLF, so it is stripped from text.
-# The web page's list is the one in hub/static.mjs, which a test holds this to. It is written out so no folder is ever copied whole.
+# Exactly what the hub imports and serves, in the same layout. A checkout on Windows can have CRLF, so it is stripped from source.
+# FILES is what the hub's code imports at run time. The web page's list comes from the build (dist/ui/build.json, the same list
+# hub/static.mjs serves from), file by file, and a test holds the two together. No folder is ever copied whole. The built files are
+# exact bytes, whose hashes the page's service worker checks, so they are copied as they are.
 FILES=(
   hub/server.mjs hub/ws.mjs hub/store.mjs hub/static.mjs hub/omni-hub.service
-  ui/web.html ui/web.js ui/web.css ui/login-worker.js
-  ui/account-core.js ui/account-error.js ui/channel-client.js ui/channel-frames.js ui/channel-set.js ui/device-log.js ui/emitter.js ui/hub-socket.js ui/log-trust.js ui/machine-links.js
-  ui/page-account.js ui/page-files.js ui/page-store.js ui/page-transport.js ui/transport.js
-  ui/index.html ui/styles.css ui/app.js ui/account.js ui/composer.js ui/contextmenu.js ui/editor.js ui/explorer.js ui/fileicons.js ui/filepane.js ui/highlight.js ui/lib.js ui/mcp-settings.js ui/mission.js ui/office-engine.js ui/office-font.js ui/office-props.js ui/office-worker.js ui/office.js ui/panel.js ui/plan.js ui/remote.js ui/resizer.js ui/settings.js ui/sidebar.js ui/stream.js ui/thinking.js ui/transcript.js
-  ui/logo.svg ui/icon-32.png ui/icon-180.png ui/icon-192.png ui/icon-512.png
+  ui/account-core.js ui/device-log.js
 )
-staging="$(mktemp -d)"
-trap 'rm -rf "$staging"' EXIT
+node scripts/build-ui.mjs --check
+mapfile -t WEB_FILES < <(node scripts/build-ui.mjs --list | tr -d '\r')
+staging="${OMNI_DEPLOY_STAGE:-$(mktemp -d)}"
+[ -n "${OMNI_DEPLOY_STAGE:-}" ] || trap 'rm -rf "$staging"' EXIT
 for file in "${FILES[@]}"; do
   mkdir -p "$staging/$(dirname "$file")"
-  case "$file" in
-    *.png) cp "$file" "$staging/$file" ;;
-    *) tr -d '\r' < "$file" > "$staging/$file" ;;
-  esac
+  tr -d '\r' < "$file" > "$staging/$file"
+done
+for file in "${WEB_FILES[@]}"; do
+  mkdir -p "$staging/$(dirname "$file")"
+  cp "$file" "$staging/$file"
 done
 # ui/*.js are ES modules, and this is what says so.
 printf '{ "private": true, "type": "module" }\n' > "$staging/package.json"
+# OMNI_DEPLOY_STAGE=<folder>: lay out what would go, and stop. A test starts a hub from it.
+[ -z "${OMNI_DEPLOY_STAGE:-}" ] || exit 0
 
 tar -C "$staging" -cf - . | remote 'rm -rf /opt/omni-hub.new && mkdir -p /opt/omni-hub.new && tar -xf - --no-same-owner -C /opt/omni-hub.new'
 
