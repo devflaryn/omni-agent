@@ -539,7 +539,9 @@ export function createAccount({ toast, openSettings }) {
     const focused = box.contains(document.activeElement) ? document.activeElement?.dataset?.key : null;
     box.textContent = "";
     const s = A.status;
-    if (s?.phase === "pending") box.appendChild(newDeviceCard(s));
+    // The first-run screen shows the same code itself, over everything.
+    const welcomeUp = showWelcome(s, { available: A.available, closed: A.welcome.closed, flow: A.welcome.flow });
+    if (s?.phase === "pending" && !welcomeUp) box.appendChild(newDeviceCard(s));
     if (s && fullDevice()) for (const row of A.pending) if (!row.expiresAt || row.expiresAt > Date.now()) box.appendChild(approvalCard(row, s));
     box.hidden = !box.childElementCount;
     if (focused) box.querySelector(`[data-key="${CSS.escape(focused)}"]`)?.focus();
