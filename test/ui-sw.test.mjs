@@ -153,7 +153,7 @@ test("the built worker carries the build's whole list, each with its hash, and a
   const build = readBuild();
   assert.doesNotMatch(built, /__PRECACHE__|__VERSION__/);
   for (const [name, file] of Object.entries(build.files)) {
-    if (name === "sw.js") continue;
+    if (name === "sw.js" || name === "phone.html") continue; // the iPhone app's page is in the app, never at the hub
     const url = name === "web.html" ? "/" : `/${name}`;
     assert.ok(built.includes(`"${url}"`) || built.includes(`url:"${url}"`), `${url} is not precached`);
     assert.ok(built.includes(file.integrity), `${url} has no hash`);

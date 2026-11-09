@@ -218,7 +218,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   }
   if (hstsMaxAge !== null && (!Number.isSafeInteger(hstsMaxAge) || hstsMaxAge < 0)) throw new Error("hub: hstsMaxAge must be a whole number of seconds");
   const securityHeaders = tls && hstsMaxAge !== null ? { "Strict-Transport-Security": `max-age=${hstsMaxAge}` } : {};
-  const webFiles = loadWebFiles(webRoot);
+  const webFiles = loadWebFiles(webRoot, { except: ["phone.html"] }); // the iPhone app's page lives in the app, not here
   const pageHeaders = { ...webHeaders(origin), ...securityHeaders };
   const store = openStore(dataDir);
   // Once an account exists the token has been spent, even if the setting is still there after a restart.

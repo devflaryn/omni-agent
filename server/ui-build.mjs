@@ -79,7 +79,7 @@ export function openUiBuild({ root, log = () => {}, fromSource = false, autoBuil
       const build = readBuild(distOf(root));
       inputs = Object.keys(build.inputs).map((name) => join(root, name));
       if (build.version === version) return;
-      const files = loadWebFiles(distOf(root), { entry: "index.html", except: ["sw.js", "web.html"] });
+      const files = loadWebFiles(distOf(root), { entry: "index.html", except: ["sw.js", "web.html", "phone.html"] });
       loaded = new Map([...(loaded ?? []), ...files]);
       version = build.version;
       serving = null;

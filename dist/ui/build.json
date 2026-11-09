@@ -1,12 +1,12 @@
 {
  "format": 1,
- "version": "52a2f241460f16e0",
+ "version": "8b8e5df680432818",
  "esbuild": "0.25.12",
  "inputs": {
-  "scripts/build-ui.mjs": "b78948ea50673d89ded33cd43ccf16c7e1497f1659761114ff75371ab8344310",
+  "scripts/build-ui.mjs": "af7419b426515b9c58657b5177bc74b6350db2256e468195d643b5840ac385d3",
   "ui/account-core.js": "1dcf6de50a63aa9bb32c17fc4a52aae4fe364818dd5f41f3f3bff134215a0166",
   "ui/account-error.js": "8d5eeaa4f9caacf7c1a0438083c85056de38615416eab5b4c0fb711a3d8ca47a",
-  "ui/account.js": "b10a846cf8ca5b941e027303422173d29e31321488fec7b30acf04e1c0cc8764",
+  "ui/account.js": "3c9f46102e6e11dc211b9c27290a3bf30a35a8b2d9b8a6de804a56a27e4d0ab6",
   "ui/app.js": "d6e11e8c55839ec5e3203f0abdbc0fdb3b3195e65110a23661fb2027af828cec",
   "ui/appearance.js": "eb3b519db382e08765013181d6035eee46042bbe219ec0c0fa6338579ff33576",
   "ui/channel-client.js": "58d51098142a042bcdacd83375a6d93f80b5be6fcfb4bb880cc3eefd2eeece7f",
@@ -29,6 +29,7 @@
   "ui/icon-32.png": "32f9bd06926d7949847178f76761396c6bc5ef7557f9e38bf4a842987dafcfd9",
   "ui/icon-512.png": "b3f8ad813f13be17ac20acc2bb7a632ce3089ad78883d74f87dfe9271ab3485b",
   "ui/index.html": "3f51ea98213e383b529e192c1236bbacfc69a4b41594252f5389e359e1e7475e",
+  "ui/keychain-store.js": "f758e1e97c3548fe4e81a8b79fb5588f5dec57cb08211d04528671ca0ec4f966",
   "ui/keys.js": "fbc19024acf35b19059c457f32e1b9582dc85a5ca97f639ffdc75f55dca561c1",
   "ui/lib.js": "902f92c46b00c5790d86af5175ed00f07315e3144b985b3bf29ac98ccd24e39a",
   "ui/log-trust.js": "dae119da721f25f5791bf25dde56644f4d4277c492f01ecb1fd3a58c0a62f711",
@@ -46,12 +47,15 @@
   "ui/office-props.js": "ddd2790d1c470e21d7d833916e4d7dcc53a291c0ca6873177be5fa5c6fef0991",
   "ui/office-worker.js": "1766f8e13f77b52d13da46315751a56eca6d6a3c5f852c3bccee429f36b64cda",
   "ui/office.js": "d49ceca17f718db7f4c08a4b17fa8d845de6cedc9ab29435a1b1d79994dda61b",
-  "ui/page-account.js": "25e7e2442415c91971ef177cebd58a3309d04e1b4dc9f51d3521b89b0c131f9a",
+  "ui/page-account.js": "e4023cd358e85015df802b684b877fe7051bec626d3a1f57997b4f22d55525d4",
   "ui/page-files.js": "e41f38729f83a17470a9c1a23603c245751cbb949d79504dec900d3ef38b487b",
   "ui/page-store.js": "4ca1f858f8c85ea8d36e466401b70320b8255a98f14a7106f0f1d6fd2f6891e0",
   "ui/page-transport.js": "7a26b9b27f66f939dc78f0fd970084f7d5106725f7369cc9050c2a8854462643",
   "ui/panel.js": "58af0f33e651a5c388a9ade9a86b1a59928284e97928259dbfcaef19d3f29212",
   "ui/paths.js": "69d47a83d2d7d62ac3f731e0cc584869bdf3535bfb3e5ce4c0ed28e15c0974f0",
+  "ui/phone-net.js": "1482fb0d5dabb91917f67673a6e99011c9acdc473a80aa9e2b3cb450a20daee4",
+  "ui/phone.html": "21cc36581c7a685efa3d39881139b51290eec1510f5c568ac050e04c87aa102a",
+  "ui/phone.js": "30e8a25878f55654798592c736e345bc13bc0e60d2e5dc10d76c72d190ebee58",
   "ui/plan.js": "a0886fc224f962db4baa8e3d14a517f28b08b90cf45875d573c4b11ba53c5de5",
   "ui/remote.js": "44895343dc40e127dda0f4b4312f1a4b733155e4328cebac356846aacf595e4e",
   "ui/resizer.js": "1073327f56875128a5c8689d56b41f2fa30949fe18c02a6101c7078c7fef0b48",
@@ -64,43 +68,56 @@
   "ui/theme.js": "ec228ebb35d84d25dfcc1459d8c85503ee52736bfed0cfcfe8a2b1389725da8e",
   "ui/toast.js": "97a000d55bcf4c90c3bdd6fdef02c34be847eed4cb187dbbabe556600e862d72",
   "ui/transcript.js": "130cbeebc02f0f643e6c9b148bc2b7853f8db903bcd2518766f3c5181e1d4584",
-  "ui/transport.js": "6cf9a8fd51db6ccb498435b92b7afb1f814d8d7c556e6ade90bca0d124a08145",
+  "ui/transport.js": "b6daf75a601380499611c80fe9e2eb13ade7f053fc79eb33dbdd563563e861f5",
+  "ui/web-app.js": "2aa267ee6364cd8014aaa5049f3569e3d0a901b86230237da2d025b61964904e",
   "ui/web-sw.js": "c09809c7fa6131d3233db0c528496e76cddcadb09170ad2c1f688a2a80ac1e5e",
   "ui/web.css": "38f08d024129cfe1e3d019231e9dfd88be3f5c0151b0e732b3c3cdc9e49dec4b",
   "ui/web.html": "0bf43f50e91b916d1923477d493762237bb6bade8c10750b4760a65b7acd43f8",
-  "ui/web.js": "f48b08a7e841d6f7b35094bab92f547c59bd17737e6af4008727cb8d75b85427"
+  "ui/web.js": "fca93760e8fe40d4278170dd5b30201c6bc8fa37ba5d02e4d1026bbfa3805f7b"
  },
  "imports": {
   "theme-RCHZNKEU.js": [],
-  "app-G472R4HN.js": [
-   "chunk-5WKYG6OC.js",
+  "app-RFFZR7IJ.js": [
+   "chunk-DCJGM4EJ.js",
    "chunk-A5US6EW5.js",
-   "chunk-4PDXQ3AT.js",
+   "chunk-J5PRW3TL.js",
    "chunk-N4COS2TB.js"
   ],
-  "web-FZP4BVTL.js": [
-   "chunk-5WKYG6OC.js",
-   "chunk-4PDXQ3AT.js",
+  "web-VYCBEQMP.js": [
+   "chunk-5P6QBPTR.js",
+   "chunk-DCJGM4EJ.js",
+   "chunk-J5PRW3TL.js",
    "chunk-N4COS2TB.js"
   ],
-  "chunk-5WKYG6OC.js": [
-   "chunk-4PDXQ3AT.js",
+  "phone-JWS2NPFH.js": [
+   "chunk-5P6QBPTR.js",
+   "chunk-DCJGM4EJ.js",
+   "chunk-J5PRW3TL.js",
+   "chunk-N4COS2TB.js"
+  ],
+  "chunk-5P6QBPTR.js": [
+   "chunk-DCJGM4EJ.js",
+   "chunk-J5PRW3TL.js",
+   "chunk-N4COS2TB.js"
+  ],
+  "chunk-DCJGM4EJ.js": [
+   "chunk-J5PRW3TL.js",
    "chunk-N4COS2TB.js"
   ],
   "chunk-HYMHTRDO.js": [
    "chunk-X45CBCX3.js",
    "chunk-N4COS2TB.js"
   ],
-  "chunk-TDTQE4ZT.js": [
+  "chunk-D7UGTGIU.js": [
    "chunk-A5US6EW5.js",
-   "chunk-4PDXQ3AT.js",
+   "chunk-J5PRW3TL.js",
    "chunk-X45CBCX3.js",
    "chunk-N4COS2TB.js"
   ],
   "chunk-A5US6EW5.js": [
    "chunk-N4COS2TB.js"
   ],
-  "chunk-4PDXQ3AT.js": [],
+  "chunk-J5PRW3TL.js": [],
   "chunk-X45CBCX3.js": [
    "chunk-N4COS2TB.js"
   ],
@@ -110,23 +127,16 @@
   "chunk-N4COS2TB.js": []
  },
  "files": {
-  "app-G472R4HN.js": {
-   "sha256": "b7c22cb21642e7cbc8d96d6657d22996e33e593405a47b299ff16c3eedb5dcbf",
-   "integrity": "sha256-t8IsshZC58vI2W1mV9IpluM+WTQFpHspn/FsPu213L8=",
+  "app-RFFZR7IJ.js": {
+   "sha256": "231329b74616a52785fd4d8318650b6d18233a17165d1a61c7acaecf1753f8e1",
+   "integrity": "sha256-IxMpt0YWpSeF/U2DGGULbRgjOhcWXRphx6yuzxdT+OE=",
    "immutable": true,
    "br": true,
    "gz": true
   },
-  "chunk-4PDXQ3AT.js": {
-   "sha256": "32a925cb0ac263b9ca2a491f89b2fe4d4ee8c02ba54bf372ee5e13d75e390554",
-   "integrity": "sha256-MqklywrCY7nKKkkfibL+TU7owCulS/Ny7l4T1145BVQ=",
-   "immutable": true,
-   "br": true,
-   "gz": true
-  },
-  "chunk-5WKYG6OC.js": {
-   "sha256": "537eb2489125759746c8945b1a2ac487d8dab350a611715c89c750cb15c36dbf",
-   "integrity": "sha256-U36ySJEldZdGyJRbGirEh9jas1CmEXFcicdQyxXDbb8=",
+  "chunk-5P6QBPTR.js": {
+   "sha256": "ebfa43fdfb04dfccd1c4e85cee7ad73c0702a024b74b7e983988093a7eeab7b2",
+   "integrity": "sha256-6/pD/fsE38zRxOhc7nrXPAcCoCS3S36YOYgJOn7qt7I=",
    "immutable": true,
    "br": true,
    "gz": true
@@ -138,6 +148,20 @@
    "br": true,
    "gz": true
   },
+  "chunk-D7UGTGIU.js": {
+   "sha256": "9306fdd9f2b1c9ee7136de0a059078e5b21be565abfa95d7dd32a450c6c16373",
+   "integrity": "sha256-kwb92fKxye5xNt4KBZB45bIb5WWr+pXX3TKkUMbBY3M=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-DCJGM4EJ.js": {
+   "sha256": "bec816289f5b7cf219dac6307c667c8e9c258846c305e3603dfd3754aea01d5b",
+   "integrity": "sha256-vsgWKJ9bfPIZ2sYwfGZ8jpwliEbDBeNgPf03VK6gHVs=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
   "chunk-HYMHTRDO.js": {
    "sha256": "3d4f29ea1b634efb21876862bc1c45962b4c579a0275c5f4fa62a1e8e8718980",
    "integrity": "sha256-PU8p6htjTvshh2hivBxFlitMV5oCdcX0+mKh6OhxiYA=",
@@ -145,16 +169,16 @@
    "br": true,
    "gz": true
   },
-  "chunk-N4COS2TB.js": {
-   "sha256": "0d21b8274e4bde233b02a6b5f48898f5959d15393d1c9c4f4c622d09bc076113",
-   "integrity": "sha256-DSG4J05L3iM7Aqa19IiY9ZWdFTk9HJxPTGItCbwHYRM=",
+  "chunk-J5PRW3TL.js": {
+   "sha256": "338f11a60b004d7ee243217dc0a16e6d74ac9926359dcf96167fd79af4b9b2d6",
+   "integrity": "sha256-M48RpgsATX7iQyF9wKFubXSsmSY1nc+WFn/XmvS5stY=",
    "immutable": true,
    "br": true,
    "gz": true
   },
-  "chunk-TDTQE4ZT.js": {
-   "sha256": "73a15ba096a1106e1e4545b04f75cc373a1a0fd9f47c9c0fd5c75befd3fa5898",
-   "integrity": "sha256-c6FboJahEG4eRUWwT3XMNzoaD9n0fJwP1cdb79P6WJg=",
+  "chunk-N4COS2TB.js": {
+   "sha256": "0d21b8274e4bde233b02a6b5f48898f5959d15393d1c9c4f4c622d09bc076113",
+   "integrity": "sha256-DSG4J05L3iM7Aqa19IiY9ZWdFTk9HJxPTGItCbwHYRM=",
    "immutable": true,
    "br": true,
    "gz": true
@@ -194,8 +218,8 @@
    "immutable": true
   },
   "index.html": {
-   "sha256": "07e220051d54d50c665f297e1a2f06420b530c5442858866d2d8341c58727244",
-   "integrity": "sha256-B+IgBR1U1QxmXyl+Gi8GQgtTDFRChYhm0tg0HFhyckQ=",
+   "sha256": "e67d8aa67044b09af3d314286c9d588c93a798d647797e7a126faa4b05277cbd",
+   "integrity": "sha256-5n2KpnBEsJrz0xQobJ1YjJOnmNZHeX56Em+qSwUnfL0=",
    "immutable": false,
    "br": true,
    "gz": true
@@ -228,6 +252,20 @@
    "br": true,
    "gz": true
   },
+  "phone-JWS2NPFH.js": {
+   "sha256": "2e7e0fa026b2ce4141adaafe8cf2017d00dec3b73c6c4445e812577de143d8e3",
+   "integrity": "sha256-Ln4PoCayzkFBrar+jPIBfQDew7c8bERF6BJXfeFD2OM=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "phone.html": {
+   "sha256": "3e0eeca591c9dd33c2ccec288b8dcc9a01103d39450319f658d761e7c4ecb236",
+   "integrity": "sha256-Pg7spZHJ3TPCzOwoi43MmgEQPTlFAxn2WNdh58TssjY=",
+   "immutable": false,
+   "br": true,
+   "gz": true
+  },
   "styles-TCFXOPUV.css": {
    "sha256": "b2a182f6a44dc48eee9d6e9a75b410575f2208b6bf1b7417a115ae6584192bf0",
    "integrity": "sha256-sqGC9qRNxI7unW6adbQQV18iCLa/G3QXoRWuZYQZK/A=",
@@ -236,8 +274,8 @@
    "gz": true
   },
   "sw.js": {
-   "sha256": "523c2ca49413052ac007b9ed2220f9bf65bff5b5679c3d1d93d875486acdec55",
-   "integrity": "sha256-UjwspJQTBSrAB7ntIiD5v2W/9bVnnD0dk9h1SGrN7FU=",
+   "sha256": "9e72e0092d46a8121e77ad4532ea0f78d959118fdda225dc7a074db3e64c041e",
+   "integrity": "sha256-nnLgCS1GqBIed61FMuoPeNlZEY/doiXcegdNs+ZMBB4=",
    "immutable": false,
    "br": true,
    "gz": true
@@ -256,16 +294,16 @@
    "br": true,
    "gz": true
   },
-  "web-FZP4BVTL.js": {
-   "sha256": "e48996376820a6e2e63a7ff736a5a4b8b2563c8284b33fb9057ea1f3914a2d7b",
-   "integrity": "sha256-5ImWN2ggpuLmOn/3NqWkuLJWPIKEsz+5BX6h85FKLXs=",
+  "web-VYCBEQMP.js": {
+   "sha256": "b2f5114efd944b3a0765912d7d26ac8086160b87536afb17356d657de1bd455b",
+   "integrity": "sha256-svURTv2USzoHZZEtfSasgIYWC4dTavsXNW1lfeG9RVs=",
    "immutable": true,
    "br": true,
    "gz": true
   },
   "web.html": {
-   "sha256": "41f2af6b85b1deff2eb6d8558a42cb7c0154a96a088bb3c7bdb3ec3e51dacc78",
-   "integrity": "sha256-QfKva4Wx3v8utthVikLLfAFUqWoIi7PHvbPsPlHazHg=",
+   "sha256": "6562c6701fbf8afa86f8db5d0e9c14e24345a43259ada4b0f77409b47ebe5d85",
+   "integrity": "sha256-ZWLGcB+/ivqG+NtdDpwU4kNFpDJZraSw93QJtH6+XYU=",
    "immutable": false,
    "br": true,
    "gz": true
