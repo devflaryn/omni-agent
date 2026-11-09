@@ -1,8 +1,10 @@
 /* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only.
    Every machine on the account is in this one window: the chats drawer lists them all, and opening a chat or starting one on
    any of them moves the window's focus there without a reload (ui/machines.js keeps one workspace per machine). */
-import { el, baseName, harnessLabel, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
-import { newView, applyEvent, finish, forkNote, agentNote, emptyNote, setOlder, prependHistory, isFollowing } from "./transcript.js";
+import { el, ago, baseName, harnessLabel, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
+import { newView, applyEvent, finish, forkNote, agentNote, emptyNote, setOlder, prependHistory, isFollowing, followLatest } from "./transcript.js";
+import { chatHash, parseHash } from "./route.js";
+import { installKeys, openPalette, openShortcuts } from "./keys.js";
 import { createComposer } from "./composer.js";
 import { createHistory } from "./sidebar.js";
 import { createPanel } from "./panel.js";
@@ -65,7 +67,7 @@ const hereApi = (path, body, method) => local.api(body || (method && method !== 
 const remote = createRemote({ api: hereApi, toast });
 const homeCwd = () => $("#homeCwd").value.trim() || S.config?.cwd || "";
 const currentDir = () => (S.page === "chat" && S.sessions.get(S.selected)?.cwd) || homeCwd() || null;
-const drafts = createDrafts();
+const drafts = createDrafts({ storage: (() => { try { return globalThis.localStorage; } catch { return null; } })() });
 
 async function deleteChat(key, sid) {
   const ws = key === focusKey ? S : wsOf(key);
@@ -143,7 +145,11 @@ const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setE
 const home = createComposer($("#homeComposer"), { ...composerHooks, onSend: homeSend });
 // In a background agent's chat the picker shows the agent's model; picking there would change Omni's own pi.
 const notForAgents = (fn) => (...args) => { if (target().kind !== "agent") return fn(...args); toast("A background agent keeps the model it started with; this picker sets Omni's own chat model. Pick it from one of its chats.", true); updateComposer(); };
-const chat = createComposer($("#chatComposer"), { ...composerHooks, onPiModel: notForAgents(setPiModel), onPiThinking: notForAgents(setPiThinking), onHook: notForAgents(setHook), onSend: chatSend, onStop: chatStop });
+// What is typed in a chat is kept as it is typed (a reload or a closed window keeps it), not only when the chat is left.
+let draftTimer = null;
+const onChatDraft = () => { clearTimeout(draftTimer); draftTimer = setTimeout(() => { if (S.page === "chat") keepDraft(); }, 300); };
+const chat = createComposer($("#chatComposer"), { ...composerHooks, onPiModel: notForAgents(setPiModel), onPiThinking: notForAgents(setPiThinking), onHook: notForAgents(setHook), onSend: chatSend, onStop: chatStop, onDraft: onChatDraft });
+globalThis.addEventListener?.("pagehide", () => { if (S.page === "chat") keepDraft(); });
 
 /** Choices made before pi runs are saved on the server and applied when it starts, so the picker never "forgets". */
 /** The open chat when it has a pi child of its own: a model, thinking or goal change is for that chat. */
@@ -334,13 +340,43 @@ function showView(name) {
   $("#btnExplorer").hidden = name !== "chat";
   document.body.classList.toggle("in-chat", name === "chat");
   // Both composers share the remembered attachment choices (memory / repo graph).
-  if (name === "home") { setExplorer(false); home.reloadOptions(); renderHome(); home.focus(); }
+  if (name === "home") { setExplorer(false); home.reloadOptions(); renderHome(); home.autoFocus(); }
   if (name === "mission") { setExplorer(false); missionView.load(); }
-  if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth > 760 && explorerPreferred()); chat.reloadOptions(); updateHeader(); updateComposer(); }
+  if (name === "chat") { explorer.setRoot(currentDir()); setExplorer(window.innerWidth > 760 && explorerPreferred()); chat.reloadOptions(); updateHeader(); updateComposer(); chat.autoFocus(); }
   renderSummary();
   renderAgents();
   updateTitle();
+  syncRoute();
 }
+
+// ------------------------------------------------------------- URLs
+// The window's place is in its URL (ui/route.js): a chat is #/c/<machine>/<chat id>, so a reload comes back to it, Back
+// goes to where the window was before, and a link opens the same chat on another device. This computer is its device id
+// once the account names it ("here" before that, or with no account).
+let hereId = null, applyingRoute = false, pendingRoute = null;
+const urlKey = (key) => (key === HERE ? hereId || "here" : key);
+/** The machine key a URL names, or null while the window does not know that machine (yet). */
+const keyFromUrl = (seg) => (seg === "here" ? (webPage() ? null : HERE) : hereId && seg === hereId && !webPage() ? HERE : byKey(seg) ? seg : null);
+const routeHash = () => (S.page === "chat" && S.selected ? chatHash(urlKey(focusKey), S.selected) : S.page === "mission" ? "#missions" : "");
+const routeUrl = (hash) => `${location.pathname}${location.search}${hash}`;
+/** A move the person made becomes a history entry; one the URL made (Back, a link, a reload) does not. */
+function syncRoute() {
+  if (applyingRoute) return;
+  const want = routeHash();
+  if ((location.hash || "") !== want) window.history.pushState(null, "", routeUrl(want));
+}
+function applyRoute(r = parseHash(location.hash)) {
+  applyingRoute = true;
+  try {
+    if (r.kind !== "chat") { pendingRoute = null; const page = r.kind === "missions" ? "mission" : "home"; if (S.page !== page) showView(page); return; }
+    const key = keyFromUrl(r.machine);
+    if (key == null) { pendingRoute = r; return; } // a machine the account has not listed yet: tried again when it does
+    pendingRoute = null;
+    if (key !== focusKey && !focusMachine(key)) { window.history.replaceState(null, "", routeUrl(routeHash())); return; }
+    if (S.page !== "chat" || S.selected !== r.sid) openChat(r.sid);
+  } finally { applyingRoute = false; }
+}
+window.addEventListener("popstate", () => applyRoute());
 
 // The agents strip above the composer: the background agents (pi, Claude Code, shell jobs) this chat started,
 // live from `agent` events. Open selects an agent's chat (a shell job shows its log here); Stop cancels it.
@@ -627,6 +663,8 @@ async function sendClearing(composer, text, send) {
 }
 async function chatSend(text, o) {
   const t = target();
+  // Sending always goes to the newest line, wherever the reader had scrolled.
+  followLatest($("#transcriptWrap"));
   // `/goal` drives Omni's own pi (the keeper); here it would quietly set that goal from an agent's chat.
   if (t.kind === "agent" && /^\/goal\b/.test(text.trim())) { toast("/goal sets the goal of Omni's own chat. Type it in one of its chats; here, just tell the agent.", true); return; }
   if (await goalCommand(text, chat)) return;
@@ -669,6 +707,7 @@ async function selectSession(sid, { reload = false } = {}) {
   if (!reload && S.selected !== sid) { keepDraft(); chat.setValue(drafts.take(key, sid)); }
   if (S.view && !reload) finish(S.view);
   S.selected = sid;
+  if (!reload) syncRoute();
   loadAll(key); // its agents may be older than the first screen's
   S.forceFork = false;
   history.render();
@@ -993,6 +1032,7 @@ function loadAll(key) {
 const lastState = new Map();
 function setMachines(list, status) {
   const here = webPage() ? null : { name: status?.device?.name || "This computer" };
+  if (!webPage() && status?.device?.id) hereId = status.device.id;
   MACHINES = machineList({ here, machines: list });
   for (const m of MACHINES) {
     const ws = wsOf(m.key);
@@ -1015,6 +1055,10 @@ function setMachines(list, status) {
   machineChrome();
   if (S.page === "home") renderHome(); else if (S.page === "chat") updateComposer();
   history.render();
+  // A chat link for a machine the account had not listed yet opens now that it has.
+  if (pendingRoute && keyFromUrl(pendingRoute.machine) != null) applyRoute(pendingRoute);
+  // This computer's URL name may just have become its device id.
+  else if (S.page === "chat" && focusKey === HERE && location.hash !== routeHash()) window.history.replaceState(null, "", routeUrl(routeHash()));
 }
 
 // ------------------------------------------------------------------ SSE
@@ -1160,6 +1204,48 @@ function handle(ev) {
   scheduleRail();
 }
 
+// ------------------------------------------------------------- keyboard
+/** The palette's rows: the main actions, then every chat the window has listed, on every machine that is reachable, newest first. */
+function paletteItems() {
+  const actions = [
+    { title: "New chat", keys: "mod+shift+o", run: newChat },
+    ...(S.page === "chat" && chat.streaming ? [{ title: "Stop the answer", keys: "mod+.", run: stopNow }] : []),
+    { title: "Show or hide the files", keys: "mod+b", run: toggleFiles },
+    { title: "Show or hide the chat history", keys: "mod+\\", run: toggleHistory },
+    { title: "Missions", run: () => showView("mission") },
+    { title: "Settings", run: () => openSettings() },
+    { title: "Keyboard shortcuts", keys: "?", run: () => openShortcuts() },
+  ].map((a) => ({ ...a, group: "Actions" }));
+  const chats = [];
+  const list = MACHINES.length ? MACHINES : [focusM()].filter(Boolean);
+  for (const m of list) {
+    if (m.state === "offline" || m.state === "refusing") continue;
+    const ws = m.key === focusKey ? S : W.get(m.key);
+    if (!ws?.sessions) continue;
+    for (const s of ws.sessions.values()) {
+      const title = agentIn(ws, s.sid)?.title || s.title;
+      if (!title) continue;
+      const when = s.lastActivity || s.mtime || 0;
+      chats.push({ group: "Chats", title, sub: [list.length > 1 ? m.label : "", ago(when)].filter(Boolean).join(" · "), when, run: () => openChatOn(m.key, s.sid) });
+    }
+  }
+  chats.sort((a, b) => b.when - a.when);
+  return [...actions, ...chats.slice(0, 300)];
+}
+function newChat() { showView("home"); home.focus(); }
+function stopNow() { if (S.page === "chat" && chat.streaming) chatStop(); }
+function toggleFiles() { if (S.page === "chat") $("#btnExplorer").click(); else if (S.page === "home") $("#homeBrowse").click(); }
+function toggleHistory() { if (document.body.classList.contains("panel-open")) panel.setOpen(false); else panel.open("chats"); }
+installKeys({
+  palette: () => openPalette(paletteItems),
+  "new-chat": newChat,
+  stop: stopNow,
+  files: toggleFiles,
+  history: toggleHistory,
+  shortcuts: () => openShortcuts(),
+  "focus-composer": () => (S.page === "chat" ? chat : home).focus(),
+});
+
 // ----------------------------------------------------------------- init
 async function init() {
   if (S.desktop) document.body.classList.add("desktop");
@@ -1173,13 +1259,17 @@ async function init() {
   const st = await loadFirst(focusKey);
   if (!st) {
     if (!webPage()) throw new Error(wsOf(focusKey).error || "no answer");
-    history.render(); showView("home"); return;
+    // The URL is kept: once the machine answers, a reload opens what it names.
+    history.render(); applyingRoute = true; try { showView("home"); } finally { applyingRoute = false; } return;
   }
   remote.init(st.access);
   if (!webPage() && st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
   history.render();
-  // #missions opens the Mission view (a link, a bookmark, the phone's home screen).
-  showView(location.hash === "#missions" ? "mission" : "home");
+  // The URL says where to open: #missions (a link, a bookmark, the phone's home screen), a chat, or Home.
+  const route = parseHash(location.hash);
+  applyingRoute = true;
+  try { showView(route.kind === "missions" ? "mission" : "home"); } finally { applyingRoute = false; }
+  if (route.kind === "chat") applyRoute(route);
   syncStreams();
   setInterval(() => { if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "chat") updateComposer(); }, 15000);
   afterFirstPaint();
