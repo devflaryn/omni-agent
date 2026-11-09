@@ -4,6 +4,8 @@
 import { el, groupLabel, nestSessions, agentTag, harnessLabel } from "./lib.js";
 
 const NOTE = { offline: "offline", refusing: "does not let web pages in", loading: "loading…" };
+/** Chats per machine in the All machines view, so every machine's name is on screen at once. */
+const PER_MACHINE = 6;
 
 /**
  * groups(filter, only)  sidebarGroups for the search text and the machine shown alone (or null)
@@ -56,12 +58,20 @@ export function createHistory({ groups, machines, selected, onSelect, onNew, onD
           note.title = known ? `${m.label} ${NOTE[g.note]}` : g.note;
           head.appendChild(note);
           if (!known) { const r = el("button", "btn quiet small", "Try again"); r.onclick = () => onRetry(m.key); head.appendChild(r); }
+        } else if (m.state === "stalled" || ws?.streamError) {
+          // Its chats stay on show, but what is new on it may not arrive: said by name.
+          const note = el("span", "hist-machine-note err", "not answering");
+          note.title = `${m.label}: ${ws?.streamError || "not answering"}`;
+          head.appendChild(note);
         }
         wrap.appendChild(head);
       }
       if (!ws?.loaded) continue;
       const titleOf = (s) => agentFor(ws, s.sid)?.title || s.title || "";
-      const rows = nestSessions(g.sessions, (s) => s.parentSid || agentFor(ws, s.sid)?.parentSid).slice(0, 200);
+      const all = nestSessions(g.sessions, (s) => s.parentSid || agentFor(ws, s.sid)?.parentSid).slice(0, 200);
+      // Every machine at a glance: a few chats each, and the rest one tap away under the machine's own name.
+      const capped = many && !only && !f;
+      const rows = capped ? all.slice(0, PER_MACHINE) : all;
       let last = null;
       for (const { s, depth } of rows) {
         // Children follow their parent whatever their own date, so only top-level rows open a day group.
@@ -88,8 +98,13 @@ export function createHistory({ groups, machines, selected, onSelect, onNew, onD
         wrap.appendChild(row);
         shownRows++;
       }
-      if (!ws.allChats && !f) {
-        const more = el("button", "btn quiet small hist-more", many ? `Older chats on ${m.here ? "this computer" : m.label}` : "Older chats");
+      const where = m.here ? "this computer" : m.label;
+      if (capped && (all.length > rows.length || !ws.allChats)) {
+        const more = el("button", "btn quiet small hist-more", `All chats on ${where}`);
+        more.onclick = () => { only = m.key; if (!ws.allChats) onMore(m.key); render(); };
+        wrap.appendChild(more);
+      } else if (!ws.allChats && !f) {
+        const more = el("button", "btn quiet small hist-more", many ? `Older chats on ${where}` : "Older chats");
         more.onclick = () => onMore(m.key);
         wrap.appendChild(more);
       } else if (many && !g.sessions.length && !g.note) wrap.appendChild(el("div", "hist-group", f ? "No matches." : "No chats yet."));

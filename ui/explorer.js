@@ -122,7 +122,7 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
 
   async function setRoot(r) {
     root = r || null;
-    const on = where().replace(/^ on /, "");
+    const on = where().replace(/^ on (.)/, (_, c) => c.toUpperCase());
     rootLbl.textContent = `${on ? `${on} · ` : ""}${root || "No working directory"}`;
     rootLbl.title = root ? `${root}${where()}` : "";
     if (!root) { tree.innerHTML = ""; loadedRoot = null; nodes.clear(); return; }

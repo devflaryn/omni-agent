@@ -149,8 +149,48 @@ test("with several machines the drawer has one group per machine, this computer 
   assert.ok(!hasClass("active")(buttons[0]) && hasClass("active")(buttons[1]), "the same sid on this computer is not the open one");
   buttons[1].onclick();
   assert.deepEqual(picked, [["bbbbbbXX", "pi:s"]]);
-  assert.ok(wrap.findAll(hasClass("hist-more")).some((b) => /Older chats on Studio/.test(b.text)), "a machine not yet listed in full offers the rest, by name");
+  assert.ok(wrap.findAll(hasClass("hist-more")).some((b) => /All chats on Studio/.test(b.text)), "a machine not yet listed in full offers the rest, by name");
   assert.equal(chips.hidden, false, "the drawer can show one machine alone");
+});
+
+test("a machine whose live stream is lost says so by name, and its chats stay on show", async () => {
+  const { createHistory } = await import("../ui/sidebar.js");
+  const { machineList, sidebarGroups, newWorkspace, HERE } = await import("../ui/machines.js");
+  const wrap = new FakeEl("div"), filter = new FakeEl("input"), btn = new FakeEl("button"), chips = new FakeEl("div");
+  filter.value = "";
+  const machines = machineList({ here: { name: "Desk" }, machines: [{ id: "bbbbbbXX", name: "Studio", online: true, link: { state: "stalled" } }] });
+  const studio = Object.assign(newWorkspace(), { loaded: true, allChats: true, streamError: "not answering: the channel closed" });
+  studio.sessions.set("s", { sid: "s", harness: "pi", title: "Kept", lastActivity: 1 });
+  withDom({ "#history": wrap, "#sessionFilter": filter, "#btnNewChat": btn, "#machineFilter": chips }, () => {
+    createHistory({ machines: () => machines, groups: (f, only) => sidebarGroups({ machines, workspaces: new Map([[HERE, Object.assign(newWorkspace(), { loaded: true, allChats: true })], ["bbbbbbXX", studio]]), filter: f, only }), selected: () => ({}), onSelect() {}, onNew() {}, onDelete() {}, onRetry() {}, onMore() {} }).render();
+  });
+  const head = wrap.children.find((c) => c.dataset?.machine === "bbbbbbXX");
+  assert.match(head.textContent, /Studio.*not answering/);
+  assert.ok(wrap.findAll(hasClass("hist")).some((b) => b.text === "Kept"));
+});
+
+test("All machines shows a few chats of each, so every machine is on screen; the rest is one tap, on that machine alone", async () => {
+  const { createHistory } = await import("../ui/sidebar.js");
+  const { machineList, sidebarGroups, newWorkspace, HERE } = await import("../ui/machines.js");
+  const wrap = new FakeEl("div"), filter = new FakeEl("input"), btn = new FakeEl("button"), chips = new FakeEl("div");
+  filter.value = "";
+  const machines = machineList({ here: { name: "Desk" }, machines: [{ id: "bbbbbbXX", name: "Studio", online: true, link: { state: "open" } }] });
+  const here = Object.assign(newWorkspace(), { loaded: true, allChats: true });
+  const studio = Object.assign(newWorkspace(), { loaded: true, allChats: true });
+  for (let i = 0; i < 20; i++) { here.sessions.set(`h${i}`, { sid: `h${i}`, harness: "pi", title: `Here ${i}`, lastActivity: 1000 + i }); studio.sessions.set(`s${i}`, { sid: `s${i}`, harness: "pi", title: `Studio ${i}`, lastActivity: 1000 + i }); }
+  const W = new Map([[HERE, here], ["bbbbbbXX", studio]]);
+  let h;
+  withDom({ "#history": wrap, "#sessionFilter": filter, "#btnNewChat": btn, "#machineFilter": chips }, () => {
+    h = createHistory({ machines: () => machines, groups: (f, only) => sidebarGroups({ machines, workspaces: W, filter: f, only }), selected: () => ({}), onSelect() {}, onNew() {}, onDelete() {}, onRetry() {}, onMore() {} });
+    h.render();
+    const count = (key) => wrap.findAll(hasClass("hist")).filter((b) => b.dataset.machine === key).length;
+    assert.equal(count(HERE), 6);
+    assert.equal(count("bbbbbbXX"), 6);
+    wrap.findAll(hasClass("hist-more")).find((b) => /Studio/.test(b.text)).onclick();
+    assert.equal(h.only, "bbbbbbXX");
+    assert.equal(count("bbbbbbXX"), 20);
+    assert.equal(count(HERE), 0);
+  });
 });
 
 // -------------------------------------------------------------------- strip

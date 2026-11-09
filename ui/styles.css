@@ -996,7 +996,8 @@ body.on-remote .machine-btn:hover { background: var(--inverse-ink); color: var(-
 .machine-dot.live { background: var(--ink); border-color: var(--ink); }
 .machine-note { display: block; color: var(--ink); font-weight: 500; margin-top: 4px; }
 .machine-note[hidden] { display: none; }
-.machine-note select, .cwd-row select, .ms-machine select { font-size: 12px; padding: 3px 6px; background: var(--field); color: var(--ink); border: 1px solid var(--line-2); border-radius: var(--r); max-width: 100%; }
+.machine-note select, .cwd-row select, .ms-machine select { font-size: 12px; padding: 3px 6px; background: var(--field); color: var(--ink); border: 1px solid var(--line-2); border-radius: var(--r); width: auto; max-width: 100%; min-width: 0; flex: 0 1 auto; }
+.ms-machine span { white-space: nowrap; }
 
 /* Every machine in one sidebar: a header per machine, its chats under it (ui/sidebar.js). */
 .mach-filter { justify-content: flex-start; margin: 8px 6px 2px; gap: 5px; }
