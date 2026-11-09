@@ -1091,3 +1091,103 @@ body.on-remote .machine-btn:hover { background: var(--inverse-ink); color: var(-
 .acct-approve { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 4px; }
 .acct-glance { color: var(--ink); }
 .acct-invite-made { margin: 8px 0; }
+
+/* chat (P5b) */
+/* Prose: about 70 characters a line at 16px, the air between paragraphs rather than between lines. Code and tables keep the full column. */
+#transcript .text { line-height: 1.65; }
+#transcript .text > :not(figure.code):not(.md-table) { max-width: 680px; }
+.text > :first-child { margin-top: 0; }
+.text > :last-child { margin-bottom: 0; }
+.text p { margin: 0.75em 0; }
+.text h5 { font-size: 0.95em; margin: 1.1em 0 0.4em; font-weight: 600; }
+.text h6 { font-size: 0.9em; margin: 1.1em 0 0.4em; font-weight: 600; color: var(--muted); }
+.text code { font-weight: 400; }
+.text strong { font-weight: 600; }
+.text del { color: var(--muted); }
+.text li > p { margin: 0.35em 0; }
+.text li > ul, .text li > ol { margin: 0.2em 0; }
+.text blockquote > :first-child { margin-top: 0; }
+.text blockquote > :last-child { margin-bottom: 0; }
+.text ul.tasks { list-style: none; padding-left: 2px; }
+.text li.task > input { margin: 0 8px 0 0; vertical-align: -2px; accent-color: var(--muted); }
+.text .md-table { overflow-x: auto; margin: 0.8em 0; }
+.text .md-table table { margin: 0; }
+
+/* Code blocks, ChatGPT's dark convention: a header with the language and Copy, the code on the sidebar's tone. */
+.text figure.code { margin: 0.9em 0; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--side); overflow: hidden; }
+.text figure.code > figcaption { display: flex; align-items: center; justify-content: space-between; gap: 8px; height: 34px; padding: 0 6px 0 14px; background: var(--field); color: var(--muted); font: 12px/1 var(--font); user-select: none; }
+.code-lang { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.code-copy { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); font: 12px/1 var(--font); cursor: pointer; transition: color 0.12s var(--ease), background 0.12s var(--ease); }
+.code-copy::before { content: ""; width: 14px; height: 14px; background: currentColor; -webkit-mask: var(--copy-ico) center / contain no-repeat; mask: var(--copy-ico) center / contain no-repeat; }
+.code-copy.copied::before { -webkit-mask-image: var(--check-ico); mask-image: var(--check-ico); }
+.code-copy.copied { color: var(--ink); }
+.code-copy { --copy-ico: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>'); --check-ico: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3.5 8.5 3 3 6-7"/></svg>'); }
+@media (hover: hover) { .code-copy:hover { color: var(--ink); background: var(--accent-soft); } }
+.text figure.code > pre { margin: 0; border: 0; border-radius: 0; background: transparent; padding: 14px 16px; overflow-x: auto; font-size: 13px; line-height: 1.6; }
+.text figure.code > pre > code { font-weight: 400; white-space: pre; }
+figure.code { --t-com: #6a9955; --t-str: #ce9178; --t-kw: #569cd6; --t-num: #b5cea8; --t-fn: #dcdcaa; --t-type: #4ec9b0; --t-op: #d4d4d4; --t-prop: #9cdcfe; --t-tag: #569cd6; --t-attr: #9cdcfe; --t-meta: #c586c0; --t-var: #9cdcfe; --t-lit: #569cd6; --t-punct: #b4b4b4; --t-head: #569cd6; --t-link: #4fb3ff; --t-ins: #89d185; --t-del: #f48771; --t-err: #f48771; --t-warn: #cca700; }
+:root[data-theme="light"] figure.code { --t-com: #008000; --t-str: #a31515; --t-kw: #0000ff; --t-num: #098658; --t-fn: #795e26; --t-type: #267f99; --t-op: #000000; --t-prop: #001080; --t-tag: #800000; --t-attr: #e50000; --t-meta: #af00db; --t-var: #001080; --t-lit: #0000ff; --t-punct: #3b3b3b; --t-head: #0451a5; --t-link: #0451a5; --t-ins: #098658; --t-del: #a31515; --t-err: #cd3131; --t-warn: #bf8803; }
+
+/* A live message: rendered as it arrives, each new block fading in, a breathing dot at the end that takes no width
+   (so no line ever wraps because of it, and nothing moves when it goes). */
+.text.live > .md-in { animation: md-in 120ms var(--ease) both; }
+@keyframes md-in { from { opacity: 0; } }
+.text.live > :is(p, h1, h2, h3, h4, h5, h6):last-child::after,
+.text.live > :is(ul, ol):last-child > li:last-child:not(:has(> ul, > ol, > p, > figure, > blockquote, > .md-table))::after {
+  content: ""; display: inline-block; width: 0.55em; height: 0.55em; margin: 0 -0.8em 0 0.25em; vertical-align: 0.05em; border-radius: 50%; background: var(--ink); animation: breathe 1.2s var(--ease) infinite;
+}
+
+/* The status line: the word and the figures apart; the word shimmers while the model is busy and nothing is arriving. */
+.meter .mtext { display: inline-flex; gap: 6px; min-width: 0; }
+.meter .mstats { color: var(--muted); font-variant-numeric: tabular-nums; }
+.meter .mstats:empty { display: none; }
+.meter:not(.live) .mstats::before { content: "· "; }
+/* The column does not move sideways when a chat grows long enough to scroll. */
+#transcriptWrap { scrollbar-gutter: stable; }
+.meter.live.waiting .mlabel { background: linear-gradient(90deg, var(--muted) 35%, var(--ink) 50%, var(--muted) 65%) 0 0 / 300% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 1.6s linear infinite; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
+
+/* Jump to latest: a round button over the transcript's bottom edge, in a zero-height sticky dock at the end of the scroller. */
+.jump-dock { position: sticky; bottom: 12px; height: 0; display: flex; justify-content: center; pointer-events: none; z-index: 5; }
+.jump-latest { position: absolute; bottom: 0; width: 36px; height: 36px; padding: 0; border-radius: 50%; border: 1px solid var(--line-2); background: var(--raised); color: var(--ink); box-shadow: var(--shadow); display: grid; place-items: center; cursor: pointer; opacity: 0; transform: scale(0.9); visibility: hidden; pointer-events: none; transition: opacity 150ms var(--ease), transform 150ms var(--ease), visibility 0s linear 150ms; }
+.jump-latest.show { opacity: 1; transform: none; visibility: visible; pointer-events: auto; transition: opacity 150ms var(--ease), transform 150ms var(--ease), visibility 0s; }
+.jump-latest svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.jump-latest .jump-dot { position: absolute; top: -1px; right: -1px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); border: 2px solid var(--ground); display: none; }
+.jump-latest.live .jump-dot { display: block; }
+@media (hover: hover) { .jump-latest:hover { background: var(--field-2); } }
+
+/* Send greyed while the box is empty: the caption keeps its usual tone (the greyed look is for chats that cannot take a message). */
+.composer:has(.send-btn.empty) .caption { color: var(--dim); }
+.actions .icon-btn.copied { color: var(--ink); opacity: 1; }
+
+/* The palette (Ctrl/⌘+K) and the shortcut sheet (?). They open without motion: the keyboard opens them. */
+.kbd-scrim { position: fixed; inset: 0; z-index: 90; background: var(--scrim); display: flex; justify-content: center; align-items: flex-start; padding: 18vh 16px 16px; }
+.pal { width: min(560px, 100%); max-height: 62vh; display: flex; flex-direction: column; background: var(--raised); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow-lg); overflow: hidden; }
+.pal-input { border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; padding: 14px 16px; font-size: 15px; outline: none; color: var(--ink); }
+.pal-input:focus { border-bottom-color: var(--line); }
+.pal-list { overflow: auto; padding: 6px; overscroll-behavior: contain; }
+.pal-group { padding: 8px 10px 4px; font-size: 12px; color: var(--dim); }
+.pal-row { display: flex; align-items: center; gap: 12px; min-height: 36px; padding: 6px 10px; border-radius: 8px; cursor: pointer; }
+.pal-row.on { background: var(--field-2); }
+.pal-main { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1; }
+.pal-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.pal-sub { color: var(--dim); font-size: 12px; white-space: nowrap; flex: none; }
+.pal-kbd { color: var(--dim); font: 12px/1 var(--font); flex: none; }
+.pal-empty { padding: 14px 10px; color: var(--muted); }
+.kbd-sheet:focus { outline: none; }
+.kbd-sheet { width: min(440px, 100%); background: var(--raised); border: 1px solid var(--line-2); border-radius: 12px; box-shadow: var(--shadow-lg); padding: 6px 16px 16px; }
+.kbd-head { display: flex; align-items: center; justify-content: space-between; }
+.kbd-head h2 { font-size: 15px; font-weight: 600; margin: 8px 0; }
+.kbd-rows { display: grid; grid-template-columns: 1fr auto; gap: 10px 16px; margin: 8px 0 0; font-size: 13.5px; }
+.kbd-rows dt { color: var(--muted); }
+.kbd-rows dd { margin: 0; text-align: right; }
+.kbd-rows kbd { display: inline-block; padding: 3px 7px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--field); color: var(--ink); font: 12px/1.2 var(--font); }
+@media (max-width: 760px) { .kbd-scrim { padding-top: 8vh; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .text.live > .md-in { animation: none; }
+  .text.live > :is(p, h1, h2, h3, h4, h5, h6):last-child::after, .text.live > :is(ul, ol):last-child > li:last-child::after { animation: none; }
+  .meter.live.waiting .mlabel { animation: none; background: none; color: inherit; }
+  .jump-latest, .jump-latest.show { transition: none; }
+  .code-copy { transition: none; }
+}
