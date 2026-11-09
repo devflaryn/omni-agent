@@ -4,7 +4,7 @@
    typed in place, and a row dragged onto a folder moves there (onto the prompt, it becomes an @reference).
    The tabs and viewers live in filepane.js. */
 import { el, showName } from "./lib.js";
-import { createFilePane } from "./filepane.js";
+import { absPath } from "./paths.js";
 import { fileIcon, folderIcon, ICONS } from "./fileicons.js";
 import { showMenu, onContext } from "./contextmenu.js";
 
@@ -20,11 +20,21 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
   const expandedBy = new Map(); // root → Set of open folder paths
   const expanded = () => { if (!expandedBy.has(root)) expandedBy.set(root, new Set()); return expandedBy.get(root); };
 
-  const pane = createFilePane({
+  // The file pane (tabs, viewers, the editor and its highlighter) loads the first time a file is opened: the tree does not need it.
+  // Until then it has no tabs, so what would tell it about a rename, a delete or a hide has nothing to act on.
+  let real = null, loading = null;
+  const loaded = () => loading ??= import("./filepane.js").then(({ createFilePane }) => (real = createFilePane({
     api, toast, insert, isRemote,
     onActive: (r, p) => { if (r === root) { activePath = p; markActive(); } },
     revealInTree: (r, p) => { if (r === root) reveal(p); },
-  });
+  })), (e) => { loading = null; toast(`The file pane could not load: ${e.message}`, true); throw e; });
+  const later = (name) => (...args) => loaded().then((p) => p[name](...args)).catch(() => {});
+  const ifLoaded = (name) => (...args) => real?.[name](...args);
+  const pane = {
+    open: later("open"), download: later("download"), copy: later("copy"),
+    renamed: ifLoaded("renamed"), deleted: ifLoaded("deleted"), hide: ifLoaded("hide"), restore: ifLoaded("restore"),
+    absPath: (r, p) => absPath(r, p),
+  };
 
   // ------------------------------------------------------------------ tree
   async function loadDir(path, container, depth) {

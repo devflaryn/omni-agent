@@ -9,12 +9,12 @@ import { languageFor, LANG_LABEL } from "./highlight.js";
 import { showMenu, onContext } from "./contextmenu.js";
 import { fileIcon, ICONS } from "./fileicons.js";
 import { framesFiles, isLeaving, onLeaveCheck, rawUrl, saveFile } from "./transport.js";
+import { absPath } from "./paths.js";
 
 const q = (o) => Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
 const ENC_LABEL = { utf8: "UTF-8", utf8bom: "UTF-8 with BOM", utf16le: "UTF-16 LE", utf16be: "UTF-16 BE", latin1: "Latin-1" };
 const EOL_LABEL = { lf: "LF", crlf: "CRLF", cr: "CR" };
-const sep = (root) => (/\\/.test(root) && !/\//.test(root) ? "\\" : "/");
-export const absPath = (root, rel) => (rel ? `${String(root).replace(/[\\/]+$/, "")}${sep(root)}${sep(root) === "\\" ? rel.replace(/\//g, "\\") : rel}` : root);
+export { absPath };
 const mdPreferred = () => { try { return localStorage.getItem("omni.mdPreview") !== "0"; } catch { return true; } };
 
 /** A hex dump: offset, 16 bytes, their printable characters. */

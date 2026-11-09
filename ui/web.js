@@ -7,6 +7,8 @@ import { openPageStore } from "./page-store.js";
 import { createPageTransport } from "./page-transport.js";
 import { appMarkup, cleanName, machine, setChannelTransport, setMachine } from "./transport.js";
 import { alertAdvice, alertTitle } from "./account.js";
+import { forgetCachedModels } from "./model-cache.js";
+import { startServiceWorker } from "./web-sw.js";
 
 const SERVER_NOTICE = "This page comes from the server it connects to. If that server were hacked, it could serve a changed page, which could capture your password and, while open and signed in, run commands on your machines as you, up to reading a machine's keys. Use it for trusted moments. For anything sensitive, prefer the installed apps, and turn Allow web page access off on any machine where this matters.";
 const NO_ACCOUNT = "An account is created in the Omni desktop app, on your computer. This page cannot create one, and it has no recovery: a web page signs no changes to your account.";
@@ -126,6 +128,7 @@ function forgetRow(s) {
   if (s.logVersion > 0 || s.device) {
     row.appendChild(button("Forget this page", "small quiet", () => {
       if (!window.confirm("Forget this page?\n\nThis deletes its keys and its copy of the device list from this browser. It would have to be approved again as a new device.")) return;
+      forgetCachedModels();
       account.signOut({ forget: true }).then(render);
     }));
   }
@@ -272,6 +275,7 @@ async function boot() {
   render();
 }
 
+startServiceWorker({ quiet: () => !appLoaded && !working && !shell.contains(document.activeElement) });
 boot().catch((error) => {
   shell.textContent = "";
   const c = card("This page could not start");
