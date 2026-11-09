@@ -651,7 +651,8 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 .pf-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .pf-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
 .dlg-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 6px; }
-.dlg-tabs .seg-btn { white-space: nowrap; }
+.dlg-tabs .seg-btn { white-space: nowrap; flex: none; }
+.dlg-head > div { min-width: 0; }
 .mf-stdio, .mf-http { display: grid; gap: 10px; }
 .mf-stdio[hidden], .mf-http[hidden], .dlg-body[hidden] { display: none; }
 .prov-form label.mf-check { display: flex; align-items: center; gap: 8px; align-self: end; padding-bottom: 6px; color: var(--ink); }
@@ -739,8 +740,14 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
   .cwd-row input { font-family: var(--font); color: var(--muted); }
   body.in-chat .machine-id { display: none; }
   body.in-chat .machine-btn .machine-name { max-width: 26vw; }
+  #top > .machine-wrap { flex: none; }
+  body:has(#machineWrap:not([hidden])) .brand .word { display: none; }
+  .home-row { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: var(--sp-3); row-gap: 2px; }
+  .home-row-meta { grid-column: 2; max-width: none; }
   .ms-machine > span { display: none; }
   .dlg-body { grid-template-columns: 1fr; }
+  .dlg-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin-right: -8px; }
+  .dlg-tabs::-webkit-scrollbar { display: none; }
   .prov-list { border-right: 0; border-bottom: 1px solid var(--line); flex-direction: row; flex-wrap: wrap; }
   .prov { width: auto; }
   .prov-item { flex-direction: row; align-items: center; }
@@ -1081,7 +1088,7 @@ body.on-remote #top > .top-title { border-left-color: color-mix(in srgb, var(--i
 .machine-btn svg { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
 .machine-glyph { width: 8px; height: 6px; border: 1.5px solid currentColor; border-radius: 2px; flex: none; }
 .machine-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-.machine-id { font-family: var(--mono); font-size: var(--fs-2xs); opacity: 0.7; flex: none; }
+.machine-id { font-family: var(--mono); font-weight: 400; font-size: var(--fs-2xs); opacity: 0.7; flex: none; }
 body.on-remote .machine-btn { background: var(--inverse-ink); color: var(--inverse); border-color: var(--inverse-ink); font-weight: 600; font-size: var(--fs-sm); }
 body.on-remote .machine-btn:hover { background: var(--inverse-ink); color: var(--inverse); opacity: 0.9; }
 .machine-back { background: transparent; border: 0; color: var(--inverse-ink); font-size: var(--fs-sm); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; padding: 4px 8px; white-space: nowrap; flex: none; }
@@ -1159,7 +1166,7 @@ body.on-remote .machine-btn:hover { background: var(--inverse-ink); color: var(-
 .acct-audit-when, .acct-audit-who { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acct-audit-method, .acct-audit-path { font-size: var(--fs-xs); overflow-wrap: anywhere; }
 @media (max-width: 760px) {
-  body.on-remote .brand .word, body.on-remote #top > .top-title, body.on-remote .machine-back { display: none; }
+  body.on-remote .brand .word, body.on-remote:not(.in-chat) #top > .top-title, body.on-remote .machine-back { display: none; }
   .machine-wrap { margin-left: 4px; }
   .machine-btn { max-width: 52vw; }
   body:not(.on-remote) .machine-btn .machine-name { max-width: 28vw; }
