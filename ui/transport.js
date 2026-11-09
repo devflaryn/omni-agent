@@ -70,6 +70,9 @@ export function setChannelTransport(impl) { channelImpl = impl; channels.clear()
 /** Whether this is the web page or the iPhone's web view, which has no computer of its own and may not approve anything. */
 export const webPage = () => channelImpl !== null;
 
+/** Whether this is the iPhone app: a client like the page, but installed, approved as `full`, and with nothing that runs out. */
+export const onPhone = () => channelImpl?.client === "phone";
+
 /** `check()` says why this window should not leave its machine (unsaved files), or nothing. Returns the way to remove it. */
 export function onLeaveCheck(check) { leaveChecks.add(check); return () => leaveChecks.delete(check); }
 
