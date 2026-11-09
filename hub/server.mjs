@@ -426,6 +426,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     const email = cleanEmail(body.email);
     if (!isB64Of(body.salt, SALT_BYTES)) throw new HttpError(400, "bad-salt");
     if (!isB64Of(body.verifierInput, KEY_BYTES)) throw new HttpError(400, "bad-verifier");
+    if (!isB64Of(body.anchor, KEY_BYTES)) throw new HttpError(400, "bad-anchor");
     // Sign-in's counter for this address. A closed hub counts too, or the lock would show which hubs are still fresh.
     const addressKey = `ip ${ip}`;
     if (failures.locked(addressKey, limits.maxAddressFailures)) throw new HttpError(429, "locked");
@@ -478,7 +479,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     // Spent first: a crash between the two costs a code, and the other way round would let a code be used twice.
     if (invite) store.putInvite({ ...invite, usedAt: now() });
     try {
-      store.putAccount({ id: trust.accountId, email, salt: body.salt, verifier: { salt: salt.toString("base64"), hash: hash.toString("base64") }, log: entries, ...(first ? { owner: true } : {}) });
+      store.putAccount({ id: trust.accountId, email, salt: body.salt, verifier: { salt: salt.toString("base64"), hash: hash.toString("base64") }, anchor: body.anchor, log: entries, ...(first ? { owner: true } : {}) });
     } catch (error) {
       if (invite) store.putInvite(invite);
       throw error;
@@ -560,7 +561,8 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
       hash: hashToken(token), id: randomBytes(16).toString("base64url"), accountId: account.id, signPub: body.signPub, name, kind, ip,
       createdAt: now(), expiresAt: now() + limits.pendingLifetimeMs, proven: false, approved: false,
     });
-    return { status: 200, body: { session: token, state: onLog ? "approved" : "pending" } };
+    // Only after the password was right. A device with nothing else checks this against the password before it trusts any log.
+    return { status: 200, body: { session: token, state: onLog ? "approved" : "pending", accountId: account.id, anchor: account.anchor ?? null } };
   }
 
   const ROUTES = new Map([["/api/register", register], ["/api/salt", salt], ["/api/login", login]]);
@@ -910,10 +912,10 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   }
 
   /** The password only guards new sign-ins, so devices and their sessions are not touched. */
-  async function passwordChange(conn, session, { currentLoginKey, salt: newSalt, verifierInput }) {
+  async function passwordChange(conn, session, { currentLoginKey, salt: newSalt, verifierInput, anchor }) {
     if (!isFullSession(conn.accountId, session)) return forbidden(conn, "password.change");
     const fail = (code) => sendTo(conn, { type: "error", code, for: "password.change" });
-    if (!isB64Of(currentLoginKey, KEY_BYTES) || !isB64Of(newSalt, SALT_BYTES) || !isB64Of(verifierInput, KEY_BYTES)) return fail("bad-message");
+    if (!isB64Of(currentLoginKey, KEY_BYTES) || !isB64Of(newSalt, SALT_BYTES) || !isB64Of(verifierInput, KEY_BYTES) || !isB64Of(anchor, KEY_BYTES)) return fail("bad-message");
 
     const { email } = store.accounts.get(conn.accountId);
     let proved;
@@ -938,7 +940,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     const account = store.accounts.get(conn.accountId);
     if (account.verifier !== proved.verifier) return fail("conflict");
     try {
-      store.putAccount({ ...account, salt: newSalt, verifier: { salt: verifierSalt.toString("base64"), hash: hash.toString("base64") } });
+      store.putAccount({ ...account, salt: newSalt, anchor, verifier: { salt: verifierSalt.toString("base64"), hash: hash.toString("base64") } });
     } catch (error) {
       log(`hub: could not save a password change: ${error.code ?? error.name}`);
       return fail("internal");

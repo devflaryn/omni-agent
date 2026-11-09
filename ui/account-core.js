@@ -6,6 +6,7 @@ const encoder = new TextEncoder();
 
 // One label per purpose, so a hash or signature made for one thing can never be taken for another.
 const LOGIN_INFO = "omni-login-v1";
+const ANCHOR_INFO = "omni-account-anchor-v1";
 const RECOVERY_INFO = "omni-recovery-sign-v1";
 const SIGN_DOMAIN = "omni-device-sign-v1";
 const COMMIT_DOMAIN = "omni-approval-commit-v1";
@@ -189,8 +190,38 @@ export function checkPassword(password) {
 
 /** Takes any length: a short password here is a wrong password, and must not reveal the policy. */
 export async function loginKeyFrom(password, salt) {
+  return (await signInKeysFrom(password, salt)).loginKey;
+}
+
+/**
+ * Both keys from one slow derivation. The hub receives `loginKey` at every sign-in, so it holds nothing it could make `anchorKey` from.
+ * `anchorKey` lets a device with nothing but the password tell the person's real account from one a hacked hub made up.
+ */
+export async function signInKeysFrom(password, salt) {
   const stretched = await scrypt(encoder.encode(normalizedPassword(password)), salt, { N: 2 ** 17, r: 8, p: 1, dkLen: KEY_BYTES });
-  return hkdf(stretched, new Uint8Array(0), LOGIN_INFO, KEY_BYTES);
+  const [loginKey, anchorKey] = await Promise.all([hkdf(stretched, new Uint8Array(0), LOGIN_INFO, KEY_BYTES), hkdf(stretched, new Uint8Array(0), ANCHOR_INFO, KEY_BYTES)]);
+  return { loginKey, anchorKey };
+}
+
+const anchorHmac = (anchorKey, usage) => subtle.importKey("raw", anchorKey, { name: "HMAC", hash: "SHA-256" }, false, [usage]);
+const anchorText = (accountId) => encoder.encode(`${ANCHOR_INFO} ${accountId}`);
+
+/**
+ * What the hub keeps for an account and hands back at sign-in. Made when the account is made and when the password changes, by a
+ * device that has the password. It says "whoever holds this password made the account with this id".
+ */
+export async function accountAnchor(anchorKey, accountId) {
+  return toB64(new Uint8Array(await subtle.sign("HMAC", await anchorHmac(anchorKey, "sign"), anchorText(accountId))));
+}
+
+/** False for a wrong anchor and for malformed input alike: both come from the hub. */
+export async function anchorMatches(anchorKey, accountId, anchor) {
+  try {
+    if (typeof accountId !== "string" || !accountId) return false;
+    return await subtle.verify("HMAC", await anchorHmac(anchorKey, "verify"), sizedB64(anchor, KEY_BYTES, "anchor"), anchorText(accountId));
+  } catch {
+    return false;
+  }
 }
 
 // --- device keys and signatures ---

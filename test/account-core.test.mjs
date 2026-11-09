@@ -698,3 +698,18 @@ function frameFields(domain, ...fields) {
     return [length, f];
   }));
 }
+
+test("the login key and the anchor key come from one slow derivation, and neither gives the other", async () => {
+  const { accountAnchor, anchorMatches, signInKeysFrom, loginKeyFrom } = await import("../ui/account-core.js");
+  const salt = utf8("0123456789abcdef");
+  const { loginKey, anchorKey } = await signInKeysFrom("correct horse battery", salt);
+  assert.equal(hex(loginKey), hex(await loginKeyFrom("correct horse battery", salt)), "the login key is what it always was");
+  assert.notEqual(hex(loginKey), hex(anchorKey));
+  const anchor = await accountAnchor(anchorKey, "account-one");
+  assert.equal(await anchorMatches(anchorKey, "account-one", anchor), true);
+  assert.equal(await anchorMatches(anchorKey, "account-two", anchor), false, "it vouches for that account and no other");
+  assert.equal(await anchorMatches(loginKey, "account-one", anchor), false, "the hub holds the login key, and that does not make one");
+  assert.notEqual(await accountAnchor(loginKey, "account-one"), anchor, "and an anchor made with it is not this one");
+  for (const bad of [null, undefined, "", "not base64!", 7, {}]) assert.equal(await anchorMatches(anchorKey, "account-one", bad), false);
+  for (const bad of [null, undefined, "", 7]) assert.equal(await anchorMatches(anchorKey, bad, anchor), false);
+});

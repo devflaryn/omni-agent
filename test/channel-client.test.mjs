@@ -37,8 +37,11 @@ const testProtector = {
   async protect(bytes) { return Buffer.concat([Buffer.from("TEST"), Buffer.from(bytes).map((b) => b ^ 0x5a)]); },
   async unprotect(bytes) { return Buffer.from(bytes).subarray(4).map((b) => b ^ 0x5a); },
 };
-const quickKey = async (password, salt) => new Uint8Array(createHash("sha256").update(password).update(salt).digest());
-const accountOptions = { hubOrigin: ORIGIN, protector: testProtector, deriveLoginKey: quickKey, reconnect: { minMs: 20, maxMs: 100 } };
+const quickKey = async (password, salt) => {
+  const part = (label) => new Uint8Array(createHash("sha256").update(label).update(password).update(salt).digest());
+  return { loginKey: part("login"), anchorKey: part("anchor") };
+};
+const accountOptions = { hubOrigin: ORIGIN, protector: testProtector, deriveKeys: quickKey, reconnect: { minMs: 20, maxMs: 100 } };
 
 const cleanups = [];
 after(async () => { for (const c of cleanups.reverse()) { try { await c(); } catch { /* */ } } });
@@ -89,7 +92,6 @@ async function approve(approver, account, role = "full") {
   const review = await approver.review(row.id);
   await until(() => account.status().pending?.code, "the code on the new device");
   assert.equal(account.status().pending.code, review.code);
-  account.confirmCode(review.code);
   await approver.approve(row.id, { code: review.code, role });
   await until(() => account.status().phase === "approved", "approval");
   await until(() => account.status().hub.connected, "the new device's socket");

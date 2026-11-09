@@ -242,11 +242,11 @@ async function supported() {
   }
 }
 
-function loginKeyInWorker(password, salt) {
+function signInKeysInWorker(password, salt) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./login-worker.js", import.meta.url), { type: "module" });
     const done = (fn, value) => { worker.terminate(); fn(value); };
-    worker.onmessage = ({ data }) => (data.key ? done(resolve, data.key) : done(reject, new Error("could not derive the login key")));
+    worker.onmessage = ({ data }) => (data.keys ? done(resolve, data.keys) : done(reject, new Error("could not derive the login key")));
     worker.onerror = () => done(reject, new Error("could not derive the login key"));
     worker.postMessage({ password, salt });
   });
@@ -261,7 +261,7 @@ async function boot() {
     return;
   }
   const store = await openPageStore();
-  account = new PageAccount({ store, hubUrl: location.origin, hubOrigin: location.origin, name: guessName(), deriveLoginKey: loginKeyInWorker });
+  account = new PageAccount({ store, hubUrl: location.origin, hubOrigin: location.origin, name: guessName(), deriveKeys: signInKeysInWorker });
   setChannelTransport(createPageTransport({ links: account.links, machine, local: account.routes() })); // from here on, words are this page's too
   account.on("status", (s) => {
     if (appLoaded) { if (s.phase !== "approved") location.reload(); return; }

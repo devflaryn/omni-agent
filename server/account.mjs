@@ -25,7 +25,7 @@ import { promises as fs } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import { approverExchange, checkPassword, fromB64, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, toB64, verify } from "../ui/account-core.js";
+import { accountAnchor, anchorMatches, approverExchange, checkPassword, fromB64, newDeviceKeys, newRecoveryCode, recoveryKeysFrom, sign, toB64, verify } from "../ui/account-core.js";
 import { LogError, append, canRecover, compareLogs, createLog, deviceCurrent, deviceExpiresAt, entryHash, verifyLog } from "../ui/device-log.js";
 import { HUB_DROPPED, HUB_SILENT, HubSocket, hubPost } from "../ui/hub-socket.js";
 import { ALERT_TEXT, NewDeviceApproval, addAlert, checkApprovedLog, judgeLog, signedClaimBytes } from "../ui/log-trust.js";
@@ -76,14 +76,14 @@ const LOG_NOT_SAVED = "This computer could not save its device list. It will try
 // ------------------------------------------------------------------------------ the slow key
 
 /** The core's scrypt is JavaScript and runs for seconds, so it gets its own thread: the server keeps answering meanwhile. */
-function loginKeyInWorker(password, salt) {
+function signInKeysInWorker(password, salt) {
   const code = `
     const { parentPort, workerData } = require("node:worker_threads");
-    import(workerData.core).then((m) => m.loginKeyFrom(workerData.password, workerData.salt)).then((key) => parentPort.postMessage(key));
+    import(workerData.core).then((m) => m.signInKeysFrom(workerData.password, workerData.salt)).then((keys) => parentPort.postMessage(keys));
   `;
   return new Promise((resolve, reject) => {
     const worker = new Worker(code, { eval: true, workerData: { core: new URL("../ui/account-core.js", import.meta.url).href, password, salt } });
-    worker.once("message", (key) => { resolve(key); worker.terminate(); });
+    worker.once("message", (keys) => { resolve(keys); worker.terminate(); });
     worker.once("error", () => reject(new Error("could not derive the login key")));
   });
 }
@@ -127,6 +127,7 @@ export class Account extends EventEmitter {
   #reviewHints = new Map();
   #review = null;
   #exchange;              // on a new device: the approval, from log-trust.js
+  #signedInTo = null;     // on a new device: the account the password vouched for at sign-in. Any log it is handed must be that account's
   #recoveryAt = null;     // the position of this device's own recover, until another device shows it holds that entry
   #approvedByHub = false;
   #links;
@@ -150,7 +151,7 @@ export class Account extends EventEmitter {
   #hubClaimedRemoved = false;
   #protector;
 
-  constructor({ dir, hubUrl, hubOrigin, log = () => {}, now = Date.now, name, kind = "desktop", protector, deriveLoginKey, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = verifyLog }) {
+  constructor({ dir, hubUrl, hubOrigin, log = () => {}, now = Date.now, name, kind = "desktop", protector, deriveKeys, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = verifyLog }) {
     super();
     const url = new URL(hubUrl);
     const loopback = /^(127\.\d+\.\d+\.\d+|localhost|\[::1\])$/.test(url.hostname);
@@ -164,7 +165,7 @@ export class Account extends EventEmitter {
     this.#name = clip(name, 128) || clip(hostname(), 128) || "Computer";
     this.#kind = clip(kind, 32) || "desktop";
     this.#protector = protector ?? defaultProtector(dir);
-    this.deriveLoginKey = deriveLoginKey ?? loginKeyInWorker;
+    this.deriveKeys = deriveKeys ?? signInKeysInWorker;
     this.WebSocketImpl = WebSocketImpl ?? globalThis.WebSocket;
     this.fetchImpl = fetchImpl ?? globalThis.fetch;
     this.reconnect = { minMs: reconnect.minMs ?? SECOND, maxMs: reconnect.maxMs ?? MINUTE };
@@ -384,7 +385,7 @@ export class Account extends EventEmitter {
   }
 
   #persistState() {
-    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange: this.#exchange.saved, recoveryAt: this.#recoveryAt }));
+    return this.#writeFile("state.json", JSON.stringify({ v: 1, email: this.#email, name: this.#name, kind: this.#kind, phase: this.#phase, exchange: this.#exchange.saved, signedInTo: this.#signedInTo, recoveryAt: this.#recoveryAt }));
   }
 
   async #ensureKeys() {
@@ -445,6 +446,7 @@ export class Account extends EventEmitter {
       this.#email = state.email ?? this.#email;
       this.#name = state.name ?? this.#name;
       this.#recoveryAt = Number.isSafeInteger(state.recoveryAt) ? state.recoveryAt : null;
+      if (typeof state.signedInTo === "string") this.#signedInTo = state.signedInTo;
       if (state.exchange?.head) this.#exchange.resume(state.exchange);
     }
     const keyRecord = await this.#readJson("keys.json").catch(() => null);
@@ -525,7 +527,7 @@ export class Account extends EventEmitter {
   }
 
   async #loginKey(password, salt) {
-    return toB64(await this.deriveLoginKey(password, salt));
+    return toB64((await this.deriveKeys(password, salt)).loginKey);
   }
 
   async #saltFor(email) {
@@ -536,13 +538,16 @@ export class Account extends EventEmitter {
   /** A password login, which yields a session the socket must then prove the key for. */
   async #login(email, loginKey) {
     const token = await this.#bootstrapToken();
-    const { session, state } = await this.#post("/api/login", { email, loginKey, signPub: this.#keys.signPub, name: this.#name, kind: this.#kind, ...(token ? { bootstrapToken: token } : {}) });
+    const { session, state, accountId, anchor } = await this.#post("/api/login", { email, loginKey, signPub: this.#keys.signPub, name: this.#name, kind: this.#kind, ...(token ? { bootstrapToken: token } : {}) });
     if (typeof session !== "string" || !session) throw new AccountError(502, "bad-login", "The hub's answer made no sense.");
     this.#email = email;
     this.#session = session;
+    this.#lastLogin = { accountId, anchor };
     await this.#writeSecret("session.json", {}, Buffer.from(session));
     return state;
   }
+
+  #lastLogin = null;
 
   #requireStartable() {
     if (this.#phase === "key-unavailable") throw new AccountError(409, "key-unavailable", ALERT_TEXT["key-unavailable"]);
@@ -553,7 +558,7 @@ export class Account extends EventEmitter {
   // ---------------------------------------------------------------------------- registering and signing in
 
   /** Returns { recoveryCode }: shown once, stored nowhere. */
-  async register({ email, password, name } = {}) {
+  async register({ email, password, name, inviteCode } = {}) {
     await this.start();
     this.#requireStartable();
     if (this.#log) throw new AccountError(409, "has-account", "This computer already belongs to an account. Sign out and forget this device first.");
@@ -586,7 +591,9 @@ export class Account extends EventEmitter {
     }
     if (!retry) await this.#recovery.apply("replaced"); // a candidate whose code the person saved: they are starting again
     const { recoveryCode, entries, salt } = retry ?? await this.#newRegistration(email);
-    const loginKey = await this.#loginKey(password, salt);
+    const keys = await this.deriveKeys(password, salt);
+    const loginKey = toB64(keys.loginKey);
+    const anchor = await accountAnchor(keys.anchorKey, entries[0].body.accountId);
     const token = await this.#bootstrapToken();
     // On disk as one before the hub can make it live. Nothing has been sent if this fails. On a retry this is the same code
     // again, which the store allows; any other would be refused there.
@@ -598,7 +605,7 @@ export class Account extends EventEmitter {
     }
     let accepted = true;
     try {
-      await this.#post("/api/register", { email, salt: toB64(salt), verifierInput: loginKey, firstLogEntry: entries[0], ...(token ? { bootstrapToken: token } : {}) });
+      await this.#post("/api/register", { email, salt: toB64(salt), verifierInput: loginKey, anchor, firstLogEntry: entries[0], ...(token ? { bootstrapToken: token } : {}), ...(inviteCode ? { inviteCode } : {}) });
     } catch (error) {
       if (error.code === "hub-unreachable") throw error;
       if (!retry && NOTHING_CREATED.has(error.code)) {
@@ -606,7 +613,7 @@ export class Account extends EventEmitter {
         this.#registerAttempt = null;
         await this.#recovery.apply("nothingCreated");
         this.#changed();
-        if (error.code === "registration-closed") throw new AccountError(403, error.code, "This hub is closed to registration: it already holds another account, or the bootstrap token is wrong. Nothing was created by this attempt.");
+        if (error.code === "registration-closed" && !inviteCode) throw new AccountError(403, error.code, "An invite code is needed to create an account here. Nothing was created by this attempt.");
         throw error;
       }
       if (!retry) {
@@ -821,7 +828,8 @@ export class Account extends EventEmitter {
       throw new AccountError(409, "removed", "This device was removed from the account. Sign out and forget this device to sign in again as a new one.");
     }
     const salt = await this.#saltFor(email);
-    const state = await this.#login(email, await this.#loginKey(password, salt));
+    const keys = await this.deriveKeys(password, salt);
+    const state = await this.#login(email, toB64(keys.loginKey));
     if (state === "approved") {
       // The hub's word alone is not enough: this device must already hold a log that names it, or one it sent itself.
       if (!this.#verified?.devices.has(this.#keys.signPub) && !this.#recovery.candidate) {
@@ -841,6 +849,17 @@ export class Account extends EventEmitter {
         this.#changed();
         throw new AccountError(409, "removed", REPORTED_REMOVED);
       }
+      // Only someone with this password can have made this. It is checked now, while the password is here, and from now on the
+      // only account this device will join is this one. Without it a hacked hub could make up an account, play its approver, and
+      // have the hub's own devices on the log this computer then trusts, with no person pressing anything.
+      if (!await anchorMatches(keys.anchorKey, this.#lastLogin?.accountId, this.#lastLogin?.anchor)) {
+        this.#alert("bad-anchor");
+        await this.#forgetSession();
+        await this.#persistState();
+        this.#changed();
+        throw new AccountError(502, "bad-anchor", ALERT_TEXT["bad-anchor"]);
+      }
+      this.#signedInTo = this.#lastLogin.accountId;
       this.#phase = "pending";
       this.#exchange.reset();
       this.#approvedByHub = false;
@@ -862,6 +881,7 @@ export class Account extends EventEmitter {
     await this.#forgetSession();
     this.#phase = "signed-out";
     this.#exchange.current = null;
+    this.#signedInTo = null;
     this.#review = null;
     this.#rows = [];
     this.#online = new Set();
@@ -948,7 +968,9 @@ export class Account extends EventEmitter {
       case "session.approved":
         this.#approvedByHub = true;
         this.#changed();
-        return void this.#tryFinishApproval();
+        // After the approval messages that came before it: the reveal may still be being checked.
+        this.#approvalChain = this.#approvalChain.then(() => this.#tryFinishApproval()).catch(() => {});
+        return undefined;
       case "pending.list":
         this.#rows = (Array.isArray(message.pending) ? message.pending : []).filter((r) => isFiniteDevice(r?.id) && isFiniteDevice(r?.signPub)).slice(0, MAX_PENDING_ROWS)
           .map((r) => ({ ...r, name: clip(r.name, 128), kind: clip(r.kind, 32), ip: clip(r.ip, 64) }));
@@ -1189,9 +1211,9 @@ export class Account extends EventEmitter {
   }
 
   /**
-   * The person saw the code match on both screens. Only now is the entry signed, and only for the code it was shown.
-   * The role is the person's choice and nothing else's: a tampered web page can call itself a desktop. `client` unless
-   * they said otherwise.
+   * The person's one tap. Only now is the entry signed, and only for the code it was shown. Whether they compared it is up to
+   * them: see docs/accounts.md for what that leaves open. The role is the person's choice and nothing else's: a tampered web
+   * page can call itself a desktop. `client` unless they said otherwise.
    */
   async approve(id, { code, role = "client" } = {}) {
     this.#requireFull("approve a new device");
@@ -1271,18 +1293,6 @@ export class Account extends EventEmitter {
     return this.status();
   }
 
-  /**
-   * The person at this computer checked that the code here matches the approving device's. Without this step, a hacked
-   * hub could play the approver on its own and hand this computer a made-up account whose devices it then controls:
-   * the log would follow the head of an exchange that was real, just not with any device of the person's.
-   */
-  confirmCode(code) {
-    if (this.#phase !== "pending") throw new AccountError(409, "no-code", "There is no code to confirm yet.");
-    this.#exchange.confirm(code);
-    this.#tryFinishApproval();
-    return this.status();
-  }
-
   async #tryFinishApproval() {
     if (this.#phase !== "pending" || !this.#approvedByHub) return;
     const exchange = this.#exchange.current;
@@ -1290,7 +1300,7 @@ export class Account extends EventEmitter {
       this.#alert("fake-log", "no-code");
       return;
     }
-    if (!exchange.confirmed) return;
+    if (!exchange.confirmed) return; // a commit taken, with no reveal yet
     let reply;
     try {
       reply = await this.#hub.rpc({ type: "log.get" }, ["log"]);
@@ -1299,7 +1309,7 @@ export class Account extends EventEmitter {
     }
     if (this.#phase !== "pending" || this.#exchange.current !== exchange) return;
     const entries = reply.entries;
-    const { verified, alert } = await checkApprovedLog(entries, { me: this.#keys.signPub, exchange, held: this.#log, now: this.now(), verifyLog: this.verifyLogImpl });
+    const { verified, alert } = await checkApprovedLog(entries, { me: this.#keys.signPub, exchange, account: this.#signedInTo, held: this.#log, now: this.now(), verifyLog: this.verifyLogImpl });
     if (alert) {
       this.#alert(...alert);
       return;
@@ -1307,6 +1317,7 @@ export class Account extends EventEmitter {
     await this.#adoptLocked(entries, verified);
     this.#phase = "approved";
     this.#exchange.current = null;
+    this.#signedInTo = null;
     this.#approvedByHub = false;
     await this.#persistState();
     this.#changed();
@@ -1465,9 +1476,10 @@ export class Account extends EventEmitter {
     const oldSalt = await this.#saltFor(this.#email);
     const currentLoginKey = await this.#loginKey(current, oldSalt);
     const salt = globalThis.crypto.getRandomValues(new Uint8Array(SALT_BYTES));
-    const verifierInput = await this.#loginKey(next, salt);
+    const nextKeys = await this.deriveKeys(next, salt);
+    const anchor = await accountAnchor(nextKeys.anchorKey, this.#verified.accountId);
     try {
-      await this.#hub.rpc({ type: "password.change", currentLoginKey, salt: toB64(salt), verifierInput }, ["password.changed"]);
+      await this.#hub.rpc({ type: "password.change", currentLoginKey, salt: toB64(salt), verifierInput: toB64(nextKeys.loginKey), anchor }, ["password.changed"]);
     } catch (error) {
       // Sent, and no answer: the hub may have done it. Other errors are its answer, and neverSent means it cannot have.
       if (!error.neverSent && (error.code === "hub-timeout" || error.code === "hub-unreachable")) throw new AccountError(error.status, error.code, PASSWORD_UNKNOWN);

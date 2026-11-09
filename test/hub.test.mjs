@@ -222,6 +222,7 @@ async function hubFor(t, { dataDir, withInvites = false, ...options } = {}) {
 
 function api(hub, path, body, { headers = {}, localAddress, method = "POST", raw } = {}) {
   if (path === "/api/register" && hub.withInvites && body && !raw) body = { inviteCode: hub.mintInvite(), ...body };
+  if (path === "/api/register" && body && !raw && !("anchor" in body)) body = { anchor: randomKey(), ...body };
   return new Promise((resolve, reject) => {
     const payload = raw ?? (body === undefined ? "" : JSON.stringify(body));
     const req = http.request({ port: hub.port, host: "127.0.0.1", path, method, localAddress, agent: false, headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload), ...headers } }, (res) => {
@@ -494,7 +495,7 @@ test("a known device signs in approved, a new one pending; login refuses malform
   assert.equal((await signIn(hub, account, account.device)).state, "approved");
   const fresh = await signIn(hub, account, await newDeviceKeys());
   assert.equal(fresh.state, "pending");
-  assert.deepEqual(Object.keys(fresh).sort(), ["session", "state"]);
+  assert.deepEqual(Object.keys(fresh).sort(), ["accountId", "anchor", "session", "state"]);
 
   const good = { email: account.email, loginKey: account.loginKey, signPub: account.device.signPub };
   for (const bad of [
@@ -1511,7 +1512,7 @@ test("only an approved full device of the same account can deny, and only a pend
 
 // --- changing the password ---
 
-const passwordChange = (currentLoginKey, salt = b64(randomBytes(16)), verifierInput = randomKey()) => ({ type: "password.change", currentLoginKey, salt, verifierInput });
+const passwordChange = (currentLoginKey, salt = b64(randomBytes(16)), verifierInput = randomKey(), anchor = randomKey()) => ({ type: "password.change", currentLoginKey, salt, verifierInput, anchor });
 
 test("a full device changes the password: the new one signs in, the old one stops, sessions stay", async (t) => {
   const hub = await hubFor(t);

@@ -1,7 +1,7 @@
 // The hub's data dir: JSON files written whole and renamed into place, so a crash leaves the old file or the new one.
 //   secret         for the fake salts, created on first run
 //   bootstrap      SHA-256 of the one-shot registration token, only until the first account exists
-//   accounts.json  {version, accounts: [{id, email, salt, verifier: {salt, hash}, log, owner?}]}. `owner` marks the first account:
+//   accounts.json  {version, accounts: [{id, email, salt, verifier: {salt, hash}, anchor, log, owner?}]}. `owner` marks the first account:
 //                  a write moves an account to the end of this file, so the order says nothing.
 //   sessions.json  {version, sessions: [{hash, accountId, signPub, name, kind, ip, createdAt, expiresAt, proven, approved}]}
 //   invites.json   {version, invites: [{id, hash, createdBy, createdAt, expiresAt, usedAt}]}. Only the SHA-256 of a code, never the code.

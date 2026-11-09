@@ -14,13 +14,10 @@ export async function handleAccountRoutes(req, res, { p, q, account, links, send
   switch (p) {
     case "/api/account/status": if (get) return send(res, 200, account.status()); break;
     case "/api/account/register":
-      if (post) return send(res, 200, await account.register({ email: need(body.email, "email"), password: need(body.password, "password"), name: body.name }));
+      if (post) return send(res, 200, await account.register({ email: need(body.email, "email"), password: need(body.password, "password"), name: body.name, inviteCode: body.inviteCode }));
       break;
     case "/api/account/sign-in":
       if (post) return send(res, 200, await account.signIn({ email: need(body.email, "email"), password: need(body.password, "password"), name: body.name }));
-      break;
-    case "/api/account/confirm-code":
-      if (post) return send(res, 200, account.confirmCode(need(body.code, "code")));
       break;
     case "/api/account/restart-exchange":
       if (post) return send(res, 200, account.restartExchange());
