@@ -113,7 +113,12 @@ function loadAgents(list, rev = agentRev) {
 const openChat = (sid) => { selectSession(sid); showView("chat"); if (window.innerWidth < 1100) panel.setOpen(false); };
 /** A chat on any machine: the window goes there first (asking about unsaved files), then opens it. */
 function openChatOn(key, sid) {
-  if (key !== focusKey && !focusMachine(key)) return;
+  if (key !== focusKey) {
+    // The window passes through Home on its way to the other machine: that is no place to come Back to.
+    const was = applyingRoute;
+    applyingRoute = true;
+    try { if (!focusMachine(key)) return; } finally { applyingRoute = was; }
+  }
   openChat(sid);
 }
 const history = createHistory({
@@ -707,7 +712,8 @@ async function selectSession(sid, { reload = false } = {}) {
   if (!reload && S.selected !== sid) { keepDraft(); chat.setValue(drafts.take(key, sid)); }
   if (S.view && !reload) finish(S.view);
   S.selected = sid;
-  if (!reload) syncRoute();
+  // Opened from Home, showView("chat") records it next; here only a switch from one chat to another is recorded.
+  if (!reload && S.page === "chat") syncRoute();
   loadAll(key); // its agents may be older than the first screen's
   S.forceFork = false;
   history.render();
