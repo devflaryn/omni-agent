@@ -3030,3 +3030,119 @@ test("the whole way: the window's routes run the account, and another device rea
   assert.equal(out.json.phase, "signed-out");
   await events.body.cancel().catch(() => {});
 });
+
+// ------------------------------------------------------------------------------- invites, the first run, and other people
+
+test("invites: the hub's owner makes, lists and revokes them; a code is shown once and lets one other person in", async () => {
+  const fixture = await hubFixture();
+  const owner = await registered(fixture);
+  const made = await owner.createInvite();
+  assert.match(made.code, /^[2-9A-Z]{4}(-[2-9A-Z]{4}){3}$/);
+  assert.ok(made.expiresAt > Date.now() + 13 * 24 * 3600_000);
+  const { invites } = await owner.invites();
+  assert.deepEqual(invites.map((i) => [i.id, i.state]), [[made.id, "live"]]);
+  assert.ok(!JSON.stringify(invites).includes(made.code.replace(/-/g, "")), "the list never shows a code");
+
+  const other = makeAccount(fixture);
+  const out = await other.register({ email: "friend@example.com", password: "another long password", name: "Friend", inviteCode: made.code });
+  assert.ok(out.recoveryCode);
+  assert.equal(other.status().phase, "approved");
+  assert.equal((await owner.invites()).invites[0].state, "used");
+  // The two are strangers to each other.
+  assert.ok(!owner.devices().some((d) => d.name === "Friend"));
+  assert.ok(!other.devices().some((d) => d.name === "First"));
+
+  await until(() => other.status().hub.connected, "the friend's socket");
+  await assert.rejects(other.createInvite(), (e) => e.status === 403 && e.code === "forbidden", "only the owner's devices make invites");
+  await assert.rejects(other.invites(), (e) => e.code === "forbidden");
+
+  const spare = await owner.createInvite();
+  await owner.revokeInvite(spare.id);
+  const late = makeAccount(fixture);
+  await assert.rejects(late.register({ email: "late@example.com", password: "another long password", inviteCode: spare.code }), (e) => e.code === "bad-invite");
+  assert.equal(late.status().recoveryCodePending, false, "nothing was created, so no code is held");
+});
+
+test("register with no invite after the first account says an invite is needed, and creates nothing", async () => {
+  const fixture = await hubFixture();
+  await registered(fixture);
+  const other = makeAccount(fixture);
+  await assert.rejects(other.register({ email: "x@example.com", password: "another long password" }), (e) => e.code === "registration-closed" && /invite code is needed/.test(e.message));
+  assert.equal(other.status().recoveryCodePending, false);
+});
+
+test("the first run: offered while nothing was ever chosen, and a choice to stay local is remembered", async () => {
+  const fixture = await hubFixture();
+  const account = makeAccount(fixture);
+  await account.start();
+  assert.equal(account.status().firstRun, true);
+  assert.equal(account.status().canCreateFirst, false);
+  writeBootstrap(account.dir);
+  assert.equal((await account.refreshStatus()).canCreateFirst, true, "the token on this computer is what creates the first account");
+  await account.chooseWelcome("local");
+  assert.equal(account.status().firstRun, false);
+  await account.stop();
+  const again = makeAccount(fixture, { dir: account.dir });
+  await again.start();
+  assert.equal(again.status().firstRun, false, "remembered across a restart");
+  assert.equal(again.status().phase, "signed-out", "and it signed nothing in");
+});
+
+test("the first run is not offered to a computer that has signed in before", async () => {
+  const fixture = await hubFixture();
+  const account = await registered(fixture);
+  assert.equal(account.status().firstRun, false);
+  await account.signOut();
+  assert.equal(account.status().firstRun, false);
+  await account.signOut({ forget: true });
+  assert.equal(account.status().firstRun, false, "forgetting a device is not a new computer: the person has chosen before");
+});
+
+test("the window's routes: invites, the first-run choice, and the reason an account action is refused", async () => {
+  const fixture = await hubFixture();
+  const dir = freshDir();
+  const accountDir = join(dir, "account");
+  writeBootstrap(accountDir);
+  const token = "window-token-for-invites-0123456789";
+  const app = await createApp(appOptions(dir, { accountDir, accountHub: fixture.url, windowToken: token, accountOptions: { hubOrigin: ORIGIN, protector: testProtector, deriveKeys: quickKey, reconnect: { minMs: 20, maxMs: 100 } } }));
+  await app.listen();
+  cleanups.push(async () => { app.close(); });
+  const at = `http://127.0.0.1:${app.server.address().port}`;
+  const noCookie = await fetch(`${at}/api/account/status`, { headers: { origin: at } });
+  assert.equal(noCookie.status, 403);
+  assert.equal((await noCookie.json()).code, "other-window", "a window that did not get this server's token is told so");
+  const swap = await fetch(`${at}/?desktop=1&token=${token}`, { redirect: "manual" });
+  const cookie = swap.headers.get("set-cookie").split(";")[0];
+  const call = async (method, path, body) => {
+    const r = await fetch(`${at}/api/account/${path}`, { method, headers: { cookie, origin: at, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    return { status: r.status, json: await r.json() };
+  };
+  const first = (await call("GET", "status")).json;
+  assert.equal(first.firstRun, true);
+  assert.equal(first.canCreateFirst, true);
+  assert.equal((await call("POST", "welcome", { choice: "local" })).status, 200);
+  assert.equal((await call("GET", "status")).json.firstRun, false);
+  assert.equal((await call("POST", "welcome", { choice: "anything" })).status, 400);
+
+  await call("POST", "register", { email: EMAIL, password: PASSWORD, name: "Host" });
+  await call("POST", "recovery-code/saved");
+  await until(async () => (await call("GET", "status")).json.hub.connected, "the host's socket");
+  const made = await call("POST", "invites", {});
+  assert.equal(made.status, 200);
+  assert.match(made.json.code, /-/);
+  const list = await call("GET", "invites");
+  assert.deepEqual(list.json.invites.map((i) => i.state), ["live"]);
+  assert.equal((await call("POST", "invites/revoke", { id: made.json.id })).status, 200);
+  assert.deepEqual((await call("GET", "invites")).json.invites, []);
+});
+
+test("a server started with no window token says so, in its own words", async () => {
+  const dir = freshDir();
+  const app = await createApp(appOptions(dir, { accountDir: join(dir, "account"), accountHub: "http://127.0.0.1:9", windowToken: "" }));
+  await app.listen();
+  cleanups.push(async () => { app.close(); });
+  const at = `http://127.0.0.1:${app.server.address().port}`;
+  const r = await fetch(`${at}/api/account/status`, { headers: { origin: at } });
+  assert.equal(r.status, 403);
+  assert.equal((await r.json()).code, "no-window");
+});

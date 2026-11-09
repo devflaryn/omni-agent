@@ -14,6 +14,7 @@
  *   state.json     email, name, phase, and a confirmed approval's head and approver (not its code). No secrets.
  *   log.json       the longest log verified so far
  *   settings.json  { allowWebAccess }
+ *   welcome.json   { choice, at }: the person has been past the first-run screen, by signing in or by choosing to stay local
  *   alerts.json    what the person has been warned of
  *   audit.jsonl    one line per request from another device, with one older file, audit.1.jsonl
  *
@@ -150,6 +151,8 @@ export class Account extends EventEmitter {
   #settleTimer = null;
   #hubClaimedRemoved = false;
   #protector;
+  #welcomed = false;
+  #canBootstrap = false;
 
   constructor({ dir, hubUrl, hubOrigin, log = () => {}, now = Date.now, name, kind = "desktop", protector, deriveKeys, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = verifyLog }) {
     super();
@@ -241,6 +244,10 @@ export class Account extends EventEmitter {
       warnings: [...this.#warnings, ...(keyProtection.warning ? [keyProtection.warning] : [])],
       alerts: this.#alerts.slice(),
       recoveries: this.#verified?.recoveries ?? [],
+      // Whether to offer the first-run screen: nothing was ever chosen here. Never a reason to wait for the hub.
+      firstRun: !this.#welcomed && this.#phase === "signed-out" && !this.#keys && !this.#email && !this.#recovery.pending,
+      // This computer holds the token that creates a hub's first account, so it needs no invite.
+      canCreateFirst: this.#canBootstrap,
       recoveryUnconfirmed: this.#recoveryAt !== null,
       recoveryCodePending: this.#recovery.pending,
       recoveryContested: this.#recovery.contested,
@@ -425,6 +432,9 @@ export class Account extends EventEmitter {
     try { await fs.access(this.dir); } catch { exists = false; }
     if (!exists) return;
     await this.#ensureDir();
+    this.#canBootstrap = !!await this.#bootstrapToken();
+    // A computer that signed in before this file existed has chosen too.
+    this.#welcomed = (await Promise.all(["welcome.json", "state.json", "keys.json"].map((name) => fs.access(join(this.dir, name)).then(() => true, () => false)))).some(Boolean);
     const settings = await this.#readJson("settings.json").catch(() => undefined);
     const settingsThere = await fs.access(join(this.dir, "settings.json")).then(() => true, () => false);
     if (settingsThere) {
@@ -549,6 +559,49 @@ export class Account extends EventEmitter {
 
   #lastLogin = null;
 
+  /** status(), after looking again at what can change on disk without Omni: the bootstrap token. */
+  async refreshStatus() {
+    await this.start();
+    this.#canBootstrap = !!await this.#bootstrapToken();
+    return this.status();
+  }
+
+  /** The first-run screen's way out without an account. Remembered, so it is not offered again. */
+  async chooseWelcome(choice) {
+    if (choice !== "local") throw new AccountError(400, "bad-choice", "The choice must be local.");
+    await this.start();
+    await this.#markWelcomed(choice);
+    return this.status();
+  }
+
+  async #markWelcomed(choice) {
+    if (this.#welcomed) return;
+    await this.#writeFile("welcome.json", JSON.stringify({ v: 1, choice, at: this.now() }));
+    this.#welcomed = true;
+    this.#changed();
+  }
+
+  // ---------------------------------------------------------------------------- invites: only the hub's owner, and the hub decides who that is
+
+  async invites() {
+    this.#requireFull("see invites");
+    const { invites } = await this.#hub.rpc({ type: "invite.list" }, ["invite.list"]);
+    return { invites: (Array.isArray(invites) ? invites : []).slice(0, 200).map((i) => ({ id: clip(i?.id, 64), createdAt: Number(i?.createdAt) || null, expiresAt: Number(i?.expiresAt) || null, state: ["live", "used", "expired"].includes(i?.state) ? i.state : "unknown" })) };
+  }
+
+  /** The code exists here once, for the person to pass on. Nothing keeps it. */
+  async createInvite() {
+    this.#requireFull("make invites");
+    const made = await this.#hub.rpc({ type: "invite.create" }, ["invite.created"]);
+    return { id: clip(made.id, 64), code: clip(made.code, 64), expiresAt: Number(made.expiresAt) || null };
+  }
+
+  async revokeInvite(id) {
+    this.#requireFull("revoke invites");
+    await this.#hub.rpc({ type: "invite.revoke", id }, ["invite.revoked"]);
+    return { ok: true };
+  }
+
   #requireStartable() {
     if (this.#phase === "key-unavailable") throw new AccountError(409, "key-unavailable", ALERT_TEXT["key-unavailable"]);
     if (this.#phase === "log-damaged") throw new AccountError(409, "log-damaged", "The device log on this computer is damaged. Sign out and forget this device to start over.");
@@ -640,6 +693,7 @@ export class Account extends EventEmitter {
     // The account exists now. From here nothing may stop the person getting this code: it is never shown again.
     this.#email = email;
     await this.#settleCommitted(entries);
+    await this.#tryLocal(() => this.#markWelcomed("account"), LOG_NOT_SAVED);
     await this.#tryLocal(() => fs.rm(join(this.dir, "bootstrap-token"), { force: true }), "Could not delete the bootstrap token from the account folder. It opens nothing now, but delete it by hand.");
     if (accepted) await this.#login(email, loginKey).catch(() => {});
     const signedIn = !!this.#session && !!this.#log;
@@ -822,6 +876,7 @@ export class Account extends EventEmitter {
     if (this.#phase === "removed") throw new AccountError(409, "removed", "This device was removed from the account. Sign out and forget this device to sign in again as a new one.");
     this.#name = clip(name, 128) || this.#name;
     await this.#ensureDir();
+    await this.#markWelcomed("account");
     await this.#ensureKeys();
     // A key that has left the log can never come back on it, so this device could only wait for ever.
     if (this.#log && this.#everOnLog(this.#keys.signPub) && !this.#verified.devices.has(this.#keys.signPub)) {
@@ -1554,4 +1609,4 @@ export class Account extends EventEmitter {
 }
 
 /** What a hub's reply to a registration says was not created. Anything else may have come after the account was made. */
-const NOTHING_CREATED = new Set(["bad-email", "bad-salt", "bad-verifier", "bad-log-entry", "bad-json", "json-only", "too-large", "origin", "locked", "too-many-pending", "busy", "registration-closed", "already-registered"]);
+const NOTHING_CREATED = new Set(["bad-email", "bad-salt", "bad-verifier", "bad-log-entry", "bad-json", "json-only", "too-large", "origin", "locked", "too-many-pending", "busy", "registration-closed", "already-registered", "bad-invite", "too-many-signups", "bad-anchor"]);

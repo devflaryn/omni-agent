@@ -865,7 +865,7 @@ export async function createApp(overrides = {}) {
   /** The account routes and the proxy to other machines: only for the desktop window, see WindowGate. */
   async function accountRoute(req, res, p, q) {
     const refusal = windowGate.refusal(req);
-    if (refusal) return send(res, 403, { error: refusal });
+    if (refusal) return send(res, 403, { error: refusal, code: windowGate.refusalCode(req) });
     if (!account) return send(res, 503, { error: "the account is off: check account.hub in omni.config.json" });
     if (p === "/remote" || p.startsWith("/remote/")) return await proxyToMachine(req, res, { links: machineLinks, send });
     try {
