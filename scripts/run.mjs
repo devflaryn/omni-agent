@@ -29,7 +29,7 @@ export async function runUnattended({ cwd, goal, provider, model, thinking, runI
   // --resume: the run's own chat (its plan and progress live there). Read it BEFORE pi starts: the fresh child
   // announces its new, empty session right away and that announcement overwrites the ledger's sessionFile.
   const resumeFile = runId ? ledger.readControl().sessionFile : "";
-  const app = await createApp({ port, host: "127.0.0.1", lan: false, relay: { host: "" }, cwd, autoStartPi: false, runLedger: ledger, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}) });
+  const app = await createApp({ port, host: "127.0.0.1", cwd, autoStartPi: false, runLedger: ledger, ...(provider ? { piProvider: provider } : {}), ...(model ? { piModel: model } : {}) });
   await app.listen();
   const pi = app.startPi(cwd);
   // Mirror pi's session file into the ledger so a restart resumes it.

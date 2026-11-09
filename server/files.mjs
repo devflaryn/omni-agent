@@ -36,24 +36,6 @@ export function safeResolve(root, rel) {
   if (isAbsolute(r) || r === ".." || r.startsWith(`..${sep}`) || r.startsWith("../")) return null;
   return abs;
 }
-/** Whether `rel` is still inside `root` once links are followed, as far as the path exists. */
-export async function staysInside(root, rel) {
-  const abs = safeResolve(root, rel);
-  if (!abs) return false;
-  const realRoot = await fs.realpath(root).catch(() => resolve(root));
-  for (let at = abs, tail = ""; ;) {
-    let real = null;
-    try { real = await fs.realpath(at); } catch { /* not there yet: the folder it would land in decides */ }
-    if (real) {
-      const r = relative(realRoot, join(real, tail));
-      return !(isAbsolute(r) || r === ".." || r.startsWith(`..${sep}`));
-    }
-    const up = dirname(at);
-    if (up === at) return false;
-    tail = join(basename(at), tail);
-    at = up;
-  }
-}
 const inside = (root, rel) => { const abs = safeResolve(root, rel); if (!abs) throw fail(400, "path outside root"); return abs; };
 /** Not the root itself: renaming or deleting the working directory from its own tree is never meant. */
 const insideNotRoot = (root, rel) => { const abs = inside(root, rel); if (abs === resolve(root)) throw fail(400, "that is the root folder itself"); return abs; };

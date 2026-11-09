@@ -8,9 +8,9 @@ import { renderThemeChoice } from "./appearance.js";
 /** `getContext()` → the saved context policy (`/api/state.config.context`); `onContext(policy)` after a save. */
 /**
  * `api` and `where()` are the machine Settings shows (Models, MCP servers, Long runs); `onTab(name)` says which tab is showing,
- * so the machine choice can show only beside that machine's own tabs. Account and Remote are always this computer's.
+ * so the machine choice can show only beside that machine's own tabs. Account is always this computer's.
  */
-export function createSettings({ api, toast, onChanged, loadRemote, loadAccount, getContext = () => null, onContext, where = () => "", onTab }) {
+export function createSettings({ api, toast, onChanged, loadAccount, getContext = () => null, onContext, where = () => "", onTab }) {
   const $ = (s) => document.querySelector(s);
   const modal = $("#settings"), list = $("#provList"), form = $("#provForm");
   const f = {
@@ -25,9 +25,9 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   let keyFor = null; // the OpenCode provider id whose key the form edits (key mode), or null
 
   const mcp = createMcpSettings({ api, toast, onChanged, where });
-  // The tabs of one dialog: the models OpenCode can use, the MCP servers it connects to, remote access (host only), long runs,
+  // The tabs of one dialog: the models OpenCode can use, the MCP servers it connects to, long runs,
   // the account and how the app looks. Each tab is its label and its controls; any longer explanation sits behind "How this works".
-  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody") }, remote: { btn: $("#tabRemote"), body: $("#remoteBody") }, long: { btn: $("#tabLong"), body: $("#longBody") }, account: { btn: $("#tabAccount"), body: $("#accountBody") }, appearance: { btn: $("#tabAppearance"), body: $("#appearanceBody") } };
+  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody") }, long: { btn: $("#tabLong"), body: $("#longBody") }, account: { btn: $("#tabAccount"), body: $("#accountBody") }, appearance: { btn: $("#tabAppearance"), body: $("#appearanceBody") } };
   for (const k of Object.keys(tabs)) if (!tabs[k].btn || !tabs[k].body) delete tabs[k];
   let tab = "models";
   function showTab(name) {
@@ -39,7 +39,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
       t.body.hidden = !on;
     }
     onTab?.(name);
-    if (name === "mcp") mcp.load(); else if (name === "remote") loadRemote?.(); else if (name === "long") renderLong(); else if (name === "account") loadAccount?.(); else if (name === "appearance") renderAppearance(); else load();
+    if (name === "mcp") mcp.load(); else if (name === "long") renderLong(); else if (name === "account") loadAccount?.(); else if (name === "appearance") renderAppearance(); else load();
   }
   for (const [k, t] of Object.entries(tabs)) t.btn.onclick = () => showTab(k);
 

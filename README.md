@@ -27,9 +27,7 @@ Console mode is still there:
 ```
 ./start.sh                     # macOS/Linux: opens http://127.0.0.1:4400, OpenCode works in ~/Desktop
 ./start.sh /some/project       # OpenCode works in that folder (the Graph tab uses this folder)
-./start.sh . --lan             # also reachable from other devices on your network
 start.cmd "C:\some\project"    # the Windows equivalents
-start.cmd . --lan
 node server/index.mjs --no-pi  # observe only, don't start OpenCode (any OS)
 ```
 
@@ -65,76 +63,7 @@ Use an account. **The full guide is [docs/accounts.md](docs/accounts.md):** firs
 - **The VPS cannot read your actions, results, files or chats, or forge an action,** through the desktop app. The web page is served by the VPS, so a hacked VPS could change it: see [the web page's risk](docs/accounts.md#the-web-pages-risk), and turn **Allow web page access** off on any machine this matters for.
 - **There is no password reset by email.** Keep the recovery code you get when you create the account.
 
-**The old relay is still running until it is removed,** and its password page stays reachable until then. [The steps to remove it](docs/accounts.md#removing-the-old-relay) are for after a week of real use.
-
-#### The old way: password and VPS relay
-
-**Being replaced by accounts. This all still runs until the relay is removed, and these instructions go with it.**
-
-Omni then runs as a small server: this computer is **the host**, everything else is **a remote browser**.
-
-| | the host (this computer's window, `http://127.0.0.1:4400`) | a remote browser (`https://<address>:4443`) |
-|---|---|---|
-| login | none | the host's password |
-| reading chats, files, memory, graphs | yes | yes (files only inside the chats' folders and the vault) |
-| sending a message, any change | runs at once | **waits for Approve/Deny on the host**, then runs or is refused |
-| Settings → Remote, shutdown | yes | never |
-
-1. Start with `--remote` (or `"remote": true` in `omni.config.json`; `--lan` means the same); the desktop
-   launcher already does. Omni keeps its own window on `127.0.0.1:4400` and adds a second listener on
-   every interface, port `4443` (`remotePort`).
-2. In the host's window open **Settings → Remote** and set a password (12+ characters). It is stored as a
-   scrypt hash in `~/.omni-agent/remote-auth.json`.
-3. On the same network, open the address Settings → Remote shows, e.g. `https://192.168.0.15:4443/`.
-   From a different network, forward TCP 4443 on your router to this computer and open
-   `https://<your public IP>:4443/`. If the firewall blocks it run `scripts\allow-lan.cmd` (or
-   `scripts/allow-lan.sh`) once.
-4. The remote listener speaks HTTPS with a self-signed certificate made by openssl on first start
-   (`~/.omni-agent/tls/`; set `tlsCert`/`tlsKey` for your own). The browser warns once: check that it
-   shows the SHA-256 fingerprint from Settings → Remote before typing the password. Without openssl it
-   falls back to plain HTTP and says so. The certificate meets Apple's rules (serverAuth usage, at most
-   825 days, every address in its SAN): iOS refuses one that does not outright, with no "visit anyway",
-   in Safari and every other iPhone browser. One made by an older Omni, near its end, or missing an
-   address the listener answers on is made again at start (the fingerprint then changes). To lose the
-   warning on a phone, open `/omni-agent.crt` there (linked on the sign-in page), install it (iPhone:
-   Settings → General → VPN & Device Management) and trust it (Settings → General → About →
-   Certificate Trust Settings).
-5. Each message or change a remote browser sends appears in the host's window as a card saying what it
-   asks for (the message text, the command an MCP server would run; secrets hidden) with **Approve** and
-   **Deny**. It waits up to `remoteApprovalTimeoutSec` (300 s), then is refused.
-
-##### From anywhere, without touching the router (VPS relay)
-
-With `"relay": { "host": "<vps>" }` in `omni.config.json`, this PC keeps an outgoing SSH connection to
-the VPS (`server/tunnel.mjs`), and `https://<vps>:4443/` reaches Omni from anywhere:
-
-    browser ──TLS──▶ VPS :4443 omni-relay ──PROXY line + same TLS bytes──▶ ssh -R ──▶ PC 127.0.0.1:4444 (HTTPS)
-
-- **The VPS cannot read the traffic.** The relay (`relay/omni-relay.mjs`) holds no certificate; TLS ends on
-  this PC. The certificate a browser sees through the VPS has the same fingerprint as Settings → Remote shows.
-- **The tunnel key can do one thing.** User `omni-tunnel` has no password and no shell; its key may only open
-  the remote forward on the VPS's `127.0.0.1:14443`, enforced in `authorized_keys` and an sshd `Match` block
-  (`relay/setup-vps.sh`). The VPS host key is pinned in `~/.omni-agent/relay/known_hosts`.
-- **Plain `http://` gets a redirect to `https://`** (an address typed without the scheme, which is what a
-  phone's browser opens), on the relay and on the LAN port alike; nothing else crosses without TLS.
-- **The relay drops** anything else that does not start with a TLS handshake, more than 32 connections at once or
-  120 a minute from one address, and idle connections after 15 minutes. It runs as a throwaway systemd
-  `DynamicUser` with a read-only system; it logs counts only.
-- **The visitor's real address** travels in the PROXY line, so the lockout below and the approval cards
-  name the real address, not the tunnel. The local listener that reads PROXY lines is loopback-only.
-- Setup: `ssh-keygen -t ed25519 -f ~/.omni-agent/relay/id_ed25519`, pin the VPS key in
-  `~/.omni-agent/relay/known_hosts`, copy `relay/` to `/opt/omni-relay/` on the VPS, run
-  `bash /opt/omni-relay/setup-vps.sh "<public key>"`, install `omni-relay.service`, and
-  `systemctl enable --now omni-relay`.
-
-**A new device needs your Approve once,** even with the right password (`remoteDeviceApproval`, on by
-default): its sign-in waits as a card in the host's window, and once approved the device is remembered for
-180 days (Settings → Remote lists and removes them). A leaked password alone therefore reads nothing.
-
-Five wrong passwords from one address lock it out for 15 minutes; thirty from anywhere lock every remote
-sign-in for 15 minutes. Remote sessions last `remoteSessionDays` (7) and end when the server restarts or
-the password changes. A request that reaches the host's port through a local tunnel or reverse proxy, or
-names a non-loopback `Host`, counts as remote too.
+**The old password-and-relay way in was removed on 2026-11-10** (the password page on port 4443, the VPS relay, Settings → Remote). Omni listens on `127.0.0.1` only. Leftover files on a PC that used it can be deleted: see [docs/accounts.md](docs/accounts.md#the-old-relay-was-removed).
 
 ### Repo graphs (Graph tab)
 
@@ -241,7 +170,7 @@ icon in the top bar, or `/#missions`) and start one: a project folder, a goal, a
 - **You, live:** the Mission view shows the orchestrator on top, its workers below it and their subagents under them, with
   status, last activity, run time and cost. Click any node to message it, ask a worker for a summary, read a report
   or open its chat; the orchestrator is told what you said to a worker. The **Inbox** has the orchestrator's `notify` messages, and
-  you can answer their questions there. A notification is only stored and shown (here and on the remote page); phone
+  you can answer their questions there. A notification is only stored and shown (here, and on your other devices); phone
   delivery comes later. The **Tasks**, **Ledger** and **Knowledge** tabs show the task tree, the notes and the graph.
 - **Storage, outside the project folder:** `~/.omni-agent/projects/<name>-<hash>/` (`projectsDir`) holds
   `missions/<id>/` (`mission.json`, `ledger.md`, `events.jsonl`, `reports/`, `workers/<id>/brief.md`,
@@ -274,8 +203,7 @@ icon in the top bar, or `/#missions`) and start one: a project folder, a goal, a
   is not overwritten without asking. `.md` shows rendered or as source, images with fit / 100 %, video
   and audio play (seeking works in Safari), PDFs in the browser's viewer, and `.zip` / `.apk` / `.jar`
   list their entries. A binary offers **Open as Text** (UTF-8 or Latin-1) and a **Hex Viewer**: both
-  read-only, so looking never changes the file, and a save over a binary is refused. A remote browser's
-  saves and file changes wait for the host's approval like everything else. **Reference** drops `@path`
+  read-only, so looking never changes the file, and a save over a binary is refused. **Reference** drops `@path`
   into the prompt. The folder button in the top bar hides or shows the explorer.
 - **Transcript**: Omni's chats stream token by token; chats run in a terminal appear whole. Each run of tool
   calls folds into one line such as "Edited files, ran commands"; open it for a row per tool and a
@@ -483,7 +411,7 @@ System included. The window's size and place are kept, and only one copy runs at
   force a binary.
 - **Its files** are in `~/Library/Application Support/Omni Agent/`: `omni.config.json`, the vault and `omni.log`. The
   account and everything else stay in `~/.omni-agent/`, as for every desktop. The app's own folder is never written to.
-- It does not open the old LAN/relay listener (`--lan`), so macOS never asks to let it accept incoming connections.
+- It listens on `127.0.0.1` only, so macOS never asks to let it accept incoming connections.
 
 **Installing it.** Open **Omni Agent.dmg**, drag **Omni Agent** onto **Applications**. To update, quit it first (Cmd-Q),
 then drag the new one over and choose **Replace**. Never copy files into an app that is installed: macOS remembers the
@@ -522,10 +450,10 @@ server/opencode-*.mjs opencode serve, chats, config server/claude-runner.mjs cla
 server/watchers.mjs   discovery, tailing, digests   server/normalize.mjs     four sources -> one event
 server/memory.mjs     the vault                     server/tokens.mjs        tally + prices
 server/providers.mjs  presets + custom providers     server/zip.mjs           .zip/.apk listing + entry read
-server/files.mjs      file browser: read/save/trash  server/tls.mjs           the remote certificate (iOS-valid)
+server/files.mjs      file browser: read/save/trash  server/access.mjs        who may do what: the host, a channel
 ui/                   index.html, styles.css, app.js + lib/transcript/composer/explorer/settings/sidebar/panel
 ui/filepane.js        editor tabs + viewers          ui/editor.js, highlight.js  code editor, syntax colouring
 desktop/              pywebview launcher            integrations/            OpenCode plugin, Claude Code hook, personas
 mac/                  Omni Agent.app: shell, launcher, build
-hub/                  the VPS hub: accounts, routing relay/                   the old relay, until removed
+hub/                  the VPS hub: accounts, routing
 ```

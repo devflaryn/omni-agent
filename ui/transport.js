@@ -55,12 +55,6 @@ export const mode = () => (!read() ? "local" : channelImpl ? "channel" : "proxie
 export const machineTitle = (title = "Omni Agent") => (read() ? `[${read().name}] ${title}` : title);
 
 /**
- * The named events to take from a machine's stream. Old-style approval cards act on this computer, so another machine's
- * stream must not be able to paint them: they come from this computer's own stream alone. `m` is the stream's machine.
- */
-export const streamEvents = (m, { approvals, resync }) => (m ? { resync } : { approvals, resync });
-
-/**
  * A page with no server of its own hands in its channel here: {api, eventSource, rawUrl, saveFile, local, forMachine(m)}.
  * `local` stands in for this computer's server, which it does not have; `forMachine` gives the same for any one machine.
  * From ui/page-transport.js.
@@ -141,7 +135,6 @@ async function ask(m, method, path, body) {
 
 async function localAnswer(r) {
   const j = await r.json().catch(() => ({}));
-  if (r.status === 401 && j.login) { globalThis.location?.reload(); throw new Error("signed out"); }
   if (!r.ok || j.error) throw failure(j.error || `${r.status}`, r.status, j.code, j);
   return j;
 }

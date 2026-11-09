@@ -25,7 +25,7 @@ function createPi({ cwd }) {
   made.push(p);
   return p;
 }
-const app = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, liveWindowMs: 0, createPi, persistHook: false, persistPiModel: false });
+const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, liveWindowMs: 0, createPi, persistHook: false, persistPiModel: false });
 await app.listen();
 const port = app.server.address().port;
 after(() => app.close());

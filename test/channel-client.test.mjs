@@ -59,7 +59,7 @@ async function hubFixture() {
   return fixture;
 }
 
-const appOptions = (dir, extra = {}) => ({ port: 0, relay: { host: "" }, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"), autoStartPi: false, cwd: dir, persistHook: false, persistPiModel: false, hook: { enabled: false }, ...extra });
+const appOptions = (dir, extra = {}) => ({ port: 0, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"), autoStartPi: false, cwd: dir, persistHook: false, persistPiModel: false, hook: { enabled: false }, ...extra });
 
 /** A real server with a window: `call` is the window's account API, `at` its address. */
 async function windowApp(fixture, { name = "Here", dir = freshDir(), links } = {}) {

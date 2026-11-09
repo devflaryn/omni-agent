@@ -40,8 +40,8 @@ test("retryDelay: doubles per attempt with jitter, capped at 30 s", () => {
 });
 
 test("a dropped stream reconnects from the latest seq with growing delays, and calms down once it is back", () => {
-  // It used to retry every 1.5 s flat: a 4-minute tunnel outage meant 40 tries a minute per tab, against the
-  // relay's 120-a-minute per-address limit that every other request from that address shares.
+  // It used to retry every 1.5 s flat: a 4-minute outage meant 40 tries a minute per tab, every one of them
+  // spent against the same server the page needs back.
   const { s, timers, got, es } = rig();
   s.start();
   assert.equal(es().url, "/events?since=0");

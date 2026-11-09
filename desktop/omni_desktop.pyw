@@ -68,7 +68,7 @@ def plan(argv):
         cwd = desktop
     node = os.environ.get("OMNI_NODE") or shutil.which("node") or find_node()
     passthrough = [a for a in argv if a.startswith("--") and a not in ("--plan", "--lan", "--port")]
-    args = [node or "node", os.path.join(ROOT, "server", "index.mjs"), "--cwd", cwd, "--port", str(port), "--lan"] + passthrough
+    args = [node or "node", os.path.join(ROOT, "server", "index.mjs"), "--cwd", cwd, "--port", str(port)] + passthrough
     return {"port": port, "url": f"http://127.0.0.1:{port}/?desktop=1", "node": node, "args": args, "log": os.path.join(ROOT, "omni.log"), "root": ROOT, "platform": PLATFORM}
 
 

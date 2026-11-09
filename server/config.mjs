@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { homedir, networkInterfaces } from "node:os";
+import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -48,51 +48,25 @@ export function writeConfigFile(patch) {
   return next;
 }
 
-/** LAN IPv4 addresses (skips loopback, link-local and virtual-switch ranges). */
-export function lanAddresses() {
-  const out = [];
-  for (const [name, list] of Object.entries(networkInterfaces())) {
-    for (const a of list || []) {
-      if (a.family !== "IPv4" || a.internal) continue;
-      if (a.address.startsWith("169.254.")) continue;
-      // Virtual switches, and VPN clients whose address no other device can reach (Cloudflare WARP).
-      if (/vmware|vmnet|vethernet|wsl|hyper-v|virtualbox|docker|cloudflare|warp/i.test(name)) continue;
-      out.push({ name, address: a.address });
-    }
-  }
-  return out;
-}
-
 const fc = readConfigFile();
-/** `--lan`/`--remote` (or {"lan":true}/{"remote":true}) also serves other devices — on the LAN or, with a port
- *  forward, the internet — from a second, password-protected, read-only listener (see server/access.mjs). */
-const lan = process.argv.includes("--lan") || process.argv.includes("--remote") || fc.lan === true || fc.remote === true;
+
+/**
+ * Settings of the password-and-relay way in, removed on 2026-11-10 (docs/accounts.md): another device reaches this
+ * computer through the account now. An omni.config.json that still has them starts as if they were not there.
+ */
+const RETIRED_KEYS = ["lan", "remote", "remotePort", "remoteTls", "tlsCert", "tlsKey", "tlsDir", "remoteAuthFile", "remoteApprovalTimeoutSec", "remoteSessionDays", "remoteDeviceApproval", "relay"];
+/** The retired keys this config file still holds, for one line at start. Pure. */
+export function retiredKeys(fileConfig = fc) {
+  return RETIRED_KEYS.filter((k) => fileConfig && typeof fileConfig === "object" && k in fileConfig);
+}
 
 export const CONFIG = {
   port: Number(argVal("--port", process.env.OMNI_PORT || fc.port || 4400)),
-  /** The host's own listener: loopback only, full access, no login. */
+  /** The only listener: loopback only. The person at this computer uses it; other devices come over account channels. */
   host: "127.0.0.1",
-  lan,
-  /** The listener other devices use (every interface). Forward this port on the router to reach it from another network. */
-  remotePort: Number(argVal("--remote-port", process.env.OMNI_REMOTE_PORT || fc.remotePort || 4443)),
-  /** HTTPS on the remote listener (a self-signed certificate is made once unless tlsCert/tlsKey are given). */
-  remoteTls: fc.remoteTls !== false,
-  tlsCert: fc.tlsCert || "",
-  tlsKey: fc.tlsKey || "",
-  tlsDir: fc.tlsDir || join(HOME, ".omni-agent", "tls"),
-  /** The remote password's scrypt hash. Outside the repo on purpose. */
-  remoteAuthFile: fc.remoteAuthFile || join(HOME, ".omni-agent", "remote-auth.json"),
   /** The account: its folder (keys, device log, audit) and the hub this desktop signs in to. */
   accountDir: fc.account?.dir || join(HOME, ".omni-agent", "account"),
   accountHub: fc.account?.hub || "https://tomcamp.tech",
-  /** How long a remote change waits for the host's Approve/Deny before it is refused. */
-  remoteApprovalTimeoutSec: Number(fc.remoteApprovalTimeoutSec) || 300,
-  remoteSessionDays: Number(fc.remoteSessionDays) || 7,
-  /** A browser on a device the host has not approved before must wait for the host's Approve to sign in,
-   *  even with the right password. Each approved device is remembered (180 days). */
-  remoteDeviceApproval: fc.remoteDeviceApproval !== false,
-  /** The internet way in without a router port forward: an SSH tunnel to a VPS (server/tunnel.mjs). Off until relay.host is set. */
-  relay: relayConfig(fc.relay),
   vaultDir: process.env.OMNI_VAULT || fc.vaultDir || join(DATA_DIR, "vault"),
   /** Deleted chats are moved here (recoverable), never hard-unlinked. */
   trashDir: fc.trashDir || join(HOME, ".omni-agent", "trash"),
@@ -177,22 +151,6 @@ export const CONFIG = {
    *  re-downloading them from GitHub or launching a GUI. Provisioned by `node scripts/install-tools.mjs`. */
   toolsBinDir: fc.toolsBinDir || join(HOME, ".omni-agent", "tools", "bin"),
 };
-
-/** VPS relay settings: `host` turns it on. The public port is the relay's on the VPS; the tunnel forwards
- *  the VPS's loopback `remotePort` to this PC's loopback `localPort`, the listener that reads PROXY headers. */
-export function relayConfig(raw) {
-  const r = raw && typeof raw === "object" ? raw : {};
-  const dir = join(HOME, ".omni-agent", "relay");
-  return {
-    host: String(r.host || "").trim(),
-    user: String(r.user || "omni-tunnel"),
-    publicPort: Number(r.publicPort) || 4443,
-    remotePort: Number(r.remotePort) || 14443,
-    localPort: Number(r.localPort) || 4444,
-    key: r.key || join(dir, "id_ed25519"),
-    knownHosts: r.knownHosts || join(dir, "known_hosts"),
-  };
-}
 
 /** Normalized goal-hook settings. Empty provider/model = the (opt-in) judge uses the chat's current model. */
 export function hookConfig(raw = {}) {

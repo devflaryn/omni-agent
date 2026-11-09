@@ -113,11 +113,11 @@ test("the merged stream's URL carries each machine's own resume point, and is on
   assert.deepEqual(parsed, [{ id: B.id, since: 4, boot: "b00t" }, { id: C.id, since: 0, boot: "" }]);
 });
 
-test("from the merged stream only a machine's chat events and its resync are taken: never approval cards", () => {
+test("from the merged stream only a machine's chat events and its resync are taken", () => {
   const known = new Set([B.id]);
   assert.deepEqual(fromMerged(JSON.stringify({ id: B.id, name: "message", data: '{"seq":1}' }), known), { id: B.id, name: "message", data: '{"seq":1}' });
   assert.deepEqual(fromMerged(JSON.stringify({ id: B.id, name: "resync", data: "{}" }), known).name, "resync");
-  assert.equal(fromMerged(JSON.stringify({ id: B.id, name: "approvals", data: "[]" }), known), null, "another machine cannot paint this computer's cards");
+  assert.equal(fromMerged(JSON.stringify({ id: B.id, name: "approvals", data: "[]" }), known), null, "any other event name is dropped");
   assert.equal(fromMerged(JSON.stringify({ id: "stranger", name: "message", data: "{}" }), known), null, "a machine the window does not show");
   assert.equal(fromMerged("not json", known), null);
   assert.equal(fromMerged(JSON.stringify({ id: B.id, name: "message", data: 5 }), known), null);

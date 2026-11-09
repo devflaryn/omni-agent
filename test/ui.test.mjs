@@ -8,7 +8,7 @@ import { titleFrom } from "../server/watchers.mjs";
 test("the Providers dialog speaks of OpenCode, not pi (toasts, confirms, tab subtitles)", async () => {
   const { readFileSync } = await import("node:fs");
   const read = (f) => readFileSync(new URL(`../ui/${f}`, import.meta.url), "utf8");
-  const dialog = read("index.html").match(/<div id="settings"[\s\S]*?<div id="approvals"/)[0];
+  const dialog = read("index.html").match(/<div id="settings"[\s\S]*?<div id="accountCards"/)[0];
   for (const [name, text] of [["settings.js", read("settings.js")], ["mcp-settings.js", read("mcp-settings.js")], ["index.html #settings", dialog]]) {
     assert.doesNotMatch(text, /\bpi (restart|connects|can use|moves|summarizes)|pi's (models\.json|own limit)|pi restarted/, name);
   }
@@ -310,4 +310,17 @@ test("editDiff prefers the harness's diff over the call's arguments", () => {
   assert.equal(d.path, "C:/p/a.py"); assert.equal(d.added, 1); assert.equal(d.removed, 1); assert.equal(d.rows[2].o, 5);
   assert.deepEqual(editDiff("write", { filePath: "n.txt", content: "1\n2" }).rows, [{ t: "add", s: "1", n: 1 }, { t: "add", s: "2", n: 2 }]);
   assert.equal(editDiff("bash", { command: "ls" }), null);
+});
+
+test("nothing of the old password-and-relay way in is left in the UI", async () => {
+  const { existsSync, readFileSync, readdirSync } = await import("node:fs");
+  const ui = new URL("../ui/", import.meta.url);
+  for (const gone of ["remote.js", "login.html"]) assert.ok(!existsSync(new URL(gone, ui)), gone);
+  const html = readFileSync(new URL("index.html", ui), "utf8");
+  for (const id of ["tabRemote", "remoteBody", "approvals", "accessChip", "lanInfo"]) assert.doesNotMatch(html, new RegExp(`id="${id}"`), id);
+  assert.doesNotMatch(html, />Remote</, "no Remote tab in Settings");
+  for (const f of readdirSync(ui).filter((name) => /\.(js|html|css)$/.test(name))) {
+    const text = readFileSync(new URL(f, ui), "utf8");
+    assert.doesNotMatch(text, /\/api\/remote\/|remote password|Read-only<|tabRemote|createRemote/i, f);
+  }
 });

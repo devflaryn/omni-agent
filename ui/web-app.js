@@ -200,7 +200,6 @@ export function startClient({ open, supported, words, guessName, client = "page"
       document.body.classList.remove("web-shell");
       document.body.classList.add("web-page");
       for (const node of [...parsed.body.children]) if (node.tagName !== "SCRIPT") document.body.appendChild(document.adoptNode(node));
-      document.getElementById("tabRemote").hidden = true; // the old relay's settings are a computer's own
       await import("./app.js");
     } catch (error) {
       appLoaded = false;
