@@ -3146,3 +3146,21 @@ test("a server started with no window token says so, in its own words", async ()
   assert.equal(r.status, 403);
   assert.equal((await r.json()).code, "no-window");
 });
+
+test("codes that differ: the new device starts again, the approver gets a new code for the same sign-in, and it lands", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture);
+  const newcomer = makeAccount(fixture);
+  await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
+  const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
+  const first = await approver.review(row.id);
+  await until(() => newcomer.status().pending?.code, "the first code");
+  newcomer.restartExchange();
+  const second = await approver.review(row.id);
+  const code = await until(() => newcomer.status().pending?.code, "the second code");
+  assert.equal(code, second.code);
+  assert.equal(approver.status().review.code, second.code);
+  await assert.rejects(approver.approve(row.id, { code: first.code === second.code ? "x" : first.code, role: "full" }), (e) => e.status === 400, "the old code is gone");
+  await approver.approve(row.id, { code: second.code, role: "full" });
+  await until(() => newcomer.status().phase === "approved", "approved");
+});

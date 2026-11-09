@@ -23,7 +23,7 @@ const ALERT_ADVICE = {
   "refused-by-device": "Check your devices. If you removed this computer on purpose there is nothing to do.",
   "bad-log": "Nothing was changed. If this repeats, check your devices from another computer.",
   "channel-failure": "The channel was closed and a new one will be opened. If this repeats, someone may be interfering with the connection.",
-  "approval-failed": "Nothing was approved. Press Start again on the new device, then Review on the device already signed in.",
+  "approval-failed": "Nothing was approved. Press Start again on the new device, then Get a new code on the device already signed in.",
   "hub-says-removed": "This is the hub's claim, not a fact this computer could check. Sign in again to see.",
   "key-unavailable": "This computer's device key could not be opened. Local use still works.",
   "bad-anchor": "Try again later. If this repeats, the server may have been tampered with: do not sign in on it until you know why.",
@@ -652,7 +652,7 @@ export function createAccount({ toast, openSettings }) {
     }
     c.appendChild(choices);
     c.appendChild(el("p", "rm-note", "Full control is for an Omni app you installed. A web page with it could add and remove devices."));
-    bar.appendChild(denied);
+    bar.append(denied, button("Get a new code", "quiet", () => startReview(row)));
     c.append(bar, out);
     return c;
   }
