@@ -270,5 +270,5 @@ test("nothing visible waits for the model list, the memory notes or the graph li
 });
 
 test("Forget this page takes the model lists with it", () => {
-  assert.match(read("web.js"), /forgetCachedModels\(\);[\s\S]{0,40}account\.signOut\(\{ forget: true \}\)/);
+  assert.match(read("web-app.js"), /forgetCachedModels\(\);[\s\S]{0,40}account\.signOut\(\{ forget: true \}\)/);
 });

@@ -4,6 +4,7 @@
 //   npm run build            build, after any change in ui/
 //   npm run build -- --check is dist/ui what ui/ makes? Exit 1 and why, if not
 //   npm run build -- --list  every file a deployment must carry, one per line
+//   npm run build -- --phone the files the iPhone app bundles (ios/), by name in dist/ui, one per line
 //
 // --check and --list need nothing installed. Only building needs esbuild (a pinned dev dependency: npm install once).
 //
@@ -197,8 +198,20 @@ function list() {
   return out;
 }
 
+/**
+ * What the iPhone app carries, by plain name in dist/ui: the build less what only a server uses. The service worker and the web page
+ * are the hub's; the compressed copies are for HTTP. The app serves the rest itself (ios/OmniAgent/BundleScheme.swift).
+ */
+function phoneBundle(files) {
+  const names = Object.keys(files).filter((name) => !["sw.js", "web.html"].includes(name)).sort();
+  if (!names.includes("phone.html")) fail("dist/ui has no phone.html: run npm run build");
+  return names;
+}
+
 const args = new Set(process.argv.slice(2));
-if (args.has("--check")) {
+if (args.has("--phone")) {
+  console.log(phoneBundle(readBuild(pathToFileURL(`${DIST}/`)).files).join("\n"));
+} else if (args.has("--check")) {
   const problem = checkBuild(ROOT);
   if (problem) fail(`dist/ui is not what ui/ makes: ${problem}. Run: npm run build`);
   console.log(`dist/ui is current (${readBuild(pathToFileURL(`${DIST}/`)).version})`);

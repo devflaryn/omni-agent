@@ -60,7 +60,7 @@ starts its own), but to end it: on Windows, in PowerShell,
 Use an account. **The full guide is [docs/accounts.md](docs/accounts.md):** first use, adding a device, recovery, a stolen device, what the VPS can see, and how to run the hub.
 
 - **One account, every computer signed in to it.** Each desktop app is a host for its own machine and a client for your others, with a machine switcher in the top bar. Signing in is optional, under **Settings → Account**, and local use never depends on the VPS.
-- **Other clients.** A web page at `https://tomcamp.tech/`, opened by that link with the `https://`. An iPhone app is planned and not built yet.
+- **Other clients.** A web page at `https://tomcamp.tech/`, opened by that link with the `https://`. The iPhone app (`ios/`), installed from the Mac with `bash ios/build.sh` and reinstalled every 7 days: see [docs/accounts.md](docs/accounts.md#the-iphone-app).
 - **A new sign-in needs your password and approval** from a device already signed in, with one tap there, and a 6-digit code shown on both screens to glance at. After that a device needs no per-action approval.
 - **The VPS cannot read your actions, results, files or chats, or forge an action,** through the desktop app. The web page is served by the VPS, so a hacked VPS could change it: see [the web page's risk](docs/accounts.md#the-web-pages-risk), and turn **Allow web page access** off on any machine this matters for.
 - **There is no password reset by email.** Keep the recovery code you get when you create the account.

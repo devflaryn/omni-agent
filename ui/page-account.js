@@ -57,6 +57,8 @@ const PAGE_ALERT_TEXT = Object.freeze({
 const OVER_30_DAYS = "This page's 30 days have run out. Sign in again and approve it from one of your devices. It comes back as a new device, with new keys.";
 const NOT_ON_A_PAGE = "A web page cannot do that. Use the desktop or phone app.";
 const clip = (value, max) => String(value ?? "").trim().slice(0, max);
+/** The same words, for a client that is not a page: the iPhone app says "this phone". */
+const ownWords = (self) => (self === "page" ? (text) => text : (text) => (typeof text === "string" ? text.replace(/\bthis page\b/g, `this ${self}`).replace(/\bThis page\b/g, `This ${self}`).replace(/\bthis page's\b/g, `this ${self}'s`) : text));
 const isFiniteDevice = (value) => typeof value === "string" && value.length > 0 && value.length < 4096;
 
 /**
@@ -92,7 +94,10 @@ export class PageAccount extends Emitter {
   #signedInTo = null; // the account the password vouched for at sign-in. Any log this page is handed must be that account's
   #channels;
 
-  constructor({ store, hubUrl, hubOrigin, now = Date.now, name = "Web page", kind = "web", deriveKeys = signInKeysFrom, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = realVerifyLog, machineLinks = {}, approverPollMs = 5 * SECOND }) {
+  #own;
+  #alertText;
+
+  constructor({ store, hubUrl, hubOrigin, now = Date.now, name = "Web page", kind = "web", self = "page", deriveKeys = signInKeysFrom, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = realVerifyLog, machineLinks = {}, approverPollMs = 5 * SECOND }) {
     super();
     const url = new URL(hubUrl);
     this.hubUrl = url.origin;
@@ -106,6 +111,8 @@ export class PageAccount extends Emitter {
     this.#name = clip(name, 128) || "Web page";
     this.#kind = clip(kind, 32) || "web";
     this.#store = store;
+    this.#own = ownWords(self);
+    this.#alertText = Object.freeze(Object.fromEntries(Object.entries(PAGE_ALERT_TEXT).map(([k, v]) => [k, this.#own(v)])));
     this.#hub = new HubSocket({
       hubUrl: this.hubUrl,
       hubOrigin: this.hubOrigin,
@@ -144,7 +151,7 @@ export class PageAccount extends Emitter {
       changed: () => this.#changed(),
       peerHeadSigned: () => {},
     });
-    this.links = new MachineLinks({ account: this, selfName: "this page", ...machineLinks });
+    this.links = new MachineLinks({ account: this, selfName: this.#own("this page"), ...machineLinks });
     this.links.on("links", (list) => this.emit("links", list));
   }
 
@@ -159,7 +166,7 @@ export class PageAccount extends Emitter {
       email: this.#email,
       accountId: this.#verified?.accountId ?? null,
       device: this.#keys ? { id: this.#keys.signPub, name: this.#name, kind: this.#kind, role: me?.role ?? null, expiresAt: me ? deviceExpiresAt(me) : null } : null,
-      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#hubError, connectionError: this.#hubError, gaveUp: this.#hubGaveUp, reconnecting: this.#hub.reconnecting },
+      hub: { url: this.hubUrl, connected: this.#hub.connected, attempts: this.#hub.attempts, lastError: this.#own(this.#hubError), connectionError: this.#own(this.#hubError), gaveUp: this.#hubGaveUp, reconnecting: this.#hub.reconnecting },
       logHead: this.#hashes.at(-1) ?? null,
       logVersion: this.#hashes.length,
       pending: this.#phase === "pending" ? { code: this.#exchange.current?.code ?? null, attempts: this.#exchange.attempts, failed: this.#exchange.failed, confirmed: !!this.#exchange.current?.confirmed, approvedByHub: this.#approvedByHub, approverOnline: this.#approverOnline } : null,
@@ -188,7 +195,7 @@ export class PageAccount extends Emitter {
   #changed() { this.emit("status", this.status()); }
 
   #alert(kind, detail) {
-    const { alerts, fresh } = addAlert(this.#alerts, kind, detail, this.now(), PAGE_ALERT_TEXT);
+    const { alerts, fresh } = addAlert(this.#alerts, kind, detail, this.now(), this.#alertText);
     this.#alerts = alerts;
     this.#store.set("alerts", JSON.stringify(alerts)).catch(() => {});
     if (fresh) this.emit("alert", fresh);
@@ -211,6 +218,8 @@ export class PageAccount extends Emitter {
 
   async #ensureKeys() {
     if (this.#keys) return;
+    // A store that cannot hold a CryptoKey (the iPhone's Keychain takes text) makes and keeps the keys itself.
+    if (this.#store.makeKeys) { this.#keys = await this.#store.makeKeys(); return; }
     const made = await newDeviceKeys({ extractable: false });
     const kept = { sign: { privateKey: made.sign.privateKey }, box: { privateKey: made.box.privateKey }, signPub: made.signPub, boxPub: made.boxPub };
     await this.#store.set("keys", kept);
@@ -290,7 +299,16 @@ export class PageAccount extends Emitter {
 
   // ---------------------------------------------------------------------------- signing in
 
-  async signIn({ email, password, name } = {}) {
+  async signIn(details) {
+    try {
+      return await this.#signIn(details);
+    } catch (error) {
+      if (typeof error?.message === "string") error.message = this.#own(error.message);
+      throw error;
+    }
+  }
+
+  async #signIn({ email, password, name } = {}) {
     await this.start();
     if (this.#phase === "log-damaged") throw new AccountError(409, "log-damaged", "The device list kept by this page is damaged. Forget this page to start over.");
     if (this.#phase === "approved" || this.#phase === "pending") throw new AccountError(409, "already-signed-in", "This page is already signed in.");
@@ -335,7 +353,7 @@ export class PageAccount extends Emitter {
       if (!await anchorMatches(keys.anchorKey, vouched?.accountId, vouched?.anchor)) {
         this.#alert("bad-anchor");
         await this.#forgetSession();
-        throw new AccountError(502, "bad-anchor", PAGE_ALERT_TEXT["bad-anchor"]);
+        throw new AccountError(502, "bad-anchor", this.#alertText["bad-anchor"]);
       }
       this.#signedInTo = vouched.accountId;
       this.#phase = "pending";

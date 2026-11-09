@@ -1073,6 +1073,8 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 /* ------------------------------------------------------------ accounts and other machines (ui/account.js) */
 /* On another machine the whole bar turns over: a command run on the wrong computer is the mistake to design against. */
 body.on-remote #top { background: var(--inverse); color: var(--inverse-ink); }
+/* The iPhone app draws under the status bar, whose text follows the theme: that strip keeps the page's ground, so the clock stays legible. */
+body.phone-app.on-remote #top { background: linear-gradient(var(--ground) 0 var(--safe-top), var(--inverse) var(--safe-top)); }
 body.on-remote #top > .brand .mark::before { background: var(--inverse-ink); }
 body.on-remote #top > .icon-btn, body.on-remote #top > .menu-wrap > .icon-btn, body.on-remote #top > .top-title, body.on-remote #top > .top-model, body.on-remote #top > .conn-status { color: var(--inverse-ink); }
 body.on-remote #top > .icon-btn:hover, body.on-remote #top > .menu-wrap > .icon-btn:hover { background: color-mix(in srgb, var(--inverse-ink) 14%, transparent); color: var(--inverse-ink); }

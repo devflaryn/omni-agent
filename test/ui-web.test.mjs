@@ -589,6 +589,9 @@ test("the page offers no registration and no recovery, and says where an account
   const src = readFileSync(new URL("../ui/web.js", import.meta.url), "utf8");
   assert.doesNotMatch(src, /Create the account|recoveryCode|Recovery code/);
   assert.match(src, /New accounts are made in the Omni desktop app/);
+  // Nor does the iPhone app, which shares the screens.
+  for (const file of ["web-app.js", "phone.js"]) assert.doesNotMatch(readFileSync(new URL(`../ui/${file}`, import.meta.url), "utf8"), /Create the account|recoveryCode|Recovery code|modes: \[/, file);
+  assert.match(readFileSync(new URL("../ui/phone.js", import.meta.url), "utf8"), /Accounts are made in the Omni desktop app\. This phone cannot create or recover one\./);
 });
 
 test("the page says once on sign-in what a hacked server could do, in plain words", () => {
@@ -1150,8 +1153,9 @@ test("device names on the wire are hostile: the machine list and machine name co
   const m = p.links.machines()[0];
   assert.ok(!/‮/.test(m.name));
   assert.equal(m.name, "Gooddoog<img src=x onerror=alert(1)>", "text, to be shown as text");
-  const src = readFileSync(new URL("../ui/web.js", import.meta.url), "utf8");
-  assert.doesNotMatch(src, /innerHTML|insertAdjacentHTML|outerHTML|document\.write/);
+  for (const file of ["web.js", "web-app.js", "phone.js", "phone-net.js", "keychain-store.js"]) {
+    assert.doesNotMatch(readFileSync(new URL(`../ui/${file}`, import.meta.url), "utf8"), /innerHTML|insertAdjacentHTML|outerHTML|document\.write/, file);
+  }
 });
 
 // ------------------------------------------------------------------------------------------------- review round 1
@@ -1301,7 +1305,8 @@ test("on a page, one helper turns the texts about this device, and drops what is
   const src = readFileSync(new URL("../ui/account.js", import.meta.url), "utf8");
   assert.doesNotMatch(src, /PHASE_TEXT\[s\./, "every phase goes through the helper");
   assert.doesNotMatch(src, /ALERT_ADVICE\[a\./, "every alert goes through the helper");
-  assert.match(readFileSync(new URL("../ui/web.js", import.meta.url), "utf8"), /const store = await openPageStore\(\);[\s\S]*setChannelTransport\([\s\S]*await account\.start\(\)/, "the transport is set before the sign-in screen draws an alert");
+  assert.match(readFileSync(new URL("../ui/web.js", import.meta.url), "utf8"), /const store = await openPageStore\(\);/);
+  assert.match(readFileSync(new URL("../ui/web-app.js", import.meta.url), "utf8"), /account = await open\(\);[\s\S]*setChannelTransport\([\s\S]*await account\.start\(\)/, "the transport is set before the sign-in screen draws an alert");
 });
 
 test("approving: the claim only orders the two choices, and a page that says it is a page gets limited first", () => {

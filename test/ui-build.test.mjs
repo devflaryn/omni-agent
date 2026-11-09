@@ -51,7 +51,7 @@ test("git leaves the built files' bytes alone, on a machine that turns line endi
 
 test("everything but the two pages and the service worker has its hash in its name, so it can be cached for good", () => {
   const fixed = names.filter((n) => !build.files[n].immutable).sort();
-  assert.deepEqual(fixed, ["index.html", "sw.js", "web.html"]);
+  assert.deepEqual(fixed, ["index.html", "phone.html", "sw.js", "web.html"]);
   for (const n of names.filter((x) => build.files[x].immutable)) assert.match(n, /^[\w.-]+-[A-Za-z0-9]{8}\.(js|css|svg|png|webmanifest)$/, n);
 });
 

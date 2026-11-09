@@ -1,6 +1,6 @@
 # Omni accounts and remote control
 
-One account reaches every computer signed in to it, from the desktop app, a web page or (once built) an iPhone app. Your actions travel encrypted between your own devices. The **hub** is the program on the VPS that holds the account and passes the encrypted frames along. It runs at `https://tomcamp.tech/`.
+One account reaches every computer signed in to it, from the desktop app, a web page or the iPhone app. Your actions travel encrypted between your own devices. The **hub** is the program on the VPS that holds the account and passes the encrypted frames along. It runs at `https://tomcamp.tech/`.
 
 Signing in is optional. An app not signed in works on its own computer as before, and local use never depends on the VPS.
 
@@ -10,7 +10,7 @@ Each account belongs to one person and sees only its own computers. The first ac
 
 - The hub is live. When it was last deployed (Task 8) no account was on it, so your first registration and first sign-in will be the first real ones over the live connection.
 - The old relay is still running. See [Removing the old relay](#removing-the-old-relay). That needs doing.
-- The iPhone app is not built yet. See [The iPhone app](#the-iphone-app).
+- The iPhone app is built and installed on the owner's iPhone (2026-11-10), but has not signed in to the real hub yet. See [The iPhone app](#the-iphone-app).
 - The web page has only been run in Chrome. Nothing has been run on Safari, Firefox or a real phone.
 
 ## First use: creating the account
@@ -63,7 +63,7 @@ Then:
 1. The card fetches a 6-digit code by itself. The same code appears on the new device. On the other devices' cards it says the sign-in is being approved there. One sign-in is approved at a time.
 2. The card says: "Check that the new device shows the same code before you approve." Glance at the new device.
 3. Press one of the two buttons. That one tap approves the device, and chooses what it may do:
-   - **Approve as an app (full control)**, role `full`. It can approve and remove devices and change the password, and it does not expire. A device is listed as a machine only if it is `full` and says it is a desktop.
+   - **Approve as an app (full control)**, role `full`. It can approve and remove devices and change the password (the iPhone app cannot yet, see [The iPhone app](#the-iphone-app)), and it does not expire. A device is listed as a machine only if it is `full` and says it is a desktop.
    - **Approve as a web page (limited)**, role `client`. It can control machines for 30 days, then must be approved again. It cannot approve or remove devices.
    - **The choice is yours, not the new device's.** What the device says it is only decides which button comes first and is highlighted: a device that says it is a web page gets the limited button first. A changed page can claim to be a desktop, so choosing full control for something opened in a browser gives that page full control. Choose it only for an Omni app you installed.
    - **A desktop approved as a web page** is not listed as a machine. To fix it, remove it, press **Forget this device** on it, and add it again.
@@ -163,14 +163,57 @@ The page comes from the VPS. You chose this so that one VPS manages everything. 
 
 ## The iPhone app
 
-> **TO FILL IN when the app is built.** `ios/build.sh` does not exist yet. Nothing here has been run, and the app cannot be installed today. The exact build, install and reinstall steps belong here. Until then, the lines below are what was decided, not a description of something working.
+A SwiftUI shell (`ios/`) around the same built UI as the desktop and the web page (`dist/ui`). The page and its code are inside the app, never loaded from a server, so a hacked hub cannot change them. iOS 17 or later. No App Store, no push notifications.
 
-- SwiftUI shell around the same `ui/`, bundled in the app and never loaded from a server. iOS 17+.
-- Built on the MacBook over SSH. Installing needs the phone connected and trusted.
-- Signed with a free Apple ID, so **the app expires every 7 days and must be reinstalled**. No push notifications. No App Store.
-- **Trusting the developer:** iOS normally refuses to open an app signed this way until you allow it, under Settings → General → VPN & Device Management. To be confirmed against the real install.
-- Approved as `full`: press **Approve as an app (full control)** when approving it.
-- It cannot create an account or recover one. Do those on a desktop.
+**What it is on the account:**
+
+- A client. It hosts nothing: the phone is never listed as a machine.
+- Approved as `full`: on the desktop's card press **Approve as an app (full control)**, which comes first for a phone. It then does not run out after 30 days.
+- It cannot create an account or recover one, and in this version it cannot approve or remove devices or change the password either, though `full` would allow it. Do those on a desktop. **Settings → Account** on the phone says so.
+- Its keys and its copy of the device list are in the iOS Keychain, on this phone only (never in iCloud or a backup that restores elsewhere). **Forget this phone** deletes them.
+- It talks to `https://tomcamp.tech` and nowhere else. The page's own policy forbids every connection; the app's native side carries the two sign-in calls and the hub's socket to that one address, with the system's normal certificate checks.
+
+**Using it:**
+
+1. Open **Omni Agent** on the phone. Enter **Email**, **Password** and **Name for this phone**, and press **Sign in**. Deriving the login key takes a few seconds on an iPhone 11.
+2. "Approve this phone" appears with a 6-digit code. On a desktop, the **New sign-in** card shows the same code. Check it, and press **Approve as an app (full control)**. The phone gives a short tap when it is in.
+3. The app opens on your first online machine, with every machine's chats in the drawer, as on a desktop.
+
+### Installing it, and the 7-day reinstall
+
+It is signed with the owner's free Apple ID (team `ZSGGNXRGCM`, bundle id `tech.tomcamp.omniagent`), so **iOS stops opening it 7 days after it was signed**. Its keys stay in the Keychain across a reinstall, so a reinstalled app is still signed in: nothing needs approving again.
+
+Once, on the Mac:
+
+- Xcode (27.1, `/Applications/Xcode-27.1.0.app`) must have the Apple ID signed in: **Xcode → Settings → Accounts → +  → Apple ID**. Without it the build says "No Accounts" and no new 7-day profile can be made. (On 2026-11-10 Xcode had no account signed in; the profile from the first test builds, which expires 2026-11-10 21:16 UTC, was used.)
+- Someone must be logged in at the Mac. The app is signed in that login session, where the keychain is open, so nothing asks for a password over SSH.
+
+Once, on the iPhone (already done on 2026-11-10):
+
+- **Settings → Privacy & Security → Developer Mode** on, then restart.
+- After the first install: **Settings → General → VPN & Device Management → Apple Development: beratbadem00@gmail.com → Trust**.
+
+**Every 7 days** (or whenever the app stops opening), with the iPhone plugged into the Mac and unlocked, from the repository on the PC in Git Bash:
+
+```
+OMNI_MAC_SSH_OPTS="-o HostName=192.168.0.35 -o HostKeyAlias=192.168.0.30" bash ios/build.sh
+```
+
+The Mac's address drifts: use the address it has now (`OMNI_MAC_SSH` names the ssh host, `macbook` by default). It builds the UI, sends the committed HEAD to the Mac as a git bundle, builds a release in `~/omni-ios-build`, installs it with `devicectl` and opens it. If it says "Installed, but iOS did not open it", unlock the phone and open the app by hand.
+
+Other modes: `bash ios/build.sh test` runs the unit tests (Keychain bridge, the page's addresses, the hub link) on a throwaway simulator; `sim` builds for the simulator; `debug-device` installs a debug build.
+
+### Trying it against a test hub
+
+A debug build, and only a debug build, can be pointed at another hub. A release build always uses `https://tomcamp.tech`; the code for anything else is not compiled into it.
+
+1. On the Mac, from a checkout: `node ios/scratch-hub.mjs --dir <a new empty folder> --host <the Mac's address> --approve`. It makes a throwaway CA, a hub at `https://<address>:4790`, and a scratch desktop (its own HOME, no model credentials) with an account and two made-up chats, and prints the launch arguments.
+2. `bash ios/build.sh debug-device`, then: `xcrun devicectl device process launch --device <UDID> tech.tomcamp.omniagent -- -OmniHub https://<address>:4790 -OmniHubCA <the printed CA>`.
+3. The app trusts that one CA for that one hub. iOS asks once to allow access to the local network: allow it. Sign in with the printed email and password; `--approve` approves the phone as `full` after 8 seconds.
+
+A debug build keeps its Keychain items apart from a release build's, so a test never leaves a release build holding a test hub's keys. Stop the scratch hub with Ctrl+C and delete its folder. Reinstall the release build afterwards.
+
+**Tested on 2026-11-10:** on the owner's iPhone 11 (debug build, scratch hub on the Mac) a sign-in was approved as `full` and the scratch machine's chats appeared and opened. The same ran in the simulator (iPhone 17, iOS 27.0), with the code checked on both sides, Settings → Account and the light theme. The release build is installed on the phone. Nothing has signed in to the real hub from the app yet.
 
 ## What the VPS can and cannot see
 

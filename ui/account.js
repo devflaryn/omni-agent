@@ -5,7 +5,7 @@
 import { el, ago, copyText } from "./lib.js";
 import { ORDINARY_DROP } from "./hub-socket.js";
 import { checkPassword } from "./account-core.js";
-import { cleanName, isRemote, local, machine, onStillWaiting, setMachine, webPage } from "./transport.js";
+import { cleanName, isRemote, local, machine, onPhone, onStillWaiting, setMachine, webPage } from "./transport.js";
 
 const NOTICE_KEY = "omni.machineNotice";
 const HUB_SEES = "The hub routes encrypted frames between your devices. It cannot read your actions, results, file contents, chat text or session titles, and it cannot forge an action. It can still see which devices are on the account, when they connect, IP addresses and the size and timing of frames, plus your email address and login verifiers. Someone who hacked the hub could try to guess your password offline; a correct guess only gets a pending sign-in, which one of your devices must still approve.";
@@ -62,11 +62,12 @@ const PHASE_TEXT = {
  */
 export function deviceWords(text) {
   if (!webPage()) return text;
+  const what = onPhone() ? "phone" : "page";
   return String(text)
     .replace(/ It still works on its own\.| Local use still works\.| This computer works on its own as usual\.|, and this computer still works on its own/g, "")
-    .replace("Check the hub address in this computer's settings.", "Check the address of this page.")
-    .replace(/\bThis computer\b/g, "This page")
-    .replace(/\bthis computer\b/g, "this page");
+    .replace("Check the hub address in this computer's settings.", onPhone() ? "The hub this app talks to is set when it is built." : "Check the address of this page.")
+    .replace(/\bThis computer\b/g, `This ${what}`)
+    .replace(/\bthis computer\b/g, `this ${what}`);
 }
 
 /** What to do about an alert. */
@@ -966,12 +967,15 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     const s = A.status;
     if (!s) { wrap.appendChild(el("p", "rm-note", "Loading…")); return; }
 
-    const thisDevice = section(wrap, webPage() ? "This page" : "This device");
+    const phone = onPhone();
+    const thisDevice = section(wrap, phone ? "This phone" : webPage() ? "This page" : "This device");
     thisDevice.appendChild(el("p", "rm-note", phaseText(s.phase)));
     if (s.email) thisDevice.appendChild(el("div", "acct-device-sub", cleanName(s.email, 254)));
-    if (s.device) thisDevice.appendChild(el("div", "acct-device-sub", `${cleanName(s.device.name)}, ${cleanName(s.device.kind, 32, "unknown")}, ${webPage() || s.device.role === "client" ? "limited web page" : s.device.role === "full" ? "full control" : "not on an account"}, ${shortId(s.device.id)}`));
+    const role = phone ? (s.device?.role === "full" ? "full control" : s.device?.role === "client" ? "limited" : "not on an account") : webPage() || s.device?.role === "client" ? "limited web page" : s.device?.role === "full" ? "full control" : "not on an account";
+    if (s.device) thisDevice.appendChild(el("div", "acct-device-sub", `${cleanName(s.device.name)}, ${cleanName(s.device.kind, 32, "unknown")}, ${role}, ${shortId(s.device.id)}`));
     thisDevice.appendChild(el("div", "acct-device-sub", `Hub ${cleanName(s.hub?.url, 200)}, ${s.hub?.connected ? "connected" : "not connected"}`));
-    if (webPage()) thisDevice.appendChild(el("p", "rm-note", "This page cannot approve or remove anything. Use a desktop or phone app for that."));
+    if (phone) thisDevice.appendChild(el("p", "rm-note", "This phone cannot approve or remove devices, or change the password. Use a desktop app for that."));
+    else if (webPage()) thisDevice.appendChild(el("p", "rm-note", "This page cannot approve or remove anything. Use a desktop or phone app for that."));
     if (s.hub?.lastError) thisDevice.appendChild(el("p", "rm-note err", s.hub.lastError));
     if (A.note) thisDevice.appendChild(el("p", "rm-note", A.note));
 
@@ -989,10 +993,10 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     if (s.phase === "removed") leave.appendChild(el("p", "rm-note", "To join the account again, forget this device, then sign in as new."));
     const row = el("div", "acct-gate-row");
     if (s.signedIn) row.appendChild(button("Sign out", "", (e) => {
-      if (!window.confirm(webPage() ? "Sign out on this page?\n\nIt stays on the device list until its 30 days run out." : "Sign out on this computer?\n\nOther machines lose it until you sign in again. It stays on the device list.")) return;
+      if (!window.confirm(phone ? "Sign out on this phone?\n\nIt stays on the device list, and signing in again needs no new approval." : webPage() ? "Sign out on this page?\n\nIt stays on the device list until its 30 days run out." : "Sign out on this computer?\n\nOther machines lose it until you sign in again. It stays on the device list.")) return;
       acting(e.currentTarget, async () => { await call("POST", "sign-out", {}); await refresh(); renderSettings(true); }).catch((err) => toast(explain(err), true));
     }));
-    row.appendChild(button(webPage() ? "Forget this page" : "Forget this device", "quiet", (e) => {
+    row.appendChild(button(phone ? "Forget this phone" : webPage() ? "Forget this page" : "Forget this device", "quiet", (e) => {
       const warn = s.recoveryCodePending ? FORGET_WARNING : "This deletes this device's identity and its copy of the device list. It would have to be approved again as a new device.";
       if (s.recoveryCodePending) { A.codeHidden = false; A.forgetStep = true; renderGate(); return; }
       if (!window.confirm(`Forget this device?\n\n${warn}`)) return;

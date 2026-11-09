@@ -1,0 +1,6 @@
+# Built on a Mac, run by bash: these keep LF on every checkout.
+*.sh text eol=lf
+*.swift text eol=lf
+*.pbxproj text eol=lf
+*.xcscheme text eol=lf
+*.plist text eol=lf
