@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-// Every icon from ui/logo.svg, drawn by headless Chrome: node scripts/make-icons.mjs [chrome path]
+// Every icon from ui/logo.svg, drawn by headless Chrome: node scripts/make-icons.mjs [--mac] [chrome path]
 //   ui/icon-{32,180,192,512}.png   the page, home screens
 //   desktop/omni.ico               the desktop window (16 to 256)
 //   ios/OmniAgent/Assets.xcassets/AppIcon.appiconset/   the iPhone app (opaque and square: iOS rounds it itself)
+//   mac/AppIcon.png                the Mac app, 1024 on Apple's grid (mac/make-app.sh makes the .icns from it). --mac: only this one.
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,16 +11,17 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const CHROME = process.argv[2] || (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "google-chrome");
+const ARGS = process.argv.slice(2);
+const CHROME = ARGS.find((a) => !a.startsWith("--")) || (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "google-chrome");
 const svg = readFileSync(join(ROOT, "ui", "logo.svg"), "utf8");
 const square = svg.replace('rx="15"', 'rx="0"'); // iOS applies its own corners, and an app icon may not be transparent
 
 const run = (args) => new Promise((res, rej) => { const p = spawn(CHROME, args, { stdio: "ignore" }); p.on("error", rej); p.on("exit", res); });
-async function draw(source, size) {
+async function draw(source, size, html = false) {
   const dir = mkdtempSync(join(tmpdir(), "omni-icon-"));
   try {
     const page = join(dir, "i.html"), shot = join(dir, "i.png");
-    writeFileSync(page, `<!doctype html><html style="background:transparent"><body style="margin:0;background:transparent"><div style="width:${size}px;height:${size}px">${source.replace("<svg ", `<svg width="${size}" height="${size}" `)}</div></body></html>`);
+    writeFileSync(page, `<!doctype html><html style="background:transparent"><body style="margin:0;background:transparent"><div style="width:${size}px;height:${size}px">${html ? source : source.replace("<svg ", `<svg width="${size}" height="${size}" `)}</div></body></html>`);
     await run(["--headless=new", "--disable-gpu", "--default-background-color=00000000", "--hide-scrollbars", "--force-device-scale-factor=1", `--window-size=${size},${Math.max(size, 200)}`, `--user-data-dir=${join(dir, "p")}`, `--screenshot=${shot}`, `file:///${page.replace(/\\/g, "/")}`]);
     return cropPng(readFileSync(shot), size);
   } finally { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }); }
@@ -63,6 +65,10 @@ function ico(images) {
   return Buffer.concat([head, ...images.map(([, p]) => p)]);
 }
 
+// macOS draws no corners or shadow of its own: the shape sits at 824 of 1024 with room for its shadow, as Apple's template has it.
+const macIcon = `<div style="width:1024px;height:1024px;display:flex;align-items:center;justify-content:center"><div style="width:824px;height:824px;margin-top:-12px;filter:drop-shadow(0 10px 14px rgba(0,0,0,.28))">${svg.replace("<svg ", '<svg width="824" height="824" ')}</div></div>`;
+writeFileSync(join(ROOT, "mac", "AppIcon.png"), await draw(macIcon, 1024, true));
+if (ARGS.includes("--mac")) { console.log("mac/AppIcon.png written"); process.exit(0); }
 for (const s of [32, 180, 192, 512]) writeFileSync(join(ROOT, "ui", `icon-${s}.png`), await draw(s === 180 ? square : svg, s));
 writeFileSync(join(ROOT, "desktop", "omni.ico"), ico(await Promise.all([16, 24, 32, 48, 64, 256].map(async (s) => [s, await draw(svg, s)]))));
 const set = join(ROOT, "ios", "OmniAgent", "Assets.xcassets", "AppIcon.appiconset");
