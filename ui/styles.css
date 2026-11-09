@@ -1281,6 +1281,8 @@ figure.code { --t-com: #6a9955; --t-str: #ce9178; --t-kw: #569cd6; --t-num: #b5c
 .pal-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .pal-sub { color: var(--dim); font-size: var(--fs-xs, 12px); white-space: nowrap; flex: none; }
 .pal-kbd { color: var(--dim); font: var(--fs-xs, 12px)/1 var(--font); flex: none; }
+/* --dim on --field-2 is about 4.2:1; the selected row's small text steps up to --muted (5.6:1 in both themes). */
+.pal-row.on .pal-sub, .pal-row.on .pal-kbd { color: var(--muted); }
 .pal-empty { padding: 14px 10px; color: var(--muted); }
 .kbd-sheet:focus { outline: none; }
 .kbd-sheet { width: min(440px, 100%); background: var(--raised); border: 1px solid var(--line-2); border-radius: var(--r-md, 12px); box-shadow: var(--shadow-lg); padding: 6px 16px 16px; }
