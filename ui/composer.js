@@ -6,7 +6,7 @@ const SEND_ICON = `<svg viewBox="0 0 16 16"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5
 export function createComposer(root, h) {
   root.innerHTML = `
   <div class="composer">
-    <textarea rows="1" placeholder="${esc(h.placeholder || "Do anything")}"></textarea>
+    <textarea rows="1" placeholder="${esc(h.placeholder || "")}"></textarea>
     <div class="composer-bar">
       <div class="menu-wrap">
         <button class="cbtn round" data-role="plus" title="Attach"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button>
@@ -55,6 +55,13 @@ export function createComposer(root, h) {
   }
   function renderModelMenu() {
     modelMenu.innerHTML = "";
+    if (!st.models.length) {
+      // Nothing to pick, so nothing to tune either: one way forward.
+      const add = el("button", "menu-add", "Add a provider");
+      add.onclick = () => { closeMenus(); h.onManageProviders?.(); };
+      modelMenu.appendChild(add);
+      return;
+    }
     const { levels, labels } = modelThinking();
     if (levels.length) {
       modelMenu.appendChild(el("div", "mh", "Thinking"));
@@ -73,7 +80,7 @@ export function createComposer(root, h) {
         b.onclick = () => { st.piModel = { provider: m.provider, id: m.id }; h.onPiModel?.(m.provider, m.id); render(); closeMenus(); };
         modelMenu.appendChild(b);
       }
-    } else modelMenu.appendChild(el("div", "menu-empty", "No models yet. Add a provider and type the model ids you want."));
+    }
     if (st.hook) renderHookSection();
     const manage = el("button", "manage", "Manage providers…");
     manage.onclick = () => { closeMenus(); h.onManageProviders?.(); };
@@ -117,7 +124,8 @@ export function createComposer(root, h) {
   function render() {
     const lbl = modelBtn.querySelector(".lbl");
     const think = st.piThinking && (modelThinking().labels[st.piThinking] ? `thinking ${modelThinking().labels[st.piThinking]}` : st.piThinking);
-    lbl.innerHTML = `<b>${esc(st.piModel?.id || "Pick a model")}</b>${think ? ` <span>${esc(think)}</span>` : ""}${st.hook?.enabled ? ` <span title="Goal hook on">hook</span>` : ""}`;
+    if (st.placeholder !== undefined) ta.placeholder = st.placeholder || "";
+    lbl.innerHTML = `<b>${esc(st.piModel?.id || (st.models.length ? "Pick a model" : "Add a model"))}</b>${think ? ` <span>${esc(think)}</span>` : ""}${st.hook?.enabled ? ` <span title="Goal hook on">hook</span>` : ""}`;
     caption.textContent = st.caption;
     caption.title = st.caption;
     ta.disabled = st.disabled && !!st.lock;

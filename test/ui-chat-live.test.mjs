@@ -153,6 +153,14 @@ test("the composer never sends mid-IME, greys Send when empty, and stops on Esc"
   assert.match(src, /pointer: fine/, "autofocus on a desktop pointer only");
 });
 
+test("the composer's placeholder comes from its caller, and an empty model list offers one way forward", () => {
+  const src = read("composer.js");
+  assert.doesNotMatch(src, /Do anything/);
+  assert.match(src, /st\.placeholder !== undefined\) ta\.placeholder/);
+  assert.match(src, /"Add a provider"/);
+  assert.match(src, /"Add a model"/);
+});
+
 test("the chat's live text is painted once a frame at most, never token by token", () => {
   const src = read("transcript.js");
   assert.match(src, /requestAnimationFrame/);

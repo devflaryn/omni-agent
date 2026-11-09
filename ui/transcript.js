@@ -130,7 +130,7 @@ export function setOlder(view, state, onLoad) {
     if (notes.length) notes[notes.length - 1].after(view.older); else view.root.prepend(view.older);
   }
   view.older.disabled = state === "loading";
-  view.older.textContent = state === "loading" ? "Loading earlier messages…" : state === "error" ? "Could not load earlier messages · retry" : "Load earlier messages";
+  view.older.textContent = state === "loading" ? "Loading earlier messages…" : state === "error" ? "Could not load earlier messages. Retry" : "Load earlier messages";
   view.older.onclick = state === "loading" ? null : onLoad || null;
 }
 
@@ -319,7 +319,7 @@ function renderMeter(t) {
   if (t.mstats.textContent !== m.stats) t.mstats.textContent = m.stats;
   t.meter.classList.toggle("waiting", m.waiting);
   const has = t.rblocks.length > 0;
-  t.meter.title = `${t.reported ? "Tokens reported by the provider" : "Tokens estimated from streamed text (chars ÷ 4)"}${has ? ` · click to ${t.reasonOpen ? "hide" : "show"} reasoning` : t.done ? " · no reasoning was returned this turn" : ""}`;
+  t.meter.title = `${t.reported ? "Tokens reported by the provider" : "Tokens estimated from streamed text (chars ÷ 4)"}${has ? `. Click to ${t.reasonOpen ? "hide" : "show"} the reasoning` : t.done ? ". No reasoning came back this turn" : ""}`;
   t.meter.classList.toggle("live", !t.done);
   t.meter.disabled = !has;
   t.meter.hidden = false;
@@ -350,7 +350,7 @@ function addImages(c, images) {
   if (!w.imgs) { w.imgs = el("div", "imgs"); w.el.insertAdjacentElement("afterend", w.imgs); }
   for (const im of images) {
     const b = el("button", "thumb");
-    b.title = `${c.label.text} · click to preview`;
+    b.title = `${c.label.text}. Click to preview`;
     const i = el("img");
     i.src = `data:${im.mimeType};base64,${im.data}`;
     i.alt = c.label.text;
