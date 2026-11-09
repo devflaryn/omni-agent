@@ -16,6 +16,8 @@ import { at, local, machine, machineTitle, setMachine, streamEvents, webPage } f
 import { createAccount } from "./account.js";
 import { cachedModels, keepModels } from "./model-cache.js";
 import { HERE, applySessionEvent, createDrafts, fromMerged, goalBox, machineList, mergedEventsUrl, newWorkspace, sidebarGroups, whereWords } from "./machines.js";
+import { createToasts } from "./toast.js";
+import { recentRows, renderRecent } from "./home.js";
 
 /** How much of a chat's file a page asks for at a time, as the page receives it: the newest first, older as it is scrolled up. */
 const HISTORY_PAGE = 96 * 1024;
@@ -44,9 +46,9 @@ const labelOf = (key) => byKey(key)?.label ?? "that machine";
 /** " on <machine>" for a confirmation, while the window holds more than one machine; else nothing, as before accounts. */
 const whereOn = (key = focusKey) => { const w = whereWords(MACHINES, key); return w ? ` on ${w}` : ""; };
 /** On another machine, or with several in the window, every caption names the machine: a command run on the wrong computer is the mistake to design against. */
-const onMachine = (caption) => { const w = whereWords(MACHINES, focusKey); return w ? (caption ? `On ${w} · ${caption}` : `On ${w}`) : caption; };
+const onMachine = (caption) => { const w = whereWords(MACHINES, focusKey); return w ? (caption ? `${caption} (on ${w})` : `On ${w}`) : caption; };
 /** Why nothing can be sent to the focused machine right now, or "". */
-const focusBlocked = () => { const m = focusM(); return !m ? "" : m.state === "offline" ? `${m.label} is offline · nothing is sent or queued` : m.state === "refusing" ? `${m.label} does not let web pages in` : ""; };
+const focusBlocked = () => { const m = focusM(); return !m ? "" : m.state === "offline" ? `${m.label} is offline. Nothing is sent or queued.` : m.state === "refusing" ? `${m.label} does not let web pages in` : ""; };
 
 /** What a remote browser may do without the host's approval (mirrors server/access.mjs READ). */
 const REMOTE_FREE = /^\/api\/(graph\/(query|explain)|remote\/(login|logout))$/;
@@ -59,7 +61,7 @@ const callOn = (key) => (path, body, method) => {
 };
 /** A request on the focused machine, bound to it as it is sent. */
 function api(path, body, method) { return callOn(focusKey)(path, body, method); }
-function toast(text, err) { const t = el("div", `toast${err ? " err" : ""}`, text); $("#toasts").appendChild(t); setTimeout(() => t.remove(), err ? 7000 : 3500); }
+const toast = createToasts($("#toasts"));
 // The old remote settings and cards are this computer's, whichever machine the window is on.
 const hereApi = (path, body, method) => local.api(body || (method && method !== "GET") ? method || "POST" : "GET", path, body);
 const remote = createRemote({ api: hereApi, toast });
@@ -71,13 +73,13 @@ async function deleteChat(key, sid) {
   const ws = key === focusKey ? S : wsOf(key);
   const s = ws.sessions.get(sid);
   const name = s?.title ? `“${s.title.slice(0, 40)}”` : "this chat";
-  if (!window.confirm(`Delete ${name}${whereOn(key)}?\nIt moves to the Omni trash folder and disappears here.`)) return;
+  if (!window.confirm(`Delete ${name}${whereOn(key)}?\n\nIt moves to Omni's trash folder.`)) return;
   try {
     await callOn(key)(`/api/sessions/${encodeURIComponent(sid)}`, null, "DELETE");
     ws.sessions.delete(sid); ws.buffers.delete(sid);
     if (key === focusKey && S.selected === sid) { S.selected = null; S.view = null; showView("home"); }
     history.render();
-    toast(`Chat deleted${whereOn(key)}`);
+    if (S.page === "home") renderHome();
   } catch (e) { toast(e.message, true); }
 }
 
@@ -142,7 +144,7 @@ function openSettings(tab) { settingsKey = focusKey; settings.open(tab); }
 const composerHooks = { onPickFile: () => { explorer.setRoot(currentDir()); setExplorer(true); }, onPiModel: setPiModel, onPiThinking: setPiThinking, onManageProviders: () => openSettings(), onHook: setHook };
 const home = createComposer($("#homeComposer"), { ...composerHooks, onSend: homeSend });
 // In a background agent's chat the picker shows the agent's model; picking there would change Omni's own pi.
-const notForAgents = (fn) => (...args) => { if (target().kind !== "agent") return fn(...args); toast("A background agent keeps the model it started with; this picker sets Omni's own chat model. Pick it from one of its chats.", true); updateComposer(); };
+const notForAgents = (fn) => (...args) => { if (target().kind !== "agent") return fn(...args); toast("A background agent keeps the model it started with. Change the model from one of Omni's own chats.", true); updateComposer(); };
 const chat = createComposer($("#chatComposer"), { ...composerHooks, onPiModel: notForAgents(setPiModel), onPiThinking: notForAgents(setPiThinking), onHook: notForAgents(setHook), onSend: chatSend, onStop: chatStop });
 
 /** Choices made before pi runs are saved on the server and applied when it starts, so the picker never "forgets". */
@@ -153,7 +155,7 @@ async function setPiModel(provider, id) {
   try {
     const sid = piChatSid();
     const r = await api("/api/pi/model", { provider, modelId: id, sid });
-    toast(r.pending ? `Model: ${id} (applies when OpenCode starts)${whereOn(key)}` : `Model: ${id}${whereOn(key)}`);
+    if (r.pending) toast(`${id} is used once OpenCode starts${whereOn(key)}`);
     if (key !== focusKey) return;
     if (sid) { const c = S.piChats.get(sid); if (c) c.model = { provider, id }; }
     // The server moves the thinking level to the nearest one the new model has.
@@ -238,15 +240,16 @@ async function setHook(patch) {
   try {
     const r = await api("/api/hook", patch, "PUT");
     if (key === focusKey) S.hook = r.hook;
-    toast(patch.enabled === true ? "Goal hook on: the agent is re-engaged until its plan is finished" : patch.enabled === false ? "Goal hook off" : `Status box model: ${r.hook.model || "same as the chat"}`);
     if (S.page === "home") renderHome(); else updateComposer();
   } catch (e) { toast(e.message, true); }
 }
 
 // --------------------------------------------------------------- views
 /** `persist` only for a deliberate toggle; leaving the chat view must not remember "closed". */
-function setExplorer(open, persist = false) { document.body.classList.toggle("explorer-open", open); if (!open) explorer.closePreview(); else explorer.restorePreview(); if (persist) { try { localStorage.setItem("omni.explorer", open ? "1" : "0"); } catch { /* */ } } }
-function explorerPreferred() { try { return localStorage.getItem("omni.explorer") !== "0"; } catch { return true; } }
+// The tree opens beside a chat only when asked for: the transcript is the product, and it stays still as a chat opens.
+function setExplorer(open, persist = false) {
+  document.body.classList.toggle("explorer-open", open); if (!open) explorer.closePreview(); else explorer.restorePreview(); if (persist) { try { localStorage.setItem("omni.explorer", open ? "1" : "0"); } catch { /* */ } } }
+function explorerPreferred() { try { return localStorage.getItem("omni.explorer") === "1"; } catch { return false; } }
 // The goal box pinned above a chat: the goal, the agent's plan (live from `plan` events, so it is always
 // current with no model call) and the status written by the separate summarizer at each milestone.
 function summaryOn() { try { return localStorage.getItem("omni.summary") !== "off"; } catch { return true; } }
@@ -276,7 +279,7 @@ function renderSummary() {
   head.appendChild(el("span", "summary-goal", gb.goal || (plan?.brainstorm?.understanding ?? "")));
   const phase = !pr ? "" : pr.complete ? "complete" : pr.phase === "execute" ? `${pr.done + pr.skipped}/${pr.steps} steps` : pr.phase === "plan" ? "planning" : pr.phase === "waiting" ? "waiting for you" : "brainstorming";
   const atTime = gb.summaryAt || plan?.updatedAt;
-  const meta = [gb.done ? "done" : phase, gb.nudges ? `re-engaged ${gb.nudges}×` : "", atTime ? `updated ${new Date(atTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""].filter(Boolean).join(" · ");
+  const meta = [gb.done ? "done" : phase, gb.nudges ? `re-engaged ${gb.nudges}×` : "", atTime ? `updated ${new Date(atTime).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""].filter(Boolean).join(", ");
   if (meta) head.appendChild(el("span", "summary-nudges", meta));
   if (plan?.milestones?.length) {
     const t = el("button", `summary-toggle${planOpen() ? " open" : ""}`, planOpen() ? "Hide plan" : "Show plan");
@@ -284,7 +287,7 @@ function renderSummary() {
     head.appendChild(t);
   }
   const x = el("button", "summary-x", "×");
-  x.title = "Hide the goal box (toggle it from the header)";
+  x.title = "Hide this. The button in the bar brings it back.";
   x.onclick = () => { try { localStorage.setItem("omni.summary", "off"); } catch { /* */ } renderSummary(); };
   head.appendChild(x);
   box.appendChild(head);
@@ -301,15 +304,15 @@ function renderSummary() {
     }
     box.appendChild(bar);
   }
-  if (pr?.waiting) box.appendChild(el("div", "plan-now waiting", `Waiting for you: ${pr.waiting.question}`));
+  if (pr?.waiting) box.appendChild(el("div", "plan-now waiting", `Waiting for you. ${pr.waiting.question}`));
   else if (pr?.current && !pr.complete) {
     const now = el("div", "plan-now");
-    now.append(el("span", "plan-now-k", pr.currentMilestone ? `Milestone ${pr.currentMilestone.id} · ${pr.current.id}` : pr.current.id), el("span", "plan-now-t", pr.current.title));
+    now.append(el("span", "plan-now-k", pr.currentMilestone ? `Milestone ${pr.currentMilestone.id}, ${pr.current.id}` : pr.current.id), el("span", "plan-now-t", pr.current.title));
     if (pr.current.doneWhen) now.appendChild(el("span", "plan-now-c", `done when ${pr.current.doneWhen}`));
     box.appendChild(now);
-  } else if (pr?.phase === "plan") box.appendChild(el("div", "plan-now", `Approach: ${plan.brainstorm?.chosen || ""}. Writing the plan…`));
+  } else if (pr?.phase === "plan") box.appendChild(el("div", "plan-now", `Writing the plan${plan.brainstorm?.chosen ? ` for ${plan.brainstorm.chosen}` : ""}…`));
   if (gb.summary) box.appendChild(el("div", "summary-body", gb.summary));
-  else if (!plan) box.appendChild(el("div", "summary-body", "No plan yet. The status is written when the agent plans the work and at each milestone."));
+  else if (!plan) box.appendChild(el("div", "summary-body", "No plan yet. A status appears once the agent plans, and at each milestone."));
   if (plan?.milestones?.length && planOpen()) {
     const ol = el("div", "plan-list");
     for (const m of plan.milestones) {
@@ -444,8 +447,8 @@ async function fetchLog(id) {
   if (logBusy.has(id)) return;
   logBusy.add(id);
   const key = focusKey;
-  try { const r = await api(`/api/agents/${encodeURIComponent(id)}/log?tail=60`); if (key === focusKey) logText.set(id, r.text || "(no output yet)"); }
-  catch (e) { if (key === focusKey) logText.set(id, `Could not read the log: ${e.message}`); }
+  try { const r = await api(`/api/agents/${encodeURIComponent(id)}/log?tail=60`); if (key === focusKey) logText.set(id, r.text || "No output yet."); }
+  catch (e) { if (key === focusKey) logText.set(id, `The log did not load. ${e.message}`); }
   finally { logBusy.delete(id); }
   for (const pre of $("#agentStrip").querySelectorAll("pre.ag-log")) {
     if (pre.dataset.id !== id) continue;
@@ -459,7 +462,7 @@ async function stopAgent(id, btn) {
   const key = focusKey;
   if (!window.confirm(`Stop “${agentTitle(a || { id })}”${whereOn(key)}?\nWhat it did so far stays in its chat.`)) return;
   if (btn) btn.disabled = true;
-  try { const r = await callOn(key)(`/api/agents/${encodeURIComponent(id)}/cancel`, {}); if (r.agent && key === focusKey) liveAgent(r.agent); toast(`Agent stopped${whereOn(key)}`); }
+  try { const r = await callOn(key)(`/api/agents/${encodeURIComponent(id)}/cancel`, {}); if (r.agent && key === focusKey) liveAgent(r.agent); }
   catch (e) { toast(e.message, true); if (btn) btn.disabled = false; }
   renderAgents(); updateComposer();
 }
@@ -504,11 +507,20 @@ function renderHome() {
   const cwdInput = $("#homeCwd");
   if (!cwdInput.value) cwdInput.value = S.pi.cwd || S.config?.cwd || "";
   const chips = $("#dirChips"); chips.innerHTML = "";
-  for (const d of recentDirs()) { const c = el("button", `chip${d === cwdInput.value ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; browseHome(); renderHome(); }; chips.appendChild(c); }
+  // Other recent folders, one tap to switch to: worth showing only when there is more than the one already picked.
+  const dirs = recentDirs();
+  const same = (a, b) => String(a).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === String(b).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  if (dirs.some((d) => !same(d, cwdInput.value))) for (const d of dirs) { const c = el("button", `chip${same(d, cwdInput.value) ? " active" : ""}`, baseName(d) || d); c.title = d; c.onclick = () => { cwdInput.value = d; renderHome(); }; chips.appendChild(c); }
   const blocked = focusBlocked();
   home.setState({ ...piModelState(), disabled: !!blocked, caption: blocked || onMachine("") });
+  // The placeholder says what Send will do, and where.
+  const folder = baseName(homeCwd());
+  $("#homeComposer textarea").placeholder = blocked ? "" : `Message OpenCode${folder ? ` in ${folder}` : ""}`;
+  const groups = sidebarGroups({ machines: MACHINES, workspaces: W, titleOf: (ws, s) => agentIn(ws, s.sid)?.title || s.title || "" });
+  renderRecent({ section: $("#homeRecent"), list: $("#homeRecentList"), title: $("#homeRecentTitle"), rows: recentRows(groups, { titleOf: (ws, s) => agentIn(ws, s.sid)?.title || s.title || "" }), many: MACHINES.length > 1, onOpen: openChatOn });
   updateHeader();
 }
+$("#homeAllChats").onclick = () => panel.open("chats");
 // `/goal <text>` sets a persistent goal: the agent brainstorms and plans it, and the keeper re-engages
 // it until every plan step is done; `/goal` or `/goal show` reports it; `/goal clear` drops it.
 // Handled here, never sent to the model. Returns true when the input was a goal command.
@@ -520,13 +532,13 @@ async function goalCommand(text, composer) {
     if (!arg || arg === "show") {
       const g = await api(`/api/goal${piChatSid() ? `?sid=${encodeURIComponent(piChatSid())}` : ""}`);
       const pg = g.progress ? ` · ${g.progress.complete ? "plan complete" : g.progress.steps ? `${g.progress.done + g.progress.skipped}/${g.progress.steps} steps` : g.progress.phase}` : g.goal ? " · no plan yet" : "";
-      toast(g.goal ? `Goal: ${g.goal}${pg}${g.nudges ? ` · re-engaged ${g.nudges}×` : ""}` : "No goal set — type /goal <text> to set one");
+      toast(g.goal ? `The goal is “${g.goal}”${pg.replace(/^ · /, ", ")}${g.nudges ? `, re-engaged ${g.nudges}×` : ""}` : "No goal yet. Type /goal and what you want done.");
     } else if (arg === "clear") {
       await api("/api/goal", { goal: "", sid: piChatSid() }, "POST");
       toast("Goal cleared");
     } else {
       await api("/api/goal", { goal: arg, sid: piChatSid() }, "POST");
-      toast("Goal set — the agent plans it first, then works until every step is done.");
+      toast("Goal set. The agent plans it, then works until every step is done.");
     }
     composer?.clear?.();
   } catch (e) { toast(e.message, true); }
@@ -535,7 +547,7 @@ async function goalCommand(text, composer) {
 async function homeSend(text, o) {
   if (await goalCommand(text, home)) return;
   const cwd = homeCwd();
-  if (!cwd) return toast("Set a working directory first", true);
+  if (!cwd) return toast("Pick a folder first", true);
   const blocked = focusBlocked();
   if (blocked) return toast(blocked, true);
   // Every step of starting this chat goes to the machine it was started on, wherever the window is by the time it answers.
@@ -587,6 +599,8 @@ function target() {
 function updateComposer() {
   const t = target();
   const st = { streaming: false, disabled: false, caption: "", ...piModelState() };
+  // The placeholder says what Send will do. A chat that takes no message shows none.
+  let hint = "";
   if (t.kind === "none") { st.caption = "Pick a chat"; st.disabled = true; }
   else if (t.kind === "agent") {
     // The agent's own model (its chat's, else what it was started with), never Omni's pi or its goal hook.
@@ -594,28 +608,32 @@ function updateComposer() {
     Object.assign(st, { piModel: { provider: t.a?.provider || "", id: model || "agent's model" }, piThinking: t.a?.thinking || "", hook: null });
     st.disabled = !t.id;
     st.streaming = t.active;
-    st.caption = !t.id ? "Background agent · view only" : t.active ? `${agentKindLabel(t.a?.kind || t.s.agentKind)} at work · a message steers it, empty send stops it` : `${agentKindLabel(t.a?.kind || t.s.agentKind)} · ${t.a?.status || "finished"} · a message picks it up again`;
+    st.caption = !t.id ? "Background agent, read-only here" : t.active ? `${agentKindLabel(t.a?.kind || t.s.agentKind)} is working. A message steers it, an empty send stops it.` : `${agentKindLabel(t.a?.kind || t.s.agentKind)}, ${t.a?.status || "finished"}. A message picks it up again.`;
+    hint = t.id ? (t.active ? "Steer the agent" : "Message the agent") : "";
   }
-  else if (t.kind === "claude") { st.caption = "Claude Code chat · view only in Omni"; st.disabled = true; }
-  else if (t.kind === "orchestrator") { Object.assign(st, { hook: null, streaming: false, caption: "Mission orchestrator · your message goes to the orchestrator first, ahead of worker reports" }); }
+  else if (t.kind === "claude") { st.caption = "Claude Code chat, read-only here"; st.disabled = true; }
+  else if (t.kind === "orchestrator") { Object.assign(st, { hook: null, streaming: false, caption: "Mission orchestrator. Your message goes ahead of worker reports." }); hint = "Message the orchestrator"; }
   else if (t.kind === "owned-pi") {
     // pi is idle while the goal hook waits to retry or check, but the chat is not: Stop must reach the hook too.
     const armed = !t.streaming && !!t.s.hookArmed;
     const retry = (t.s.hookRetryAt || 0) > Date.now() ? new Date(t.s.hookRetryAt).toLocaleTimeString() : "";
     st.streaming = t.streaming || armed;
-    st.caption = t.streaming ? "Working · a message steers it, empty send stops it" : armed ? `${retry ? `Goal hook retries at ${retry} after a model error` : "Goal hook is about to continue"} · empty send stops it` : "";
+    st.caption = t.streaming ? "Working. A message steers it, an empty send stops it." : armed ? `${retry ? `The goal hook retries at ${retry} after a model error.` : "The goal hook is about to carry on."} An empty send stops it.` : "";
+    hint = t.streaming ? "Steer this run" : "Reply";
   }
   else {
     const fork = S.forceFork || t.live;
-    st.caption = fork ? `Forks ${t.live ? "the running " : "this "}chat into Omni` : "Continues this chat in Omni";
+    st.caption = fork ? `Sending forks ${t.live ? "the running" : "this"} chat` : "";
+    hint = fork ? "Fork this chat" : "Continue this chat";
   }
-  if (t.s?.compacting) st.caption = "Compacting the context (a long chat is summarized first; this can take minutes)…";
+  if (t.s?.compacting) st.caption = "Compacting this long chat first. It can take minutes.";
   $("#chatComposer").classList.toggle("for-agent", t.kind === "agent");
   st.caption = onMachine(st.caption);
   // A machine that is gone takes nothing: said by name, and nothing waits to be sent later.
   const blocked = focusBlocked();
-  if (blocked && t.kind !== "none") { st.disabled = true; st.streaming = false; st.caption = blocked; }
+  if (blocked && t.kind !== "none") { st.disabled = true; st.streaming = false; st.caption = blocked; hint = ""; }
   chat.setState(st);
+  $("#chatComposer textarea").placeholder = hint;
 }
 /**
  * Empty the box as the message goes: its bubble is in the chat already, and pi answers only once it has started the
@@ -628,7 +646,7 @@ async function sendClearing(composer, text, send) {
 async function chatSend(text, o) {
   const t = target();
   // `/goal` drives Omni's own pi (the keeper); here it would quietly set that goal from an agent's chat.
-  if (t.kind === "agent" && /^\/goal\b/.test(text.trim())) { toast("/goal sets the goal of Omni's own chat. Type it in one of its chats; here, just tell the agent.", true); return; }
+  if (t.kind === "agent" && /^\/goal\b/.test(text.trim())) { toast("/goal is for Omni's own chats. Here, just tell the agent.", true); return; }
   if (await goalCommand(text, chat)) return;
   // The chat's own machine, fixed now: an answer that comes after the person has moved on still belongs to it.
   const key = focusKey, call = callOn(key);
@@ -650,7 +668,7 @@ async function chatSend(text, o) {
     chat.setState({ disabled: true, caption: onMachine("Starting…") });
     const r = await sendClearing(chat, text, () => call(`/api/sessions/${encodeURIComponent(t.s.sid)}/continue`, { message: text, memory: o.memory, graph: o.graph, fork: S.forceFork }));
     S.forceFork = false;
-    if (r.sid !== S.selected && key === focusKey) { if (r.forked) toast("Forked into a new session"); selectSession(r.sid); }
+    if (r.sid !== S.selected && key === focusKey) selectSession(r.sid);
   } catch (e) { toast(e.message, true); }
   finally { updateComposer(); }
 }
@@ -725,9 +743,9 @@ async function selectSession(sid, { reload = false } = {}) {
     maybeLoadOlder();
   } catch (e) {
     if (focusKey !== key) return;
-    toast(`Could not load history${whereOn(key)}: ${e.message}`, true);
-    if (reload && S.selected === sid) S.view = previous; // what is on the screen stays, and stays live
-    else if (S.view === view) emptyNote(view, `Could not load this chat${whereOn(key)}: ${e.message}`);
+    // Said where the chat would be. A reload keeps what is on the screen, so only then is it news from elsewhere.
+    if (reload && S.selected === sid) { S.view = previous; toast(`This chat did not refresh${whereOn(key)}. ${e.message}`, true); }
+    else if (S.view === view) emptyNote(view, `This chat did not load${whereOn(key)}. ${e.message}`);
   }
   updateHeader(); updateComposer();
   if (document.body.classList.contains("panel-open")) panel.renderStats();
@@ -756,7 +774,6 @@ async function loadOlder(view) {
   } catch (e) {
     view.olderFailed = true;
     if (S.view === view) setOlder(view, "error", () => loadOlder(view));
-    toast(`Could not load earlier messages: ${e.message}`, true);
   } finally { view.loadingOlder = false; }
   // A short page may leave the top still in view.
   if (S.view === view) maybeLoadOlder();
@@ -766,23 +783,23 @@ function updateHeader() {
   updateTitle();
   const model = s?.model || (s ? "" : S.config?.piModel) || "";
   // A foreign chat's model is labelled with its harness so the slot never implies pi is running it.
-  $("#topModel").textContent = s && s.harness !== "pi" && model ? `${s.harness} · ${model}` : model;
+  $("#topModel").textContent = s && s.harness !== "pi" && model ? `${model} (${harnessLabel(s.harness)})` : model;
   $("#topModel").hidden = !model;
-  $("#topModel").title = s ? `${harnessLabel(s.harness)} · ${s.cwd || ""}` : S.pi.cwd || "";
+  $("#topModel").title = s ? `${harnessLabel(s.harness)}${s.cwd ? ` in ${s.cwd}` : ""}` : S.pi.cwd || "";
 }
 function renderChatMenu() {
   const m = $("#chatMenu"); m.innerHTML = "";
   const s = S.sessions.get(S.selected); if (!s) return;
   const item = (label, fn, on) => { const b = el("button", on ? "on" : "", label); b.onclick = () => { m.hidden = true; fn(); }; m.appendChild(b); };
   if (s.harness === "pi") item("Fork into a new chat with the next message", () => { S.forceFork = !S.forceFork; updateComposer(); chat.focus(); }, S.forceFork);
-  item("Digest this chat to the vault", async () => { try { const r = await api("/api/memory/digest", { sid: s.sid }); toast(`Digest written: ${r.path}`); } catch (e) { toast(e.message, true); } });
-  item("Copy session id", () => navigator.clipboard?.writeText(s.sid.split(":").slice(1).join(":")).then(() => toast("Session id copied")).catch(() => {}));
+  item("Save a digest to memory", async () => { try { const r = await api("/api/memory/digest", { sid: s.sid }); toast(`Digest saved to ${r.path}`); } catch (e) { toast(e.message, true); } });
+  item("Copy the chat id", () => navigator.clipboard?.writeText(s.sid.split(":").slice(1).join(":")).then(() => toast("Copied")).catch(() => {}));
   item("Tokens for this chat", () => panel.open("tokens"));
   if (s.forkedFrom) item("Open the original chat", () => selectSession(s.forkedFrom));
   const parent = s.parentSid || agentFor(s.sid)?.parentSid;
   if (parent && S.sessions.has(parent)) item("Open the chat that started this agent", () => openChat(parent));
   item("Delete this chat", () => deleteChat(focusKey, s.sid));
-  m.appendChild(el("div", "mh", `${whereWords(MACHINES, focusKey) ? `${whereWords(MACHINES, focusKey)} · ` : ""}${harnessLabel(s.harness)} · ${s.cwd || ""}`));
+  m.appendChild(el("div", "mh", `${harnessLabel(s.harness)}${whereWords(MACHINES, focusKey) ? ` on ${whereWords(MACHINES, focusKey)}` : ""}${s.cwd ? `, in ${baseName(s.cwd)}` : ""}`));
 }
 $("#transcriptWrap").addEventListener("scroll", maybeLoadOlder, { passive: true });
 $("#btnChatMenu").onclick =(e) => { e.stopPropagation(); const m = $("#chatMenu"); if (m.hidden) renderChatMenu(); m.hidden = !m.hidden; };
@@ -837,14 +854,14 @@ const missionView = (() => {
     view.onBadge((n) => { const b = $("#missionsBadge"); b.hidden = !n; b.textContent = n > 99 ? "99+" : String(n); });
     for (const [name, args] of waiting.splice(0)) view[name](...args);
     return view;
-  }, (e) => { loading = null; toast(`Missions could not load: ${e.message}`, true); throw e; });
+  }, (e) => { loading = null; $("#view-mission").replaceChildren(el("p", "ms-empty-sub err ms-empty", `Missions did not load. ${e.message}`)); throw e; });
   const call = (name) => (...args) => { if (view) view[name](...args); else waiting.push([name, args]); };
   return { ready, load: () => ready().then((v) => v.load()).catch(() => {}), reset: () => view?.reset(), render: () => view?.render(), onAgent: call("onAgent"), onMission: call("onMission"), onRemoved: call("onRemoved"), onNotify: call("onNotify"), onStatus: call("onStatus") };
 })();
 $("#btnMissions").onclick = () => showView("mission");
 
 // --------------------------------------------------------- one window, every machine
-const HERO = { title: $(".hero").textContent, sub: $(".hero-sub").textContent };
+const HERO = { title: $(".hero").textContent };
 let homeSig = "";
 /** What on the screen says which machine the window is on: the bar, the home screen, the title, the pickers. */
 function machineChrome() {
@@ -852,9 +869,8 @@ function machineChrome() {
   const far = !!m && !m.here;
   document.body.classList.toggle("on-remote", far);
   $(".hero").textContent = far ? `What should ${m.label} work on?` : HERO.title;
-  $(".hero-sub").textContent = far ? `OpenCode runs on ${m.label}, in the folder you pick there. Its chats are in the history drawer, with every other machine's.` : HERO.sub;
-  $("#connStatus").title = far ? `The connection to ${m.label} dropped; it reconnects by itself` : "The connection to Omni dropped; it reconnects by itself";
-  $("#connStatus").textContent = far ? `reconnecting to ${m.label}` : "reconnecting";
+  $("#connStatus").title = far ? `The connection to ${m.label} dropped. It reconnects by itself.` : "The connection dropped. It reconnects by itself.";
+  $("#connStatus").textContent = far ? `Reconnecting to ${m.label}` : "Reconnecting";
   $("#connStatus").hidden = !down.has(focusKey);
   const row = $("#homeMachineRow");
   row.hidden = MACHINES.length < 2;
@@ -877,7 +893,7 @@ function renderSettingsMachine(tab) {
   const machineTab = ["models", "mcp", "long"].includes(tab);
   box.hidden = !machineTab || MACHINES.length < 2;
   if (box.hidden) return;
-  $("#settingsMachineText").textContent = "Models, MCP servers and Long runs on";
+  $("#settingsMachineText").textContent = "Settings for";
   const sel = machineSelect(settingsOn(), (key) => { settingsKey = key; settings.reload(); }, "The machine these settings are for");
   sel.id = "settingsMachineSel";
   $("#settingsMachineSel").replaceWith(sel);
@@ -891,7 +907,7 @@ function focusMachine(key, { whenClean = false } = {}) {
   if (key === focusKey) return true;
   const m = byKey(key);
   if (!m) return false;
-  if (!m.here && (m.state === "offline" || m.state === "refusing")) { toast(m.state === "offline" ? `${m.label} is offline. Nothing was sent to it.` : `${m.label} does not let web pages in: Allow web page access is off there.`, true); return false; }
+  if (!m.here && (m.state === "offline" || m.state === "refusing")) { toast(m.state === "offline" ? `${m.label} is offline. Nothing was sent to it.` : `${m.label} does not let web pages in. Allow web page access is off there.`, true); return false; }
   keepDraft();
   if (!setMachine(m.here ? null : m.id, { name: m.label, whenClean })) return false;
   explorer.switchMachine();
@@ -976,7 +992,7 @@ async function refreshFirst(key) {
     if (key === focusKey) for (const f of SWAP) ws[f] = S[f];
     applyFirst(ws, st);
     if (key === focusKey) { for (const f of SWAP) S[f] = ws[f]; if (S.page === "home") renderHome(); else updateComposer(); }
-  } catch (e) { if (key === focusKey) toast(`${labelOf(key)}: ${e.message}`, true); }
+  } catch (e) { if (key === focusKey) toast(`${labelOf(key)} did not answer. ${e.message}`, true); }
 }
 /** Every chat of a machine, once: when its chats are asked for. The focused machine's goes through refreshState. */
 const loadingAll = new Map();
@@ -985,7 +1001,7 @@ function loadAll(key) {
   if (ws.allChats || !ws.loaded || loadingAll.has(key)) return;
   const done = key === focusKey
     ? refreshState()
-    : handleOf(key).api("GET", "/api/state").then((st) => mergeAll(ws, st), (e) => toast(`Older chats${whereOn(key)}: ${e.message}`, true));
+    : handleOf(key).api("GET", "/api/state").then((st) => mergeAll(ws, st), (e) => toast(`Older chats${whereOn(key)} did not load. ${e.message}`, true));
   loadingAll.set(key, done.finally(() => { loadingAll.delete(key); history.render(); renderAgents(); }));
 }
 
@@ -1139,7 +1155,7 @@ function handle(ev) {
   const s = applySessionEvent(S, ev);
   if (!s) return;
   if (ev.kind === "status" && s.missionRole === "orchestrator" && S.page === "mission") missionView.onStatus(ev);
-  if (ev.kind === "digest") toast(`Digest saved: ${ev.path}`);
+  if (ev.kind === "digest") toast(`Digest saved to ${ev.path}`);
   if ((ev.kind === "summary" || ev.kind === "plan" || ev.kind === "goal" || (ev.kind === "hook" && ev.attempt)) && ev.sid === S.selected) renderSummary();
   if (ev.kind === "keeper" && ev.sid === S.selected) updateComposer();
   // A background pi agent is owned too, but it is its own pi process: it must not pass for Omni's main pi.
@@ -1176,7 +1192,7 @@ async function init() {
     history.render(); showView("home"); return;
   }
   remote.init(st.access);
-  if (!webPage() && st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
+  if (!webPage() && st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password from Settings, Remote. It is read-only there, and every change waits for your approval."; }
   history.render();
   // #missions opens the Mission view (a link, a bookmark, the phone's home screen).
   showView(location.hash === "#missions" ? "mission" : "home");
@@ -1190,4 +1206,4 @@ function afterFirstPaint() {
   const later = globalThis.requestIdleCallback ?? ((fn) => setTimeout(fn, 200));
   later(() => missionView.ready().catch(() => {}));
 }
-init().catch((e) => { if (webPage()) account.machineDown(e.message); else toast(`Omni Agent failed to start: ${e.message}`, true); });
+init().catch((e) => { if (webPage()) account.machineDown(e.message); else toast(`Omni Agent did not start. ${e.message}`, true); });
