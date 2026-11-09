@@ -9,7 +9,7 @@ import { brotliDecompressSync, gunzipSync } from "node:zlib";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createApp } from "../server/index.mjs";
-import { openUiBuild, checkBuild } from "../server/ui-build.mjs";
+import { openUiBuild, checkBuild, hashSource } from "../server/ui-build.mjs";
 import { readBuild, webFileList } from "../hub/static.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
@@ -313,3 +313,11 @@ test("the build script's check and list work with no node_modules, as on a plain
   assert.equal(stale.status, 1);
   assert.match(stale.stderr, /ui\/lib\.js/);
 });
+
+test("every text source the build reads hashes the same with either line ending, so a Mac checkout matches a Windows build", () => {
+  for (const name of ["ui/a.js", "ui/a.css", "ui/a.html", "ui/a.svg", "ui/a.json", "ui/manifest.webmanifest"]) {
+    assert.equal(hashSource(Buffer.from('{\r\n  "a": 1\r\n}\r\n'), name), hashSource(Buffer.from('{\n  "a": 1\n}\n'), name), name);
+  }
+  assert.notEqual(hashSource(Buffer.from("a\r\n"), "ui/icon.png"), hashSource(Buffer.from("a\n"), "ui/icon.png"), "pictures are exact bytes");
+});
+
