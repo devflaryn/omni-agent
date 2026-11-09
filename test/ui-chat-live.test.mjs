@@ -153,10 +153,16 @@ test("the composer never sends mid-IME, greys Send when empty, and stops on Esc"
   assert.match(src, /pointer: fine/, "autofocus on a desktop pointer only");
 });
 
-test("the composer's placeholder comes from its caller, and an empty model list offers one way forward", () => {
+test("the composer's placeholder has one writer, the page that knows the chat, and an empty model list offers one way forward", () => {
   const src = read("composer.js");
   assert.doesNotMatch(src, /Do anything/);
-  assert.match(src, /st\.placeholder !== undefined\) ta\.placeholder/);
+  // app.js says what Send will do (Home, every chat kind, a blocked machine); the composer never writes it, so nothing
+  // can fight it.
+  assert.doesNotMatch(src, /placeholder/i, "the composer has no placeholder path of its own");
+  const app = read("app.js");
+  assert.match(app, /\$\("#homeComposer textarea"\)\.placeholder = /);
+  assert.match(app, /\$\("#chatComposer textarea"\)\.placeholder = hint;/);
+  assert.doesNotMatch(app, /placeholder:/, "and nothing hands one to the composer");
   assert.match(src, /"Add a provider"/);
   assert.match(src, /"Add a model"/);
 });

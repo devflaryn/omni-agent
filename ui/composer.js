@@ -1,4 +1,5 @@
-/* The composer card: textarea, + menu (file / memory / repo graph), model + thinking pill, send/stop. OpenCode chats only. */
+/* The composer card: textarea, + menu (file / memory / repo graph), model + thinking pill, send/stop. OpenCode chats only.
+   What the box says while empty is app.js's to write (renderHome, updateComposer): it knows the chat, the folder and the machine. */
 import { el, esc } from "./lib.js";
 
 const SEND_ICON = `<svg viewBox="0 0 16 16"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>`;
@@ -6,7 +7,7 @@ const SEND_ICON = `<svg viewBox="0 0 16 16"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5
 export function createComposer(root, h) {
   root.innerHTML = `
   <div class="composer">
-    <textarea rows="1" placeholder="${esc(h.placeholder || "")}"></textarea>
+    <textarea rows="1"></textarea>
     <div class="composer-bar">
       <div class="menu-wrap">
         <button class="cbtn round" data-role="plus" title="Attach"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button>
@@ -124,7 +125,6 @@ export function createComposer(root, h) {
   function render() {
     const lbl = modelBtn.querySelector(".lbl");
     const think = st.piThinking && (modelThinking().labels[st.piThinking] ? `thinking ${modelThinking().labels[st.piThinking]}` : st.piThinking);
-    if (st.placeholder !== undefined) ta.placeholder = st.placeholder || "";
     lbl.innerHTML = `<b>${esc(st.piModel?.id || (st.models.length ? "Pick a model" : "Add a model"))}</b>${think ? ` <span>${esc(think)}</span>` : ""}${st.hook?.enabled ? ` <span title="Goal hook on">hook</span>` : ""}`;
     caption.textContent = st.caption;
     caption.title = st.caption;
