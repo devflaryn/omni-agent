@@ -4,12 +4,14 @@
 const LIFE = 4000, ERR_LIFE = 7000, EXIT_MS = 160;
 
 export function createToasts(box = document.querySelector("#toasts")) {
+  // The box is the live region, there before any toast: screen readers often skip a region that arrives already filled.
+  box?.setAttribute("aria-live", "polite");
   return function toast(text, err = false) {
     if (!box) return null;
     const t = document.createElement("div");
     t.className = `toast${err ? " err" : ""}`;
     t.textContent = text;
-    t.setAttribute("role", err ? "alert" : "status");
+    if (err) t.setAttribute("role", "alert");
     box.appendChild(t);
     let left = err ? ERR_LIFE : LIFE, started = Date.now(), timer = null, hover = false;
     const go = () => {

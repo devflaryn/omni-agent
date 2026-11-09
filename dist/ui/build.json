@@ -1,6 +1,6 @@
 {
  "format": 1,
- "version": "a03070716ec50dbd",
+ "version": "deee5edc916fd8c5",
  "esbuild": "0.25.12",
  "inputs": {
   "scripts/build-ui.mjs": "b78948ea50673d89ded33cd43ccf16c7e1497f1659761114ff75371ab8344310",
@@ -28,7 +28,7 @@
   "ui/icon-192.png": "0be9b10e64b606a242f95291c4ff2217d849d1cd14766f16b5464f4b2208765a",
   "ui/icon-32.png": "32f9bd06926d7949847178f76761396c6bc5ef7557f9e38bf4a842987dafcfd9",
   "ui/icon-512.png": "b3f8ad813f13be17ac20acc2bb7a632ce3089ad78883d74f87dfe9271ab3485b",
-  "ui/index.html": "3da5fc929ea29111d58003baa48cc6969d9986317fd2b26ed33548c528573c2f",
+  "ui/index.html": "3f51ea98213e383b529e192c1236bbacfc69a4b41594252f5389e359e1e7475e",
   "ui/keys.js": "fbc19024acf35b19059c457f32e1b9582dc85a5ca97f639ffdc75f55dca561c1",
   "ui/lib.js": "902f92c46b00c5790d86af5175ed00f07315e3144b985b3bf29ac98ccd24e39a",
   "ui/log-trust.js": "dae119da721f25f5791bf25dde56644f4d4277c492f01ecb1fd3a58c0a62f711",
@@ -62,7 +62,7 @@
   "ui/styles.css": "1c8395feb080d86cab6446363f9c2228ed3caf0d21fe18de546b6efe1682d081",
   "ui/sw.js": "1fb53a5b50e22cc03bbacd1b7517a2a23d914e0c803406b85ab6eb0a0b167826",
   "ui/theme.js": "ec261da779a7600cd531e4c2b5c0c447a9ffc1e5c01b3df3609adfb4b36c22cd",
-  "ui/toast.js": "da4b72994f2ab835ad420c7d1431f24f712bd3190dae4ad6b06e0408bb4c24c2",
+  "ui/toast.js": "97a000d55bcf4c90c3bdd6fdef02c34be847eed4cb187dbbabe556600e862d72",
   "ui/transcript.js": "130cbeebc02f0f643e6c9b148bc2b7853f8db903bcd2518766f3c5181e1d4584",
   "ui/transport.js": "6cf9a8fd51db6ccb498435b92b7afb1f814d8d7c556e6ade90bca0d124a08145",
   "ui/web-sw.js": "c09809c7fa6131d3233db0c528496e76cddcadb09170ad2c1f688a2a80ac1e5e",
@@ -72,13 +72,13 @@
  },
  "imports": {
   "theme-U2WP3QSA.js": [],
-  "app-V72HTE4Y.js": [
+  "app-G472R4HN.js": [
    "chunk-5WKYG6OC.js",
    "chunk-A5US6EW5.js",
    "chunk-4PDXQ3AT.js",
    "chunk-N4COS2TB.js"
   ],
-  "web-CHKWUXVE.js": [
+  "web-FZP4BVTL.js": [
    "chunk-5WKYG6OC.js",
    "chunk-4PDXQ3AT.js",
    "chunk-N4COS2TB.js"
@@ -110,9 +110,9 @@
   "chunk-N4COS2TB.js": []
  },
  "files": {
-  "app-V72HTE4Y.js": {
-   "sha256": "21d1a386b1994af9a1770a7418a91c29d6761965d24000aa0fb087f51343058f",
-   "integrity": "sha256-IdGjhrGZSvmhdwp0GKkcKdZ2GWXSQACqD7CH9RNDBY8=",
+  "app-G472R4HN.js": {
+   "sha256": "b7c22cb21642e7cbc8d96d6657d22996e33e593405a47b299ff16c3eedb5dcbf",
+   "integrity": "sha256-t8IsshZC58vI2W1mV9IpluM+WTQFpHspn/FsPu213L8=",
    "immutable": true,
    "br": true,
    "gz": true
@@ -194,8 +194,8 @@
    "immutable": true
   },
   "index.html": {
-   "sha256": "b198564794ac0a3e2e3f01b09cee55bbb60825d1c09e0a24df6139c7eeb99134",
-   "integrity": "sha256-sZhWR5SsCj4uPwGwnO5Vu7YIJdHAngok32E5x+65kTQ=",
+   "sha256": "78f45e599fe75cd57b374d561329338e1217472ce287ee07af4961a522825b5d",
+   "integrity": "sha256-ePReWZ/nXNV7N01WEykzjhIXRyzih+4Hr0lhpSKCW10=",
    "immutable": false,
    "br": true,
    "gz": true
@@ -236,8 +236,8 @@
    "gz": true
   },
   "sw.js": {
-   "sha256": "d5b1358ff1c65a1d30a800c054a6ba4f04e680d3dfb63c660ad1eb4d71c5b167",
-   "integrity": "sha256-1bE1j/HGWh0wqADAVKa6TwTmgNPftjxmCtHrTXHFsWc=",
+   "sha256": "d4dc918cc014d1c8604a957bb16da69d4a456a6c83dd77328b97166689cbbd77",
+   "integrity": "sha256-1NyRjMAU0chgSpV7sW2mnUpFamyD3Xcyi5cWZonLvXc=",
    "immutable": false,
    "br": true,
    "gz": true
@@ -249,13 +249,6 @@
    "br": true,
    "gz": true
   },
-  "web-CHKWUXVE.js": {
-   "sha256": "7f9e260bc259bd4e08374d3fa71c2fdf6581fe77d472018ccf90dec1cd8e3515",
-   "integrity": "sha256-f54mC8JZvU4IN00/pxwv32WB/nfUcgGMz5Dewc2ONRU=",
-   "immutable": true,
-   "br": true,
-   "gz": true
-  },
   "web-EVP7N4LU.css": {
    "sha256": "0ae516e2dc277e682bf67500a3edc109c0096c6d73101e6ab09a8ca0953311cc",
    "integrity": "sha256-CuUW4twnfmgr9nUAo+3BCcAJbG1zEB5qsJqMoJUzEcw=",
@@ -263,9 +256,16 @@
    "br": true,
    "gz": true
   },
+  "web-FZP4BVTL.js": {
+   "sha256": "e48996376820a6e2e63a7ff736a5a4b8b2563c8284b33fb9057ea1f3914a2d7b",
+   "integrity": "sha256-5ImWN2ggpuLmOn/3NqWkuLJWPIKEsz+5BX6h85FKLXs=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
   "web.html": {
-   "sha256": "1cc974e6849de64f1b9cb9285b5213631a7ca0f62cab8843e478310e75b46232",
-   "integrity": "sha256-HMl05oSd5k8bnLkoW1ITYxp8oPYsq4hD5HgxDnW0YjI=",
+   "sha256": "44d602883becf2941fd187df0c31777877d21354206d133de01d8f48a1440fa6",
+   "integrity": "sha256-RNYCiDvs8pQf0YffDDF3eHfSE1QgbRM94B2PSKFED6Y=",
    "immutable": false,
    "br": true,
    "gz": true
