@@ -173,7 +173,9 @@ export function createAccount({ toast, openSettings }) {
     if (!m || !A.status) return;
     const news = linkNews(A.linkDown, A.machines.find((x) => x.id === m.id), !!A.status.hub?.connected);
     A.linkDown = news.down;
-    if (news.reconnected) toast(`Reconnected to ${m.name}`);
+    // Only a link that was up on this page comes back: one still opening as the page starts is not news.
+    if (news.reconnected && A.linkWasUp) toast(`Reconnected to ${m.name}`);
+    if (!news.down) A.linkWasUp = true;
   }
 
   function listen() {

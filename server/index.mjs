@@ -32,7 +32,9 @@ import { PRESETS, readModelsFile, listProviders, saveCustomProvider, removeProvi
 import { THINKING_LEVELS, clampThinking, thinkingProfile } from "../ui/thinking.js";
 import * as files from "./files.mjs";
 import { SessionRegistry, SessionWatcher, titleFrom } from "./watchers.mjs";
-import { applyStatus } from "../ui/lib.js";
+import { AGENT_ACTIVE as AGENT_RUNNING, applyStatus } from "../ui/lib.js";
+import { openUiBuild } from "./ui-build.mjs";
+import { serveWebFile } from "../hub/static.mjs";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
 import { createServer as createNetServer } from "node:net";
@@ -214,7 +216,7 @@ export async function createApp(overrides = {}) {
       if (r.copied.length || r.extended.length) { writeConfig(); await disposeOpencode(); }
     } catch (e) { log("could not copy pi's providers:", e.message); }
   }
-  let catalogCache = null;
+  let catalogCache = null, catalogRefresh = null;
   /** OpenCode's `GET /provider` catalog, cached a minute (`fresh` re-reads it); starts the server when needed. */
   async function catalog(fresh = false) {
     if (!fresh && catalogCache && Date.now() - catalogCache.at < 60000) return catalogCache.value;
@@ -222,6 +224,12 @@ export async function createApp(overrides = {}) {
     const value = await server.request("GET", "/provider", { directory: cfg.cwd });
     catalogCache = { at: Date.now(), value };
     return value;
+  }
+  /** For the picker, which a page asks at every load: what is known, at once, and past its minute a fresh look behind the scenes. A change of providers clears it. */
+  function pickerCatalog() {
+    if (!catalogCache) return catalog(true);
+    if (Date.now() - catalogCache.at >= 60000 && !catalogRefresh) catalogRefresh = catalog(true).catch(() => null).finally(() => { catalogRefresh = null; });
+    return catalogCache.value;
   }
   /** provider/id in the catalog while the server runs (this never starts it), else null. */
   async function knownModel(provider, id) {
@@ -594,6 +602,11 @@ export async function createApp(overrides = {}) {
   }
 
   // ------------------------------------------------------------------ http
+  // The UI: dist/ui while it is what ui/ makes, ui/ itself the moment it is not (server/ui-build.mjs).
+  const UI_ROOT = cfg.uiRoot || ROOT;
+  // A checkout with esbuild installed rebuilds a stale UI by itself; never under test, where the build must be the committed one.
+  const uiBuild = openUiBuild({ root: UI_ROOT, log: cfg.log || log, fromSource: !!cfg.uiFromSource || process.env.OMNI_UI_SOURCE === "1", autoBuild: cfg.uiAutoBuild ?? (!underTest && process.env.OMNI_UI_AUTOBUILD !== "0"), runBuild: cfg.uiRunBuild });
+  const NO_FILES = new Map(), NOTHING_FETCH_ONLY = new Set();
   const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
   function send(res, code, body, type = "application/json") {
     res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
@@ -906,10 +919,17 @@ export async function createApp(overrides = {}) {
       if (p.startsWith("/api/remote/")) return remoteAdmin(req, res, p);
       if (req.method === "GET" && p === CERT_PATH) return sendCert(res);
       // static UI
-      if (req.method === "GET" && (p === "/" || p === "/index.html")) return send(res, 200, await fs.readFile(join(ROOT, "ui", "index.html")), MIME[".html"]);
+      if (req.method === "GET" && (p === "/" || p === "/index.html")) {
+        const built = uiBuild.current();
+        if (built) { serveWebFile(req, res, built.files, {}, { fetchOnly: NOTHING_FETCH_ONLY }); return; }
+        res.setHeader("X-Omni-Ui", "source");
+        return send(res, 200, await fs.readFile(join(UI_ROOT, "ui", "index.html")), MIME[".html"]);
+      }
       if (req.method === "GET" && /^\/[\w.-]+\.(js|mjs|css|svg|png|ico)$/.test(p)) {
-        const f = join(ROOT, "ui", p.slice(1));
-        if (!existsSync(f)) return send(res, 404, { error: "not found" });
+        if (serveWebFile(req, res, uiBuild.files() ?? NO_FILES, {}, { fetchOnly: NOTHING_FETCH_ONLY })) return;
+        const f = join(UI_ROOT, "ui", p.slice(1));
+        if (p === "/sw.js" || !existsSync(f)) return send(res, 404, { error: "not found" }); // the worker is the web page's, and its source a template
+
         return send(res, 200, await fs.readFile(f), MIME[extname(f)] || "application/octet-stream");
       }
       // events
@@ -926,6 +946,13 @@ export async function createApp(overrides = {}) {
       }
       // state
       if (req.method === "GET" && p === "/api/state") {
+        // `first`: what the first screen needs, in one small answer. The page asks for the whole once it has painted.
+        const first = q.get("first") === "1";
+        const allSessions = registry.list();
+        const allAgents = agents.list();
+        const brief = (text) => (typeof text === "string" && text.length > 300 ? `${text.slice(0, 300)}…` : text);
+        const sessionsNow = !first ? allSessions : [...allSessions].sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0)).filter((s, i) => i < 60 || s.streaming || s.owned);
+        const agentsNow = !first ? allAgents.slice(0, 200) : [...allAgents.filter((a) => AGENT_RUNNING.has(a.status)).slice(0, 12), ...allAgents.filter((a) => !AGENT_RUNNING.has(a.status)).slice(0, 20)];
         return send(res, 200, {
           config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: remoteStatus().urls, piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking, context: cfg.context },
           access: { role: req.omniHost ? "host" : req.omniChannel ? "device" : "remote", ...(req.omniHost ? { remote: remoteStatus() } : {}) },
@@ -936,8 +963,9 @@ export async function createApp(overrides = {}) {
           goal: pi?.sid ? keeper.status(pi.sid) : null,
           runs: claude.list(),
           // A record can hold a 20 KB report and up to 500 are kept: the list carries a preview.
-          agents: agents.list().slice(0, 200).map((a) => ({ ...a, resultText: (a.resultText || "").length > 2000 ? `${a.resultText.slice(0, 2000)}…` : a.resultText })),
-          sessions: registry.list().map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
+          agents: agentsNow.map((a) => (first ? { ...a, task: brief(a.task), command: brief(a.command), resultText: brief(a.resultText) } : { ...a, resultText: (a.resultText || "").length > 2000 ? `${a.resultText.slice(0, 2000)}…` : a.resultText })),
+          sessions: sessionsNow.map((s) => ({ ...s, tally: tally.has(s.sid) ? tally.get(s.sid) : null })),
+          ...(first ? { sessionsTotal: allSessions.length } : {}),
           seq: bus.seq,
           boot: bus.boot,
         });
@@ -946,7 +974,10 @@ export async function createApp(overrides = {}) {
       if (req.method === "GET" && (m = /^\/api\/sessions\/([^/]+)\/history$/.exec(p))) {
         const sid = decodeURIComponent(m[1]);
         const before = q.get("before");
-        const h = await watcher.history(sid, { before: before == null || before === "" ? undefined : Number(before) });
+        // A far machine's page asks for less than the whole window at a time. The floor keeps a page a page.
+        const asked = Number(q.get("page"));
+        const pageBytes = Number.isSafeInteger(asked) && asked > 0 ? Math.max(asked, 8 * 1024) : undefined;
+        const h = await watcher.history(sid, { before: before == null || before === "" ? undefined : Number(before), pageBytes });
         return send(res, 200, { ...h, events: h.events.map(wireEvent), session: registry.get(sid) || null });
       }
       // A tool's full output (a page gets long ones clipped): the event ring holds a live one the file may not have yet.
@@ -1196,7 +1227,7 @@ export async function createApp(overrides = {}) {
           case "/api/pi/models": {
             // OpenCode's connected providers (its free `opencode` models and every provider with a key). The
             // piModels allowlist narrows the others; the `opencode` provider is always listed in full.
-            const models = pickerModels(await catalog(true));
+            const models = pickerModels(await pickerCatalog());
             const shown = cfg.piModels?.length ? models.filter((x) => x.provider === "opencode" || filterPiModels([x], cfg.piModels).length) : models;
             return send(res, 200, { success: true, data: { models: shown } });
           }

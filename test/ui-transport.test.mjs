@@ -218,6 +218,8 @@ test("every direct URL to a file's bytes goes through the one helper", () => {
 test("only transport.js calls fetch or opens an EventSource, so nothing can miss the machine", () => {
   for (const f of uiFiles()) {
     if (f === "transport.js") continue;
+    // The service worker fetches the page's own files, from the server that served the page, and never acts on a machine.
+    if (f === "sw.js") { assert.doesNotMatch(read(f), /\/api\/|\/remote\/|\/events/, "sw.js names nothing of a machine"); continue; }
     assert.doesNotMatch(read(f), /(^|[^.\w])fetch\(|\b(window|globalThis|self)\.fetch\(/m, `${f} calls fetch`);
     assert.doesNotMatch(read(f), /new\s+((window|globalThis|self)\.)?EventSource\(/, `${f} opens an EventSource`);
   }

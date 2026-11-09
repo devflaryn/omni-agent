@@ -1,0 +1,2 @@
+# Built output is exact bytes: its names and the service worker's list hold hashes of them. Never turn its line endings, and don't show its diffs.
+dist/** -text -diff

@@ -117,6 +117,8 @@ The page comes from the VPS. You chose this so that one VPS manages everything. 
 
 > **The limits that remain:** the web page is approved as `client`, so it cannot approve or remove devices, or add an attacker's device to the account through the account's own controls. A changed page could claim to be a desktop, so `full` is only ever granted by the person's explicit choice on the approving device: choosing `full` for something opened in a browser would give that page full control. Its access ends when its 30 days run out or it is removed.
 
+> **What the page keeps in the browser to load fast:** a service worker holds the page's own files, the ones the build lists, each checked against the hash the build recorded, so a repeat visit paints without the hub. It never holds what passes through the page: no API answer, chat text, key or file from a machine (those go over the channel, which it cannot see, and it caches nothing but at install). What this changes for a hacked hub: nothing about what a changed page can do, and nothing about how soon it arrives, since the browser checks the hub for a new worker on every visit. What is new is the way back: once the hub is clean, the first visit after can still show the changed page, from its cache, before the clean worker replaces it, and a page that stays open stays as it was. A worker planted under another name is told by the clean hub to remove itself and its caches. To be sure after an incident, clear the site's data in the browser, which removes the worker and its files.
+
 **Allow web page access** is in **Settings → Account** on each machine, as the tick box "Let limited web pages control this computer". It is on by default. Turned off, that machine refuses `client` devices and closes any web page connected to it at that moment. Only your desktop and phone apps can then reach it. If its saved settings are damaged, it turns off and says so, until you choose again.
 
 ## The iPhone app
@@ -275,7 +277,7 @@ Run it after any change to `hub/` or to a file the page serves. Run `bash hub/de
 - It creates `/etc/omni-hub/bootstrap.env` only if missing, and never prints it.
 - It does not touch nginx or certbot.
 - It logs in as `root@72.62.59.232`, with the VPS host key pinned in `~/.omni-agent/relay/known_hosts`. Override with `OMNI_VPS`, `OMNI_KNOWN_HOSTS` and `OMNI_SSH`.
-- A new file in the web page must be added to both `hub/static.mjs` and the list in `hub/deploy.sh`. A test holds them equal.
+- The page's files are the build's (`dist/ui`, see the README's "The UI build"). Deploy first checks that the build is what `ui/` makes and stops if not, then copies exactly the files `dist/ui/build.json` lists. A new file in `ui/` needs no list: the build follows the imports.
 
 ### The certificate
 
@@ -348,7 +350,7 @@ From a PC behind WARP, a closed port looks like a timeout rather than "refused",
 - In `ui/app.js`, `ui/index.html` and `ui/settings.js`, delete `createRemote`, the approval cards, the Read-only chip and the **Settings → Remote** tab. In `ui/web.js`, delete the line that hides `tabRemote`.
 - In `desktop/omni_desktop.pyw`, stop passing `--lan`, and update `test/desktop.test.mjs`.
 - Delete `scripts/allow-lan.cmd` and `scripts/allow-lan.sh`, and the `--lan` lines in the README.
-- Take `remote.js` out of `hub/static.mjs` and `hub/deploy.sh`, then run `hub/deploy.sh`.
+- Run `npm run build`, commit `dist/ui`, then run `hub/deploy.sh`. The build drops `remote.js` by itself once nothing imports it.
 - In the README, delete the section "The old way: password and VPS relay", and in this file, delete this section.
 
 **5. Clean up on the PC.**

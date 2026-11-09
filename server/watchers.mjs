@@ -6,7 +6,8 @@
 import { promises as fs, existsSync, watch } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { JsonlTail, readAppended, readTail, readWindow, readLineAt, scanBack } from "./tailer.mjs";
-import { resultIn } from "./wire.mjs";
+import { resultIn, wireEvent } from "./wire.mjs";
+import { PLAN_TOOL } from "../ui/plan.js";
 import { normalizePiEntry, normalizeClaudeEntry } from "./normalize.mjs";
 import { createTally } from "./tokens.mjs";
 import { cleanTitle } from "../ui/lib.js";
@@ -75,6 +76,31 @@ function applyToRegistry(registry, ev) {
     s.lastActivity = Math.max(s.lastActivity, ev.ts || 0);
   }
   return s;
+}
+
+/**
+ * How many of a window's lines to leave out, oldest first, so what is left comes to about `pageBytes` as a page receives it. The cut
+ * moves forward to a person's message when there is one within the page, as a turn reads from its start; when not, it stays where the
+ * bytes put it, since one very long turn must still page. A single line over the limit comes whole. 0 if it all fits.
+ */
+function pageCut(lines, pageBytes) {
+  let bytes = 0, cut = lines.length;
+  while (cut > 0) {
+    const line = lines[cut - 1].evs.reduce((sum, ev) => sum + JSON.stringify(wireEvent(ev)).length, 0);
+    if (bytes + line > pageBytes && cut < lines.length) break;
+    bytes += line;
+    cut--;
+  }
+  if (cut === 0) return 0;
+  const asked = (i) => lines[i].evs.some((ev) => ev.kind === "msg" && ev.role === "user");
+  for (let i = cut; i < lines.length; i++) if (asked(i)) return i;
+  // No message of the person's in the page: its turn's start, if that is within another page back.
+  let back = 0;
+  for (let i = cut - 1; i >= 0 && back <= pageBytes; i--) {
+    if (asked(i)) return i;
+    back += lines[i].evs.reduce((sum, ev) => sum + JSON.stringify(wireEvent(ev)).length, 0);
+  }
+  return cut;
 }
 
 export class SessionWatcher {
@@ -237,7 +263,12 @@ export class SessionWatcher {
    * at a user message, so a turn is never split across pages; `more` says an older page exists. Each tool
    * result carries `at`, its line's offset, so its full output can be read back later (toolOutput).
    */
-  async history(sid, { before, maxBytes = 2 * 1024 * 1024 } = {}) {
+  /**
+   * A page of chat `sid`. `pageBytes` asks for only the newest that many bytes as a page receives them (a far machine's first paint
+   * should not wait on 2 MB), from the same window: the tally still counts the whole window, and a plan older than the page comes
+   * along as `plan`. It ends at a person's message when one is near enough, and `start` is where the next page picks up.
+   */
+  async history(sid, { before, maxBytes = 2 * 1024 * 1024, pageBytes } = {}) {
     const s = this.registry.get(sid);
     if (!s?.file) return { events: [], tally: null, start: 0, more: false };
     const harness = s.harness;
@@ -247,7 +278,7 @@ export class SessionWatcher {
     const lines = r.lines.map(({ at, obj }) => ({ at, evs: normalizeEntry(harness, obj, ctx) }));
     let from = 0;
     if (r.start > 0) { const i = lines.findIndex((l) => l.evs.some((ev) => ev.kind === "msg" && ev.role === "user")); if (i > 0) from = i; }
-    const start = from < lines.length ? lines[from].at : r.start;
+    let start = from < lines.length ? lines[from].at : r.start;
     const events = [];
     for (const l of lines.slice(from)) {
       for (const ev of l.evs) {
@@ -263,7 +294,15 @@ export class SessionWatcher {
       for (const ev of events) if (ev.kind === "msg" && ev.usage) { const u = { groupId: ev.groupId || ev.id, usage: ev.usage, model: ev.model, cost: ev.cost, ts: ev.ts }; tally.add(sid, u); this.tally.add(sid, u); }
       pageTally = tally.get(sid);
     }
-    return { events, tally: pageTally, start, more: start > 0, truncated: start > 0 };
+    const cut = pageBytes > 0 ? pageCut(lines.slice(from), pageBytes) : 0;
+    if (!cut) return { events, tally: pageTally, start, more: start > 0, truncated: start > 0 };
+    const kept = lines.slice(from + cut);
+    start = kept[0].at;
+    const dropped = lines.slice(from, from + cut).flatMap((l) => l.evs);
+    const shown = kept.flatMap((l) => l.evs);
+    const planIn = (evs) => { for (let i = evs.length - 1; i >= 0; i--) { const ev = evs[i]; if (ev.kind === "msg" && ev.role === "tool") for (const b of ev.blocks || []) if (b.name === PLAN_TOOL && b.details?.plan) return b.details; } return null; };
+    const plan = planIn(shown) ? null : planIn(dropped);
+    return { events: shown, tally: pageTally, start, more: true, truncated: true, ...(plan ? { plan } : {}) };
   }
 
   /** The full result of tool call `toolId`: from the line at byte `at` when given, else the newest line naming it. */

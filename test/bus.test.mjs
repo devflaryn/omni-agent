@@ -12,7 +12,8 @@ test("a client whose write buffer is over the cap is dropped, not buffered forev
 });
 
 const sink = () => { const out = []; return { out, writableLength: 0, write(s) { out.push(s); return true; } }; };
-const sent = (r) => r.out.filter((s) => s.startsWith("data: ")).map((s) => JSON.parse(s.slice(6)));
+// One write may hold many events (a replay goes as one): read them as the browser does, block by block.
+const sent = (r) => r.out.join("").split("\n\n").filter((s) => s.startsWith("data: ")).map((s) => JSON.parse(s.slice(6)));
 
 test("a fresh page's replay leaves out the chat messages its history fetch reads from the session file", () => {
   // Measured on the owner's server: 9.4 MB of the 4000-event ring was assistant/tool messages, sent to every
@@ -43,7 +44,7 @@ test("a reconnect that cannot be caught up is told to resync instead of silently
   const gap = sink();
   bus.addClient(gap, 1, bus.boot); // 2 and 3 fell out of the ring
   assert.match(gap.out[0], /^event: resync\ndata: /);
-  assert.deepEqual(JSON.parse(gap.out[0].split("data: ")[1]), { boot: bus.boot, seq: 6 });
+  assert.deepEqual(JSON.parse(gap.out[0].split("\n\n")[0].split("data: ")[1]), { boot: bus.boot, seq: 6 });
   const restarted = sink();
   bus.addClient(restarted, 5, "an-earlier-run");
   assert.match(restarted.out[0], /^event: resync\n/);

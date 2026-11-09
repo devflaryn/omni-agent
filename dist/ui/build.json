@@ -1,0 +1,237 @@
+{
+ "format": 1,
+ "version": "a7f095e479082b32",
+ "esbuild": "0.25.12",
+ "inputs": {
+  "scripts/build-ui.mjs": "65aff36bebf4b67e135ede1db8aed41bee2e9b52502de137b58c41ac756055bd",
+  "ui/account-core.js": "6e697647934b72b5328dd3b23a4af0f57f5746bc5e47e29c58ed8db1e237885c",
+  "ui/account-error.js": "8d5eeaa4f9caacf7c1a0438083c85056de38615416eab5b4c0fb711a3d8ca47a",
+  "ui/account.js": "f4fc1c3b6d787bf1f137647dc612b621145fb4c83e0c230558d24847a6086219",
+  "ui/app.js": "d9486eab023ee1bc4b723d2cd8c4a3d2e9ab960dc2bb399ebab74f91d0e9131f",
+  "ui/channel-client.js": "58d51098142a042bcdacd83375a6d93f80b5be6fcfb4bb880cc3eefd2eeece7f",
+  "ui/channel-frames.js": "45eedabcf7e9b70a61aa53378e94a33ee45eb7e82a8de0165571079c45b873e1",
+  "ui/channel-set.js": "54311f0c925d8b3a6ef7af59f584e287d7ba0b1b98c0a632f5825c270c5d65a0",
+  "ui/composer.js": "8a479fcd5c49623785e7c332f48a975de162eeb7f79e4908e17b94de13c36a05",
+  "ui/contextmenu.js": "e97c5a60f8f5af28451c4033865ac4fd6917afe4f2fa299d42f70c984dff6974",
+  "ui/device-log.js": "b0a3ea99880043d207162172577b835b53b4f05db2759739c40351e356e2f40b",
+  "ui/editor.js": "e3743741853da77626bf1b9cebf91d2483f79e01d63c951e4b1617d982c25e0e",
+  "ui/emitter.js": "96005ae8183cd6964398d09e4d00bedc8ddb702d200b05653c21cc2e5cc0e11a",
+  "ui/explorer.js": "932648761e10656041743f7e4fffebdc99cb3943a9736a9ef3504aa97d00a48c",
+  "ui/fileicons.js": "6df8c139a7270c85e986564c9875f3c9e47fc9a7970c88a4d1d683756a6046c1",
+  "ui/filepane.js": "f49b01251055b51218cacc037bd8b4cfc7d936fd1440a7cc4879448d69b14409",
+  "ui/highlight.js": "5102ea8a5ca34089b92170b6104682c729131df04b594a0e932301b7a2ea8cf7",
+  "ui/hub-socket.js": "05791e2f6fcb0f28b29835cefb92cfbdbd14ffce4197307e1a72f394b2ef2570",
+  "ui/icon-180.png": "a54ed0bca1be7b3c6854051b0881d56f9ec030990c31e46b43bd9e60f6919935",
+  "ui/icon-32.png": "32f9bd06926d7949847178f76761396c6bc5ef7557f9e38bf4a842987dafcfd9",
+  "ui/index.html": "e9851f940d08b48efa41c65a0269b48828abf01bf3b4b1f7ee7f30c2b872cda8",
+  "ui/lib.js": "5333630e8309d2c8422b387a25b2ef2cf15c816022abf0b88a3cc40908985fca",
+  "ui/log-trust.js": "9a25d56aaeddbb692ec8081e85f4515cc3b9c0f8b61e79b5ca625979a719d1b1",
+  "ui/login-worker.js": "67453a31ca59d220909c9c40f5cbeb50b51e5ace0e045da04de8196ca17d3960",
+  "ui/logo.svg": "5d3de0fd56a69e57f107fb708f085cbe8cf8369b8459d92696e760bee248f2bd",
+  "ui/machine-links.js": "88f5daf8d7fd21c8523ab94322c065a25bbe2aee0df2fe60ecac23c75e88dd5d",
+  "ui/mcp-settings.js": "b2831eccd5cedc51a3abde4eac7291f5f1c350c849267415c1092db873c1a229",
+  "ui/mission.js": "de128732fba008e3e181e6afa9d618bbc900fda00887d0c636f75b04dc89c433",
+  "ui/model-cache.js": "fefab3b2af6694cc0fc73e88dbe3df23dcba83972c8fd4282b76d3034eaf15f0",
+  "ui/office-engine.js": "e0f45006eead42522dd707c06156f342aa1ffe32ffd33f6ab496bde508f15800",
+  "ui/office-font.js": "1a424c848b0b75598712a482b40d299172d37ecf24d0e1ba4f253bd1133c1b3f",
+  "ui/office-props.js": "ddd2790d1c470e21d7d833916e4d7dcc53a291c0ca6873177be5fa5c6fef0991",
+  "ui/office-worker.js": "1766f8e13f77b52d13da46315751a56eca6d6a3c5f852c3bccee429f36b64cda",
+  "ui/office.js": "d49ceca17f718db7f4c08a4b17fa8d845de6cedc9ab29435a1b1d79994dda61b",
+  "ui/page-account.js": "9f318943442f004d72dce4720eb9c1fcc03c24a69411307ae5da8e5c245317c8",
+  "ui/page-files.js": "e41f38729f83a17470a9c1a23603c245751cbb949d79504dec900d3ef38b487b",
+  "ui/page-store.js": "4ca1f858f8c85ea8d36e466401b70320b8255a98f14a7106f0f1d6fd2f6891e0",
+  "ui/page-transport.js": "7a26b9b27f66f939dc78f0fd970084f7d5106725f7369cc9050c2a8854462643",
+  "ui/panel.js": "fdb80fb23aa6726884563e9db67b353469b069d7f9afdb640b471b9f80a6708f",
+  "ui/paths.js": "69d47a83d2d7d62ac3f731e0cc584869bdf3535bfb3e5ce4c0ed28e15c0974f0",
+  "ui/plan.js": "a0886fc224f962db4baa8e3d14a517f28b08b90cf45875d573c4b11ba53c5de5",
+  "ui/remote.js": "60b6bd373916ccecf8f0030859fead090550d89d7a619765bb2da8519371a779",
+  "ui/resizer.js": "1073327f56875128a5c8689d56b41f2fa30949fe18c02a6101c7078c7fef0b48",
+  "ui/settings.js": "b4fd7ac918041b0c317fee7c678e5f6a1baf84222675b1a01d1fe753ecde3f72",
+  "ui/sidebar.js": "25135a7bde575e67b482244a1bd04c38502042cbd0f4516f0afe740ce24c89d1",
+  "ui/stream.js": "62f62ae60b7753510b6bba4c438676bbdda935aa2d303a5e0961e27f3bed0212",
+  "ui/styles.css": "12c2958ed68dbfcf128f190f2882774e48568a2aad7e4d59fd6390406bdc0f5f",
+  "ui/sw.js": "1fb53a5b50e22cc03bbacd1b7517a2a23d914e0c803406b85ab6eb0a0b167826",
+  "ui/transcript.js": "5481a7a515cf2252f18175a89f36db752c2f1bd30190e3ba704ad64441ee69e0",
+  "ui/transport.js": "24177b8f1655b50dcb31be7ff94bb9d7174c8b4a7e4153db15c8b96648a38063",
+  "ui/web-sw.js": "c09809c7fa6131d3233db0c528496e76cddcadb09170ad2c1f688a2a80ac1e5e",
+  "ui/web.css": "fcf555906afb02dc4dbb107f6be6961037c44584c6ad44ace7699640dbb9c3ea",
+  "ui/web.html": "3b70e67c200426d9586edb7ea8c68a1c26e3bc206a7c956de36545ad81d56ed9",
+  "ui/web.js": "3dbc73473fece872aefee4291e62471a553dedf7305b4d2d3e5edcad9d0be3a8"
+ },
+ "imports": {
+  "app-6YMEX2TO.js": [
+   "chunk-HI3HEPOI.js",
+   "chunk-VYHOQXZE.js",
+   "chunk-6RB5GD6N.js",
+   "chunk-H2NR6FFW.js"
+  ],
+  "web-YSREHAV2.js": [
+   "chunk-HI3HEPOI.js",
+   "chunk-6RB5GD6N.js",
+   "chunk-H2NR6FFW.js"
+  ],
+  "chunk-HI3HEPOI.js": [
+   "chunk-6RB5GD6N.js",
+   "chunk-H2NR6FFW.js"
+  ],
+  "chunk-SRMTLNEO.js": [
+   "chunk-5QBVNMUI.js",
+   "chunk-H2NR6FFW.js"
+  ],
+  "chunk-AJ4GJCP5.js": [
+   "chunk-VYHOQXZE.js",
+   "chunk-6RB5GD6N.js",
+   "chunk-5QBVNMUI.js",
+   "chunk-H2NR6FFW.js"
+  ],
+  "chunk-VYHOQXZE.js": [
+   "chunk-H2NR6FFW.js"
+  ],
+  "chunk-6RB5GD6N.js": [],
+  "chunk-5QBVNMUI.js": [
+   "chunk-H2NR6FFW.js"
+  ],
+  "chunk-7MLUTT7M.js": [
+   "chunk-H2NR6FFW.js"
+  ],
+  "chunk-H2NR6FFW.js": []
+ },
+ "files": {
+  "app-6YMEX2TO.js": {
+   "sha256": "636489b54b199cb2ff36b29ae0f281ea1146cfdefa19920dd9cad33e050c7792",
+   "integrity": "sha256-Y2SJtUsZnLL/NrKa4PKB6hFGz976GZIN2crTPgUMd5I=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-5QBVNMUI.js": {
+   "sha256": "a91723e1260aa5eee53abd413d0c5d326c29fa09717a8ad5443d86daf7f06865",
+   "integrity": "sha256-qRcj4SYKpe7lOr1BPQxdMmwp+glxeorVRD2G2vfwaGU=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-6RB5GD6N.js": {
+   "sha256": "7451af2b1482ee5534c328f82329163c582ad93e69d36c564ae731d367adf5ff",
+   "integrity": "sha256-dFGvKxSC7lU0wyj4IykWPFgq2T5p02xWSucx02et9f8=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-7MLUTT7M.js": {
+   "sha256": "a7af912cc098b9c5d026751145598f339b84b777847abcba6a8c7a37f7f26022",
+   "integrity": "sha256-p6+RLMCYucXQJnURRVmPM5uEt3eEery6aox6N/fyYCI=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-AJ4GJCP5.js": {
+   "sha256": "0cb7eac9e205afdc9731a6f73342ca2188a792aea2e5420d4547edb1120cf6c8",
+   "integrity": "sha256-DLfqyeIFr9yXMab3M0LKIYinkq6i5UINRUftsRIM9sg=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-H2NR6FFW.js": {
+   "sha256": "c9389dadd1ef686794167c788dd148424656afdb535a788572a6c3e7bbca8221",
+   "integrity": "sha256-yTidrdHvaGeUFnx4jdFIQkZWr9tTWniFcqbD57vKgiE=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-HI3HEPOI.js": {
+   "sha256": "d47054ac775b8462805f1e476d809d6d48245a4ead9809be6a942fe73cc2902c",
+   "integrity": "sha256-1HBUrHdbhGKAXx5HbYCdbUgkWk6tmAm+apQv5zzCkCw=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-SRMTLNEO.js": {
+   "sha256": "6d2ff27c789ff59353844b7f57fadad16b5717d9e6b9829ab149ec6256e4bd96",
+   "integrity": "sha256-bS/yfHif9ZNThEt/V/ra0WtXF9nmuYKasUnsYlbkvZY=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "chunk-VYHOQXZE.js": {
+   "sha256": "590d3ea939356fb05fa010c4f56147d681f023e115294fed468e86a7cf877807",
+   "integrity": "sha256-WQ0+qTk1b7BfoBDE9WFH1oHwI+EVKU/tRo6Gp8+HeAc=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "icon-180-a54ed0bc.png": {
+   "sha256": "a54ed0bca1be7b3c6854051b0881d56f9ec030990c31e46b43bd9e60f6919935",
+   "integrity": "sha256-pU7QvKG+ezxoVAUbCIHVb57AMJkMMeRrQ72eYPaRmTU=",
+   "immutable": true
+  },
+  "icon-32-32f9bd06.png": {
+   "sha256": "32f9bd06926d7949847178f76761396c6bc5ef7557f9e38bf4a842987dafcfd9",
+   "integrity": "sha256-Mvm9BpJteUmEcXj3Z2E5bGvF73VX+eOL9KhCmH2vz9k=",
+   "immutable": true
+  },
+  "index.html": {
+   "sha256": "107c605d459a5a4efd66d3672494c82ddba6cd1755326088badbbb2d28fff456",
+   "integrity": "sha256-EHxgXUWaWk79ZtNnJJTILdumzRdVMmCIutu7LSj/9FY=",
+   "immutable": false,
+   "br": true,
+   "gz": true
+  },
+  "login-worker-MEH6LL6R.js": {
+   "sha256": "72b3adf271248b8914de48c4a404eda7f4a276fcd6c69270baeb76a6db88d77e",
+   "integrity": "sha256-crOt8nEki4kU3kjEpATtp/SidvzWxpJwuut2ptuI134=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "logo-5d3de0fd.svg": {
+   "sha256": "5d3de0fd56a69e57f107fb708f085cbe8cf8369b8459d92696e760bee248f2bd",
+   "integrity": "sha256-XT3g/VamnlfxB/twjwhcvoz4NpuEWdkmludgvuJI8r0=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "office-worker-CTNKFHEQ.js": {
+   "sha256": "e99c0e329fcebc528436986e3b09c1a8fc3d70443b5e2bc8f7c733242d83c9b3",
+   "integrity": "sha256-6ZwOMp/OvFKENphuOwnBqPw9cEQ7XivI98czJC2DybM=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "styles-5TSZXMTC.css": {
+   "sha256": "389c6178b5fc1f497e7635fdd80e699641346ccc95e6bb826431785c695fbe6a",
+   "integrity": "sha256-OJxheLX8H0l+djX92A5plkE0bMyV5ruCZDF4XGlfvmo=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "sw.js": {
+   "sha256": "23841b0b0c86cb0306a6a7009691e28506c6c6e3c382ffb29c98394c67216628",
+   "integrity": "sha256-I4QbCwyGywMGpqcAlpHihQbGxuPDgv+ynJg5TGchZig=",
+   "immutable": false,
+   "br": true,
+   "gz": true
+  },
+  "web-25WLHAHX.css": {
+   "sha256": "05b8270922167f1ea13668d5837e7241fc96867b240e8e0ac8d0d257c591c3df",
+   "integrity": "sha256-BbgnCSIWfx6hNmjVg35yQfyWhnskDo4KyNDSV8WRw98=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "web-YSREHAV2.js": {
+   "sha256": "7f6b58a7d5eb2a1b463338931bc5de99638677661285f8594115ba8dc80452eb",
+   "integrity": "sha256-f2tYp9XrKhtGMziTG8XemWOGd2YShfhZQRW6jcgEUus=",
+   "immutable": true,
+   "br": true,
+   "gz": true
+  },
+  "web.html": {
+   "sha256": "bc98e2804ec96972bc67186d44ddd3563055a88874efa3dbbcff6fe97db85183",
+   "integrity": "sha256-vJjigE7JaXK8ZxhtRN3TVjBVqIh076PbvP9v6X24UYM=",
+   "immutable": false,
+   "br": true,
+   "gz": true
+  }
+ }
+}

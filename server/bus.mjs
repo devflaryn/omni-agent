@@ -8,6 +8,8 @@ import { wireEvent, resultIn } from "./wire.mjs";
 
 /** Chat messages the session files hold: a page reads those through the history route, never from a replay. */
 const inFile = (ev) => ev.kind === "msg" && (ev.role === "assistant" || ev.role === "tool" || ev.role === "user");
+/** A turn's text as it is being written, which its message then holds whole. */
+const streamPart = (ev) => ev.kind === "delta" || ev.kind === "block";
 
 export class Bus extends EventEmitter {
   constructor({ ring = 4000 } = {}) {
@@ -43,15 +45,21 @@ export class Bus extends EventEmitter {
    * its bytes (megabytes, over the relay to a phone), the history route serves them from the file anyway, and
    * their usage counted again on top of /api/state's tally doubled the token totals. A reconnect gets exactly
    * what it missed, unless that is gone (the ring wrapped, or the server restarted and seq began again): then it
-   * is told to `resync` (reload its state) and gets the fresh replay.
+   * is told to `resync` (reload its state) and gets the fresh replay. The stream parts of a turn whose message has
+   * since gone by are in the file too: only a turn still running has parts the page cannot get elsewhere.
+   * All of it is one write, for over a channel each write is at least a sealed frame of its own.
    */
   addClient(res, since = 0, boot = "") {
     this.clients.add(res);
     const first = this.ring[0]?.seq ?? this.seq + 1;
     const lost = since > 0 && ((boot && boot !== this.boot) || since > this.seq || since < first - 1);
-    if (lost) res.write(`event: resync\ndata: ${JSON.stringify({ boot: this.boot, seq: this.seq })}\n\n`);
+    let out = lost ? `event: resync\ndata: ${JSON.stringify({ boot: this.boot, seq: this.seq })}\n\n` : "";
     const fresh = since <= 0 || lost;
-    for (const ev of this.ring) if (fresh ? !inFile(ev) : ev.seq > since) res.write(`data: ${JSON.stringify(wireEvent(ev))}\n\n`);
+    const lastInFile = new Map();
+    if (fresh) for (const ev of this.ring) if (inFile(ev)) lastInFile.set(ev.sid, ev.seq);
+    const wanted = (ev) => (fresh ? !inFile(ev) && !(streamPart(ev) && ev.seq < (lastInFile.get(ev.sid) ?? 0)) : ev.seq > since);
+    for (const ev of this.ring) if (wanted(ev)) out += `data: ${JSON.stringify(wireEvent(ev))}\n\n`;
+    if (out) res.write(out);
   }
 
   /** The full result of a tool call still in the ring (a live one the session file may not hold yet). */

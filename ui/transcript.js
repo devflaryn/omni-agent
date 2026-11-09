@@ -1,6 +1,12 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
 import { el, esc, md, showName, fmtN, fmtBytes, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, editDiff, diffCounts, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
-import { highlight, languageFor } from "./highlight.js";
+
+/** ui/highlight.js, once loaded. One import for every diff waiting on it. */
+let highlighter = null, highlighterLoading = null;
+const loadHighlighter = () => highlighterLoading ??= import("./highlight.js").then((m) => (highlighter = m), () => { highlighterLoading = null; });
+/** Escaped text either way: plain until the highlighter is here. */
+const highlight = (text, lang) => (highlighter ? highlighter.highlight(text, lang) : esc(text));
+const languageFor = (path) => (highlighter ? highlighter.languageFor(path) : "plain");
 
 const active = { view: null, timer: null };
 const THINK_KEY = "omni.thinking.open";
@@ -297,6 +303,8 @@ function renderDiff(c) {
   // A file tool's row already says which file; its JSON stays only when there is nothing better to show.
   c.args.hidden = !!rows || (c.label.kind === "read" && !!c.label.target);
   if (!rows) return;
+  // The highlighter is not the first screen's: a diff drawn before it has loaded is plain, and drawn again in colour once it has.
+  if (!highlighter) loadHighlighter().then(() => { if (highlighter && c.dv.isConnected !== false) renderDiff(c); });
   const lang = languageFor(d.path);
   const sign = { add: "+", del: "−", ctx: " " };
   let html = "";

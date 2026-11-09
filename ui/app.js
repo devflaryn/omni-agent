@@ -10,9 +10,12 @@ import { initResizers } from "./resizer.js";
 import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
 import { createRemote } from "./remote.js";
 import { createStream } from "./stream.js";
-import { createMissionView } from "./mission.js";
-import { api as machineApi, eventSource, isRemote, local, machineName, machineTitle, setMachine, streamEvents } from "./transport.js";
+import { api as machineApi, eventSource, isRemote, local, machine, machineName, machineTitle, setMachine, streamEvents } from "./transport.js";
 import { createAccount } from "./account.js";
+import { cachedModels, keepModels } from "./model-cache.js";
+
+/** How much of a chat's file a page asks for at a time, as the page receives it: the newest first, older as it is scrolled up. */
+const HISTORY_PAGE = 96 * 1024;
 
 const $ = (s) => document.querySelector(s);
 // agents: background agents by id (/api/state + live `agent` events); agentSids: an agent chat's sid → agent id;
@@ -79,7 +82,7 @@ function loadAgents(list, rev = agentRev) {
 // ------------------------------------------------------------- modules
 const openChat = (sid) => { selectSession(sid); showView("chat"); if (window.innerWidth < 1100) panel.setOpen(false); };
 const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat, agentFor });
-const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => history.render() });
+const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => { loadAllChats(); history.render(); } });
 // Reveal opens a window on the screen of the computer serving the files: never from a remote browser, or from a window on another machine.
 const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat"), isRemote: () => remote.role === "remote" || isRemote() });
 const account = createAccount({ toast, openSettings: () => settings.open("account") });
@@ -114,7 +117,15 @@ async function setPiThinking(level) {
     if (S.page === "home") renderHome(); else updateComposer();
   } catch (e) { toast(e.message, true); }
 }
+/** The picker gets the list last seen on this machine at once (ui/model-cache.js), then the real one when it comes. */
+const modelsKey = () => machine()?.id ?? "here";
+let modelsShown = false;
 async function loadPiChoices() {
+  if (!modelsShown) {
+    modelsShown = true;
+    const kept = cachedModels(modelsKey());
+    if (kept) { const choices = { models: kept.models, ...(kept.levels?.length ? { levels: kept.levels, labels: kept.labels || {} } : {}) }; home.setPiChoices(choices); chat.setPiChoices(choices); }
+  }
   const [m, l] = await Promise.allSettled([api("/api/pi/models"), api("/api/pi/thinking-levels")]);
   const choices = {};
   const models = m.status === "fulfilled" ? (m.value.data?.models || []) : [];
@@ -122,6 +133,7 @@ async function loadPiChoices() {
   if (m.status === "fulfilled") choices.models = models;
   if (levels.length) { choices.levels = levels; choices.labels = l.value.data?.labels || {}; }
   if (Object.keys(choices).length) { home.setPiChoices(choices); chat.setPiChoices(choices); }
+  if (m.status === "fulfilled") keepModels(modelsKey(), { models, levels: choices.levels, labels: choices.labels });
 }
 /** What the picker shows: the open chat's pi child when it has one, else the saved choice the next pi child will start with. */
 function piModelState() {
@@ -137,6 +149,7 @@ function setPiChats(list) {
   if (!Array.isArray(list)) return;
   S.piChats = new Map(list.filter((c) => c?.sid && c.sid !== "pi:pending").map((c) => [c.sid, c]));
 }
+/** The whole state: every chat, and the agents in full. */
 async function refreshState() { try { const rev = agentRev; const st = await api("/api/state"); for (const s of st.sessions || []) { S.sessions.set(s.sid, { ...(S.sessions.get(s.sid) || {}), ...s }); if (s.agentId) S.agentSids.set(s.sid, s.agentId); } if (st.boot) S.boot = st.boot; S.pi = st.pi; setPiChats(st.pis); S.runs = st.runs || []; S.hook = st.hook || S.hook; if (st.config) S.config = st.config; if (st.agents) { loadAgents(st.agents, rev); renderAgents(); } updateHeader(); if (S.page === "home") renderHome(); else updateComposer(); } catch { /* transient */ } }
 /** Goal hook settings live in omni.config.json through the server; the menu reflects the saved state. */
 async function setHook(patch) {
@@ -557,6 +570,7 @@ async function selectSession(sid, { reload = false } = {}) {
   const previous = S.view;
   if (S.view && !reload) finish(S.view);
   S.selected = sid;
+  loadAllChats(); // its agents may be older than the first screen's
   S.forceFork = false;
   history.render();
   const s0 = S.sessions.get(sid);
@@ -569,7 +583,7 @@ async function selectSession(sid, { reload = false } = {}) {
   if (s0?.cwd) explorer.setRoot(s0.cwd);
   try {
     const fetchedAt = Date.now();
-    const h = await api(`/api/sessions/${encodeURIComponent(sid)}/history`);
+    const h = await api(`/api/sessions/${encodeURIComponent(sid)}/history?page=${HISTORY_PAGE}`);
     if (S.selected !== sid) return;
     if (h.session) S.sessions.set(sid, { ...(S.sessions.get(sid) || {}), ...h.session, tally: h.tally || S.sessions.get(sid)?.tally });
     const s = S.sessions.get(sid);
@@ -580,7 +594,7 @@ async function selectSession(sid, { reload = false } = {}) {
     const events = withLiveReports(h.events, S.buffers.get(sid));
     for (const ev of events) { applyEvent(view, ev); if (ev.kind === "msg" && ev.id) seen.add(ev.id); }
     // A reopened chat gets its plan back from the plan tool's results in the file (live events keep it current after).
-    const histPlan = planFromEvents(h.events);
+    const histPlan = planFromEvents(h.events) || asPlan(h.plan); // a plan older than this page comes beside it
     if (histPlan && s && !((s.goalBox?.plan?.updatedAt || 0) > (histPlan.updatedAt || 0))) { goalBox(s).plan = histPlan; renderSummary(); }
     // Live events buffered while the chat was open elsewhere: skip messages the file already gave us.
     // Anything older than the fetch is already in the file. The one exception: a turn still streaming has
@@ -628,7 +642,7 @@ async function loadOlder(view) {
   view.loadingOlder = true; view.olderFailed = false;
   setOlder(view, "loading");
   try {
-    const h = await api(`/api/sessions/${encodeURIComponent(view.sid)}/history?before=${view.olderAt}`);
+    const h = await api(`/api/sessions/${encodeURIComponent(view.sid)}/history?before=${view.olderAt}&page=${HISTORY_PAGE}`);
     if (S.view !== view) return;
     const wrap = $("#transcriptWrap");
     // Keep what is on screen where it is: the page goes in above it.
@@ -678,11 +692,23 @@ $("#machineBtn").onclick = (e) => { e.stopPropagation(); account.openMenu(); };
 $("#machineBack").onclick = () => setMachine(null);
 document.addEventListener("click", (e) => { if (!e.target.closest("#machineMenu, #machineBtn")) $("#machineMenu").hidden = true; });
 // Missions: the orchestrator/worker view (ui/mission.js). Its badge counts unread notifications across missions.
-const missionView = createMissionView({
-  root: $("#view-mission"), api, toast, onOpenChat: (sid) => openChat(sid), sessionOf: (sid) => S.sessions.get(sid) || null,
-  defaultDir: () => homeCwd(), defaultModel: () => S.pi.state?.model?.id ? { provider: S.pi.state.model.provider || "", id: S.pi.state.model.id } : (S.config?.piModel ? { provider: S.config.piProvider || "", id: S.config.piModel } : null),
-});
-missionView.onBadge((n) => { const b = $("#missionsBadge"); b.hidden = !n; b.textContent = n > 99 ? "99+" : String(n); });
+// Its code (and the office's) is not the first screen's: it loads once that has painted, or at once when Missions is opened, and
+// what the stream says meanwhile waits for it in order.
+const missionView = (() => {
+  let view = null, loading = null;
+  const waiting = [];
+  const ready = () => loading ??= import("./mission.js").then(({ createMissionView }) => {
+    view = createMissionView({
+      root: $("#view-mission"), api, toast, onOpenChat: (sid) => openChat(sid), sessionOf: (sid) => S.sessions.get(sid) || null,
+      defaultDir: () => homeCwd(), defaultModel: () => S.pi.state?.model?.id ? { provider: S.pi.state.model.provider || "", id: S.pi.state.model.id } : (S.config?.piModel ? { provider: S.config.piProvider || "", id: S.config.piModel } : null),
+    });
+    view.onBadge((n) => { const b = $("#missionsBadge"); b.hidden = !n; b.textContent = n > 99 ? "99+" : String(n); });
+    for (const [name, args] of waiting.splice(0)) view[name](...args);
+    return view;
+  }, (e) => { loading = null; toast(`Missions could not load: ${e.message}`, true); throw e; });
+  const call = (name) => (...args) => { if (view) view[name](...args); else waiting.push([name, args]); };
+  return { ready, load: () => ready().then((v) => v.load()).catch(() => {}), onAgent: call("onAgent"), onMission: call("onMission"), onRemoved: call("onRemoved"), onNotify: call("onNotify"), onStatus: call("onStatus") };
+})();
 $("#btnMissions").onclick = () => showView("mission");
 
 // ------------------------------------------------------------------ SSE
@@ -788,7 +814,8 @@ async function init() {
     $(".hero").textContent = `What should ${machineName()} work on?`;
     updateTitle();
   }
-  const st = await api("/api/state");
+  // The first screen's state is the recent chats and what is running: one small answer. The rest follows once it has painted.
+  const st = await api("/api/state?first=1");
   S.config = st.config; S.pi = st.pi; setPiChats(st.pis); S.runs = st.runs || []; S.hook = st.hook || null; S.boot = st.boot || "";
   for (const s of st.sessions) { S.sessions.set(s.sid, s); if (s.agentId) S.agentSids.set(s.sid, s.agentId); }
   loadAgents(st.agents);
@@ -803,11 +830,24 @@ async function init() {
   }
   remote.init(st.access);
   if (!isRemote() && st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password (Settings → Remote); it is read-only there and every change waits for your approval"; }
-  await Promise.all([panel.loadMemory(""), panel.loadGraphList(), loadPiChoices()]);
   history.render();
   // #missions opens the Mission view (a link, a bookmark, the phone's home screen).
   showView(location.hash === "#missions" ? "mission" : "home");
   stream.start();
   setInterval(() => { if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "chat") updateComposer(); }, 15000);
+  afterFirstPaint(st.sessionsTotal > st.sessions.length);
+}
+/** What no part of the first screen waits for: the model list (shown from the last one seen until then), and Missions. */
+function afterFirstPaint(moreChats) {
+  allChatsLoaded = !moreChats;
+  loadPiChoices().catch(() => {});
+  const later = globalThis.requestIdleCallback ?? ((fn) => setTimeout(fn, 200));
+  later(() => missionView.ready().catch(() => {}));
+}
+/** Every chat and agent, once: when the chats drawer opens or a chat does, which is where the older ones are seen. */
+let allChatsLoaded = true, allChatsLoading = null;
+function loadAllChats() {
+  if (allChatsLoaded) return;
+  allChatsLoading ??= refreshState().then(() => { allChatsLoaded = true; history.render(); renderAgents(); }).finally(() => { allChatsLoading = null; });
 }
 init().catch((e) => { if (isRemote()) account.machineDown(e.message); else toast(`Omni Agent failed to start: ${e.message}`, true); });
