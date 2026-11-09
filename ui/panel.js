@@ -37,7 +37,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
       const win = s.harness === "claude" ? (/haiku/.test(s.model || "") ? 200000 : 1000000) : (getPiContextWindow() || 262144);
       const pct = Math.min(100, Math.round((t.context / win) * 100));
       const f = $("#ctxFill"); f.style.width = `${pct}%`; f.className = pct > 85 ? "hot" : pct > 60 ? "warn" : "";
-      $("#ctxLabel").textContent = `context ${fmtN(t.context)} of ${fmtN(win)} (${pct}%)${pct > 60 ? " – consider compacting or a fresh session" : ""}`;
+      $("#ctxLabel").textContent = `Context ${fmtN(t.context)} of ${fmtN(win)} (${pct}%)${pct > 60 ? ". A fresh chat would be sharper." : ""}`;
     } else { tiles.appendChild(el("div", "lead", "No token data for this chat yet.")); $("#ctxFill").style.width = "0"; $("#ctxLabel").textContent = ""; }
     const all = { input: 0, output: 0, cacheRead: 0, cost: 0, n: 0 };
     const today = new Date().setHours(0, 0, 0, 0);
@@ -49,10 +49,10 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
       all.input += x.tally.input; all.output += x.tally.output; all.cacheRead += x.tally.cacheRead; all.cost += x.tally.cost; all.n++;
     }
     const a = $("#statAll"); a.innerHTML = "";
-    a.append(tile("sessions", all.n), tile("input", fmtN(all.input)), tile("output", fmtN(all.output)), tile("cache read", fmtN(all.cacheRead)), tile("cost", `$${all.cost.toFixed(2)}`), tile("cache hit", all.input + all.cacheRead ? `${Math.round((all.cacheRead / (all.input + all.cacheRead)) * 100)}%` : "–"));
+    a.append(tile("chats", all.n), tile("input", fmtN(all.input)), tile("output", fmtN(all.output)), tile("cache read", fmtN(all.cacheRead)), tile("cost", `$${all.cost.toFixed(2)}`), tile("cache hit", all.input + all.cacheRead ? `${Math.round((all.cacheRead / (all.input + all.cacheRead)) * 100)}%` : "–"));
     const top = $("#statTop"); top.innerHTML = "";
     for (const x of ranked.sort((p, q) => q.tally.cost - p.tally.cost || q.tally.total - p.tally.total).slice(0, 10)) {
-      const r = el("div", "row"); r.append(el("span", null, `${harnessLabel(x.harness)} · ${(x.title || x.sid).slice(0, 60)}`), el("span", null, `${fmtN(x.tally.total)} tok  $${x.tally.cost.toFixed(2)}`));
+      const r = el("div", "row"); r.title = harnessLabel(x.harness); r.append(el("span", null, (x.title || x.sid).slice(0, 60)), el("span", null, `${fmtN(x.tally.total)} tokens, $${x.tally.cost.toFixed(2)}`));
       r.onclick = () => onSelect(x.sid);
       top.appendChild(r);
     }
@@ -66,7 +66,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
       const notes = q ? data.hits : data.notes.filter((n) => !n.path.startsWith("Graphs/"));
       if (!q) S.memCount = notes.length;
       list.innerHTML = "";
-      if (!notes.length) list.appendChild(el("div", "lead", q ? "No notes match." : "The vault is empty. Save a memory, import Claude's, or let a session digest land here."));
+      if (!notes.length) list.appendChild(el("div", "lead", q ? "No notes match." : "No memories yet."));
       for (const n of notes) {
         const d = el("div", "note");
         const name = el("div", "n-name", n.name); name.dataset.type = n.type || "";
@@ -74,7 +74,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
         d.onclick = () => openNote(n.path);
         list.appendChild(d);
       }
-    } catch (e) { toast(e.message, true); }
+    } catch (e) { list.replaceChildren(el("div", "lead err", `Memory did not load. ${e.message}`)); }
   }
   async function openNote(path) {
     try { const n = await api(`/api/memory/note?path=${encodeURIComponent(path)}`); $("#memPath").textContent = path; $("#memText").value = n.raw; $("#memEditor").hidden = false; $("#memForm").hidden = true; $("#memList").hidden = true; }
@@ -82,32 +82,38 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
   }
   function closeNote() { $("#memEditor").hidden = true; $("#memForm").hidden = true; $("#memList").hidden = false; }
   $("#memSearch").addEventListener("input", () => { clearTimeout(window._ms); window._ms = setTimeout(() => loadMemory($("#memSearch").value.trim()), 250); });
+  // The quieter actions live behind ⋯, so the tab has one primary button.
+  const memMenu = $("#memMenu");
+  $("#memMore").onclick = (e) => { e.stopPropagation(); memMenu.hidden = !memMenu.hidden; };
+  memMenu.addEventListener("click", () => { memMenu.hidden = true; });
+  document.addEventListener("click", (e) => { if (!e.target.closest("#memMenu, #memMore")) memMenu.hidden = true; });
   $("#memNew").onclick = () => { $("#memForm").hidden = false; $("#memEditor").hidden = true; $("#memList").hidden = true; $("#mfName").focus(); };
   $("#mfCancel").onclick = closeNote;
-  $("#mfSave").onclick = async () => { try { const r = await api("/api/memory/save", { name: $("#mfName").value, description: $("#mfDesc").value, type: $("#mfType").value, body: $("#mfBody").value }); toast(`Saved ${r.path}`); $("#mfName").value = $("#mfDesc").value = $("#mfBody").value = ""; closeNote(); loadMemory(""); } catch (e) { toast(e.message, true); } };
-  $("#memSave").onclick = async () => { try { await api("/api/memory/note", { path: $("#memPath").textContent, text: $("#memText").value }, "PUT"); toast("Note saved"); loadMemory($("#memSearch").value.trim()); } catch (e) { toast(e.message, true); } };
-  $("#memDelete").onclick = async () => { const p = $("#memPath").textContent; if (!confirm(`Delete ${p}${where()}?`)) return; try { await api(`/api/memory/note?path=${encodeURIComponent(p)}`, null, "DELETE"); toast("Note deleted"); closeNote(); loadMemory(""); } catch (e) { toast(e.message, true); } };
+  $("#mfSave").onclick = async () => { try { const r = await api("/api/memory/save", { name: $("#mfName").value, description: $("#mfDesc").value, type: $("#mfType").value, body: $("#mfBody").value }); $("#mfName").value = $("#mfDesc").value = $("#mfBody").value = ""; closeNote(); loadMemory(""); } catch (e) { toast(e.message, true); } };
+  $("#memSave").onclick = async () => { try { await api("/api/memory/note", { path: $("#memPath").textContent, text: $("#memText").value }, "PUT"); toast("Saved"); loadMemory($("#memSearch").value.trim()); } catch (e) { toast(e.message, true); } };
+  $("#memDelete").onclick = async () => { const p = $("#memPath").textContent; if (!confirm(`Delete ${p}${where()}?`)) return; try { await api(`/api/memory/note?path=${encodeURIComponent(p)}`, null, "DELETE"); closeNote(); loadMemory(""); } catch (e) { toast(e.message, true); } };
   $("#memClose").onclick = closeNote;
-  $("#memImport").onclick = async () => { try { const r = await api("/api/memory/import-claude", {}); toast(`Imported ${r.imported.length} Claude memory notes`); loadMemory(""); } catch (e) { toast(e.message, true); } };
-  $("#memReindex").onclick = async () => { try { const r = await api("/api/memory/reindex", {}); toast(`Index rebuilt: ${r.notes} notes`); } catch (e) { toast(e.message, true); } };
+  $("#memImport").onclick = async () => { try { const r = await api("/api/memory/import-claude", {}); toast(`Imported ${r.imported.length} notes from Claude Code`); loadMemory(""); } catch (e) { toast(e.message, true); } };
+  $("#memReindex").onclick = async () => { try { const r = await api("/api/memory/reindex", {}); toast(`Index rebuilt with ${r.notes} notes`); } catch (e) { toast(e.message, true); } };
   $("#memOpen").onclick = () => api("/api/memory/open-vault", {}).catch((e) => toast(e.message, true));
-  $("#memDigest").onclick = async () => { if (!S.selected) return toast("Open a chat first", true); try { const r = await api("/api/memory/digest", { sid: S.selected }); toast(`Digest written: ${r.path}`); loadMemory(""); } catch (e) { toast(e.message, true); } };
+  $("#memDigest").onclick = async () => { if (!S.selected) return toast("Open a chat first", true); try { const r = await api("/api/memory/digest", { sid: S.selected }); toast(`Digest saved to ${r.path}`); loadMemory(""); } catch (e) { toast(e.message, true); } };
 
   // ----------------------------------------------------------------- graph
   const G = { dir: null, data: null, pos: new Map(), sel: null, view: { x: 0, y: 0, k: 1 }, drag: null, raf: 0, ticks: 0 };
   async function loadGraph() {
     const dir = currentDir();
-    $("#graphDir").textContent = dir ? `Repo: ${dir}` : "Pick a chat or set a working directory on Home; that folder is the repo.";
+    $("#graphDir").textContent = dir ? `Repo ${dir.replace(/\\/g, "/").split("/").filter(Boolean).slice(-2).join("/")}` : "Open a chat or pick a folder on Home. That folder is the repo.";
+    $("#graphDir").title = dir || "";
     if (!dir) return;
     G.dir = dir;
     try {
       const d = await api(`/api/graph/data?dir=${encodeURIComponent(dir)}&limit=${Number($("#graphLimit").value) || 150}&q=${encodeURIComponent($("#graphFilter").value.trim())}`);
       G.data = d;
-      $("#graphTotals").textContent = `${d.totals.nodes} nodes, ${d.totals.links} links, ${d.totals.communities} communities; showing the ${d.nodes.length} best-connected.`;
+      $("#graphTotals").textContent = `${d.totals.nodes} nodes, ${d.totals.links} links and ${d.totals.communities} communities. Showing the ${d.nodes.length} best connected.`;
       layoutGraph();
     } catch (e) {
       G.data = null; drawGraph();
-      $("#graphTotals").textContent = /no graph/.test(e.message) ? "No graph for this folder yet. Build one (takes seconds, no LLM)." : e.message;
+      $("#graphTotals").textContent = /no graph/.test(e.message) ? "No graph for this folder yet. Building one takes seconds and calls no model." : e.message;
     }
   }
   function layoutGraph() {
@@ -191,8 +197,8 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
   async function loadGraphList() { try { S.graphs = (await api("/api/graph/list")).graphs || []; } catch { S.graphs = []; } }
   $("#graphBuild").onclick = async () => {
     const dir = currentDir(); if (!dir) return;
-    $("#graphBuild").disabled = true; $("#graphTotals").textContent = "Building… (graphify update + clustering)";
-    try { const r = await api("/api/graph/build", { dir }); toast(`Graph built: ${r.nodes} nodes, ${r.notes} notes in vault/${r.vault}`); await loadGraphList(); await loadGraph(); }
+    $("#graphBuild").disabled = true; $("#graphTotals").textContent = "Building…";
+    try { const r = await api("/api/graph/build", { dir }); toast(`Graph built with ${r.nodes} nodes, and ${r.notes} notes in vault/${r.vault}`); await loadGraphList(); await loadGraph(); }
     catch (e) { toast(e.message, true); $("#graphTotals").textContent = e.message; }
     finally { $("#graphBuild").disabled = false; }
   };
@@ -203,7 +209,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
   $("#graphAsk").onclick = async () => {
     const q = $("#graphQ").value.trim(); const dir = currentDir(); if (!q || !dir) return;
     $("#graphAnswer").hidden = false; $("#graphAnswer").textContent = "Asking the graph…";
-    try { const r = await api("/api/graph/query", { dir, question: q }); $("#graphAnswer").textContent = r.answer || "(no answer)"; } catch (e) { $("#graphAnswer").textContent = e.message; }
+    try { const r = await api("/api/graph/query", { dir, question: q }); $("#graphAnswer").textContent = r.answer || "No answer."; } catch (e) { $("#graphAnswer").textContent = e.message; }
   };
   $("#graphQ").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#graphAsk").click(); });
 

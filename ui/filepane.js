@@ -117,11 +117,11 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
     for (const t of tabs) {
       const tab = el("div", `pv-tab${t === active ? " active" : ""}${t.pinned ? "" : " transient"}${t.dirty ? " dirty" : ""}`);
       tab.setAttribute("role", "tab"); tab.setAttribute("aria-selected", String(t === active));
-      tab.title = showName(absPath(t.root, t.path)) + (t.dirty ? " · unsaved" : "");
+      tab.title = showName(absPath(t.root, t.path)) + (t.dirty ? " (unsaved)" : "");
       tab.innerHTML = fileIcon(t.name);
       tab.appendChild(el("span", "pv-tab-name", showName(t.name)));
       if (count[t.name] > 1) tab.appendChild(el("span", "pv-tab-dir", showName(t.path.split("/").slice(-2, -1)[0] || "/")));
-      const x = el("button", "pv-tab-x"); x.title = t.dirty ? "Unsaved · close" : "Close"; x.setAttribute("aria-label", `Close ${showName(t.name)}`);
+      const x = el("button", "pv-tab-x"); x.title = t.dirty ? "Close (unsaved)" : "Close"; x.setAttribute("aria-label", `Close ${showName(t.name)}`);
       x.innerHTML = `<svg viewBox="0 0 16 16"><path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/></svg>`;
       x.onclick = (e) => { e.stopPropagation(); close(t); };
       tab.appendChild(x);
@@ -130,16 +130,16 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
       tab.onauxclick = (e) => { if (e.button === 1) { e.preventDefault(); close(t); } };
       onContext(tab, (cx, cy) => showMenu(cx, cy, [
         { label: "Close", action: () => close(t) },
-        { label: "Close Others", action: () => closeMany(tabs.filter((o) => o !== t)), disabled: tabs.length < 2 },
-        { label: "Close Saved", action: () => closeMany(tabs.filter((o) => !o.dirty)) },
-        { label: "Close All", action: () => closeMany(tabs) },
+        { label: "Close others", action: () => closeMany(tabs.filter((o) => o !== t)), disabled: tabs.length < 2 },
+        { label: "Close saved", action: () => closeMany(tabs.filter((o) => !o.dirty)) },
+        { label: "Close all", action: () => closeMany(tabs) },
         "-",
-        { label: "Keep Open", action: () => { t.pinned = true; drawTabs(); }, disabled: t.pinned },
-        { label: "Reload from Disk", action: () => refreshFromDisk(t, { ask: true }) },
+        { label: "Keep open", action: () => { t.pinned = true; drawTabs(); }, disabled: t.pinned },
+        { label: "Reload from disk", action: () => refreshFromDisk(t, { ask: true }) },
         "-",
-        { label: "Copy Path", action: () => copy(absPath(t.root, t.path)) },
-        { label: "Copy Relative Path", action: () => copy(t.path) },
-        { label: "Reveal in Explorer View", action: () => revealInTree?.(t.root, t.path) },
+        { label: "Copy path", action: () => copy(absPath(t.root, t.path)) },
+        { label: "Copy relative path", action: () => copy(t.path) },
+        { label: "Show in the file tree", action: () => revealInTree?.(t.root, t.path) },
       ]));
       tabsBar.appendChild(tab);
       if (t === active) requestAnimationFrame(() => tab.scrollIntoView({ block: "nearest", inline: "nearest" }));
@@ -184,19 +184,19 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
     const i = t.info || {};
     const textual = i.kind === "text" || i.kind === "markdown";
     return [
-      textual && !i.tooBig && t.mode !== "edit" && { label: "Open in Editor", action: () => setMode(t, "edit") },
-      t.mode !== "text" && i.kind !== "archive" && { label: textual ? "Open as Plain Text (read-only)" : "Open as Text (read-only)", action: () => setMode(t, "text") },
-      t.mode !== "hex" && { label: "Open in Hex Viewer", action: () => setMode(t, "hex") },
+      textual && !i.tooBig && t.mode !== "edit" && { label: "Open in editor", action: () => setMode(t, "edit") },
+      t.mode !== "text" && i.kind !== "archive" && { label: textual ? "Open as plain text (read-only)" : "Open as text (read-only)", action: () => setMode(t, "text") },
+      t.mode !== "hex" && { label: "Open in hex viewer", action: () => setMode(t, "hex") },
       !textual && t.mode !== defaultMode(i) && { label: `Back to the ${defaultMode(i)} view`, action: () => setMode(t, defaultMode(i)) },
       "-",
-      { label: "Reload from Disk", action: () => refreshFromDisk(t, { ask: true }) },
+      { label: "Reload from disk", action: () => refreshFromDisk(t, { ask: true }) },
       { label: "Download", action: () => download(t.root, t.path) },
-      { label: "Reference in Prompt", action: () => insert(`@${t.path} `) },
+      { label: "Reference in message", action: () => insert(`@${t.path} `) },
       "-",
-      { label: "Copy Path", action: () => copy(absPath(t.root, t.path)) },
-      { label: "Copy Relative Path", action: () => copy(t.path) },
-      { label: "Reveal in Explorer View", action: () => revealInTree?.(t.root, t.path) },
-      { label: document.body.classList.contains("preview-max") ? "Restore Editor Size" : "Maximize Editor", action: toggleMax },
+      { label: "Copy path", action: () => copy(absPath(t.root, t.path)) },
+      { label: "Copy relative path", action: () => copy(t.path) },
+      { label: "Show in the file tree", action: () => revealInTree?.(t.root, t.path) },
+      { label: document.body.classList.contains("preview-max") ? "Restore editor size" : "Maximize editor", action: toggleMax },
     ];
   }
   function drawStatus() {
@@ -284,7 +284,7 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
       const textual = t.info.kind === "text" || t.info.kind === "markdown";
       t.view.appendChild(banner(textual
         ? `Read-only${d.truncated ? `: the first ${fmtBytes(d.content.length)} of ${fmtBytes(d.size)}` : ""}.`
-        : `Read-only: this file is binary, shown as ${t.textEncoding === "latin1" ? "Latin-1 (every byte as one character)" : "UTF-8 (bytes that are not text appear as �)"}${d.truncated ? `, first ${fmtBytes(TEXT_LIMIT)} only` : ""}. Looking never changes the file.`, "note"));
+        : `Read-only. This file is binary, shown as ${t.textEncoding === "latin1" ? "Latin-1 (every byte as one character)" : "UTF-8 (bytes that are not text appear as �)"}${d.truncated ? `, first ${fmtBytes(TEXT_LIMIT)} only` : ""}. Looking never changes the file.`, "note"));
       const ed = createEditor({ value: d.content, lang: textual ? languageFor(t.name) : "plain", readOnly: true, onCursor: () => { if (t === active) drawStatus(); } });
       t.editor = ed; t.view.appendChild(ed.el);
       if (t === active) drawHead();
@@ -349,7 +349,7 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
     c.appendChild(el("div", "pv-binary-title", line || "This file is binary or in an encoding the editor does not read."));
     c.appendChild(el("div", "pv-binary-sub", `${t.info?.ext || "no extension"} · ${fmtBytes(t.info?.size)}. Opening it below is read-only and never changes the file.`));
     const row = el("div", "pv-binary-actions");
-    row.append(button("Open as Text", () => setMode(t, "text"), { primary: true }), button("Hex Viewer", () => setMode(t, "hex")), button("Download", () => download(t.root, t.path)));
+    row.append(button("Open as text", () => setMode(t, "text"), { primary: true }), button("Hex viewer", () => setMode(t, "hex")), button("Download", () => download(t.root, t.path)));
     for (const b of row.children) b.classList.remove("quiet");
     c.appendChild(row);
     return c;
@@ -376,7 +376,7 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
       row.innerHTML = `${fileIcon(n.name)}<span class="name"></span><span class="size"></span>`;
       row.querySelector(".name").textContent = showName(depth === -1 ? n.path : n.name);
       row.querySelector(".size").textContent = fmtBytes(n.size);
-      row.title = `${showName(n.path)} · ${fmtBytes(n.size)} (${fmtBytes(n.compressed)} compressed)`;
+      row.title = `${showName(n.path)}, ${fmtBytes(n.size)} (${fmtBytes(n.compressed)} compressed)`;
       row.onclick = () => openEntry(t, n.entry, out, box);
       return row;
     };
@@ -387,7 +387,7 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
       row.innerHTML = `<span class="ico">${ICONS.folder}</span><span class="name"></span><span class="size"></span>`;
       row.querySelector(".name").textContent = showName(n.name);
       row.querySelector(".size").textContent = `${n.count}`;
-      row.title = `${showName(n.path)} · ${n.count} file${n.count === 1 ? "" : "s"}`;
+      row.title = `${showName(n.path)}, ${n.count} file${n.count === 1 ? "" : "s"}`;
       kids.hidden = true;
       let built = false;
       row.onclick = () => { kids.hidden = !kids.hidden; row.querySelector(".ico").innerHTML = kids.hidden ? ICONS.folder : ICONS.folderOpen; if (!built) { built = true; for (const k of n.children) kids.appendChild(k.dir ? folderNode(k, depth + 1) : entryRow(k, depth + 1)); } };

@@ -47,16 +47,16 @@ export function createMcpSettings({ api, toast, onChanged, where = () => "" }) {
 
   async function load() {
     let r;
-    try { r = await api("/api/mcp"); } catch (e) { toast(e.message, true); return; }
+    try { r = await api("/api/mcp"); } catch (e) { list.replaceChildren(el("p", "rm-note err", `MCP servers did not load. ${e.message}`)); return; }
     servers = r.servers || [];
-    f.file.textContent = r.file || "";
+    f.file.textContent = String(r.file || "").split(/[\\/]+/).filter(Boolean).slice(-2).join("/"); f.file.title = r.file || "";
     if (editing && servers.some((s) => s.name === editing)) edit(editing);
     else if (servers.length) edit(servers[0].name);
     else startNew();
   }
   function summary(s) {
     const where = s.type === "http" ? (() => { try { return new URL(s.url).host; } catch { return s.url; } })() : [s.command, ...s.args].join(" ");
-    return [s.type, where, s.disabled ? "off" : tested.get(s.name)].filter(Boolean).join(" · ");
+    return [s.type, where, s.disabled ? "off" : tested.get(s.name)].filter(Boolean).join(", ");
   }
   function renderList() {
     list.innerHTML = "";
@@ -111,12 +111,12 @@ export function createMcpSettings({ api, toast, onChanged, where = () => "" }) {
   }
   async function save() {
     const name = f.name.value.trim();
-    if (!name) { toast("give the server a name", true); f.name.focus(); return; }
+    if (!name) { toast("Give the server a name", true); f.name.focus(); return; }
     f.save.disabled = true;
     try {
       const r = await api(`/api/mcp/${encodeURIComponent(name)}`, { ...body(), ...(editing && editing !== name ? { rename: editing } : {}) }, "PUT");
       if (editing && editing !== name) tested.delete(editing);
-      toast(r.restarted ? `Saved ${name} · OpenCode reloaded to connect` : r.restartPending ? `Saved ${name} · OpenCode reloads once the chats are idle` : `Saved ${name} · OpenCode connects on its next start`);
+      toast(r.restarted ? `Saved ${name}. OpenCode reloaded to connect.` : r.restartPending ? `Saved ${name}. OpenCode reloads once the chats are idle.` : `Saved ${name}. OpenCode connects on its next start.`);
       editing = name;
       await load();
       onChanged?.();
@@ -135,7 +135,7 @@ export function createMcpSettings({ api, toast, onChanged, where = () => "" }) {
         f.out.textContent = r.error;
         if (editing) tested.set(editing, "failed");
       } else {
-        f.out.append(el("div", null, `Connected${r.server ? ` to ${r.server}` : ""} · ${r.tools.length} tool${r.tools.length === 1 ? "" : "s"}`));
+        f.out.append(el("div", null, `Connected${r.server ? ` to ${r.server}` : ""}, ${r.tools.length} tool${r.tools.length === 1 ? "" : "s"}`));
         const ul = el("ul");
         for (const t of r.tools) {
           const li = el("li");
@@ -151,8 +151,8 @@ export function createMcpSettings({ api, toast, onChanged, where = () => "" }) {
     finally { f.test.disabled = false; }
   }
   async function remove() {
-    if (!editing || !window.confirm(`Remove MCP server "${editing}"${where()}? OpenCode reloads without its tools.`)) return;
-    try { await api(`/api/mcp/${encodeURIComponent(editing)}`, null, "DELETE"); toast(`Removed ${editing}`); tested.delete(editing); editing = null; await load(); onChanged?.(); }
+    if (!editing || !window.confirm(`Remove MCP server "${editing}"${where()}?\n\nOpenCode reloads without its tools.`)) return;
+    try { await api(`/api/mcp/${encodeURIComponent(editing)}`, null, "DELETE"); tested.delete(editing); editing = null; await load(); onChanged?.(); }
     catch (e) { toast(e.message, true); }
   }
   function fillFromPaste() {
@@ -161,7 +161,7 @@ export function createMcpSettings({ api, toast, onChanged, where = () => "" }) {
       const type = String(s.type || (s.url ? "http" : "stdio")).toLowerCase();
       fill({ type: type === "stdio" ? "stdio" : "http", command: s.command, args: (s.args || []).map(String), env: s.env, cwd: s.cwd, url: s.url, headers: s.headers, timeoutSec: s.timeoutSec, disabled: s.disabled });
       if (name && !editing) f.name.value = name;
-      f.pasteHint.textContent = type === "sse" ? "SSE servers are not supported; this one may also accept http on the same URL" : "Filled. Check it, then Save.";
+      f.pasteHint.textContent = type === "sse" ? "SSE servers are not supported. This one may also accept http on the same URL." : "Filled. Check it, then Save.";
       f.paste.value = "";
       f.pasteBox.open = false;
     } catch (e) { f.pasteHint.textContent = e.message; }

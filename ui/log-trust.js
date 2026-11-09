@@ -13,19 +13,19 @@ const encoder = new TextEncoder();
 // ---------------------------------------------------------------------------------- alerts
 
 export const ALERT_TEXT = Object.freeze({
-  rollback: "The hub offered an older copy of the device list than this computer already has. It was refused: someone may be hiding a removal.",
-  fork: "The hub showed a device list that differs from this computer's at the same position. It was refused: the hub may be showing different lists to different devices.",
+  rollback: "The hub offered an older copy of the device list than this computer already has. It was refused, because someone may be hiding a removal.",
+  fork: "The hub showed a device list that differs from this computer's at the same position. It was refused, because the hub may be showing different lists to different devices.",
   "different-account": "The hub showed the device list of a different account. It was refused.",
   "bad-log": "A device list failed its signature checks and was refused.",
   "fake-log": "This computer was told it was approved, but the device list does not follow the approval code it was shown. It was refused, and this computer stays out of the account.",
-  "log-unreconciled": "Another device has a device list this computer cannot get from the hub. The channel was refused: the hub may be hiding a change.",
+  "log-unreconciled": "Another device has a device list this computer cannot get from the hub. The channel was refused, because the hub may be hiding a change.",
   removed: "This device is no longer on the account.",
   recovered: "A device recovered this account with the recovery code. If that was not you, your recovery code is out and that device has full control.",
   "channel-failure": "An encrypted channel failed its check and was closed. A frame was changed, lost or replayed on the way.",
   "approval-failed": "An approval exchange failed its check and was abandoned. No code from it is shown.",
   "bad-anchor": "The hub could not show that it holds the account your password belongs to. This computer did not sign in, and nothing was changed.",
   "refused-by-device": "A device on your account refused this computer, so the two hold different device lists. The hub may be hiding a change from one of them, or this computer may have been removed.",
-  "hub-says-removed": "The hub says this device was removed from the account. This computer's own device list does not show that, so do not forget this device on the hub's word alone: check under Settings → Account → Devices on another device first.",
+  "hub-says-removed": "The hub says this device was removed from the account. This computer's own device list does not show that, so do not forget this device on the hub's word alone. Check Settings → Account → Devices on another device first.",
   "key-unavailable": "This computer's account keys could not be opened. Nothing was changed. To start over, sign out and forget this device.",
 });
 

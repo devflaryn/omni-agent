@@ -3,7 +3,7 @@
    started it (nestSessions). With one machine it looks as it did before accounts: no machine headers. */
 import { el, groupLabel, nestSessions, agentTag, harnessLabel } from "./lib.js";
 
-const NOTE = { offline: "offline", refusing: "does not let web pages in", loading: "loading…" };
+const NOTE = { offline: "offline", refusing: "does not let web pages in", loading: "Loading…" };
 /** Chats per machine in the All machines view, so every machine's name is on screen at once. */
 const PER_MACHINE = 6;
 
@@ -83,7 +83,7 @@ export function createHistory({ groups, machines, selected, onSelect, onNew, onD
         const b = el("button", `hist${on ? " active" : ""}${isLive(s) ? " live" : ""}`);
         b.dataset.h = s.harness;
         b.dataset.machine = m.key;
-        b.title = `${many ? `${m.label} · ` : ""}${tag ? `${tag} · ` : ""}${harnessLabel(s.harness)} · ${s.cwd || ""}${s.forkedFrom ? " · forked" : ""}`;
+        b.title = [many ? m.label : "", tag, harnessLabel(s.harness), s.cwd || "", s.forkedFrom ? "forked" : ""].filter(Boolean).join(", ");
         b.textContent = titleOf(s);
         if (tag) b.appendChild(el("span", "own agent", tag));
         else if (s.harness === "claude") b.appendChild(el("span", "own", "Claude Code"));

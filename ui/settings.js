@@ -24,24 +24,51 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   let keyFor = null; // the OpenCode provider id whose key the form edits (key mode), or null
 
   const mcp = createMcpSettings({ api, toast, onChanged, where });
-  // Four tabs in one dialog: the models OpenCode can use, the MCP servers it connects to, remote access (host only) and long runs.
-  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody"), sub: $("#subModels") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody"), sub: $("#subMcp") }, remote: { btn: $("#tabRemote"), body: $("#remoteBody"), sub: $("#subRemote") }, long: { btn: $("#tabLong"), body: $("#longBody"), sub: $("#subLong") }, account: { btn: $("#tabAccount"), body: $("#accountBody"), sub: $("#subAccount") } };
+  // The tabs of one dialog: the models OpenCode can use, the MCP servers it connects to, remote access (host only), long runs,
+  // the account and how the app looks. Each tab is its label and its controls; any longer explanation sits behind "How this works".
+  const tabs = { models: { btn: $("#tabModels"), body: $("#provBody") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody") }, remote: { btn: $("#tabRemote"), body: $("#remoteBody") }, long: { btn: $("#tabLong"), body: $("#longBody") }, account: { btn: $("#tabAccount"), body: $("#accountBody") }, appearance: { btn: $("#tabAppearance"), body: $("#appearanceBody") } };
+  for (const k of Object.keys(tabs)) if (!tabs[k].btn || !tabs[k].body) delete tabs[k];
   let tab = "models";
   function showTab(name) {
+    if (!tabs[name]) name = "models";
     tab = name;
     for (const [k, t] of Object.entries(tabs)) {
       const on = k === name;
       t.btn.classList.toggle("active", on); t.btn.setAttribute("aria-selected", String(on));
-      t.body.hidden = !on; t.sub.hidden = !on;
+      t.body.hidden = !on;
     }
     onTab?.(name);
-    if (name === "mcp") mcp.load(); else if (name === "remote") loadRemote?.(); else if (name === "long") renderLong(); else if (name === "account") loadAccount?.(); else load();
+    if (name === "mcp") mcp.load(); else if (name === "remote") loadRemote?.(); else if (name === "long") renderLong(); else if (name === "account") loadAccount?.(); else if (name === "appearance") renderAppearance(); else load();
   }
-  tabs.models.btn.onclick = () => showTab("models");
-  tabs.mcp.btn.onclick = () => showTab("mcp");
-  tabs.remote.btn.onclick = () => showTab("remote");
-  tabs.long.btn.onclick = () => showTab("long");
-  tabs.account.btn.onclick = () => showTab("account");
+  for (const [k, t] of Object.entries(tabs)) t.btn.onclick = () => showTab(k);
+
+  // ------------------------------------------------------------ appearance
+  /** Dark (the default), Light, or System. ui/theme.js applies it before the first paint; this is only the control. */
+  function renderAppearance() {
+    const body = tabs.appearance.body;
+    const theme = globalThis.omniTheme;
+    body.innerHTML = "";
+    const wrap = el("div", "rm-wrap");
+    const sec = el("section", "rm-sec");
+    sec.appendChild(el("h3", null, "Theme"));
+    const row = el("div", "dlg-tabs");
+    row.setAttribute("role", "radiogroup");
+    row.setAttribute("aria-label", "Theme");
+    const now = theme?.get() ?? "dark";
+    for (const [value, label] of [["dark", "Dark"], ["light", "Light"], ["system", "System"]]) {
+      const b = el("button", `seg-btn${now === value ? " active" : ""}`, label);
+      b.type = "button";
+      b.dataset.theme = value;
+      b.setAttribute("role", "radio");
+      b.setAttribute("aria-checked", String(now === value));
+      b.onclick = () => { theme?.set(value); renderAppearance(); };
+      row.appendChild(b);
+    }
+    sec.appendChild(row);
+    sec.appendChild(el("p", "rm-note", "System follows this device's light or dark setting."));
+    wrap.appendChild(sec);
+    body.appendChild(wrap);
+  }
 
   // ------------------------------------------------------------ long runs
   function renderLong() {
@@ -54,45 +81,60 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
     const row = el("label", "lr-row");
     const k = el("input");
     k.type = "number"; k.min = "0"; k.step = "1"; k.id = "lrCompact"; k.value = String(compactAtK(ctx.compactAt));
-    row.append("Compact chats at", k, "k tokens", el("span", "pf-note", "0 = off"));
+    row.append("Compact chats at", k, "k tokens", el("span", "pf-note", "0 turns it off"));
     sec.appendChild(row);
-    sec.appendChild(el("p", "rm-note", "Omni has OpenCode summarize the older part of a chat once its prompt reaches this size, so a long run keeps a sharp model instead of filling the model's whole window. It applies to every model with a larger window; smaller ones keep OpenCode's own limit."));
     const chk = el("label", "lr-check");
     const cb = el("input");
     cb.type = "checkbox"; cb.id = "lrAuto"; cb.checked = ctx.autoContinue !== false;
     chk.append(cb, "Keep going when the model stops for context");
     sec.appendChild(chk);
-    sec.appendChild(el("p", "rm-note", "Models sometimes stop mid-task to say their context is nearly full. Omni then compacts if it needs to and tells the model to carry on, even with the goal hook off. A question to you, a finished answer or your Stop is left alone."));
+    const how = el("details", "how");
+    how.append(el("summary", null, "How this works"),
+      el("p", null, "Once a chat's prompt reaches this size, OpenCode summarizes its older part, so a long run keeps a sharp model instead of filling the whole window. It applies to models with a larger window. Smaller ones keep OpenCode's own limit. A new size applies from each chat's next message."),
+      el("p", null, "Models sometimes stop mid-task to say their context is nearly full. With the box ticked, the chat is compacted if needed and the model is told to carry on, even with the goal hook off. A question to you, a finished answer or your Stop is left alone."));
+    sec.appendChild(how);
     const save = el("button", "btn primary", "Save");
+    const saved = el("span", "rm-note saved-note");
     save.onclick = async () => {
       const p = compactAtFromField(k.value, ctx.compactAt);
-      if (p.error) { toast(p.error, true); k.focus(); return; }
+      if (p.error) { flash(saved, p.error, true); k.focus(); return; }
       const patch = { compactAt: p.compactAt, autoContinue: cb.checked };
       save.disabled = true;
       try {
         const r = await api("/api/context", patch, "PUT");
-        const saved = r.context || { ...ctx, ...patch };
-        onContext?.(saved);
-        ctx.compactAt = saved.compactAt;
-        k.value = String(compactAtK(saved.compactAt));
-        toast(`${saved.compactAt ? `Chats compact at ${compactAtK(saved.compactAt)}k tokens` : "Compaction cap off"} · ${saved.autoContinue ? "keeps going on context stops" : "context stops are left alone"}`);
-      } catch (e) { toast(e.message, true); }
+        const kept = r.context || { ...ctx, ...patch };
+        onContext?.(kept);
+        ctx.compactAt = kept.compactAt;
+        k.value = String(compactAtK(kept.compactAt));
+        flash(saved, "Saved");
+      } catch (e) { flash(saved, e.message, true); }
       finally { save.disabled = false; }
     };
     k.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save.click(); } });
-    sec.appendChild(save);
+    const bar = el("div", "pf-actions");
+    bar.append(save, saved);
+    sec.appendChild(bar);
     wrap.appendChild(sec);
     body.appendChild(wrap);
+  }
+
+  /** Success and failure beside the button that caused them, not in a toast far away. */
+  function flash(node, text, err = false) {
+    node.textContent = text;
+    node.classList.toggle("err", err);
+    clearTimeout(node._t);
+    if (!err) node._t = setTimeout(() => { node.textContent = ""; }, 2000);
   }
 
   function open(which = tab) { modal.hidden = false; showTab(which); }
   function close() { modal.hidden = true; }
   async function load() {
-    try { data = await api("/api/providers"); } catch (e) { toast(e.message, true); return; }
+    try { data = await api("/api/providers"); } catch (e) { list.replaceChildren(el("p", "rm-note err", `Providers did not load. ${e.message}`)); return; }
     data.opencode ||= [];
-    f.file.textContent = data.file || "";
+    // The config file by its last two names; the whole path is in the tooltip.
+    f.file.textContent = String(data.file || "").split(/[\\/]+/).filter(Boolean).slice(-2).join("/"); f.file.title = data.file || "";
     const group = (kind, label) => `<optgroup label="${esc(label)}">${data.presets.filter((p) => p.kind === kind).map((p) => `<option value="${esc(p.key)}">${esc(p.label)}</option>`).join("")}</optgroup>`;
-    f.preset.innerHTML = group("key", "OpenCode's own providers · key only") + group("custom", "Your own endpoint · OpenAI-compatible");
+    f.preset.innerHTML = group("key", "OpenCode's own providers (a key is enough)") + group("custom", "Your own endpoint (OpenAI-compatible)");
     renderList();
     if (keyFor && data.opencode.some((p) => p.id === keyFor)) editKey(keyFor);
     else if (editing && data.providers.some((p) => p.name === editing)) edit(editing);
@@ -108,10 +150,10 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
       const b = el("button", `prov${p.name === editing ? " active" : ""}`);
       const on = data.active?.provider === p.name;
       b.innerHTML = `<span class="pn"></span><span class="pm"></span>`;
-      b.querySelector(".pn").textContent = p.name + (on ? " · active" : "");
+      b.querySelector(".pn").textContent = p.name + (on ? " (in use)" : "");
       b.querySelector(".pm").textContent = p.builtIn
-        ? `${p.models.length} Omni-added model${p.models.length === 1 ? "" : "s"} · OpenCode's ${p.name}`
-        : `${p.models.length} model${p.models.length === 1 ? "" : "s"} · ${p.hasKey ? `key •••${p.keyHint}` : "no key"}`;
+        ? `${p.models.length} added model${p.models.length === 1 ? "" : "s"} for OpenCode's ${p.name}`
+        : `${p.models.length} model${p.models.length === 1 ? "" : "s"}, ${p.hasKey ? `key •••${p.keyHint}` : "no key"}`;
       b.onclick = () => edit(p.name);
       // The six-dot grip under each provider: drag (or arrow keys) to set the order of Omni's providers.
       const grip = el("button", "prov-grip");
@@ -137,13 +179,13 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
       const item = el("div", "prov-item");
       const b = el("button", `prov${p.id === keyFor ? " active" : ""}`);
       b.innerHTML = `<span class="pn"></span><span class="pm"></span>`;
-      b.querySelector(".pn").textContent = p.id + (data.active?.provider === p.id ? " · active" : "");
-      b.querySelector(".pm").textContent = `OpenCode${p.name && p.name !== p.id ? ` · ${p.name}` : ""} · connected`;
+      b.querySelector(".pn").textContent = p.id + (data.active?.provider === p.id ? " (in use)" : "");
+      b.querySelector(".pm").textContent = `Connected in OpenCode${p.name && p.name !== p.id ? ` as ${p.name}` : ""}`;
       b.onclick = () => editKey(p.id);
       item.append(b);
       list.appendChild(item);
     }
-    const add = el("button", "prov add", "+ Add provider or key");
+    const add = el("button", "prov add", "Add a provider or key");
     add.onclick = startNew;
     list.appendChild(add);
   }
@@ -191,7 +233,6 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
       try {
         const r = await api("/api/providers-order", { order }, "POST");
         data.providers = r.providers;
-        toast(`Provider order: ${r.order.join(" → ")}`);
         onChanged?.();
       } catch (e) { toast(e.message, true); renderList(); }
     })();
@@ -200,7 +241,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   function presetFor(key) { return data.presets.find((p) => p.key === key); }
   /** "key": the form sets the API key of one of OpenCode's own providers; "custom": one of Omni's endpoints. */
   const keyMode = () => presetFor(f.preset.value)?.kind === "key";
-  const KEY_NOTE = "Saved in OpenCode's own login store (auth.json), which the opencode CLI on this computer shares.";
+  const KEY_NOTE = "Kept in OpenCode's login store (auth.json), shared with the opencode CLI here.";
   function showMode() {
     const key = keyMode();
     for (const row of customRows) if (row) row.hidden = key;
@@ -214,7 +255,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
     showMode();
     if (p.kind === "key") {
       f.name.value = p.anyId ? "" : p.key; f.name.disabled = !p.anyId; f.name.placeholder = "moonshotai";
-      f.hint.textContent = `${p.hint || ""} · ${KEY_NOTE}`;
+      f.hint.textContent = p.hint ? `${p.hint}. ${KEY_NOTE}`.replace(/\.\. /, ". ") : KEY_NOTE;
       return;
     }
     f.name.disabled = false; f.name.placeholder = "modal";
@@ -224,7 +265,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   }
   function startNew() {
     editing = null; keyFor = null;
-    f.title.textContent = "New provider or key";
+    f.title.textContent = "Add a provider or key";
     f.preset.disabled = false;
     f.name.disabled = false; f.name.value = ""; f.baseUrl.value = ""; f.key.value = ""; f.key.placeholder = "API key"; f.models.value = ""; f.ctx.value = ""; f.max.value = "";
     f.ctx.dataset.was = ""; f.max.dataset.was = "";
@@ -236,12 +277,12 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   /** One of OpenCode's own connected providers: only its key can be replaced or removed here. */
   function editKey(id) {
     editing = null; keyFor = id;
-    f.title.textContent = `${id} · OpenCode`;
+    f.title.textContent = `${id} in OpenCode`;
     f.preset.value = presetFor(id)?.kind === "key" ? id : "opencode-other";
     f.preset.disabled = true;
     showMode();
     f.name.value = id; f.name.disabled = true;
-    f.key.value = ""; f.key.placeholder = "paste a new key to replace OpenCode's";
+    f.key.value = ""; f.key.placeholder = "Paste a new key to replace it";
     f.hint.textContent = `Connected in OpenCode. ${KEY_NOTE}`;
     f.del.hidden = false;
     renderList();
@@ -257,7 +298,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
     f.hint.textContent = preset?.hint || "";
     f.name.value = name; f.name.disabled = true;
     f.baseUrl.value = p.baseUrl;
-    f.key.value = ""; f.key.placeholder = p.hasKey ? `•••••••• ${p.keyHint}  (leave empty to keep)` : "API key";
+    f.key.value = ""; f.key.placeholder = p.hasKey ? `•••••••• ${p.keyHint} (empty keeps it)` : "API key";
     f.models.value = p.models.map((m) => (m.name && m.name !== m.id ? `${m.id} | ${m.name}` : m.id)).join("\n");
     const cw = p.models[0]?.contextWindow, mt = p.models[0]?.maxTokens;
     f.ctx.value = cw || ""; f.max.value = mt || "";
@@ -265,10 +306,10 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
     f.del.hidden = false;
     if (p.builtIn) {
       // Extra models for one of OpenCode's own providers: OpenCode's definition and stored key apply, so no URL or key here.
-      f.title.textContent = `${name} · Omni-added models`;
+      f.title.textContent = `Added models for ${name}`;
       $("#pfBaseRow").hidden = true;
       if (keyRow) keyRow.hidden = true;
-      f.hint.textContent = `Models OpenCode's ${name} does not list, added to it by Omni. Its key is set in its own row below.`;
+      f.hint.textContent = `Models OpenCode's ${name} does not list. Its key is set in its own row.`;
       f.del.textContent = "Remove these models";
     }
     renderList();
@@ -284,7 +325,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
       return m;
     });
   }
-  const reloaded = (r) => (r.restarted ? " · OpenCode reloaded" : r.restartPending ? " · OpenCode reloads once the chats are idle" : "");
+  const reloaded = (r) => (r.restarted ? ". OpenCode reloaded." : r.restartPending ? ". OpenCode reloads once the chats are idle." : "");
   async function save() {
     if (keyMode()) return saveKey();
     const name = (editing || f.name.value).trim().toLowerCase();
@@ -293,7 +334,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
     f.save.disabled = true;
     try {
       const r = await api(`/api/providers/${encodeURIComponent(name)}`, body, "PUT");
-      toast(`Saved ${name}${reloaded(r)}`);
+      if (reloaded(r)) toast(`Saved ${name}${reloaded(r)}`);
       editing = name;
       await load();
       onChanged?.();
@@ -304,12 +345,12 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
     const p = presetFor(f.preset.value);
     const id = (keyFor || (p?.anyId ? f.name.value : p?.key) || "").trim().toLowerCase();
     const key = f.key.value.trim();
-    if (!id) { toast("type the OpenCode provider id", true); f.name.focus(); return; }
-    if (!key) { toast("paste the API key", true); f.key.focus(); return; }
+    if (!id) { toast("Type the OpenCode provider id", true); f.name.focus(); return; }
+    if (!key) { toast("Paste the API key", true); f.key.focus(); return; }
     f.save.disabled = true;
     try {
       const r = await api(`/api/provider-keys/${encodeURIComponent(id)}`, { key }, "PUT");
-      toast(`Saved the key for ${id}${reloaded(r)}`);
+      if (reloaded(r)) toast(`Saved the key for ${id}${reloaded(r)}`);
       keyFor = id; editing = null;
       await load();
       onChanged?.();
@@ -318,14 +359,14 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   }
   async function remove() {
     if (keyFor) {
-      if (!window.confirm(`Remove OpenCode's key for "${keyFor}"${where()}? It is removed from OpenCode's own login store, which the opencode CLI shares.`)) return;
-      try { const r = await api(`/api/provider-keys/${encodeURIComponent(keyFor)}`, null, "DELETE"); toast(`Removed the key for ${keyFor}${reloaded(r)}`); keyFor = null; await load(); onChanged?.(); }
+      if (!window.confirm(`Remove OpenCode's key for "${keyFor}"${where()}?\n\nIt goes from OpenCode's login store, which the opencode CLI shares too.`)) return;
+      try { const r = await api(`/api/provider-keys/${encodeURIComponent(keyFor)}`, null, "DELETE"); if (reloaded(r)) toast(`Removed the key for ${keyFor}${reloaded(r)}`); keyFor = null; await load(); onChanged?.(); }
       catch (e) { toast(e.message, true); }
       return;
     }
-    const confirmText = editingBuiltIn() ? `Remove the models Omni added to OpenCode's "${editing}"${where()}? OpenCode's own models and key stay.` : `Remove provider "${editing}" and its models from OpenCode${where()}?`;
+    const confirmText = editingBuiltIn() ? `Remove the models added to OpenCode's "${editing}"${where()}?\n\nOpenCode's own models and key stay.` : `Remove provider "${editing}" and its models from OpenCode${where()}?`;
     if (!editing || !window.confirm(confirmText)) return;
-    try { const r = await api(`/api/providers/${encodeURIComponent(editing)}`, null, "DELETE"); toast(`Removed ${editing}${reloaded(r)}`); editing = null; await load(); onChanged?.(); }
+    try { const r = await api(`/api/providers/${encodeURIComponent(editing)}`, null, "DELETE"); if (reloaded(r)) toast(`Removed ${editing}${reloaded(r)}`); editing = null; await load(); onChanged?.(); }
     catch (e) { toast(e.message, true); }
   }
 
