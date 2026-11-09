@@ -13,10 +13,11 @@ Runs on macOS (Apple silicon and Intel), Windows and Linux. Needs Node 22+; the 
 Python 3.11+ with `pip install pywebview` (WKWebView on macOS, WebView2 on Windows); without pywebview
 it falls back to an Edge app window on Windows, or your browser elsewhere.
 
-**macOS:** double-click **Omni Agent.command** (or run `python3 desktop/omni_desktop.pyw`). It starts the
-server hidden, opens a native window, and turns LAN access on so phones and laptops on your network can
-open the link shown in the sidebar footer. The launcher finds Homebrew/nvm/fnm/volta `node` itself even when
-started from Finder; set `OMNI_NODE` to point at another binary.
+**macOS:** use **Omni Agent.app** (see [The Mac app](#the-mac-app)). From a checkout, **Omni Agent.command**
+(or `python3 desktop/omni_desktop.pyw`) still works: it starts the server hidden, opens a pywebview window,
+and turns LAN access on so phones and laptops on your network can open the link shown in the sidebar footer.
+It finds Homebrew/nvm/fnm/volta `node` itself even when started from Finder; set `OMNI_NODE` to point at
+another binary.
 
 **Windows:** double-click **Omni Agent.cmd** (or a Desktop shortcut pointing at
 `pythonw.exe "…\desktop\omni_desktop.pyw"`).
@@ -467,6 +468,52 @@ full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at 
 - After a merge, run `npm run build` rather than resolving `dist/ui/build.json` by hand.
 - `scripts/measure-load.mjs <url> --link 50,10` times a page in headless Edge on an emulated link.
 
+## The Mac app
+
+**Omni Agent.app** is a small AppKit program (`mac/OmniAgent.swift`) with a WKWebView. It has its own Dock icon, Cmd-Tab
+entry and menu bar (About, Settings with Cmd-comma, Edit, View with zoom and full screen, Window, Help → Show the Server
+Log). It starts Omni's server hidden (`mac/launch.mjs`, inside the app) and shows it in the window, which alone receives the
+window token, so account actions work there. The title bar takes the page's colours and follows **Settings → Appearance**,
+System included. The window's size and place are kept, and only one copy runs at a time.
+
+- **Closing the window** hides it. The server keeps running, so this Mac stays reachable from your other devices. Click the
+  Dock icon to bring it back. **Cmd-Q** stops the server and everything it started.
+- **Node:** it uses the Node you already have (Homebrew, nvm, fnm, volta, or whatever your login shell's PATH finds; Node 22
+  or newer), the same one OpenCode and the other agents need. Without Node it says so and how to get it. Set `OMNI_NODE` to
+  force a binary.
+- **Its files** are in `~/Library/Application Support/Omni Agent/`: `omni.config.json`, the vault and `omni.log`. The
+  account and everything else stay in `~/.omni-agent/`, as for every desktop. The app's own folder is never written to.
+- It does not open the old LAN/relay listener (`--lan`), so macOS never asks to let it accept incoming connections.
+
+**Installing it.** Open **Omni Agent.dmg**, drag **Omni Agent** onto **Applications**. To update, quit it first (Cmd-Q),
+then drag the new one over and choose **Replace**. Never copy files into an app that is installed: macOS remembers the
+signature of a binary and kills one rewritten in place.
+
+**The first launch.** The app is signed ad hoc, not by an Apple developer account. Built on your own Mac and opened from
+there it just opens. A copy that was downloaded or sent to you carries the quarantine flag, and macOS then says it
+"cannot be opened because Apple cannot check it for malicious software". Either:
+
+1. Try to open it once, then **System Settings → Privacy & Security**, scroll down to the message about Omni Agent, press
+   **Open Anyway**, and confirm with your password; or
+2. in Terminal: `xattr -dr com.apple.quarantine "/Applications/Omni Agent.app"`, then open it normally.
+
+**Building it.** From any machine with ssh access to the Mac, Git Bash on Windows included:
+
+```
+OMNI_MAC_SSH=macbook bash mac/build.sh [--copy-dmg-to DIR]
+```
+
+It runs `npm run build`, sends the committed HEAD to the Mac as a git bundle (nothing is pushed), checks it out in
+`~/omni-mac-build/src` and runs `mac/make-app.sh` there, which compiles the shell with `swiftc` (arm64 and x86_64), makes
+the icon from `mac/AppIcon.png` (`node scripts/make-icons.mjs --mac`), signs ad hoc, and writes `~/omni-mac-build/out/Omni
+Agent.app` and `Omni Agent.dmg`. It builds in a new folder and moves the result into place, and stops before free space
+would drop under 4 GB. `OMNI_MAC_SSH_OPTS` adds ssh options; `OMNI_MAC_DEVELOPER_DIR` picks an Xcode that is not the
+selected one. On the Mac itself, `bash mac/make-app.sh` does the same.
+
+**Testing it.** `OMNI_SHELL_AUTOMATION=<folder>` at launch (for example `open "Omni Agent.app" --env
+OMNI_SHELL_AUTOMATION=/tmp/omni-auto`) lets a test run page scripts, show, hide or quit the app, and have it draw its own
+window into a PNG. Off unless that variable is set.
+
 ## Layout
 
 ```
@@ -479,5 +526,6 @@ server/files.mjs      file browser: read/save/trash  server/tls.mjs           th
 ui/                   index.html, styles.css, app.js + lib/transcript/composer/explorer/settings/sidebar/panel
 ui/filepane.js        editor tabs + viewers          ui/editor.js, highlight.js  code editor, syntax colouring
 desktop/              pywebview launcher            integrations/            OpenCode plugin, Claude Code hook, personas
+mac/                  Omni Agent.app: shell, launcher, build
 hub/                  the VPS hub: accounts, routing relay/                   the old relay, until removed
 ```
