@@ -2,7 +2,7 @@
    runtime dependency, and every byte of output is one this file chose. Pure (no DOM), so `node --test` imports it.
 
    Safety: the source is never trusted. Text is escaped as it is emitted; the only tags are the ones below; the only attributes
-   are fixed classes, a sanitised fence language, a table cell's alignment, and an href that safeHref let through (http, https,
+   are fixed classes (a table cell's alignment is one), a sanitised fence language, and an href that safeHref let through (http, https,
    mailto, with no quote, bracket or whitespace in it). There is no HTML pass-through and no image load.
 
    Streaming: `mdBlocks` gives one HTML string per top-level block, each a single element, so a live message can replace only
@@ -322,8 +322,9 @@ function blocks(lines, depth) {
 
 function table(lines, start) {
   const head = cells(lines[start]);
-  const aligns = cells(lines[start + 1]).map((c) => (/^:-+:$/.test(c) ? "center" : /^-+:$/.test(c) ? "right" : /^:-+$/.test(c) ? "left" : ""));
-  const cell = (tag, text, k) => `<${tag}${aligns[k] ? ` style="text-align:${aligns[k]}"` : ""}>${inline(text)}</${tag}>`;
+  // Alignment is a class, never a style attribute: the hub serves this page under `style-src 'self'`, which blocks those.
+  const aligns = cells(lines[start + 1]).map((c) => (/^:-+:$/.test(c) ? "al-c" : /^-+:$/.test(c) ? "al-r" : /^:-+$/.test(c) ? "al-l" : ""));
+  const cell = (tag, text, k) => `<${tag}${aligns[k] ? ` class="${aligns[k]}"` : ""}>${inline(text)}</${tag}>`;
   let i = start + 2;
   const rows = [];
   while (i < lines.length && !RE.blank.test(lines[i]) && lines[i].includes("|") && !(isFenceOpen(lines[i]) || RE.quote.test(lines[i]) || RE.heading.test(lines[i]))) {

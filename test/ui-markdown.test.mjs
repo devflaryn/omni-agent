@@ -2,19 +2,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { md, mdBlocks, closeOpen, safeHref, fenceLang } from "../ui/markdown.js";
 import { md as libMd } from "../ui/lib.js";
+import { readFileSync } from "node:fs";
 
 const HOSTILE = `<img src=x onerror=alert(1)><script>alert(2)</script>"'&<svg/onload=alert(3)>`;
 /** Every tag in the output is one the renderer makes, and no attribute is anything but the few it writes. */
 function onlyOwnMarkup(html) {
   const tags = /<\/?([a-z0-9]+)((?:\s+[a-z-]+(?:="[^"<>]*")?)*)\s*\/?>/gi;
   const allowed = new Set(["p", "br", "strong", "em", "del", "code", "pre", "a", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "blockquote", "hr", "table", "thead", "tbody", "tr", "th", "td", "div", "figure", "figcaption", "span", "button", "input"]);
-  const attrs = new Set(["class", "href", "target", "rel", "data-lang", "type", "disabled", "checked", "start", "style", "title", "aria-label"]);
+  // No style attribute, ever: the hub serves this page under `style-src 'self'`, which blocks one (and logs a violation).
+  const attrs = new Set(["class", "href", "target", "rel", "data-lang", "type", "disabled", "checked", "start", "title", "aria-label"]);
   let m;
   const stripped = html.replace(tags, (whole, tag, a) => {
     assert.ok(allowed.has(tag.toLowerCase()), `tag ${tag} in ${html}`);
     for (const at of a.matchAll(/([a-z-]+)(?:="([^"]*)")?/gi)) {
       assert.ok(attrs.has(at[1].toLowerCase()), `attribute ${at[1]} in ${whole}`);
-      if (at[1] === "style") assert.match(at[2], /^text-align:(left|center|right)$/);
       if (at[1] === "href") assert.match(at[2], /^(https?:|mailto:|#)/i, whole);
     }
     return "";
@@ -149,7 +150,11 @@ test("task lists", () => {
 
 test("tables with alignment, escaped pipes, a row of the wrong width", () => {
   const out = md("| a | b | c |\n| :-- | :-: | --: |\n| 1 | **2** | `3\\|4` |\n| only |");
-  assert.equal(out, '<div class="md-table"><table><thead><tr><th style="text-align:left">a</th><th style="text-align:center">b</th><th style="text-align:right">c</th></tr></thead><tbody><tr><td style="text-align:left">1</td><td style="text-align:center"><strong>2</strong></td><td style="text-align:right"><code>3|4</code></td></tr><tr><td style="text-align:left">only</td><td style="text-align:center"></td><td style="text-align:right"></td></tr></tbody></table></div>');
+  assert.equal(out, '<div class="md-table"><table><thead><tr><th class="al-l">a</th><th class="al-c">b</th><th class="al-r">c</th></tr></thead><tbody><tr><td class="al-l">1</td><td class="al-c"><strong>2</strong></td><td class="al-r"><code>3|4</code></td></tr><tr><td class="al-l">only</td><td class="al-c"></td><td class="al-r"></td></tr></tbody></table></div>');
+  onlyOwnMarkup(out);
+  // The classes do the aligning, and win over the plain cell rule wherever markdown is shown.
+  const css = readFileSync(new URL("../ui/styles.css", import.meta.url), "utf8");
+  for (const [cls, align] of [["al-l", "left"], ["al-c", "center"], ["al-r", "right"]]) assert.match(css, new RegExp(`\\.md-table \\.${cls} \\{ text-align: ${align}; \\}`));
   assert.match(md("| | |\r\n|---|---|\r\n| **File** | x |\r\n"), /<td><strong>File<\/strong><\/td><td>x<\/td>/, "CRLF too");
   assert.equal(md("a | b\n--- | ---\n1 | 2"), "<div class=\"md-table\"><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>", "outer pipes are optional");
   assert.equal(md("| not | a table |"), "<p>| not | a table |</p>");

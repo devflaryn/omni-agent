@@ -1216,6 +1216,10 @@ body.on-remote .machine-btn:hover { background: var(--inverse-ink); color: var(-
 .text li.task > input { margin: 0 8px 0 0; vertical-align: -2px; accent-color: var(--muted); }
 .text .md-table { overflow-x: auto; margin: 0.8em 0; }
 .text .md-table table { margin: 0; }
+/* A column's alignment (`|:-:|--:|`) is a class: the hub's `style-src 'self'` blocks a style attribute. */
+.md-table .al-l { text-align: left; }
+.md-table .al-c { text-align: center; }
+.md-table .al-r { text-align: right; }
 
 /* Code blocks, ChatGPT's dark convention: a header with the language and Copy, the code on the sidebar's tone. */
 .text figure.code { margin: 0.9em 0; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--side); overflow: hidden; }
