@@ -167,6 +167,24 @@ test("the composer's placeholder has one writer, the page that knows the chat, a
   assert.match(src, /"Add a model"/);
 });
 
+test("the palette separates a chat's machine and age with a comma, as Home does", () => {
+  const app = read("app.js");
+  const fn = app.slice(app.indexOf("function paletteItems"), app.indexOf("function newChat"));
+  assert.ok(fn.length > 100);
+  assert.doesNotMatch(fn, /·/);
+  assert.match(fn, /\.join\(", "\)/);
+});
+
+test("styles.css has one rule for a markdown paragraph's margins, and none for what nothing draws any more", () => {
+  const css = read("styles.css");
+  assert.equal(css.match(/^\.text p \{/gm)?.length, 1, "one .text p");
+  assert.match(css, /^\.text p \{ margin: 0\.75em 0; \}/m, "the chat's own margins");
+  assert.equal(css.match(/^\.text code \{/gm), null, ".text code lives in one rule, with .body code");
+  assert.doesNotMatch(css, /tokIn|\.tok\b|menu-empty|@keyframes blink\b/);
+  assert.match(css, /^\.stream\.on::after/m, "the thinking text's dot is still drawn (.rblock.stream)");
+  assert.match(read("transcript.js"), /"rblock stream"/);
+});
+
 test("the chat's live text is painted once a frame at most, never token by token", () => {
   const src = read("transcript.js");
   assert.match(src, /requestAnimationFrame/);

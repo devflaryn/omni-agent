@@ -1248,7 +1248,7 @@ function paletteItems() {
       const title = agentIn(ws, s.sid)?.title || s.title;
       if (!title) continue;
       const when = s.lastActivity || s.mtime || 0;
-      chats.push({ group: "Chats", title, sub: [list.length > 1 ? m.label : "", ago(when)].filter(Boolean).join(" · "), when, run: () => openChatOn(m.key, s.sid) });
+      chats.push({ group: "Chats", title, sub: [list.length > 1 ? m.label : "", ago(when)].filter(Boolean).join(", "), when, run: () => openChatOn(m.key, s.sid) });
     }
   }
   chats.sort((a, b) => b.when - a.when);
