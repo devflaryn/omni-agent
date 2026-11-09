@@ -1219,6 +1219,8 @@ export class Account extends EventEmitter {
   async review(id) {
     this.#requireFull("approve a new device");
     if (this.#review) throw new AccountError(409, "review-in-progress", "Another review is in progress. Finish or deny it first.");
+    // The window starts a review by itself as soon as a card shows, so two of the person's devices may both try: the second gives way.
+    if (this.#reviewHints.has(id)) throw new AccountError(409, "being-reviewed", `This sign-in is being approved on ${this.#reviewHints.get(id)}.`);
     const row = this.#rows.find((r) => r.id === id);
     if (!row) throw new AccountError(404, "no-such-signin", "That sign-in is no longer waiting.");
     this.#review = { id, row, code: null, claim: { name: row.name, kind: row.kind }, head: null, arrived: null };

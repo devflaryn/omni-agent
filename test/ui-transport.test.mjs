@@ -283,13 +283,12 @@ test("account.js speaks to this computer only, and shows supplied text as text",
   assert.match(src, /local\.api\(/);
 });
 
-test("the approval card: Deny at once, role full only by choice, no approve without the code step", () => {
+test("the approval card: Deny at once, the role only from the person's tap, no approve without the code on screen", () => {
   const src = read("account.js");
-  assert.match(src, /role: box\.checked \? "full" : "client"/);
-  assert.doesNotMatch(src, /box\.checked = true/, "never preselected");
-  const reviewless = src.slice(src.indexOf("if (!review) {"), src.indexOf('el("div", "ap-title", "Does the new device show this code?")'));
-  assert.doesNotMatch(reviewless, /"approve"/, "before the review there is nothing to approve with");
-  assert.match(src, /This is my desktop or phone app/);
+  assert.match(src, /role: choice\.role/, "the role sent is the one on the button pressed");
+  const reviewless = src.slice(src.indexOf("if (!review) {"), src.indexOf('c.appendChild(el("div", "acct-code", groupCode(review.code)));'));
+  assert.ok(reviewless.length > 100);
+  assert.doesNotMatch(reviewless, /"approve"/, "before the code is there, there is nothing to approve with");
 });
 
 test("HTML from a far machine cannot break out of an attribute in the shared helpers", () => {

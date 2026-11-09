@@ -17,7 +17,7 @@ import { createPageTransport } from "../ui/page-transport.js";
 import { BLOB_LIMIT, fileClass } from "../ui/page-files.js";
 import { approverExchange, newDeviceKeys, newRecoveryCode, recoveryKeysFrom } from "../ui/account-core.js";
 import { append, createLog, verifyLog } from "../ui/device-log.js";
-import { alertAdvice, alertTitle, deviceWords, explain, hubLostText, phaseText } from "../ui/account.js";
+import { GLANCE, alertAdvice, alertTitle, deviceWords, explain, hubLostText, noAccountText, phaseText, roleChoices, showWelcome } from "../ui/account.js";
 import { MachineLinks } from "../ui/machine-links.js";
 import { framesFiles, local, mode, rawUrl as chosenRawUrl, saveFile, setChannelTransport, setMachine, setTransportEnv, webPage } from "../ui/transport.js";
 
@@ -588,7 +588,7 @@ test("account.js shows no approve, remove or password control on a web page, wha
 test("the page offers no registration and no recovery, and says where an account is made", () => {
   const src = readFileSync(new URL("../ui/web.js", import.meta.url), "utf8");
   assert.doesNotMatch(src, /Create the account|recoveryCode|Recovery code/);
-  assert.match(src, /created in the Omni desktop app/);
+  assert.match(src, /To create an account, use the Omni desktop app/);
 });
 
 test("the page says once on sign-in what a hacked server could do, in plain words", () => {
@@ -1302,4 +1302,54 @@ test("on a page, one helper turns the texts about this device, and drops what is
   assert.doesNotMatch(src, /PHASE_TEXT\[s\./, "every phase goes through the helper");
   assert.doesNotMatch(src, /ALERT_ADVICE\[a\./, "every alert goes through the helper");
   assert.match(readFileSync(new URL("../ui/web.js", import.meta.url), "utf8"), /const store = await openPageStore\(\);[\s\S]*setChannelTransport\([\s\S]*await account\.start\(\)/, "the transport is set before the sign-in screen draws an alert");
+});
+
+test("approving: the claim only orders the two choices, and a page that says it is a page gets limited first", () => {
+  for (const kind of ["web", "", undefined, "something else", "Web"]) {
+    const [first, second] = roleChoices(kind);
+    assert.deepEqual([first.role, first.primary, second.role, second.primary], ["client", true, "full", false], String(kind));
+  }
+  for (const kind of ["desktop", "phone", "iphone"]) assert.deepEqual(roleChoices(kind).map((c) => c.role), ["full", "client"], kind);
+  for (const kind of ["web", "desktop"]) assert.deepEqual(roleChoices(kind).map((c) => c.role).sort(), ["client", "full"], "both are always offered");
+  assert.match(roleChoices("web")[0].label, /web page \(limited\)/);
+  assert.match(roleChoices("web")[1].label, /app \(full control\)/);
+  assert.equal(GLANCE, "Check that the new device shows the same code before you approve.");
+});
+
+test("the approval card asks for a glance in one sentence, and has one tap per choice and no second step", () => {
+  const src = readFileSync(new URL("../ui/account.js", import.meta.url), "utf8");
+  const card = src.slice(src.indexOf("function approvalCard("), src.indexOf("// --------------------------------------------------------------------------------- the recovery code"));
+  assert.match(card, /GLANCE/);
+  assert.match(card, /roleChoices\(/);
+  assert.doesNotMatch(card, /type = "checkbox"|The codes match|This is my desktop or phone app/);
+  const web = readFileSync(new URL("../ui/web.js", import.meta.url), "utf8");
+  for (const text of [src, web]) assert.doesNotMatch(text, /This matches|confirm-code|confirmCode/);
+});
+
+test("the first-run screen shows only on a desktop with its account on, until a choice, and while its own sign-in waits", () => {
+  const status = (over) => ({ phase: "signed-out", firstRun: true, ...over });
+  assert.equal(showWelcome(status(), { available: true }), true);
+  assert.equal(showWelcome(status(), { available: false }), false, "an account that is off never blocks local use");
+  assert.equal(showWelcome(null, { available: true }), false);
+  assert.equal(showWelcome(status({ firstRun: false }), { available: true }), false, "chosen once, remembered");
+  assert.equal(showWelcome(status(), { available: true, closed: true }), false);
+  assert.equal(showWelcome(status({ firstRun: false, phase: "pending" }), { available: true, flow: true }), true, "its own sign-in, waiting for approval");
+  assert.equal(showWelcome(status({ firstRun: false, phase: "approved" }), { available: true, flow: true }), false, "and gone once in");
+  const data = new Map();
+  setTransportEnv({ storage: { getItem: (k) => data.get(k) ?? null, setItem: (k, v) => data.set(k, v), removeItem: (k) => data.delete(k) }, reload: () => {} });
+  try {
+    setChannelTransport({ api() {}, eventSource() {}, rawUrl() {}, saveFile() {}, local: {} });
+    assert.equal(showWelcome(status(), { available: true }), false, "never on a web page, which has its own sign-in");
+  } finally { setChannelTransport(null); setTransportEnv({ storage: null, reload: () => {} }); }
+});
+
+test("the first-run screen and the sign-in surface speak plainly: no phase, role, log or hub", () => {
+  const src = readFileSync(new URL("../ui/account.js", import.meta.url), "utf8");
+  const part = (from, to) => src.slice(src.indexOf(from), src.indexOf(to));
+  const words = (code) => [...code.matchAll(/(["`])((?:\.|(?!).)*)/g)].map((m) => m[2]).filter((s) => /\s/.test(s));
+  const main = [part("export function signInSurface(", "export function createAccount("), part("function renderWelcome(", "/** The hub's own words"), part("function welcomeWaiting(", "// ---------------------------------------------------------------------------------- machine switcher")];
+  for (const text of main.flatMap(words)) assert.doesNotMatch(text, /(phase|role|log|hub)/i, text);
+  for (const code of ["no-window", "other-window", undefined]) assert.doesNotMatch(noAccountText(code), /(phase|role|log|hub|token)/i);
+  assert.match(noAccountText("no-window"), /Omni Agent/);
+  assert.match(noAccountText("other-window"), /Another Omni window/);
 });
