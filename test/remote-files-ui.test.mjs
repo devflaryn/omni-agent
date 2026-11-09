@@ -2,7 +2,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { api, isLeaving, isRemote, machine, mode, onLeaveCheck, rawUrl, setMachine, setTransportEnv } from "../ui/transport.js";
+import { api, isRemote, machine, mode, onLeaveCheck, rawUrl, setMachine, setTransportEnv } from "../ui/transport.js";
 import { diffCounts, editDiff, esc, md, toolLabel } from "../ui/lib.js";
 import { fileIcon, iconFor } from "../ui/fileicons.js";
 import { highlight, languageFor } from "../ui/highlight.js";
@@ -31,7 +31,7 @@ test("a refused save carries the answer, here and on another machine: the pane o
 });
 
 test("the reveal action is hidden on another machine as well as in a remote browser, and never built without the check", () => {
-  assert.match(read("app.js"), /createExplorer\(\{[^\n]*isRemote: \(\) => remote\.role === "remote" \|\| isRemote\(\)/);
+  assert.match(read("app.js"), /createExplorer\(\{[^\n]*isRemote: \(\) => remote\.role === "remote" \|\| !focusM\(\)\?\.here/);
   const uses = read("explorer.js").split(/\r?\n/).filter((l) => /revealOnHost\(/.test(l) && !/async function/.test(l));
   assert.ok(uses.length >= 2);
   for (const l of uses) assert.match(l, /!isRemote\(\) &&/, l.trim());
@@ -40,26 +40,23 @@ test("the reveal action is hidden on another machine as well as in a remote brow
 test("unsaved work: No leaves the window exactly where it was, so a later refresh does not jump machines", async () => {
   onLeaveCheck(() => "A file has unsaved changes.");
   answerToAsk = false;
-  assert.equal(setMachine("far", { name: "Ubuntu" }), null);
+  assert.equal(setMachine("far", { name: "Ubuntu" }), false);
   assert.equal(asked.length, 1);
   assert.match(asked[0], /unsaved changes/);
+  assert.match(asked[0], /Ubuntu/, "the question names where the window would go");
   assert.equal(reloads, 0);
   assert.equal(store.size, 0, "nothing stored");
   assert.equal(isRemote(), false);
   assert.equal(await rawUrl("/api/fs/raw?path=a"), "/api/fs/raw?path=a");
-  assert.equal(isLeaving(), false, "and a later reload still asks");
 });
 
-test("unsaved work: Yes goes on, and the page's own prompt does not ask a second time", () => {
+test("unsaved work: Yes goes on, with no reload", () => {
   onLeaveCheck(() => "A file has unsaved changes.");
   onLeaveCheck(() => null);
-  const page = environment(false);
-  setTransportEnv(page);
-  onLeaveCheck(() => "A file has unsaved changes.");
-  assert.equal(setMachine("far", { name: "Ubuntu" }).id, "far");
+  assert.equal(setMachine("far", { name: "Ubuntu" }), true);
+  assert.equal(machine().id, "far");
   assert.equal(asked.length, 1);
-  assert.equal(reloads, 1);
-  assert.equal(isLeaving(), true);
+  assert.equal(reloads, 0);
   assert.ok(store.has("omni.machine"));
 });
 
@@ -68,28 +65,25 @@ test("a switch not chosen by the person never asks, and waits for the work to be
   store.set("omni.machine", JSON.stringify({ id: "gone", name: "Gone" }));
   setTransportEnv(environment());
   onLeaveCheck(() => (dirty ? "A file has unsaved changes." : null));
-  assert.equal(setMachine(null, { whenClean: true })?.id, "gone");
+  assert.equal(setMachine(null, { whenClean: true }), false);
+  assert.equal(machine().id, "gone");
   assert.equal(asked.length, 0);
-  assert.equal(reloads, 0);
   assert.ok(store.has("omni.machine"));
   dirty = false;
-  assert.equal(setMachine(null, { whenClean: true }), null);
-  assert.equal(reloads, 1);
+  assert.equal(setMachine(null, { whenClean: true }), true);
+  assert.equal(reloads, 0);
   assert.equal(machine(), null);
 });
 
-test("until the page is gone it stays on its machine: what it shows and what it sends never differ", async () => {
-  setTransportEnv(environment(false));
-  setMachine("far", { name: "Ubuntu" });
-  assert.equal(reloads, 1);
+test("the file pane is the focused machine's: once a move is agreed its tabs close, and nothing of the last tree is drawn", () => {
+  const app = read("app.js");
+  const focus = app.slice(app.indexOf("function focusMachine("), app.indexOf("function chooseMachine("));
+  assert.ok(focus.indexOf("setMachine(") > 0 && focus.indexOf("setMachine(") < focus.indexOf("explorer.switchMachine()"), "asked first, then the tabs go");
+  assert.match(read("explorer.js"), /function switchMachine\(\) \{\s*real\?\.forgetAll\(\);\s*epoch\+\+;/);
+  assert.match(read("explorer.js"), /if \(asked !== epoch\) return;/);
   assert.equal(mode(), "local");
-  assert.equal(machine(), null);
-  assert.equal(await rawUrl("/api/fs/raw?path=a"), "/api/fs/raw?path=a");
-  assert.match(store.get("omni.machine"), /far/, "the new page reads this");
-  // The one prompt a reload can meet is the file pane's, and it stands down once the switch was agreed.
-  assert.match(read("filepane.js"), /beforeunload", \(e\) => \{ if \(!isLeaving\(\) && /);
   for (const f of ["app.js", "account.js", "explorer.js", "editor.js", "mission.js", "settings.js", "panel.js", "composer.js"]) assert.doesNotMatch(read(f), /beforeunload/, f);
-  assert.match(read("account.js"), /setMachine\(null, \{ whenClean: true \}\)/);
+  assert.match(read("account.js"), /choose\(null, null, \{ whenClean: true \}\)/);
 });
 
 test("names are shown without what would turn them around, and only shown", () => {
