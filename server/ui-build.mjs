@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadWebFiles, readBuild } from "../hub/static.mjs";
 
-const TEXT = /\.(?:m?js|css|html|svg|json)$/;
+const TEXT = /\.(?:m?js|css|html|svg|json|webmanifest)$/;
 
 /** A source file's hash. Text is hashed without carriage returns. */
 export function hashSource(bytes, name) {

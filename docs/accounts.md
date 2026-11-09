@@ -17,7 +17,7 @@ Each account belongs to one person and sees only its own computers. The first ac
 
 Do this once, in the desktop app, on the PC that holds the file `~/.omni-agent/account/bootstrap-token`. That token is what lets the hub accept its first account, with no invite code. On any other computer creating an account needs an [invite code](#inviting-someone). Registering deletes the token file.
 
-1. Open Omni with its desktop launcher (**Omni Agent.cmd** or **Omni Agent.command**).
+1. Open Omni with its desktop launcher (**Omni Agent.cmd** on Windows; **Omni Agent.app** or **Omni Agent.command** on a Mac).
 2. The first time, Omni shows **Welcome to Omni Agent**, with **Sign in**, **Create an account** and **Continue without an account**. Choose **Create an account**. On the PC with the token there is no invite code field. (Later, or if you chose to continue without an account, it is under **Settings → Account → Create an account**.)
 3. Fill in **Email**, **Password**, **Password again** and **Name for this computer**, then press **Create the account**.
 4. The **Save your recovery code** screen appears. Copy the code and put it somewhere safe, away from this computer. Press **I saved it**.

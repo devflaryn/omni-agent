@@ -1,2 +1,8 @@
 # Built output is exact bytes: its names and the service worker's list hold hashes of them. Never turn its line endings, and don't show its diffs.
 dist/** -text -diff
+
+# Run on macOS and Linux as they are.
+*.sh text eol=lf
+*.swift text eol=lf
+*.plist text eol=lf
+*.command text eol=lf

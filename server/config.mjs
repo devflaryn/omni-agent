@@ -5,7 +5,10 @@ import { fileURLToPath } from "node:url";
 
 export const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const HOME = homedir();
-export const CONFIG_FILE = join(ROOT, "omni.config.json");
+/** Where this install's own writable files live: omni.config.json, the vault, openrouter.txt. The checkout by default; the Mac
+ *  app sets OMNI_DATA_DIR (its code sits in a signed bundle, which must never be written to). */
+export const DATA_DIR = process.env.OMNI_DATA_DIR || ROOT;
+export const CONFIG_FILE = join(DATA_DIR, "omni.config.json");
 
 /** analyzeHeadless of the newest Ghidra under ~/re-tools/ghidra, else the bare name (PATH). */
 export function findGhidra(home = HOME) {
@@ -90,7 +93,7 @@ export const CONFIG = {
   remoteDeviceApproval: fc.remoteDeviceApproval !== false,
   /** The internet way in without a router port forward: an SSH tunnel to a VPS (server/tunnel.mjs). Off until relay.host is set. */
   relay: relayConfig(fc.relay),
-  vaultDir: process.env.OMNI_VAULT || fc.vaultDir || join(ROOT, "vault"),
+  vaultDir: process.env.OMNI_VAULT || fc.vaultDir || join(DATA_DIR, "vault"),
   /** Deleted chats are moved here (recoverable), never hard-unlinked. */
   trashDir: fc.trashDir || join(HOME, ".omni-agent", "trash"),
   piSessionsDir: fc.piSessionsDir || join(HOME, ".pi", "agent", "sessions"),
@@ -117,7 +120,7 @@ export const CONFIG = {
    */
   piExtConfigFile: fc.piExtConfigFile || join(fc.piAgentDir || join(HOME, ".pi", "agent"), "omni-agent.json"),
   /** Key files handed to Omni's `opencode serve` as environment variables (one line each, gitignored). */
-  apiKeyFiles: { OPENROUTER_API_KEY: join(ROOT, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },
+  apiKeyFiles: { OPENROUTER_API_KEY: join(DATA_DIR, "openrouter.txt"), ...(fc.apiKeyFiles || {}) },
   /** Guest resolution (WxH[@DPI]) exported as OMNI_DISPLAY to Omni's `opencode serve`, so any omnidroid
    *  the model launches boots at a higher default resolution. Empty string / "native" = off. */
   emulatorDisplay: fc.emulatorDisplay ?? "1600x1000",
@@ -168,7 +171,7 @@ export const CONFIG = {
   /** Where unattended run ledgers live. */
   /** The status-box summarizer's own side conversations (one OpenCode session per goal, ids kept in opencode-sessions.json; the judge's and the summarizer's sessions run in this directory), apart from the chats. */
   statusSessionsDir: fc.statusSessionsDir || join(HOME, ".omni-agent", "status-sessions"),
-  runsDir: fc.runsDir || join(fc.vaultDir || join(ROOT, "vault"), "Runs"),
+  runsDir: fc.runsDir || join(fc.vaultDir || join(DATA_DIR, "vault"), "Runs"),
   /** CLI reverse-engineering tools (jadx/apktool/baksmali/smali) are pre-installed here and this
    *  bin dir is put on the PATH of Omni's `opencode serve`, so the agent finds working headless CLIs instead of
    *  re-downloading them from GitHub or launching a GUI. Provisioned by `node scripts/install-tools.mjs`. */
