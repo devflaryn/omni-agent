@@ -457,6 +457,16 @@ full event log as JSONL under `workspace/`. Exit 0 when the agent settles, 2 at 
 `OPENROUTER_API_KEY` ← `openrouter.txt`), `claudeTaskTimeoutSec`, `hook` (`{ "enabled", "provider",
 "model", "maxIdleNudges": 5, "graceMs": 2000 }`; the model menu writes it).
 
+## The UI build
+
+`ui/` is the source and runs as it is. `npm run build` (esbuild, a pinned dev dependency: `npm install` once) turns it into `dist/ui`: bundled, with a hash in each file's name, compressed ahead of time as brotli and gzip, and with Missions, the file pane, the editor and the highlighter in parts loaded when first used. The desktop server, the hub and the iPhone bundle all use that one output.
+
+- `dist/ui` is committed, because the desktop launcher runs from a plain checkout with no install step and the hub is deployed from one. A fresh build is checked in, and `test/ui-build.test.mjs` fails if a commit leaves it behind.
+- The server checks the build against `ui/` on every page load (sizes and times first, hashes only when one moved). If they differ it serves `ui/` itself and says so in its log, so an edit is never hidden behind an old build. With esbuild installed it also rebuilds by itself; `OMNI_UI_AUTOBUILD=0` turns that off, and `OMNI_UI_SOURCE=1` always serves source.
+- `npm run build -- --check` says whether the build is current; `-- --list` prints every file a deployment carries. Neither needs anything installed.
+- After a merge, run `npm run build` rather than resolving `dist/ui/build.json` by hand.
+- `scripts/measure-load.mjs <url> --link 50,10` times a page in headless Edge on an emulated link.
+
 ## Layout
 
 ```
