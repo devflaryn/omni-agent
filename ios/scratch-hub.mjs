@@ -84,7 +84,7 @@ async function serve() {
       try {
         const { code } = await app.account.review(row.id);
         console.log(`card code: ${code}`);
-        await new Promise((r) => setTimeout(r, 3000)); // time to see the code on both
+        await new Promise((r) => setTimeout(r, 8000)); // time to see the code on both
         await app.account.approve(row.id, { code, role: "full" });
         console.log(`approved "${row.name}" as full`);
       } catch (error) { console.log(`approval failed: ${error.message}`); }
