@@ -8,7 +8,7 @@ import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import { WINDOW_COOKIE, WindowGate, channelAllowed, classify, inAccountFolder } from "../server/access.mjs";
+import { WINDOW_COOKIE, WindowGate, channelAllowed, inAccountFolder } from "../server/access.mjs";
 import { channelClient, serveChannel } from "../server/channel-host.mjs";
 import { createApp } from "../server/index.mjs";
 import { FRAME, FRAME_VERSION, MAX_CHUNK, decodeFrame, encodeFrame } from "../ui/channel-frames.js";
@@ -115,13 +115,6 @@ test("channelAllowed: a target that parses to something other than a local path 
 test("channelAllowed: a method outside the known set, in any spelling, is refused", () => {
   for (const method of ["post", "Get", "TRACE", "CONNECT", "", null, undefined, "GET ", "G\r\nET"]) assert.equal(channelAllowed(method, "/api/state"), false, String(method));
   for (const method of ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]) assert.equal(channelAllowed(method, "/api/state"), true, method);
-});
-
-test("classify: a remote browser can never reach the account routes or the proxy", () => {
-  for (const path of ["/api/account/status", "/api/account/approve", "/remote/x/api/state"]) {
-    assert.equal(classify("GET", path), "host", path);
-    assert.equal(classify("POST", path), "host", path);
-  }
 });
 
 // ------------------------------------------------------------------------------- frames
@@ -371,7 +364,7 @@ const hasLinks = (() => {
   try { symlinkSync(accountDir, join(work, "keylink"), "junction"); return true; } catch { return false; }
 })();
 
-const app = await createApp({ port: 0, lan: true, relay: { host: "" }, remotePort: 0, remoteHost: "127.0.0.1", remoteTls: false, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir, windowToken: "window-token-for-the-test-0123456789" });
+const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir, windowToken: "window-token-for-the-test-0123456789" });
 await app.listen();
 const port = app.server.address().port;
 after(() => app.close());
@@ -406,7 +399,7 @@ test("real handle: a channel reads state as a device, and the event stream carri
   assert.equal(r.status, 200);
   const state = await r.json();
   assert.equal(state.access.role, "device");
-  assert.equal(state.access.remote, undefined, "the host's remote settings are not shared");
+  assert.deepEqual(Object.keys(state.access), ["role"], "nothing of the host's own settings");
   const ev = await http.request({ method: "GET", path: "/events" });
   assert.equal(ev.status, 200);
   assert.match(ev.headers["content-type"], /event-stream/);
@@ -429,22 +422,20 @@ test("real handle: the never list is 403 even with a hand-made request that skip
   }
 });
 
-test("real handle: allowed routes are the person's, not a remote browser's, with no approval card", async () => {
+test("real handle: allowed routes are the person's, as at the machine", async () => {
   const { http } = realDevice();
-  const before = app.approvals.list().length;
   const r = await http.request({ method: "POST", path: "/api/missions", body: Buffer.from(JSON.stringify({})) });
   assert.notEqual(r.status, 403, "starting a mission is something the person at the machine can do");
   await r.text();
-  assert.equal(app.approvals.list().length, before);
   const list = await http.request({ method: "GET", path: `/api/fs/list?${q({ root: base })}` });
   assert.equal(list.status, 200, "any folder, as at the machine");
   await list.text();
 });
 
-test("real handle: a channel body is capped like a signed-in remote browser's", async () => {
+test("real handle: a channel body is capped at 32 MB", async () => {
   const { http } = realDevice();
   const fine = await http.request({ method: "POST", path: "/api/goal", body: Buffer.from(JSON.stringify({ goal: "x".repeat(100 * 1024) })) });
-  assert.notEqual(fine.status, 413, "past a signed-out browser's 16 KB");
+  assert.notEqual(fine.status, 413, "well past 16 KB");
   await fine.text();
   const r = await http.request({ method: "POST", path: "/api/goal", body: Buffer.alloc(33 * 1024 * 1024, 32) });
   assert.equal(r.status, 413);
@@ -581,7 +572,6 @@ test("any other route taking a path refuses the account folder, local or channel
   const cases = [
     ["POST", "/api/pi/start", { cwd: accountDir }],
     ["POST", "/api/pi/open", { cwd: accountDir }],
-    ["POST", "/api/pi/send", { cwd: accountDir, message: "x" }],
     ["POST", "/api/pi/switch", { file: secrets }],
     ["POST", "/api/claude/run", { cwd: accountDir, prompt: "x" }],
     ["POST", "/api/missions", { dir: accountDir, goal: "x" }],
@@ -611,6 +601,28 @@ test("a malformed body still fails the way it did, once the path check has read 
   assert.equal(r.status, 500);
 });
 
+test("a loopback request that is not the host's is refused on every route, with no sign-in page", async () => {
+  const notHost = [{ host: "evil.example" }, { "x-forwarded-for": "8.8.8.8" }, { forwarded: "for=8.8.8.8" }, { "x-real-ip": "8.8.8.8" }];
+  for (const headers of notHost) for (const path of ["/", "/index.html", "/login", "/app.js", "/api/state", "/events", "/api/remote/me", "/api/remote/status", "/omni-agent.crt"]) {
+    const r = await raw(path, { headers });
+    assert.equal(r.status, 403, `${JSON.stringify(headers)} ${path}`);
+    assert.match(r.json?.error || "", /this computer's own window/, path);
+  }
+  const post = await raw("/api/remote/login", { method: "POST", headers: { host: "evil.example", "content-type": "application/json" }, body: JSON.stringify({ password: "x".repeat(20) }) });
+  assert.equal(post.status, 403);
+});
+
+test("the host gets no password routes, page or certificate any more", async () => {
+  for (const path of ["/api/remote/me", "/api/remote/status", "/api/remote/approvals", "/omni-agent.crt", "/login.html"]) assert.equal((await raw(path)).status, 404, path);
+  for (const path of ["/api/remote/password", "/api/remote/login", "/api/remote/logout"]) assert.equal((await raw(path, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).status, 404, path);
+  const state = await raw("/api/state");
+  assert.equal(state.json.access.role, "host");
+  assert.equal(state.json.config.lan, undefined);
+  assert.equal(state.json.config.lanUrls, undefined);
+  assert.equal(app.remote, undefined);
+  assert.equal(app.relay, undefined);
+});
+
 // ------------------------------------------------------------------------------- the window token
 
 const swap = (token) => raw(`/?desktop=1&token=${encodeURIComponent(token)}`);
@@ -628,10 +640,7 @@ test("account routes: 403 without the cookie even from loopback, also the proxy"
   assert.equal(tokenAsCookie.status, 403, "the token itself is not the cookie");
 });
 
-test("window token: not for the remote listener or a request that is not the host's", async () => {
-  const remotePort = app.remote.port;
-  const remote = await raw("/?desktop=1&token=window-token-for-the-test-0123456789", { listenerPort: remotePort });
-  assert.equal(remote.headers["set-cookie"], undefined);
+test("window token: not for a request that is not the host's", async () => {
   const rebinding = await raw("/?desktop=1&token=window-token-for-the-test-0123456789", { headers: { host: "evil.example" } });
   assert.equal(rebinding.headers["set-cookie"], undefined);
   const proxied = await raw("/?desktop=1&token=window-token-for-the-test-0123456789", { headers: { "x-forwarded-for": "8.8.8.8" } });
@@ -680,8 +689,6 @@ test("WindowGate: the right cookie on a request that is not the host's own is st
 });
 
 test("window cookie: not accepted anywhere but the host's own request", async () => {
-  const remote = await raw("/api/account/status", { headers: { cookie }, listenerPort: app.remote.port });
-  assert.ok(remote.status === 401 || remote.status === 403, `${remote.status}`);
   const rebinding = await raw("/api/account/status", { headers: { cookie, host: "evil.example" } });
   assert.notEqual(rebinding.status, 200);
   const proxied = await raw("/api/account/status", { headers: { cookie, "x-forwarded-for": "8.8.8.8" } });
@@ -734,7 +741,7 @@ test("account routes: settings and audit answer through the window cookie", asyn
 
 test("the token is not left in the environment for every child to inherit", async () => {
   process.env.OMNI_WINDOW_TOKEN = "from-the-launcher-0123456789abcdef";
-  const scratch = await createApp({ port: 0, relay: { host: "" }, vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir: join(base, "acct3") });
+  const scratch = await createApp({ port: 0, vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir: join(base, "acct3") });
   assert.equal(process.env.OMNI_WINDOW_TOKEN, undefined);
   await scratch.listen();
   const scratchPort = scratch.server.address().port;
@@ -744,7 +751,7 @@ test("the token is not left in the environment for every child to inherit", asyn
 });
 
 test("without a token from the launcher the account routes say to open the desktop app", async () => {
-  const scratch = await createApp({ port: 0, relay: { host: "" }, vaultDir: join(base, "vault4"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir: join(base, "acct4") });
+  const scratch = await createApp({ port: 0, vaultDir: join(base, "vault4"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir: join(base, "acct4") });
   await scratch.listen();
   const r = await raw("/api/account/status", { listenerPort: scratch.server.address().port });
   assert.equal(r.status, 403);

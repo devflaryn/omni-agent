@@ -18,7 +18,7 @@ const work = join(base, "work");
 mkdirSync(work);
 const hasLinks = (() => { try { symlinkSync(accountDir, join(work, "keylink"), "junction"); return true; } catch { return false; } })();
 
-const app = await createApp({ port: 0, relay: { host: "" }, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: base, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir, fsTrash: async (abs) => rmSync(abs, { recursive: true, force: true }) });
+const app = await createApp({ port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: base, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir, fsTrash: async (abs) => rmSync(abs, { recursive: true, force: true }) });
 await app.listen();
 const at = `http://127.0.0.1:${app.server.address().port}`;
 after(async () => { await app.close(); try { rmSync(base, { recursive: true, force: true }); } catch { /* */ } });

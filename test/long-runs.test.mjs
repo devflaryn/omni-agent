@@ -56,7 +56,7 @@ function agentPiFactory(bus, answer = "The file has 42 lines.") {
 }
 
 const opts = (dir, extra = {}) => ({
-  port: 0, relay: { host: "" }, autoStartPi: false, cwd: base, liveWindowMs: 0,
+  port: 0, autoStartPi: false, cwd: base, liveWindowMs: 0,
   vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"),
   agentsFile: join(dir, "agents.json"), agentsDir: join(dir, "agents"), goalsFile: join(dir, "goals.json"),
   piModelsFile: join(dir, "pi-agent", "models.json"),

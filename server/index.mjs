@@ -7,13 +7,12 @@
  * OpencodeRpc (server/opencode-rpc.mjs) that keeps pi's RPC contract: the internal harness key stays "pi".
  */
 import { createServer } from "node:http";
-import { createServer as createHttpsServer } from "node:https";
 import { promises as fs, createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { basename, dirname, extname, join, resolve } from "node:path";
-import { CONFIG, CONFIG_FILE, ROOT, contextConfig, hookConfig, lanAddresses, piChildEnv, writeConfigFile } from "./config.mjs";
+import { CONFIG, CONFIG_FILE, ROOT, contextConfig, hookConfig, piChildEnv, retiredKeys, writeConfigFile } from "./config.mjs";
 import { AgentManager } from "./agents.mjs";
 import { handleAgentRoutes } from "./agent-routes.mjs";
 import * as graph from "./graph.mjs";
@@ -37,13 +36,10 @@ import { openUiBuild } from "./ui-build.mjs";
 import { serveWebFile } from "../hub/static.mjs";
 import { Vault } from "./memory.mjs";
 import { createTally, estimateTokens } from "./tokens.mjs";
-import { createServer as createNetServer } from "node:net";
-import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, WindowGate, channelAllowed, classify, clientIp, describe, inAccountFolder, isHostRequest, parseCookies, parseProxyLine, redact, requestTouchesAccountFolder } from "./access.mjs";
+import { WindowGate, channelAllowed, isHostRequest, requestTouchesAccountFolder } from "./access.mjs";
 import { Account, AccountError, handleAccountRoutes } from "./account.mjs";
 import { MachineLinks, mergedEvents, proxyToMachine } from "./channel-client.mjs";
 import { serveChannel } from "./channel-host.mjs";
-import { httpsRedirect, loadOrCreateCert } from "./tls.mjs";
-import { SshTunnel } from "./tunnel.mjs";
 import { ProjectStore } from "./projects.mjs";
 import { MissionManager } from "./missions.mjs";
 import { handleMissionRoutes } from "./mission-routes.mjs";
@@ -68,10 +64,6 @@ export async function createApp(overrides = {}) {
     if (!("piModelsFile" in overrides)) cfg.migratePiProviders = false;
     if (!("persistContext" in overrides)) cfg.persistContext = false;
     for (const k of ["opencodeConfigDir", "statusSessionsDir", "projectsDir", "accountDir"]) if (!(k in overrides)) cfg[k] = join(tmp, k);
-    // Nor the real certificate (a renewal would change the fingerprint phones trust) or the real remote port:
-    // a test that wants the LAN listener says so.
-    if (!("tlsDir" in overrides)) cfg.tlsDir = join(tmp, "tls");
-    if (!("lan" in overrides)) cfg.lan = false;
   }
   cfg.opencodeMirrorDir ||= join(cfg.piSessionsDir, "opencode");
   // Another Omni on another port (headless.mjs, a scratch instance) keeps its own registry and goals: each server
@@ -99,16 +91,6 @@ export async function createApp(overrides = {}) {
   const registry = new SessionRegistry();
   const vault = new Vault(cfg.vaultDir).ensure();
   const claude = new ClaudeRunner({ bin: cfg.claudeBin, bus, spawn: cfg.claudeSpawn });
-  const auth = cfg.remoteAuth || new RemoteAuth({ file: cfg.remoteAuthFile, sessionTtlMs: (cfg.remoteSessionDays || 7) * 86_400_000 });
-  const approvals = new Approvals({ timeoutMs: (cfg.remoteApprovalTimeoutSec || 300) * 1000 });
-  /** The remote listener, once it listens: { server, port, tls: { fingerprint, selfSigned } | null, error }. */
-  const remote = { server: null, front: null, port: null, tls: null, error: null };
-  /** The VPS relay's loopback listener: { server, front, port, fingerprint, selfSigned, error }. */
-  const relay = { server: null, front: null, port: null, fingerprint: null, selfSigned: false, error: null };
-  let tunnel = null;
-  /** Host browsers' event streams: only they hear about pending approvals. */
-  const hostStreams = new Set();
-  approvals.on("change", (list) => { const line = `event: approvals\ndata: ${JSON.stringify(list)}\n\n`; for (const res of hostStreams) { try { res.write(line); } catch { hostStreams.delete(res); } } });
   /**
    * Omni's own pi children, one per chat that runs at once: a busy chat never blocks another (each child can
    * start background agents of its own). `pi` is the one used last; routes without a `sid` talk to it.
@@ -591,15 +573,8 @@ export async function createApp(overrides = {}) {
   }, 30000);
 
   // ------------------------------------------------------------- file browser (server/files.mjs)
-  /** The host browses any folder. A remote viewer only the folders Omni works in (the chats' working
-   *  directories, the default one and the vault), never the rest of the disk. */
-  const normDir = (d) => { const r = resolve(String(d)); return process.platform === "win32" ? r.toLowerCase() : r; };
-  function fsRootAllowed(req, root) {
-    if (!String(root || "").trim()) return false;
-    if (req.omniHost || req.omniChannel) return true;
-    const allowed = new Set([cfg.cwd, cfg.vaultDir, ...[...pis].map((c) => c.cwd), ...registry.list().map((s) => s.cwd)].filter(Boolean).map(normDir));
-    return allowed.has(normDir(root));
-  }
+  /** The host and a device on the account browse any folder: only an empty root is refused. */
+  const fsRootAllowed = (root) => !!String(root || "").trim();
 
   // ------------------------------------------------------------------ http
   // The UI: dist/ui while it is what ui/ makes, ui/ itself the moment it is not (server/ui-build.mjs).
@@ -612,12 +587,12 @@ export async function createApp(overrides = {}) {
     res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
     res.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
   }
-  /** Read once and kept on the request: the approval gate reads a remote body before the route does. */
+  /** Read once and kept on the request: the account-folder check reads a body before the route does. */
   async function readBody(req) {
     if (req.omniBody) return req.omniBody;
     if (req.omniBodyError) throw req.omniBodyError;
-    // A remote body is capped (16 KB before sign-in, 32 MB after: pasted images); the host's is not.
-    const cap = req.omniHost ? Infinity : req.omniSignedIn || req.omniChannel ? 32 * 1024 * 1024 : 16 * 1024;
+    // A channel's body is capped at 32 MB (pasted images); the host's is not. Nobody else gets as far as a body.
+    const cap = req.omniHost ? Infinity : req.omniChannel ? 32 * 1024 * 1024 : 16 * 1024;
     const chunks = [];
     let size = 0;
     for await (const c of req) {
@@ -741,121 +716,6 @@ export async function createApp(overrides = {}) {
     });
   }
 
-  // Secure whenever the certificate exists: the relay path is always HTTPS even if the LAN listener is off.
-  const secure = () => (remote.tls || relay.server ? "; Secure" : "");
-  const cookieFor = (token, maxAgeSec) => `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSec}${secure()}`;
-  // The device token only ever needs to reach the sign-in route.
-  const deviceCookieFor = (token, maxAgeSec) => `${DEVICE_COOKIE}=${token}; Path=/api/remote/login; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSec}${secure()}`;
-  function remoteStatus() {
-    const proto = remote.tls ? "https" : "http";
-    return {
-      enabled: !!cfg.lan, listening: !!remote.server, port: remote.port, error: remote.error,
-      https: !!remote.tls, fingerprint: remote.tls?.fingerprint || relay.fingerprint || null, selfSigned: !!(remote.tls?.selfSigned ?? relay.selfSigned),
-      urls: remote.server ? lanAddresses().map((a) => `${proto}://${a.address}:${remote.port}/`) : [],
-      relay: cfg.relay?.host ? { url: `https://${cfg.relay.host}:${cfg.relay.publicPort}/`, listening: !!relay.server, error: relay.error, tunnel: tunnel?.status() || null } : null,
-      hasPassword: auth.hasPassword(), sessions: auth.list(), pending: approvals.list().length,
-      deviceApproval: cfg.remoteDeviceApproval !== false, devices: auth.listDevices(),
-    };
-  }
-
-  /** Password right: a trusted device signs straight in; a new one waits for the host's Approve, and is
-   *  then remembered. At most one waiting sign-in per address and three in all, so a leaked password
-   *  cannot bury the host in cards. */
-  async function signIn(req, res, ip, body) {
-    await auth.verify(ip, body.password);
-    const ua = String(req.headers["user-agent"] || "");
-    if (cfg.remoteDeviceApproval !== false && !auth.isTrustedDevice(parseCookies(req.headers.cookie)[DEVICE_COOKIE])) {
-      const waiting = approvals.list().filter((a) => a.kind === "signin");
-      if (waiting.some((a) => a.ip === ip) || waiting.length >= 3) throw Object.assign(new Error("a sign-in is already waiting for the host"), { status: 429 });
-      const gone = new AbortController();
-      res.on("close", () => { if (!res.writableFinished) gone.abort(); });
-      log(`remote ${ip} signs in from a new device; waiting for the host`);
-      const outcome = await approvals.request({ kind: "signin", ip, method: "POST", path: "/api/remote/login", title: "Sign in from a new device", text: `${ua.slice(0, 300) || "unknown browser"}\n\nApprove only if this is you. The device is remembered for 180 days (Settings → Remote lists it).`, detail: {} }, { signal: gone.signal });
-      log(`  → ${outcome}`);
-      if (outcome === "cancelled") return;
-      if (outcome !== "approved") throw Object.assign(new Error(outcome === "denied" ? "the host declined this device" : "the host did not answer in time"), { status: 403 });
-      res.appendHeader("Set-Cookie", deviceCookieFor(auth.trustDevice({ label: ua, ip }), Math.round(auth.deviceTtlMs / 1000)));
-    }
-    log(`remote sign-in from ${ip}`);
-    res.appendHeader("Set-Cookie", cookieFor(auth.createSession(ip, { userAgent: ua }), Math.round(auth.sessionTtlMs / 1000)));
-    send(res, 200, { ok: true });
-  }
-
-  /** The self-signed certificate as a file iOS installs as a profile (Settings → General → VPN & Device
-   *  Management, then Settings → General → About → Certificate Trust Settings): the warning is then gone. */
-  const CERT_PATH = "/omni-agent.crt";
-  function sendCert(res) {
-    const c = remote.tls || relay.server ? loadCert() : null;
-    if (!c?.cert) return send(res, 404, { error: "this listener has no certificate" });
-    res.writeHead(200, { "Content-Type": "application/x-x509-ca-cert", "Content-Disposition": 'attachment; filename="omni-agent.crt"', "Cache-Control": "no-store" });
-    res.end(c.cert);
-  }
-
-  /** Everything a request from anywhere but the host's own browser goes through first. Answers the
-   *  request itself (login page, 401, refusal) and returns true, or returns false to let the route run. */
-  async function remoteGate(req, res, p) {
-    const ip = clientIp(req);
-    const token = parseCookies(req.headers.cookie)[COOKIE];
-    if (p === "/api/remote/login" && req.method === "POST") {
-      await signIn(req, res, ip, await readBody(req));
-      return true;
-    }
-    if (p === "/api/remote/logout" && req.method === "POST") {
-      auth.logout(token);
-      res.setHeader("Set-Cookie", cookieFor("", 0));
-      send(res, 200, { ok: true });
-      return true;
-    }
-    // The certificate is public (every visitor's browser is sent it): a phone downloads it to trust it.
-    if (req.method === "GET" && p === CERT_PATH) { sendCert(res); return true; }
-    const session = auth.session(token);
-    if (!session) {
-      if (req.method === "GET" && (p === "/" || p === "/index.html" || p === "/login")) { send(res, 200, await fs.readFile(join(ROOT, "ui", "login.html")), MIME[".html"]); return true; }
-      send(res, 401, { error: "sign in first", login: true });
-      return true;
-    }
-    req.omniSignedIn = true;
-    if (p === "/login") { res.writeHead(302, { Location: "/" }); res.end(); return true; }
-    const kind = classify(req.method, p);
-    if (kind === "host") { send(res, 403, { error: "only the host can do that, at the computer itself" }); return true; }
-    if (kind === "read") return false;
-    // A change: hold it open until the host approves or denies it on this computer.
-    const body = req.method === "GET" || req.method === "DELETE" ? {} : await readBody(req);
-    const d = describe(req.method, p, body, { titleOf: (sid) => registry.get(sid)?.title || "" });
-    const gone = new AbortController();
-    res.on("close", () => { if (!res.writableFinished) gone.abort(); });
-    log(`remote ${ip} asks: ${d.title}`);
-    const outcome = await approvals.request({ ip, method: req.method, path: p, title: d.title, text: String(d.text || "").slice(0, 4000), detail: redact(body) }, { signal: gone.signal });
-    log(`  → ${outcome}`);
-    if (outcome === "approved") return false;
-    if (outcome !== "cancelled") send(res, 403, { error: outcome === "denied" ? "the host declined this" : "the host did not answer in time", approval: outcome });
-    return true;
-  }
-
-  /** The host's controls for remote access (Settings → Remote, and the approval cards). */
-  async function remoteAdmin(req, res, p) {
-    let m;
-    if (req.method === "GET" && p === "/api/remote/status") return send(res, 200, remoteStatus());
-    if (req.method === "POST" && p === "/api/remote/password") {
-      await auth.setPassword((await readBody(req)).password);
-      log("remote password changed; remote browsers signed out");
-      return send(res, 200, remoteStatus());
-    }
-    if (req.method === "DELETE" && p === "/api/remote/sessions") return send(res, 200, { signedOut: auth.logoutAll(), ...remoteStatus() });
-    if (req.method === "DELETE" && (m = /^\/api\/remote\/devices\/([^/]+)$/.exec(p))) {
-      const removed = auth.removeDevice(decodeURIComponent(m[1]));
-      // A device no longer trusted must not stay signed in either.
-      if (removed) auth.logoutAll();
-      return send(res, 200, { removed, ...remoteStatus() });
-    }
-    if (req.method === "GET" && p === "/api/remote/approvals") return send(res, 200, { approvals: approvals.list() });
-    if (req.method === "POST" && (m = /^\/api\/remote\/approvals\/([^/]+)$/.exec(p))) {
-      const ok = approvals.decide(decodeURIComponent(m[1]), (await readBody(req)).approve === true);
-      return ok ? send(res, 200, { ok: true }) : send(res, 404, { error: "that request is no longer waiting" });
-    }
-    return send(res, 404, { error: "unknown remote route" });
-  }
-
   /** Whether this request names a path in the account folder, in its query or anywhere in its JSON body. */
   async function accountFolderAsked(req, p, q) {
     let body = {};
@@ -891,7 +751,7 @@ export async function createApp(overrides = {}) {
     }
   }
 
-  async function handle(req, res, { remoteListener = false } = {}) {
+  async function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const p = url.pathname;
     const q = url.searchParams;
@@ -903,9 +763,10 @@ export async function createApp(overrides = {}) {
     try {
       const sfs = req.headers["sec-fetch-site"];
       if (req.method !== "GET" && sfs && sfs !== "same-origin" && sfs !== "none") return send(res, 403, { error: "cross-site request refused" });
-      req.omniHost = !req.omniChannel && isHostRequest(req, { remoteListener });
+      req.omniHost = !req.omniChannel && isHostRequest(req);
       if (req.omniChannel) { if (!channelAllowed(req.method, req.url)) return send(res, 403, { error: "that is not available over a channel" }); }
-      else if (!req.omniHost && (await remoteGate(req, res, p))) return;
+      // Loopback, but not the person at this computer: another Host (DNS rebinding) or a proxy or tunnel on this machine.
+      else if (!req.omniHost) return send(res, 403, { error: "Omni answers only this computer's own window here. Other devices reach it through the account." });
       // The proxy first: its body is the far machine's to read, as it streams, and no path in it names anything here.
       if (p === "/remote" || p.startsWith("/remote/")) return await accountRoute(req, res, p, q);
       // Whoever asks, by whatever route: the keys are not reachable through this server.
@@ -917,9 +778,6 @@ export async function createApp(overrides = {}) {
         return res.end();
       }
       if (p === "/api/account" || p.startsWith("/api/account/")) return await accountRoute(req, res, p, q);
-      if (req.method === "GET" && p === "/api/remote/me") return send(res, 200, { role: req.omniHost ? "host" : "remote" });
-      if (p.startsWith("/api/remote/")) return remoteAdmin(req, res, p);
-      if (req.method === "GET" && p === CERT_PATH) return sendCert(res);
       // static UI
       if (req.method === "GET" && (p === "/" || p === "/index.html")) {
         const built = uiBuild.current();
@@ -939,11 +797,10 @@ export async function createApp(overrides = {}) {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
         res.write(": omni\n\n");
         bus.addClient(res, Number(q.get("since") || 0), q.get("boot") || "");
-        if (req.omniHost) { hostStreams.add(res); res.write(`event: approvals\ndata: ${JSON.stringify(approvals.list())}\n\n`); }
         // A real event, not an SSE comment: page code never sees a comment, and the page needs this beat to
-        // notice a stream that died without a FIN (a phone switching networks, the relay's far side gone).
+        // notice a stream that died without a FIN (a phone switching networks, a channel's far side gone).
         const ka = setInterval(() => { try { res.write("event: ka\ndata: 1\n\n"); } catch { /* */ } }, cfg.sseKeepAliveMs || 20000);
-        req.on("close", () => { clearInterval(ka); bus.removeClient(res); hostStreams.delete(res); });
+        req.on("close", () => { clearInterval(ka); bus.removeClient(res); });
         return;
       }
       // state
@@ -956,8 +813,8 @@ export async function createApp(overrides = {}) {
         const sessionsNow = !first ? allSessions : [...allSessions].sort((a, b) => (b.lastActivity || 0) - (a.lastActivity || 0)).filter((s, i) => i < 60 || s.streaming || s.owned);
         const agentsNow = !first ? allAgents.slice(0, 200) : [...allAgents.filter((a) => AGENT_RUNNING.has(a.status)).slice(0, 12), ...allAgents.filter((a) => !AGENT_RUNNING.has(a.status)).slice(0, 20)];
         return send(res, 200, {
-          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, lan: cfg.lan, lanUrls: remoteStatus().urls, piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking, context: cfg.context },
-          access: { role: req.omniHost ? "host" : req.omniChannel ? "device" : "remote", ...(req.omniHost ? { remote: remoteStatus() } : {}) },
+          config: { cwd: cfg.cwd, vault: cfg.vaultDir, port: cfg.port, piModelsFile: cfg.piModelsFile, claudeBin: cfg.claudeBin, memoryBudgetTokens: cfg.memoryBudgetTokens, liveWindowMs: cfg.liveWindowMs, piProvider: cfg.piProvider, piModel: cfg.piModel, piThinking: cfg.piThinking, context: cfg.context },
+          access: { role: req.omniHost ? "host" : "device" },
           pi: pi ? { running: !!pi.proc, sid: pi.sid, cwd: pi.cwd, streaming: pi.streaming, state: pi.state } : { running: false },
           // Every chat with a pi child right now (`pi` is the one used last), and each one's goal.
           pis: piList().map((x) => ({ ...x, goal: keeper.goal(x.sid) ? keeper.status(x.sid) : null })),
@@ -1144,16 +1001,6 @@ export async function createApp(overrides = {}) {
             if (!fresh) await c.newSession();
             return send(res, 200, { ok: true, sid: c.sid, cwd: c.cwd, state: c.state });
           }
-          // A new chat in one step (open it, then prompt): what a remote browser's Home sends, so the host
-          // approves one request instead of three.
-          case "/api/pi/send": {
-            if (!body.message?.trim()) return send(res, 400, { error: "empty" });
-            const { child: c, fresh } = await acquirePi(body.cwd || cfg.cwd);
-            if (!fresh) await c.newSession();
-            const composed = await composePrompt("pi", body.message, { memory: body.memory, graph: body.graph, dir: graphDirFor(c.sid) });
-            await usePi(c).prompt(composed.text, { images: body.images });
-            return send(res, 200, { ok: true, sid: c.sid });
-          }
           case "/api/pi/prompt": {
             if (!body.message?.trim()) return send(res, 400, { error: "empty" });
             // The chat's child was closed (idle too long, or it opened another chat): pick the chat up again.
@@ -1325,9 +1172,7 @@ export async function createApp(overrides = {}) {
         const path = (isGet ? q.get("path") : b.path) || "";
         // files.mjs reads what it is given as text: only text is a path here.
         if ([root, path, b.to].some((v) => v != null && typeof v !== "string")) return send(res, 400, { error: "root, path and to must be text" });
-        if (!fsRootAllowed(req, root)) return send(res, 403, { error: "that folder is not a known session folder" });
-        // A password viewer is kept to the folders above, so a link in one does not lead out. The host and a device may browse anywhere.
-        if (!req.omniHost && !req.omniChannel) for (const rel of [path, b.to]) if (rel != null && files.safeResolve(root, rel) && !(await files.staysInside(root, rel))) return send(res, 403, { error: "that link leads outside the folder" });
+        if (!fsRootAllowed(root)) return send(res, 403, { error: "no folder was given" });
         if (isGet) switch (p) {
           case "/api/fs/list": return send(res, 200, { entries: await files.listDir(root, path) });
           case "/api/fs/read": return send(res, 200, await files.readFileInfo(root, path));
@@ -1358,100 +1203,6 @@ export async function createApp(overrides = {}) {
 
   const server = createServer((req, res) => handle(req, res));
 
-  let certCache = null;
-  const loadCert = () => (certCache ||= loadOrCreateCert({ dir: cfg.tlsDir, certFile: cfg.tlsCert, keyFile: cfg.tlsKey, altNames: [...lanAddresses().map((a) => a.address), ...(cfg.relay?.host ? [cfg.relay.host] : [])], log: (t) => log(`  ${t}`) }));
-  /** Limits for a listener strangers reach: slow or idle clients are cut off, and connections are capped.
-   *  requestTimeout covers receiving a request, not the wait for an approval after it. */
-  function harden(srv) {
-    srv.headersTimeout = 15_000;
-    srv.requestTimeout = 60_000;
-    srv.keepAliveTimeout = 10_000;
-    srv.maxConnections = 256;
-    srv.maxHeadersCount = 100;
-    return srv;
-  }
-
-  /** Other devices' listener: every interface, HTTPS when a certificate can be had. Every request on it is remote. */
-  async function listenRemote() {
-    let tls = null;
-    if (cfg.remoteTls !== false) {
-      tls = loadCert();
-      if (tls.error) { log(`  remote HTTPS unavailable (${tls.error}); serving plain HTTP: passwords cross the network readable`); tls = null; }
-    }
-    const onReq = (req, res) => handle(req, res, { remoteListener: true });
-    const srv = harden(tls ? createHttpsServer({ key: tls.key, cert: tls.cert }, onReq) : createServer(onReq));
-    // With TLS a front sorts each connection by its first byte: a TLS handshake goes to the HTTPS server, a
-    // plain-HTTP request (the address typed without https://, which is what a phone's browser then opens)
-    // gets a redirect to https:// instead of a dropped connection.
-    const front = tls ? createNetServer((sock) => {
-      sock.on("error", () => {});
-      const drop = setTimeout(() => sock.destroy(), 10_000);
-      const first = () => {
-        const c = sock.read();
-        if (c === null) return void sock.once("readable", first);
-        clearTimeout(drop);
-        if (c[0] === 0x16) { sock.unshift(c); srv.emit("connection", sock); return; }
-        const local = String(sock.localAddress || "").replace(/^::ffff:/, "");
-        const reply = httpsRedirect(c, `${local.includes(":") ? `[${local}]` : local}:${sock.localPort}`);
-        if (reply) sock.end(reply); else sock.destroy();
-      };
-      sock.once("readable", first);
-    }) : srv;
-    if (tls) front.maxConnections = 256;
-    try {
-      await new Promise((r, j) => { front.once("error", j); front.listen(cfg.remotePort, cfg.remoteHost || "0.0.0.0", () => { front.off("error", j); r(); }); });
-    } catch (e) { remote.error = e.message; log(`  remote listener could not start on port ${cfg.remotePort}: ${e.message}`); return; }
-    Object.assign(remote, { server: srv, front, port: front.address().port, tls: tls ? { fingerprint: tls.fingerprint, selfSigned: tls.selfSigned } : null });
-    const proto = tls ? "https" : "http";
-    for (const a of lanAddresses()) log(`  other devices: ${proto}://${a.address}:${remote.port}/   (${a.name})`);
-    log(`  from another network: forward TCP ${remote.port} on your router to this PC, then open ${proto}://<your public IP>:${remote.port}/`);
-    log(`  remote browsers sign in with the host's password (${auth.hasPassword() ? "set" : "NOT SET: set it in Settings → Remote"}), see everything read-only, and every change waits for your approval here`);
-    if (tls) log(`  certificate SHA-256 ${tls.fingerprint}${tls.selfSigned ? " (self-signed: the browser warns once; compare this fingerprint)" : ""}`);
-    if (process.platform === "win32") log(`  if the firewall blocks it run scripts\\allow-lan.cmd ${remote.port} once`);
-  }
-
-  /** The VPS relay's way in: loopback only (nothing on the network can reach it; the SSH tunnel brings the
-   *  VPS's connections here), HTTPS only, and every connection must open with the relay's PROXY line naming
-   *  the visitor, or it is dropped. Everything on it is remote. */
-  async function listenRelay() {
-    const tls = loadCert();
-    if (tls.error) { relay.error = `no certificate (${tls.error}); the relay never serves plain HTTP`; log(`  relay off: ${relay.error}`); return; }
-    const srv = harden(createHttpsServer({ key: tls.key, cert: tls.cert }, (req, res) => handle(req, res, { remoteListener: true })));
-    const front = createNetServer((sock) => {
-      let acc = Buffer.alloc(0);
-      const drop = setTimeout(() => sock.destroy(), 5000);
-      sock.on("error", () => {});
-      sock.pause();
-      const onReadable = () => {
-        let c;
-        while ((c = sock.read()) !== null) {
-          acc = Buffer.concat([acc, c]);
-          const i = acc.indexOf("\r\n");
-          if (i < 0) { if (acc.length > 107) { clearTimeout(drop); sock.destroy(); } continue; }
-          sock.off("readable", onReadable);
-          clearTimeout(drop);
-          const ip = parseProxyLine(acc.subarray(0, i).toString("latin1"));
-          if (!ip) { sock.destroy(); return; }
-          sock.omniIp = ip;
-          sock.unshift(acc.subarray(i + 2));
-          srv.emit("connection", sock);
-          return;
-        }
-      };
-      sock.on("readable", onReadable);
-    });
-    front.maxConnections = 256;
-    try {
-      await new Promise((r, j) => { front.once("error", j); front.listen(cfg.relay.localPort, "127.0.0.1", () => { front.off("error", j); r(); }); });
-    } catch (e) { relay.error = e.message; log(`  relay listener could not start on 127.0.0.1:${cfg.relay.localPort}: ${e.message}`); return; }
-    Object.assign(relay, { server: srv, front, port: front.address().port, fingerprint: tls.fingerprint, selfSigned: tls.selfSigned, error: null });
-    log(`  internet: https://${cfg.relay.host}:${cfg.relay.publicPort}/  (through the VPS relay; no router port forward)`);
-    if (!cfg.relayNoTunnel) {
-      tunnel = new SshTunnel({ host: cfg.relay.host, user: cfg.relay.user, key: cfg.relay.key, knownHosts: cfg.relay.knownHosts, remotePort: cfg.relay.remotePort, localPort: relay.port, spawn: cfg.tunnelSpawn, log: (t) => log(`  ${t}`) });
-      tunnel.start();
-    }
-  }
-
   async function listen() {
     // The agent registry is loaded BEFORE the server answers anything: an empty manager would tell a reconnecting
     // delivery poller there is nothing to deliver, and its first save would overwrite agents.json. Agents that were
@@ -1462,9 +1213,9 @@ export async function createApp(overrides = {}) {
     missions.reconcile();
     await new Promise((r) => server.listen(cfg.port, cfg.host, r));
     log(`Omni Agent on http://127.0.0.1:${cfg.port}  vault=${cfg.vaultDir}`);
+    const retired = cfg.retiredKeys ?? retiredKeys();
+    if (retired.length) log(`omni.config.json still has ${retired.join(", ")}: the password-and-relay way in was removed, so they do nothing and can be deleted`);
     account?.start(); // never awaited: local use does not wait for the hub, or for the key store
-    if (cfg.lan) await listenRemote();
-    if (cfg.relay?.host) await listenRelay();
     await watcher.start();
     log(`watching ${watcher.tails.size} session files (${registry.list().length} known sessions)`);
     // Agent chats keep their place under their parent (only chats the watcher found: a deleted one is not recreated blank).
@@ -1509,20 +1260,13 @@ export async function createApp(overrides = {}) {
     try { if (typeof opencode.killSync === "function") opencode.killSync(); else opencode.stop(); } catch (e) { log("could not stop opencode", e.message); }
     exitGuard?.release();
     claude.stopAll();
-    approvals.dispose();
     machineLinks?.close();
     account?.stop();
     for (const res of accountStreams) { try { res.end(); } catch { /* */ } }
-    for (const res of hostStreams) { try { res.end(); } catch { /* */ } }
     server.close();
-    remote.front?.close();
-    if (remote.front !== remote.server) remote.server?.closeAllConnections?.();
-    tunnel?.stop();
-    relay.front?.close();
-    relay.server?.closeAllConnections?.();
   }
 
-  return { server, remote, relay, account, handleChannelRequest: (req, res) => handle(req, res), get tunnel() { return tunnel; }, listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, missions, projects, auth, approvals, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, opencode, cfg };
+  return { server, account, handleChannelRequest: (req, res) => handle(req, res), listen, close, bus, vault, registry, tally, watcher, claude, keeper, agents, missions, projects, get pi() { return pi; }, get pis() { return [...pis]; }, startPi, opencode, cfg };
 }
 
 if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, "/")}` || process.argv[1]?.endsWith("index.mjs")) {

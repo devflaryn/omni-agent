@@ -130,7 +130,7 @@ test("a run of one long turn with no person's message nearby is cut anyway, so a
 async function app(extra = {}) {
   const dir = mkdtempSync(join(base, "app-"));
   mkdirSync(join(dir, "vault"), { recursive: true });
-  const created = await createApp({ port: 0, relay: { host: "" }, autoStartPi: false, hook: { enabled: false }, persistHook: false, persistPiModel: false, cwd: dir, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"), projectsDir: join(dir, "projects"), tlsDir: join(dir, "tls"), remoteAuthFile: join(dir, "remote.json"), accountDir: join(dir, "account"), opencodeConfigDir: join(dir, "oc"), log: () => {}, ...extra });
+  const created = await createApp({ port: 0, autoStartPi: false, hook: { enabled: false }, persistHook: false, persistPiModel: false, cwd: dir, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"), projectsDir: join(dir, "projects"), accountDir: join(dir, "account"), opencodeConfigDir: join(dir, "oc"), log: () => {}, ...extra });
   await created.listen();
   cleanups.push(() => created.close());
   return { app: created, at: `http://127.0.0.1:${created.server.address().port}` };

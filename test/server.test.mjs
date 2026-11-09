@@ -42,7 +42,7 @@ const fakeSpawn = (bin, args, opts) => {
 };
 // liveWindowMs: 0 — the fixture files were written a moment ago and would otherwise count as "open in a terminal".
 // `hook` is pinned so the developer's own omni.config.json (where the goal hook may be on) never leaks into the assertions.
-const app = await createApp({ port: 0, relay: { host: "" }, sseKeepAliveMs: 100, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
+const app = await createApp({ port: 0, sseKeepAliveMs: 100, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false } });
 await app.listen();
 const port = app.server.address().port;
 const api = async (path, opts) => {
@@ -234,7 +234,7 @@ function makeFakePi({ cwd, model, provider, thinking }) {
   return fakePi;
 }
 const oc2 = new FakeServer();
-const app2 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false, piThinking: "", opencodeServer: oc2, opencodeConfigDir: join(base, "oc2-config"), opencodeProvidersFile: join(base, "omni", "opencode-providers.json") });
+const app2 = await createApp({ port: 0, vaultDir: join(base, "vault2"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeFakePi, piModelsFile: join(base, "pi-agent", "models.json"), piExtConfigFile: join(base, "pi-agent", "omni-agent.json"), persistHook: false, persistPiModel: false, piThinking: "", opencodeServer: oc2, opencodeConfigDir: join(base, "oc2-config"), opencodeProvidersFile: join(base, "omni", "opencode-providers.json") });
 const disposes = () => oc2.calls.filter((c) => c.method === "POST" && c.path === "/global/dispose").length;
 const app2Logs = [];
 app2.bus.on("event", (ev) => { if (ev.kind === "log") app2Logs.push(ev); });
@@ -555,7 +555,7 @@ function makeGoalPi({ cwd, model, provider, thinking } = {}) {
   };
   return goalPi;
 }
-const app3 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeGoalPi, persistHook: false, persistPiModel: false, hook: { enabled: false } });
+const app3 = await createApp({ port: 0, vaultDir: join(base, "vault3"), piSessionsDir: join(base, "pi-sessions"), claudeProjectsDir: join(base, "claude-projects"), autoStartPi: false, cwd: base, claudeSpawn: fakeSpawn, liveWindowMs: 0, createPi: makeGoalPi, persistHook: false, persistPiModel: false, hook: { enabled: false } });
 await app3.listen();
 const port3 = app3.server.address().port;
 after(() => app3.close());
@@ -599,7 +599,7 @@ function fakePiFactory() {
 }
 
 test("startPi starts the stall watchdog", async () => {
-  const app = await createApp({ relay: { host: "" }, autoStartPi: false, createPi: fakePiFactory(), port: 0 });
+  const app = await createApp({ autoStartPi: false, createPi: fakePiFactory(), port: 0 });
   const pi = app.startPi(process.cwd());
   assert.ok(pi.watchdogTimer || pi._watchdogStarted, "watchdog should be armed");
   app.close();
@@ -677,7 +677,7 @@ mkdirSync(personasDir, { recursive: true });
 writeFileSync(join(personasDir, "scout.md"), "---\nname: scout\ndescription: Recon.\ntools: read, find\n---\nYou scout.\n");
 const oc = new FakeServer({ catalog: OC_CATALOG, up: false, reply: (m, p) => (m === "POST" && /^\/session\/[^/]+\/message$/.test(p) ? { info: { id: "msg_side" }, parts: [{ type: "text", text: "side answer" }] } : undefined) });
 const ocLogs = [];
-const app4 = await createApp({ relay: { host: "" }, port: 0, vaultDir: join(ocBase, "vault"), piSessionsDir: join(ocBase, "pi-sessions"), claudeProjectsDir: join(ocBase, "claude-projects"), autoStartPi: false, cwd: ocBase, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeServer: oc, opencodeConfigDir: join(ocBase, "oc-config"), piExtConfigFile: join(ocBase, "pi-agent", "omni-agent.json"), piModelsFile: join(ocBase, "pi-agent", "models.json"), statusSessionsDir: join(ocBase, "status"), personasDir, piModels: ["anthropic/x"], piProvider: "opencode", piModel: "gone", piThinking: "high", context: { compactAt: 300000 }, opencodeAuthFile: join(ocBase, "oc-data", "opencode", "auth.json"), opencodeAuthWatch: { interval: 20, debounceMs: 30 } });
+const app4 = await createApp({ port: 0, vaultDir: join(ocBase, "vault"), piSessionsDir: join(ocBase, "pi-sessions"), claudeProjectsDir: join(ocBase, "claude-projects"), autoStartPi: false, cwd: ocBase, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeServer: oc, opencodeConfigDir: join(ocBase, "oc-config"), piExtConfigFile: join(ocBase, "pi-agent", "omni-agent.json"), piModelsFile: join(ocBase, "pi-agent", "models.json"), statusSessionsDir: join(ocBase, "status"), personasDir, piModels: ["anthropic/x"], piProvider: "opencode", piModel: "gone", piThinking: "high", context: { compactAt: 300000 }, opencodeAuthFile: join(ocBase, "oc-data", "opencode", "auth.json"), opencodeAuthWatch: { interval: 20, debounceMs: 30 } });
 app4.bus.on("event", (ev) => { if (ev.kind === "log") ocLogs.push(ev); });
 await app4.listen();
 const port4 = app4.server.address().port;
@@ -862,7 +862,7 @@ test("opencode: an injected server gets no process exit hooks unless asked", () 
 
 // ---------------------------------------------- a failed first start, and the exit guard
 const failBase = mkdtempSync(join(tmpdir(), "omni-oc-fail-"));
-const failOpts = (dir, extra) => ({ relay: { host: "" }, port: 0, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi-sessions"), claudeProjectsDir: join(dir, "claude"), autoStartPi: false, cwd: dir, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeConfigDir: join(dir, "oc-config"), piExtConfigFile: join(dir, "pi-agent", "omni-agent.json"), piModelsFile: join(dir, "pi-agent", "models.json"), piProvider: "opencode", piModel: "big-pickle", ...extra });
+const failOpts = (dir, extra) => ({ port: 0, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi-sessions"), claudeProjectsDir: join(dir, "claude"), autoStartPi: false, cwd: dir, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, opencodeConfigDir: join(dir, "oc-config"), piExtConfigFile: join(dir, "pi-agent", "omni-agent.json"), piModelsFile: join(dir, "pi-agent", "models.json"), piProvider: "opencode", piModel: "big-pickle", ...extra });
 
 test("opencode: a failed first start is tried again when a chat is used, and the guard is set up once", async () => {
   const proc = new EventEmitter();

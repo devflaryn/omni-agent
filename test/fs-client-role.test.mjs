@@ -34,7 +34,7 @@ writeFileSync(join(sibling, "keep.txt"), "x");
 writeFileSync(join(work, "note.txt"), "n");
 const hasLinks = (() => { try { symlinkSync(appDir, join(work, "applink"), "junction"); return true; } catch { return false; } })();
 
-const options = { port: 0, relay: { host: "" }, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir: join(base, "account"), fsTrash: async (abs) => rmSync(abs, { recursive: true, force: true }) };
+const options = { port: 0, vaultDir: join(base, "vault"), piSessionsDir: join(base, "pi"), claudeProjectsDir: join(base, "claude"), autoStartPi: false, cwd: work, liveWindowMs: 0, persistHook: false, persistPiModel: false, hook: { enabled: false }, accountDir: join(base, "account"), fsTrash: async (abs) => rmSync(abs, { recursive: true, force: true }) };
 const app = await createApp({ ...options, appFiles: [appDir, cfgFile] });
 await app.listen();
 after(async () => { await app.close(); try { rmSync(base, { recursive: true, force: true }); } catch { /* */ } });
