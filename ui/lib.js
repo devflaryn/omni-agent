@@ -1,5 +1,24 @@
 /* Pure helpers shared by the UI modules. No DOM access, so `node --test` can import it. */
 export const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+/**
+ * Puts `text` on the clipboard. The Clipboard API exists only on a secure origin, so on plain-http LAN access (or when the
+ * API refuses) the old copy command does it, from a textarea that comes and goes; the focus goes back where it was.
+ * Resolves once copied, rejects when neither way worked.
+ */
+export async function copyText(text, { clipboard = globalThis.navigator?.clipboard } = {}) {
+  if (clipboard?.writeText) { try { await clipboard.writeText(text); return; } catch { /* refused: the old way below */ } }
+  const prev = document.activeElement;
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.className = "copy-buffer";
+  document.body.appendChild(ta);
+  let ok = false;
+  try { ta.select(); ok = document.execCommand("copy"); } catch { /* not supported */ }
+  ta.remove();
+  if (prev?.isConnected && prev !== document.body) prev.focus?.({ preventScroll: true });
+  if (!ok) throw new Error("Could not copy");
+}
 export const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 export const fmtN = (n) => (n == null ? "–" : n >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n));
 export const ago = (ts) => { if (!ts) return ""; const d = Date.now() - ts; if (d < 60e3) return "just now"; if (d < 3600e3) return `${Math.floor(d / 60e3)} min ago`; if (d < 86400e3) return `${Math.floor(d / 3600e3)} h ago`; return `${Math.floor(d / 86400e3)} d ago`; };

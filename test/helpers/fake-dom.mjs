@@ -70,6 +70,7 @@ export class FakeEl {
   blur() { if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body; }
   click() { this.ownerDocument.dispatch(this, { type: "click" }); }
   scrollIntoView() { /* nothing to scroll */ }
+  select() { this.ownerDocument.selected = this.value; }
   all() { const out = []; for (const c of this.children) { out.push(c); out.push(...c.all()); } return out; }
   querySelectorAll(sel) { const parts = sel.split(",").map((s) => s.trim()); return this.all().filter((e) => parts.some((p) => matches(e, p))); }
   querySelector(sel) { return this.querySelectorAll(sel)[0] ?? null; }

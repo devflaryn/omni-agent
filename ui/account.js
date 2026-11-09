@@ -2,7 +2,7 @@
    code screen and the security banners. All of it is about this computer's account, whichever machine the window is on, so
    it talks to this computer's server only (transport's `local`).
    Everything a device or the hub supplies is shown as text, through cleanName: device names are hostile input. */
-import { el, ago } from "./lib.js";
+import { el, ago, copyText } from "./lib.js";
 import { ORDINARY_DROP } from "./hub-socket.js";
 import { checkPassword } from "./account-core.js";
 import { cleanName, isRemote, local, machine, onStillWaiting, setMachine, webPage } from "./transport.js";
@@ -695,7 +695,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
       const copied = el("span", "rm-note");
       const copy = button("Copy", "", () => {
         const done = () => { copied.textContent = "Copied. Now put it somewhere safe, away from this computer."; };
-        (navigator.clipboard?.writeText(shown.recoveryCode) ?? Promise.reject()).then(done).catch(() => { copied.textContent = "Could not copy. Select it and copy it by hand."; });
+        copyText(shown.recoveryCode).then(done).catch(() => { copied.textContent = "Could not copy. Select it and copy it by hand."; });
       });
       const row = el("div", "acct-gate-row"); row.append(copy, copied);
       box.appendChild(row);
@@ -878,7 +878,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
       made.appendChild(el("div", "acct-recovery mono", code));
       const copied = el("span", "rm-note", "Give this code to the person you invite. It is shown only once.");
       const copy = button("Copy", "small", () => {
-        (navigator.clipboard?.writeText(code) ?? Promise.reject()).then(() => { copied.textContent = "Copied."; }).catch(() => { copied.textContent = "Could not copy. Select it and copy it by hand."; });
+        copyText(code).then(() => { copied.textContent = "Copied."; }).catch(() => { copied.textContent = "Could not copy. Select it and copy it by hand."; });
       });
       const row = el("div", "acct-gate-row"); row.append(copy, copied);
       made.appendChild(row);

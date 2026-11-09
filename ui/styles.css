@@ -1262,6 +1262,8 @@ figure.code { --t-com: #6a9955; --t-str: #ce9178; --t-kw: #569cd6; --t-num: #b5c
 /* Send greyed while the box is empty: the caption keeps its usual tone (the greyed look is for chats that cannot take a message). */
 .composer:has(.send-btn.empty) .caption { color: var(--dim); }
 .actions .icon-btn.copied { color: var(--ink); opacity: 1; }
+/* copyText's stand-in on plain http, where there is no Clipboard API: there for one copy command, never seen. */
+.copy-buffer { position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; }
 
 /* The palette (Ctrl/⌘+K) and the shortcut sheet (?). They open without motion: the keyboard opens them. */
 .kbd-scrim { position: fixed; inset: 0; z-index: 90; background: var(--scrim); display: flex; justify-content: center; align-items: flex-start; padding: 18vh 16px 16px; }

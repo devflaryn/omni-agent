@@ -1,7 +1,7 @@
 /* Omni Agent front end. Home (one container) → Chat (explorer | preview | transcript). Right drawer: Chats / Memory / Graph / Tokens. pi only.
    Every machine on the account is in this one window: the chats drawer lists them all, and opening a chat or starting one on
    any of them moves the window's focus there without a reload (ui/machines.js keeps one workspace per machine). */
-import { el, ago, baseName, harnessLabel, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
+import { el, ago, copyText, baseName, harnessLabel, AGENT_ACTIVE, agentTone, agentKindLabel, agentTitle, agentsFor, agentSummary, agentSubline, agentElapsed, agentReportKey, withLiveReports, mergeAgentSnapshot } from "./lib.js";
 import { newView, applyEvent, finish, forkNote, agentNote, emptyNote, setOlder, prependHistory, isFollowing, followLatest } from "./transcript.js";
 import { chatHash, parseHash } from "./route.js";
 import { installKeys, openPalette, openShortcuts } from "./keys.js";
@@ -838,7 +838,7 @@ function renderChatMenu() {
   const item = (label, fn, on) => { const b = el("button", on ? "on" : "", label); b.onclick = () => { m.hidden = true; fn(); }; m.appendChild(b); };
   if (s.harness === "pi") item("Fork into a new chat with the next message", () => { S.forceFork = !S.forceFork; updateComposer(); chat.focus(); }, S.forceFork);
   item("Save a digest to memory", async () => { try { const r = await api("/api/memory/digest", { sid: s.sid }); toast(`Digest saved to ${r.path}`); } catch (e) { toast(e.message, true); } });
-  item("Copy the chat id", () => navigator.clipboard?.writeText(s.sid.split(":").slice(1).join(":")).then(() => toast("Copied")).catch(() => {}));
+  item("Copy the chat id", () => copyText(s.sid.split(":").slice(1).join(":")).then(() => toast("Copied")).catch(() => {}));
   item("Tokens for this chat", () => panel.open("tokens"));
   if (s.forkedFrom) item("Open the original chat", () => selectSession(s.forkedFrom));
   const parent = s.parentSid || agentFor(s.sid)?.parentSid;

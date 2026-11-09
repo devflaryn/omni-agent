@@ -3,7 +3,7 @@
    file: the code editor for text (Ctrl+S saves, in the file's own encoding and line endings; a file changed on
    disk meanwhile is not overwritten without asking), rendered Markdown, images, video, audio, PDF, the entries
    of zip-like archives, and for a binary a read-only text or hex view (looking never writes the file). */
-import { el, md, fileKind, fmtBytes, buildTree, showName } from "./lib.js";
+import { el, md, copyText, fileKind, fmtBytes, buildTree, showName } from "./lib.js";
 import { createEditor } from "./editor.js";
 import { languageFor, LANG_LABEL } from "./highlight.js";
 import { showMenu, onContext } from "./contextmenu.js";
@@ -491,9 +491,7 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
 
   // ----------------------------------------------------------------- helpers
   async function copy(text) {
-    try { await navigator.clipboard.writeText(text); }
-    catch { const ta = el("textarea"); ta.value = text; document.body.appendChild(ta); ta.select(); try { document.execCommand("copy"); } catch { /* */ } ta.remove(); }
-    toast("Copied");
+    try { await copyText(text); toast("Copied"); } catch { toast("Could not copy", true); }
   }
   function download(root, path) {
     saveFile(`/api/fs/raw?${q({ root, path, download: 1 })}`, showName(path.split("/").pop())).catch((e) => toast(e.message, true));

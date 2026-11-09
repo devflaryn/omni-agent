@@ -1,5 +1,5 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
-import { el, esc, showName, fmtN, fmtBytes, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, editDiff, diffCounts, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
+import { el, esc, copyText, showName, fmtN, fmtBytes, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, editDiff, diffCounts, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
 import { mdBlocks, closeOpen, fenceLang } from "./markdown.js";
 import { planBlocks, meterLabel, jumpShown, paintGap } from "./chat-live.js";
 
@@ -60,7 +60,7 @@ globalThis.document?.addEventListener("click", (e) => {
   if (!b) return;
   const code = b.closest("figure.code")?.querySelector("pre > code");
   if (!code) return;
-  navigator.clipboard?.writeText(code.textContent).then(() => {
+  copyText(code.textContent).then(() => {
     b.classList.add("copied"); b.textContent = "Copied";
     clearTimeout(b.copiedTimer);
     b.copiedTimer = setTimeout(() => { b.classList.remove("copied"); b.textContent = "Copy"; }, COPIED_MS);
@@ -396,7 +396,7 @@ function toolCard(view, t, { toolId, name, args, ts }) {
   d.innerHTML = `<summary>${icon("other")}<span class="tlbl"></span><span class="tdiff" hidden></span><span class="st">running</span>${icon("chev", "chev")}</summary><div class="io"><button class="io-copy icon-btn" title="Copy args + output">${ICONS.copy}</button><div class="dv" hidden></div><pre class="args"></pre><pre class="out" hidden></pre><button class="out-more" hidden></button></div>`;
   c = { el: d, ico: d.querySelector(".ico"), lbl: d.querySelector(".tlbl"), diff: d.querySelector(".tdiff"), dv: d.querySelector(".dv"), args: d.querySelector(".args"), out: d.querySelector(".out"), more: d.querySelector(".out-more"), st: d.querySelector(".st"), argText: "", toolId: toolId || null, pending: null, call: { name: name || "tool", args: undefined }, label: { kind: "other", text: name || "tool" }, item: { kind: "tool", startTs: ts || Date.now(), endTs: null } };
   const ioCopy = d.querySelector(".io-copy");
-  if (ioCopy) ioCopy.onclick = (e) => { e.preventDefault(); e.stopPropagation(); const parts = [c.args.textContent, c.out.hidden ? "" : c.out.textContent].filter(Boolean); navigator.clipboard?.writeText(parts.join("\n\n")).catch(() => {}); };
+  if (ioCopy) ioCopy.onclick = (e) => { e.preventDefault(); e.stopPropagation(); const parts = [c.args.textContent, c.out.hidden ? "" : c.out.textContent].filter(Boolean); copyText(parts.join("\n\n")).catch(() => {}); };
   c.view = view; c.turn = t;
   d.addEventListener("toggle", () => { if (d.open && c.pending && !c.pending.loaded) loadOutput(c); });
   c.more.onclick = () => loadOutput(c, 0);
@@ -594,7 +594,7 @@ function actionRow(t) {
   // The reply as it was written (markdown), not the screen's text with its code headers and Copy buttons in it.
   copy.onclick = () => {
     const text = [...t.body.querySelectorAll(".text")].map((d) => d.mdSource ?? d.innerText).join("\n\n");
-    navigator.clipboard?.writeText(text).then(() => {
+    copyText(text).then(() => {
       copy.innerHTML = ICONS.check; copy.classList.add("copied");
       clearTimeout(copy.copiedTimer);
       copy.copiedTimer = setTimeout(() => { copy.innerHTML = ICONS.copy; copy.classList.remove("copied"); }, COPIED_MS);
