@@ -6,12 +6,12 @@ Signing in is optional. An app not signed in works on its own computer as before
 
 Each account belongs to one person and sees only its own computers. The first account is the hub's **owner**, and other people join with an [invite code](#inviting-someone) from the owner.
 
-**State of things on 2026-11-03:**
+**State of things on 2026-11-10:**
 
-- The hub is live. When it was last deployed (Task 8) no account was on it, so your first registration and first sign-in will be the first real ones over the live connection.
-- The old password-and-relay way in was removed from the code on 2026-11-10. See [The old relay was removed](#the-old-relay-was-removed).
-- The iPhone app is built and installed on the owner's iPhone (2026-11-10), but has not signed in to the real hub yet. See [The iPhone app](#the-iphone-app).
-- The web page has only been run in Chrome. Nothing has been run on Safari, Firefox or a real phone.
+- The hub is live with this version (deployed 2026-11-09). The owner's account exists, and the Windows desktop and the iPhone app are signed in and working on it.
+- The old password-and-relay way in is gone, from the code and from the VPS. See [The old relay was removed](#the-old-relay-was-removed).
+- The Mac app is built but has not yet signed in to the real hub.
+- The web page has only been run in Chrome and Edge. Nothing has been run on Safari or Firefox.
 
 ## First use: creating the account
 
@@ -198,6 +198,8 @@ Once, on the iPhone (already done on 2026-11-10):
 ```
 OMNI_MAC_SSH_OPTS="-o HostName=192.168.0.35 -o HostKeyAlias=192.168.0.30" bash ios/build.sh
 ```
+
+If the expiry date does not move, Xcode reused the old profile: move the old `.mobileprovision` out of `~/Library/Developer/Xcode/UserData/Provisioning Profiles` on the Mac and run it again, and a fresh 7-day profile is made (Xcode needs your Apple ID under Settings → Accounts).
 
 The Mac's address drifts: use the address it has now (`OMNI_MAC_SSH` names the ssh host, `macbook` by default). It builds the UI, sends the committed HEAD to the Mac as a git bundle, builds a release in `~/omni-ios-build`, installs it with `devicectl` and opens it. If it says "Installed, but iOS did not open it", unlock the phone and open the app by hand.
 
