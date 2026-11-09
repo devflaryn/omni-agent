@@ -91,11 +91,11 @@ test("relPath strips the cwd and normalizes slashes", () => {
 });
 
 test("md renders code, bold, lists and escapes html", () => {
-  assert.equal(md("**hi** <b>"), "<p><b>hi</b> &lt;b&gt;</p>");
-  assert.match(md("```js\nlet a = 1\n```"), /<pre><code>let a = 1<\/code><\/pre>/);
+  assert.equal(md("**hi** <b>"), "<p><strong>hi</strong> &lt;b&gt;</p>");
+  assert.match(md("```js\nlet a = 1\n```"), /<pre><code data-lang="js">let a = 1<\/code><\/pre>/);
   assert.match(md("- a\n- b"), /<ul><li>a<\/li><li>b<\/li><\/ul>/);
   // CRLF files (Windows-authored notes) render tables and lists too
-  assert.match(md("| | |\r\n|---|---|\r\n| **File** | x |\r\n"), /<table><tr><th><\/th><th><\/th><\/tr><tr><td><b>File<\/b><\/td><td>x<\/td><\/tr><\/table>/);
+  assert.match(md("| | |\r\n|---|---|\r\n| **File** | x |\r\n"), /<table><thead><tr><th><\/th><th><\/th><\/tr><\/thead><tbody><tr><td><strong>File<\/strong><\/td><td>x<\/td><\/tr><\/tbody><\/table>/);
 });
 
 test("splitAttachments strips leading omni-memory/repo-graph packs", () => {

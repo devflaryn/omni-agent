@@ -260,29 +260,8 @@ export function buildTree(entries) {
 }
 
 // ----------------------------------------------------------- markdown
-export function md(src) {
-  const blocks = String(src || "").replace(/\r\n?/g, "\n").split(/(```[\s\S]*?```)/g);
-  return blocks.map((b) => {
-    const m = b.match(/^```(\w*)\n?([\s\S]*?)```$/);
-    if (m) return `<pre><code>${esc(m[2].replace(/\n$/, ""))}</code></pre>`;
-    let h = esc(b);
-    h = h.replace(/`([^`\n]+)`/g, (_, c) => `<code>${c}</code>`);
-    h = h.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>").replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<i>$2</i>");
-    h = h.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-    h = h.replace(/^(#{1,4})\s+(.*)$/gm, (_, x, t) => `<h${x.length}>${t}</h${x.length}>`);
-    h = h.replace(/(?:^|\n)((?:[ \t]*(?:[-*]|\d+\.)[ \t]+.*(?:\n|$))+)/g, (_, blk) => {
-      const ordered = /^\s*\d+\./.test(blk);
-      const items = blk.trim().split(/\n/).map((l) => l.replace(/^\s*(?:[-*]|\d+\.)\s+/, "")).map((t) => `<li>${t}</li>`).join("");
-      return `\n<${ordered ? "ol" : "ul"}>${items}</${ordered ? "ol" : "ul"}>`;
-    });
-    h = h.replace(/(?:^|\n)(\|.+\|\n\|[-:| ]+\|\n(?:\|.*\|\n?)*)/g, (_, tbl) => {
-      const rows = tbl.trim().split("\n").filter((r) => !/^\|(?:\s*:?-+:?\s*\|)+$/.test(r));
-      return `\n<table>${rows.map((r, i) => `<tr>${r.split("|").slice(1, -1).map((c) => `<${i ? "td" : "th"}>${c.trim()}</${i ? "td" : "th"}>`).join("")}</tr>`).join("")}</table>`;
-    });
-    h = h.replace(/\n{2,}/g, "</p><p>").replace(/(?<!>)\n(?!<)/g, "<br>");
-    return `<p>${h}</p>`;
-  }).join("");
-}
+/** The chat's markdown renderer (ui/markdown.js), here too for the modules that import it from here. */
+export { md } from "./markdown.js";
 
 // ------------------------------------------------------- tool labels
 const one = (s, n = 120) => { const t = String(s ?? "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n)}…` : t; };
