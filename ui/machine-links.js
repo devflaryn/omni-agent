@@ -189,6 +189,7 @@ export class MachineLinks extends Emitter {
     link.client = null;
     link.state = "idle";
     link.lastError = String(reason ?? "the channel closed");
+    link.refusing = link.lastError === CLOSE_REASONS["web-access-off"]; // turned off while this page was using it
     this.#changed();
   }
 

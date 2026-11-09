@@ -216,6 +216,23 @@ test("a machine with Allow web page access off is refusing, not broken, and says
   } finally { links.close(); }
 });
 
+test("a machine that turns web pages away while one is using it shows as refusing too", async () => {
+  const { Emitter } = await import("../ui/emitter.js");
+  const device = { id: "d", name: "Studio", kind: "desktop", role: "full", online: true, self: false };
+  const channel = Object.assign(new Emitter(), { closed: false, close(reason) { this.closed = true; this.emit("close", reason); } });
+  const account = { devices: () => [device], status: () => ({ phase: "approved", hub: { connected: true } }), openChannel: async () => channel };
+  const { Readable } = await import("node:stream");
+  const client = () => ({ request: async () => ({ status: 200, headers: {}, body: Readable.from([]), abort() {} }), ping: async () => {} });
+  const links = new MachineLinks({ account, client, selfName: "this page", connectTimeoutMs: 200, budgetMs: 500 });
+  try {
+    const r = await links.request("d", { method: "GET", path: "/api/state" });
+    for await (const _ of r.body) { /* drained */ }
+    assert.equal(links.machines()[0].link.state, "open");
+    channel.close(CLOSE_REASONS["web-access-off"]);
+    assert.equal(links.machines()[0].link.state, "refusing");
+  } finally { links.close(); }
+});
+
 test("app.js reloads for no machine: every switch keeps the window", () => {
   const app = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
   assert.doesNotMatch(app, /location\.reload\(\)/);
