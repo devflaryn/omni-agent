@@ -18,6 +18,8 @@
       requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("theme-switching")));
     }
     for (const m of document.querySelectorAll('meta[name="theme-color"]')) m.setAttribute("content", theme === "light" ? "#ffffff" : "#212121");
+    // The Mac app paints its title bar and window to match, and follows the choice when it is System.
+    try { window.webkit?.messageHandlers?.omniShell?.postMessage({ theme, choice }); } catch { /* not in the Mac app */ }
   }
   apply();
   media?.addEventListener?.("change", () => { if (choice === "system") apply(); });
