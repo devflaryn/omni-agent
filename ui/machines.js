@@ -118,7 +118,7 @@ export function mergedEventsUrl(list) {
 
 /**
  * One `m` event of the merged stream, if it is for a machine the window shows and is a chat event or a resync. Anything
- * else, approval cards above all (they act on this computer), is dropped.
+ * else is dropped.
  */
 export function fromMerged(text, known) {
   let x;

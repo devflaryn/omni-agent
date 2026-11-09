@@ -9,13 +9,13 @@ const PY = ["python3", "python"].find((p) => spawnSync(p, ["--version"], { encod
 const havePython = !!PY;
 const run = (...args) => spawnSync(PY, [script, ...args], { encoding: "utf8" });
 
-test("desktop launcher --plan prints node args with --lan and --cwd", { skip: !havePython && "python not on PATH" }, () => {
-  const r = run("--plan", "C:\\some\\project", "--port", "4567");
+test("desktop launcher --plan prints node args with --cwd, and no --lan (that listener is gone)", { skip: !havePython && "python not on PATH" }, () => {
+  const r = run("--plan", "C:\\some\\project", "--port", "4567", "--lan");
   assert.equal(r.status, 0, r.stderr);
   const plan = JSON.parse(r.stdout);
   assert.equal(plan.port, 4567);
   assert.equal(plan.url, "http://127.0.0.1:4567/?desktop=1");
-  assert.ok(plan.args.includes("--lan"));
+  assert.ok(!plan.args.includes("--lan"), "not added, and not passed on when given");
   assert.equal(plan.args[plan.args.indexOf("--cwd") + 1], "C:\\some\\project");
   assert.ok(plan.args[1].endsWith("index.mjs"));
   assert.ok(!plan.args.includes("--plan"));

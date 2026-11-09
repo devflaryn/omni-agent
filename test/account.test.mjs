@@ -2705,7 +2705,7 @@ test("password change: full device only, old password stops working, keys and th
 
 // ------------------------------------------------------------------------------- hub unreachable
 
-const appOptions = (dir, extra = {}) => ({ port: 0, relay: { host: "" }, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"), autoStartPi: false, cwd: dir, persistHook: false, persistPiModel: false, hook: { enabled: false }, ...extra });
+const appOptions = (dir, extra = {}) => ({ port: 0, vaultDir: join(dir, "vault"), piSessionsDir: join(dir, "pi"), claudeProjectsDir: join(dir, "claude"), autoStartPi: false, cwd: dir, persistHook: false, persistPiModel: false, hook: { enabled: false }, ...extra });
 
 test("a hub that never answers costs the server's startup nothing", async () => {
   const fixture = await hubFixture();

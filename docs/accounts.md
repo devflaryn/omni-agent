@@ -9,7 +9,7 @@ Each account belongs to one person and sees only its own computers. The first ac
 **State of things on 2026-11-03:**
 
 - The hub is live. When it was last deployed (Task 8) no account was on it, so your first registration and first sign-in will be the first real ones over the live connection.
-- The old relay is still running. See [Removing the old relay](#removing-the-old-relay). That needs doing.
+- The old password-and-relay way in was removed from the code on 2026-11-10. See [The old relay was removed](#the-old-relay-was-removed).
 - The iPhone app is built and installed on the owner's iPhone (2026-11-10), but has not signed in to the real hub yet. See [The iPhone app](#the-iphone-app).
 - The web page has only been run in Chrome. Nothing has been run on Safari, Firefox or a real phone.
 
@@ -117,7 +117,7 @@ You can always tell which machine an action runs on:
 - The composer's caption starts with **On *name*** (or **On this computer**), the window title names the machine, and every delete, stop or remove confirmation names it.
 - The file tree's path starts with the machine's name.
 
-**Per machine:** Settings' Models, MCP servers and Long runs have their own machine picker; they open on the machine you are on. Missions has one too. Account and Remote are always this computer's. The Memory, Graph and Tokens tabs follow the machine you are on.
+**Per machine:** Settings' Models, MCP servers and Long runs have their own machine picker; they open on the machine you are on. Missions has one too. Account is always this computer's. The Memory, Graph and Tokens tabs follow the machine you are on.
 
 **If the link has trouble, a banner says so:**
 
@@ -390,60 +390,20 @@ Nothing else on the VPS was changed. Comparisons before and after showed only `l
 
 To remove everything, work from the top of this table down. The certificate cannot renew without the last two, so remove those only together with it.
 
-## Removing the old relay
+## The old relay was removed
 
-**To do later, after a week of real use. You have not asked for this yet, but it does need doing.** Until it is done, the old way stays open: the relay on the VPS still reaches this PC's old password page at `https://72.62.59.232:4443/`. Anyone with that password and one Approve on the host (or a device approved there in the last 180 days) can view your chats and files read-only and ask for changes. The launcher's `--lan` also keeps the same page on this PC's port 4443. The old way is described in the README under its own heading.
+**2026-11-10.** The old way in, a password page on this PC's port 4443 reached over the LAN or through an SSH tunnel to a relay on the VPS, is gone from the code, once accounts had worked on two real devices (Windows and iPhone). Removed with it: the relay listener on port 4444 and the tunnel, the self-signed certificate, the sign-in page, the approval cards, the Read-only chip, **Settings → Remote**, the launcher's `--lan`, `relay/` and the `allow-lan` scripts. Omni listens on `127.0.0.1` only, and another device reaches a computer through the account. A loopback request that is not the window's own (another `Host`, or a proxy header) is refused.
 
-These steps come from `relay/setup-vps.sh`, the README and the design. They have not been run.
+The relay service on the VPS is not part of this code and is removed there by hand. The steps that were here are in the git history of this file, before that date.
 
-**Before you start,** check all of these:
+**Old settings.** An `omni.config.json` that still has `relay`, `remote`, `lan`, `remotePort`, `remoteTls`, `tlsCert`, `tlsKey`, `tlsDir`, `remoteAuthFile`, `remoteApprovalTimeoutSec`, `remoteSessionDays` or `remoteDeviceApproval` starts as before. Omni logs one line naming them at start, and they can be deleted.
 
-- You have used accounts for a week and do not rely on port 4443.
-- You have your recovery code, and ideally a second `full` device.
-- You have a way onto the VPS other than Omni. SSH as root is not affected by these steps.
+**Left-over files on a PC that used the old way.** Omni no longer reads these, and they can be deleted:
 
-**1. Stop the tunnel on the PC.** Remove the `"relay"` key from `omni.config.json`, and restart Omni.
+- `~/.omni-agent/relay/id_ed25519` and `id_ed25519.pub`, the tunnel's key.
+- `~/.omni-agent/remote-auth.json`, the password's hash and the approved browsers.
+- `~/.omni-agent/tls/`, the certificate.
 
-**2. Remove the relay from the VPS.** `systemctl cat omni-relay` first shows where its unit really is.
+**Keep `~/.omni-agent/relay/known_hosts`.** `hub/deploy.sh` uses it.
 
-```
-systemctl disable --now omni-relay
-rm /etc/systemd/system/omni-relay.service
-systemctl daemon-reload
-rm -rf /opt/omni-relay
-rm /etc/ssh/sshd_config.d/90-omni-tunnel.conf
-sshd -t && systemctl reload ssh
-pkill -u omni-tunnel; userdel -r omni-tunnel
-```
-
-**3. Check.** The first line should print nothing, and the others should answer as they did before:
-
-```
-ss -tlnp | grep -E ':(4443|14443)\b'
-curl https://tomcamp.tech/api/health
-curl -s -o /dev/null -w '%{http_code}\n' http://tomcamp.tech/
-curl -s -o /dev/null -w '%{http_code}\n' http://tomcamp.tech:8081/
-curl -s -o /dev/null -w '%{http_code}\n' http://tomcamp.tech:8082/
-curl -s -o /dev/null -w '%{http_code}\n' http://tomcamp.tech:8733/
-```
-
-From a PC behind WARP, a closed port looks like a timeout rather than "refused", so judge 4443 by `ss` on the VPS. Then sign in from a second device, to prove accounts still work.
-
-**4. Remove the code, in a branch, then run the tests:**
-
-- Delete `server/tunnel.mjs`, `relay/`, `ui/login.html`, `ui/remote.js`, `test/remote.test.mjs`. Then correct what `test/stream.test.mjs` and `test/ui-transport.test.mjs` say about them.
-- In `server/access.mjs`, delete `RemoteAuth`, `Approvals` and the helpers only they use.
-- In `server/index.mjs`, delete the remote listener, the relay listener, the login routes, `/api/remote/*` and the approval routes. Keep the local listener and the channel path. `isHostRequest` and `classify` need rereading once the remote listener is gone.
-- In `server/config.mjs`, delete `lan`, `remote*`, `tls*`, `relay` and `relayConfig`. `server/tls.mjs` goes too, if nothing else uses it.
-- In `ui/app.js`, `ui/index.html` and `ui/settings.js`, delete `createRemote`, the approval cards, the Read-only chip and the **Settings → Remote** tab. In `ui/web.js`, delete the line that hides `tabRemote`.
-- In `desktop/omni_desktop.pyw`, stop passing `--lan`, and update `test/desktop.test.mjs`.
-- Delete `scripts/allow-lan.cmd` and `scripts/allow-lan.sh`, and the `--lan` lines in the README.
-- Run `npm run build`, commit `dist/ui`, then run `hub/deploy.sh`. The build drops `remote.js` by itself once nothing imports it.
-- In the README, delete the section "The old way: password and VPS relay", and in this file, delete this section.
-
-**5. Clean up on the PC.**
-
-- Delete `~/.omni-agent/relay/id_ed25519` and `id_ed25519.pub`, `~/.omni-agent/remote-auth.json`, and `~/.omni-agent/tls/`.
-- **Keep `~/.omni-agent/relay/known_hosts`.** `hub/deploy.sh` uses it.
-- If you ran `scripts\allow-lan.cmd`: `netsh advfirewall firewall delete rule name="Omni Agent"`.
-- If you forwarded port 4443 on your router, remove that.
+If you ran `scripts\allow-lan.cmd`, remove its firewall rule with `netsh advfirewall firewall delete rule name="Omni Agent"`. If you forwarded port 4443 on your router, remove that too.
