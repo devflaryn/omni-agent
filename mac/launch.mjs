@@ -96,6 +96,9 @@ export function stopWith(stop, { stdin = process.stdin, proc = process, parentPi
 const say = (tag, obj) => process.stdout.write(`${tag} ${JSON.stringify(obj)}\n`);
 
 export async function main(argv = process.argv.slice(2)) {
+  // A log line must never take the server down: if the app's end of the pipe is gone, stop writing, keep serving.
+  process.stdout.on("error", () => {});
+  process.stderr.on("error", () => {});
   const old = nodeTooOld();
   if (old) { say("OMNI-FAIL", { message: old }); return 2; }
   let plan;

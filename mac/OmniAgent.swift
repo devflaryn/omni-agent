@@ -74,6 +74,7 @@ final class Server {
     private(set) var pid: pid_t = 0
     private var stdinWrite: Int32 = -1
     private var exitSource: DispatchSourceProcess?
+    private var output: FileHandle? // held: a FileHandle that goes away closes the pipe, and the server's next log line fails
     private var buffer = Data()
     private var log: FileHandle?
     private var announced = false
@@ -125,6 +126,7 @@ final class Server {
         _ = fcntl(stdinWrite, F_SETFD, FD_CLOEXEC)
 
         let out = FileHandle(fileDescriptor: outPipe[0], closeOnDealloc: true)
+        output = out
         out.readabilityHandler = { [weak self] h in
             let chunk = h.availableData
             if chunk.isEmpty { h.readabilityHandler = nil; return }
