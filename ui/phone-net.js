@@ -8,7 +8,7 @@
  * `events` is where the shell's calls arrive: globalThis.__omniNet(id, kind, data).
  */
 
-/** fetch(url, init) for hubPost: one JSON POST to the hub, by path. */
+/** hubPost's fetchImpl: one JSON POST to the hub, by path, and nothing else. */
 export function nativeFetch(bridge, hubUrl) {
   const origin = new URL(hubUrl).origin;
   return async (url, init = {}) => {
