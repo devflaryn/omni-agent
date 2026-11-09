@@ -2,7 +2,6 @@
 REM Omni Agent — local agentic OS for pi + Claude Code with an Obsidian memory vault.
 REM   start.cmd                 local only, pi works in Desktop
 REM   start.cmd "C:\project"    pi works in that folder
-REM   start.cmd . --lan         also reachable from other devices on your network (token required)
 setlocal
 set "HERE=%~dp0"
 set "WD=%~1"

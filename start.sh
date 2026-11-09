@@ -2,7 +2,6 @@
 # Omni Agent — console mode on macOS / Linux (the .cmd files are the Windows equivalents).
 #   ./start.sh                  local only, pi works in ~/Desktop
 #   ./start.sh /some/project    pi works in that folder
-#   ./start.sh . --lan          also reachable from other devices on your network (token required)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WD="${1:-$HOME/Desktop}"
