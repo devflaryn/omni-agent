@@ -3,12 +3,18 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<meta name="color-scheme" content="dark" />
+<meta name="color-scheme" content="dark light" />
 <meta name="theme-color" content="#212121" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Omni Agent" />
 <title>Omni Agent</title>
-  <link rel="icon" href="/logo.svg" type="image/svg+xml" />
-  <link rel="alternate icon" href="/icon-32.png" type="image/png" />
-  <link rel="apple-touch-icon" href="/icon-180.png" />
+<link rel="icon" href="/logo.svg" type="image/svg+xml" />
+<link rel="alternate icon" href="/icon-32.png" type="image/png" />
+<link rel="apple-touch-icon" href="/icon-180.png" />
+<link rel="manifest" href="/manifest.webmanifest" />
+<script src="/theme.js"></script>
 <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -17,16 +23,16 @@
   <div class="menu-wrap machine-wrap" id="machineWrap" hidden><button class="machine-btn" id="machineBtn" aria-haspopup="true"><span class="machine-glyph"></span><span class="machine-name" id="machineName"></span><span class="machine-id" id="machineId" hidden></span><svg viewBox="0 0 16 16"><path d="m4 6 4 4 4-4"/></svg></button><div class="menu" id="machineMenu" hidden></div></div>
   <button class="machine-back" id="machineBack" hidden>Back to this computer</button>
   <div class="top-title" id="topTitle"></div>
-  <div class="menu-wrap"><button class="icon-btn" id="btnChatMenu" title="Chat actions" hidden><svg viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="0.9"/><circle cx="8" cy="8" r="0.9"/><circle cx="12.5" cy="8" r="0.9"/></svg></button><div class="menu" id="chatMenu" hidden></div></div>
+  <div class="menu-wrap"><button class="icon-btn" id="btnChatMenu" title="Chat actions" aria-label="Chat actions" hidden><svg viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="0.9"/><circle cx="8" cy="8" r="0.9"/><circle cx="12.5" cy="8" r="0.9"/></svg></button><div class="menu" id="chatMenu" hidden></div></div>
   <span class="grow"></span>
   <div class="access-chip" id="accessChip" hidden></div>
-  <div class="conn-status" id="connStatus" title="The connection to Omni dropped; it reconnects by itself" hidden>reconnecting</div>
+  <div class="conn-status" id="connStatus" title="The connection dropped. It reconnects by itself." hidden>Reconnecting</div>
   <div class="top-model" id="topModel"></div>
-  <button class="icon-btn" id="btnExplorer" title="Files (working directory)" hidden><svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg></button>
-  <button class="icon-btn" id="btnSummary" title="Goal & summary (TLDR)" hidden><svg viewBox="0 0 16 16"><path d="M3 2.5h10v11H3zM5 5.5h6M5 8h6M5 10.5h4"/></svg></button>
-  <button class="icon-btn" id="btnMissions" title="Missions"><svg viewBox="0 0 16 16"><circle cx="8" cy="3.5" r="1.6"/><circle cx="3.5" cy="12.5" r="1.6"/><circle cx="8" cy="12.5" r="1.6"/><circle cx="12.5" cy="12.5" r="1.6"/><path d="M8 5.1v5.8M8 8H3.5v2.9M8 8h4.5v2.9"/></svg><span class="top-badge" id="missionsBadge" hidden></span></button>
-  <button class="icon-btn" id="btnPanel" title="Chat history"><svg viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg></button>
-  <button class="icon-btn" id="btnSettings" title="Providers and models"><svg viewBox="0 0 16 16"><path d="M2.5 4.5h5M11 4.5h2.5M2.5 8h1.5M7 8h6.5M2.5 11.5h5.5M12 11.5h1.5"/><circle cx="9" cy="4.5" r="1.5"/><circle cx="5.5" cy="8" r="1.5"/><circle cx="10" cy="11.5" r="1.5"/></svg></button>
+  <button class="icon-btn" id="btnExplorer" title="Files" aria-label="Files" hidden><svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z"/></svg></button>
+  <button class="icon-btn" id="btnSummary" title="Goal and plan" aria-label="Goal and plan" hidden><svg viewBox="0 0 16 16"><path d="M3 2.5h10v11H3zM5 5.5h6M5 8h6M5 10.5h4"/></svg></button>
+  <button class="icon-btn" id="btnMissions" title="Missions" aria-label="Missions"><svg viewBox="0 0 16 16"><circle cx="8" cy="3.5" r="1.6"/><circle cx="3.5" cy="12.5" r="1.6"/><circle cx="8" cy="12.5" r="1.6"/><circle cx="12.5" cy="12.5" r="1.6"/><path d="M8 5.1v5.8M8 8H3.5v2.9M8 8h4.5v2.9"/></svg><span class="top-badge" id="missionsBadge" hidden></span></button>
+  <button class="icon-btn" id="btnPanel" title="Chats" aria-label="Chats"><svg viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h7"/></svg></button>
+  <button class="icon-btn" id="btnSettings" title="Settings" aria-label="Settings"><svg viewBox="0 0 16 16"><path d="M2.5 4.5h5M11 4.5h2.5M2.5 8h1.5M7 8h6.5M2.5 11.5h5.5M12 11.5h1.5"/><circle cx="9" cy="4.5" r="1.5"/><circle cx="5.5" cy="8" r="1.5"/><circle cx="10" cy="11.5" r="1.5"/></svg></button>
 </header>
 <div id="accountBanners" hidden></div>
 
@@ -34,51 +40,56 @@
   <aside id="explorer">
     <div class="ex-head">
       <span class="ex-title">Files</span>
-      <button class="icon-btn small" id="explorerNewFile" title="New File…"><svg viewBox="0 0 16 16"><path d="M4 2h5l3 3v4M9 2v3h3M4 2v12h4M11.5 10.5v4M9.5 12.5h4"/></svg></button>
-      <button class="icon-btn small" id="explorerNewFolder" title="New Folder…"><svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v1.5M2 4.5v7A1.5 1.5 0 0 0 3.5 13H8M11.5 9.5v4M9.5 11.5h4"/></svg></button>
-      <button class="icon-btn small" id="explorerCollapse" title="Collapse Folders"><svg viewBox="0 0 16 16"><path d="M3 3h10v10H3zM5.5 8h5"/></svg></button>
-      <button class="icon-btn small" id="explorerRefresh" title="Refresh"><svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 3v2.8h-2.8"/></svg></button>
-      <button class="icon-btn small" id="explorerClose" title="Hide"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+      <button class="icon-btn small" id="explorerNewFile" title="New file…" aria-label="New file"><svg viewBox="0 0 16 16"><path d="M4 2h5l3 3v4M9 2v3h3M4 2v12h4M11.5 10.5v4M9.5 12.5h4"/></svg></button>
+      <button class="icon-btn small" id="explorerNewFolder" title="New folder…" aria-label="New folder"><svg viewBox="0 0 16 16"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3h3l1.5 1.5h4.5A1.5 1.5 0 0 1 14 6v1.5M2 4.5v7A1.5 1.5 0 0 0 3.5 13H8M11.5 9.5v4M9.5 11.5h4"/></svg></button>
+      <button class="icon-btn small" id="explorerCollapse" title="Collapse folders" aria-label="Collapse folders"><svg viewBox="0 0 16 16"><path d="M3 3h10v10H3zM5.5 8h5"/></svg></button>
+      <button class="icon-btn small" id="explorerRefresh" title="Refresh" aria-label="Refresh"><svg viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.5-3.6M13 3v2.8h-2.8"/></svg></button>
+      <button class="icon-btn small" id="explorerClose" title="Close files" aria-label="Close files"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
-    <div class="ex-root mono" id="explorerRoot"></div>
+    <div class="ex-root" id="explorerRoot"></div>
     <input id="explorerFilter" type="search" placeholder="Filter files" />
     <div id="tree" tabindex="0" role="tree" aria-label="Files"></div>
-    <div class="resizer" data-for="explorer" title="Drag to resize · double-click to reset"></div>
+    <div class="resizer" data-for="explorer" title="Drag to resize. Double-click to reset."></div>
   </aside>
 
   <aside id="preview" hidden>
     <div class="pv-tabbar">
       <div class="pv-tabs" id="pvTabs" role="tablist"></div>
-      <button class="icon-btn small" id="pvMax" title="Maximize or restore the editor"><svg viewBox="0 0 16 16"><path d="M3 6V3h3M13 6V3h-3M3 10v3h3M13 10v3h-3"/></svg></button>
-      <button class="icon-btn small" id="pvClose" title="Hide the editor (open tabs are kept)"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+      <button class="icon-btn small" id="pvMax" title="Maximize or restore" aria-label="Maximize or restore"><svg viewBox="0 0 16 16"><path d="M3 6V3h3M13 6V3h-3M3 10v3h3M13 10v3h-3"/></svg></button>
+      <button class="icon-btn small" id="pvClose" title="Close the editor. Open tabs are kept." aria-label="Close the editor"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
     <div class="pv-head">
       <span class="pv-path mono" id="pvPath"></span>
       <span class="pv-meta" id="pvMeta"></span>
       <div class="pv-actions" id="pvActions"></div>
-      <button class="btn small" id="pvRef" title="Insert @path into the prompt">Reference</button>
+      <button class="btn small" id="pvRef" title="Put @path in the message">Reference</button>
     </div>
     <div id="pvBody"></div>
     <div class="pv-status" id="pvStatus"></div>
-    <div class="resizer" data-for="preview" title="Drag to resize · double-click to reset"></div>
+    <div class="resizer" data-for="preview" title="Drag to resize. Double-click to reset."></div>
   </aside>
 
   <div id="content">
     <section class="view active" id="view-home">
       <div class="home">
         <h1 class="hero">What should we work on?</h1>
-        <p class="hero-sub">OpenCode runs here, in the folder you pick. Every chat on this machine lives in the history drawer.</p>
         <div id="homeComposer"></div>
-        <div class="cwd-row" id="homeMachineRow" hidden>
-          <span>Machine</span>
-          <select id="homeMachine" aria-label="The machine the new chat runs on"></select>
+        <div class="home-where">
+          <div class="cwd-row" id="homeMachineRow" hidden>
+            <span>On</span>
+            <select id="homeMachine" aria-label="The machine the new chat runs on"></select>
+          </div>
+          <div class="cwd-row">
+            <span>In</span>
+            <input id="homeCwd" spellcheck="false" aria-label="Working directory" />
+            <button class="btn quiet small" id="homeBrowse" title="Show this folder's files">Files</button>
+          </div>
+          <div class="chips" id="dirChips"></div>
         </div>
-        <div class="cwd-row">
-          <span>Working directory</span>
-          <input id="homeCwd" spellcheck="false" />
-          <button class="btn quiet small" id="homeBrowse" title="Browse this folder">Files</button>
-        </div>
-        <div class="chips" id="dirChips"></div>
+        <section class="home-recent" id="homeRecent" hidden>
+          <div class="home-recent-head"><h2 id="homeRecentTitle">Recent</h2><button class="btn quiet small" id="homeAllChats">All chats</button></div>
+          <div id="homeRecentList"></div>
+        </section>
       </div>
     </section>
 
@@ -94,14 +105,14 @@
 </main>
 
 <aside id="panel">
-  <div class="resizer left" data-for="panel" title="Drag to resize · double-click to reset"></div>
+  <div class="resizer left" data-for="panel" title="Drag to resize. Double-click to reset."></div>
   <div class="panel-tabs">
     <button class="ptab active" data-tab="chats">Chats</button>
     <button class="ptab" data-tab="memory">Memory</button>
     <button class="ptab" data-tab="graph">Graph</button>
     <button class="ptab" data-tab="tokens">Tokens</button>
     <span class="grow"></span>
-    <button class="icon-btn" id="btnPanelClose" title="Close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+    <button class="icon-btn" id="btnPanelClose" title="Close" aria-label="Close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
   </div>
 
   <div class="ptab-body active" id="tab-chats">
@@ -118,22 +129,24 @@
       <div class="tiles" id="statTiles"></div>
       <div class="ctx"><div class="ctx-bar"><div id="ctxFill"></div></div><div class="ctx-label" id="ctxLabel"></div></div>
     </div>
-    <div class="stat-block"><div class="stat-title">All sessions today</div><div class="tiles" id="statAll"></div></div>
-    <div class="stat-block"><div class="stat-title">Costliest sessions</div><div id="statTop"></div></div>
+    <div class="stat-block"><div class="stat-title">All chats today</div><div class="tiles" id="statAll"></div></div>
+    <div class="stat-block"><div class="stat-title">Costliest chats</div><div id="statTop"></div></div>
   </div>
 
   <div class="ptab-body" id="tab-memory">
-    <p class="lead">An Obsidian vault the agent reads and writes. One fact per note; session digests land here on their own.</p>
     <div class="row-tools">
-      <input id="memSearch" type="search" placeholder="Search the vault" />
-      <button class="btn" id="memNew">New</button>
+      <input id="memSearch" type="search" placeholder="Search memory" />
+      <button class="btn primary" id="memNew">New memory</button>
+      <div class="menu-wrap"><button class="icon-btn" id="memMore" title="More" aria-label="More memory actions" aria-haspopup="true"><svg viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="0.9"/><circle cx="8" cy="8" r="0.9"/><circle cx="12.5" cy="8" r="0.9"/></svg></button>
+        <div class="menu mem-menu" id="memMenu" hidden>
+          <button id="memImport" title="Copy Claude Code's auto-memory notes into the vault">Import Claude Code memory</button>
+          <button id="memDigest" title="Write a digest of the open chat now">Digest the open chat</button>
+          <button id="memReindex">Rebuild the index</button>
+          <button id="memOpen" title="Open the vault folder">Open the folder</button>
+        </div>
+      </div>
     </div>
-    <div class="row-tools small">
-      <button class="btn quiet" id="memImport" title="Copy Claude Code's auto-memory notes into the vault">Import Claude memory</button>
-      <button class="btn quiet" id="memReindex">Rebuild index</button>
-      <button class="btn quiet" id="memOpen" title="Open the vault folder">Open folder</button>
-      <button class="btn quiet" id="memDigest" title="Write a digest for the current chat now">Digest chat</button>
-    </div>
+    <details class="how lead"><summary>How this works</summary><p>Memory is an Obsidian vault the agent reads and writes, one fact per note. A digest of each chat lands here on its own.</p></details>
     <div id="memList"></div>
     <div id="memEditor" hidden>
       <div class="mem-path" id="memPath"></div>
@@ -150,15 +163,15 @@
   </div>
 
   <div class="ptab-body" id="tab-graph">
-    <p class="lead" id="graphDir">Pick a chat or set a working directory on Home; that folder is the repo.</p>
+    <p class="lead" id="graphDir">Open a chat or pick a folder on Home. That folder is the repo.</p>
     <div class="row-tools">
-      <button class="btn primary" id="graphBuild" title="Run graphify (AST extraction, no LLM) and write file notes with wikilinks into the vault">Build repo graph</button>
+      <button class="btn primary" id="graphBuild" title="Run graphify (no model, just the code's structure) and write a note per file into the vault">Build the repo graph</button>
       <button class="btn quiet" id="graphRefresh">Refresh</button>
       <button class="btn quiet" id="graphOpenNotes">Notes</button>
     </div>
     <div class="row-tools">
       <input id="graphFilter" type="search" placeholder="Filter nodes (file or symbol)" />
-      <input id="graphLimit" type="number" value="150" min="20" max="600" title="Max nodes drawn" />
+      <input id="graphLimit" type="number" value="150" min="20" max="600" title="Most nodes to draw" aria-label="Most nodes to draw" />
     </div>
     <div class="lead" id="graphTotals"></div>
     <canvas id="graphCanvas"></canvas>
@@ -179,15 +192,11 @@
           <button class="seg-btn" role="tab" id="tabRemote" aria-selected="false" aria-controls="remoteBody">Remote</button>
           <button class="seg-btn" role="tab" id="tabLong" aria-selected="false" aria-controls="longBody">Long runs</button>
           <button class="seg-btn" role="tab" id="tabAccount" aria-selected="false" aria-controls="accountBody">Account</button>
+          <button class="seg-btn" role="tab" id="tabAppearance" aria-selected="false" aria-controls="appearanceBody">Appearance</button>
         </div>
-        <span class="dlg-sub" id="subModels">Which LLMs OpenCode can use. Paste a key for one of OpenCode's own providers (OpenRouter, Anthropic, …) and its models show up in the picker; or add your own OpenAI-compatible endpoint with the model ids you type. Saving reloads OpenCode; chats keep going.</span>
-        <span class="dlg-sub" id="subMcp" hidden>Tool servers OpenCode connects to. Each tool shows up as &lt;server&gt;_&lt;tool&gt;. Saving reloads OpenCode so it connects.</span>
-        <span class="dlg-sub" id="subRemote" hidden>Use Omni from another device or network. Remote browsers sign in with this password and see everything read-only; each message or change they send waits for your Approve here.</span>
-        <span class="dlg-sub" id="subAccount" hidden>This computer's account: sign in, your devices, recovery, and what other devices did here. Signing in is optional; without it Omni works on this computer as usual.</span>
         <label class="dlg-sub machine-note" id="settingsMachine" hidden><span id="settingsMachineText">Settings for</span> <select id="settingsMachineSel" aria-label="The machine these settings are for"></select></label>
-        <span class="dlg-sub" id="subLong" hidden>How Omni keeps long, unattended runs going: when a growing chat is compacted, and what happens when a model stops early because it thinks its context is full. A new compaction size applies from each chat's next prompt.</span>
       </div>
-      <button class="icon-btn" id="settingsClose" title="Close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+      <button class="icon-btn" id="settingsClose" title="Close" aria-label="Close settings"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
     </div>
     <div class="dlg-body" id="provBody" role="tabpanel">
       <div class="prov-list" id="provList"></div>
@@ -198,7 +207,7 @@
         <label>Provider name<input id="pfName" placeholder="modal" spellcheck="false" autocomplete="off" /></label>
         <label id="pfBaseRow">Base URL<input id="pfBase" placeholder="https://host/v1" spellcheck="false" autocomplete="off" /></label>
         <label id="pfKeyRow">API key<input id="pfKey" type="password" placeholder="API key" autocomplete="off" /></label>
-        <label id="pfModelsRow">Models <span class="pf-note">one id per line · optional display name after a |</span><textarea id="pfModels" rows="6" placeholder="deepseek/deepseek-v4-flash-0731 | DeepSeek V4 Flash&#10;moonshotai/kimi-k2.5" spellcheck="false"></textarea></label>
+        <label id="pfModelsRow">Models <span class="pf-note">One id per line, with a name after | if you like</span><textarea id="pfModels" rows="6" placeholder="deepseek/deepseek-v4-flash-0731 | DeepSeek V4 Flash&#10;moonshotai/kimi-k2.5" spellcheck="false"></textarea></label>
         <div class="pf-row" id="pfLimits">
           <label>Context window<input id="pfCtx" type="number" placeholder="128000" min="1000" /></label>
           <label>Max output tokens<input id="pfMax" type="number" placeholder="16384" min="256" /></label>
@@ -209,6 +218,7 @@
           <span class="grow"></span>
           <span class="pf-file mono" id="provFile"></span>
         </div>
+        <details class="how"><summary>How this works</summary><p>Paste a key for one of OpenCode's own providers, such as OpenRouter or Anthropic, and its models show up in the picker. Or add your own OpenAI-compatible endpoint with the model ids you type. Saving reloads OpenCode, and running chats keep going.</p></details>
       </form>
     </div>
     <div class="dlg-body" id="mcpBody" role="tabpanel" hidden>
@@ -222,17 +232,17 @@
         </details>
         <div class="pf-row">
           <label>Server name<input id="mfName" placeholder="github" spellcheck="false" autocomplete="off" /></label>
-          <label>Transport<select id="mfType"><option value="stdio">stdio · runs a command</option><option value="http">http · connects to a URL</option></select></label>
+          <label>Transport<select id="mfType"><option value="stdio">stdio (runs a command)</option><option value="http">http (connects to a URL)</option></select></label>
         </div>
         <div class="mf-stdio">
           <label>Command<input id="mfCommand" placeholder="npx" spellcheck="false" autocomplete="off" /></label>
-          <label>Arguments <span class="pf-note">one per line</span><textarea id="mfArgs" rows="3" spellcheck="false" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/Users/me/src"></textarea></label>
-          <label>Environment <span class="pf-note">KEY=value per line · ${VAR} reads Omni's environment</span><textarea id="mfEnv" rows="2" spellcheck="false" placeholder="API_TOKEN=..."></textarea></label>
-          <label>Working directory <span class="pf-note">optional</span><input id="mfCwd" spellcheck="false" autocomplete="off" /></label>
+          <label>Arguments <span class="pf-note">One per line</span><textarea id="mfArgs" rows="3" spellcheck="false" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/Users/me/src"></textarea></label>
+          <label>Environment <span class="pf-note">KEY=value per line. ${VAR} reads this computer's environment.</span><textarea id="mfEnv" rows="2" spellcheck="false" placeholder="API_TOKEN=..."></textarea></label>
+          <label>Working directory <span class="pf-note">Optional</span><input id="mfCwd" spellcheck="false" autocomplete="off" /></label>
         </div>
         <div class="mf-http" hidden>
           <label>URL<input id="mfUrl" placeholder="https://example.com/mcp" spellcheck="false" autocomplete="off" /></label>
-          <label>Headers <span class="pf-note">Name: value per line · e.g. Authorization: Bearer ${GITHUB_TOKEN}</span><textarea id="mfHeaders" rows="2" spellcheck="false"></textarea></label>
+          <label>Headers <span class="pf-note">One per line, like Authorization: Bearer ${GITHUB_TOKEN}</span><textarea id="mfHeaders" rows="2" spellcheck="false"></textarea></label>
         </div>
         <div class="pf-row">
           <label>Call timeout (seconds)<input id="mfTimeout" type="number" placeholder="300" min="1" /></label>
@@ -246,11 +256,13 @@
           <span class="grow"></span>
           <span class="pf-file mono" id="mcpFile"></span>
         </div>
+        <details class="how"><summary>How this works</summary><p>These are tool servers OpenCode connects to. Each tool shows up to the model as server_tool. Saving reloads OpenCode so it connects.</p></details>
       </form>
     </div>
     <div class="dlg-body remote-body" id="remoteBody" role="tabpanel" hidden></div>
     <div class="dlg-body long-body" id="longBody" role="tabpanel" hidden></div>
     <div class="dlg-body remote-body" id="accountBody" role="tabpanel" hidden></div>
+    <div class="dlg-body long-body" id="appearanceBody" role="tabpanel" hidden></div>
   </div>
 </div>
 

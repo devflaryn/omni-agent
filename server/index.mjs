@@ -607,7 +607,7 @@ export async function createApp(overrides = {}) {
   // A checkout with esbuild installed rebuilds a stale UI by itself; never under test, where the build must be the committed one.
   const uiBuild = openUiBuild({ root: UI_ROOT, log: cfg.log || log, fromSource: !!cfg.uiFromSource || process.env.OMNI_UI_SOURCE === "1", autoBuild: cfg.uiAutoBuild ?? (!underTest && process.env.OMNI_UI_AUTOBUILD !== "0"), runBuild: cfg.uiRunBuild });
   const NO_FILES = new Map(), NOTHING_FETCH_ONLY = new Set();
-  const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
+  const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json" };
   function send(res, code, body, type = "application/json") {
     res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" });
     res.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
@@ -927,7 +927,7 @@ export async function createApp(overrides = {}) {
         res.setHeader("X-Omni-Ui", "source");
         return send(res, 200, await fs.readFile(join(UI_ROOT, "ui", "index.html")), MIME[".html"]);
       }
-      if (req.method === "GET" && /^\/[\w.-]+\.(js|mjs|css|svg|png|ico)$/.test(p)) {
+      if (req.method === "GET" && /^\/[\w.-]+\.(js|mjs|css|svg|png|ico|webmanifest)$/.test(p)) {
         if (serveWebFile(req, res, uiBuild.files() ?? NO_FILES, {}, { fetchOnly: NOTHING_FETCH_ONLY })) return;
         const f = join(UI_ROOT, "ui", p.slice(1));
         if (p === "/sw.js" || !existsSync(f)) return send(res, 404, { error: "not found" }); // the worker is the web page's, and its source a template

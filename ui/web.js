@@ -10,9 +10,11 @@ import { alertAdvice, alertTitle, signInSurface } from "./account.js";
 import { forgetCachedModels } from "./model-cache.js";
 import { startServiceWorker } from "./web-sw.js";
 
+/** The security facts of a web page, short on the card; the whole of it one tap away. Shortened, never dropped. */
+const SERVER_SHORT = "A hacked server could change this page. For anything sensitive, use the installed apps.";
 const SERVER_NOTICE = "This page comes from the server it connects to. If that server were hacked, it could serve a changed page, which could capture your password and, while open and signed in, run commands on your machines as you, up to reading a machine's keys. Use it for trusted moments. For anything sensitive, prefer the installed apps, and turn Allow web page access off on any machine where this matters.";
-const NO_ACCOUNT = "To create an account, use the Omni desktop app on your computer. This page cannot create or recover one.";
-const LOG_TEXT = "Your password alone does not get in: one of your computers approves this page with one tap. The page can then use your computers for 30 days.";
+const NO_ACCOUNT = "New accounts are made in the Omni desktop app. This page cannot create or recover one.";
+const LOG_TEXT = "Your password alone does not get in. One of your computers approves this page with one tap, and then it can use your computers for 30 days.";
 const PHASE_NOTE = {
   denied: "A device on the account refused this sign-in.",
 };
@@ -28,7 +30,7 @@ const guessName = () => {
   const ua = navigator.userAgent;
   const browser = /Edg\//.test(ua) ? "Edge" : /Firefox\//.test(ua) ? "Firefox" : /Chrome\//.test(ua) ? "Chrome" : /Safari\//.test(ua) ? "Safari" : "Browser";
   const place = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android" : /Mac OS X/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : /Linux/.test(ua) ? "Linux" : "";
-  return `Web page: ${browser}${place ? ` on ${place}` : ""}`;
+  return `${browser}${place ? ` on ${place}` : ""} (web page)`;
 };
 
 function button(label, cls, onclick) {
@@ -90,8 +92,14 @@ function signInScreen(s) {
         render();
       }
     },
-    footer: [el("p", "rm-note web-noaccount", NO_ACCOUNT), el("p", "rm-note web-notice", SERVER_NOTICE), forgetRow(s)],
+    footer: [el("p", "rm-note web-noaccount", NO_ACCOUNT), serverNotice(), forgetRow(s)],
   });
+}
+
+function serverNotice() {
+  const how = el("details", "how web-notice");
+  how.append(el("summary", null, SERVER_SHORT), el("p", null, SERVER_NOTICE));
+  return how;
 }
 
 function forgetRow(s) {
@@ -121,7 +129,7 @@ function waitingScreen(s) {
     c.appendChild(el("p", "rm-note err", "That try did not go through, so nothing was approved. Press Start again here, then look at your other device. If this keeps happening, someone may be interfering."));
     bar.appendChild(again("Start again", "primary"));
   } else if (p.code) {
-    c.appendChild(el("p", "rm-note", "On one of your computers, a card has appeared. Approve it there. It shows this same code:"));
+    c.appendChild(el("p", "rm-note", "Approve it on one of your computers. The card there shows this same code."));
     c.appendChild(el("div", "acct-code", groupCode(p.code)));
     c.appendChild(el("p", "rm-note", "If it shows a different code, do not approve there, and press The codes differ."));
     bar.appendChild(again("The codes differ", "quiet"));
@@ -201,11 +209,10 @@ async function loadApp() {
     document.body.classList.add("web-page");
     for (const node of [...parsed.body.children]) if (node.tagName !== "SCRIPT") document.body.appendChild(document.adoptNode(node));
     document.getElementById("tabRemote").hidden = true; // the old relay's settings are a computer's own
-    document.getElementById("subAccount").textContent = "This page's place on your account: your devices, and how to leave. It cannot approve or remove anything: for that, use a desktop or phone app.";
     await import("./app.js");
   } catch (error) {
     appLoaded = false;
-    document.body.appendChild(el("p", "rm-note err web-failed", `The app could not start: ${error.message}`));
+    document.body.appendChild(el("p", "rm-note err web-failed", `The app did not start. ${error.message}`));
   }
 }
 
@@ -233,7 +240,7 @@ async function boot() {
   if (!await supported()) {
     shell.textContent = "";
     const c = card("This browser cannot run this page");
-    c.appendChild(el("p", "rm-note", "It needs Chrome 137 or later, Safari 17 or later, or Firefox 130 or later, with site data allowed: the page keeps its keys in this browser, where they cannot be copied out."));
+    c.appendChild(el("p", "rm-note", "It needs Chrome 137 or later, Safari 17 or later, or Firefox 130 or later, with site data allowed. The page keeps its keys in this browser, where they cannot be copied out."));
     shell.appendChild(c);
     return;
   }

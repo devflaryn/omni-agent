@@ -588,7 +588,7 @@ test("account.js shows no approve, remove or password control on a web page, wha
 test("the page offers no registration and no recovery, and says where an account is made", () => {
   const src = readFileSync(new URL("../ui/web.js", import.meta.url), "utf8");
   assert.doesNotMatch(src, /Create the account|recoveryCode|Recovery code/);
-  assert.match(src, /To create an account, use the Omni desktop app/);
+  assert.match(src, /New accounts are made in the Omni desktop app/);
 });
 
 test("the page says once on sign-in what a hacked server could do, in plain words", () => {
@@ -1196,7 +1196,7 @@ test("the banner promises a reconnect only when one is set and nothing else is w
   const text = hubLostText({ recoveryContested: true, hub: { reconnecting: true, lastError: "Keep every recovery code. The hub connection was lost.", connectionError: "The hub connection was lost." } });
   assert.equal(text, promise);
   assert.doesNotMatch(hubLostText({ hub: { lastError: "Keep every recovery code.", connectionError: null } }), /recovery code/);
-  assert.match(readFileSync(new URL("../ui/account.js", import.meta.url), "utf8"), /cannot be reached:`, hubLostText\(A\.status\)/);
+  assert.match(readFileSync(new URL("../ui/account.js", import.meta.url), "utf8"), /cannot be reached\.`, hubLostText\(A\.status\)/);
 });
 
 test("the hub gone with no reason to give up: the wait ends naming this page, not a computer", async () => {
@@ -1293,7 +1293,7 @@ test("on a page, one helper turns the texts about this device, and drops what is
       assert.doesNotMatch(phaseText(phase), /this computer|on its own/i, phase);
     }
     assert.equal(phaseText("signed-out"), "Not signed in.");
-    assert.equal(explain({ code: "hub-unreachable", message: "No." }), "The hub cannot be reached: No. Nothing here changed.");
+    assert.equal(explain({ code: "hub-unreachable", message: "No." }), "The hub cannot be reached. No. Nothing here changed.");
     assert.match(hubLostText({ hub: {} }), /^this page has lost the hub/);
     assert.match(hubLostText({ hub: { reconnecting: true } }), /^this page has lost the hub.*It reconnects by itself\.$/);
     assert.equal(deviceWords("This computer and this computer"), "This page and this page");

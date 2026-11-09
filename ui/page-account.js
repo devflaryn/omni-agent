@@ -40,12 +40,12 @@ const DEFAULT_LIMITS = Object.freeze({
 
 /** This page's words for what ALERT_TEXT says of a computer. */
 const PAGE_ALERT_TEXT = Object.freeze({
-  rollback: "The hub offered an older copy of the device list than this page already has. It was refused: someone may be hiding a removal.",
-  fork: "The hub showed a device list that differs from this page's at the same position. It was refused: the hub may be showing different lists to different devices.",
+  rollback: "The hub offered an older copy of the device list than this page already has. It was refused, because someone may be hiding a removal.",
+  fork: "The hub showed a device list that differs from this page's at the same position. It was refused, because the hub may be showing different lists to different devices.",
   "different-account": "The hub showed the device list of a different account. It was refused.",
   "bad-log": "A device list failed its signature checks and was refused.",
   "fake-log": "This page was told it was approved, but the device list does not follow the approval code it was shown. It was refused, and this page stays out of the account.",
-  "log-unreconciled": "Another device has a device list this page cannot get from the hub. The channel was refused: the hub may be hiding a change.",
+  "log-unreconciled": "Another device has a device list this page cannot get from the hub. The channel was refused, because the hub may be hiding a change.",
   removed: "This page is no longer on the account.",
   recovered: "A device recovered this account with the recovery code. If that was not you, your recovery code is out and that device has full control.",
   "channel-failure": "An encrypted channel failed its check and was closed. A frame was changed, lost or replayed on the way.",

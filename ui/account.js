@@ -26,7 +26,7 @@ const ALERT_ADVICE = {
   "approval-failed": "Nothing was approved. Press Start again on the new device, then Get a new code on the device already signed in.",
   "hub-says-removed": "This is the hub's claim, not a fact this computer could check. Sign in again to see.",
   "key-unavailable": "This computer's device key could not be opened. Local use still works.",
-  "bad-anchor": "Try again later. If this repeats, the server may have been tampered with: do not sign in on it until you know why.",
+  "bad-anchor": "Try again later. If this repeats, the server may have been tampered with. Do not sign in on it until you know why.",
 };
 const ALERT_TITLE = {
   rollback: "The hub showed an older device list",
@@ -132,7 +132,7 @@ export function showWelcome(status, { available, closed, flow }) {
 
 /** Why a window has no account, in the person's words. `code` is the server's: see WindowGate.refusalCode. */
 export function noAccountText(code) {
-  if (code === "no-window") return "Omni was started without its window, so signing in is off here. Everything else works. To sign in, close Omni and open it again with Omni Agent.";
+  if (code === "no-window") return "This server was started without its window, so signing in is off here. Everything else works. To sign in, close Omni Agent and open it again.";
   if (code === "other-window") return "Another Omni window holds this computer's sign-in. Use that window, or close every Omni window and open Omni again. Everything else works here.";
   return "Signing in works only in the Omni window on this computer. Everything else works here.";
 }
@@ -232,8 +232,8 @@ async function acting(b, work, out) {
 }
 
 export function explain(e) {
-  if (e.code === "locked") return "Too many tries. This lock is temporary: wait a while, then try again.";
-  if (e.code === "hub-unreachable") return deviceWords(`The hub cannot be reached: ${e.message} Nothing here changed, and this computer still works on its own.`);
+  if (e.code === "locked") return "Too many tries. The lock is temporary, so wait a while and try again.";
+  if (e.code === "hub-unreachable") return deviceWords(`The hub cannot be reached. ${e.message} Nothing here changed, and this computer still works on its own.`);
   return e.message;
 }
 
@@ -370,7 +370,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     const why = s.hub?.lastError && W.flow ? s.hub.lastError : "";
     box.appendChild(signInSurface({
       title: "Welcome to Omni Agent",
-      intro: "Sign in to reach your other computers from here. Omni works on this computer without an account too.",
+      intro: "Sign in to reach your other computers from here. Without an account, everything still works on this computer.",
       modes: ["signin", "create"],
       mode: W.mode,
       needsInvite: !s.canCreateFirst,
@@ -425,7 +425,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     if (p.failed) {
       c.appendChild(el("p", "rm-note err", "That try did not go through, so nothing was approved. Press Try again here, then look at your other device."));
     } else if (p.code) {
-      c.appendChild(el("p", "rm-note", "On a computer where you are already signed in, a card has appeared. Approve it there. It shows this same code:"));
+      c.appendChild(el("p", "rm-note", "A card has appeared on a computer where you are already signed in. Approve it there. It shows this same code."));
       c.appendChild(el("div", "acct-code", groupCode(p.code)));
     } else if (p.confirmed) {
       c.appendChild(el("p", "rm-note", "Waiting for your other device to approve."));
@@ -506,7 +506,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     if (!m) return null;
     const back = () => (webPage() ? null : button(backText(), "small", () => choose(null, null)));
     if (A.machineDown) return banner("danger", `Could not load ${m.name}.`, A.machineDown, [button("Try again", "small", () => retry()), back()]);
-    if (!A.status?.hub?.connected) return banner("danger", `${m.name} cannot be reached:`, hubLostText(A.status), [back()]);
+    if (!A.status?.hub?.connected) return banner("danger", `${m.name} cannot be reached.`, hubLostText(A.status), [back()]);
     const x = A.machines.find((y) => y.id === m.id);
     if (!x) return null;
     if (!x.online || x.link.state === "offline") return banner("danger", `${x.name} is offline.`, "Nothing you send will reach it, and nothing is queued for later.", [back()]);
@@ -566,7 +566,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     const again = (label = "Start again", cls = "") => button(label, cls, (e) => acting(e.currentTarget, async () => { await call("POST", "restart-exchange"); await refresh(); }, out));
     if (p.failed) {
       c.appendChild(el("div", "ap-title", "That try did not go through, so nothing was approved."));
-      c.appendChild(el("p", "rm-note", "Press Start again here, then look at your other device. Each failed try is visible: if this keeps happening, someone may be interfering."));
+      c.appendChild(el("p", "rm-note", "Press Start again here, then look at your other device. Each failed try is visible. If this keeps happening, someone may be interfering."));
       const bar = el("div", "ap-bar"); bar.appendChild(again("Start again", "primary")); c.append(bar, out);
       return c;
     }
@@ -648,7 +648,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
         for (const other of choices.querySelectorAll("button")) other.disabled = true;
         A.failures.delete(row.id);
         call("POST", "approve", { id: row.id, code: review.code, role: choice.role })
-          .then(() => { toast(choice.role === "full" ? "Approved with full control" : "Approved as a web page"); return refresh(); })
+          .then(() => refresh())
           .catch((err) => {
             for (const other of choices.querySelectorAll("button")) other.disabled = false;
             b.disabled = false;
@@ -695,12 +695,12 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
       const copied = el("span", "rm-note");
       const copy = button("Copy", "", () => {
         const done = () => { copied.textContent = "Copied. Now put it somewhere safe, away from this computer."; };
-        (navigator.clipboard?.writeText(shown.recoveryCode) ?? Promise.reject()).then(done).catch(() => { copied.textContent = "Could not copy: select it and copy by hand."; });
+        (navigator.clipboard?.writeText(shown.recoveryCode) ?? Promise.reject()).then(done).catch(() => { copied.textContent = "Could not copy. Select it and copy it by hand."; });
       });
       const row = el("div", "acct-gate-row"); row.append(copy, copied);
       box.appendChild(row);
     } else box.appendChild(el("p", "rm-note err", shown.error ?? "The stored code could not be opened on this computer."));
-    box.appendChild(el("p", "rm-note", "With your password and this code you can get back in if you lose every device. Omni will not show it again, and nothing can issue another: a forgotten code cannot be reset by email."));
+    box.appendChild(el("p", "rm-note", "With your password and this code you can get back in if you lose every device. It is shown only once, and no one can issue another. A forgotten code cannot be reset by email."));
     if (s.recoveryUnconfirmed) box.appendChild(el("p", "rm-note", "You just recovered the account. Keep your old code too until another device confirms this recovery, then discard the old one."));
     const contested = !!s.recoveryContested;
     if (contested) box.appendChild(el("p", "rm-note err", s.hub?.lastError ?? "This computer cannot tell whether this code counts. Keep every recovery code you have."));
@@ -715,14 +715,14 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
         await call("POST", "recovery-code/saved");
         A.showing = null;
         await refresh();
-        toast(A.status?.phase === "approved" ? "Recovery code saved. Omni no longer holds a copy." : "Omni no longer holds that code. You can sign in now.");
+        toast(A.status?.phase === "approved" ? "Recovery code saved. This computer no longer holds a copy." : "This computer no longer holds that code. You can sign in now.");
       }, out)));
     }
     box.append(bar, out);
     if (A.forgetStep) {
       const warn = el("div", "acct-forget");
       warn.appendChild(el("p", "rm-note err", FORGET_WARNING));
-      warn.appendChild(el("p", "rm-note", "The code is still on the screen above: write it down first."));
+      warn.appendChild(el("p", "rm-note", "The code is still on the screen above. Write it down first."));
       const row = el("div", "ap-bar");
       row.append(button("Keep it", "", () => { A.forgetStep = false; drawGate(); }), button("Delete it and forget this device", "danger", (e) => acting(e.currentTarget, async () => {
         await call("POST", "sign-out", { forget: true });
@@ -770,7 +770,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     sec.appendChild(seg);
     const mode = A.form.mode;
     const needsInvite = !A.status?.canCreateFirst;
-    sec.appendChild(el("p", "rm-note", mode === "signin" ? "Signing in is optional. Your password alone does not get in: a device already on the account approves this one, with one tap." : mode === "register" ? `${needsInvite ? "You need an invite code from the person who runs your Omni server. " : "This computer can create the first account. "}A forgotten password cannot be reset by email: nothing is ever mailed, and the server never sees your password. You will get a recovery code to keep.` : "If you have lost every device. You need your email, password and recovery code. You will get a new code, and every device is told."));
+    sec.appendChild(el("p", "rm-note", mode === "signin" ? "Optional. Your password alone does not get in. A device already on the account approves this one with one tap." : mode === "register" ? `${needsInvite ? "You need an invite code from the person who runs your Omni server. " : "This computer can create the first account. "}A forgotten password cannot be reset by email. Nothing is ever mailed, and the server never sees your password. You get a recovery code to keep.` : "For when you have lost every device. You need your email, password and recovery code. You get a new code, and every device is told."));
     const form = el("form", "rm-form");
     form.onsubmit = (e) => e.preventDefault();
     const invite = mode === "register" && needsInvite ? field(form, { label: "Invite code", autocomplete: "off", placeholder: "XXXX-XXXX-XXXX-XXXX", key: "invite" }) : null;
@@ -832,16 +832,16 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
         if (d.self) top.appendChild(el("span", "acct-self", hereWords()));
         main.appendChild(top);
         const role = d.role === "full" ? "full control" : "limited web page";
-        main.appendChild(el("div", "acct-device-sub", [cleanName(d.kind, 32, "unknown"), role, shortId(d.id), d.addedAt ? `added ${when(d.addedAt)}` : "", d.expiresAt ? `ends ${when(d.expiresAt)}` : ""].filter(Boolean).join(" · ")));
+        main.appendChild(el("div", "acct-device-sub", [cleanName(d.kind, 32, "unknown"), role, shortId(d.id), d.addedAt ? `added ${when(d.addedAt)}` : "", d.expiresAt ? `ends ${when(d.expiresAt)}` : ""].filter(Boolean).join(", ")));
         row.appendChild(main);
         if (fullDevice()) {
           const rm = button("Remove", "small", (e) => {
             const name = cleanName(d.name);
             const text = d.self
-              ? `Remove THIS computer from the account?\n\nIt loses access to your other machines straight away, and they lose access to it. It needs a new approval to come back, and if it is your only full device you will need your recovery code.`
+              ? `Remove this computer, the one you are using, from the account?\n\nIt loses access to your other machines straight away, and they lose access to it. It needs a new approval to come back, and if it is your only full device you will need your recovery code.`
               : `Remove "${name}" from the account?\n\nIt is cut off from every machine as soon as each sees the new list.`;
             if (!window.confirm(text)) return;
-            acting(e.currentTarget, async () => { await call("POST", "remove", { id: d.id }); toast(`${name} removed`); await refresh(); renderSettings(true); }).catch((err) => toast(explain(err), true));
+            acting(e.currentTarget, async () => { await call("POST", "remove", { id: d.id }); await refresh(); renderSettings(true); }).catch((err) => toast(explain(err), true));
           });
           row.appendChild(rm);
         }
@@ -866,7 +866,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
         const row = el("div", "acct-device");
         const main = el("div", "acct-device-main");
         main.appendChild(el("b", null, `${words[i.state] ?? "Unknown"} invite`));
-        main.appendChild(el("div", "acct-device-sub", [i.createdAt ? `made ${when(i.createdAt)}` : "", i.state === "live" && i.expiresAt ? `ends ${when(i.expiresAt)}` : ""].filter(Boolean).join(" · ")));
+        main.appendChild(el("div", "acct-device-sub", [i.createdAt ? `made ${when(i.createdAt)}` : "", i.state === "live" && i.expiresAt ? `ends ${when(i.expiresAt)}` : ""].filter(Boolean).join(", ")));
         row.appendChild(main);
         if (i.state === "live") row.appendChild(button("Revoke", "small", (e) => acting(e.currentTarget, async () => { await call("POST", "invites/revoke", { id: i.id }); made.textContent = ""; await load(); }, out)));
         list.appendChild(row);
@@ -876,9 +876,9 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
       const { code } = await call("POST", "invites", {});
       made.textContent = "";
       made.appendChild(el("div", "acct-recovery mono", code));
-      const copied = el("span", "rm-note", "Give this code to the person you invite. Omni will not show it again.");
+      const copied = el("span", "rm-note", "Give this code to the person you invite. It is shown only once.");
       const copy = button("Copy", "small", () => {
-        (navigator.clipboard?.writeText(code) ?? Promise.reject()).then(() => { copied.textContent = "Copied."; }).catch(() => { copied.textContent = "Could not copy: select it and copy by hand."; });
+        (navigator.clipboard?.writeText(code) ?? Promise.reject()).then(() => { copied.textContent = "Copied."; }).catch(() => { copied.textContent = "Could not copy. Select it and copy it by hand."; });
       });
       const row = el("div", "acct-gate-row"); row.append(copy, copied);
       made.appendChild(row);
@@ -890,7 +890,7 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
 
   function passwordSection(wrap) {
     const sec = section(wrap, "Change the password");
-    sec.appendChild(el("p", "rm-note", "It changes how you sign in, and nothing else: no device has to be approved again."));
+    sec.appendChild(el("p", "rm-note", "It changes how you sign in. No device needs approving again."));
     const form = el("form", "rm-form");
     form.onsubmit = (e) => e.preventDefault();
     const current = field(form, { label: "Current password", type: "password", autocomplete: "current-password", key: "pw-current" });
@@ -909,13 +909,13 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
 
   function recoverySection(wrap, s) {
     const sec = section(wrap, "Recovery");
-    sec.appendChild(el("p", "rm-note", "Your recovery code, with your password, gets you back in if you lose every device. Omni does not keep it once you say you saved it, and cannot show it again."));
+    sec.appendChild(el("p", "rm-note", "With your password, your recovery code gets you back in if you lose every device. Once you say you saved it, this computer keeps no copy and cannot show it again."));
     if (s.recoveryUnconfirmed) sec.appendChild(el("p", "rm-note err", "Keep your old recovery code until another device confirms this recovery, then discard it."));
     if (s.recoveryContested && s.hub?.lastError) sec.appendChild(el("p", "rm-note err", s.hub.lastError));
     if (s.recoveryCodePending) sec.appendChild(button("Show the waiting code", "", () => { A.codeHidden = false; renderGate(); renderBanners(); }));
     if (s.recoveries?.length) {
-      sec.appendChild(el("p", "rm-note", "This account has been recovered:"));
-      for (const r of s.recoveries) sec.appendChild(el("div", "acct-device-sub", `${when(r.addedAt)} · ${cleanName(r.name)} · ${cleanName(r.kind, 32, "unknown")} · ${shortId(r.signPub)}`));
+      sec.appendChild(el("p", "rm-note", "This account has been recovered before."));
+      for (const r of s.recoveries) sec.appendChild(el("div", "acct-device-sub", `${when(r.addedAt)}, by ${cleanName(r.name)} (${cleanName(r.kind, 32, "unknown")}, ${shortId(r.signPub)})`));
     }
   }
 
@@ -969,8 +969,9 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     const thisDevice = section(wrap, webPage() ? "This page" : "This device");
     thisDevice.appendChild(el("p", "rm-note", phaseText(s.phase)));
     if (s.email) thisDevice.appendChild(el("div", "acct-device-sub", cleanName(s.email, 254)));
-    if (s.device) thisDevice.appendChild(el("div", "acct-device-sub", `${cleanName(s.device.name)} · ${cleanName(s.device.kind, 32, "unknown")} · ${webPage() || s.device.role === "client" ? "limited web page" : s.device.role === "full" ? "full control" : "not on an account"} · ${shortId(s.device.id)}`));
-    thisDevice.appendChild(el("div", "acct-device-sub", `Hub: ${cleanName(s.hub?.url, 200)} · ${s.hub?.connected ? "connected" : "not connected"}`));
+    if (s.device) thisDevice.appendChild(el("div", "acct-device-sub", `${cleanName(s.device.name)}, ${cleanName(s.device.kind, 32, "unknown")}, ${webPage() || s.device.role === "client" ? "limited web page" : s.device.role === "full" ? "full control" : "not on an account"}, ${shortId(s.device.id)}`));
+    thisDevice.appendChild(el("div", "acct-device-sub", `Hub ${cleanName(s.hub?.url, 200)}, ${s.hub?.connected ? "connected" : "not connected"}`));
+    if (webPage()) thisDevice.appendChild(el("p", "rm-note", "This page cannot approve or remove anything. Use a desktop or phone app for that."));
     if (s.hub?.lastError) thisDevice.appendChild(el("p", "rm-note err", s.hub.lastError));
     if (A.note) thisDevice.appendChild(el("p", "rm-note", A.note));
 
@@ -999,8 +1000,10 @@ export function createAccount({ toast, openSettings, choose = (id, name) => setM
     }));
     leave.appendChild(row);
 
-    const hub = section(wrap, "What the hub can and cannot see");
-    hub.appendChild(el("p", "rm-note", HUB_SEES));
+    // The hub's limits, in full, one tap away: a fact sheet, not a paragraph in the main path.
+    const hub = el("details", "how rm-sec");
+    hub.append(el("summary", null, "What the hub can and cannot see"), el("p", null, HUB_SEES));
+    wrap.appendChild(hub);
   }
 
   return {

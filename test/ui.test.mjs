@@ -28,7 +28,7 @@ test("the Home page, composer, toasts and errors name OpenCode, not pi", async (
     assert.doesNotMatch(s, bad, `${f}: ${s}`);
   }
   const html = read("index.html").replace(/<script[\s\S]*?<\/script>/g, "").replace(/<[^>]*\bclass="[^"]*"/g, (m) => m.replace(/class="[^"]*"/, ""));
-  assert.match(html, /OpenCode runs here/);
+  assert.match(read("app.js"), /`Message OpenCode/, "Home's placeholder says OpenCode takes the message");
   assert.doesNotMatch(html.replace(/<[^>]+>/g, " ").replace(/(placeholder|title|aria-label)="[^"]*"/g, ""), /\bpi\b/);
   assert.doesNotMatch(html, /placeholder="[^"]*\bpi\b/);
 });

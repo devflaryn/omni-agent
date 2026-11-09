@@ -28,7 +28,7 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
     api, toast, insert, isRemote,
     onActive: (r, p) => { if (r === root) { activePath = p; markActive(); } },
     revealInTree: (r, p) => { if (r === root) reveal(p); },
-  })), (e) => { loading = null; toast(`The file pane could not load: ${e.message}`, true); throw e; });
+  })), (e) => { loading = null; tree.prepend(el("div", "empty err", `Files could not open. ${e.message}`)); throw e; });
   const later = (name) => (...args) => loaded().then((p) => p[name](...args)).catch(() => {});
   const ifLoaded = (name) => (...args) => real?.[name](...args);
   const pane = {
@@ -123,12 +123,14 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
   async function setRoot(r) {
     root = r || null;
     const on = where().replace(/^ on (.)/, (_, c) => c.toUpperCase());
-    rootLbl.textContent = `${on ? `${on} · ` : ""}${root || "No working directory"}`;
+    // The folder by its last two names: the whole path, often a long temp one, is in the tooltip.
+    const short = root ? root.replace(/\\/g, "/").split("/").filter(Boolean).slice(-2).join("/") : "";
+    rootLbl.textContent = `${on ? `${on}, ` : ""}${short || "No folder"}`;
     rootLbl.title = root ? `${root}${where()}` : "";
     if (!root) { tree.innerHTML = ""; loadedRoot = null; nodes.clear(); return; }
     if (root === loadedRoot) return;
     loadedRoot = root; nodes.clear(); selected = null;
-    tree.innerHTML = ""; tree.appendChild(el("div", "empty", "loading…"));
+    tree.innerHTML = ""; tree.appendChild(el("div", "empty", "Loading…"));
     await loadDir("", tree, 0);
   }
   async function refresh() { if (!root) return; loadedRoot = root; await loadDir("", tree, 0); }
@@ -294,12 +296,12 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
 
   async function remove(n, { permanent = false } = {}) {
     const what = `${n.entry.dir ? "the folder " : ""}“${showName(n.entry.name)}”${n.entry.dir ? " and everything in it" : ""}`;
-    if (!window.confirm(permanent ? `Permanently delete ${what}${where()}? This cannot be undone.` : `Move ${what}${where()} to the trash?`)) return;
+    if (!window.confirm(permanent ? `Delete ${what}${where()} for good? This cannot be undone.` : `Move ${what}${where()} to the trash?`)) return;
     try {
       try { await post("/api/fs/delete", { path: n.entry.path, permanent }); }
       catch (e) {
         if (!e.body?.trashFailed) throw e;
-        if (!window.confirm(`${e.message}.\n\nDelete ${what}${where()} permanently instead? This cannot be undone.`)) return;
+        if (!window.confirm(`${e.message}.\n\nDelete ${what}${where()} for good instead? This cannot be undone.`)) return;
         await post("/api/fs/delete", { path: n.entry.path, permanent: true });
       }
       pane.deleted(root, n.entry.path);
@@ -315,44 +317,44 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
   async function revealOnHost(path) {
     try { await post("/api/fs/reveal", { path }); } catch (e) { toast(e.message, true); }
   }
-  const revealLabel = isMac ? "Reveal in Finder" : /Win/.test(navigator.platform || navigator.userAgent) ? "Reveal in File Explorer" : "Open Containing Folder";
+  const revealLabel = isMac ? "Reveal in Finder" : /Win/.test(navigator.platform || navigator.userAgent) ? "Reveal in File Explorer" : "Open containing folder";
 
   function menuFor(n) {
     const p = n.entry.path, dir = n.entry.dir, here = dir ? p : parentOf(p);
     const k = (win, mac) => (isMac ? mac : win);
     return [
       !dir && { label: "Open", action: () => pane.open(root, p, { pin: true }) },
-      !dir && { label: "Open as Text (read-only)", action: () => pane.open(root, p, { pin: true, mode: "text" }) },
-      !dir && { label: "Open in Hex Viewer", action: () => pane.open(root, p, { pin: true, mode: "hex" }) },
+      !dir && { label: "Open as text (read-only)", action: () => pane.open(root, p, { pin: true, mode: "text" }) },
+      !dir && { label: "Open in hex viewer", action: () => pane.open(root, p, { pin: true, mode: "hex" }) },
       dir && { label: n.kids.hidden ? "Expand" : "Collapse", action: () => setOpen(n, n.kids.hidden) },
       "-",
-      { label: "New File…", action: () => create(here) },
-      { label: "New Folder…", action: () => create(here, { dir: true }) },
+      { label: "New file…", action: () => create(here) },
+      { label: "New folder…", action: () => create(here, { dir: true }) },
       "-",
-      { label: "Reference in Prompt", action: () => insert(`@${p} `) },
+      { label: "Reference in message", action: () => insert(`@${p} `) },
       "-",
-      { label: "Copy Path", kbd: k("Ctrl+Alt+C", "⌥⌘C"), action: () => pane.copy(pane.absPath(root, p)) },
-      { label: "Copy Relative Path", action: () => pane.copy(p) },
-      { label: "Copy Name", action: () => pane.copy(n.entry.name) },
+      { label: "Copy path", kbd: k("Ctrl+Alt+C", "⌥⌘C"), action: () => pane.copy(pane.absPath(root, p)) },
+      { label: "Copy relative path", action: () => pane.copy(p) },
+      { label: "Copy name", action: () => pane.copy(n.entry.name) },
       !dir && { label: "Download", action: () => pane.download(root, p) },
       !isRemote() && { label: revealLabel, action: () => revealOnHost(p) },
       "-",
       { label: "Rename…", kbd: "F2", action: () => rename(n) },
       { label: "Duplicate", action: () => duplicate(n) },
-      { label: "Move to Trash", kbd: k("Delete", "⌘⌫"), action: () => remove(n), danger: true },
-      { label: "Delete Permanently", kbd: "Shift+Del", action: () => remove(n, { permanent: true }), danger: true },
+      { label: "Move to trash", kbd: k("Delete", "⌘⌫"), action: () => remove(n), danger: true },
+      { label: "Delete for good", kbd: "Shift+Del", action: () => remove(n, { permanent: true }), danger: true },
       ...(dir ? ["-", { label: "Refresh", action: () => { n.loaded = false; if (!n.kids.hidden) reloadDir(p); } }] : []),
     ];
   }
   function rootMenu() {
     return [
-      { label: "New File…", action: () => create("") },
-      { label: "New Folder…", action: () => create("", { dir: true }) },
+      { label: "New file…", action: () => create("") },
+      { label: "New folder…", action: () => create("", { dir: true }) },
       "-",
       { label: "Refresh", action: refresh },
-      { label: "Collapse All", action: collapseAll },
+      { label: "Collapse all", action: collapseAll },
       "-",
-      { label: "Copy Path", action: () => pane.copy(root) },
+      { label: "Copy path", action: () => pane.copy(root) },
       !isRemote() && { label: revealLabel, action: () => revealOnHost("") },
     ];
   }

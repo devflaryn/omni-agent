@@ -8,7 +8,7 @@ web
 
 ## Users
 
-One person: the developer who owns this machine. The app runs on their Mac and is opened in the pywebview desktop window or a browser; a large share of use is remote control from a phone or laptop on the same LAN (`--lan`). There is no login and no second audience. Labels can assume the owner's vocabulary (pi, Claude Code, omnidroid, frida, APK, vault) but the phone view is a first-class layout target, not a fallback.
+The developer who owns these machines, and the few people they invite (each sees only their own machines). The app runs on their PC and Mac in the desktop window or a browser; a large share of use is from a phone or laptop elsewhere, through an account that puts every machine in one window. Signing in is optional: without an account the app works on its own computer as before. Labels can assume the owner's vocabulary (pi, Claude Code, omnidroid, frida, APK, vault) but the phone view is a first-class layout target, not a fallback.
 
 ## Product Purpose
 
@@ -22,22 +22,22 @@ A single window over the agents that already run on this machine, rather than a 
 
 - The dominant job is watching long agent runs on omnidroid work: pi running APKs on Android, APK rebuilds, frida hooks, custom APK boots. Tool activity, run status and the elapsed/token line matter more than prose polish. Runs last minutes to hours and are often observed from a phone.
 - Secondary job: general coding chats in project folders, with the file explorer and preview beside the transcript.
-- Surfaces: Home (prompt + working directory), Chat (explorer, preview, transcript, composer), history drawer (Chats, Memory, Graph, Tokens), Providers dialog, toasts.
-- Runtime: Node 22 server on port 4400, static `ui/` (vanilla HTML/CSS/ES modules, no framework, no build step), SSE for live events. Desktop window is WKWebView via pywebview; phone use is Mobile Safari / Chrome over LAN.
+- Surfaces: Home (prompt, machine and folder, running work and recent chats), Chat (explorer, preview, transcript, composer), history drawer (Chats, Memory, Graph, Tokens), Missions, Settings (Models, MCP servers, Remote, Long runs, Account, Appearance), sign-in and approval cards, toasts.
+- Runtime: Node 22 server on port 4400, `ui/` in vanilla HTML/CSS/ES modules with no framework, built by `npm run build` into content-hashed files in `dist/ui`. SSE for live events. The desktop window is a web view; phone use is Mobile Safari or Chrome, and Add to Home Screen opens it standalone.
 - Models are user-configured providers in pi's `~/.pi/agent/models.json` (OpenRouter + DeepSeek today). DeepSeek is text-only, so some skills carry text-only verification loops.
 
 ## Capabilities and Constraints
 
 - Everything in the current UI stays: home composer with directory chips, explorer with archive browsing and preview (text, rendered markdown with Raw toggle, images, zip/apk entries), `@path` references, transcript with folded tool-call groups, tool-result images with overlay, thinking status line with tok/sec, goal hook line, history drawer with day grouping and live-dot, trash-based delete, Memory/Graph/Tokens tabs, Providers dialog with presets, resizable columns with remembered widths, toasts.
 - Two agent sources are distinguished throughout: pi (interactive, drives from here) and Claude Code (read-only in the UI, never launched from it). Keep them visually tellable apart.
-- No build step, no framework, no bundler: plain CSS and ES modules served as-is. Fonts must be system or self-hosted-free; the app must work offline on the LAN.
+- No framework. Plain CSS and ES modules, bundled by one small build step (esbuild) into `dist/ui`. Fonts are the system's; the app must work offline on the LAN.
 - Must work in WKWebView (macOS) and mobile Safari; keyboard-driven on desktop, touch on phone.
 - Terminology to keep: "Working directory", "History", "Chats / Memory / Graph / Tokens", "Providers", "Goal hook", "Thinking".
-- Theme: the UI follows the system color scheme (light by day on the Mac, dark on a phone at night); a manual in-app switch is not requested. Decided 2026-09-16.
+- Theme: dark by default. Settings → Appearance offers Dark, Light and System; System follows the device. Decided 2026-11-09, replacing the 2026-09-16 "follow the system, no switch" rule.
 
 ## Brand Commitments
 
-Name: **Omni Agent**. No logo, wordmark or icon assets exist yet. The owner's binding request for this redesign: it must read as a clean, deliberate tool UI and not as generic AI-generated chat-app styling (no glows, gradient halos, oversized pill radii, or decorative flourishes without purpose). The incumbent dark/amber look is discarded, not refined.
+Name: **Omni Agent**, with the lightning mark. The look is ChatGPT's dark UI, chosen by the owner on 2026-11-09 and kept on purpose: pills, the rounded composer, ChatGPT's greys. The binding request is that it be a faithful, refined and consistent version of that look, described in `DESIGN.md`, with no glows, gradient halos or decoration without a purpose, and copy in a plain human voice.
 
 ## Evidence on Hand
 
@@ -55,4 +55,4 @@ Name: **Omni Agent**. No logo, wordmark or icon assets exist yet. The owner's bi
 
 ## Accessibility & Inclusion
 
-Keyboard focus must stay visible on controls (existing `:focus-visible` rings), motion respects `prefers-reduced-motion`, touch targets on phone at least 40px. No formal standard has been mandated.
+Keyboard focus must stay visible on controls (`:focus-visible` rings), motion respects `prefers-reduced-motion`, text meets 4.5:1 contrast in both themes, and touch targets are at least 44px under a coarse pointer. No formal standard has been mandated.

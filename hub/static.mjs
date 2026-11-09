@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const JS = "text/javascript; charset=utf-8";
-const CONTENT_TYPES = { ".html": "text/html; charset=utf-8", ".js": JS, ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png" };
+const CONTENT_TYPES = { ".html": "text/html; charset=utf-8", ".js": JS, ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 const DIST = new URL("../dist/ui/", import.meta.url);
 /** A hash in the name means this name always holds these bytes. */
 const FOREVER = "public, max-age=31536000, immutable";
@@ -41,6 +41,7 @@ export function webPolicy(origin) {
     "style-src 'self'",
     "img-src 'self' blob: data:",
     "media-src 'self' blob:",
+    "manifest-src 'self'",
     `connect-src 'self'${socket}`,
     "frame-ancestors 'none'",
     "base-uri 'none'",

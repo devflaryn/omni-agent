@@ -31,7 +31,7 @@ export function createRemote({ api, toast }) {
     render();
     const fresh = pending.filter((a) => !before.has(a.id));
     if (fresh.length && document.hidden && "Notification" in window && Notification.permission === "granted") {
-      try { new Notification("Omni Agent: approval needed", { body: fresh[0].title }); } catch { /* */ }
+      try { new Notification("Omni Agent needs your approval", { body: fresh[0].title }); } catch { /* */ }
     }
   }
 
@@ -64,7 +64,7 @@ export function createRemote({ api, toast }) {
     const detail = a.detail && typeof a.detail === "object" && Object.keys(a.detail).length ? a.detail : null;
     if (detail) {
       const d = el("details", "ap-detail");
-      d.appendChild(el("summary", null, `Details · ${a.method} ${route}`));
+      d.appendChild(el("summary", null, `Details (${a.method} ${route})`));
       d.appendChild(el("pre", null, JSON.stringify(detail, null, 2)));
       c.appendChild(d);
     } else c.appendChild(el("div", "ap-route mono", `${a.method} ${route}`));
@@ -73,7 +73,7 @@ export function createRemote({ api, toast }) {
     const ok = el("button", "btn primary", "Approve");
     const decide = async (approve) => {
       deny.disabled = ok.disabled = true;
-      try { await api(`/api/remote/approvals/${encodeURIComponent(a.id)}`, { approve }); toast(approve ? "Approved" : "Denied"); }
+      try { await api(`/api/remote/approvals/${encodeURIComponent(a.id)}`, { approve }); }
       catch (e) { toast(e.message, true); deny.disabled = ok.disabled = false; }
     };
     deny.onclick = () => decide(false);
@@ -87,23 +87,26 @@ export function createRemote({ api, toast }) {
   async function loadSettings() {
     const body = $("#remoteBody");
     let st;
-    try { st = await api("/api/remote/status"); } catch (e) { body.textContent = e.message; return; }
+    try { st = await api("/api/remote/status"); } catch (e) { const w = el("div", "rm-wrap"); w.appendChild(el("p", "rm-note err", `Remote access did not load. ${e.message}`)); body.replaceChildren(w); return; }
     body.innerHTML = "";
     const wrap = el("div", "rm-wrap");
+    const how = el("details", "how");
+    how.append(el("summary", null, "How this works"), el("p", null, "Another device or network opens this computer in a browser and signs in with this password. It sees everything read-only, and each message or change it sends waits for your Approve here."));
+    wrap.appendChild(how);
 
     const sec = (title) => { const s = el("section", "rm-sec"); s.appendChild(el("h3", null, title)); wrap.appendChild(s); return s; };
 
     const where = sec("Address");
     if (!st.enabled) where.appendChild(el("p", "rm-note", "Remote access is off. Start Omni with --remote (the desktop launcher does), or set \"remote\": true in omni.config.json, then restart."));
-    else if (!st.listening) where.appendChild(el("p", "rm-note err", `The remote listener did not start: ${st.error || "unknown error"}`));
+    else if (!st.listening) where.appendChild(el("p", "rm-note err", `The remote listener did not start. ${st.error || "No reason was given."}`));
     else {
       for (const u of st.urls) where.appendChild(el("div", "rm-url mono", u));
-      if (!st.relay) where.appendChild(el("p", "rm-note", `From another network: forward TCP ${st.port} on your router to this computer, then open ${st.https ? "https" : "http"}://<your public IP>:${st.port}/ there.`));
-      if (st.https) where.appendChild(el("p", "rm-note", `HTTPS${st.selfSigned ? " with a self-signed certificate: the browser warns once. Check that it shows this SHA-256 fingerprint before you type the password:" : ". Certificate SHA-256:"}`));
-      else where.appendChild(el("p", "rm-note err", "Plain HTTP: the password and everything you see cross the network readable. Install openssl, or set tlsCert/tlsKey, and restart."));
+      if (!st.relay) where.appendChild(el("p", "rm-note", `From another network, forward TCP ${st.port} on your router to this computer, then open ${st.https ? "https" : "http"}://<your public IP>:${st.port}/ there.`));
+      if (st.https) where.appendChild(el("p", "rm-note", st.selfSigned ? "HTTPS with a self-signed certificate, so the browser warns once. Check that it shows this SHA-256 fingerprint before you type the password." : "HTTPS. The certificate's SHA-256 is below."));
+      else where.appendChild(el("p", "rm-note err", "Plain HTTP. The password and everything you see cross the network readable. Install openssl, or set tlsCert and tlsKey, and restart."));
       if (st.fingerprint) where.appendChild(el("div", "rm-fp mono", st.fingerprint));
       if (st.https && st.selfSigned) {
-        const p = el("p", "rm-note", "No warning at all on a phone: open "), a = el("a", null, "/omni-agent.crt");
+        const p = el("p", "rm-note", "For no warning at all on a phone, open "), a = el("a", null, "/omni-agent.crt");
         a.href = "/omni-agent.crt"; a.setAttribute("download", "");
         p.append(a, " there, install it (iPhone: Settings → General → VPN & Device Management) and trust it (Settings → General → About → Certificate Trust Settings).");
         where.appendChild(p);
@@ -114,13 +117,13 @@ export function createRemote({ api, toast }) {
       const net = sec("From anywhere (through your VPS)");
       net.appendChild(el("div", "rm-url mono", st.relay.url));
       const t = st.relay.tunnel;
-      const state = !st.relay.listening ? `off: ${st.relay.error || "not started"}` : !t ? "tunnel not started" : t.state === "up" ? "connected" : t.state === "connecting" ? "connecting…" : `down${t.lastError ? `: ${t.lastError}` : ""}`;
-      net.appendChild(el("p", `rm-note${t?.state === "up" ? "" : " err"}`, `Tunnel: ${state}`));
-      net.appendChild(el("p", "rm-note", "No router setup needed: this PC keeps an outgoing SSH connection to the VPS, and the VPS passes visitors through still encrypted. It can't read the traffic."));
+      const state = !st.relay.listening ? `off. ${st.relay.error || "Not started."}` : !t ? "not started" : t.state === "up" ? "connected" : t.state === "connecting" ? "connecting…" : `down${t.lastError ? `. ${t.lastError}` : ""}`;
+      net.appendChild(el("p", `rm-note${t?.state === "up" ? "" : " err"}`, `The tunnel is ${state}`));
+      net.appendChild(el("p", "rm-note", "No router setup needed. This PC keeps an outgoing SSH connection to the VPS, which passes visitors through still encrypted. The VPS cannot read the traffic."));
     }
 
     const pw = sec(st.hasPassword ? "Change the password" : "Set a password");
-    if (!st.hasPassword) pw.appendChild(el("p", "rm-note err", "No password yet: remote browsers cannot sign in until you set one."));
+    if (!st.hasPassword) pw.appendChild(el("p", "rm-note err", "No password yet. Remote browsers cannot sign in until you set one."));
     const form = el("form", "rm-form");
     form.onsubmit = (e) => e.preventDefault();
     const p1 = el("input"); p1.type = "password"; p1.placeholder = "New password (12+ characters)"; p1.autocomplete = "new-password";
@@ -128,7 +131,7 @@ export function createRemote({ api, toast }) {
     const save = el("button", "btn primary", st.hasPassword ? "Change password" : "Set password");
     save.onclick = async () => {
       if (p1.value !== p2.value) return toast("The two passwords differ", true);
-      try { await api("/api/remote/password", { password: p1.value }); toast("Password saved; remote browsers were signed out"); loadSettings(); }
+      try { await api("/api/remote/password", { password: p1.value }); toast("Password saved. Remote browsers were signed out."); loadSettings(); }
       catch (e) { toast(e.message, true); }
     };
     form.appendChild(p1); form.appendChild(p2); form.appendChild(save);
@@ -145,17 +148,17 @@ export function createRemote({ api, toast }) {
     }
     if (st.sessions.length) {
       const out = el("button", "btn", "Sign everyone out");
-      out.onclick = async () => { try { await api("/api/remote/sessions", null, "DELETE"); toast("Remote browsers signed out"); loadSettings(); } catch (e) { toast(e.message, true); } };
+      out.onclick = async () => { try { await api("/api/remote/sessions", null, "DELETE"); loadSettings(); } catch (e) { toast(e.message, true); } };
       who.appendChild(out);
     }
     const devs = sec(`Approved devices (${st.devices?.length || 0})`);
-    devs.appendChild(el("p", "rm-note", st.deviceApproval ? "A device you haven't approved needs your Approve here once, even with the right password. Removing a device signs every remote browser out." : "Device approval is off (remoteDeviceApproval: false): the password alone signs any device in."));
+    devs.appendChild(el("p", "rm-note", st.deviceApproval ? "A device you haven't approved needs your Approve here once, even with the right password. Removing a device signs every remote browser out." : "Device approval is off (remoteDeviceApproval is false), so the password alone signs any device in."));
     for (const d of st.devices || []) {
       const row = el("div", "rm-sess");
       row.appendChild(el("span", "mono", d.ip || ""));
       row.appendChild(el("span", "rm-ua", d.label || "unknown browser"));
       const rm = el("button", "btn small", "Remove");
-      rm.onclick = async () => { try { await api(`/api/remote/devices/${encodeURIComponent(d.id)}`, null, "DELETE"); toast("Device removed"); loadSettings(); } catch (e) { toast(e.message, true); } };
+      rm.onclick = async () => { try { await api(`/api/remote/devices/${encodeURIComponent(d.id)}`, null, "DELETE"); loadSettings(); } catch (e) { toast(e.message, true); } };
       row.appendChild(rm);
       devs.appendChild(row);
     }
