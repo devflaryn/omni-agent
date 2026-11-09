@@ -8,7 +8,7 @@ import { createEditor } from "./editor.js";
 import { languageFor, LANG_LABEL } from "./highlight.js";
 import { showMenu, onContext } from "./contextmenu.js";
 import { fileIcon, ICONS } from "./fileicons.js";
-import { framesFiles, isLeaving, onLeaveCheck, rawUrl, saveFile } from "./transport.js";
+import { framesFiles, onLeaveCheck, rawUrl, saveFile } from "./transport.js";
 import { absPath } from "./paths.js";
 
 const q = (o) => Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
@@ -485,8 +485,8 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
   }
   // The agent edits files while they are open: a clean active tab follows the disk when the window regains focus.
   window.addEventListener("focus", () => { if (active && !active.dirty && !pane.hidden) refreshFromDisk(active, { quiet: true }); });
-  window.addEventListener("beforeunload", (e) => { if (!isLeaving() && tabs.some((t) => t.dirty)) { e.preventDefault(); e.returnValue = ""; } });
-  // Switching machine asks first (transport.js), so its answer can leave the window as it was.
+  window.addEventListener("beforeunload", (e) => { if (tabs.some((t) => t.dirty)) { e.preventDefault(); e.returnValue = ""; } });
+  // Going to another machine asks first (transport.js), so its answer can leave the window as it was. Its tabs are this machine's.
   onLeaveCheck(() => { const n = tabs.filter((t) => t.dirty).length; return n ? `${n === 1 ? "A file has" : `${n} files have`} unsaved changes.` : null; });
 
   // ----------------------------------------------------------------- helpers
@@ -513,6 +513,8 @@ export function createFilePane({ api, toast, insert, isRemote = () => false, onA
     /** Back with the explorer: the open tabs return unless the person hid the editor themselves. */
     restore() { if (tabs.length && !userHidden) show(); },
     closeAll: () => closeMany(tabs),
+    /** The window went to another machine, already agreed to: these tabs were the last machine's, so none may stay open. */
+    forgetAll: () => { for (const t of [...tabs]) close(t, { force: true }); },
     get active() { return active; },
     get hasTabs() { return tabs.length > 0; },
     /** The tree renamed or moved something: open tabs under it follow. */

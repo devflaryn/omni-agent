@@ -141,17 +141,16 @@ function waitingScreen(s) {
 }
 
 function machineScreen(s) {
-  const c = card("Choose a machine");
+  // Shown only while none of the account's machines can be used: the app opens by itself as soon as one can.
+  const c = card("Your machines");
   const list = el("div", "web-machines");
   const machines = account.links.machines();
   if (!machines.length) list.appendChild(el("p", "rm-note", "There are no desktop machines on this account yet."));
+  else c.appendChild(el("p", "rm-note", "None of your machines can be reached right now. This page opens as soon as one can."));
   for (const m of machines) {
-    const row = el("button", "machine-row web-machine");
-    row.type = "button";
-    row.append(el("span", `machine-dot${m.online ? " live" : ""}`), el("span", "machine-row-name", cleanName(m.name)), el("span", "machine-row-id", String(m.id).slice(0, 6)), el("span", "machine-row-state", m.online ? "" : "offline"));
-    row.disabled = !m.online;
-    row.title = m.online ? `Act on ${cleanName(m.name)}` : `${cleanName(m.name)} is offline`;
-    row.onclick = () => setMachine(m.id, { name: m.name });
+    const refusing = m.link?.state === "refusing";
+    const row = el("div", "machine-row web-machine");
+    row.append(el("span", `machine-dot${m.online && !refusing ? " live" : ""}`), el("span", "machine-row-name", cleanName(m.name)), el("span", "machine-row-id", String(m.id).slice(0, 6)), el("span", "machine-row-state", !m.online ? "offline" : refusing ? "does not let web pages in" : ""));
     list.appendChild(row);
   }
   c.appendChild(list);
@@ -177,10 +176,14 @@ function render() {
   const s = account.status();
   const typing = shell.contains(document.activeElement) && document.activeElement?.tagName === "INPUT";
   if (typing && ["signed-out", "denied", "expired", "removed"].includes(s.phase)) return;
-  const chosen = machine();
-  if (s.phase === "approved" && chosen) {
-    if (account.links.machines().some((m) => m.id === chosen.id)) { loadApp(); return; }
-    setMachine(null, { reload: false }); // a machine since gone from the account
+  if (s.phase === "approved") {
+    // The app shows every machine on the account; it opens on the one chosen last, or the first that answers.
+    const machines = account.links.machines();
+    const usable = (m) => m.online && m.link?.state !== "refusing";
+    const chosen = machine();
+    const start = machines.find((m) => m.id === chosen?.id && usable(m)) ?? machines.find(usable);
+    if (start) { setMachine(start.id, { name: start.name }); loadApp(); return; }
+    if (chosen) setMachine(null); // a machine since gone from the account
   }
   shell.textContent = "";
   shell.appendChild(alertBanners(s));
@@ -236,12 +239,15 @@ async function boot() {
   }
   const store = await openPageStore();
   account = new PageAccount({ store, hubUrl: location.origin, hubOrigin: location.origin, name: guessName(), deriveKeys: signInKeysInWorker });
-  setChannelTransport(createPageTransport({ links: account.links, machine, local: account.routes() })); // from here on, words are this page's too
+  // One transport per machine, each fixed to its own: the app shows them all at once. From here on, words are this page's too.
+  const local = account.routes();
+  setChannelTransport({ ...createPageTransport({ links: account.links, machine, local }), forMachine: (m) => createPageTransport({ links: account.links, machine: () => m, local }) });
   account.on("status", (s) => {
     if (appLoaded) { if (s.phase !== "approved") location.reload(); return; }
     render();
   });
   account.on("devices", () => render());
+  account.on("links", () => render());
   await account.start();
   render();
 }

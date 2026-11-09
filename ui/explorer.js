@@ -12,10 +12,11 @@ const parentOf = (p) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "");
 const nameOf = (p) => p.split("/").pop();
 const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 
-export function createExplorer({ api, toast, insert, onClose, isRemote = () => false }) {
+/** `where()`: " on <machine>" while the window shows more than one machine, else "". The tree is that machine's. */
+export function createExplorer({ api, toast, insert, onClose, isRemote = () => false, where = () => "" }) {
   const $ = (s) => document.querySelector(s);
   const tree = $("#tree"), rootLbl = $("#explorerRoot"), filter = $("#explorerFilter");
-  let root = null, loadedRoot = null, selected = null, activePath = null;
+  let root = null, loadedRoot = null, selected = null, activePath = null, epoch = 0;
   const nodes = new Map(); // path → { entry, el, row, kids, loaded, depth }
   const expandedBy = new Map(); // root → Set of open folder paths
   const expanded = () => { if (!expandedBy.has(root)) expandedBy.set(root, new Set()); return expandedBy.get(root); };
@@ -38,8 +39,10 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
 
   // ------------------------------------------------------------------ tree
   async function loadDir(path, container, depth) {
+    const asked = epoch;
     try {
       const { entries } = await api(`/api/fs/list?root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`);
+      if (asked !== epoch) return; // the last machine's folder: not drawn in this one's tree
       // Forget what was drawn under this folder before.
       for (const k of [...nodes.keys()]) if (k !== path && (path === "" || k.startsWith(`${path}/`))) nodes.delete(k);
       container.innerHTML = "";
@@ -48,7 +51,7 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
       // Folders that were open stay open.
       await Promise.all(entries.filter((e) => e.dir && expanded().has(e.path)).map((e) => setOpen(nodes.get(e.path), true)));
       applyFilter(); markActive();
-    } catch (e) { container.innerHTML = ""; container.appendChild(el("div", "empty err", e.message)); }
+    } catch (e) { if (asked !== epoch) return; container.innerHTML = ""; container.appendChild(el("div", "empty err", e.message)); }
   }
   function nodeFor(e, depth) {
     const node = el("div", "node"), row = el("div", "row");
@@ -119,8 +122,9 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
 
   async function setRoot(r) {
     root = r || null;
-    rootLbl.textContent = root || "No working directory";
-    rootLbl.title = root || "";
+    const on = where().replace(/^ on /, "");
+    rootLbl.textContent = `${on ? `${on} · ` : ""}${root || "No working directory"}`;
+    rootLbl.title = root ? `${root}${where()}` : "";
     if (!root) { tree.innerHTML = ""; loadedRoot = null; nodes.clear(); return; }
     if (root === loadedRoot) return;
     loadedRoot = root; nodes.clear(); selected = null;
@@ -211,7 +215,7 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
     e.preventDefault();
     const dest = to ? `${to}/${nameOf(from)}` : nameOf(from);
     if (dest === from || to === from || to.startsWith(`${from}/`)) return;
-    if (!window.confirm(`Move “${showName(nameOf(from))}” into “${showName(to || nameOf(root.replace(/[\\/]+$/, "")) || "the root")}”?`)) return;
+    if (!window.confirm(`Move “${showName(nameOf(from))}” into “${showName(to || nameOf(root.replace(/[\\/]+$/, "")) || "the root")}”${where()}?`)) return;
     await moveTo(from, dest);
   });
 
@@ -290,12 +294,12 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
 
   async function remove(n, { permanent = false } = {}) {
     const what = `${n.entry.dir ? "the folder " : ""}“${showName(n.entry.name)}”${n.entry.dir ? " and everything in it" : ""}`;
-    if (!window.confirm(permanent ? `Permanently delete ${what}? This cannot be undone.` : `Move ${what} to the trash?`)) return;
+    if (!window.confirm(permanent ? `Permanently delete ${what}${where()}? This cannot be undone.` : `Move ${what}${where()} to the trash?`)) return;
     try {
       try { await post("/api/fs/delete", { path: n.entry.path, permanent }); }
       catch (e) {
         if (!e.body?.trashFailed) throw e;
-        if (!window.confirm(`${e.message}.\n\nDelete ${what} permanently instead? This cannot be undone.`)) return;
+        if (!window.confirm(`${e.message}.\n\nDelete ${what}${where()} permanently instead? This cannot be undone.`)) return;
         await post("/api/fs/delete", { path: n.entry.path, permanent: true });
       }
       pane.deleted(root, n.entry.path);
@@ -361,8 +365,18 @@ export function createExplorer({ api, toast, insert, onClose, isRemote = () => f
   $("#explorerRefresh").onclick = refresh;
   $("#explorerClose").onclick = () => onClose?.();
 
+  /** The window went to another machine: nothing of the last one's tree or tabs stays, however alike the paths look. */
+  function switchMachine() {
+    real?.forgetAll();
+    epoch++;
+    root = loadedRoot = selected = activePath = null;
+    nodes.clear(); expandedBy.clear();
+    tree.innerHTML = "";
+    rootLbl.textContent = "";
+  }
+
   return {
-    setRoot, refresh,
+    setRoot, refresh, switchMachine,
     openFile: (path) => pane.open(root, path, { pin: true }),
     closePreview: () => pane.hide(),
     restorePreview: () => pane.restore(),

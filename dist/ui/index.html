@@ -9,9 +9,9 @@
   <link rel="icon" href="/logo-5d3de0fd.svg" type="image/svg+xml" />
   <link rel="alternate icon" href="/icon-32-32f9bd06.png" type="image/png" />
   <link rel="apple-touch-icon" href="/icon-180-a54ed0bc.png" />
-<link rel="stylesheet" href="/styles-2HUJ7G6Z.css" />
-<link rel="modulepreload" href="/chunk-5QLGFVZS.js" />
-<link rel="modulepreload" href="/chunk-6RB5GD6N.js" />
+<link rel="stylesheet" href="/styles-ZTX2W4VC.css" />
+<link rel="modulepreload" href="/chunk-DVXKFE47.js" />
+<link rel="modulepreload" href="/chunk-4PDXQ3AT.js" />
 <link rel="modulepreload" href="/chunk-H2NR6FFW.js" />
 <link rel="modulepreload" href="/chunk-VYHOQXZE.js" />
 </head>
@@ -73,6 +73,10 @@
         <h1 class="hero">What should we work on?</h1>
         <p class="hero-sub">OpenCode runs here, in the folder you pick. Every chat on this machine lives in the history drawer.</p>
         <div id="homeComposer"></div>
+        <div class="cwd-row" id="homeMachineRow" hidden>
+          <span>Machine</span>
+          <select id="homeMachine" aria-label="The machine the new chat runs on"></select>
+        </div>
         <div class="cwd-row">
           <span>Working directory</span>
           <input id="homeCwd" spellcheck="false" />
@@ -107,6 +111,7 @@
   <div class="ptab-body active" id="tab-chats">
     <button class="side-btn" id="btnNewChat"><span class="plus"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></span> New chat</button>
     <input id="sessionFilter" type="search" placeholder="Search chats" />
+    <div class="chips mach-filter" id="machineFilter" hidden></div>
     <div id="history"></div>
     <div class="side-foot"><div class="lan" id="lanInfo"></div></div>
   </div>
@@ -183,7 +188,7 @@
         <span class="dlg-sub" id="subMcp" hidden>Tool servers OpenCode connects to. Each tool shows up as &lt;server&gt;_&lt;tool&gt;. Saving reloads OpenCode so it connects.</span>
         <span class="dlg-sub" id="subRemote" hidden>Use Omni from another device or network. Remote browsers sign in with this password and see everything read-only; each message or change they send waits for your Approve here.</span>
         <span class="dlg-sub" id="subAccount" hidden>This computer's account: sign in, your devices, recovery, and what other devices did here. Signing in is optional; without it Omni works on this computer as usual.</span>
-        <span class="dlg-sub machine-note" id="settingsMachine" hidden></span>
+        <label class="dlg-sub machine-note" id="settingsMachine" hidden><span id="settingsMachineText">Settings for</span> <select id="settingsMachineSel" aria-label="The machine these settings are for"></select></label>
         <span class="dlg-sub" id="subLong" hidden>How Omni keeps long, unattended runs going: when a growing chat is compacted, and what happens when a model stops early because it thinks its context is full. A new compaction size applies from each chat's next prompt.</span>
       </div>
       <button class="icon-btn" id="settingsClose" title="Close"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
@@ -257,6 +262,6 @@
 <div id="accountCards" hidden></div>
 <div id="accountGate" class="modal acct-gate" hidden><div class="dialog acct-gate-box" id="accountGateBox" role="alertdialog" aria-label="Save your recovery code"></div></div>
 <div id="toasts"></div>
-<script type="module" src="/app-4G42XXGK.js"></script>
+<script type="module" src="/app-M753R4KN.js"></script>
 </body>
 </html>

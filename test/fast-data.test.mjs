@@ -261,7 +261,8 @@ test("nothing visible waits for the model list, the memory notes or the graph li
   const init = app.slice(app.indexOf("async function init()"));
   assert.doesNotMatch(init, /await Promise\.all\(\[[^\]]*loadPiChoices/, "the first screen does not wait for the models");
   assert.doesNotMatch(init, /loadMemory|loadGraphList/, "a closed drawer's data is its own to load");
-  assert.match(init, /\/api\/state\?first=1/);
+  assert.match(app.slice(app.indexOf("function loadFirst(")), /\/api\/state\?first=1/);
+  assert.match(init, /await loadFirst\(focusKey\)/, "the first screen is the focused machine's first state");
   assert.ok(init.indexOf('showView(') < init.indexOf("afterFirstPaint"), "the screen first");
   assert.match(read("panel.js"), /if \(name === "memory"\) loadMemory/, "the drawer loads its own");
   assert.match(app, /\/history\?page=\$\{HISTORY_PAGE\}/);

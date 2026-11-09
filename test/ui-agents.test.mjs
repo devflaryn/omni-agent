@@ -86,10 +86,20 @@ test("the history drawer renders agent chats indented under their parent with a 
   ]) S.sessions.set(s.sid, s);
   // claude:k carries no parentSid itself; the agent registry knows it.
   const recs = { "claude:k": { id: "a-0000000b", kind: "claude", parentSid: "pi:parent", title: "Refactor the store" }, "pi:child": { id: "a-0000000a", kind: "pi", parentSid: "pi:parent", title: "Find the flaky test" } };
+  const { machineList, sidebarGroups, newWorkspace, HERE } = await import("../ui/machines.js");
+  const ws = Object.assign(newWorkspace(), { sessions: S.sessions, loaded: true, allChats: true });
+  const machines = machineList({ here: { name: "Desk" }, machines: [] });
+  const agentFor = (_ws, sid) => recs[sid] || null;
   withDom({ "#history": wrap, "#sessionFilter": filter, "#btnNewChat": btn }, () => {
-    const h = createHistory({ S, onSelect: () => {}, onNew: () => {}, onDelete: () => {}, agentFor: (sid) => recs[sid] || null });
+    const h = createHistory({
+      machines: () => machines,
+      groups: (f, only) => sidebarGroups({ machines, workspaces: new Map([[HERE, ws]]), filter: f, only, titleOf: (w, s) => agentFor(w, s.sid)?.title || s.title || "" }),
+      selected: () => ({ key: HERE, sid: S.selected }),
+      onSelect: () => {}, onNew: () => {}, onDelete: () => {}, onRetry: () => {}, onMore: () => {}, agentFor,
+    });
     h.render();
   });
+  assert.equal(wrap.children.filter(hasClass("hist-machine")).length, 0, "one machine: no machine headers, as before accounts");
   const rows = wrap.children.filter(hasClass("hist-row"));
   const label = (r) => r.find(hasClass("hist"));
   assert.deepEqual(rows.map((r) => label(r).text), ["Orphan agent", "Plain chat", "Parent chat", "Find the flaky test", "Refactor the store"], "children follow the parent; the agent's own title wins");
@@ -104,6 +114,43 @@ test("the history drawer renders agent chats indented under their parent with a 
   assert.equal(tagOf(plain), "in Omni");
   assert.ok(hasClass("active")(child), "the selected agent chat is highlighted");
   assert.equal(wrap.children.filter(hasClass("hist-group")).length, 1, "one day group: children never open a group of their own");
+});
+
+test("with several machines the drawer has one group per machine, this computer first, and the open chat is the one on its machine", async () => {
+  const { createHistory } = await import("../ui/sidebar.js");
+  const { machineList, sidebarGroups, newWorkspace, HERE } = await import("../ui/machines.js");
+  const wrap = new FakeEl("div"), filter = new FakeEl("input"), btn = new FakeEl("button"), chips = new FakeEl("div");
+  filter.value = "";
+  const now = Date.now();
+  const machines = machineList({ here: { name: "Desk" }, machines: [
+    { id: "bbbbbbXX", name: "Studio", online: true, link: { state: "open" } },
+    { id: "ccccccYY", name: "Laptop", online: false, link: { state: "offline" } },
+  ] });
+  const here = Object.assign(newWorkspace(), { loaded: true, allChats: true });
+  const studio = Object.assign(newWorkspace(), { loaded: true, allChats: false });
+  here.sessions.set("pi:s", { sid: "pi:s", harness: "pi", title: "Here chat", lastActivity: now });
+  studio.sessions.set("pi:s", { sid: "pi:s", harness: "pi", title: "Studio chat", lastActivity: now });
+  const W = new Map([[HERE, here], ["bbbbbbXX", studio], ["ccccccYY", newWorkspace()]]);
+  const picked = [];
+  withDom({ "#history": wrap, "#sessionFilter": filter, "#btnNewChat": btn, "#machineFilter": chips }, () => {
+    const h = createHistory({
+      machines: () => machines,
+      groups: (f, only) => sidebarGroups({ machines, workspaces: W, filter: f, only }),
+      selected: () => ({ key: "bbbbbbXX", sid: "pi:s" }),
+      onSelect: (key, sid) => picked.push([key, sid]), onNew: () => {}, onDelete: () => {}, onRetry: () => {}, onMore: () => {},
+    });
+    h.render();
+  });
+  const heads = wrap.children.filter(hasClass("hist-machine"));
+  assert.deepEqual(heads.map((x) => x.dataset.machine), [HERE, "bbbbbbXX", "ccccccYY"]);
+  assert.match(heads[2].textContent, /Laptop.*offline/);
+  const buttons = wrap.findAll(hasClass("hist"));
+  assert.deepEqual(buttons.map((b) => `${b.dataset.machine}:${b.text}`), [`${HERE}:Here chat`, "bbbbbbXX:Studio chat"]);
+  assert.ok(!hasClass("active")(buttons[0]) && hasClass("active")(buttons[1]), "the same sid on this computer is not the open one");
+  buttons[1].onclick();
+  assert.deepEqual(picked, [["bbbbbbXX", "pi:s"]]);
+  assert.ok(wrap.findAll(hasClass("hist-more")).some((b) => /Older chats on Studio/.test(b.text)), "a machine not yet listed in full offers the rest, by name");
+  assert.equal(chips.hidden, false, "the drawer can show one machine alone");
 });
 
 // -------------------------------------------------------------------- strip
