@@ -22,6 +22,9 @@
 //     wrong-credentials  password.change: the current loginKey is wrong
 //     locked             password.change: too many failures, as for login
 //     conflict           password.change: another device changed the password first
+//     too-many-devices   log.append: the account is at its limit of devices. A recovery is never refused for this
+//     log-full           log.append: the account's log is at its limit of entries. A recovery is never refused for this
+//     too-many-invites   invite.create: at the limit of live invites
 //     internal           the hub could not save; nothing changed
 // - Close codes: 4401 no valid token or proof, or a timeout; 4403 no longer on the log; 4408 pending expired;
 //   4409 replaced by a newer socket or sign-in of this device; 4410 denied by a device on the account;
@@ -52,6 +55,13 @@ const DEFAULT_LIMITS = Object.freeze({
   maxConcurrentHashes: 8,              // each scrypt holds 16 MiB and a worker thread
   maxBodyBytes: 16 * KIB,
   maxAccounts: 1000,
+  maxSignupsPerAddress: 10,            // attempts to use an invite, right code or wrong, per address
+  signupWindowMs: 60 * MINUTE,
+  inviteLifetimeMs: 14 * DAY,
+  inviteKeptMs: 30 * DAY,              // how long a used or expired invite stays on the owner's list
+  maxLiveInvites: 20,
+  maxDevicesPerAccount: 24,            // with maxPending, below maxSocketsPerAccount: every device can be online and still approve
+  maxLogEntries: 1024,                 // adding and removing devices must not grow accounts.json without end
   maxPending: 5,                       // sign-ins not yet settled, per account
   pendingLifetimeMs: 10 * MINUTE,
   sessionLifetimeMs: 180 * DAY,        // rolling: renewed each time a device connects
@@ -80,6 +90,10 @@ const SALT_BYTES = 16;
 const KEY_BYTES = 32;
 const MAX_EMAIL = 254, MAX_NAME = 128, MAX_KIND = 32;
 const MIN_BOOTSTRAP_TOKEN = 16, MAX_BOOTSTRAP_TOKEN = 256;
+const MAX_INVITE_CODE = 64;
+// No 0/O or 1/I/L: a code gets read out over a phone. 16 of these 31 letters are over 79 bits, so it needs no slow hash.
+const INVITE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+const INVITE_LENGTH = 16;
 
 // The login verifier. loginKey is already the output of a slow scrypt on the client.
 const VERIFIER_SCRYPT = { N: 2 ** 14, r: 8, p: 1 };
@@ -117,6 +131,23 @@ const sha256 = (text) => createHash("sha256").update(text).digest();
 const deriveVerifier = (loginKey, salt) => new Promise((resolve, reject) => {
   scrypt(loginKey, salt, VERIFIER_BYTES, VERIFIER_SCRYPT, (error, hash) => (error ? reject(error) : resolve(hash)));
 });
+
+function newInviteCode() {
+  let code = "";
+  while (code.length < INVITE_LENGTH) {
+    for (const byte of randomBytes(INVITE_LENGTH * 2)) {
+      // Taken only from whole multiples of the alphabet's size, so that no letter comes up more often.
+      if (byte < 248 && code.length < INVITE_LENGTH) code += INVITE_ALPHABET[byte % INVITE_ALPHABET.length];
+    }
+  }
+  return code;
+}
+
+const groupInviteCode = (code) => code.replace(/(.{4})(?=.)/g, "$1-");
+
+/** What was typed, as it is hashed: any case, with or without spaces and dashes. */
+const bareInviteCode = (value) => value.toUpperCase().replace(/[\s-]/g, "");
+const inviteHash = (bare) => createHash("sha256").update(bare).digest("base64");
 
 function cleanEmail(value) {
   if (typeof value !== "string") throw new HttpError(400, "bad-email");
@@ -175,12 +206,12 @@ class FailureLog {
 /**
  * Starts a hub. Options: port, dataDir, tls ({cert, key}, without it the hub only listens on loopback), host, origin
  * (the hub's own browser origin, also bound into every proof), origins (more exact origins allowed to connect, for the
- * iPhone app), webRoot (the folder of the web page's files, ui/ by default), bootstrapToken (opens the first registration, once), allowSignup (opens later registrations), hstsMaxAge
+ * iPhone app), webRoot (the folder of the web page's files, ui/ by default), bootstrapToken (opens the first registration, once), hstsMaxAge
  * (seconds of Strict-Transport-Security, TLS only, off by default: a browser applies it to every port of the name, so
  * it also turns plain sites on other ports of that name into failures), now, log(line), sweepMs, limits (overrides of DEFAULT_LIMITS).
  * Rejects with a StoreError if the data dir is damaged.
  */
-export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, origins = [], webRoot, bootstrapToken = null, allowSignup = false, hstsMaxAge = null, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
+export async function startHub({ port = 0, dataDir, tls = null, host, origin = null, origins = [], webRoot, bootstrapToken = null, hstsMaxAge = null, now = Date.now, log = (line) => console.error(line), sweepMs = SWEEP_MS, limits: limitOverrides = {} }) {
   const limits = { ...DEFAULT_LIMITS, ...limitOverrides };
   if (bootstrapToken !== null && (typeof bootstrapToken !== "string" || bootstrapToken.length < MIN_BOOTSTRAP_TOKEN || bootstrapToken.length > MAX_BOOTSTRAP_TOKEN)) {
     throw new Error(`hub: bootstrapToken must be text of ${MIN_BOOTSTRAP_TOKEN} to ${MAX_BOOTSTRAP_TOKEN} characters`);
@@ -195,6 +226,7 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   const allowedOrigins = new Set([origin, ...origins].filter((value) => value !== null));
   const proofText = (domain, nonce) => new TextEncoder().encode(`${domain} ${origin ?? ""} ${nonce}`);
   const failures = new FailureLog(limits, now);
+  const signups = new FailureLog({ loginFailureWindowMs: limits.signupWindowMs, maxTrackedFailures: limits.maxTrackedFailures }, now);
   const dummyVerifier = { salt: randomBytes(16).toString("base64"), hash: randomBytes(VERIFIER_BYTES).toString("base64") };
 
   /** Per account: the verified log and the sockets of its devices, by signPub. Never crosses to another account. */
@@ -346,10 +378,24 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     }
   }
 
+  /** Past use and past keeping. A failed write leaves them for the next sweep: nothing depends on them being gone. */
+  function sweepInvites() {
+    const settledAt = (invite) => invite.usedAt ?? invite.expiresAt;
+    const gone = [...store.invites.values()].filter((invite) => settledAt(invite) + limits.inviteKeptMs <= now()).map((invite) => invite.hash);
+    if (gone.length === 0) return;
+    try {
+      store.deleteInvites(gone);
+    } catch (error) {
+      log(`hub: could not drop old invites: ${error.code ?? error.name}`);
+    }
+  }
+
   async function sweep() {
     sweepSessions();
     for (const accountId of store.accounts.keys()) await refreshTrust(accountId);
     failures.prune();
+    signups.prune();
+    sweepInvites();
   }
 
   // Before anything is served: every stored log must verify, and sessions must agree with it.
@@ -380,14 +426,33 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     const email = cleanEmail(body.email);
     if (!isB64Of(body.salt, SALT_BYTES)) throw new HttpError(400, "bad-salt");
     if (!isB64Of(body.verifierInput, KEY_BYTES)) throw new HttpError(400, "bad-verifier");
-    // A fresh hub is open only to whoever holds the token. Otherwise the first stranger to find it would own it.
-    const closed = () => (store.accounts.size === 0 ? !bootstrapMatches(body.bootstrapToken) : !allowSignup || store.accounts.size >= limits.maxAccounts);
     // Sign-in's counter for this address. A closed hub counts too, or the lock would show which hubs are still fresh.
     const addressKey = `ip ${ip}`;
     if (failures.locked(addressKey, limits.maxAddressFailures)) throw new HttpError(429, "locked");
-    if (closed()) {
+    const first = store.accounts.size === 0;
+    // Someone holding a code is told about their code. Everyone else hears only that this hub is closed.
+    const offered = !first && typeof body.inviteCode === "string" && body.inviteCode.length <= MAX_INVITE_CODE ? bareInviteCode(body.inviteCode) : null;
+    const signupKey = `signup ${ip}`;
+    if (offered !== null) {
+      if (signups.locked(signupKey, limits.maxSignupsPerAddress)) throw new HttpError(429, "too-many-signups");
+      signups.add(signupKey); // counted before anything slow, so a burst of tries cannot all get in first
+    }
+    const usableInvite = () => {
+      const invite = offered === null ? undefined : store.invites.get(inviteHash(offered));
+      return invite && invite.usedAt === null && invite.expiresAt > now() ? invite : null;
+    };
+    // A fresh hub is open only to whoever holds the token, or the first stranger to find it would own it. After that, each
+    // new account needs an invite from the owner.
+    const refusal = () => {
+      if (store.accounts.size === 0) return bootstrapMatches(body.bootstrapToken) ? null : "registration-closed";
+      if (store.accounts.size >= limits.maxAccounts) return "registration-closed";
+      if (offered === null) return "registration-closed";
+      return usableInvite() ? null : "bad-invite";
+    };
+    const refused = refusal();
+    if (refused) {
       failures.add(addressKey);
-      throw new HttpError(403, "registration-closed");
+      throw new HttpError(403, refused);
     }
     const entries = [body.firstLogEntry];
     let trust;
@@ -405,17 +470,28 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     } finally {
       hashesRunning--;
     }
-    // Checked again here, with no await before the write: several requests can have been waiting at once.
-    if (closed()) throw new HttpError(403, "registration-closed");
+    // Checked again here, with no await before the write: several requests can have been waiting at once, and a code is good once.
+    const late = refusal();
+    if (late) throw new HttpError(403, late);
     if (store.byEmail.has(email) || store.accounts.has(trust.accountId)) throw new HttpError(409, "already-registered");
-    store.putAccount({ id: trust.accountId, email, salt: body.salt, verifier: { salt: salt.toString("base64"), hash: hash.toString("base64") }, log: entries });
+    const invite = first ? null : usableInvite();
+    // Spent first: a crash between the two costs a code, and the other way round would let a code be used twice.
+    if (invite) store.putInvite({ ...invite, usedAt: now() });
+    try {
+      store.putAccount({ id: trust.accountId, email, salt: body.salt, verifier: { salt: salt.toString("base64"), hash: hash.toString("base64") }, log: entries, ...(first ? { owner: true } : {}) });
+    } catch (error) {
+      if (invite) store.putInvite(invite);
+      throw error;
+    }
     const entry = liveOf(trust.accountId);
     entry.trust = trust;
     entry.trustAt = now();
-    try {
-      store.clearBootstrap();
-    } catch (error) {
-      log(`hub: could not delete the bootstrap token: ${error.code ?? error.name}`); // it opens nothing now an account exists
+    if (first) {
+      try {
+        store.clearBootstrap();
+      } catch (error) {
+        log(`hub: could not delete the bootstrap token: ${error.code ?? error.name}`); // it opens nothing now an account exists
+      }
     }
     return { status: 201, body: { ok: true } };
   }
@@ -748,6 +824,11 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     if (prevHead !== state.trust.head) return sendTo(conn, { type: "log.conflict", ...currentLog(accountId) });
     const refusal = refusalBeforeReplay(entry, state.trust);
     if (refusal) return sendTo(conn, { type: "error", code: "invalid-entry", for: "log.append", reason: refusal });
+    // Limits on one account's share of this hub. Recovery goes through them: it is the last way back in.
+    if (entry.type !== "recover") {
+      if (store.accounts.get(accountId).log.length >= limits.maxLogEntries) return sendTo(conn, { type: "error", code: "log-full", for: "log.append" });
+      if (entry.type === "add" && state.trust.devices.size >= limits.maxDevicesPerAccount) return sendTo(conn, { type: "error", code: "too-many-devices", for: "log.append" });
+    }
 
     const account = store.accounts.get(accountId);
     const entries = [...account.log, entry];
@@ -865,6 +946,48 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     sendTo(conn, { type: "password.changed" });
   }
 
+  // --- invites: only a full device of the first account. That session has proved its key, and the key is on a log it cannot forge ---
+
+  const ownerDevice = (conn, session) => conn.accountId === store.ownerId && isFullSession(conn.accountId, session);
+
+  const inviteState = (invite) => (invite.usedAt !== null ? "used" : invite.expiresAt <= now() ? "expired" : "live");
+
+  function inviteList(conn, session) {
+    if (!ownerDevice(conn, session)) return forbidden(conn, "invite.list");
+    const invites = [...store.invites.values()].map((i) => ({ id: i.id, createdAt: i.createdAt, expiresAt: i.expiresAt, state: inviteState(i) }));
+    sendTo(conn, { type: "invite.list", invites });
+  }
+
+  function inviteCreate(conn, session) {
+    if (!ownerDevice(conn, session)) return forbidden(conn, "invite.create");
+    const live = [...store.invites.values()].filter((i) => inviteState(i) === "live").length;
+    if (live >= limits.maxLiveInvites) return sendTo(conn, { type: "error", code: "too-many-invites", for: "invite.create" });
+    const code = newInviteCode();
+    const invite = { id: randomBytes(12).toString("base64url"), hash: inviteHash(code), createdBy: conn.accountId, createdAt: now(), expiresAt: now() + limits.inviteLifetimeMs, usedAt: null };
+    try {
+      store.putInvite(invite);
+    } catch (error) {
+      log(`hub: could not save an invite: ${error.code ?? error.name}`);
+      return sendTo(conn, { type: "error", code: "internal", for: "invite.create" });
+    }
+    // The only time the code exists outside the person's hands.
+    sendTo(conn, { type: "invite.created", id: invite.id, code: groupInviteCode(code), createdAt: invite.createdAt, expiresAt: invite.expiresAt });
+  }
+
+  function inviteRevoke(conn, session, { id }) {
+    if (!ownerDevice(conn, session)) return forbidden(conn, "invite.revoke");
+    if (typeof id !== "string") return sendTo(conn, { type: "error", code: "bad-message", for: "invite.revoke" });
+    const invite = [...store.invites.values()].find((i) => i.id === id);
+    if (!invite) return sendTo(conn, { type: "error", code: "not-found", for: "invite.revoke" });
+    try {
+      store.deleteInvites([invite.hash]);
+    } catch (error) {
+      log(`hub: could not revoke an invite: ${error.code ?? error.name}`);
+      return sendTo(conn, { type: "error", code: "internal", for: "invite.revoke" });
+    }
+    sendTo(conn, { type: "invite.revoked", id });
+  }
+
   const COMMANDS = new Map([
     ["log.get", logGet],
     ["log.append", logAppend],
@@ -874,6 +997,9 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
     ["channel.msg", channelMsg],
     ["pending.deny", pendingDeny],
     ["password.change", passwordChange],
+    ["invite.create", inviteCreate],
+    ["invite.list", inviteList],
+    ["invite.revoke", inviteRevoke],
   ]);
 
   // --- the listener ---
@@ -927,6 +1053,12 @@ export async function startHub({ port = 0, dataDir, tls = null, host, origin = n
   return {
     port: address.port,
     address: address.address,
+    /** Only for what runs in this process, such as a test: no route reaches it. Returns a new code. */
+    mintInvite() {
+      const code = newInviteCode();
+      store.putInvite({ id: randomBytes(12).toString("base64url"), hash: inviteHash(code), createdBy: store.ownerId ?? "none", createdAt: now(), expiresAt: now() + limits.inviteLifetimeMs, usedAt: null });
+      return groupInviteCode(code);
+    },
     async close() {
       clearInterval(sweeper);
       for (const conn of [...conns]) {
@@ -952,7 +1084,6 @@ async function main() {
     origin: env.OMNI_HUB_ORIGIN ?? null,
     origins: (env.OMNI_HUB_EXTRA_ORIGINS ?? "").split(",").map((entry) => entry.trim()).filter(Boolean),
     bootstrapToken: env.OMNI_HUB_BOOTSTRAP_TOKEN || null,
-    allowSignup: env.OMNI_HUB_ALLOW_SIGNUP === "1",
     hstsMaxAge: env.OMNI_HUB_HSTS_MAX_AGE ? Number(env.OMNI_HUB_HSTS_MAX_AGE) : null,
     tls,
   });
