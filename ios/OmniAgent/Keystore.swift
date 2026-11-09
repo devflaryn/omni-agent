@@ -71,6 +71,12 @@ struct Keychain: SecretStore {
         guard status == errSecSuccess else { throw KeystoreError.keychain(status) }
     }
 
+    /// Every item under this service.
+    func deleteAll() throws {
+        let status = SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service] as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw KeystoreError.keychain(status) }
+    }
+
     func delete(_ name: String) throws {
         let status = SecItemDelete(query(name) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { throw KeystoreError.keychain(status) }

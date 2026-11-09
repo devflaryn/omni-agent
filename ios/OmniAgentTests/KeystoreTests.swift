@@ -230,6 +230,19 @@ final class KeychainTests: XCTestCase {
         try keychain.delete("log")
     }
 
+    func testDeleteAllTakesThisServiceOnly() throws {
+        let other = Keychain(service: "\(keychain.service).other")
+        defer { try? other.deleteAll() }
+        try keychain.write("keys", "a")
+        try keychain.write("log", "b")
+        try other.write("keys", "kept")
+        try keychain.deleteAll()
+        XCTAssertNil(try keychain.read("keys"))
+        XCTAssertNil(try keychain.read("log"))
+        XCTAssertEqual(try other.read("keys"), "kept")
+        try keychain.deleteAll()
+    }
+
     func testThisDeviceOnlyAndNeverSynced() throws {
         try keychain.write("state", "{}")
         let ask: [String: Any] = [

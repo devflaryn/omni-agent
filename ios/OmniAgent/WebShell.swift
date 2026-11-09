@@ -78,7 +78,15 @@ final class Shell: NSObject, WKNavigationDelegate, WKUIDelegate {
     #endif
 
     override init() {
-        keystore = KeystoreBridge(store: Keychain(service: "tech.tomcamp.omniagent.keystore"))
+        // A debug build talks to test hubs, so it keeps its own items: a release build never starts from a test hub's keys.
+        #if DEBUG
+        let service = "tech.tomcamp.omniagent.keys.debug"
+        #else
+        let service = "tech.tomcamp.omniagent.keys"
+        #endif
+        // The name the first test builds used (2026-11-10), for test hubs only. Nothing real was ever kept under it.
+        try? Keychain(service: "tech.tomcamp.omniagent.keystore").deleteAll()
+        keystore = KeystoreBridge(store: Keychain(service: service))
         #if DEBUG
         net = HubLink(hub: hub, testCA: Hub.testCA)
         #else
