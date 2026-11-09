@@ -38,7 +38,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/app"
 
 echo "== compiling the shell ($("$SWIFTC" --version 2>/dev/null | head -1))"
 for arch in arm64 x86_64; do
-  "$SWIFTC" -O -swift-version 5 -sdk "$SDK" -target "$arch-apple-macos12.0" -framework AppKit -framework WebKit \
+  "$SWIFTC" -O -swift-version 5 -sdk "$SDK" -target "$arch-apple-macos13.0" -framework AppKit -framework WebKit \
     -o "$STAGE/shell-$arch" "$SRC/mac/OmniAgent.swift"
 done
 lipo -create -output "$APP/Contents/MacOS/$NAME" "$STAGE/shell-arm64" "$STAGE/shell-x86_64"

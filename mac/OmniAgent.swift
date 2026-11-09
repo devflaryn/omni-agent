@@ -93,12 +93,12 @@ final class Server {
         guard pipe(&inPipe) == 0, pipe(&outPipe) == 0 else { throw NSError(domain: "omni", code: 1, userInfo: [NSLocalizedDescriptionKey: "pipe() failed"]) }
         let logFD = open(logURL.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
 
-        var actions: posix_spawn_file_actions_t = nil
+        var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         posix_spawn_file_actions_adddup2(&actions, inPipe[0], 0)
         posix_spawn_file_actions_adddup2(&actions, outPipe[1], 1)
         posix_spawn_file_actions_adddup2(&actions, logFD >= 0 ? logFD : outPipe[1], 2)
-        var attr: posix_spawnattr_t = nil
+        var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         // Its own process group, so whatever it leaves behind can be found and stopped; and no other descriptor of ours leaks in.
         posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
@@ -122,7 +122,7 @@ final class Server {
         }
         pid = child
         stdinWrite = inPipe[1]
-        fcntl(stdinWrite, F_SETFD, FD_CLOEXEC)
+        _ = fcntl(stdinWrite, F_SETFD, FD_CLOEXEC)
 
         let out = FileHandle(fileDescriptor: outPipe[0], closeOnDealloc: true)
         out.readabilityHandler = { [weak self] h in
