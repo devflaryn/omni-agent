@@ -133,8 +133,12 @@ case "$MODE" in
     mac bash -s <<EOF
 set -uo pipefail
 $ENVS
-runtime=\$(xcrun simctl list runtimes available | grep -o 'com.apple.CoreSimulator.SimRuntime.iOS-[0-9-]*' | tail -1)
-U=\$(xcrun simctl create omni-unit-tests com.apple.CoreSimulator.SimDeviceType.iPhone-17 "\$runtime")
+# The newest iOS runtime that has an iPhone 17 (not every runtime has every model).
+U=""
+for runtime in \$(xcrun simctl list runtimes available | grep -o 'com.apple.CoreSimulator.SimRuntime.iOS-[0-9-]*' | sort -r); do
+  U=\$(xcrun simctl create omni-unit-tests com.apple.CoreSimulator.SimDeviceType.iPhone-17 "\$runtime" 2>/dev/null) && break
+done
+[ -n "\$U" ] || { echo "no simulator runtime has an iPhone 17" >&2; exit 1; }
 trap 'xcrun simctl shutdown \$U >/dev/null 2>&1 || true; xcrun simctl delete \$U' EXIT
 $BUILD -configuration Debug -destination "id=\$U" test > build-test.log 2>&1 && ok=0 || ok=\$?
 grep -E "Test Case .*(passed|failed)|error:|Executed" build-test.log | sed 's/^.*Test Case/Test Case/' | sort -u | tail -40
