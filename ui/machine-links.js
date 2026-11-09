@@ -16,6 +16,10 @@
 import { Emitter } from "./emitter.js";
 import { channelClient } from "./channel-client.js";
 import { cleanName } from "./transport.js";
+import { CLOSE_REASONS } from "./channel-frames.js";
+
+/** A machine that turned web pages away: not broken, and not worth asking until it changes its mind. */
+const refusedWebPages = (error) => error?.code === "channel-refused" && error.message === CLOSE_REASONS["web-access-off"];
 
 const SECOND = 1000;
 const DEFAULTS = Object.freeze({
@@ -72,7 +76,7 @@ export class MachineLinks extends Emitter {
   #linkView(device) {
     const link = this.#links.get(device.id);
     const state = link?.state ?? "idle";
-    const shown = !device.online && state === "idle" ? "offline" : state;
+    const shown = !device.online && state === "idle" ? "offline" : state === "idle" && link?.refusing ? "refusing" : state;
     return { state: shown, lastError: link?.lastError ?? null };
   }
 
@@ -129,6 +133,7 @@ export class MachineLinks extends Emitter {
       link.client = this.makeClient(channel, { onHeard: () => this.#heard(link, channel) });
       link.state = "open";
       link.lastError = null;
+      link.refusing = false;
       link.tick = setInterval(() => this.#watch(link, channel), Math.min(SECOND, this.options.pingEveryMs));
       link.tick.unref?.();
       channel.once("close", (reason) => this.#gone(link, channel, reason));
@@ -137,6 +142,7 @@ export class MachineLinks extends Emitter {
     } catch (error) {
       link.state = "idle";
       link.lastError = error.message;
+      link.refusing = refusedWebPages(error);
       this.#changed();
       throw error;
     }
@@ -183,6 +189,7 @@ export class MachineLinks extends Emitter {
     link.client = null;
     link.state = "idle";
     link.lastError = String(reason ?? "the channel closed");
+    link.refusing = link.lastError === CLOSE_REASONS["web-access-off"]; // turned off while this page was using it
     this.#changed();
   }
 
@@ -200,6 +207,7 @@ export class MachineLinks extends Emitter {
     try {
       client = link.client ?? await deadline(link.opening ??= this.#connect(link).finally(() => { link.opening = null; }), left(), `${name} did not finish connecting`);
     } catch (error) {
+      if (refusedWebPages(error)) throw new MachineError(403, "machine-refusing", `${name} does not let web pages in: Allow web page access is off on ${name}. Nothing was sent to it.`, { id, name });
       if (DIFFERENT_VERSION.test(error.message)) throw new MachineError(502, "machine-version", `${name} runs a different version of Omni. Update Omni on ${name} and on ${this.selfName}. Nothing was sent to it.`, { id, name });
       throw new MachineError(504, "machine-unreachable", `Could not reach ${name}: ${error.message}. Nothing was sent to it.`, { id, name });
     }

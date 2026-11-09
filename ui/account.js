@@ -237,7 +237,11 @@ export function explain(e) {
   return e.message;
 }
 
-export function createAccount({ toast, openSettings }) {
+/**
+ * `choose(id, name)` takes the window to a machine (null: this computer), and says whether it went; `onMachines(list, status)`
+ * hears every change to the account's machines; `retry()` loads the focused machine again after it failed.
+ */
+export function createAccount({ toast, openSettings, choose = (id, name) => setMachine(id, { name }), onMachines = () => {}, retry = () => {} }) {
   const $ = (s) => document.querySelector(s);
   const A = {
     available: null, why: "", status: null, pending: [], machines: [],
@@ -316,17 +320,16 @@ export function createAccount({ toast, openSettings }) {
   function checkChosenMachine() {
     const m = machine();
     if (!m) return;
+    if (webPage()) return; // a page has no computer to come back to: its list says which machines are there
     const signedOut = !A.available || !A.status || A.status.phase !== "approved";
     const known = A.machines.find((x) => x.id === m.id);
     if (signedOut || !known) {
-      try { sessionStorage.setItem(NOTICE_KEY, deviceWords(`This window was on ${m.name}, which ${signedOut ? "this computer can no longer reach without signing in" : "is no longer on the account"}. It is back on this computer.`)); } catch { /* */ }
-      setMachine(null, { whenClean: true });
-      return;
+      if (choose(null, null, { whenClean: true })) toast(deviceWords(`This window was on ${m.name}, which ${signedOut ? "this computer can no longer reach without signing in" : "is no longer on the account"}. It is back on this computer.`), true);
     }
-    if (known.name !== m.name) { setMachine(m.id, { name: known.name }); renderMachine(); }
   }
 
   function renderAll() {
+    onMachines(A.available && A.status?.phase === "approved" ? A.machines : [], A.status);
     renderMachine();
     renderBanners();
     renderCards();
@@ -447,34 +450,35 @@ export function createAccount({ toast, openSettings }) {
     wrap.hidden = !m && !usable;
     if (m) {
       name.textContent = `On ${m.name}`;
-      btn.title = deviceWords(`Everything in this window, chats and commands included, runs on ${m.name} (${shortId(m.id)}), not on this computer.`);
+      btn.title = deviceWords(`What you see and send here runs on ${m.name} (${shortId(m.id)})${webPage() ? "" : ", not on this computer"}. Choose another machine to start a chat there.`);
       $("#machineId").textContent = shortId(m.id);
       $("#machineId").hidden = false;
     } else {
       name.textContent = here();
-      btn.title = "Choose which of your machines this window acts on";
+      btn.title = "Choose a machine to start a chat on";
       $("#machineId").hidden = true;
     }
-    $("#machineBack").hidden = !m;
+    $("#machineBack").hidden = !m || webPage();
     $("#machineBack").textContent = backText();
     if (!$("#machineMenu").hidden) renderMachineMenu();
-    const sub = $("#settingsMachine");
-    if (sub) { sub.hidden = !m; sub.textContent = !m ? "" : webPage() ? `Models, MCP servers and Long runs here are ${m.name}'s. Account is this page's.` : `Models, MCP servers and Long runs here are ${m.name}'s. Account and Remote are always this computer's.`; }
   }
 
   function renderMachineMenu() {
     const menu = $("#machineMenu"), m = machine();
     menu.textContent = "";
-    const local_ = el("button", m ? "" : "on", here());
-    local_.onclick = () => { menu.hidden = true; setMachine(null); };
-    menu.appendChild(local_);
-    if (A.machines.length) menu.appendChild(el("div", "mh", "Your other machines"));
+    if (!webPage()) {
+      const local_ = el("button", m ? "" : "on", here());
+      local_.onclick = () => { menu.hidden = true; choose(null, null); };
+      menu.appendChild(local_);
+    }
+    if (A.machines.length) menu.appendChild(el("div", "mh", webPage() ? "Start a chat on" : "Your other machines"));
     for (const x of A.machines) {
+      const refusing = x.link?.state === "refusing";
       const row = el("button", `machine-row${m?.id === x.id ? " on" : ""}`);
-      row.append(el("span", `machine-dot${x.online ? " live" : ""}`), el("span", "machine-row-name", x.name), el("span", "machine-row-id", shortId(x.id)), el("span", "machine-row-state", x.online ? "" : "offline"));
-      row.disabled = !x.online;
-      row.title = x.online ? `Act on ${x.name}` : `${x.name} is offline`;
-      row.onclick = () => { menu.hidden = true; setMachine(x.id, { name: x.name }); };
+      row.append(el("span", `machine-dot${x.online && !refusing ? " live" : ""}`), el("span", "machine-row-name", x.name), el("span", "machine-row-id", shortId(x.id)), el("span", "machine-row-state", !x.online ? "offline" : refusing ? "refuses web pages" : ""));
+      row.disabled = !x.online || refusing;
+      row.title = !x.online ? `${x.name} is offline` : refusing ? `${x.name} has Allow web page access off` : `Start a chat on ${x.name}`;
+      row.onclick = () => { menu.hidden = true; choose(x.id, x.name); };
       menu.appendChild(row);
     }
     const manage = el("button", "manage", "Devices and account");
@@ -491,7 +495,7 @@ export function createAccount({ toast, openSettings }) {
     if (text) words.appendChild(el("span", null, ` ${text}`));
     b.appendChild(words);
     const row = el("div", "acct-banner-actions");
-    for (const a of actions) row.appendChild(a);
+    for (const a of actions) if (a) row.appendChild(a);
     b.appendChild(row);
     return b;
   }
@@ -500,13 +504,14 @@ export function createAccount({ toast, openSettings }) {
   function linkBanner() {
     const m = machine();
     if (!m) return null;
-    const back = () => button(backText(), "small", () => setMachine(null));
-    if (A.machineDown) return banner("danger", `Could not load ${m.name}.`, A.machineDown, [button("Try again", "small", () => location.reload()), back()]);
+    const back = () => (webPage() ? null : button(backText(), "small", () => choose(null, null)));
+    if (A.machineDown) return banner("danger", `Could not load ${m.name}.`, A.machineDown, [button("Try again", "small", () => retry()), back()]);
     if (!A.status?.hub?.connected) return banner("danger", `${m.name} cannot be reached:`, hubLostText(A.status), [back()]);
     const x = A.machines.find((y) => y.id === m.id);
     if (!x) return null;
     if (!x.online || x.link.state === "offline") return banner("danger", `${x.name} is offline.`, "Nothing you send will reach it, and nothing is queued for later.", [back()]);
     if (x.link.state === "stalled") return banner("danger", `${x.name} has stopped answering.`, "Actions may fail. If it does not recover soon, whatever is waiting is rejected with its name on it.", [back()]);
+    if (x.link.state === "refusing") return banner("danger", `${x.name} does not let web pages in.`, `Allow web page access is off on ${x.name}. Nothing is sent to it from this page.`, [back()]);
     return null;
   }
 
@@ -1005,6 +1010,10 @@ export function createAccount({ toast, openSettings }) {
     /** The chosen machine could not give the page its first state. */
     machineDown(message) { A.machineDown = message; renderBanners(); },
     machineUp() { A.machineDown = null; renderBanners(); },
+    /** The window went to another machine: the pill, the menu and the banners follow it. */
+    refocus() { A.machineDown = null; A.linkDown = false; A.linkWasUp = false; renderMachine(); renderBanners(); noteLink(); },
+    /** This computer's name on the account, if it has one. */
+    get selfName() { return A.status?.device?.name ?? null; },
     get isRemote() { return isRemote(); },
   };
 }

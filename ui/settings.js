@@ -5,7 +5,11 @@ import { el, esc, compactAtFromField, compactAtK } from "./lib.js";
 import { createMcpSettings } from "./mcp-settings.js";
 
 /** `getContext()` → the saved context policy (`/api/state.config.context`); `onContext(policy)` after a save. */
-export function createSettings({ api, toast, onChanged, loadRemote, loadAccount, getContext = () => null, onContext }) {
+/**
+ * `api` and `where()` are the machine Settings shows (Models, MCP servers, Long runs); `onTab(name)` says which tab is showing,
+ * so the machine choice can show only beside that machine's own tabs. Account and Remote are always this computer's.
+ */
+export function createSettings({ api, toast, onChanged, loadRemote, loadAccount, getContext = () => null, onContext, where = () => "", onTab }) {
   const $ = (s) => document.querySelector(s);
   const modal = $("#settings"), list = $("#provList"), form = $("#provForm");
   const f = {
@@ -19,7 +23,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   let editing = null; // custom provider name being edited, or null for a new one
   let keyFor = null; // the OpenCode provider id whose key the form edits (key mode), or null
 
-  const mcp = createMcpSettings({ api, toast, onChanged });
+  const mcp = createMcpSettings({ api, toast, onChanged, where });
   // Four tabs in one dialog: the models OpenCode can use, the MCP servers it connects to, remote access (host only) and long runs.
   const tabs = { models: { btn: $("#tabModels"), body: $("#provBody"), sub: $("#subModels") }, mcp: { btn: $("#tabMcp"), body: $("#mcpBody"), sub: $("#subMcp") }, remote: { btn: $("#tabRemote"), body: $("#remoteBody"), sub: $("#subRemote") }, long: { btn: $("#tabLong"), body: $("#longBody"), sub: $("#subLong") }, account: { btn: $("#tabAccount"), body: $("#accountBody"), sub: $("#subAccount") } };
   let tab = "models";
@@ -30,6 +34,7 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
       t.btn.classList.toggle("active", on); t.btn.setAttribute("aria-selected", String(on));
       t.body.hidden = !on; t.sub.hidden = !on;
     }
+    onTab?.(name);
     if (name === "mcp") mcp.load(); else if (name === "remote") loadRemote?.(); else if (name === "long") renderLong(); else if (name === "account") loadAccount?.(); else load();
   }
   tabs.models.btn.onclick = () => showTab("models");
@@ -313,12 +318,12 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   }
   async function remove() {
     if (keyFor) {
-      if (!window.confirm(`Remove OpenCode's key for "${keyFor}"? It is removed from OpenCode's own login store, which the opencode CLI shares.`)) return;
+      if (!window.confirm(`Remove OpenCode's key for "${keyFor}"${where()}? It is removed from OpenCode's own login store, which the opencode CLI shares.`)) return;
       try { const r = await api(`/api/provider-keys/${encodeURIComponent(keyFor)}`, null, "DELETE"); toast(`Removed the key for ${keyFor}${reloaded(r)}`); keyFor = null; await load(); onChanged?.(); }
       catch (e) { toast(e.message, true); }
       return;
     }
-    const confirmText = editingBuiltIn() ? `Remove the models Omni added to OpenCode's "${editing}"? OpenCode's own models and key stay.` : `Remove provider "${editing}" and its models from OpenCode?`;
+    const confirmText = editingBuiltIn() ? `Remove the models Omni added to OpenCode's "${editing}"${where()}? OpenCode's own models and key stay.` : `Remove provider "${editing}" and its models from OpenCode${where()}?`;
     if (!editing || !window.confirm(confirmText)) return;
     try { const r = await api(`/api/providers/${encodeURIComponent(editing)}`, null, "DELETE"); toast(`Removed ${editing}${reloaded(r)}`); editing = null; await load(); onChanged?.(); }
     catch (e) { toast(e.message, true); }
@@ -332,5 +337,11 @@ export function createSettings({ api, toast, onChanged, loadRemote, loadAccount,
   $("#settingsClose").onclick = close;
   modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !modal.hidden) close(); });
-  return { open, close };
+  return {
+    open, close,
+    /** Its machine changed: the tab showing is that machine's now. */
+    reload() { if (!modal.hidden) showTab(tab); },
+    get tab() { return tab; },
+    get shown() { return !modal.hidden; },
+  };
 }

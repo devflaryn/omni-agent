@@ -97,23 +97,32 @@ Other people can have their own accounts on your hub, each seeing only their own
 
 ## Choosing a machine
 
-Each desktop app is a host for its own machine and a client for your others. The machine must have Omni running, signed in and online. Nothing is queued for a machine that is offline.
+Each desktop app is a host for its own machine and a client for your others. A machine must have Omni running, signed in and online. Nothing is queued for a machine that is offline.
 
-The machine button is in the top bar. It shows **This computer** until you pick another. Its menu lists **Your other machines**, each with a dot for online, its name and a 6-character id. Offline ones cannot be chosen. **Devices and account** opens Settings.
+**Every machine is in one window.** The chats drawer lists the chats of every machine on your account, grouped under each machine's name, with **This computer** first. A few recent chats show per machine; **All chats on *name*** shows the rest of that machine's. The chips above the list show one machine alone. Two machines with the same name carry their 6-character id, so they are never confused.
 
-You can tell you are acting on another machine by these:
+- An **offline** machine shows as offline, with no chats. Nothing is asked of it until it is back.
+- A machine that **does not let web pages in** (its **Allow web page access** is off) shows that on the web page, with no chats. It is not broken.
+- A machine that **stops answering** says "not answering" beside its name. Its chats stay on show.
+- Each machine's recent chats load on their own, so a slow machine does not hold up the others. Full chat histories load only for the chat you open.
+- New chats and chats at work show up live from every machine.
 
-- The top bar turns over to inverse colours, and shows **On *name*** with the short id. Two machines can share a name, and only the id tells them apart.
-- The window title and the composer's caption name the machine, and delete confirmations do too.
-- **Back to this computer** appears in the top bar.
+**Opening a chat on any machine** takes the window there. Nothing reloads. A half-typed message stays with its chat, on its machine, and is there when you come back to it. Files with unsaved changes are the one thing asked about first, because the file pane belongs to the machine you are on.
 
-Switching reloads the window, so no chat, path or half-typed message carries over from the last machine. A half-typed message is lost.
+**Starting a chat:** on Home, pick the **Machine**, then its **Working directory**. The machine button in the top bar does the same: its menu lists your machines with a dot for online and the short id. Offline ones cannot be picked. **Devices and account** opens Settings.
 
-While on another machine, Settings' Models, MCP servers and Long runs are that machine's. Account and Remote are always this computer's.
+You can always tell which machine an action runs on:
+
+- On another machine the top bar turns over to inverse colours and shows **On *name*** with the short id. **Back to this computer** appears beside it.
+- The composer's caption starts with **On *name*** (or **On this computer**), the window title names the machine, and every delete, stop or remove confirmation names it.
+- The file tree's path starts with the machine's name.
+
+**Per machine:** Settings' Models, MCP servers and Long runs have their own machine picker; they open on the machine you are on. Missions has one too. Account and Remote are always this computer's. The Memory, Graph and Tokens tabs follow the machine you are on.
 
 **If the link has trouble, a banner says so:**
 
-- "*name* is offline. Nothing you send will reach it, and nothing is queued for later."
+- "*name* is offline. Nothing you send will reach it, and nothing is queued for later." The composer says so too, and does not send.
+- "*name* does not let web pages in." On the web page only: turn **Allow web page access** on at that machine to use it there.
 - "*name* has stopped answering." A request waiting on it is then rejected by name, about 25 seconds into the silence, saying it may or may not have run there.
 - "Still waiting for *name*..." The link is alive and the route is slow, as with a long prompt. It waits as long as the route takes.
 
@@ -127,7 +136,7 @@ It needs Chrome 137+, Safari 17+ or Firefox 130+, with site data allowed.
 
 1. Enter **Email**, **Password** and **Name for this page**, and press **Sign in**. It is the same sign-in as the desktop's welcome screen, without **Create an account**.
 2. "Approve this page" appears, with a code once a desktop's card has fetched it. Approve it from a desktop app as in [Adding a device](#adding-a-device), with **Approve as a web page (limited)**, which comes first for a page.
-3. Under **Choose a machine**, pick one. The same app then runs on that machine. **All machines** goes back.
+3. The app opens on your first online machine, with every machine in the chats drawer, as on a desktop. If none can be reached, the page lists them and opens by itself once one can.
 
 What differs from the desktop:
 

@@ -1,7 +1,7 @@
 /* Right drawer: tab strip + Chats (history), Memory, Graph and Tokens. */
 import { el, esc, fmtN, harnessLabel } from "./lib.js";
 
-export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextWindow, onShowChats }) {
+export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextWindow, onShowChats, where = () => "" }) {
   const $ = (s) => document.querySelector(s);
   const TABS = ["chats", "memory", "graph", "tokens"];
   let tab = "chats";
@@ -86,7 +86,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
   $("#mfCancel").onclick = closeNote;
   $("#mfSave").onclick = async () => { try { const r = await api("/api/memory/save", { name: $("#mfName").value, description: $("#mfDesc").value, type: $("#mfType").value, body: $("#mfBody").value }); toast(`Saved ${r.path}`); $("#mfName").value = $("#mfDesc").value = $("#mfBody").value = ""; closeNote(); loadMemory(""); } catch (e) { toast(e.message, true); } };
   $("#memSave").onclick = async () => { try { await api("/api/memory/note", { path: $("#memPath").textContent, text: $("#memText").value }, "PUT"); toast("Note saved"); loadMemory($("#memSearch").value.trim()); } catch (e) { toast(e.message, true); } };
-  $("#memDelete").onclick = async () => { const p = $("#memPath").textContent; if (!confirm(`Delete ${p}?`)) return; try { await api(`/api/memory/note?path=${encodeURIComponent(p)}`, null, "DELETE"); toast("Note deleted"); closeNote(); loadMemory(""); } catch (e) { toast(e.message, true); } };
+  $("#memDelete").onclick = async () => { const p = $("#memPath").textContent; if (!confirm(`Delete ${p}${where()}?`)) return; try { await api(`/api/memory/note?path=${encodeURIComponent(p)}`, null, "DELETE"); toast("Note deleted"); closeNote(); loadMemory(""); } catch (e) { toast(e.message, true); } };
   $("#memClose").onclick = closeNote;
   $("#memImport").onclick = async () => { try { const r = await api("/api/memory/import-claude", {}); toast(`Imported ${r.imported.length} Claude memory notes`); loadMemory(""); } catch (e) { toast(e.message, true); } };
   $("#memReindex").onclick = async () => { try { const r = await api("/api/memory/reindex", {}); toast(`Index rebuilt: ${r.notes} notes`); } catch (e) { toast(e.message, true); } };
@@ -207,5 +207,7 @@ export function createPanel({ S, api, toast, onSelect, currentDir, getPiContextW
   };
   $("#graphQ").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#graphAsk").click(); });
 
-  return { open, toggle, show, setOpen, renderStats, loadMemory, loadGraph, loadGraphList, graphLine: (t) => { $("#graphTotals").textContent = t; } };
+  /** The window went to another machine: an open drawer shows that machine's memory, graph and tokens. */
+  const refresh = () => { if (document.body.classList.contains("panel-open")) show(tab); };
+  return { open, toggle, show, setOpen, refresh, renderStats, loadMemory, loadGraph, loadGraphList, graphLine: (t) => { $("#graphTotals").textContent = t; } };
 }

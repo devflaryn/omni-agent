@@ -48,7 +48,11 @@ export function orchestratorState(m, session) {
   return { tone: "", text: "idle · waiting for reports", px: "idle" };
 }
 
-export function createMissionView({ root, api, toast, onOpenChat, sessionOf = () => null, defaultDir = () => "", defaultModel = () => null }) {
+/**
+ * `machinePicker()`: a control naming the machine these missions are on, to go to another (null while there is one machine);
+ * `machineSig()` changes when it should be drawn again. `where()`: " on <machine>" for a confirmation, or "".
+ */
+export function createMissionView({ root, api, toast, onOpenChat, sessionOf = () => null, defaultDir = () => "", defaultModel = () => null, machinePicker = () => null, machineSig = () => "", where = () => "" }) {
   const M = { list: new Map(), agents: new Map(), reports: new Map(), open: null, selected: "orchestrator", tab: "inbox", timer: null, tick: null, models: null, kg: { q: "", text: "", node: "", stats: null, missionId: null } };
   const shell = el("div", "ms-shell");
   const side = el("aside", "ms-list");
@@ -166,7 +170,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
 
   function renderList() {
     const ms = [...M.list.values()].sort((a, b) => b.createdAt - a.createdAt);
-    if (!changed("list", JSON.stringify([M.open, minute(), ms.map((m) => [m.id, m.title, m.status, ago(m.updatedAt), (m.notifications || []).filter((x) => !x.read).length])]))) return;
+    if (!changed("list", JSON.stringify([machineSig(), M.open, minute(), ms.map((m) => [m.id, m.title, m.status, ago(m.updatedAt), (m.notifications || []).filter((x) => !x.read).length])]))) return;
     const out = [];
     const head = el("div", "ms-list-head");
     head.append(el("span", "ms-list-title", "Missions"));
@@ -174,6 +178,8 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     nb.onclick = () => openNew();
     head.append(nb);
     out.push(head);
+    const picker = machinePicker();
+    if (picker) out.push(picker);
     if (!ms.length) out.push(el("div", "ms-list-empty", "No missions yet."));
     for (const m of ms) {
       const row = el("button", `ms-row${m.id === M.open ? " on" : ""}`);
@@ -212,7 +218,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     left.append(goal);
     const acts = el("div", "ms-head-acts");
     if (m.status === "paused" || m.status === "error") { const b = el("button", "btn small", "Resume"); b.onclick = () => act(`/api/missions/${m.id}/resume`, "Mission resumed"); acts.append(b); }
-    else if (m.status !== "done") { const b = el("button", "btn small", "Pause"); b.title = "Stops the orchestrator and every worker; resume continues from the ledger"; b.onclick = () => { if (window.confirm("Pause this mission? Every worker is stopped; Resume continues from the ledger.")) act(`/api/missions/${m.id}/stop`, "Mission paused"); }; acts.append(b); }
+    else if (m.status !== "done") { const b = el("button", "btn small", "Pause"); b.title = "Stops the orchestrator and every worker; resume continues from the ledger"; b.onclick = () => { if (window.confirm(`Pause this mission${where()}? Every worker is stopped; Resume continues from the ledger.`)) act(`/api/missions/${m.id}/stop`, "Mission paused"); }; acts.append(b); }
     const rm = el("button", "btn small quiet", "Remove"); rm.title = "Stops this mission and deletes its ledger, reports and inbox"; rm.onclick = () => removeMission(m); acts.append(rm);
     h.append(left, acts);
     return h;
@@ -220,7 +226,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
 
   async function removeMission(m) {
     const running = m.status === "running" || m.status === "starting";
-    if (!window.confirm(`Remove "${one(m.title, 60)}"?${running ? " It is still running: the orchestrator and every worker are stopped." : ""} Its ledger, reports and inbox are deleted and cannot be restored. The project's memory and knowledge graph stay.`)) return;
+    if (!window.confirm(`Remove "${one(m.title, 60)}"${where()}?${running ? " It is still running: the orchestrator and every worker are stopped." : ""} Its ledger, reports and inbox are deleted and cannot be restored. The project's memory and knowledge graph stay.`)) return;
     try { await api(`/api/missions/${m.id}/remove`, {}); onRemoved(m.id); toast("Mission removed"); render(); } catch (e) { toast(e.message, true); }
   }
 
@@ -313,7 +319,7 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
       r.onclick = async () => { try { report((await api(`/api/missions/${m.id}/report/${a.id}`)).text); } catch (e) { report(e.message); } schedule(); };
       acts.append(r);
     }
-    if (ACTIVE.has(a.status)) { const c = el("button", "btn small quiet", "Stop"); c.onclick = () => { if (window.confirm(`Stop ${a.id}?`)) act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/cancel` : `/api/agents/${a.id}/cancel`, "Stopped"); }; acts.append(c); }
+    if (ACTIVE.has(a.status)) { const c = el("button", "btn small quiet", "Stop"); c.onclick = () => { if (window.confirm(`Stop ${a.id}${where()}?`)) act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/cancel` : `/api/agents/${a.id}/cancel`, "Stopped"); }; acts.append(c); }
     d.append(acts, out);
     if (a.kind !== "shell") d.append(composer(a.role === "worker" ? "Message this worker (the orchestrator is told)…" : "Message this subagent…", (text) => act(a.role === "worker" ? `/api/missions/${m.id}/workers/${a.id}/message` : `/api/agents/${a.id}/message`, "Sent", { text })));
     return d;
@@ -468,5 +474,13 @@ export function createMissionView({ root, api, toast, onOpenChat, sessionOf = ()
     goal.focus();
   }
 
-  return { load, render, onMission, onRemoved, onAgent, onNotify, onStatus, openNew, onBadge: (f) => { badgeListeners.add(f); f(unreadCount(M.list.values())); }, get state() { return M; } };
+  /** The view went to another machine: nothing of the last one's missions stays on show. */
+  function reset() {
+    M.list = new Map(); M.agents = new Map(); M.reports = new Map(); M.open = null; M.selected = "orchestrator"; M.models = null;
+    M.kg = { q: "", text: "", node: "", stats: null, missionId: null };
+    removed.clear(); sigs.clear(); saved.clear(); shownMission = shownSide = null;
+    main.replaceChildren();
+    emitBadge();
+  }
+  return { load, reset, render, onMission, onRemoved, onAgent, onNotify, onStatus, openNew, onBadge: (f) => { badgeListeners.add(f); f(unreadCount(M.list.values())); }, get state() { return M; } };
 }

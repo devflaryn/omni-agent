@@ -31,7 +31,7 @@ export function parsePastedServer(text) {
   return first;
 }
 
-export function createMcpSettings({ api, toast, onChanged }) {
+export function createMcpSettings({ api, toast, onChanged, where = () => "" }) {
   const $ = (s) => document.querySelector(s);
   const list = $("#mcpList"), form = $("#mcpForm");
   const f = {
@@ -151,7 +151,7 @@ export function createMcpSettings({ api, toast, onChanged }) {
     finally { f.test.disabled = false; }
   }
   async function remove() {
-    if (!editing || !window.confirm(`Remove MCP server "${editing}"? OpenCode reloads without its tools.`)) return;
+    if (!editing || !window.confirm(`Remove MCP server "${editing}"${where()}? OpenCode reloads without its tools.`)) return;
     try { await api(`/api/mcp/${encodeURIComponent(editing)}`, null, "DELETE"); toast(`Removed ${editing}`); tested.delete(editing); editing = null; await load(); onChanged?.(); }
     catch (e) { toast(e.message, true); }
   }

@@ -59,24 +59,22 @@ test("this computer's own calls ignore the machine", async () => {
   assert.equal(local.eventSource("/api/account/events").url, "/api/account/events");
 });
 
-test("setMachine starts the page over, and persists for this window only", () => {
-  setMachine(ID, { name: "Ubuntu" });
-  assert.equal(reloads, 1, "the reload is what clears the open chat, the state, and the stream's seq");
+test("setMachine moves the focus without a reload, and persists for this window only", () => {
+  assert.equal(setMachine(ID, { name: "Ubuntu" }), true);
+  assert.equal(reloads, 0, "the window keeps its drafts and its other machines");
   assert.deepEqual(JSON.parse(storage.data.get("omni.machine")), { id: ID, name: "Ubuntu" });
 
-  // The reloaded page reads it back.
-  // As a real reload does: the page is built again from what is stored.
+  // A page loaded again reads it back.
   const page = { storage, reload: () => { reloads++; setTransportEnv(page); } };
   setTransportEnv(page);
   assert.deepEqual(machine(), { id: ID, name: "Ubuntu" });
   assert.equal(mode(), "proxied");
 
   setMachine(ID, { name: "Ubuntu renamed" });
-  assert.equal(reloads, 1, "the same machine again is not a switch");
   assert.equal(machineName(), "Ubuntu renamed");
 
   setMachine(null);
-  assert.equal(reloads, 2);
+  assert.equal(reloads, 0);
   assert.equal(storage.data.has("omni.machine"), false);
   assert.equal(mode(), "local");
 });
@@ -87,10 +85,9 @@ test("nothing is stored where another window would read it", () => {
   assert.match(src, /sessionStorage/);
 });
 
-test("the switch reloads the real page: the app itself keeps no last machine's state across it", () => {
-  // What setMachine leaves to a reload must really be built from nothing: S starts empty and seq at 0 in app.js.
+test("each machine keeps its own place in the app: nothing of one machine's is read as another's", () => {
   const app = readFileSync(new URL("../ui/app.js", import.meta.url), "utf8");
-  assert.match(app, /const S = \{ sessions: new Map\(\), selected: null,[^\n]*seq: 0,/);
+  assert.match(app, /newWorkspace\(\)/, "one workspace per machine");
   assert.doesNotMatch(app, /sessionStorage/, "app.js persists nothing of a machine");
 });
 
@@ -120,7 +117,7 @@ test("an error names the machine, carries the code, and a dropped answer never l
   // A 401 from a far machine is not this window's sign-out: no reload loop.
   globalThis.fetch = async () => answer(401, { error: "signed out there", login: true });
   await assert.rejects(api("GET", "/api/x"), /signed out there/);
-  assert.equal(reloads, 1, "only the switch itself reloaded");
+  assert.equal(reloads, 0, "nothing reloaded");
 });
 
 test("past the wait the window says so, once, and clears on the answer: good or bad", async () => {
@@ -227,12 +224,11 @@ test("only transport.js calls fetch or opens an EventSource, so nothing can miss
 
 test("another machine's stream cannot paint this computer's approval cards", () => {
   const handlers = { approvals: () => "approvals", resync: () => "resync" };
-  assert.deepEqual(Object.keys(streamEvents(handlers)).sort(), ["approvals", "resync"], "this computer's own stream carries them");
-  setMachine(ID, { name: "Ubuntu" });
-  assert.deepEqual(Object.keys(streamEvents(handlers)), ["resync"]);
+  assert.deepEqual(Object.keys(streamEvents(null, handlers)).sort(), ["approvals", "resync"], "this computer's own stream carries them");
+  assert.deepEqual(Object.keys(streamEvents({ id: ID, name: "Ubuntu" }, handlers)), ["resync"]);
   const app = read("app.js");
-  assert.match(app, /const stream = createStream\(\{[\s\S]*?on: streamEvents\(\{/, "app.js uses it for the machine's stream");
-  assert.match(app, /const hereStream = isRemote\(\) \? createStream\(\{[\s\S]*?on: \{ approvals:/, "and this computer's own stream carries the real ones");
+  assert.match(app, /on: streamEvents\(m\.id \? m : null, \{/, "app.js uses it for every machine's stream");
+  assert.match(app, /fromMerged\(/, "the other machines' merged stream goes through the filter that drops approvals");
 });
 
 test("an approval card keeps the machine in the title, whenever it renders", () => {

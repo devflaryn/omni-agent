@@ -161,6 +161,8 @@ export function createComposer(root, h) {
     insert(text) { ta.value += `${ta.value && !/\s$/.test(ta.value) ? " " : ""}${text}`; autosize(); ta.focus(); },
     focus() { ta.focus(); },
     clear() { ta.value = ""; autosize(); },
+    /** A draft put back: the box holds exactly this. */
+    setValue(text) { ta.value = text || ""; autosize(); },
     get value() { return ta.value; },
   };
 }

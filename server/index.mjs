@@ -40,7 +40,7 @@ import { createTally, estimateTokens } from "./tokens.mjs";
 import { createServer as createNetServer } from "node:net";
 import { Approvals, COOKIE, DEVICE_COOKIE, RemoteAuth, WindowGate, channelAllowed, classify, clientIp, describe, inAccountFolder, isHostRequest, parseCookies, parseProxyLine, redact, requestTouchesAccountFolder } from "./access.mjs";
 import { Account, AccountError, handleAccountRoutes } from "./account.mjs";
-import { MachineLinks, proxyToMachine } from "./channel-client.mjs";
+import { MachineLinks, mergedEvents, proxyToMachine } from "./channel-client.mjs";
 import { serveChannel } from "./channel-host.mjs";
 import { httpsRedirect, loadOrCreateCert } from "./tls.mjs";
 import { SshTunnel } from "./tunnel.mjs";
@@ -880,6 +880,8 @@ export async function createApp(overrides = {}) {
     const refusal = windowGate.refusal(req);
     if (refusal) return send(res, 403, { error: refusal, code: windowGate.refusalCode(req) });
     if (!account) return send(res, 503, { error: "the account is off: check account.hub in omni.config.json" });
+    // Every other machine's live events in one stream: `~` is never in a device id.
+    if (p === "/remote/~events" && req.method === "GET") return await mergedEvents(req, res, { links: machineLinks, send });
     if (p === "/remote" || p.startsWith("/remote/")) return await proxyToMachine(req, res, { links: machineLinks, send });
     try {
       return await handleAccountRoutes(req, res, { p, q, account, links: machineLinks, send, readBody, streams: accountStreams });

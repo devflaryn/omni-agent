@@ -4,9 +4,11 @@
      proxied  another machine, through this computer's server at /remote/<id>, which holds the channel. The desktop window.
      channel  another machine, over a channel this page holds itself: the web page, and the iPhone app's web view. See `setChannelTransport`.
 
-   Changing machine reloads the page, on purpose: nothing of the last machine's can then survive, not a chat, a path in a
-   field, a seq, a half-typed message or an answer still on its way. The choice lives in sessionStorage, for this window only.
-   This file also runs in Node, so nothing here may touch a browser global until it is called. */
+   A window shows every machine on the account at once. `at(machine)` is a handle fixed to one machine: whatever it sends goes
+   there and nowhere else, however the window moves on. The window's focus (`machine()`) is the machine of what it shows now:
+   the open chat, or the one a new chat starts on. Changing it never reloads the page, so no draft is lost; files with unsaved
+   changes are asked about first, since the file pane is the focused machine's. The focus lives in sessionStorage, for this
+   window only. This file also runs in Node, so nothing here may touch a browser global until it is called. */
 
 const STORE_KEY = "omni.machine";
 const CONTROL_CHARS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu; // controls, direction marks and zero-width characters, line separators
@@ -23,16 +25,15 @@ export function cleanName(name, max = 64, fallback = "Unnamed device") {
 
 let env = {
   get storage() { try { return globalThis.sessionStorage ?? null; } catch { return null; } },
-  reload: () => globalThis.location?.reload(),
   confirm: (text) => globalThis.confirm(text),
 };
 /** For tests. */
-export function setTransportEnv(replacement) { env = replacement; current = undefined; channelImpl = null; leaveChecks.clear(); leaving = false; }
+export function setTransportEnv(replacement) { env = replacement; current = undefined; channelImpl = null; channels.clear(); leaveChecks.clear(); }
 
 let current; // undefined until first read: { id, name } | null
 let channelImpl = null;
+const channels = new Map(); // machine id → its channel transport, on a page
 const leaveChecks = new Set();
-let leaving = false;
 
 function read() {
   if (current !== undefined) return current;
@@ -44,59 +45,52 @@ function read() {
   return current;
 }
 
-/** The machine this window acts on, or null for this computer. */
+/** The machine this window is focused on, or null for this computer. */
 export const machine = () => read();
 export const isRemote = () => read() !== null;
 export const machineName = () => read()?.name ?? "this computer";
 export const mode = () => (!read() ? "local" : channelImpl ? "channel" : "proxied");
-const prefix = () => (read() ? `/remote/${encodeURIComponent(read().id)}` : "");
 
 /** The window's title, saying which machine it is on. Everything that sets the title goes through here. */
 export const machineTitle = (title = "Omni Agent") => (read() ? `[${read().name}] ${title}` : title);
 
 /**
- * The named events to take from the chosen machine's stream. Old-style approval cards act on this computer, so another
- * machine's stream must not be able to paint them: on another machine they come from this computer's own stream alone.
+ * The named events to take from a machine's stream. Old-style approval cards act on this computer, so another machine's
+ * stream must not be able to paint them: they come from this computer's own stream alone. `m` is the stream's machine.
  */
-export const streamEvents = ({ approvals, resync }) => (read() ? { resync } : { approvals, resync });
+export const streamEvents = (m, { approvals, resync }) => (m ? { resync } : { approvals, resync });
 
 /**
- * A page with no server of its own hands in its channel here: {api, eventSource, rawUrl, saveFile, local}. `local` stands in for
- * this computer's server, which it does not have. From ui/page-transport.js.
+ * A page with no server of its own hands in its channel here: {api, eventSource, rawUrl, saveFile, local, forMachine(m)}.
+ * `local` stands in for this computer's server, which it does not have; `forMachine` gives the same for any one machine.
+ * From ui/page-transport.js.
  */
-export function setChannelTransport(impl) { channelImpl = impl; }
+export function setChannelTransport(impl) { channelImpl = impl; channels.clear(); }
 
 /** Whether this is the web page or the iPhone's web view, which has no computer of its own and may not approve anything. */
 export const webPage = () => channelImpl !== null;
 
 /** `check()` says why this window should not leave its machine (unsaved files), or nothing. Returns the way to remove it. */
 export function onLeaveCheck(check) { leaveChecks.add(check); return () => leaveChecks.delete(check); }
-/** A switch has been agreed and the page is about to go: it asks nothing more of the person. */
-export const isLeaving = () => leaving;
 
 /**
- * Points this window at a machine, or at this computer with null, and starts the page over on it. `name` is what the top
- * bar shows. Nothing is sent to the machine by this: the reloaded page asks for its state, and says so if it cannot.
- *
- * The person is asked here, before anything changes, so that No leaves the window exactly where it was and a later refresh
- * does not jump machines. This page stays on its machine until it is gone: what it shows and what it sends never differ.
- * `whenClean`: not the person's own choice, so it does not ask, and waits to be tried again.
+ * Focuses this window on a machine, or on this computer with null. Never reloads. Returns whether it moved: unsaved files
+ * are asked about first, and No leaves everything where it was. `whenClean`: not the person's own choice, so it does not
+ * ask, and does not move while there is something to lose.
  */
-export function setMachine(id, { name, reload = true, whenClean = false } = {}) {
+export function setMachine(id, { name, whenClean = false } = {}) {
   const next = id ? { id: String(id), name: cleanName(name) } : null;
   const unchanged = (read()?.id ?? null) === (next?.id ?? null);
-  const switching = reload && !unchanged;
-  if (switching) {
+  if (!unchanged) {
     const reasons = [...leaveChecks].map((check) => check()).filter(Boolean);
-    if (reasons.length && (whenClean || !env.confirm(`${reasons.join("\n")}\n\nSwitch machine and lose them?`))) return read();
-    leaving = true;
-  } else current = next;
+    if (reasons.length && (whenClean || !env.confirm(`${reasons.join("\n")}\n\nGo to ${next ? next.name : "this computer"} and lose them?`))) return false;
+  }
+  current = next;
   try {
     if (next) env.storage?.setItem(STORE_KEY, JSON.stringify(next));
     else env.storage?.removeItem(STORE_KEY);
   } catch { /* in memory only, for this page */ }
-  if (switching) env.reload();
-  return next;
+  return true;
 }
 
 // A link that answers pings may wait for a slow route for as long as it takes, so the window says it is waiting.
@@ -109,26 +103,35 @@ export function onStillWaiting(listener) { waitingListeners.add(listener); retur
 /** For tests. */
 export function setStillWaitingAfter(ms) { stillWaitingAfterMs = ms; }
 
-/** One request. Throws an Error with `.status`, `.code` and the answer as `.body` (a file save tells a conflict or a binary from other failures), whose message names the machine when another was asked. */
-export async function api(method, path, body) {
-  if (!read()) return ask(method, path, body);
+const prefixFor = (m) => (m ? `/remote/${encodeURIComponent(m.id)}` : "");
+
+/** The channel transport for one machine, on a page. */
+function channelFor(m) {
+  if (!channelImpl.forMachine) return channelImpl;
+  let t = channels.get(m.id);
+  if (!t) channels.set(m.id, (t = channelImpl.forMachine({ id: m.id, name: m.name })));
+  return t;
+}
+
+/** One request to `m` (null: this computer). Throws an Error with `.status`, `.code` and the answer as `.body`, whose message names the machine when another was asked. */
+async function apiOn(m, method, path, body) {
+  if (!m) return ask(null, method, path, body);
   let late = false;
   const timer = setTimeout(() => { late = true; waiting++; announceWaiting(); }, stillWaitingAfterMs);
-  try { return await ask(method, path, body); }
+  try { return await ask(m, method, path, body); }
   finally {
     clearTimeout(timer);
     if (late) { waiting--; announceWaiting(); }
   }
 }
 
-async function ask(method, path, body) {
-  if (mode() === "channel") return channelImpl.api(method, path, body);
-  const m = read();
+async function ask(m, method, path, body) {
+  if (m && channelImpl) return channelFor(m).api(method, path, body);
   const options = method !== "GET"
     ? { method, headers: { "content-type": "application/json" }, body: body !== undefined && body !== null ? JSON.stringify(body) : undefined }
     : { method: "GET" };
   let r;
-  try { r = await globalThis.fetch(`${prefix()}${path}`, options); }
+  try { r = await globalThis.fetch(`${prefixFor(m)}${path}`, options); }
   catch (e) { throw m ? failure(`Could not reach ${m.name} through this computer's Omni: ${e.message}`) : e; }
   return m ? remoteAnswer(r, m) : localAnswer(r);
 }
@@ -168,11 +171,47 @@ export function failure(message, status, code, body) {
   return e;
 }
 
-/** What createStream needs: an EventSource, for this machine. */
-export function eventSource(url) {
-  if (mode() === "channel") return channelImpl.eventSource(url);
-  return new globalThis.EventSource(`${prefix()}${url}`);
+function eventSourceOn(m, url) {
+  if (m && channelImpl) return channelFor(m).eventSource(url);
+  return new globalThis.EventSource(`${prefixFor(m)}${url}`);
 }
+
+async function rawUrlOn(m, path) {
+  if (m && channelImpl) return channelFor(m).rawUrl(path);
+  return `${prefixFor(m)}${path}`;
+}
+
+async function saveFileOn(m, path, name) {
+  if (m && channelImpl) return channelFor(m).saveFile(path, name);
+  const a = globalThis.document.createElement("a");
+  a.href = `${prefixFor(m)}${path}`;
+  a.download = name;
+  globalThis.document.body.appendChild(a);
+  a.click();
+  a.remove();
+  return {};
+}
+
+/**
+ * A handle on one machine ({id, name}, or null for this computer). Everything sent through it goes to that machine, whatever
+ * the window is focused on later: a chat's Stop reaches the chat's machine even if the person has moved on.
+ */
+export function at(m) {
+  const fixed = m ? { id: String(m.id), name: cleanName(m.name) } : null;
+  return Object.freeze({
+    machine: fixed,
+    api: (method, path, body) => apiOn(fixed, method, path, body),
+    eventSource: (url) => eventSourceOn(fixed, url),
+    rawUrl: (path) => rawUrlOn(fixed, path),
+    saveFile: (path, name) => saveFileOn(fixed, path, name),
+  });
+}
+
+/** One request to the focused machine. See apiOn. */
+export const api = (method, path, body) => apiOn(read(), method, path, body);
+
+/** What createStream needs: an EventSource, for the focused machine. */
+export const eventSource = (url) => eventSourceOn(read(), url);
 
 /**
  * A URL for an <img>, a <video> or an <audio>, and for nothing else. The one helper for direct URLs: a page in channel mode has
@@ -180,22 +219,10 @@ export function eventSource(url) {
  * there it refuses, with code `not-viewable`, anything that could run, and with `too-large-for-page` anything over 200 MB. Both
  * mean: offer saveFile. So a caller shows its error with a Download button, and never frames this or navigates to it.
  */
-export async function rawUrl(path) {
-  if (mode() === "channel") return channelImpl.rawUrl(path);
-  return `${prefix()}${path}`;
-}
+export const rawUrl = (path) => rawUrlOn(read(), path);
 
 /** Saves a file's bytes on this device, whatever they are. To be called from a click: the page's way may open a file dialog. */
-export async function saveFile(path, name) {
-  if (mode() === "channel") return channelImpl.saveFile(path, name);
-  const a = globalThis.document.createElement("a");
-  a.href = `${prefix()}${path}`;
-  a.download = name;
-  globalThis.document.body.appendChild(a);
-  a.click();
-  a.remove();
-  return {};
-}
+export const saveFile = (path, name) => saveFileOn(read(), path, name);
 
 /**
  * Whether a file's URL may go in an <iframe> or a new window, as a PDF does on a desktop, where a server's sandbox header goes with
