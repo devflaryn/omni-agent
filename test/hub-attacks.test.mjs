@@ -79,9 +79,11 @@ class ThinClient {
     return this.#refuse({ "a-newer": "rollback", fork: "fork", "different-account": "different-account" }[relation]);
   }
 
-  /** Section 4, step 5. The code was shown to the person, who said whether another device of theirs shows the same one. */
-  async acceptApproval(entries, { logHead, approverPub, role = "full" }, personConfirmedCode) {
-    if (!personConfirmedCode) return this.#refuse("code-not-confirmed");
+  /**
+   * Section 4, step 5. Nobody on this device is asked anything: the code is shown, and the person may glance at it. So nothing here
+   * depends on the person, and `account` is what the password vouched for at sign-in. See test/account.test.mjs for the real client.
+   */
+  async acceptApproval(entries, { logHead, approverPub, role = "full", account }) {
     let trust;
     try {
       trust = await verifyLog(entries, { now: now() });
@@ -89,6 +91,7 @@ class ThinClient {
       if (error instanceof LogError) return this.#refuse("bad-log");
       throw error;
     }
+    if (account !== undefined && trust.accountId !== account) return this.#refuse("not-the-account-the-password-vouched-for");
     let at = -1;
     for (let i = 0; i < entries.length && at < 0; i++) if (await entryHash(entries[i]) === logHead) at = i;
     if (at < 0) return this.#refuse("not-the-head-in-the-code");
@@ -389,7 +392,7 @@ test("fake log: a forged add for the new device, with no authority behind it, do
   const forged = [...log, await signedEntry(log, "add", addBody(fresh), mallory)];
   await assert.rejects(verifyLog(forged, { now: now() }), /not on the log/);
   const client = new ThinClient(fresh);
-  assert.equal(await client.acceptApproval(forged, { logHead, approverPub: owner.signPub }, true), "bad-log");
+  assert.equal(await client.acceptApproval(forged, { logHead, approverPub: owner.signPub }), "bad-log");
   assert.equal(client.log, null);
 });
 
@@ -447,14 +450,14 @@ test("fake log: a log the new device is not on, or one not following the head in
   const context = { logHead, approverPub: owner.signPub };
 
   assert.ok(!(await verifyLog(log, { now: now() })).devices.has(fresh.signPub), "the core's list does not have it");
-  assert.equal(await client.acceptApproval(log, context, true), "not-added");
+  assert.equal(await client.acceptApproval(log, context), "not-added");
 
   const other = await familyOf();
   const elsewhere = await append(other.log, { type: "add", ...addBody(fresh) }, other.owner);
-  assert.equal(await client.acceptApproval(elsewhere, context, true), "not-the-head-in-the-code");
+  assert.equal(await client.acceptApproval(elsewhere, context), "not-the-head-in-the-code");
 
   const added = await append(log, { type: "add", ...addBody(fresh) }, owner);
-  assert.equal(await client.acceptApproval(added, context, true), "adopted");
+  assert.equal(await client.acceptApproval(added, context), "adopted");
   assert.deepEqual(client.alerts, ["not-added", "not-the-head-in-the-code"]);
 });
 
@@ -462,7 +465,7 @@ test("fake log: the approver in the code must have been a full device on the log
   const { log, owner, fresh, malloryApprover, logHead } = await approvalSetting();
   const added = await append(log, { type: "add", ...addBody(fresh) }, owner);
   const client = new ThinClient(fresh);
-  assert.equal(await client.acceptApproval(added, { logHead, approverPub: malloryApprover.signPub }, true), "approver-not-on-log");
+  assert.equal(await client.acceptApproval(added, { logHead, approverPub: malloryApprover.signPub }), "approver-not-on-log");
 });
 
 test("the code does not cover the box key or the role, so the new device checks its own entry", async () => {
@@ -473,14 +476,14 @@ test("the code does not cover the box key or the role, so the new device checks 
   const swappedBox = await append(log, { type: "add", ...addBody({ ...fresh, boxPub: mallory.boxPub }) }, owner);
   const trusted = await verifyLog(swappedBox, { now: now() });
   assert.equal(trusted.devices.get(fresh.signPub).boxPub, mallory.boxPub, "the core returns the entry as signed, for the device to compare");
-  assert.equal(await new ThinClient(fresh).acceptApproval(swappedBox, context, true), "wrong-box-key");
+  assert.equal(await new ThinClient(fresh).acceptApproval(swappedBox, context), "wrong-box-key");
 
   // A web page told "desktop" to the approver by the hub would hold a full device's authority. An honest page refuses it.
   const promoted = await append(log, { type: "add", ...addBody(fresh, "full") }, owner);
-  assert.equal(await new ThinClient(fresh).acceptApproval(promoted, { ...context, role: "client" }, true), "wrong-role");
+  assert.equal(await new ThinClient(fresh).acceptApproval(promoted, { ...context, role: "client" }), "wrong-role");
 });
 
-test("a hub playing a whole fake account: the log verifies, so only the person comparing codes stops it", async () => {
+test("a hub playing a whole fake account: the log verifies, and the account the password vouched for is what stops it", async () => {
   // REQUIREMENT on the clients: the core cannot refuse this one. A new device must not adopt any log until the person has
   // said the code it shows is also on another device of theirs. Otherwise the fake account's device can reach this machine.
   const { owner, fresh, logHead } = await approvalSetting();
@@ -501,8 +504,10 @@ test("a hub playing a whole fake account: the log verifies, so only the person c
   real.revealRandom();
   assert.notEqual(await real.code(), newCode);
 
+  // Nobody on the new device is asked anything now. What refuses this is that the password vouched for the real account at sign-in.
   const client = new ThinClient(fresh);
-  assert.equal(await client.acceptApproval(added, { logHead: fakeHead, approverPub: mallory.signPub }, false), "code-not-confirmed");
+  const accountId = "the id the password vouched for at sign-in";
+  assert.equal(await client.acceptApproval(added, { logHead: fakeHead, approverPub: mallory.signPub, account: accountId }), "not-the-account-the-password-vouched-for");
   assert.equal(client.log, null);
 });
 
@@ -1161,7 +1166,7 @@ async function dial(hub, account, keys, extra = {}) {
 async function registered(hub) {
   const family = await familyOf();
   const account = { email: "owner@example.com", loginKey: randomKey() };
-  const r = await post(hub, "/api/register", { email: account.email, salt: b64(randomBytes(16)), verifierInput: account.loginKey, firstLogEntry: family.log[0], bootstrapToken: BOOTSTRAP });
+  const r = await post(hub, "/api/register", { email: account.email, salt: b64(randomBytes(16)), verifierInput: account.loginKey, anchor: randomKey(), firstLogEntry: family.log[0], bootstrapToken: BOOTSTRAP });
   assert.equal(r.status, 201);
   return { ...family, account };
 }
@@ -1210,7 +1215,8 @@ test("honest path through the real hub: approval, then a channel, and the hub's 
   freshSocket.send({ type: "log.get" });
   const served = await freshSocket.next("log");
   const client = new ThinClient(fresh);
-  assert.equal(await client.acceptApproval(served.entries, { logHead: opening.logHead, approverPub: opening.approverPub }, shownOnNew === shownOnApprover), "adopted");
+  assert.equal(shownOnNew, shownOnApprover, "the code is the same on both, for anyone who glances");
+  assert.equal(await client.acceptApproval(served.entries, { logHead: opening.logHead, approverPub: opening.approverPub }), "adopted");
 
   // A channel over the real routing.
   const relay = async (from, to, toKey, value) => {

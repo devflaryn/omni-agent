@@ -6,7 +6,6 @@
 import { newDeviceExchange, sign } from "./account-core.js";
 import { LogError, compareLogs } from "./device-log.js";
 import { encodeOuter } from "./channel-frames.js";
-import { AccountError } from "./account-error.js";
 
 export const CLAIM_DOMAIN = "omni-approval-claim-v1";
 const encoder = new TextEncoder();
@@ -18,12 +17,13 @@ export const ALERT_TEXT = Object.freeze({
   fork: "The hub showed a device list that differs from this computer's at the same position. It was refused: the hub may be showing different lists to different devices.",
   "different-account": "The hub showed the device list of a different account. It was refused.",
   "bad-log": "A device list failed its signature checks and was refused.",
-  "fake-log": "This computer was told it was approved, but the device list does not follow the approval code you confirmed. It was refused, and this computer stays out of the account.",
+  "fake-log": "This computer was told it was approved, but the device list does not follow the approval code it was shown. It was refused, and this computer stays out of the account.",
   "log-unreconciled": "Another device has a device list this computer cannot get from the hub. The channel was refused: the hub may be hiding a change.",
   removed: "This device is no longer on the account.",
   recovered: "A device recovered this account with the recovery code. If that was not you, your recovery code is out and that device has full control.",
   "channel-failure": "An encrypted channel failed its check and was closed. A frame was changed, lost or replayed on the way.",
   "approval-failed": "An approval exchange failed its check and was abandoned. No code from it is shown.",
+  "bad-anchor": "The hub could not show that it holds the account your password belongs to. This computer did not sign in, and nothing was changed.",
   "refused-by-device": "A device on your account refused this computer, so the two hold different device lists. The hub may be hiding a change from one of them, or this computer may have been removed.",
   "hub-says-removed": "The hub says this device was removed from the account. This computer's own device list does not show that, so do not forget this device on the hub's word alone: check under Settings → Account → Devices on another device first.",
   "key-unavailable": "This computer's account keys could not be opened. Nothing was changed. To start over, sign out and forget this device.",
@@ -33,7 +33,7 @@ export const ALERT_TEXT = Object.freeze({
  * What the person must not miss: these are never pushed out by others. Every other kind can be raised by a hub at will
  * from public data, so each is one row with a count, whatever it is about.
  */
-const LASTING_ALERTS = new Set(["fork", "rollback", "fake-log", "different-account", "recovered", "removed", "log-unreconciled", "refused-by-device"]);
+const LASTING_ALERTS = new Set(["fork", "rollback", "fake-log", "bad-anchor", "different-account", "recovered", "removed", "log-unreconciled", "refused-by-device"]);
 /** A hub can make different-account or fake-log rows for ever by building new logs, so past this they count on the last row. */
 const MAX_ROWS_PER_KIND = 8;
 
@@ -76,11 +76,12 @@ export async function judgeLog(held, entries, { now, verifyLog }) {
 }
 
 /**
- * The log a device gets on being approved. It must verify, name this device in the add right after the head in the code,
- * signed by the key in the code, and not contradict any log this device held before. Without this, a hub could hand a new
- * device a made-up account. Returns {verified} or {alert: [kind, detail]}.
+ * The log a device gets on being approved. It must verify, belong to the account the password vouched for at sign-in (`account`),
+ * name this device in the add right after the head in the code, signed by the key in the code, and not contradict any log this
+ * device held before. Nobody confirms anything on a new device, so this is what stops a hub playing the approver itself and
+ * handing it a made-up account whose devices the hub controls. Returns {verified} or {alert: [kind, detail]}.
  */
-export async function checkApprovedLog(entries, { me, exchange, held, now, verifyLog }) {
+export async function checkApprovedLog(entries, { me, exchange, account, held, now, verifyLog }) {
   let verified;
   try {
     verified = await verifyLog(entries, { now });
@@ -88,6 +89,7 @@ export async function checkApprovedLog(entries, { me, exchange, held, now, verif
     if (!(error instanceof LogError)) throw error;
     return { alert: ["fake-log", "invalid"] };
   }
+  if (!account || verified.accountId !== account) return { alert: ["fake-log", String(verified.head)] };
   const added = entries.findIndex((entry) => entry.type === "add" && entry.body.signPub === me);
   const follows = added > 0 && entries[added].prev === exchange.head && entries[added].signer === exchange.from;
   if (!follows || !verified.devices.has(me)) return { alert: ["fake-log", String(verified.head)] };
@@ -107,7 +109,9 @@ export const signedClaimBytes = claimBytes;
 
 /**
  * The new device's side of an approval. The order is the security, and only the person starts another exchange: otherwise a
- * hub could keep trying values until the codes matched, and could replace one already confirmed.
+ * hub could keep trying values until the codes matched, and could replace one on the screen. The person is not asked anything
+ * here. The code is shown so that they can glance at it, and an exchange that checks out is ready at once (`confirmed`); what
+ * then stands between this device and a made-up account is checkApprovedLog.
  *   device()  {keys, name, kind} of this device
  *   send(to, opaque), changed(), alert(kind, detail), persist()
  */
@@ -129,7 +133,7 @@ export class NewDeviceApproval {
     this.current = null;
   }
 
-  /** After a restart: confirmed before it, and the code itself was not kept. */
+  /** After a restart: the exchange checked out before it, and the code itself was not kept. */
   resume({ from, head }) {
     this.#accept = false;
     this.current = { from, head, code: null, core: null, confirmed: true };
@@ -171,6 +175,8 @@ export class NewDeviceApproval {
       await exchange.core.receiveReveal(random);
       exchange.code = await exchange.core.code();
       exchange.core = null;
+      exchange.confirmed = true;
+      this.persist();
       this.changed();
     } catch {
       this.#fail();
@@ -190,19 +196,6 @@ export class NewDeviceApproval {
     this.current = null;
     this.failed = false;
     this.#accept = true;
-    this.persist();
-    this.changed();
-  }
-
-  /**
-   * The person at this device checked that the code here matches the approving device's. Without this step, a hacked hub could
-   * play the approver on its own and hand this device a made-up account whose devices it then controls: the log would follow
-   * the head of an exchange that was real, just not with any device of the person's.
-   */
-  confirm(code) {
-    if (!this.current?.code) throw new AccountError(409, "no-code", "There is no code to confirm yet.");
-    if (code !== this.current.code) throw new AccountError(400, "wrong-code", "That is not the code shown on this computer.");
-    this.current.confirmed = true;
     this.persist();
     this.changed();
   }

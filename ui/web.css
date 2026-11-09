@@ -24,3 +24,4 @@ body.web-shell { display: block; height: auto; min-height: 100dvh; overflow: aut
 .web-machine:disabled { opacity: 0.55; cursor: default; }
 .web-machine .machine-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .web-failed { padding: 16px; }
+.web-main > .welcome-card { width: 100%; }

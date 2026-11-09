@@ -50,7 +50,7 @@ It holds: account records, login verifiers, device logs, pending sign-ins, and w
 - Listens on 443, free today. nginx (80, 8081, 8082), the service on 8733 and SSH are not touched.
 - Serves the web page and `wss://` at `https://tomcamp.tech/` with a Let's Encrypt certificate. The user wants this one VPS to host everything, with no outside service.
 - Storage is a file or `node:sqlite` under `/var/lib/omni-hub` (builder's choice).
-- **Registration closes after the first account (my call):** the hub is a personal service. A hub setting reopens it.
+- **Registration closes after the first account (my call):** the hub is a personal service. A hub setting reopens it. *Changed 2026-11-09: there is no such setting. Later accounts need a single-use invite code from the first account's `full` device, and each sees only its own machines. See docs/accounts.md.*
 - **Email is a login name only (my call):** nothing is ever mailed, so no mail server. Addresses are not verified.
 
 ### 2. Signing in
@@ -75,6 +75,8 @@ The password never reaches the hub.
 - The hub accepts the first valid entry at each position. Devices also compare their log head inside every signed handshake (section 6). A device that sees a longer valid log adopts it. A device that sees two different entries at one position shows a security alert and refuses that channel.
 
 ### 4. Approving a new sign-in
+
+*Changed 2026-11-09, by the user's decision (PLAN-accounts-v2.md): one tap on the approving device, which also chooses the role; nothing is confirmed on the new device, and comparing is not forced. The new device instead checks, at sign-in, a value only the password can make that names the account, and adopts only that account. The accepted limit and the checks that remain are in docs/accounts.md. Steps 2, 4 and 5 below describe the first version.*
 
 1. The new device signs in with email and password. That gives only a **pending** session: it can wait for approval and nothing else.
 2. Every online `full` device shows a card: device kind and name, IP address as seen by the hub. The person presses **Review** on one. The other cards then say it is being reviewed there. One review at a time **(my call)**.

@@ -12,7 +12,7 @@
  *
  * The rules about the log and an approval are in log-trust.js, shared with the desktop.
  */
-import { loginKeyFrom, fromB64, newDeviceKeys, toB64 } from "./account-core.js";
+import { anchorMatches, fromB64, newDeviceKeys, signInKeysFrom, toB64 } from "./account-core.js";
 import { deviceCurrent, deviceExpiresAt, entryHash, verifyLog as realVerifyLog } from "./device-log.js";
 import { decodeOuter, foreignOuter } from "./channel-frames.js";
 import { AccountError } from "./account-error.js";
@@ -44,12 +44,13 @@ const PAGE_ALERT_TEXT = Object.freeze({
   fork: "The hub showed a device list that differs from this page's at the same position. It was refused: the hub may be showing different lists to different devices.",
   "different-account": "The hub showed the device list of a different account. It was refused.",
   "bad-log": "A device list failed its signature checks and was refused.",
-  "fake-log": "This page was told it was approved, but the device list does not follow the approval code you confirmed. It was refused, and this page stays out of the account.",
+  "fake-log": "This page was told it was approved, but the device list does not follow the approval code it was shown. It was refused, and this page stays out of the account.",
   "log-unreconciled": "Another device has a device list this page cannot get from the hub. The channel was refused: the hub may be hiding a change.",
   removed: "This page is no longer on the account.",
   recovered: "A device recovered this account with the recovery code. If that was not you, your recovery code is out and that device has full control.",
   "channel-failure": "An encrypted channel failed its check and was closed. A frame was changed, lost or replayed on the way.",
   "approval-failed": "An approval exchange failed its check and was abandoned. No code from it is shown.",
+  "bad-anchor": "The server could not show that it holds the account your password belongs to. This page did not sign in, and nothing was changed.",
   "refused-by-device": "A device on your account refused this page, so the two hold different device lists. The hub may be hiding a change from one of them, or this page may have been removed.",
   "hub-says-removed": "The hub says this page is no longer on the account, and this page's own device list does not show that. If it was not you, check your devices from a desktop or phone app.",
 });
@@ -60,7 +61,7 @@ const isFiniteDevice = (value) => typeof value === "string" && value.length > 0 
 
 /**
  * Events: status, devices, alert ({kind, message, at}), links (the machines), channel-closed.
- * store: page-store.js. deriveLoginKey(password, salt): the slow key, in a worker on a page.
+ * store: page-store.js. deriveKeys(password, salt): the slow {loginKey, anchorKey}, in a worker on a page.
  */
 export class PageAccount extends Emitter {
   #phase = "signed-out";
@@ -88,16 +89,17 @@ export class PageAccount extends Emitter {
   #store;
   #hub;
   #exchange;
+  #signedInTo = null; // the account the password vouched for at sign-in. Any log this page is handed must be that account's
   #channels;
 
-  constructor({ store, hubUrl, hubOrigin, now = Date.now, name = "Web page", kind = "web", deriveLoginKey = loginKeyFrom, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = realVerifyLog, machineLinks = {}, approverPollMs = 5 * SECOND }) {
+  constructor({ store, hubUrl, hubOrigin, now = Date.now, name = "Web page", kind = "web", deriveKeys = signInKeysFrom, WebSocketImpl, fetchImpl, reconnect = {}, limits = {}, verifyLogImpl = realVerifyLog, machineLinks = {}, approverPollMs = 5 * SECOND }) {
     super();
     const url = new URL(hubUrl);
     this.hubUrl = url.origin;
     this.hubOrigin = hubOrigin ?? url.origin;
     this.now = now;
     this.limits = { ...DEFAULT_LIMITS, ...limits };
-    this.deriveLoginKey = deriveLoginKey;
+    this.deriveKeys = deriveKeys;
     this.fetchImpl = fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.verifyLogImpl = verifyLogImpl;
     this.approverPollMs = approverPollMs;
@@ -204,7 +206,7 @@ export class PageAccount extends Emitter {
   #signedIn() { return this.#phase === "approved" || this.#phase === "pending"; }
 
   #saveState() {
-    return this.#store.set("state", { email: this.#email, name: this.#name, phase: this.#phase, exchange: this.#exchange.saved, knownRecoveries: this.#knownRecoveries, reason: this.#signedIn() ? null : this.#hubError });
+    return this.#store.set("state", { email: this.#email, name: this.#name, phase: this.#phase, exchange: this.#exchange.saved, signedInTo: this.#signedInTo, knownRecoveries: this.#knownRecoveries, reason: this.#signedIn() ? null : this.#hubError });
   }
 
   async #ensureKeys() {
@@ -247,6 +249,7 @@ export class PageAccount extends Emitter {
       this.#email = state.email ?? null;
       this.#name = state.name ?? this.#name;
       this.#knownRecoveries = Number.isSafeInteger(state.knownRecoveries) ? state.knownRecoveries : 0;
+      if (typeof state.signedInTo === "string") this.#signedInTo = state.signedInTo;
       if (state.exchange?.head) this.#exchange.resume(state.exchange);
       this.#hubError = typeof state.reason === "string" ? state.reason : null; // why this page is at the sign-in, across the reload that follows
     }
@@ -297,11 +300,14 @@ export class PageAccount extends Emitter {
     const { salt } = await post("/api/salt", { email });
     let saltBytes;
     try { saltBytes = fromB64(salt); } catch { throw new AccountError(502, "bad-salt", "The hub gave a salt that makes no sense."); }
-    const loginKey = toB64(await this.deriveLoginKey(password, saltBytes));
+    const keys = await this.deriveKeys(password, saltBytes);
+    const loginKey = toB64(keys.loginKey);
+    let vouched = null;
     const login = async () => {
-      const { session, state } = await post("/api/login", { email, loginKey, signPub: this.#keys.signPub, name: this.#name, kind: this.#kind });
+      const { session, state, accountId, anchor } = await post("/api/login", { email, loginKey, signPub: this.#keys.signPub, name: this.#name, kind: this.#kind });
       if (typeof session !== "string" || !session) throw new AccountError(502, "bad-login", "The hub's answer made no sense.");
       this.#session = session;
+      vouched = { accountId, anchor };
       await this.#store.set("session", session);
       return state;
     };
@@ -324,6 +330,14 @@ export class PageAccount extends Emitter {
       }
       this.#phase = "approved";
     } else {
+      // Only someone with this password can have made this. From now on the only account this page will join is this one: see
+      // the same step in server/account.mjs. On a hacked server the page itself may be changed, but the iPhone app runs this too.
+      if (!await anchorMatches(keys.anchorKey, vouched?.accountId, vouched?.anchor)) {
+        this.#alert("bad-anchor");
+        await this.#forgetSession();
+        throw new AccountError(502, "bad-anchor", PAGE_ALERT_TEXT["bad-anchor"]);
+      }
+      this.#signedInTo = vouched.accountId;
       this.#phase = "pending";
       this.#exchange.reset();
       this.#approvedByHub = false;
@@ -346,6 +360,7 @@ export class PageAccount extends Emitter {
     await this.#forgetSession();
     this.#phase = "signed-out";
     this.#exchange.current = null;
+    this.#signedInTo = null;
     this.#online = new Set();
     this.#approvedByHub = false;
     this.#hubError = null;
@@ -446,7 +461,8 @@ export class PageAccount extends Emitter {
       case "session.approved":
         this.#approvedByHub = true;
         this.#changed();
-        this.#tryFinishApproval();
+        // After the approval messages that came before it: the reveal may still be being checked.
+        this.#approvalChain = this.#approvalChain.then(() => this.#tryFinishApproval()).catch(() => {});
         return;
       case "pending.list":
         if (typeof message.approverOnline === "boolean" && message.approverOnline !== this.#approverOnline) {
@@ -604,14 +620,6 @@ export class PageAccount extends Emitter {
     return this.status();
   }
 
-  /** The person checked that this page's code matches the approving device's. Nothing is adopted before this. */
-  confirmCode(code) {
-    if (this.#phase !== "pending") throw new AccountError(409, "no-code", "There is no code to confirm yet.");
-    this.#exchange.confirm(code);
-    this.#tryFinishApproval();
-    return this.status();
-  }
-
   async #tryFinishApproval() {
     if (this.#phase !== "pending" || !this.#approvedByHub) return;
     const exchange = this.#exchange.current;
@@ -619,7 +627,7 @@ export class PageAccount extends Emitter {
       this.#alert("fake-log", "no-code");
       return;
     }
-    if (!exchange.confirmed) return;
+    if (!exchange.confirmed) return; // a commit taken, with no reveal yet
     let reply;
     try {
       reply = await this.#hub.rpc({ type: "log.get" }, ["log"]);
@@ -627,7 +635,7 @@ export class PageAccount extends Emitter {
       return; // the next connection tries again
     }
     if (this.#phase !== "pending" || this.#exchange.current !== exchange) return;
-    const { verified, alert } = await checkApprovedLog(reply.entries, { me: this.#keys.signPub, exchange, held: this.#log, now: this.now(), verifyLog: this.verifyLogImpl });
+    const { verified, alert } = await checkApprovedLog(reply.entries, { me: this.#keys.signPub, exchange, account: this.#signedInTo, held: this.#log, now: this.now(), verifyLog: this.verifyLogImpl });
     if (alert) {
       this.#alert(...alert);
       return;
@@ -635,6 +643,7 @@ export class PageAccount extends Emitter {
     await this.#run(() => this.#adopt(reply.entries, verified));
     this.#phase = "approved";
     this.#exchange.current = null;
+    this.#signedInTo = null;
     this.#approvedByHub = false;
     clearInterval(this.#approverTimer);
     await this.#saveState();
@@ -668,7 +677,6 @@ export class PageAccount extends Emitter {
       switch (name) {
         case "sign-in": return this.signIn(body);
         case "sign-out": return this.signOut(body ?? {});
-        case "confirm-code": return this.confirmCode(body?.code);
         case "restart-exchange": return this.restartExchange();
         case "alerts/clear": await this.clearAlerts(); return { ok: true };
         default: throw new AccountError(403, "web-page", NOT_ON_A_PAGE);

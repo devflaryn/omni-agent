@@ -6,13 +6,13 @@ import { PageAccount } from "./page-account.js";
 import { openPageStore } from "./page-store.js";
 import { createPageTransport } from "./page-transport.js";
 import { appMarkup, cleanName, machine, setChannelTransport, setMachine } from "./transport.js";
-import { alertAdvice, alertTitle } from "./account.js";
+import { alertAdvice, alertTitle, signInSurface } from "./account.js";
 import { forgetCachedModels } from "./model-cache.js";
 import { startServiceWorker } from "./web-sw.js";
 
 const SERVER_NOTICE = "This page comes from the server it connects to. If that server were hacked, it could serve a changed page, which could capture your password and, while open and signed in, run commands on your machines as you, up to reading a machine's keys. Use it for trusted moments. For anything sensitive, prefer the installed apps, and turn Allow web page access off on any machine where this matters.";
-const NO_ACCOUNT = "An account is created in the Omni desktop app, on your computer. This page cannot create one, and it has no recovery: a web page signs no changes to your account.";
-const LOG_TEXT = "Your password alone does not get in: one of your devices must also approve this page, with a code you compare. It can then control your machines for 30 days, and cannot approve or remove devices.";
+const NO_ACCOUNT = "To create an account, use the Omni desktop app on your computer. This page cannot create or recover one.";
+const LOG_TEXT = "Your password alone does not get in: one of your computers approves this page with one tap. The page can then use your computers for 30 days.";
 const PHASE_NOTE = {
   denied: "A device on the account refused this sign-in.",
 };
@@ -69,58 +69,29 @@ function alertBanners(s) {
   return box;
 }
 
-function field(parent, { label, type = "text", value = "", autocomplete, key }) {
-  const row = el("label", "acct-field");
-  row.appendChild(el("span", null, label));
-  const input = el("input");
-  input.type = type;
-  input.value = value;
-  input.dataset.key = key;
-  if (autocomplete) input.autocomplete = autocomplete;
-  input.spellcheck = false;
-  row.appendChild(input);
-  parent.appendChild(row);
-  return input;
-}
-
 function signInScreen(s) {
-  const c = card("Sign in");
-  const why = s.hub?.lastError ?? PHASE_NOTE[s.phase];
-  if (why) c.appendChild(el("p", "rm-note err", why));
-  c.appendChild(el("p", "rm-note", LOG_TEXT));
-  const f = el("form", "rm-form");
-  f.onsubmit = (e) => e.preventDefault();
-  const email = field(f, { label: "Email", type: "email", value: form.email, autocomplete: "username", key: "email" });
-  const password = field(f, { label: "Password", type: "password", autocomplete: "current-password", key: "password" });
-  const name = field(f, { label: "Name for this page", value: form.name || guessName(), key: "name" });
-  const out = el("p", "rm-note err");
-  out.textContent = formNote;
-  out.hidden = !formNote;
-  const go = button("Sign in", "primary", async (e) => {
-    const b = e.currentTarget;
-    b.disabled = true;
-    b.textContent = "Signing in…";
-    working = true;
-    form = { email: email.value.trim(), name: name.value.trim() };
-    formNote = "";
-    out.hidden = true;
-    try {
-      await account.signIn({ email: form.email, password: password.value, name: form.name });
-    } catch (error) {
-      formNote = error.code === "wrong-credentials" ? `${error.message} ${NO_ACCOUNT}` : error.message;
-    } finally {
-      working = false;
-      password.value = "";
-      render();
-    }
+  if (!form.name) form.name = guessName();
+  return signInSurface({
+    title: "Sign in",
+    intro: LOG_TEXT,
+    form,
+    nameLabel: "Name for this page",
+    error: formNote || s.hub?.lastError || PHASE_NOTE[s.phase] || "",
+    onSubmit: async (_mode, values) => {
+      working = true;
+      form = { email: values.email, name: values.name };
+      formNote = "";
+      try {
+        await account.signIn({ email: values.email, password: values.password, name: values.name });
+      } catch (error) {
+        formNote = error.code === "wrong-credentials" ? `${error.message} ${NO_ACCOUNT}` : error.message;
+      } finally {
+        working = false;
+        render();
+      }
+    },
+    footer: [el("p", "rm-note web-noaccount", NO_ACCOUNT), el("p", "rm-note web-notice", SERVER_NOTICE), forgetRow(s)],
   });
-  f.appendChild(go);
-  f.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go.click(); } });
-  c.append(f, out);
-  c.appendChild(el("p", "rm-note web-noaccount", NO_ACCOUNT));
-  c.appendChild(el("p", "rm-note web-notice", SERVER_NOTICE));
-  c.appendChild(forgetRow(s));
-  return c;
 }
 
 function forgetRow(s) {
@@ -137,30 +108,30 @@ function forgetRow(s) {
 
 const groupCode = (code) => String(code ?? "").replace(/(\d{3})(\d{3})/, "$1 $2");
 
-/** The code and the wait. Nothing is adopted before the person presses This matches, and only the person starts again. */
+/** The code and the wait. There is nothing to press here: the other device approves. Only the person starts again. */
 function waitingScreen(s) {
-  const c = card("Waiting for approval");
+  const c = card("Approve this page");
   const p = s.pending ?? {};
   const out = el("p", "rm-note err");
   out.hidden = true;
   const attempt = (work) => { try { work(); } catch (error) { out.textContent = error.message; out.hidden = false; } };
-  const again = () => button("Start again", "", () => attempt(() => account.restartExchange()));
+  const again = (label, cls) => button(label, cls, () => attempt(() => account.restartExchange()));
   const bar = el("div", "ap-bar");
   if (p.failed) {
-    c.appendChild(el("p", "rm-note err", "That exchange failed, so nothing was accepted. Press Start again here, then Review on the other device. Each failed try is visible: if this keeps happening, someone may be interfering."));
-    bar.appendChild(again());
-  } else if (p.confirmed) {
-    c.appendChild(el("p", "rm-note", "Codes confirmed. Waiting for the other device to approve. This page accepts nothing until the approval comes back and checks out against the code."));
-    bar.appendChild(again());
+    c.appendChild(el("p", "rm-note err", "That try did not go through, so nothing was approved. Press Start again here, then look at your other device. If this keeps happening, someone may be interfering."));
+    bar.appendChild(again("Start again", "primary"));
   } else if (p.code) {
-    c.appendChild(el("p", "rm-note", "Compare this code with the other screen."));
+    c.appendChild(el("p", "rm-note", "On one of your computers, a card has appeared. Approve it there. It shows this same code:"));
     c.appendChild(el("div", "acct-code", groupCode(p.code)));
-    c.appendChild(el("p", "rm-note", "Press This matches only if the other device shows exactly these six digits. If they differ, someone may be in the middle: press Start again, and do not approve there."));
-    bar.append(again(), button("This matches", "primary", () => attempt(() => account.confirmCode(p.code))));
+    c.appendChild(el("p", "rm-note", "If it shows a different code, do not approve there, and press The codes differ."));
+    bar.appendChild(again("The codes differ", "quiet"));
+  } else if (p.confirmed) {
+    c.appendChild(el("p", "rm-note", "Waiting for your other device to approve."));
+    bar.appendChild(again("Start again", "quiet"));
   } else {
-    c.appendChild(el("p", "rm-note", "Open Omni on a desktop or phone app signed in to this account. A card appears there: press Review, and a code appears here and there."));
-    if (!s.hub?.connected) c.appendChild(el("p", "rm-note err", s.hub?.lastError ?? "Connecting to the hub…"));
-    else if (p.approverOnline === false) c.appendChild(el("p", "rm-note err web-noapprover", "None of your desktop or phone apps is online right now, so nothing can approve this page. Open one and this page goes on from here. It waits for 10 minutes."));
+    c.appendChild(el("p", "rm-note", "Open Omni on a computer signed in to this account. A card appears there, and a code appears here."));
+    if (!s.hub?.connected) c.appendChild(el("p", "rm-note err", s.hub?.lastError ?? "Connecting…"));
+    else if (p.approverOnline === false) c.appendChild(el("p", "rm-note err web-noapprover", "None of your computers is online right now, so nothing can approve this page. Open Omni on one and this page goes on from here. It waits for 10 minutes."));
   }
   c.append(bar, out);
   const leave = el("div", "web-leave");
@@ -245,11 +216,11 @@ async function supported() {
   }
 }
 
-function loginKeyInWorker(password, salt) {
+function signInKeysInWorker(password, salt) {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./login-worker.js", import.meta.url), { type: "module" });
     const done = (fn, value) => { worker.terminate(); fn(value); };
-    worker.onmessage = ({ data }) => (data.key ? done(resolve, data.key) : done(reject, new Error("could not derive the login key")));
+    worker.onmessage = ({ data }) => (data.keys ? done(resolve, data.keys) : done(reject, new Error("could not derive the login key")));
     worker.onerror = () => done(reject, new Error("could not derive the login key"));
     worker.postMessage({ password, salt });
   });
@@ -264,7 +235,7 @@ async function boot() {
     return;
   }
   const store = await openPageStore();
-  account = new PageAccount({ store, hubUrl: location.origin, hubOrigin: location.origin, name: guessName(), deriveLoginKey: loginKeyInWorker });
+  account = new PageAccount({ store, hubUrl: location.origin, hubOrigin: location.origin, name: guessName(), deriveKeys: signInKeysInWorker });
   setChannelTransport(createPageTransport({ links: account.links, machine, local: account.routes() })); // from here on, words are this page's too
   account.on("status", (s) => {
     if (appLoaded) { if (s.phase !== "approved") location.reload(); return; }

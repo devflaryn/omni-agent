@@ -304,6 +304,16 @@ export class WindowGate {
     return out;
   }
 
+  /**
+   * Which kind of refusal, for the window to explain: `no-window` when this server was started with no desktop window (start.cmd,
+   * start.sh), `other-window` when it was, and this is not that window (a second launcher reusing the server, or a browser tab).
+   */
+  refusalCode(req) {
+    if (!req.omniHost) return "not-here";
+    if (!this.available) return "no-window";
+    return "other-window";
+  }
+
   /** Why this request may not use an account route, or null. */
   refusal(req) {
     if (!req.omniHost) return "only the desktop window on this computer can do that";

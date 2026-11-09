@@ -14,7 +14,9 @@ import { RecoveryStore } from "../server/account-recovery.mjs";
 import { channelClient, serveChannel } from "../server/channel-host.mjs";
 import { createApp } from "../server/index.mjs";
 import { FRAME, FRAME_VERSION, encodeFrame, encodeJson, encodeOuter } from "../ui/channel-frames.js";
-import { fromB64, newDeviceKeys, recoveryKeysFrom, sign, startHandshake, toB64 } from "../ui/account-core.js";
+import { randomBytes } from "node:crypto";
+import { approverExchange, fromB64, newDeviceExchange, newDeviceKeys, recoveryKeysFrom, sign, startHandshake, toB64 } from "../ui/account-core.js";
+import { signedClaimBytes } from "../ui/log-trust.js";
 import { append, canRecover, createLog, entryBytes, verifyLog } from "../ui/device-log.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -41,7 +43,8 @@ const testProtector = {
 };
 const quickKey = async (password, salt) => {
   const { createHash } = await import("node:crypto");
-  return new Uint8Array(createHash("sha256").update(password).update(salt).digest());
+  const part = (label) => new Uint8Array(createHash("sha256").update(label).update(password).update(salt).digest());
+  return { loginKey: part("login"), anchorKey: part("anchor") };
 };
 
 const cleanups = [];
@@ -86,7 +89,7 @@ function makeAccount(fixture, overrides = {}) {
   const dir = overrides.dir || join(freshDir(), "account");
   const tap = { sockets: [] };
   const account = new Account({
-    dir, hubUrl: fixture.url, hubOrigin: ORIGIN, name: "Device", kind: "desktop", protector: testProtector, deriveLoginKey: quickKey, WebSocketImpl: tappedSocket(tap),
+    dir, hubUrl: fixture.url, hubOrigin: ORIGIN, name: "Device", kind: "desktop", protector: testProtector, deriveKeys: quickKey, WebSocketImpl: tappedSocket(tap),
     log: (...a) => logged.push(a.join(" ")), reconnect: { minMs: 20, maxMs: 100 }, ...overrides,
   });
   account.tap = tap;
@@ -117,7 +120,6 @@ async function approveNewDevice(approver, newcomer, role = "full") {
   const review = await approver.review(row.id);
   const code = await until(() => newcomer.status().pending?.code, "the newcomer's code");
   assert.equal(review.code, code);
-  newcomer.confirmCode(code);
   await approver.approve(row.id, { code: review.code, role });
   await until(() => newcomer.status().phase === "approved", "the newcomer approved");
   return row;
@@ -311,7 +313,7 @@ test("a hub on plain http is refused unless it is on this machine", () => {
 
 test("sign-in with the real key derivation does not hold up the server", async () => {
   const fixture = await hubFixture();
-  const account = makeAccount(fixture, { deriveLoginKey: undefined });
+  const account = makeAccount(fixture, { deriveKeys: undefined });
   writeBootstrap(account.dir);
   let worst = 0, last = Date.now();
   const beat = setInterval(() => { const t = Date.now(); worst = Math.max(worst, t - last); last = t; }, 5);
@@ -319,10 +321,10 @@ test("sign-in with the real key derivation does not hold up the server", async (
   clearInterval(beat);
   assert.ok(out.recoveryCode);
   assert.ok(worst < 400, `the event loop stalled ${worst} ms`);
-  const second = makeAccount(fixture, { deriveLoginKey: undefined });
+  const second = makeAccount(fixture, { deriveKeys: undefined });
   await second.signIn({ email: EMAIL, password: PASSWORD, name: "Second" });
   assert.equal(second.status().phase, "pending", "the same key derivation reaches the same account");
-  const wrong = makeAccount(fixture, { deriveLoginKey: undefined });
+  const wrong = makeAccount(fixture, { deriveKeys: undefined });
   await assert.rejects(wrong.signIn({ email: EMAIL, password: `${PASSWORD}x`, name: "Third" }), (e) => e.status === 401);
 });
 
@@ -531,7 +533,7 @@ test("register over a landed registration: the exits are the right password, sav
   const A2 = await second.showRecoveryCode();
   clock2 += 10 * 60_000;
   await second.recoveryCodeSaved();
-  await assert.rejects(second.register({ email: EMAIL, password: "a mistyped long password", name: "First" }), (e) => e.code === "registration-closed" && /already holds another account/.test(e.message));
+  await assert.rejects(second.register({ email: EMAIL, password: "a mistyped long password", name: "First" }), (e) => e.code === "registration-closed" && /invite code is needed/.test(e.message));
   assert.equal(second.status().recoveryCodePending, false);
   assert.ok(!existsSync(join(killedDir2, "recovery-code.json")), "the attempt that created nothing left nothing");
   assert.equal(await codeWorks(fixture2, A2.recoveryCode), true);
@@ -774,7 +776,7 @@ test("sign-in passes the bootstrap token along when it is there, and keeps the f
 
 // ------------------------------------------------------------------------------- approving
 
-test("approval: the whole exchange, and the add entry comes only after the person confirmed the code", async () => {
+test("approval: the whole exchange, one tap on the approver, and nothing asked of the new device", async () => {
   const fixture = await hubFixture();
   const approver = await registered(fixture);
   const approvals = [];
@@ -808,10 +810,6 @@ test("approval: the whole exchange, and the add entry comes only after the perso
   const added = approver.devices().find((d) => d.name === "Laptop");
   assert.equal(added.role, "full");
   assert.equal(added.id, newcomer.status().device.id);
-  assert.equal(newcomer.status().phase, "pending", "still waits for its own person");
-
-  assert.throws(() => newcomer.confirmCode("123"), (e) => e.status === 400);
-  newcomer.confirmCode(code);
   await until(() => newcomer.status().phase === "approved", "the newcomer approved");
   assert.equal(newcomer.status().logHead, approver.status().logHead);
   assert.equal(newcomer.status().pending, null);
@@ -825,7 +823,6 @@ test("approval: the role is the approver's choice, client unless they say otherw
   const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Claims desktop"), "the card");
   const review = await approver.review(row.id);
   const code = await until(() => liar.status().pending?.code, "the code");
-  liar.confirmCode(code);
   await approver.approve(row.id, { code: review.code });
   assert.equal(approver.devices().find((d) => d.id === liar.status().device.id).role, "client");
   await until(() => liar.status().phase === "approved", "approved");
@@ -938,7 +935,6 @@ test("approval: on log.conflict the approver refreshes, tells the person, and mu
   newcomer.restartExchange();
   const again = await approver.review(row.id);
   const code = await until(() => newcomer.status().pending?.code === again.code && again.code, "the new code");
-  newcomer.confirmCode(code);
   await approver.approve(row.id, { code, role: "full" });
   await until(() => newcomer.status().phase === "approved", "approved after the second review");
 });
@@ -979,7 +975,6 @@ test("hacked hub: a log that does not follow the head in the code is refused, an
   const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
   const review = await approver.review(row.id);
   const code = await until(() => newcomer.status().pending?.code, "the code");
-  newcomer.confirmCode(code);
   assert.equal(code, review.code);
   // The real approval goes through, but this device is shown someone else's account.
   const fake = await fakeAccountAdding(newcomer);
@@ -999,7 +994,7 @@ test("hacked hub: a log signed by the real approver that does not follow the cod
   await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
   const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
   await approver.review(row.id);
-  newcomer.confirmCode(await until(() => newcomer.status().pending?.code, "the code"));
+  await until(() => newcomer.status().pending?.code, "the code");
   // Another entry slipped in before the add, as if taken from a stolen moment of the approver's key.
   const keys = await keysOf(approver);
   const other = await newDeviceKeys({ extractable: true });
@@ -1021,7 +1016,7 @@ test("hacked hub: an add right after the head, signed by a device other than the
   await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
   const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
   await approver.review(row.id);
-  newcomer.confirmCode(await until(() => newcomer.status().pending?.code, "the code"));
+  await until(() => newcomer.status().pending?.code, "the code");
   const entries = JSON.parse(readFileSync(join(approver.dir, "log.json"), "utf8"));
   const forged = await append(entries, { type: "add", name: "Laptop", kind: "desktop", role: "full", signPub: newcomer.status().device.id, boxPub: toB64(new Uint8Array(32).fill(7)) }, await keysOf(other));
   newcomer.tap.incoming = (m) => (m.type === "error" && m.for === "log.get" ? { type: "log", entries: forged, head: "x", version: forged.length } : m);
@@ -1103,7 +1098,6 @@ test("hacked hub: more commits while one exchange runs are ignored, and cannot r
   const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
   const review = await approver.review(row.id);
   const code = await until(() => newcomer.status().pending?.code, "the code");
-  newcomer.confirmCode(code);
   const stranger = await newDeviceKeys({ extractable: true });
   const commit = toB64(new Uint8Array(32).fill(4));
   for (let i = 0; i < 6; i++) inject(newcomer, { type: "approval.msg", from: stranger.signPub, opaque: JSON.stringify({ v: FRAME_VERSION, t: "commit", commit, logHead: "head" }) });
@@ -1123,7 +1117,6 @@ test("the confirmed code is not stored, and a restart between confirming and the
   const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
   const review = await approver.review(row.id);
   const code = await until(() => newcomer.status().pending?.code, "the code");
-  newcomer.confirmCode(code);
   const stored = await until(() => { try { const s = JSON.parse(readFileSync(join(newcomer.dir, "state.json"), "utf8")); return s.exchange ? s : null; } catch { return null; } }, "the confirmation on disk");
   assert.equal(stored.exchange.code, undefined);
   for (const content of onDisk(newcomer.dir)) assert.ok(!content.includes(`"${code}"`), "the code is on no file in that window");
@@ -1138,7 +1131,7 @@ test("the confirmed code is not stored, and a restart between confirming and the
   assert.equal(again.alerts.filter((a) => a.kind === "fake-log").length, 0);
 });
 
-test("a new device adopts nothing before its person confirms, even once the hub says approved", async () => {
+test("one tap: the code shows on the new device with nothing to press, and it lands when the approver approves", async () => {
   const fixture = await hubFixture();
   const approver = await registered(fixture);
   const newcomer = makeAccount(fixture);
@@ -1148,13 +1141,192 @@ test("a new device adopts nothing before its person confirms, even once the hub 
   const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
   const review = await approver.review(row.id);
   const code = await until(() => newcomer.status().pending?.code, "the code");
+  assert.equal(code, review.code);
+  assert.equal(typeof newcomer.confirmCode, "undefined", "there is no second confirmation to give");
+  assert.ok(!asked.includes("log.get"), "and no log is asked for before the approval");
   await approver.approve(row.id, { code: review.code, role: "full" });
-  await until(() => newcomer.status().pending.approvedByHub, "the hub's word");
-  await sleep(50);
+  await until(() => newcomer.status().phase === "approved", "approved");
+  assert.equal(newcomer.status().logHead, approver.status().logHead);
+  assert.equal(newcomer.alerts.length, 0);
+});
+
+test("one tap: an approval faster than the reveal's check is no false alarm", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture);
+  const newcomer = makeAccount(fixture);
+  await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
+  const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
+  // Approving in the same breath as the code appearing, with nobody reading anything.
+  const review = await approver.review(row.id);
+  await approver.approve(row.id, { code: review.code, role: "client" });
+  await until(() => newcomer.status().phase === "approved", "approved");
+  assert.equal(newcomer.alerts.length, 0);
+});
+
+/** A hacked hub playing the approver for this device: a real exchange, with its own key, over the head of its own log. */
+async function hubPlaysApprover(newcomer, approverKeys, head) {
+  const exchange = await approverExchange({ approverPub: approverKeys.signPub, newPub: newcomer.status().device.id, logHead: head });
+  const random = new Promise((resolve) => {
+    const before = newcomer.tap.outgoing;
+    newcomer.tap.outgoing = (m) => {
+      if (m.type === "approval.msg" && JSON.parse(m.opaque).t === "random") { resolve(JSON.parse(m.opaque).random); return null; }
+      return before ? before(m) : m;
+    };
+  });
+  inject(newcomer, { type: "approval.msg", from: approverKeys.signPub, opaque: encodeOuter({ t: "commit", commit: exchange.commit, logHead: head }) });
+  exchange.receiveRandom(await random);
+  inject(newcomer, { type: "approval.msg", from: approverKeys.signPub, opaque: encodeOuter({ t: "reveal", random: exchange.revealRandom() }) });
+}
+
+test("hacked hub: playing the approver alone, with a made-up account, gets nowhere though nobody presses anything", async () => {
+  const fixture = await hubFixture();
+  await registered(fixture);
+  const newcomer = makeAccount(fixture);
+  await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
+  await until(() => newcomer.status().hub.connected, "connected");
+  const fake = await fakeAccountAdding(newcomer);
+  await hubPlaysApprover(newcomer, fake.attacker, fake.head);
+  const code = await until(() => newcomer.status().pending?.code, "the code from the hub's own exchange");
+  assert.match(code, /^\d{6}$/);
+  // Every check of the exchange passed, and the add follows the head in the code, signed by the key in the code.
+  const entries = await fake.withDevice();
+  assert.equal(entries.at(-1).prev, fake.head);
+  assert.equal(entries.at(-1).signer, fake.attacker.signPub);
+  newcomer.tap.incoming = (m) => (m.type === "error" && m.for === "log.get" ? { type: "log", entries, head: "x", version: entries.length } : m);
+  inject(newcomer, { type: "session.approved" });
+  await until(() => newcomer.alerts.some((a) => a.kind === "fake-log"), "the alert");
+  assert.equal(newcomer.status().phase, "pending", "it is not the account the password vouched for");
   assert.equal(newcomer.status().logHead, null);
-  assert.ok(!asked.includes("log.get"), "does not even fetch it");
-  newcomer.confirmCode(code);
-  await until(() => newcomer.status().phase === "approved", "now it does");
+  assert.deepEqual(newcomer.devices(), []);
+});
+
+test("hacked hub: an account made up for this password cannot get past sign-in, with no anchor, another's, or one for another id", async () => {
+  const fixture = await hubFixture();
+  await registered(fixture);
+  const made = randomBytes(16).toString("base64");
+  for (const lie of [{ anchor: null }, { anchor: randomBytes(32).toString("base64") }, { accountId: made }, { accountId: undefined, anchor: undefined }]) {
+    const newcomer = makeAccount(fixture, { fetchImpl: async (url, init) => {
+      const r = await fetch(url, init);
+      if (!String(url).endsWith("/api/login")) return r;
+      return new Response(JSON.stringify({ ...await r.json(), ...lie }), { status: r.status });
+    } });
+    await assert.rejects(newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" }), (e) => e.code === "bad-anchor", JSON.stringify(lie));
+    assert.equal(newcomer.status().phase, "signed-out");
+    assert.equal(newcomer.status().hub.connected, false);
+    assert.ok(newcomer.alerts.some((a) => a.kind === "bad-anchor"));
+    assert.ok(!existsSync(join(newcomer.dir, "session.json")), "no session is kept from it");
+  }
+});
+
+test("the hub never sees what vouches for an account: not the anchor key, and the anchor differs from the login key", async () => {
+  const fixture = await hubFixture();
+  const sent = [];
+  const account = makeAccount(fixture, { fetchImpl: async (url, init) => { sent.push(init.body); return fetch(url, init); } });
+  writeBootstrap(account.dir);
+  await account.register({ email: EMAIL, password: PASSWORD, name: "First" });
+  const { anchorKey, loginKey } = await quickKey(PASSWORD, fromB64(JSON.parse(sent.find((b) => b.includes("firstLogEntry"))).salt));
+  const everything = sent.join("\n");
+  assert.ok(everything.includes(toB64(loginKey)), "the login key does cross, as it always did");
+  assert.ok(!everything.includes(toB64(anchorKey)), "the anchor key never does");
+});
+
+test("a changed password goes on vouching for the account: a new device signs in with the new one, and joins", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture);
+  await approver.changePassword({ current: PASSWORD, next: "a whole new long password" });
+  const newcomer = makeAccount(fixture);
+  await newcomer.signIn({ email: EMAIL, password: "a whole new long password", name: "Laptop" });
+  await approveNewDevice(approver, newcomer);
+  assert.equal(newcomer.status().phase, "approved");
+});
+
+test("the account a sign-in was vouched for survives a restart, and still decides what is adopted", async () => {
+  const fixture = await hubFixture();
+  await registered(fixture);
+  const newcomer = makeAccount(fixture);
+  await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
+  await until(() => newcomer.status().hub.connected, "connected");
+  const fake = await fakeAccountAdding(newcomer);
+  await hubPlaysApprover(newcomer, fake.attacker, fake.head);
+  await until(() => newcomer.status().pending?.code, "the code");
+  await until(() => { try { return JSON.parse(readFileSync(join(newcomer.dir, "state.json"), "utf8")).exchange; } catch { return null; } }, "the exchange on disk");
+  await newcomer.stop();
+  const again = makeAccount(fixture, { dir: newcomer.dir });
+  await again.start();
+  await until(() => again.status().hub.connected, "reconnected");
+  const entries = await fake.withDevice();
+  again.tap.incoming = (m) => (m.type === "error" && m.for === "log.get" ? { type: "log", entries, head: "x", version: entries.length } : m);
+  inject(again, { type: "session.approved" });
+  await until(() => again.alerts.some((a) => a.kind === "fake-log"), "the alert");
+  assert.equal(again.status().phase, "pending");
+});
+
+/*
+ * THE ACCEPTED LIMIT, decided by the owner on 2026-11-09 (PLAN-accounts-v2.md, decision 1) and stated in docs/accounts.md and on
+ * the approval card. This test documents it: it passes because the attack WORKS. If it starts failing because the attack fails,
+ * that is good news, and the card and the docs can say less.
+ *
+ * Comparing the code is no longer forced. A hacked hub can show the approver a card for a device of its own while the person is
+ * signing in somewhere else. Every automatic check passes, because the approver really is talking to a device with that key. Only
+ * the person can notice: the code on their card is not the code on their new device.
+ */
+test("ACCEPTED LIMIT: someone who approves without glancing at the code can let in a hacked hub's device", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture);
+  const person = makeAccount(fixture);
+  await person.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
+  await until(() => person.status().hub.connected, "the person's real new device");
+
+  // The hub puts its own key on the card in place of the person's, and answers for it.
+  const mallory = await newDeviceKeys({ extractable: true });
+  const realKey = person.status().device.id;
+  const myKey = approver.status().device.id;
+  approver.tap.incoming = (m) => (m.type === "pending.list" ? { ...m, pending: m.pending.map((r) => (r.signPub === realKey ? { ...r, signPub: mallory.signPub } : r)) } : m);
+  approver.tap.outgoing = (m) => {
+    if (m.type !== "approval.msg" || m.to !== mallory.signPub) return m;
+    const outer = JSON.parse(m.opaque);
+    if (outer.t === "commit") {
+      (async () => {
+        const core = await newDeviceExchange({ approverPub: myKey, newPub: mallory.signPub, logHead: outer.logHead });
+        core.receiveCommit(outer.commit);
+        const claim = { name: "Laptop", kind: "desktop", boxPub: mallory.boxPub };
+        const sig = await sign(mallory.sign.privateKey, signedClaimBytes(claim, outer.logHead, myKey));
+        inject(approver, { type: "approval.msg", from: mallory.signPub, opaque: encodeOuter({ t: "random", random: core.releaseRandom(), claim, sig }) });
+      })();
+    }
+    return null;
+  };
+  approver.tap.sockets.at(-1).real.send(JSON.stringify({ type: "pending.list" }));
+  const row = await until(() => approver.pendingSignIns().find((r) => r.signPub === mallory.signPub), "the hub's card");
+  assert.equal(row.name, "Laptop", "to the person it looks like the sign-in they just started");
+
+  const review = await approver.review(row.id);
+  assert.match(review.code, /^\d{6}$/, "every automatic check passed");
+  assert.notEqual(person.status().pending?.code, review.code, "this is the only thing that gives it away: the person's own screen shows another code, or none");
+
+  // One tap, without a glance.
+  await approver.approve(row.id, { code: review.code, role: "full" });
+  const admitted = approver.devices().find((d) => d.id === mallory.signPub);
+  assert.equal(admitted?.role, "full", "the hub's device is on the account, with the role the person chose");
+  assert.ok(!approver.devices().some((d) => d.id === realKey), "and the person's own device is not");
+  assert.equal(person.status().phase, "pending", "which is still waiting");
+});
+
+test("what that limit does not reach: a stolen password alone adds nothing, and a device cannot be added with no tap", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture);
+  const thief = makeAccount(fixture);
+  await thief.signIn({ email: EMAIL, password: PASSWORD, name: "Looks fine" });
+  const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Looks fine"), "the card");
+  const review = await approver.review(row.id);
+  assert.equal(approver.status().logVersion, 1, "showing the code signs nothing");
+  await sleep(100);
+  assert.equal(approver.status().logVersion, 1);
+  assert.equal(thief.status().phase, "pending");
+  await approver.deny(row.id);
+  await until(() => thief.status().phase === "denied", "denied");
+  await assert.rejects(approver.approve(row.id, { code: review.code, role: "full" }), (e) => e.status === 409);
+  assert.equal(approver.status().logVersion, 1);
 });
 
 // ------------------------------------------------------------------------------- the log on disk
@@ -2328,7 +2500,7 @@ test("register: an error from the hub keeps the code unless it shows nothing was
   account = makeAccount(fixture);
   mkdirSync(account.dir, { recursive: true });
   writeFileSync(join(account.dir, "bootstrap-token"), "wrong-token-0123456789");
-  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "x" }), (e) => e.code === "registration-closed" && /already holds another account/.test(e.message));
+  await assert.rejects(account.register({ email: EMAIL, password: PASSWORD, name: "x" }), (e) => e.code === "registration-closed" && /invite code is needed/.test(e.message));
   assert.equal(account.status().recoveryCodePending, false);
   assert.ok(!existsSync(join(account.dir, "recovery-code.json")));
 });
@@ -2785,7 +2957,7 @@ test("the whole way: the window's routes run the account, and another device rea
   const accountDir = join(dir, "account");
   writeBootstrap(accountDir);
   const token = "window-token-for-the-whole-way-0123456789";
-  const app = await createApp(appOptions(dir, { accountDir, accountHub: fixture.url, windowToken: token, accountOptions: { hubOrigin: ORIGIN, protector: testProtector, deriveLoginKey: quickKey, reconnect: { minMs: 20, maxMs: 100 } } }));
+  const app = await createApp(appOptions(dir, { accountDir, accountHub: fixture.url, windowToken: token, accountOptions: { hubOrigin: ORIGIN, protector: testProtector, deriveKeys: quickKey, reconnect: { minMs: 20, maxMs: 100 } } }));
   await app.listen();
   cleanups.push(async () => { app.close(); });
   const at = `http://127.0.0.1:${app.server.address().port}`;
@@ -2827,7 +2999,6 @@ test("the whole way: the window's routes run the account, and another device rea
   assert.equal(review.status, 200);
   const code = await until(() => phone.status().pending?.code, "the code");
   assert.equal(review.json.code, code);
-  phone.confirmCode(code);
   const approved = await call("POST", "approve", { id: row.id, code, role: "full" });
   assert.equal(approved.status, 200);
   await until(() => phone.status().phase === "approved", "the phone approved");
@@ -2858,4 +3029,138 @@ test("the whole way: the window's routes run the account, and another device rea
   const out = await call("POST", "sign-out", { forget: true });
   assert.equal(out.json.phase, "signed-out");
   await events.body.cancel().catch(() => {});
+});
+
+// ------------------------------------------------------------------------------- invites, the first run, and other people
+
+test("invites: the hub's owner makes, lists and revokes them; a code is shown once and lets one other person in", async () => {
+  const fixture = await hubFixture();
+  const owner = await registered(fixture);
+  const made = await owner.createInvite();
+  assert.match(made.code, /^[2-9A-Z]{4}(-[2-9A-Z]{4}){3}$/);
+  assert.ok(made.expiresAt > Date.now() + 13 * 24 * 3600_000);
+  const { invites } = await owner.invites();
+  assert.deepEqual(invites.map((i) => [i.id, i.state]), [[made.id, "live"]]);
+  assert.ok(!JSON.stringify(invites).includes(made.code.replace(/-/g, "")), "the list never shows a code");
+
+  const other = makeAccount(fixture);
+  const out = await other.register({ email: "friend@example.com", password: "another long password", name: "Friend", inviteCode: made.code });
+  assert.ok(out.recoveryCode);
+  assert.equal(other.status().phase, "approved");
+  assert.equal((await owner.invites()).invites[0].state, "used");
+  // The two are strangers to each other.
+  assert.ok(!owner.devices().some((d) => d.name === "Friend"));
+  assert.ok(!other.devices().some((d) => d.name === "First"));
+
+  await until(() => other.status().hub.connected, "the friend's socket");
+  await assert.rejects(other.createInvite(), (e) => e.status === 403 && e.code === "forbidden", "only the owner's devices make invites");
+  await assert.rejects(other.invites(), (e) => e.code === "forbidden");
+
+  const spare = await owner.createInvite();
+  await owner.revokeInvite(spare.id);
+  const late = makeAccount(fixture);
+  await assert.rejects(late.register({ email: "late@example.com", password: "another long password", inviteCode: spare.code }), (e) => e.code === "bad-invite");
+  assert.equal(late.status().recoveryCodePending, false, "nothing was created, so no code is held");
+});
+
+test("register with no invite after the first account says an invite is needed, and creates nothing", async () => {
+  const fixture = await hubFixture();
+  await registered(fixture);
+  const other = makeAccount(fixture);
+  await assert.rejects(other.register({ email: "x@example.com", password: "another long password" }), (e) => e.code === "registration-closed" && /invite code is needed/.test(e.message));
+  assert.equal(other.status().recoveryCodePending, false);
+});
+
+test("the first run: offered while nothing was ever chosen, and a choice to stay local is remembered", async () => {
+  const fixture = await hubFixture();
+  const account = makeAccount(fixture);
+  await account.start();
+  assert.equal(account.status().firstRun, true);
+  assert.equal(account.status().canCreateFirst, false);
+  writeBootstrap(account.dir);
+  assert.equal((await account.refreshStatus()).canCreateFirst, true, "the token on this computer is what creates the first account");
+  await account.chooseWelcome("local");
+  assert.equal(account.status().firstRun, false);
+  await account.stop();
+  const again = makeAccount(fixture, { dir: account.dir });
+  await again.start();
+  assert.equal(again.status().firstRun, false, "remembered across a restart");
+  assert.equal(again.status().phase, "signed-out", "and it signed nothing in");
+});
+
+test("the first run is not offered to a computer that has signed in before", async () => {
+  const fixture = await hubFixture();
+  const account = await registered(fixture);
+  assert.equal(account.status().firstRun, false);
+  await account.signOut();
+  assert.equal(account.status().firstRun, false);
+  await account.signOut({ forget: true });
+  assert.equal(account.status().firstRun, false, "forgetting a device is not a new computer: the person has chosen before");
+});
+
+test("the window's routes: invites, the first-run choice, and the reason an account action is refused", async () => {
+  const fixture = await hubFixture();
+  const dir = freshDir();
+  const accountDir = join(dir, "account");
+  writeBootstrap(accountDir);
+  const token = "window-token-for-invites-0123456789";
+  const app = await createApp(appOptions(dir, { accountDir, accountHub: fixture.url, windowToken: token, accountOptions: { hubOrigin: ORIGIN, protector: testProtector, deriveKeys: quickKey, reconnect: { minMs: 20, maxMs: 100 } } }));
+  await app.listen();
+  cleanups.push(async () => { app.close(); });
+  const at = `http://127.0.0.1:${app.server.address().port}`;
+  const noCookie = await fetch(`${at}/api/account/status`, { headers: { origin: at } });
+  assert.equal(noCookie.status, 403);
+  assert.equal((await noCookie.json()).code, "other-window", "a window that did not get this server's token is told so");
+  const swap = await fetch(`${at}/?desktop=1&token=${token}`, { redirect: "manual" });
+  const cookie = swap.headers.get("set-cookie").split(";")[0];
+  const call = async (method, path, body) => {
+    const r = await fetch(`${at}/api/account/${path}`, { method, headers: { cookie, origin: at, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+    return { status: r.status, json: await r.json() };
+  };
+  const first = (await call("GET", "status")).json;
+  assert.equal(first.firstRun, true);
+  assert.equal(first.canCreateFirst, true);
+  assert.equal((await call("POST", "welcome", { choice: "local" })).status, 200);
+  assert.equal((await call("GET", "status")).json.firstRun, false);
+  assert.equal((await call("POST", "welcome", { choice: "anything" })).status, 400);
+
+  await call("POST", "register", { email: EMAIL, password: PASSWORD, name: "Host" });
+  await call("POST", "recovery-code/saved");
+  await until(async () => (await call("GET", "status")).json.hub.connected, "the host's socket");
+  const made = await call("POST", "invites", {});
+  assert.equal(made.status, 200);
+  assert.match(made.json.code, /-/);
+  const list = await call("GET", "invites");
+  assert.deepEqual(list.json.invites.map((i) => i.state), ["live"]);
+  assert.equal((await call("POST", "invites/revoke", { id: made.json.id })).status, 200);
+  assert.deepEqual((await call("GET", "invites")).json.invites, []);
+});
+
+test("a server started with no window token says so, in its own words", async () => {
+  const dir = freshDir();
+  const app = await createApp(appOptions(dir, { accountDir: join(dir, "account"), accountHub: "http://127.0.0.1:9", windowToken: "" }));
+  await app.listen();
+  cleanups.push(async () => { app.close(); });
+  const at = `http://127.0.0.1:${app.server.address().port}`;
+  const r = await fetch(`${at}/api/account/status`, { headers: { origin: at } });
+  assert.equal(r.status, 403);
+  assert.equal((await r.json()).code, "no-window");
+});
+
+test("codes that differ: the new device starts again, the approver gets a new code for the same sign-in, and it lands", async () => {
+  const fixture = await hubFixture();
+  const approver = await registered(fixture);
+  const newcomer = makeAccount(fixture);
+  await newcomer.signIn({ email: EMAIL, password: PASSWORD, name: "Laptop" });
+  const row = await until(() => approver.pendingSignIns().find((r) => r.name === "Laptop"), "the card");
+  const first = await approver.review(row.id);
+  await until(() => newcomer.status().pending?.code, "the first code");
+  newcomer.restartExchange();
+  const second = await approver.review(row.id);
+  const code = await until(() => newcomer.status().pending?.code, "the second code");
+  assert.equal(code, second.code);
+  assert.equal(approver.status().review.code, second.code);
+  await assert.rejects(approver.approve(row.id, { code: first.code === second.code ? "x" : first.code, role: "full" }), (e) => e.status === 400, "the old code is gone");
+  await approver.approve(row.id, { code: second.code, role: "full" });
+  await until(() => newcomer.status().phase === "approved", "approved");
 });

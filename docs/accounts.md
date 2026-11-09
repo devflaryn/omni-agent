@@ -4,6 +4,8 @@ One account reaches every computer signed in to it, from the desktop app, a web 
 
 Signing in is optional. An app not signed in works on its own computer as before, and local use never depends on the VPS.
 
+Each account belongs to one person and sees only its own computers. The first account is the hub's **owner**, and other people join with an [invite code](#inviting-someone) from the owner.
+
 **State of things on 2026-11-03:**
 
 - The hub is live. When it was last deployed (Task 8) no account was on it, so your first registration and first sign-in will be the first real ones over the live connection.
@@ -13,12 +15,21 @@ Signing in is optional. An app not signed in works on its own computer as before
 
 ## First use: creating the account
 
-Do this once, in the desktop app, on the PC that holds the file `~/.omni-agent/account/bootstrap-token`. That token is what lets the hub accept its first account. On any other computer the hub answers that it is closed to registration. Registering deletes the token file.
+Do this once, in the desktop app, on the PC that holds the file `~/.omni-agent/account/bootstrap-token`. That token is what lets the hub accept its first account, with no invite code. On any other computer creating an account needs an [invite code](#inviting-someone). Registering deletes the token file.
 
-1. Open Omni with its desktop launcher (**Omni Agent.cmd** or **Omni Agent.command**). A server started with `start.cmd` or `start.sh`, or a launcher reusing a server that was already running, gets no account access, and Settings says "This needs the desktop app". If you see that, close Omni fully and open it with the launcher.
-2. Open **Settings → Account**, and choose **Create the account**.
+1. Open Omni with its desktop launcher (**Omni Agent.cmd** or **Omni Agent.command**).
+2. The first time, Omni shows **Welcome to Omni Agent**, with **Sign in**, **Create an account** and **Continue without an account**. Choose **Create an account**. On the PC with the token there is no invite code field. (Later, or if you chose to continue without an account, it is under **Settings → Account → Create an account**.)
 3. Fill in **Email**, **Password**, **Password again** and **Name for this computer**, then press **Create the account**.
 4. The **Save your recovery code** screen appears. Copy the code and put it somewhere safe, away from this computer. Press **I saved it**.
+
+**Continue without an account** is remembered on that computer, and the welcome screen does not come back. Nothing on it waits for the VPS.
+
+**If Settings → Account says "Signing in is off in this window"**, the window cannot reach this computer's account, and everything else still works:
+
+- "Omni was started without its window": the server was started with `start.cmd` or `start.sh`, or by a launcher that found such a server already running. Close Omni, then open it with the launcher.
+- "Another Omni window holds this computer's sign-in": a launcher found an Omni server that another launcher started, and opened a second window on it, or this is a browser tab. Use the first window, or close every Omni window and open Omni again.
+
+The welcome screen is not shown in such a window.
 
 **The password.** At least 12 characters. It never reaches the hub.
 
@@ -37,31 +48,52 @@ Do this once, in the desktop app, on the PC that holds the file `~/.omni-agent/a
 
 ## Adding a device
 
-On the new device, sign in: **Settings → Account → Sign in** in the desktop app, or the [web page](#the-web-page). That gives only a pending session. It can wait for approval and nothing else.
+On the new device, sign in: on the welcome screen or under **Settings → Account → Sign in** in the desktop app, or on the [web page](#the-web-page). That gives only a pending session. It can wait for approval and nothing else.
 
 On every online `full` device, a **New sign-in** card appears anywhere in the app. It shows:
 
 - **It says its name is**, **It says it is a**: the new device's own claims, not facts.
-- **Address the hub saw**: the IP address as the hub reports it.
+- **From address**: the IP address as the hub reports it.
 - The time it expires. A pending sign-in lasts 10 minutes.
 
 If no `full` device is online, the new device waits. A recovery code is the only other way in.
 
 Then:
 
-1. Press **Review** on one device. Other cards then say it is being reviewed there. One review runs at a time.
-2. Both screens show a 6-digit code. **Compare them digit by digit.** Someone in the middle would have to fix their value before seeing yours, so they match by luck one time in a million.
-3. Choose what this device is, with the tick box **This is my desktop or phone app**:
-   - **Off (the default): a limited web page,** role `client`. It can control machines for 30 days, then must be approved again. It cannot approve or remove devices.
-   - **On: full control,** role `full`. It can approve and remove devices and change the password, and it does not expire. A device is listed as a machine only if it is `full` and says it is a desktop.
-   - **The choice is yours, not the new device's.** A changed page can claim to be anything. Choosing `full` for something opened in a browser gives that page full control. Tick it only for an app you installed.
-   - **A desktop approved with the box off** is not listed as a machine. To fix it, remove it, press **Forget this device** on it, and add it again.
-4. If the codes match, press **The codes match: approve** here and **This matches** on the new device. The new device accepts nothing until you press **This matches**.
-5. If the codes differ, do not approve. Press **Start again** on the new device, then **Review** on the other. Each failed try is visible, and the app never restarts an exchange by itself. If this keeps happening, someone may be interfering.
+1. The card fetches a 6-digit code by itself. The same code appears on the new device. On the other devices' cards it says the sign-in is being approved there. One sign-in is approved at a time.
+2. The card says: "Check that the new device shows the same code before you approve." Glance at the new device.
+3. Press one of the two buttons. That one tap approves the device, and chooses what it may do:
+   - **Approve as an app (full control)**, role `full`. It can approve and remove devices and change the password, and it does not expire. A device is listed as a machine only if it is `full` and says it is a desktop.
+   - **Approve as a web page (limited)**, role `client`. It can control machines for 30 days, then must be approved again. It cannot approve or remove devices.
+   - **The choice is yours, not the new device's.** What the device says it is only decides which button comes first and is highlighted: a device that says it is a web page gets the limited button first. A changed page can claim to be a desktop, so choosing full control for something opened in a browser gives that page full control. Choose it only for an Omni app you installed.
+   - **A desktop approved as a web page** is not listed as a machine. To fix it, remove it, press **Forget this device** on it, and add it again.
+4. Nothing is pressed on the new device. It joins as soon as the approval arrives and checks out.
+5. If the codes differ, do not approve. Press **The codes differ** on the new device, then **Get a new code** on the card. Each failed try is visible, and the app never restarts an exchange by itself. If this keeps happening, someone may be interfering.
 
 **Deny** blocks that attempt. The new device says "A device on the account refused this sign-in." and can try again. Deny anything you did not start. If the attempt was not you, assume your password is out, and change it under **Settings → Account → Change the password**.
 
 An approved device needs no per-action approval. Signed in means full control.
+
+### What one tap checks, and the limit you accepted
+
+Before any button appears, and whether or not you look at the code, these checks run and refuse on any failure:
+
+- **The order of the exchange.** The approving device commits to its random value before it sees the new device's, and reveals it only after. So nobody in the middle can try values until the two codes match. A reveal that does not fit the commitment ends the exchange, shows no code, and raises an alert.
+- **Signatures.** The new device's name, kind and encryption key are signed with its own key, bound to the approver and to the device list the code was made from. A hub that swaps any of them is caught before the reveal.
+- **The device list the new device adopts.** It must verify from the start, add this device right after the list that went into the code, be signed by the device that made the code, and not contradict any list this device held.
+- **The account itself.** At sign-in the hub must show a value that only someone with the password can have made, naming the account. The new device checks it against the password before it does anything else, and from then on it joins only that account. This is what stops a hacked hub playing the approver itself and handing a new device a made-up account, now that nobody confirms anything on the new device. The value is made from the password with the same slow derivation as the login key, by a different label, and the hub never receives what makes it.
+
+**The limit, accepted on 2026-11-09:** comparing the code is no longer forced. A hacked hub can show your device a card for a device of its own while you are signing in somewhere else, and every check above passes, because your device really is talking to a device with that key. Only the code gives it away: the card shows a code your new device does not. **If you approve without glancing at the code, a hacked hub's device can get in**, with the role you chose. A stolen password alone still gets nowhere, because nothing is added without your tap. `test/account.test.mjs` has a test named "ACCEPTED LIMIT" that shows this attack working.
+
+## Inviting someone
+
+Other people can have their own accounts on your hub, each seeing only their own computers. Creating an account needs an invite code from the hub's owner.
+
+- **Making one:** on a `full` device of the owner's account, **Settings → Account → Invite someone → Make an invite code**. The code is shown once. Press **Copy** and pass it on. Omni does not keep it and cannot show it again.
+- **What it does:** it lets one person create one account, once, within 14 days. They type it under **Create an account**, in any case, with or without the dashes.
+- **The list** under **Invite someone** shows each invite as Open, Used or Expired, with dates, never the code. **Revoke** ends an open one at once. Used and expired ones drop off the list 30 days later.
+- **Only the owner** sees **Invite someone**. The hub decides who that is: the account created with the bootstrap token. Another account's devices, a web page and a sign-in still waiting for approval are all refused.
+- **Nothing crosses between accounts.** Frames, device lists, presence, pending sign-ins and invites stay on their own account, and a device of one account cannot reach a device of another. To the sender, another account's device looks exactly like no device at all.
 
 ## Choosing a machine
 
@@ -93,10 +125,9 @@ Open **`https://tomcamp.tech/`** by that link, and bookmark it. Include the `htt
 
 It needs Chrome 137+, Safari 17+ or Firefox 130+, with site data allowed.
 
-1. Enter **Email**, **Password** and **Name for this page**, and press **Sign in**.
-2. "Waiting for approval" appears. Approve it from a desktop app as in [Adding a device](#adding-a-device), leaving the box off.
-3. Press **This matches** on the page once the codes agree.
-4. Under **Choose a machine**, pick one. The same app then runs on that machine. **All machines** goes back.
+1. Enter **Email**, **Password** and **Name for this page**, and press **Sign in**. It is the same sign-in as the desktop's welcome screen, without **Create an account**.
+2. "Approve this page" appears, with a code once a desktop's card has fetched it. Approve it from a desktop app as in [Adding a device](#adding-a-device), with **Approve as a web page (limited)**, which comes first for a page.
+3. Under **Choose a machine**, pick one. The same app then runs on that machine. **All machines** goes back.
 
 What differs from the desktop:
 
@@ -115,7 +146,7 @@ The page comes from the VPS. You chose this so that one VPS manages everything. 
 
 > **How far the limit goes:** the role limits what the page itself can do on the account, and it cannot write Omni's own files or `omni.config.json` through the file routes. It can still change settings that take effect, such as providers and MCP servers, which run commands. But a signed-in page can still tell an agent on a machine to run commands, and a command runs as the person. So a changed page, while open and signed in, can do real damage to a machine it reaches, up to reading that machine's keys. Treat the page as a convenience for trusted moments, and turn "Allow web page access" off on any machine this matters for.
 
-> **The limits that remain:** the web page is approved as `client`, so it cannot approve or remove devices, or add an attacker's device to the account through the account's own controls. A changed page could claim to be a desktop, so `full` is only ever granted by the person's explicit choice on the approving device: choosing `full` for something opened in a browser would give that page full control. Its access ends when its 30 days run out or it is removed.
+> **The limits that remain:** the web page is approved as `client`, so it cannot approve or remove devices, or add an attacker's device to the account through the account's own controls. A changed page could claim to be a desktop, so `full` is only ever granted by the person's own tap on the approving device: choosing full control for something opened in a browser would give that page full control. Its access ends when its 30 days run out or it is removed.
 
 > **What the page keeps in the browser to load fast:** a service worker holds the page's own files, the ones the build lists, each checked against the hash the build recorded, so a repeat visit paints without the hub. It never holds what passes through the page: no API answer, chat text, key or file from a machine (those go over the channel, which it cannot see, and it caches nothing but at install). What this changes for a hacked hub: nothing about what a changed page can do, and nothing about how soon it arrives, since the browser checks the hub for a new worker on every visit. What is new is the way back: once the hub is clean, the first visit after can still show the changed page, from its cache, before the clean worker replaces it, and a page that stays open stays as it was. A worker planted under another name is told by the clean hub to remove itself and its caches. To be sure after an incident, clear the site's data in the browser, which removes the worker and its files.
 
@@ -129,7 +160,7 @@ The page comes from the VPS. You chose this so that one VPS manages everything. 
 - Built on the MacBook over SSH. Installing needs the phone connected and trusted.
 - Signed with a free Apple ID, so **the app expires every 7 days and must be reinstalled**. No push notifications. No App Store.
 - **Trusting the developer:** iOS normally refuses to open an app signed this way until you allow it, under Settings → General → VPN & Device Management. To be confirmed against the real install.
-- Approved as `full`: tick **This is my desktop or phone app** when approving it.
+- Approved as `full`: press **Approve as an app (full control)** when approving it.
 - It cannot create an account or recover one. Do those on a desktop.
 
 ## What the VPS can and cannot see
@@ -138,7 +169,7 @@ Settings shows this too:
 
 > The hub routes encrypted frames between your devices. It cannot read your actions, results, file contents, chat text or session titles, and it cannot forge an action. It can still see which devices are on the account, when they connect, IP addresses and the size and timing of frames, plus your email address and login verifiers. Someone who hacked the hub could try to guess your password offline; a correct guess only gets a pending sign-in, which one of your devices must still approve.
 
-The hub never receives your password or recovery code. It stores the device list and cannot forge an entry in it. The web page is the exception to "cannot read", [as above](#the-web-pages-risk).
+The hub also keeps, per account, the value that vouches for the account at sign-in (see [What one tap checks](#what-one-tap-checks-and-the-limit-you-accepted)), and the hashes of invite codes. Like the verifier, the vouching value can be used to check password guesses offline. The hub never receives your password or recovery code. It stores the device list and cannot forge an entry in it. The web page is the exception to "cannot read", [as above](#the-web-pages-risk).
 
 ## What this does not stop
 
@@ -156,6 +187,7 @@ Also:
 
 - **Someone using a device you left unlocked.** Omni has no lock of its own. A `full` device can approve and remove devices, including yours.
 - **A hub refusing service.** It can drop connections, block an approval until you press **Start again**, or keep a recovery code "in question". It gains no access by doing so.
+- **Approving without a glance at the code**, on a hacked hub. See [the limit you accepted](#what-one-tap-checks-and-the-limit-you-accepted).
 - **Signing out does not end the session on the hub.** The hub has no logout, so the session lasts until it expires (180 days, renewed each time the device connects). It is useless without the device's key.
 
 ## A stolen device
@@ -178,14 +210,15 @@ Alerts stay as red banners until you press **I have read this**. Each line is th
 - **The hub showed an older device list.** Someone may be hiding a removal, and it was refused. Do not approve or remove anything until another device has confirmed the list.
 - **Two different device lists exist.** The hub may be showing different lists to different devices, and this one was refused. Do not approve anything. Check your devices from another computer, and remove any you do not recognise.
 - **The hub showed a different account.** It was refused. Do not approve anything. Check the hub address (`account.hub` in `omni.config.json`, `https://tomcamp.tech` by default).
-- **The hub showed a false device list.** This computer was told it was approved, but the list does not follow the code you confirmed, so it stays out. Do not type your recovery code here again. Check your devices from another computer.
+- **The hub showed a false device list.** This computer was told it was approved, but the list does not follow the code it was shown, or is not the account the password vouched for, so it stays out. Do not type your recovery code here again. Check your devices from another computer.
+- **The server could not prove it holds your account.** At sign-in, the hub could not show the value only your password makes. This computer did not sign in and nothing changed. Try again later. If it repeats, the hub may have been tampered with: do not sign in on it until you know why.
 - **Two of your devices disagree about the device list.** The hub may be hiding a change, and the channel was refused. Check your devices, and try again once both machines are online.
 - **The account was recovered with a recovery code.** If that was not you, your recovery code is out and that device has full control. Remove the device it added, and use your recovery code on a device you trust.
 - **This computer was removed from the account.** The device list shows it. It still works on its own. If this was not you, sign in again from a device you trust and check the list.
 - **One of your devices refused this computer.** The two hold different lists: the hub may be hiding a change, or this computer was removed. Check your devices. If you removed this computer on purpose there is nothing to do.
 - **The hub sent a device list that does not check out.** It failed its signatures and nothing changed. If this repeats, check your devices from another computer.
 - **A frame on a channel failed its check.** A frame was changed, lost or replayed, and the channel was closed. A new one is opened. If this repeats, someone may be interfering.
-- **An approval exchange failed.** Nothing was approved. Press **Start again** on the new device, then **Review** on the device already signed in.
+- **An approval exchange failed.** Nothing was approved. Press **Start again** on the new device, then **Get a new code** on the device already signed in.
 - **The hub says this device was removed.** This is the hub's claim, not a fact this computer could check. Do not forget the device on that word alone. Sign in again to see.
 - **The device key cannot be used.** Local use still works. To start over, sign out and forget this device.
 
@@ -265,8 +298,11 @@ File routes refuse this folder, locally and over a channel. To point a desktop a
 
 - **Check it:** `curl https://tomcamp.tech/api/health` should answer 200. On the VPS: `systemctl status omni-hub`, `journalctl -u omni-hub`.
 - **Sign-in limits:** over 15 minutes, 5 failures for one account and address, 50 for one account, or 20 from one address lock further tries. The lock is temporary.
+- **Sign-up limits:** 10 tries at an invite code per address per hour, right or wrong. Then "Too many tries from this address". A refused try does not spend the code.
+- **Limits per account,** so one account cannot use up the VPS: 24 devices, 1024 entries in its device list, 32 connections at once, 5 sign-ins waiting. A recovery is never refused by the device limits: it is the last way back in. The hub holds at most 1000 accounts and 20 open invites.
 - **Sessions:** 180 days, renewed each time a device connects. Past that, the device signs in again.
-- **Registration is closed** after the first account. To open it to further accounts, add `OMNI_HUB_ALLOW_SIGNUP=1` on an `Environment=` line in `hub/omni-hub.service`, and deploy.
+- **Registration needs an invite** after the first account. There is no setting that opens it to anyone: `OMNI_HUB_ALLOW_SIGNUP` is gone, and the hub ignores it. See [Inviting someone](#inviting-someone).
+- **The data dir** also holds `invites.json`, the hashes of invite codes, never the codes. Each account records whether it is the owner (`owner: true`), because the order of `accounts.json` changes on every write. A hub with a single account from before this field treats that one as the owner. Accounts created before 2026-11-09 have no vouching value, so a new device cannot sign in to one: change the password on a `full` device of that account, which stores one. The hub had no accounts then.
 - **HSTS stays off** (`OMNI_HUB_HSTS_MAX_AGE` is unset), for the reason [above](#the-web-page). A browser keeps the rule for the whole max-age, so a mistake could not be undone from the server. Serving the hub on its own subdomain would be the clean fix.
 
 ### `hub/deploy.sh`

@@ -18,7 +18,12 @@ const HUB_ERROR_TEXT = {
   locked: "Too many failed attempts. Try again later.",
   "too-many-pending": "Too many sign-ins are waiting on this account.",
   busy: "The hub is busy. Try again in a moment.",
-  "registration-closed": "This hub is not open for registration.",
+  "registration-closed": "An invite code is needed to create an account here.",
+  "bad-invite": "That invite code is not valid. It may have been used, revoked or expired. Ask for a new one.",
+  "too-many-signups": "Too many tries from this address. Try again in an hour.",
+  "too-many-invites": "There are as many open invites as allowed. Revoke one first.",
+  "too-many-devices": "This account has as many devices as allowed. Remove one first.",
+  "log-full": "This account's device list has reached its limit.",
   "already-registered": "That email is already registered.",
   "bad-email": "That does not look like an email address.",
   conflict: "Another device changed the password first.",
@@ -27,7 +32,7 @@ const HUB_ERROR_TEXT = {
   "invalid-entry": "The hub refused the change to the device list.",
 };
 export const hubErrorText = (code) => (Object.hasOwn(HUB_ERROR_TEXT, code) ? HUB_ERROR_TEXT[code] : `The hub refused this (${code}).`);
-const HUB_CODE_STATUS = { "wrong-credentials": 401, locked: 429, busy: 503, conflict: 409, forbidden: 403, "not-found": 404, "invalid-entry": 400, "bad-message": 400 };
+const HUB_CODE_STATUS = { "too-many-invites": 409, "too-many-devices": 409, "log-full": 409, "wrong-credentials": 401, locked: 429, busy: 503, conflict: 409, forbidden: 403, "not-found": 404, "invalid-entry": 400, "bad-message": 400 };
 
 /** One JSON call to the hub. A failure is an AccountError whose message is safe to show. */
 export async function hubPost({ fetchImpl, hubUrl, timeoutMs }, path, body) {

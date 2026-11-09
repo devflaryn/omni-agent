@@ -23,9 +23,10 @@ const ALERT_ADVICE = {
   "refused-by-device": "Check your devices. If you removed this computer on purpose there is nothing to do.",
   "bad-log": "Nothing was changed. If this repeats, check your devices from another computer.",
   "channel-failure": "The channel was closed and a new one will be opened. If this repeats, someone may be interfering with the connection.",
-  "approval-failed": "Nothing was approved. Press Start again on the new device, then Review on the device already signed in.",
+  "approval-failed": "Nothing was approved. Press Start again on the new device, then Get a new code on the device already signed in.",
   "hub-says-removed": "This is the hub's claim, not a fact this computer could check. Sign in again to see.",
   "key-unavailable": "This computer's device key could not be opened. Local use still works.",
+  "bad-anchor": "Try again later. If this repeats, the server may have been tampered with: do not sign in on it until you know why.",
 };
 const ALERT_TITLE = {
   rollback: "The hub showed an older device list",
@@ -41,6 +42,7 @@ const ALERT_TITLE = {
   "approval-failed": "An approval exchange failed",
   "hub-says-removed": "The hub says this device was removed",
   "key-unavailable": "The device key cannot be used",
+  "bad-anchor": "The server could not prove it holds your account",
 };
 const PHASE_TEXT = {
   "signed-out": "Not signed in. This computer works on its own as usual.",
@@ -107,6 +109,110 @@ export function linkNews(wasDown, row, hubConnected) {
 }
 
 const groupCode = (code) => String(code ?? "").replace(/(\d{3})(\d{3})/, "$1 $2");
+
+/** The one sentence on every approval: comparing is not forced, so it asks, calmly, for a glance. */
+export const GLANCE = "Check that the new device shows the same code before you approve.";
+
+/**
+ * The two ways to approve, in the order to show them. What the new device says it is only orders and highlights them: either
+ * one is a tap away, and a device that says it is a web page is never offered full control first.
+ */
+export function roleChoices(kind) {
+  const app = { role: "full", label: "Approve as an app (full control)" };
+  const page = { role: "client", label: "Approve as a web page (limited)" };
+  const saysApp = kind === "desktop" || kind === "phone" || kind === "iphone";
+  return saysApp ? [{ ...app, primary: true }, { ...page, primary: false }] : [{ ...page, primary: true }, { ...app, primary: false }];
+}
+
+/** Whether the window shows the first-run screen: never on a page, never when this computer's account is off, and never again once chosen. */
+export function showWelcome(status, { available, closed, flow }) {
+  if (webPage() || !available || !status || closed) return false;
+  return !!status.firstRun || (!!flow && ["pending", "signed-out", "denied", "expired"].includes(status.phase));
+}
+
+/** Why a window has no account, in the person's words. `code` is the server's: see WindowGate.refusalCode. */
+export function noAccountText(code) {
+  if (code === "no-window") return "Omni was started without its window, so signing in is off here. Everything else works. To sign in, close Omni and open it again with Omni Agent.";
+  if (code === "other-window") return "Another Omni window holds this computer's sign-in. Use that window, or close every Omni window and open Omni again. Everything else works here.";
+  return "Signing in works only in the Omni window on this computer. Everything else works here.";
+}
+
+/**
+ * The sign-in surface, the same on the desktop's first-run screen and on the web page. Plain words only.
+ *   modes        which tabs: "signin", and on a desktop "create"
+ *   mode         the one showing
+ *   needsInvite  creating an account needs an invite code (false on the computer that holds the first account's token)
+ *   form         {email, name, invite}, kept between redraws
+ *   nameLabel    "Name for this computer" or "Name for this page"
+ *   error, note  text to show
+ *   onMode(mode), onSubmit(mode, values): a promise; it shows its own errors
+ *   footer       nodes under the form
+ */
+export function signInSurface({ title, intro, modes = ["signin"], mode = "signin", needsInvite = true, form = {}, nameLabel, error = "", note = "", onMode, onSubmit, footer = [] }) {
+  const card = el("section", "welcome-card");
+  const brand = el("div", "welcome-brand brand");
+  brand.append(el("span", "mark"), el("span", "word", "Omni Agent"));
+  card.appendChild(brand);
+  card.appendChild(el("h1", "welcome-title", title));
+  if (intro) card.appendChild(el("p", "rm-note", intro));
+  if (modes.length > 1) {
+    const tabs = el("div", "welcome-tabs");
+    tabs.setAttribute("role", "tablist");
+    for (const [key, label] of [["signin", "Sign in"], ["create", "Create an account"]].filter(([key]) => modes.includes(key))) {
+      const b = el("button", `seg-btn${mode === key ? " active" : ""}`, label);
+      b.type = "button";
+      b.setAttribute("role", "tab");
+      b.setAttribute("aria-selected", String(mode === key));
+      b.onclick = () => onMode?.(key);
+      tabs.appendChild(b);
+    }
+    card.appendChild(tabs);
+  }
+  const creating = mode === "create";
+  const f = el("form", "rm-form welcome-form");
+  f.onsubmit = (e) => e.preventDefault();
+  const input = (label, { type = "text", value = "", autocomplete, key, placeholder }) => {
+    const row = el("label", "acct-field");
+    row.appendChild(el("span", null, label));
+    const i = el("input");
+    i.type = type;
+    i.value = value;
+    i.dataset.key = key;
+    if (autocomplete) i.autocomplete = autocomplete;
+    if (placeholder) i.placeholder = placeholder;
+    i.spellcheck = false;
+    row.appendChild(i);
+    f.appendChild(row);
+    return i;
+  };
+  const invite = creating && needsInvite ? input("Invite code", { value: form.invite ?? "", autocomplete: "off", key: "invite", placeholder: "XXXX-XXXX-XXXX-XXXX" }) : null;
+  const email = input("Email", { type: "email", value: form.email ?? "", autocomplete: "username", key: "email" });
+  const password = input("Password", { type: "password", autocomplete: creating ? "new-password" : "current-password", key: "password", placeholder: creating ? "12 characters or more" : "" });
+  const repeat = creating ? input("Password again", { type: "password", autocomplete: "new-password", key: "repeat" }) : null;
+  const name = input(nameLabel, { value: form.name ?? "", key: "name" });
+  const out = el("p", "rm-note err");
+  out.textContent = error;
+  out.hidden = !error;
+  const go = el("button", "btn primary welcome-go", creating ? "Create the account" : "Sign in");
+  go.type = "button";
+  go.onclick = async () => {
+    out.hidden = true;
+    const values = { email: email.value.trim(), password: password.value, repeat: repeat?.value, name: name.value.trim(), invite: invite?.value.trim() };
+    if (creating && values.password !== values.repeat) { out.textContent = "The two passwords differ."; out.hidden = false; return; }
+    if (creating) { try { checkPassword(values.password); } catch { out.textContent = "The password needs at least 12 characters."; out.hidden = false; return; } }
+    if (creating && needsInvite && !values.invite) { out.textContent = "Type the invite code you were given."; out.hidden = false; return; }
+    go.disabled = true;
+    const was = go.textContent;
+    go.textContent = creating ? "Creating…" : "Signing in…";
+    try { await onSubmit(mode, values); } finally { go.disabled = false; go.textContent = was; }
+  };
+  f.appendChild(go);
+  f.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); go.click(); } });
+  card.append(f, out);
+  if (note) card.appendChild(el("p", "rm-note", note));
+  for (const node of footer) if (node) card.appendChild(node);
+  return card;
+}
 const shortId = (id) => String(id ?? "").slice(0, 6);
 const when = (at) => (at ? new Date(at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "");
 
@@ -137,6 +243,8 @@ export function createAccount({ toast, openSettings }) {
     available: null, why: "", status: null, pending: [], machines: [],
     fullChosen: new Set(), failures: new Map(), showing: null, codeHidden: false, forgetStep: false,
     form: { mode: "signin", email: "", name: "" }, formNote: "", hiddenWarnings: new Set(), machineDown: null, note: "",
+    whyCode: null, autoReviewed: new Set(), reviewing: new Set(),
+    welcome: { mode: "signin", form: { email: "", name: "", invite: "" }, error: "", flow: false, closed: false, busy: false },
   };
   let events = null;
   let tick = null;
@@ -157,6 +265,7 @@ export function createAccount({ toast, openSettings }) {
     } catch (e) {
       A.available = false;
       A.why = e.message;
+      A.whyCode = e.code ?? null;
       A.status = null;
     }
     if (A.available) {
@@ -222,7 +331,111 @@ export function createAccount({ toast, openSettings }) {
     renderBanners();
     renderCards();
     renderGate();
+    renderWelcome();
     if (settingsShown()) renderSettings();
+  }
+
+  // ---------------------------------------------------------------------------------- the first run
+  /** Over the app until the person chooses. Nothing on it waits for the hub: "Continue without an account" only writes here. */
+  function renderWelcome() {
+    let box = document.getElementById("accountWelcome");
+    const W = A.welcome;
+    const show = showWelcome(A.status, { available: A.available, closed: W.closed, flow: W.flow });
+    if (!show) { if (box) box.hidden = true; return; }
+    if (!box) {
+      box = el("div", "modal welcome");
+      box.id = "accountWelcome";
+      document.body.appendChild(box);
+    }
+    box.hidden = false;
+    // A half-typed password is not thrown away because some news arrived.
+    const a = document.activeElement;
+    if (W.busy || (box.contains(a) && a?.tagName === "INPUT")) return;
+    const key = JSON.stringify([A.status.phase, A.status.pending?.code, A.status.pending?.failed, A.status.canCreateFirst, W.mode, W.error]);
+    if (key === W.drawn && box.childElementCount) return;
+    W.drawn = key;
+    box.textContent = "";
+    const s = A.status;
+    if (s.phase === "pending") { box.appendChild(welcomeWaiting(s)); return; }
+    const later = el("button", "btn quiet welcome-local", "Continue without an account");
+    later.type = "button";
+    later.onclick = () => acting(later, async () => {
+      await call("POST", "welcome", { choice: "local" });
+      W.closed = true;
+      await refresh();
+    }, null).catch((e) => { W.error = e.message; W.drawn = null; renderWelcome(); });
+    const why = s.hub?.lastError && W.flow ? s.hub.lastError : "";
+    box.appendChild(signInSurface({
+      title: "Welcome to Omni Agent",
+      intro: "Sign in to reach your other computers from here. Omni works on this computer without an account too.",
+      modes: ["signin", "create"],
+      mode: W.mode,
+      needsInvite: !s.canCreateFirst,
+      form: W.form,
+      nameLabel: "Name for this computer",
+      error: W.error || why,
+      note: W.mode === "create" ? (s.canCreateFirst ? "This computer can create the first account. You will get a recovery code to keep." : "You need an invite code from the person who runs your Omni server. You will get a recovery code to keep.") : "A new computer is approved from one you already use.",
+      onMode: (mode) => { W.mode = mode; W.error = ""; W.drawn = null; renderWelcome(); },
+      onSubmit: welcomeSubmit,
+      footer: [el("div", "welcome-or"), later],
+    }));
+  }
+
+  async function welcomeSubmit(mode, values) {
+    const W = A.welcome;
+    W.form = { email: values.email, name: values.name, invite: values.invite ?? "" };
+    W.error = "";
+    W.busy = true;
+    const creds = { email: values.email, password: values.password, name: values.name || undefined };
+    try {
+      if (mode === "create") {
+        await call("POST", "register", { ...creds, ...(values.invite ? { inviteCode: values.invite } : {}) });
+        W.closed = true; // the recovery code's screen comes next, over everything
+      } else {
+        await call("POST", "sign-in", creds);
+        W.flow = true;
+      }
+    } catch (e) {
+      W.error = welcomeError(e);
+    } finally {
+      W.busy = false;
+      W.drawn = null;
+    }
+    await refresh();
+  }
+
+  /** The hub's own words, with "hub" left out of the way in: on this screen it is Omni's sign-in server. */
+  function welcomeError(e) {
+    if (e.code === "hub-unreachable") return "Omni's sign-in server cannot be reached right now. Try again later, or continue without an account.";
+    if (e.code === "locked") return "Too many tries. Wait a while, then try again.";
+    return String(e.message ?? e).replace(/\bThe hub\b/g, "The server").replace(/\bthe hub\b/g, "the server");
+  }
+
+  function welcomeWaiting(s) {
+    const W = A.welcome;
+    const c = el("section", "welcome-card");
+    const brand = el("div", "welcome-brand brand");
+    brand.append(el("span", "mark"), el("span", "word", "Omni Agent"));
+    c.appendChild(brand);
+    const p = s.pending ?? {};
+    c.appendChild(el("h1", "welcome-title", "Approve this computer"));
+    if (p.failed) {
+      c.appendChild(el("p", "rm-note err", "That try did not go through, so nothing was approved. Press Try again here, then look at your other device."));
+    } else if (p.code) {
+      c.appendChild(el("p", "rm-note", "On a computer where you are already signed in, a card has appeared. Approve it there. It shows this same code:"));
+      c.appendChild(el("div", "acct-code", groupCode(p.code)));
+    } else if (p.confirmed) {
+      c.appendChild(el("p", "rm-note", "Waiting for your other device to approve."));
+    } else {
+      c.appendChild(el("p", "rm-note", "Open Omni on a computer where you are already signed in. A card appears there, and a code appears here."));
+      if (!s.hub?.connected) c.appendChild(el("p", "rm-note", "Connecting…"));
+    }
+    const out = el("p", "rm-note err"); out.hidden = true;
+    const bar = el("div", "ap-bar");
+    if (p.failed || p.code) bar.appendChild(button(p.failed ? "Try again" : "The codes differ", p.failed ? "primary" : "quiet", (e) => acting(e.currentTarget, async () => { await call("POST", "restart-exchange"); await refresh(); }, out)));
+    bar.appendChild(button("Do this later", "quiet", () => { W.closed = true; renderWelcome(); }));
+    c.append(bar, out);
+    return c;
   }
 
   // ---------------------------------------------------------------------------------- machine switcher
@@ -328,50 +541,60 @@ export function createAccount({ toast, openSettings }) {
     const focused = box.contains(document.activeElement) ? document.activeElement?.dataset?.key : null;
     box.textContent = "";
     const s = A.status;
-    if (s?.phase === "pending") box.appendChild(newDeviceCard(s));
+    // The first-run screen shows the same code itself, over everything.
+    const welcomeUp = showWelcome(s, { available: A.available, closed: A.welcome.closed, flow: A.welcome.flow });
+    if (s?.phase === "pending" && !welcomeUp) box.appendChild(newDeviceCard(s));
     if (s && fullDevice()) for (const row of A.pending) if (!row.expiresAt || row.expiresAt > Date.now()) box.appendChild(approvalCard(row, s));
     box.hidden = !box.childElementCount;
     if (focused) box.querySelector(`[data-key="${CSS.escape(focused)}"]`)?.focus();
   }
 
-  /** On the new device: its code, a confirm step, and a start-again only a person can press. Nothing is adopted before that. */
+  /** On the new device: its code, and a start-again only a person can press. There is nothing to confirm here. */
   function newDeviceCard(s) {
     const c = el("section", "ap-card acct-card");
     c.setAttribute("role", "status");
     const head = el("div", "ap-head");
-    head.appendChild(el("span", "ap-tag", "This computer wants to join"));
+    head.appendChild(el("span", "ap-tag", deviceWords("This computer wants to join")));
     c.appendChild(head);
     const p = s.pending ?? {};
     const out = el("div", "rm-note err"); out.hidden = true;
-    const again = () => button("Start again", "", (e) => acting(e.currentTarget, async () => { await call("POST", "restart-exchange"); await refresh(); }, out));
+    const again = (label = "Start again", cls = "") => button(label, cls, (e) => acting(e.currentTarget, async () => { await call("POST", "restart-exchange"); await refresh(); }, out));
     if (p.failed) {
-      c.appendChild(el("div", "ap-title", "That exchange failed, so nothing was accepted."));
-      c.appendChild(el("p", "rm-note", "Press Start again here, then Review on the other device. Each failed try is visible: if this keeps happening, someone may be interfering."));
-      const bar = el("div", "ap-bar"); bar.appendChild(again()); c.append(bar, out);
+      c.appendChild(el("div", "ap-title", "That try did not go through, so nothing was approved."));
+      c.appendChild(el("p", "rm-note", "Press Start again here, then look at your other device. Each failed try is visible: if this keeps happening, someone may be interfering."));
+      const bar = el("div", "ap-bar"); bar.appendChild(again("Start again", "primary")); c.append(bar, out);
+      return c;
+    }
+    if (p.code) {
+      c.appendChild(el("div", "ap-title", "Approve it on your other device"));
+      c.appendChild(el("div", "acct-code", groupCode(p.code)));
+      c.appendChild(el("p", "rm-note", "Your other device shows this same code. If it shows a different one, do not approve there, and press The codes differ."));
+      const bar = el("div", "ap-bar"); bar.appendChild(again("The codes differ", "quiet")); c.append(bar, out);
       return c;
     }
     if (p.confirmed) {
-      c.appendChild(el("div", "ap-title", "Codes confirmed. Waiting for the other device to approve."));
-      c.appendChild(el("p", "rm-note", "This computer accepts nothing until the approval comes back and checks out against the code."));
-      const bar = el("div", "ap-bar"); bar.appendChild(again()); c.append(bar, out);
+      c.appendChild(el("div", "ap-title", "Waiting for your other device to approve."));
+      const bar = el("div", "ap-bar"); bar.appendChild(again("Start again", "quiet")); c.append(bar, out);
       return c;
     }
-    if (!p.code) {
-      c.appendChild(el("div", "ap-title", "Waiting for one of your devices to press Review."));
-      c.appendChild(el("p", "rm-note", "Open Omni on a device already signed in to this account. A card appears there. If none is online, this waits; a recovery code is the only other way in."));
-      return c;
-    }
-    c.appendChild(el("div", "ap-title", "Compare this code with the other screen."));
-    c.appendChild(el("div", "acct-code", groupCode(p.code)));
-    c.appendChild(el("p", "rm-note", "Press This matches only if the other device shows exactly these six digits. If they differ, someone may be in the middle: press Start again, and do not approve there."));
-    const bar = el("div", "ap-bar");
-    const yes = button("This matches", "primary", (e) => acting(e.currentTarget, async () => { await call("POST", "confirm-code", { code: p.code }); await refresh(); }, out));
-    bar.append(again(), yes);
-    c.append(bar, out);
+    c.appendChild(el("div", "ap-title", "Waiting for one of your devices."));
+    c.appendChild(el("p", "rm-note", "Open Omni on a device already signed in to this account. A card appears there, and a code appears here."));
     return c;
   }
 
-  /** On a device already signed in. The name and kind are the new device's own claims, and are labelled as that. */
+  /** Starts the exchange by itself, once per sign-in, so that the code is on both screens before anyone presses anything. */
+  function startReview(row) {
+    A.reviewing.add(row.id);
+    A.failures.delete(row.id);
+    call("POST", "review", { id: row.id })
+      .catch((err) => { A.failures.set(row.id, explain(err)); })
+      .finally(() => { A.reviewing.delete(row.id); refresh(); });
+  }
+
+  /**
+   * On a device already signed in. The name and kind are the new device's own claims, and are labelled as that. One tap approves,
+   * and that tap is also the choice of what the device may do: the claim only decides which choice comes first.
+   */
   function approvalCard(row, s) {
     const c = el("section", "ap-card acct-card");
     c.setAttribute("role", "alertdialog");
@@ -383,51 +606,55 @@ export function createAccount({ toast, openSettings }) {
     c.appendChild(head);
     const facts = el("dl", "acct-facts");
     const fact = (k, v) => { facts.append(el("dt", null, k), el("dd", null, v)); };
-    fact("It says its name is", cleanName(row.name));
-    fact("It says it is a", cleanName(row.kind, 32, "unknown"));
-    fact("Address the hub saw", cleanName(row.ip, 64, "unknown"));
+    fact("It says its name is", cleanName(review?.name ?? row.name));
+    fact("It says it is a", cleanName(review?.kind ?? row.kind, 32, "unknown"));
+    fact("From address", cleanName(row.ip, 64, "unknown"));
     c.appendChild(facts);
     const out = el("div", "rm-note err");
     const failure = A.failures.get(row.id);
     out.textContent = failure ?? "";
     out.hidden = !failure;
     const failed = (e) => { A.failures.set(row.id, explain(e)); renderCards(); };
-    const denied = button("Deny", "", (e) => { const b = e.currentTarget; b.disabled = true; call("POST", "deny", { id: row.id }).then(refresh).catch((err) => { b.disabled = false; failed(err); }); });
+    const denied = button("Deny", "quiet", (e) => { const b = e.currentTarget; b.disabled = true; call("POST", "deny", { id: row.id }).then(refresh).catch((err) => { b.disabled = false; failed(err); }); });
     const bar = el("div", "ap-bar");
 
     if (!review) {
       const elsewhere = row.reviewedBy ? cleanName(row.reviewedBy) : null;
-      if (elsewhere) c.appendChild(el("p", "rm-note", `Being reviewed on ${elsewhere}.`));
-      if (row.online === false) c.appendChild(el("p", "rm-note", "That device is not online right now."));
-      const start = button("Review", "primary", (e) => { const b = e.currentTarget; b.disabled = true; A.failures.delete(row.id); call("POST", "review", { id: row.id }).then(refresh).catch((err) => { b.disabled = false; failed(err); }); });
-      start.disabled = !!s.review || !!elsewhere;
-      bar.append(denied, start);
+      const canStart = !s.review && !elsewhere && row.online !== false;
+      if (canStart && !A.autoReviewed.has(row.id) && document.visibilityState !== "hidden") {
+        A.autoReviewed.add(row.id);
+        startReview(row);
+      }
+      if (elsewhere) c.appendChild(el("p", "rm-note", `Being approved on ${elsewhere}.`));
+      else if (row.online === false) c.appendChild(el("p", "rm-note", "That device is not online right now."));
+      else if (A.reviewing.has(row.id)) c.appendChild(el("p", "rm-note", "Getting the code…"));
+      if (failure && canStart) bar.append(denied, button("Try again", "primary", () => startReview(row)));
+      else bar.appendChild(denied);
       c.append(bar, out);
       return c;
     }
 
-    c.appendChild(el("div", "ap-title", "Does the new device show this code?"));
     c.appendChild(el("div", "acct-code", groupCode(review.code)));
-    const choice = el("label", "acct-choice");
-    const box = el("input"); box.type = "checkbox"; box.dataset.key = `full-${row.id}`; box.checked = A.fullChosen.has(row.id);
-    const warn = el("p", "rm-note err", "Only for an app you installed. Choosing this for something opened in a browser gives that page full control: it could approve and remove devices.");
-    warn.hidden = !box.checked;
-    box.onchange = () => { if (box.checked) A.fullChosen.add(row.id); else A.fullChosen.delete(row.id); warn.hidden = !box.checked; };
-    choice.append(box, el("span", null, "This is my desktop or phone app"));
-    c.appendChild(choice);
-    c.appendChild(warn);
-    c.appendChild(el("p", "rm-note", "Left off, this is a limited web page: it can control machines for 30 days, and cannot approve or remove devices."));
-    const yes = button("The codes match: approve", "primary", (e) => {
-      const b = e.currentTarget; b.disabled = true; A.failures.delete(row.id);
-      call("POST", "approve", { id: row.id, code: review.code, role: box.checked ? "full" : "client" })
-        .then(() => { A.fullChosen.delete(row.id); toast("Device approved"); return refresh(); })
-        .catch((err) => {
-          b.disabled = false;
-          failed(err.code === "log-conflict" ? new Error("Another device changed the device list at the same moment. Press Start again on the new device, then review again.") : err);
-          refresh();
-        });
-    });
-    bar.append(denied, yes);
+    c.appendChild(el("p", "rm-note acct-glance", GLANCE));
+    const choices = el("div", "acct-approve");
+    for (const choice of roleChoices(review.kind ?? row.kind)) {
+      choices.appendChild(button(choice.label, choice.primary ? "primary" : "", (e) => {
+        const b = e.currentTarget;
+        for (const other of choices.querySelectorAll("button")) other.disabled = true;
+        A.failures.delete(row.id);
+        call("POST", "approve", { id: row.id, code: review.code, role: choice.role })
+          .then(() => { toast(choice.role === "full" ? "Approved with full control" : "Approved as a web page"); return refresh(); })
+          .catch((err) => {
+            for (const other of choices.querySelectorAll("button")) other.disabled = false;
+            b.disabled = false;
+            failed(err.code === "log-conflict" ? new Error("Another device changed the device list at the same moment. Press Start again on the new device.") : err);
+            refresh();
+          });
+      }));
+    }
+    c.appendChild(choices);
+    c.appendChild(el("p", "rm-note", "Full control is for an Omni app you installed. A web page with it could add and remove devices."));
+    bar.append(denied, button("Get a new code", "quiet", () => startReview(row)));
     c.append(bar, out);
     return c;
   }
@@ -529,7 +756,7 @@ export function createAccount({ toast, openSettings }) {
   function signInSection(wrap) {
     const sec = section(wrap, "Sign in");
     const seg = el("div", "dlg-tabs");
-    for (const [mode, label] of [["signin", "Sign in"], ["register", "Create the account"], ["recover", "Recover"]]) {
+    for (const [mode, label] of [["signin", "Sign in"], ["register", "Create an account"], ["recover", "Recover"]]) {
       const b = el("button", `seg-btn${A.form.mode === mode ? " active" : ""}`, label);
       b.type = "button";
       b.onclick = () => { A.form.mode = mode; A.formNote = ""; renderSettings(true); };
@@ -537,9 +764,11 @@ export function createAccount({ toast, openSettings }) {
     }
     sec.appendChild(seg);
     const mode = A.form.mode;
-    sec.appendChild(el("p", "rm-note", mode === "signin" ? "Signing in is optional. Your password alone does not get in: a device already on the account must also approve this one, with a code you compare." : mode === "register" ? "For the first device. A forgotten password cannot be reset by email: nothing is ever mailed, and the hub never sees your password. You will get a recovery code to keep." : "If you have lost every device. You need your email, password and recovery code. You will get a new code, and every device is told."));
+    const needsInvite = !A.status?.canCreateFirst;
+    sec.appendChild(el("p", "rm-note", mode === "signin" ? "Signing in is optional. Your password alone does not get in: a device already on the account approves this one, with one tap." : mode === "register" ? `${needsInvite ? "You need an invite code from the person who runs your Omni server. " : "This computer can create the first account. "}A forgotten password cannot be reset by email: nothing is ever mailed, and the server never sees your password. You will get a recovery code to keep.` : "If you have lost every device. You need your email, password and recovery code. You will get a new code, and every device is told."));
     const form = el("form", "rm-form");
     form.onsubmit = (e) => e.preventDefault();
+    const invite = mode === "register" && needsInvite ? field(form, { label: "Invite code", autocomplete: "off", placeholder: "XXXX-XXXX-XXXX-XXXX", key: "invite" }) : null;
     const email = field(form, { label: "Email", type: "email", value: A.form.email, autocomplete: "username", key: "email" });
     const password = field(form, { label: "Password", type: "password", autocomplete: mode === "register" ? "new-password" : "current-password", placeholder: mode === "register" ? "12 characters or more" : "", key: "password" });
     const repeat = mode === "register" ? field(form, { label: "Password again", type: "password", autocomplete: "new-password", key: "repeat" }) : null;
@@ -553,12 +782,13 @@ export function createAccount({ toast, openSettings }) {
       const refuse = (text) => { A.formNote = text; out.textContent = text; out.hidden = false; };
       if (mode === "register") {
         if (password.value !== repeat.value) return refuse("The two passwords differ.");
+        if (invite && !invite.value.trim()) return refuse("Type the invite code you were given.");
         try { checkPassword(password.value); } catch { return refuse("The password needs at least 12 characters."); }
       }
       let done = false;
       try {
         if (mode === "register") {
-          const r = await call("POST", "register", creds);
+          const r = await call("POST", "register", { ...creds, ...(invite ? { inviteCode: invite.value.trim() } : {}) });
           A.note = r.resumed ? "This computer finished the earlier registration." : r.signedIn === false ? "The account exists, but signing in after it failed. Save the code, then sign in." : "";
         } else if (mode === "signin") {
           await call("POST", "sign-in", creds);
@@ -613,6 +843,44 @@ export function createAccount({ toast, openSettings }) {
         list.appendChild(row);
       }
     }).catch((e) => { list.textContent = e.message; });
+  }
+
+  /** Only the hub's owner sees this: the hub says who that is, and anyone else's list is refused, which hides the section. */
+  function invitesSection(wrap) {
+    const sec = section(wrap, "Invite someone");
+    sec.hidden = true;
+    sec.appendChild(el("p", "rm-note", "An invite code lets one person create their own account on your Omni server. They see only their own computers, and you see only yours. A code works once, for 14 days."));
+    const made = el("div", "acct-invite-made");
+    const list = el("div", "acct-devices");
+    const out = el("p", "rm-note err"); out.hidden = true;
+    const load = () => call("GET", "invites").then(({ invites }) => {
+      sec.hidden = false;
+      list.textContent = "";
+      const words = { live: "Open", used: "Used", expired: "Expired" };
+      for (const i of invites) {
+        const row = el("div", "acct-device");
+        const main = el("div", "acct-device-main");
+        main.appendChild(el("b", null, `${words[i.state] ?? "Unknown"} invite`));
+        main.appendChild(el("div", "acct-device-sub", [i.createdAt ? `made ${when(i.createdAt)}` : "", i.state === "live" && i.expiresAt ? `ends ${when(i.expiresAt)}` : ""].filter(Boolean).join(" · ")));
+        row.appendChild(main);
+        if (i.state === "live") row.appendChild(button("Revoke", "small", (e) => acting(e.currentTarget, async () => { await call("POST", "invites/revoke", { id: i.id }); made.textContent = ""; await load(); }, out)));
+        list.appendChild(row);
+      }
+    }).catch((e) => { if (e.status === 403) sec.remove(); else { sec.hidden = false; out.textContent = explain(e); out.hidden = false; } });
+    const make = button("Make an invite code", "primary", (e) => acting(e.currentTarget, async () => {
+      const { code } = await call("POST", "invites", {});
+      made.textContent = "";
+      made.appendChild(el("div", "acct-recovery mono", code));
+      const copied = el("span", "rm-note", "Give this code to the person you invite. Omni will not show it again.");
+      const copy = button("Copy", "small", () => {
+        (navigator.clipboard?.writeText(code) ?? Promise.reject()).then(() => { copied.textContent = "Copied."; }).catch(() => { copied.textContent = "Could not copy: select it and copy by hand."; });
+      });
+      const row = el("div", "acct-gate-row"); row.append(copy, copied);
+      made.appendChild(row);
+      await load();
+    }, out));
+    sec.append(make, made, list, out);
+    load();
   }
 
   function passwordSection(wrap) {
@@ -686,9 +954,8 @@ export function createAccount({ toast, openSettings }) {
     const wrap = el("div", "rm-wrap");
     body.appendChild(wrap);
     if (A.available === false) {
-      const sec = section(wrap, "This needs the desktop app");
-      sec.appendChild(el("p", "rm-note", "Accounts, approvals and your other machines work only in the Omni desktop window, because only it holds this computer's account token. Everything else here works as usual."));
-      sec.appendChild(el("p", "rm-note", A.why));
+      const sec = section(wrap, "Signing in is off in this window");
+      sec.appendChild(el("p", "rm-note", noAccountText(A.whyCode)));
       return;
     }
     const s = A.status;
@@ -705,6 +972,7 @@ export function createAccount({ toast, openSettings }) {
     const signedOutLike = ["signed-out", "denied", "expired"].includes(s.phase);
     if (signedOutLike) signInSection(wrap);
     if (["approved", "recovering"].includes(s.phase)) devicesSection(wrap);
+    if (fullDevice()) invitesSection(wrap);
     if (fullDevice()) passwordSection(wrap);
     if (webPage()) { if (s.recoveries?.length) recoverySection(wrap, s); }
     else if (s.phase !== "signed-out" || s.recoveries?.length || s.recoveryCodePending) recoverySection(wrap, s);

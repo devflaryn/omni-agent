@@ -1058,3 +1058,21 @@ body.on-remote .machine-btn:hover { background: var(--inverse-ink); color: var(-
   .acct-recovery { font-size: 16px; }
 }
 #graphLimit { width: 72px; }
+
+/* The sign-in surface: the desktop's first-run screen and the web page share it. */
+.welcome { z-index: 85; overflow: auto; }
+.welcome[hidden] { display: none; }
+.welcome-card { box-sizing: border-box; width: min(420px, 100%); margin: auto; background: var(--raised); border: 1px solid var(--line-2); border-radius: var(--r-lg); box-shadow: var(--shadow-lg); padding: 22px 22px 18px; display: flex; flex-direction: column; gap: 12px; }
+.welcome-brand { display: flex; align-items: center; gap: 8px; padding: 0; cursor: default; }
+.welcome-title { font-size: 20px; font-weight: 600; margin: 2px 0 0; }
+.welcome-card p { margin: 0; overflow-wrap: anywhere; }
+.welcome-tabs { display: flex; gap: 4px; }
+.welcome-form { display: flex; flex-direction: column; gap: 10px; }
+.welcome-form .acct-field input { width: 100%; box-sizing: border-box; min-height: 36px; font-size: 14px; padding: 7px 11px; color: var(--ink); background: var(--ground); border: 1px solid var(--line-2); border-radius: var(--r); }
+.welcome-go { align-self: stretch; min-height: 36px; }
+.welcome-or { border-top: 1px solid var(--line-2); margin: 2px 0; }
+.welcome-local { align-self: center; }
+.welcome-card .ap-bar { flex-wrap: wrap; }
+.acct-approve { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 4px; }
+.acct-glance { color: var(--ink); }
+.acct-invite-made { margin: 8px 0; }

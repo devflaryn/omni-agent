@@ -1,8 +1,10 @@
 // The hub's data dir: JSON files written whole and renamed into place, so a crash leaves the old file or the new one.
 //   secret         for the fake salts, created on first run
 //   bootstrap      SHA-256 of the one-shot registration token, only until the first account exists
-//   accounts.json  {version, accounts: [{id, email, salt, verifier: {salt, hash}, log}]}
+//   accounts.json  {version, accounts: [{id, email, salt, verifier: {salt, hash}, anchor, log, owner?}]}. `owner` marks the first account:
+//                  a write moves an account to the end of this file, so the order says nothing.
 //   sessions.json  {version, sessions: [{hash, accountId, signPub, name, kind, ip, createdAt, expiresAt, proven, approved}]}
+//   invites.json   {version, invites: [{id, hash, createdBy, createdAt, expiresAt, usedAt}]}. Only the SHA-256 of a code, never the code.
 //
 // Anything damaged stops the hub. Starting empty would let anyone register the account again.
 
@@ -13,7 +15,7 @@ import { join } from "node:path";
 const VERSION = 1;
 const SECRET_BYTES = 32;
 const BOOTSTRAP_HASH_BYTES = 32;
-const SECRET_FILE = "secret", ACCOUNTS_FILE = "accounts.json", SESSIONS_FILE = "sessions.json", BOOTSTRAP_FILE = "bootstrap";
+const SECRET_FILE = "secret", ACCOUNTS_FILE = "accounts.json", SESSIONS_FILE = "sessions.json", INVITES_FILE = "invites.json", BOOTSTRAP_FILE = "bootstrap";
 const PRIVATE_FILE = 0o600, PRIVATE_DIR = 0o700;
 
 export class StoreError extends Error {
@@ -69,6 +71,8 @@ const validAccount = (a) => isText(a?.id) && isText(a.email) && isText(a.salt) &
 const validSession = (s) => isText(s?.hash) && isText(s.id) && isText(s.accountId) && isText(s.signPub) && typeof s.name === "string" && typeof s.kind === "string" && typeof s.ip === "string"
   && isTime(s.createdAt) && isTime(s.expiresAt) && typeof s.proven === "boolean" && typeof s.approved === "boolean";
 
+const validInvite = (i) => isText(i?.id) && isText(i.hash) && isText(i.createdBy) && isTime(i.createdAt) && isTime(i.expiresAt) && (i.usedAt === null || isTime(i.usedAt));
+
 function readSecret(dir) {
   let secret;
   try {
@@ -96,13 +100,17 @@ export function openStore(dir) {
     writeAtomic(join(dir, SESSIONS_FILE), JSON.stringify({ version: VERSION, sessions: [] }));
     syncDir(dir);
   }
+  // A hub from before invites has none of these yet.
+  if (!existsSync(join(dir, INVITES_FILE))) writeAtomic(join(dir, INVITES_FILE), JSON.stringify({ version: VERSION, invites: [] }));
   const accountList = readJson(dir, ACCOUNTS_FILE, "accounts", validAccount);
   const sessionList = readJson(dir, SESSIONS_FILE, "sessions", validSession);
+  const inviteList = readJson(dir, INVITES_FILE, "invites", validInvite);
   const secret = readSecret(dir);
 
   const accounts = new Map(accountList.map((a) => [a.id, a]));
   const byEmail = new Map(accountList.map((a) => [a.email, a]));
   const sessions = new Map(sessionList.map((s) => [s.hash, s]));
+  const invites = new Map(inviteList.map((i) => [i.hash, i]));
   if (accounts.size !== accountList.length || byEmail.size !== accountList.length) throw new StoreError(ACCOUNTS_FILE, "has duplicate accounts");
   if (sessionList.some((s) => !accounts.has(s.accountId))) throw new StoreError(SESSIONS_FILE, "names an account that does not exist");
 
@@ -123,12 +131,23 @@ export function openStore(dir) {
     writeAtomic(join(dir, SESSIONS_FILE), JSON.stringify({ version: VERSION, sessions: list }));
     syncDir(dir);
   };
+  const writeInvites = (list) => {
+    writeAtomic(join(dir, INVITES_FILE), JSON.stringify({ version: VERSION, invites: list }));
+    syncDir(dir);
+  };
 
   return {
     secret,
     accounts,
     byEmail,
     sessions,
+    invites,
+    /** The first account's id. A hub with one account from before this field was kept: that one is the first. */
+    get ownerId() {
+      const marked = [...accounts.values()].find((a) => a.owner === true);
+      if (marked) return marked.id;
+      return accounts.size === 1 ? accounts.keys().next().value : null;
+    },
     get bootstrapHash() { return bootstrapHash; },
     setBootstrapHash(hash) {
       writeAtomic(bootstrapPath, hash.toString("hex"));
@@ -153,6 +172,15 @@ export function openStore(dir) {
     deleteSession(hash) {
       sessions.delete(hash);
       writeSessions([...sessions.values()]);
+    },
+    /** Adds or replaces an invite, by its hash. */
+    putInvite(invite) {
+      writeInvites([...invites.values()].filter((i) => i.hash !== invite.hash).concat(invite));
+      invites.set(invite.hash, invite);
+    },
+    deleteInvites(hashes) {
+      writeInvites([...invites.values()].filter((i) => !hashes.includes(i.hash)));
+      for (const hash of hashes) invites.delete(hash);
     },
   };
 }

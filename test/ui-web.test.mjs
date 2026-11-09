@@ -15,9 +15,9 @@ import { PageAccount } from "../ui/page-account.js";
 import { memoryStore } from "../ui/page-store.js";
 import { createPageTransport } from "../ui/page-transport.js";
 import { BLOB_LIMIT, fileClass } from "../ui/page-files.js";
-import { newDeviceKeys } from "../ui/account-core.js";
-import { append } from "../ui/device-log.js";
-import { alertAdvice, alertTitle, deviceWords, explain, hubLostText, phaseText } from "../ui/account.js";
+import { approverExchange, newDeviceKeys, newRecoveryCode, recoveryKeysFrom } from "../ui/account-core.js";
+import { append, createLog, verifyLog } from "../ui/device-log.js";
+import { GLANCE, alertAdvice, alertTitle, deviceWords, explain, hubLostText, noAccountText, phaseText, roleChoices, showWelcome } from "../ui/account.js";
 import { MachineLinks } from "../ui/machine-links.js";
 import { framesFiles, local, mode, rawUrl as chosenRawUrl, saveFile, setChannelTransport, setMachine, setTransportEnv, webPage } from "../ui/transport.js";
 
@@ -40,7 +40,10 @@ const testProtector = {
   async protect(bytes) { return Buffer.concat([Buffer.from("TEST"), Buffer.from(bytes).map((b) => b ^ 0x5a)]); },
   async unprotect(bytes) { return Buffer.from(bytes).subarray(4).map((b) => b ^ 0x5a); },
 };
-const quickKey = async (password, salt) => new Uint8Array(createHash("sha256").update(password).update(salt).digest());
+const quickKey = async (password, salt) => {
+  const part = (label) => new Uint8Array(createHash("sha256").update(label).update(password).update(salt).digest());
+  return { loginKey: part("login"), anchorKey: part("anchor") };
+};
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 const cleanups = [];
 after(async () => { for (const c of cleanups.reverse()) { try { await c(); } catch { /* */ } } });
@@ -78,7 +81,7 @@ function tappedSocket(tap) {
 function desktop(fixture, { name = "Desk", kind = "desktop", ...rest } = {}) {
   const dir = join(freshDir(), "account");
   mkdirSync(dir, { recursive: true });
-  const account = new Account({ dir, hubUrl: fixture.url, hubOrigin: ORIGIN, name, kind, protector: testProtector, deriveLoginKey: quickKey, reconnect: { minMs: 20, maxMs: 100 }, log: () => {}, ...rest });
+  const account = new Account({ dir, hubUrl: fixture.url, hubOrigin: ORIGIN, name, kind, protector: testProtector, deriveKeys: quickKey, reconnect: { minMs: 20, maxMs: 100 }, log: () => {}, ...rest });
   cleanups.push(() => account.stop());
   return account;
 }
@@ -94,7 +97,7 @@ async function firstDesktop(fixture, options = {}) {
 }
 
 function page(fixture, { store = memoryStore(), tap = {}, ...rest } = {}) {
-  const account = new PageAccount({ store, hubUrl: fixture.url, hubOrigin: ORIGIN, name: "Chrome here", deriveLoginKey: quickKey, WebSocketImpl: tappedSocket(tap), reconnect: { minMs: 20, maxMs: 100 }, ...rest });
+  const account = new PageAccount({ store, hubUrl: fixture.url, hubOrigin: ORIGIN, name: "Chrome here", deriveKeys: quickKey, WebSocketImpl: tappedSocket(tap), reconnect: { minMs: 20, maxMs: 100 }, ...rest });
   account.store = store;
   account.tap = tap;
   account.alerts = [];
@@ -118,7 +121,6 @@ async function approvePage(approver, p, role = "client") {
   const review = await approver.review(row.id);
   const code = await until(() => p.status().pending?.code, "the code on the page");
   assert.equal(code, review.code);
-  p.confirmCode(code);
   await approver.approve(row.id, { code, role });
   await until(() => p.status().phase === "approved", "approval");
   await until(() => p.status().logHead === approver.status().logHead, "the same log");
@@ -184,7 +186,7 @@ test("the page's private keys cannot leave as bytes, and are what the store hold
   assert.equal(again.status().device.id, keys.signPub);
 });
 
-test("sign-in shows the code and waits: nothing is adopted, and no log is even asked for, until the person confirms", async () => {
+test("sign-in shows the code with nothing to press, and is in once the other device approves", async () => {
   const fixture = await hubFixture();
   const far = await firstDesktop(fixture);
   const sent = [];
@@ -199,30 +201,54 @@ test("sign-in shows the code and waits: nothing is adopted, and no log is even a
   const review = await far.review(row.id);
   const code = await until(() => p.status().pending?.code, "the code");
   assert.equal(code, review.code);
-  await far.approve(row.id, { code, role: "client" });
-  await until(() => p.status().pending?.approvedByHub, "the hub's word");
-  await sleep(100);
-  assert.equal(p.status().phase, "pending", "the hub says approved, and the page waits for the person");
+  assert.equal(typeof p.confirmCode, "undefined", "there is no second confirmation to give");
+  assert.ok(!sent.includes("log.get"), "no log is asked for before the approval");
   assert.equal(p.status().logVersion, 0);
   assert.equal(await p.store.get("log"), null);
-  assert.ok(!sent.includes("log.get"), "not even asked for");
-  p.confirmCode(code);
+  await far.approve(row.id, { code, role: "client" });
   await until(() => p.status().phase === "approved", "approved");
   assert.equal(p.status().device.role, "client");
   assert.equal((await p.store.get("log")).length, 2);
 });
 
-test("a code other than the one shown confirms nothing", async () => {
+test("a page signs in to the account the password vouches for, and refuses a hub that cannot show that", async () => {
   const fixture = await hubFixture();
-  const far = await firstDesktop(fixture);
-  const p = page(fixture);
+  await firstDesktop(fixture);
+  const lying = page(fixture, { fetchImpl: async (url, init) => {
+    const r = await fetch(url, init);
+    if (!String(url).endsWith("/api/login")) return r;
+    return new Response(JSON.stringify({ ...await r.json(), anchor: Buffer.alloc(32, 3).toString("base64") }), { status: r.status });
+  } });
+  await assert.rejects(signIn(lying), (e) => e.code === "bad-anchor");
+  assert.equal(lying.status().phase, "signed-out");
+  assert.ok(lying.alerts.some((a) => a.kind === "bad-anchor"));
+  assert.equal(await lying.store.get("session"), null);
+});
+
+test("a hacked hub playing the approver for a page, with a made-up account, gets nowhere though nobody presses anything", async () => {
+  const fixture = await hubFixture();
+  await firstDesktop(fixture);
+  const tap = {};
+  const p = page(fixture, { tap });
   await signIn(p);
   await until(() => p.status().hub.connected, "connected");
-  const row = await until(() => far.pendingSignIns().find((x) => x.signPub === p.status().device.id), "the card");
-  await far.review(row.id);
-  await until(() => p.status().pending?.code, "the code");
-  assert.throws(() => p.confirmCode("000000x"), (e) => e.code === "wrong-code");
-  assert.equal(p.status().pending.confirmed, false);
+  const mallory = await newDeviceKeys();
+  const keys = await p.store.get("keys");
+  const log = await createLog({ device: { ...mallory, name: "Mallory", kind: "desktop" }, recovery: await recoveryKeysFrom(newRecoveryCode()) });
+  const { head } = await verifyLog(log, { now: Date.now() });
+  const added = await append(log, { type: "add", name: "Victim", kind: "web", role: "client", signPub: keys.signPub, boxPub: keys.boxPub }, mallory);
+  const exchange = await approverExchange({ approverPub: mallory.signPub, newPub: keys.signPub, logHead: head });
+  const random = new Promise((resolve) => { tap.outgoing = (m) => { if (m.type === "approval.msg") { resolve(JSON.parse(m.opaque).random); return null; } return m; }; });
+  const hubSays = (m) => tap.socket.onmessage({ data: JSON.stringify(m) });
+  hubSays({ type: "approval.msg", from: mallory.signPub, opaque: encodeOuter({ t: "commit", commit: exchange.commit, logHead: head }) });
+  exchange.receiveRandom(await random);
+  hubSays({ type: "approval.msg", from: mallory.signPub, opaque: encodeOuter({ t: "reveal", random: exchange.revealRandom() }) });
+  await until(() => p.status().pending?.code, "the code from the hub's exchange");
+  tap.incoming = (m) => (m.type === "error" && m.for === "log.get" ? { type: "log", entries: added, head: "x", version: added.length } : m);
+  hubSays({ type: "session.approved" });
+  await until(() => p.alerts.some((a) => a.kind === "fake-log"), "the alert");
+  assert.equal(p.status().phase, "pending");
+  assert.equal(await p.store.get("log"), null);
 });
 
 test("sign-in says when no full device is online, and stops saying it when one is", async () => {
@@ -302,7 +328,7 @@ test("a second commit cannot replace a code on the screen", async () => {
   assert.equal(p.status().pending.attempts, 1);
 });
 
-test("a log that does not follow the confirmed code is refused, with an alert, and the page stays out", async () => {
+test("a log that does not follow the code is refused, with an alert, and the page stays out", async () => {
   const fixture = await hubFixture();
   const far = await firstDesktop(fixture);
   let forge = false;
@@ -321,7 +347,6 @@ test("a log that does not follow the confirmed code is refused, with an alert, a
   const review = await far.review(row.id);
   const code = await until(() => p.status().pending?.code, "the code");
   forge = true;
-  p.confirmCode(code);
   await far.approve(row.id, { code, role: "client" });
   await until(() => p.alerts.some((a) => a.kind === "fake-log"), "the alert");
   assert.equal(p.status().phase, "pending");
@@ -345,7 +370,6 @@ test("a real log, really signed, whose add does not follow the head in the code 
   const stranger = await newDeviceKeys();
   const longer = await append(before, { type: "add", name: "Slipped in", kind: "desktop", role: "full", signPub: stranger.signPub, boxPub: stranger.boxPub }, signer);
   forged = await append(longer, { type: "add", name: "Chrome here", kind: "web", role: "client", signPub: keys.signPub, boxPub: keys.boxPub }, signer);
-  p.confirmCode(code);
   await far.approve(row.id, { code, role: "client" });
   await until(() => p.alerts.some((a) => a.kind === "fake-log"), "the alert");
   assert.equal(p.status().phase, "pending");
@@ -422,7 +446,6 @@ test("the page keeps the highest verified log: rollback and fork are refused, vi
   const row = far.pendingSignIns().find((x) => x.signPub === other.status().device.id);
   const review = await far.review(row.id);
   await until(() => other.status().pending?.code, "code");
-  other.confirmCode(review.code);
   await far.approve(row.id, { code: review.code, role: "full" });
   await until(() => p.status().logVersion === 3, "the newer log");
   const newer = await p.store.get("log");
@@ -484,7 +507,6 @@ test("the handshake compares heads: a machine holding a log the hub hides from t
   const row = far.pendingSignIns().find((x) => x.signPub === other.status().device.id);
   const review = await far.review(row.id);
   await until(() => other.status().pending?.code, "code");
-  other.confirmCode(review.code);
   await far.approve(row.id, { code: review.code, role: "full" });
   await until(() => far.status().logVersion === 3, "the desktop's newer log");
   await assert.rejects(transportFor(p, farId).api("GET", "/x"), (e) => /Far box|Desk/.test(e.message));
@@ -566,7 +588,7 @@ test("account.js shows no approve, remove or password control on a web page, wha
 test("the page offers no registration and no recovery, and says where an account is made", () => {
   const src = readFileSync(new URL("../ui/web.js", import.meta.url), "utf8");
   assert.doesNotMatch(src, /Create the account|recoveryCode|Recovery code/);
-  assert.match(src, /created in the Omni desktop app/);
+  assert.match(src, /To create an account, use the Omni desktop app/);
 });
 
 test("the page says once on sign-in what a hacked server could do, in plain words", () => {
@@ -1280,4 +1302,54 @@ test("on a page, one helper turns the texts about this device, and drops what is
   assert.doesNotMatch(src, /PHASE_TEXT\[s\./, "every phase goes through the helper");
   assert.doesNotMatch(src, /ALERT_ADVICE\[a\./, "every alert goes through the helper");
   assert.match(readFileSync(new URL("../ui/web.js", import.meta.url), "utf8"), /const store = await openPageStore\(\);[\s\S]*setChannelTransport\([\s\S]*await account\.start\(\)/, "the transport is set before the sign-in screen draws an alert");
+});
+
+test("approving: the claim only orders the two choices, and a page that says it is a page gets limited first", () => {
+  for (const kind of ["web", "", undefined, "something else", "Web"]) {
+    const [first, second] = roleChoices(kind);
+    assert.deepEqual([first.role, first.primary, second.role, second.primary], ["client", true, "full", false], String(kind));
+  }
+  for (const kind of ["desktop", "phone", "iphone"]) assert.deepEqual(roleChoices(kind).map((c) => c.role), ["full", "client"], kind);
+  for (const kind of ["web", "desktop"]) assert.deepEqual(roleChoices(kind).map((c) => c.role).sort(), ["client", "full"], "both are always offered");
+  assert.match(roleChoices("web")[0].label, /web page \(limited\)/);
+  assert.match(roleChoices("web")[1].label, /app \(full control\)/);
+  assert.equal(GLANCE, "Check that the new device shows the same code before you approve.");
+});
+
+test("the approval card asks for a glance in one sentence, and has one tap per choice and no second step", () => {
+  const src = readFileSync(new URL("../ui/account.js", import.meta.url), "utf8");
+  const card = src.slice(src.indexOf("function approvalCard("), src.indexOf("// --------------------------------------------------------------------------------- the recovery code"));
+  assert.match(card, /GLANCE/);
+  assert.match(card, /roleChoices\(/);
+  assert.doesNotMatch(card, /type = "checkbox"|The codes match|This is my desktop or phone app/);
+  const web = readFileSync(new URL("../ui/web.js", import.meta.url), "utf8");
+  for (const text of [src, web]) assert.doesNotMatch(text, /This matches|confirm-code|confirmCode/);
+});
+
+test("the first-run screen shows only on a desktop with its account on, until a choice, and while its own sign-in waits", () => {
+  const status = (over) => ({ phase: "signed-out", firstRun: true, ...over });
+  assert.equal(showWelcome(status(), { available: true }), true);
+  assert.equal(showWelcome(status(), { available: false }), false, "an account that is off never blocks local use");
+  assert.equal(showWelcome(null, { available: true }), false);
+  assert.equal(showWelcome(status({ firstRun: false }), { available: true }), false, "chosen once, remembered");
+  assert.equal(showWelcome(status(), { available: true, closed: true }), false);
+  assert.equal(showWelcome(status({ firstRun: false, phase: "pending" }), { available: true, flow: true }), true, "its own sign-in, waiting for approval");
+  assert.equal(showWelcome(status({ firstRun: false, phase: "approved" }), { available: true, flow: true }), false, "and gone once in");
+  const data = new Map();
+  setTransportEnv({ storage: { getItem: (k) => data.get(k) ?? null, setItem: (k, v) => data.set(k, v), removeItem: (k) => data.delete(k) }, reload: () => {} });
+  try {
+    setChannelTransport({ api() {}, eventSource() {}, rawUrl() {}, saveFile() {}, local: {} });
+    assert.equal(showWelcome(status(), { available: true }), false, "never on a web page, which has its own sign-in");
+  } finally { setChannelTransport(null); setTransportEnv({ storage: null, reload: () => {} }); }
+});
+
+test("the first-run screen and the sign-in surface speak plainly: no phase, role, log or hub", () => {
+  const src = readFileSync(new URL("../ui/account.js", import.meta.url), "utf8");
+  const part = (from, to) => src.slice(src.indexOf(from), src.indexOf(to));
+  const words = (code) => [...code.matchAll(/(["`])((?:\.|(?!).)*)/g)].map((m) => m[2]).filter((s) => /\s/.test(s));
+  const main = [part("export function signInSurface(", "export function createAccount("), part("function renderWelcome(", "/** The hub's own words"), part("function welcomeWaiting(", "// ---------------------------------------------------------------------------------- machine switcher")];
+  for (const text of main.flatMap(words)) assert.doesNotMatch(text, /(phase|role|log|hub)/i, text);
+  for (const code of ["no-window", "other-window", undefined]) assert.doesNotMatch(noAccountText(code), /(phase|role|log|hub|token)/i);
+  assert.match(noAccountText("no-window"), /Omni Agent/);
+  assert.match(noAccountText("other-window"), /Another Omni window/);
 });
