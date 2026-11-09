@@ -22,7 +22,8 @@ export function shortcutFor(e, { mac = false } = {}) {
     if (k === "k" && !e.shiftKey) return "palette";
     if (k === "o" && e.shiftKey) return "new-chat";
     if (k === ".") return "stop";
-    if (k === "b" && !e.shiftKey) return "files";
+    // In the file editor Ctrl+B is the editor's: hiding the files there would close the file being edited.
+    if (k === "b" && !e.shiftKey) return e.target?.classList?.contains("ce-ta") ? null : "files";
     if (k === "\\") return "history";
     if (k === "/") return "shortcuts";
     return null;
@@ -92,6 +93,9 @@ export const isMac = () => /Mac|iPhone|iPad/.test(globalThis.navigator?.platform
 // ------------------------------------------------------------------ drawing
 const make = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 let openLayer = null;
+// A layer closed so that another can open in its place (the palette's "Keyboard shortcuts") hands on where the focus was
+// before it, so the next one gives it back there. Only for the moment of that hand-over.
+let handOff = null;
 function closeLayer(restore = true) {
   if (!openLayer) return;
   const { scrim, prev, onKey } = openLayer;
@@ -99,12 +103,18 @@ function closeLayer(restore = true) {
   document.removeEventListener("keydown", onKey, true);
   scrim.remove();
   if (restore && prev?.isConnected) prev.focus?.({ preventScroll: true });
+  if (!restore) { handOff = prev; queueMicrotask(() => { handOff = null; }); }
 }
 export const layerOpen = () => !!openLayer;
 
+/** A modal dialog is up (Settings, the account gate, New mission, an image): it owns the keyboard, so no shortcut acts behind it. */
+const MODALS = ".modal, .ms-dlg-wrap, .lightbox";
+export const modalOpen = () => [...document.querySelectorAll(MODALS)].some((m) => !m.hidden);
+
 function layer(cls, label, onKey) {
   closeLayer(false);
-  const prev = document.activeElement;
+  const prev = handOff?.isConnected ? handOff : document.activeElement;
+  handOff = null;
   const scrim = make("div", `kbd-scrim ${cls}-scrim`);
   const box = make("div", cls);
   box.setAttribute("role", "dialog");
@@ -176,12 +186,12 @@ export function openPalette(items, { mac = isMac() } = {}) {
   input.focus();
 }
 
-/** The sheet of shortcuts. */
+/** The sheet of shortcuts. Its one control is Close, so Tab and Shift+Tab stay on it, as the palette keeps Tab in its box. */
 export function openShortcuts({ mac = isMac() } = {}) {
-  const box = layer("kbd-sheet", "Keyboard shortcuts");
+  const x = make("button", "icon-btn kbd-close");
+  const box = layer("kbd-sheet", "Keyboard shortcuts", (e) => { if (e.key === "Tab") { e.preventDefault(); x.focus(); } });
   const head = make("div", "kbd-head");
   head.appendChild(make("h2", null, "Keyboard shortcuts"));
-  const x = make("button", "icon-btn kbd-close");
   x.type = "button";
   x.setAttribute("aria-label", "Close");
   x.innerHTML = '<svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>';
@@ -199,12 +209,16 @@ export function openShortcuts({ mac = isMac() } = {}) {
   box.focus();
 }
 
-/** Global keys: `actions[name]()` for each shortcut. Escape and the layers' own keys are theirs. */
+/**
+ * Global keys: `actions[name]()` for each shortcut. Escape and the layers' own keys are theirs. While a modal is open no
+ * shortcut acts, Ctrl/⌘+K included: Esc closes the modal first. A Ctrl/⌘ combination still keeps the browser's meaning away.
+ */
 export function installKeys(actions, { mac = isMac() } = {}) {
   document.addEventListener("keydown", (e) => {
     if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
     const name = shortcutFor(e, { mac });
     if (!name) return;
+    if (modalOpen()) { if (e.ctrlKey || e.metaKey) e.preventDefault(); return; }
     if (openLayer && name !== "palette" && name !== "shortcuts") return;
     const fn = actions[name];
     if (!fn) return;
