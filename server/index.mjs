@@ -604,7 +604,8 @@ export async function createApp(overrides = {}) {
   // ------------------------------------------------------------------ http
   // The UI: dist/ui while it is what ui/ makes, ui/ itself the moment it is not (server/ui-build.mjs).
   const UI_ROOT = cfg.uiRoot || ROOT;
-  const uiBuild = openUiBuild({ root: UI_ROOT, log: cfg.log || log, fromSource: !!cfg.uiFromSource || process.env.OMNI_UI_SOURCE === "1" });
+  // A checkout with esbuild installed rebuilds a stale UI by itself; never under test, where the build must be the committed one.
+  const uiBuild = openUiBuild({ root: UI_ROOT, log: cfg.log || log, fromSource: !!cfg.uiFromSource || process.env.OMNI_UI_SOURCE === "1", autoBuild: cfg.uiAutoBuild ?? (!underTest && process.env.OMNI_UI_AUTOBUILD !== "0"), runBuild: cfg.uiRunBuild });
   const NO_FILES = new Map(), NOTHING_FETCH_ONLY = new Set();
   const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
   function send(res, code, body, type = "application/json") {

@@ -259,6 +259,38 @@ test("openUiBuild looks at the disk only when a file really changed", () => {
   assert.match(ui.reason(), /ui\/lib\.js/);
 });
 
+test("a developer's checkout rebuilds a stale UI by itself, once at a time, and a failed build waits for the next change", async () => {
+  const dir = checkoutCopy();
+  mkdirSync(join(dir, "node_modules", "esbuild"), { recursive: true });
+  const logged = [];
+  let builds = 0, fail = true;
+  const runBuild = async () => { builds++; if (fail) throw new Error("ui/app.js:1: broken"); };
+  const ui = openUiBuild({ root: dir, log: (l) => logged.push(l), autoBuild: true, runBuild });
+  assert.ok(ui.current(), "fresh: nothing to do");
+  assert.equal(builds, 0);
+  const file = join(dir, "ui", "lib.js");
+  touch(file, `${readFileSync(file, "utf8")}\n// edit\n`);
+  assert.equal(ui.current(), null, "source while it builds");
+  await ui.building;
+  assert.equal(builds, 1);
+  assert.ok(logged.some((l) => /build failed.*broken/.test(l)));
+  ui.current();
+  await ui.building;
+  assert.equal(builds, 1, "not again for the same sources");
+  fail = false;
+  touch(file, `${readFileSync(file, "utf8")}\n// another\n`);
+  ui.current();
+  await ui.building;
+  assert.equal(builds, 2);
+
+  const plain = checkoutCopy(); // no node_modules: never built
+  let none = 0;
+  const off = openUiBuild({ root: plain, autoBuild: true, runBuild: async () => { none++; } });
+  touch(join(plain, "ui", "lib.js"), "// changed\n");
+  assert.equal(off.current(), null);
+  assert.equal(none, 0);
+});
+
 test("the build script's check and list work with no node_modules, as on a plain checkout", () => {
   const dir = checkoutCopy();
   const run = (...args) => spawnSync(process.execPath, [join(dir, "scripts", "build-ui.mjs"), ...args], { encoding: "utf8", cwd: dir });

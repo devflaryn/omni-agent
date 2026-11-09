@@ -82,7 +82,7 @@ function loadAgents(list, rev = agentRev) {
 // ------------------------------------------------------------- modules
 const openChat = (sid) => { selectSession(sid); showView("chat"); if (window.innerWidth < 1100) panel.setOpen(false); };
 const history = createHistory({ S, onSelect: openChat, onNew: () => { showView("home"); home.focus(); }, onDelete: deleteChat, agentFor });
-const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => history.render() });
+const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => { loadAllChats(); history.render(); } });
 // Reveal opens a window on the screen of the computer serving the files: never from a remote browser, or from a window on another machine.
 const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat"), isRemote: () => remote.role === "remote" || isRemote() });
 const account = createAccount({ toast, openSettings: () => settings.open("account") });
@@ -570,6 +570,7 @@ async function selectSession(sid, { reload = false } = {}) {
   const previous = S.view;
   if (S.view && !reload) finish(S.view);
   S.selected = sid;
+  loadAllChats(); // its agents may be older than the first screen's
   S.forceFork = false;
   history.render();
   const s0 = S.sessions.get(sid);
@@ -836,11 +837,17 @@ async function init() {
   setInterval(() => { if (document.body.classList.contains("panel-open")) history.render(); if (S.page === "chat") updateComposer(); }, 15000);
   afterFirstPaint(st.sessionsTotal > st.sessions.length);
 }
-/** What no part of the first screen waits for: the model list (shown from the last one seen until then), every older chat, Missions. */
+/** What no part of the first screen waits for: the model list (shown from the last one seen until then), and Missions. */
 function afterFirstPaint(moreChats) {
+  allChatsLoaded = !moreChats;
   loadPiChoices().catch(() => {});
-  if (moreChats) refreshState().then(() => history.render());
   const later = globalThis.requestIdleCallback ?? ((fn) => setTimeout(fn, 200));
   later(() => missionView.ready().catch(() => {}));
+}
+/** Every chat and agent, once: when the chats drawer opens or a chat does, which is where the older ones are seen. */
+let allChatsLoaded = true, allChatsLoading = null;
+function loadAllChats() {
+  if (allChatsLoaded) return;
+  allChatsLoading ??= refreshState().then(() => { allChatsLoaded = true; history.render(); renderAgents(); }).finally(() => { allChatsLoading = null; });
 }
 init().catch((e) => { if (isRemote()) account.machineDown(e.message); else toast(`Omni Agent failed to start: ${e.message}`, true); });

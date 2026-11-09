@@ -2,6 +2,7 @@
 // with no install runs this. A build that is not the sources' is never served: the server goes to source and says so in its log.
 //
 // Line endings do not count, for a checkout that turns them is the same source; see scripts/build-ui.mjs, which strips them too.
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -46,8 +47,21 @@ function damagedOutput(root) {
  * page load and looks only at each input's size and time unless one has moved, which costs well under a millisecond a file.
  * `files()` is the build's files even when stale, for a page that loaded them before the edit.
  */
-export function openUiBuild({ root, log = () => {}, fromSource = false }) {
+export function openUiBuild({ root, log = () => {}, fromSource = false, autoBuild = false, runBuild = defaultBuild }) {
   const list = join(root, "dist", "ui", "build.json");
+  // A developer's checkout, with esbuild installed: a stale build is rebuilt by itself, one at a time, while source is served. A failed
+  // build is not tried again until a source changes. A plain checkout has no esbuild and is not touched.
+  const canBuild = autoBuild && !fromSource && existsSync(join(root, "node_modules", "esbuild"));
+  let building = null, failedAt = null;
+  function rebuild() {
+    if (!canBuild || building || failedAt === signature) return;
+    const at = signature;
+    log("building the UI (npm run build)");
+    building = runBuild(root).then(
+      () => { log("the UI is built"); },
+      (error) => { failedAt = at; log(`the UI build failed, so the UI stays on source: ${String(error.message).split("\n").slice(0, 6).join(" | ")}`); },
+    ).finally(() => { building = null; });
+  }
   let loaded = null;       // the build's files, once read, and those of any build before it this run
   let version = null;
   let inputs = [];
@@ -77,8 +91,9 @@ export function openUiBuild({ root, log = () => {}, fromSource = false }) {
     why = fromSource ? "OMNI_UI_SOURCE or uiFromSource asks for it" : checkBuild(root);
     serving = why ? null : (serving ?? { files: loaded });
     signature = sign();
-    const line = why ? `serving the UI from source: ${why}. npm run build makes it fast again` : "serving the built UI";
+    const line = why ? `serving the UI from source: ${why}.${canBuild ? "" : " npm run build makes it fast again"}` : "serving the built UI";
     if (line !== said) { said = line; log(line); }
+    if (why) rebuild();
   }
 
   return {
@@ -92,5 +107,19 @@ export function openUiBuild({ root, log = () => {}, fromSource = false }) {
       return loaded;
     },
     reason() { this.current(); return why; },
+    /** The build under way, if any: for tests. */
+    get building() { return building; },
   };
+}
+
+/** `node scripts/build-ui.mjs` in `root`. Its output goes to the log only when it fails. */
+function defaultBuild(root) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [join(root, "scripts", "build-ui.mjs")], { cwd: root, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let text = "";
+    child.stdout.on("data", (d) => { text += d; });
+    child.stderr.on("data", (d) => { text += d; });
+    child.on("error", reject);
+    child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(text.trim() || `exit ${code}`))));
+  });
 }
