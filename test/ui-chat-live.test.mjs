@@ -185,6 +185,10 @@ test("styles.css has one rule for a markdown paragraph's margins, and none for w
   assert.match(read("transcript.js"), /"rblock stream"/);
 });
 
+test("the Settings form's column never grows past the dialog on a phone (a long path or select stays inside)", () => {
+  assert.match(read("styles.css"), /^\.prov-form \{[^}]*grid-template-columns: minmax\(0, 1fr\);/m);
+});
+
 test("the chat's live text is painted once a frame at most, never token by token", () => {
   const src = read("transcript.js");
   assert.match(src, /requestAnimationFrame/);

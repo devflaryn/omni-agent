@@ -637,7 +637,7 @@ body.panel-open #btnPanel { color: var(--ink); background: var(--field); }
 .prov-grip:hover, .prov-grip:focus-visible { background: var(--field-2); outline: 0; }
 .prov-grip:hover::before, .prov-grip:focus-visible::before { background-image: radial-gradient(circle, var(--muted) 1.2px, transparent 1.6px); }
 .prov-item.dragging .prov-grip { cursor: grabbing; }
-.prov-form { padding: 14px 20px 18px; overflow: auto; display: grid; gap: 10px; align-content: start; }
+.prov-form { padding: 14px 20px 18px; overflow: auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; align-content: start; }
 .pf-title { font-size: var(--fs-md); font-weight: 600; }
 .prov-form label { display: grid; gap: 4px; font-size: var(--fs-sm); color: var(--muted); }
 .prov-form input, .prov-form select, .prov-form textarea { color: var(--ink); font-size: var(--fs-sm); }
