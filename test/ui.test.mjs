@@ -149,14 +149,32 @@ test("toolLabel gives a one-line Claude-Code-style row label", () => {
   assert.deepEqual(toolLabel("Bash", undefined), { kind: "shell", text: "Ran a command" });
 });
 
-test("workSummary joins verb phrases in first-seen order", () => {
-  assert.equal(workSummary(["browser", "edit", "shell", "edit"]), "Used the browser, edited files, ran commands");
-  assert.equal(workSummary(["shell"]), "Ran commands");
-  assert.equal(workSummary(["read", "search"]), "Read files, searched files");
-  assert.equal(workSummary(["agent", "web", "mcp", "other"]), "Ran subagents, fetched the web, used tools");
+test("workSummary counts by kind in first-seen order", () => {
+  assert.equal(workSummary(["browser", "edit", "shell", "edit"]), "Used the browser, edited 2 files, ran a command");
+  assert.equal(workSummary(["shell"]), "Ran a command");
+  assert.equal(workSummary(["read", "search"]), "Read a file, 1 search");
+  assert.equal(workSummary(["agent", "web", "mcp", "other"]), "Ran a subagent, fetched the web, used 2 tools");
   assert.equal(workSummary([]), "Worked");
   assert.equal(workSummary(["shell"], true), "Running a command…");
   assert.equal(workSummary(["edit", "browser"], true), "Using the browser…");
+});
+
+test("workSummary names what it can: files, programs, tools", () => {
+  const L = (name, args) => toolLabel(name, args, "C:/p");
+  assert.equal(workSummary([L("grep", { pattern: "a" }), L("glob", { pattern: "*.py" }), L("read", { path: "C:/p/display.py" }), L("bash", { command: "pytest -q" })]), "2 searches, read display.py, ran pytest");
+  assert.equal(workSummary([L("read", { path: "a.py" }), L("read", { path: "a.py" })]), "Read a.py");
+  assert.equal(workSummary([L("read", { path: "a.py" }), L("read", { path: "b.py" })]), "Read a.py and b.py");
+  assert.equal(workSummary([L("read", { path: "a.py" }), L("read", { path: "b.py" }), L("read", { path: "c.py" })]), "Read 3 files");
+  assert.equal(workSummary([L("edit", { path: "a.js", oldText: "x", newText: "y" }), L("write", { path: "b.js", content: "z" })]), "Edited a.js and b.js");
+  assert.equal(workSummary([L("bash", { command: "cd server && npm test" }), L("bash", { command: "npm test" })]), "Ran npm test twice");
+  assert.equal(workSummary([L("bash", { command: "python -m pytest -q tests/x.py" }), L("bash", { command: "git status --short" })]), "Ran pytest and git status");
+  assert.equal(workSummary([L("bash", { command: "ls" }), L("bash", { command: "cat x | grep y" }), L("bash", { command: "npx vitest run" })]), "Ran 3 commands");
+  assert.equal(workSummary([L("bash", { command: "FOO=1 sudo /usr/bin/make.exe all" })]), "Ran make all");
+  assert.equal(workSummary([L("Skill", { skill: "graphify" })]), "Used Skill");
+  assert.equal(workSummary([L("mcp__omnidroid__screenshot", {}), L("mcp__omnidroid__screenshot", {})]), "Used screenshot");
+  assert.equal(workSummary([L("read", { path: "C:/p/display.py" })], true), "Reading display.py…");
+  assert.equal(workSummary([L("read", { path: "a.py" }), L("bash", { command: "pytest -q" })], true), "Running pytest…");
+  assert.equal(workSummary([L("grep", { pattern: "x" })], true), "Searching…");
 });
 
 test("fileKind picks the preview family from the name", () => {
@@ -249,7 +267,7 @@ test("plan tool calls read as plan moves in the transcript", () => {
   assert.equal(toolLabel("plan", { action: "create", milestones: [{}, {}] }).text, "Planned 2 milestones");
   assert.equal(toolLabel("plan", { action: "done", step: "1.2" }).text, "Finished step 1.2");
   assert.equal(toolLabel("plan", { action: "show" }).text, "Checked the plan");
-  assert.equal(workSummary(["plan", "shell"]), "Updated the plan, ran commands");
+  assert.equal(workSummary(["plan", "shell"]), "Updated the plan, ran a command");
 });
 
 test("applyStatus: a compaction status says nothing about streaming, so it leaves it as it was", () => {

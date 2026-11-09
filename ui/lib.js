@@ -327,13 +327,81 @@ export function toolLabel(name, args, cwd, resultDiff) {
     default: { const b = one(a.command || a.file_path || a.path || a.pattern || a.query || a.skill || a.task || a.description, 80); return { kind, text: b ? `${name} ${b}` : String(name || "tool") }; }
   }
 }
-const VERBS = { plan: ["updated the plan", "Planning"], browser: ["used the browser", "Using the browser"], edit: ["edited files", "Editing a file"], shell: ["ran commands", "Running a command"], read: ["read files", "Reading a file"], search: ["searched files", "Searching files"], agent: ["ran subagents", "Running a subagent"], web: ["fetched the web", "Fetching the web"], mcp: ["used tools", "Using a tool"], other: ["used tools", "Using a tool"] };
-export function workSummary(kinds, live = false) {
-  const ks = (kinds || []).map((k) => (VERBS[k] ? k : "other"));
-  if (live) return `${(VERBS[ks[ks.length - 1]] || VERBS.other)[1]}…`;
-  const seen = [...new Set(ks.map((k) => VERBS[k][0]))];
-  if (!seen.length) return "Worked";
-  const s = seen.join(", ");
+const LIVE = { plan: "Planning", browser: "Using the browser", edit: "Editing a file", shell: "Running a command", read: "Reading a file", search: "Searching", agent: "Running a subagent", web: "Fetching the web", mcp: "Using a tool", other: "Using a tool" };
+/** Words that are the program, not what it runs: `npx vitest` is vitest, `sudo make` is make. */
+const RUNNERS = new Set(["sudo", "env", "time", "nohup", "exec", "command", "npx", "pnpx", "bunx", "uvx", "call", "start"]);
+/** Programs whose next word says what was run: `npm test`, `git status`, `cargo build`. */
+const WITH_SUB = new Set(["npm", "pnpm", "yarn", "bun", "git", "cargo", "go", "dotnet", "docker", "kubectl", "gh", "make", "gradle", "mvn", "poetry", "pip", "pip3", "uv", "deno"]);
+/** The program a shell command ran, as a reader names it ("npm test", "pytest", "git status"), or "". */
+export function commandName(command) {
+  // The last step of a chain is the one that matters (`cd server && npm test`); of a pipe, the first.
+  const step = String(command || "").split(/&&|\|\||;|\n/).map((s) => s.trim()).filter(Boolean).pop() || "";
+  const words = step.split("|")[0].trim().split(/\s+/).filter(Boolean);
+  while (words.length && (/^[A-Za-z_][\w]*=/.test(words[0]) || RUNNERS.has(words[0].toLowerCase()))) words.shift();
+  const base = (w) => baseName(String(w || "").replace(/^["']|["']$/g, "")).replace(/\.(exe|cmd|bat|sh)$/i, "");
+  let prog = base(words[0]);
+  if (!prog) return "";
+  const lower = prog.toLowerCase();
+  if (/^python[\d.]*$|^py$/.test(lower) && words[1] === "-m" && words[2]) return base(words[2]);
+  if (lower === "uv" && words[1] === "run" && words[2]) return base(words[2]);
+  if (WITH_SUB.has(lower) && words[1] && !words[1].startsWith("-")) {
+    prog = `${prog} ${words[1]}`;
+    if (/^(run|exec|x)$/.test(words[1]) && words[2] && !words[2].startsWith("-")) prog += ` ${words[2]}`;
+  }
+  return prog.slice(0, 40);
+}
+const plural = (n, one, many) => (n === 1 ? one : many.replace("#", n));
+/** "a.py", "a.py and b.py", or how many: the files a run of reads or edits touched. */
+function filesPhrase(verb, labels) {
+  const names = [...new Set(labels.map((l) => l.target).filter(Boolean))];
+  const unnamed = labels.filter((l) => !l.target).length;
+  if (!unnamed && names.length === 1) return `${verb} ${names[0]}`;
+  if (!unnamed && names.length === 2) return `${verb} ${names[0]} and ${names[1]}`;
+  const n = names.length + unnamed;
+  return `${verb} ${plural(n, "a file", "# files")}`;
+}
+const toolName = (l) => { const w = String(l.text || "").split(/\s+/)[0] || "tool"; return w.split("__").pop(); };
+function phrase(kind, labels) {
+  const n = labels.length;
+  switch (kind) {
+    case "search": return plural(n, "1 search", "# searches");
+    case "read": return filesPhrase("read", labels);
+    case "edit": return filesPhrase("edited", labels);
+    case "shell": {
+      const progs = labels.map((l) => (/^Ran /.test(l.text || "") ? commandName(l.text.slice(4)) : ""));
+      const names = [...new Set(progs.filter(Boolean))];
+      if (!progs.includes("") && names.length === 1) return `ran ${names[0]}${n === 2 ? " twice" : n > 2 ? ` ${n} times` : ""}`;
+      if (!progs.includes("") && names.length === 2 && n === 2) return `ran ${names[0]} and ${names[1]}`;
+      return `ran ${plural(n, "a command", "# commands")}`;
+    }
+    case "web": return n === 1 ? "fetched the web" : `${n} web lookups`;
+    case "agent": return `ran ${plural(n, "a subagent", "# subagents")}`;
+    case "browser": return "used the browser";
+    case "plan": return "updated the plan";
+    default: {
+      const names = [...new Set(labels.map((l) => (l.text ? toolName(l) : "")))];
+      return names.length === 1 && names[0] ? `used ${names[0]}` : `used ${plural(n, "a tool", "# tools")}`;
+    }
+  }
+}
+/**
+ * A work group's one line: counts and real names, in first-seen order ("2 searches, read display.py, ran pytest").
+ * `items`: the tool labels (toolLabel), or bare kinds. Live: what the newest call is doing ("Running pytest…").
+ */
+export function workSummary(items, live = false) {
+  const labels = (items || []).map((x) => (typeof x === "string" ? { kind: x } : x || {})).map((l) => ({ ...l, kind: LIVE[l.kind] ? l.kind : "other" }));
+  if (live) {
+    const l = labels[labels.length - 1] || { kind: "other" };
+    if (l.kind === "read" && l.target) return `Reading ${l.target}…`;
+    if (l.kind === "edit" && l.target) return `Editing ${l.target}…`;
+    if (l.kind === "shell" && /^Ran /.test(l.text || "")) { const p = commandName(l.text.slice(4)); if (p) return `Running ${p}…`; }
+    return `${LIVE[l.kind]}…`;
+  }
+  if (!labels.length) return "Worked";
+  const byKind = new Map();
+  // mcp and other tools read alike: one phrase for both.
+  for (const l of labels) { const k = l.kind === "mcp" ? "other" : l.kind; if (!byKind.has(k)) byKind.set(k, []); byKind.get(k).push(l); }
+  const s = [...byKind].map(([k, ls]) => phrase(k, ls)).join(", ");
   return s[0].toUpperCase() + s.slice(1);
 }
 
