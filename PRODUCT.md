@@ -22,7 +22,7 @@ A single window over the agents that already run on this machine, rather than a 
 
 - The dominant job is watching long agent runs on omnidroid work: pi running APKs on Android, APK rebuilds, frida hooks, custom APK boots. Tool activity, run status and the elapsed/token line matter more than prose polish. Runs last minutes to hours and are often observed from a phone.
 - Secondary job: general coding chats in project folders, with the file explorer and preview beside the transcript.
-- Surfaces: Home (prompt, machine and folder, running work and recent chats), Chat (explorer, preview, transcript, composer), history drawer (Chats, Memory, Graph, Tokens), Missions, Settings (Models, MCP servers, Remote, Long runs, Account, Appearance), sign-in and approval cards, toasts.
+- Surfaces: Home (prompt, machine and folder, running work and recent chats), Chat (explorer, preview, transcript, composer), history drawer (Chats, Memory, Graph, Tokens), Missions, Settings (Models, MCP servers, Long runs, Account, Appearance), sign-in and approval cards, toasts.
 - Runtime: Node 22 server on port 4400, `ui/` in vanilla HTML/CSS/ES modules with no framework, built by `npm run build` into content-hashed files in `dist/ui`. SSE for live events. The desktop window is a web view; phone use is Mobile Safari or Chrome, and Add to Home Screen opens it standalone.
 - Models are user-configured providers in pi's `~/.pi/agent/models.json` (OpenRouter + DeepSeek today). DeepSeek is text-only, so some skills carry text-only verification loops.
 
