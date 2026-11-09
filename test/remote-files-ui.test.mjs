@@ -30,8 +30,8 @@ test("a refused save carries the answer, here and on another machine: the pane o
   await assert.rejects(api("POST", "/api/fs/delete", {}), (e) => e.body?.trashFailed === true);
 });
 
-test("the reveal action is hidden on another machine as well as in a remote browser, and never built without the check", () => {
-  assert.match(read("app.js"), /createExplorer\(\{[^\n]*isRemote: \(\) => remote\.role === "remote" \|\| !focusM\(\)\?\.here/);
+test("the reveal action is hidden on another machine, and never built without the check", () => {
+  assert.match(read("app.js"), /createExplorer\(\{[^\n]*isRemote: \(\) => !focusM\(\)\?\.here/);
   const uses = read("explorer.js").split(/\r?\n/).filter((l) => /revealOnHost\(/.test(l) && !/async function/.test(l));
   assert.ok(uses.length >= 2);
   for (const l of uses) assert.match(l, /!isRemote\(\) &&/, l.trim());

@@ -12,9 +12,8 @@ import { createExplorer } from "./explorer.js";
 import { createSettings } from "./settings.js";
 import { initResizers } from "./resizer.js";
 import { asPlan, planProgress, PLAN_TOOL } from "./plan.js";
-import { createRemote } from "./remote.js";
 import { createStream } from "./stream.js";
-import { at, local, machine, machineTitle, setMachine, streamEvents, webPage } from "./transport.js";
+import { at, local, machine, machineTitle, setMachine, webPage } from "./transport.js";
 import { createAccount } from "./account.js";
 import { cachedModels, keepModels } from "./model-cache.js";
 import { HERE, applySessionEvent, createDrafts, fromMerged, goalBox, machineList, mergedEventsUrl, newWorkspace, sidebarGroups, whereWords } from "./machines.js";
@@ -52,21 +51,11 @@ const onMachine = (caption) => { const w = whereWords(MACHINES, focusKey); retur
 /** Why nothing can be sent to the focused machine right now, or "". */
 const focusBlocked = () => { const m = focusM(); return !m ? "" : m.state === "offline" ? `${m.label} is offline. Nothing is sent or queued.` : m.state === "refusing" ? `${m.label} does not let web pages in` : ""; };
 
-/** What a remote browser may do without the host's approval (mirrors server/access.mjs READ). */
-const REMOTE_FREE = /^\/api\/(graph\/(query|explain)|remote\/(login|logout))$/;
 /** A request on one machine, by key. */
-const callOn = (key) => (path, body, method) => {
-  const verb = body || (method && method !== "GET") ? method || "POST" : "GET";
-  // A remote change is held open by the server until the host decides: say so while it waits.
-  if (remote.role === "remote" && verb !== "GET" && !REMOTE_FREE.test(path)) toast("Waiting for the host to approve…");
-  return handleOf(key).api(verb, path, body || undefined);
-};
+const callOn = (key) => (path, body, method) => handleOf(key).api(body || (method && method !== "GET") ? method || "POST" : "GET", path, body || undefined);
 /** A request on the focused machine, bound to it as it is sent. */
 function api(path, body, method) { return callOn(focusKey)(path, body, method); }
 const toast = createToasts($("#toasts"));
-// The old remote settings and cards are this computer's, whichever machine the window is on.
-const hereApi = (path, body, method) => local.api(body || (method && method !== "GET") ? method || "POST" : "GET", path, body);
-const remote = createRemote({ api: hereApi, toast });
 const homeCwd = () => $("#homeCwd").value.trim() || S.config?.cwd || "";
 const currentDir = () => (S.page === "chat" && S.sessions.get(S.selected)?.cwd) || homeCwd() || null;
 const drafts = createDrafts({ storage: (() => { try { return globalThis.localStorage; } catch { return null; } })() });
@@ -132,8 +121,8 @@ const history = createHistory({
   agentFor: agentIn,
 });
 const panel = createPanel({ S, api, toast, onSelect: openChat, currentDir, getPiContextWindow: () => S.pi.state?.model?.contextWindow, onShowChats: () => { loadAll(focusKey); history.render(); }, where: () => whereOn() });
-// Reveal opens a window on the screen of the computer serving the files: never from a remote browser, or from a window on another machine.
-const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat"), isRemote: () => remote.role === "remote" || !focusM()?.here, where: () => whereOn() });
+// Reveal opens a window on the screen of the computer serving the files: never from a window on another machine.
+const explorer = createExplorer({ api, toast, insert: (t) => (S.page === "chat" ? chat : home).insert(t), onClose: () => setExplorer(false, S.page === "chat"), isRemote: () => !focusM()?.here, where: () => whereOn() });
 const account = createAccount({ toast, openSettings: () => openSettings("account"), choose: chooseMachine, onMachines: setMachines, retry: () => loadFirst(focusKey) });
 // Settings shows one machine's models, MCP servers and long runs: the focused one when it opens, and any other picked in it.
 let settingsKey = null;
@@ -142,7 +131,7 @@ const settingsConfig = () => (settingsOn() === focusKey ? S.config : wsOf(settin
 const settings = createSettings({
   api: (path, body, method) => callOn(settingsOn())(path, body, method), toast,
   onChanged: () => { if (settingsOn() === focusKey) { loadPiChoices(); refreshState(); } },
-  loadRemote: () => remote.loadSettings(), loadAccount: () => account.renderSettings(),
+  loadAccount: () => account.renderSettings(),
   getContext: () => settingsConfig()?.context,
   onContext: (context) => { if (settingsOn() === focusKey) S.config = { ...(S.config || {}), context }; else { const ws = wsOf(settingsOn()); ws.config = { ...(ws.config || {}), context }; } },
   where: () => whereOn(settingsOn()), onTab: renderSettingsMachine,
@@ -593,18 +582,8 @@ async function homeSend(text, o) {
   if (blocked) return toast(blocked, true);
   // Every step of starting this chat goes to the machine it was started on, wherever the window is by the time it answers.
   const key = focusKey, call = callOn(key), ws = wsOf(key);
-  home.setState({ disabled: true, caption: remote.role === "remote" ? "Waiting for the host to approve…" : onMachine("Starting…") });
+  home.setState({ disabled: true, caption: onMachine("Starting…") });
   try {
-    if (remote.role === "remote") {
-      // One request, one approval: the server starts pi (or a new session) and sends the message.
-      const r = await call("/api/pi/send", { cwd, message: text, memory: o.memory, graph: o.graph });
-      const st = await call("/api/state");
-      if (key === focusKey) S.pi = st.pi;
-      ws.sessions.set(r.sid, { ...(ws.sessions.get(r.sid) || {}), sid: r.sid, harness: "pi", owned: true, cwd, title: text.replace(/\s+/g, " ").slice(0, 80), lastActivity: Date.now(), streaming: true });
-      if (key === focusKey) openChat(r.sid);
-      home.clear();
-      return;
-    }
     // A chat of its own: a free pi child in that folder opens it, else another one starts. Chats already working keep going.
     const r = await call("/api/pi/open", { cwd });
     if (!r.sid || r.sid === "pi:pending") throw new Error("OpenCode did not report a session");
@@ -1094,7 +1073,7 @@ function streamUp(key) { down.delete(key); wsOf(key).streamError = null; if (key
 function streamDown(key, why) {
   down.add(key);
   if (why) wsOf(key).streamError = why;
-  if (key === focusKey) { $("#connStatus").hidden = false; if (key === HERE) checkSignedIn(); }
+  if (key === focusKey) $("#connStatus").hidden = false;
   history.render();
 }
 /** One event of a machine's stream: to its workspace, and to the screen if that machine is the one shown. */
@@ -1126,11 +1105,7 @@ function machineStream(m) {
     url: () => eventsUrl(wsOf(key)),
     EventSource: function MachineEvents(url) { return handleOf(key).eventSource(url); }, // called with new: what it returns is the stream
     onMessage: (msg) => dispatch(key, msg.data),
-    on: streamEvents(m.id ? m : null, {
-      // Only this computer's own stream carries these: remote changes waiting for Approve/Deny.
-      approvals: (msg) => { try { remote.setApprovals(JSON.parse(msg.data)); } catch { /* */ } },
-      resync: (msg) => resyncMachine(key, msg.data),
-    }),
+    on: { resync: (msg) => resyncMachine(key, msg.data) },
     onUp: () => streamUp(key),
     onDown: () => streamDown(key),
   });
@@ -1171,14 +1146,6 @@ function syncStreams() {
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") pokeStreams(); });
 window.addEventListener("online", () => pokeStreams());
 function pokeStreams() { for (const s of streams.values()) s.poke(); merged?.poke(); }
-/** EventSource cannot see a 401, so a remote browser whose session ended (the server restarted, the password
- *  changed, it expired) retried "reconnecting" forever. After a drop, ask once; api() reloads to the sign-in page. */
-let probing = false;
-function checkSignedIn() {
-  if (remote.role !== "remote" || probing) return;
-  probing = true;
-  hereApi("/api/remote/me").catch(() => {}).finally(() => { probing = false; });
-}
 async function resync() {
   await refreshState();
   history.render();
@@ -1284,8 +1251,6 @@ async function init() {
     // The URL is kept: once the machine answers, a reload opens what it names.
     history.render(); applyingRoute = true; try { showView("home"); } finally { applyingRoute = false; } return;
   }
-  remote.init(st.access);
-  if (!webPage() && st.access?.role !== "remote" && st.config?.lanUrls?.length) { $("#lanInfo").textContent = st.config.lanUrls[0]; $("#lanInfo").title = "Open this on another device and sign in with the remote password from Settings, Remote. It is read-only there, and every change waits for your approval."; }
   history.render();
   // The URL says where to open: #missions (a link, a bookmark, the phone's home screen), a chat, or Home.
   const route = parseHash(location.hash);

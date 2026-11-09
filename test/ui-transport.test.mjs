@@ -2,9 +2,8 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
-import { api, cleanName, eventSource, isRemote, local, machine, machineName, machineTitle, mode, onStillWaiting, rawUrl, setChannelTransport, setMachine, setStillWaitingAfter, setTransportEnv, streamEvents } from "../ui/transport.js";
+import { api, cleanName, eventSource, isRemote, local, machine, machineName, machineTitle, mode, onStillWaiting, rawUrl, setChannelTransport, setMachine, setStillWaitingAfter, setTransportEnv } from "../ui/transport.js";
 import { alertTitle, gateKey, linkNews } from "../ui/account.js";
-import { createRemote } from "../ui/remote.js";
 import { esc, md } from "../ui/lib.js";
 
 const ID = "a/b+c==";
@@ -222,31 +221,11 @@ test("only transport.js calls fetch or opens an EventSource, so nothing can miss
   }
 });
 
-test("another machine's stream cannot paint this computer's approval cards", () => {
-  const handlers = { approvals: () => "approvals", resync: () => "resync" };
-  assert.deepEqual(Object.keys(streamEvents(null, handlers)).sort(), ["approvals", "resync"], "this computer's own stream carries them");
-  assert.deepEqual(Object.keys(streamEvents({ id: ID, name: "Ubuntu" }, handlers)), ["resync"]);
+test("a machine's stream takes chat events and its resync, and nothing of the old approval cards", () => {
   const app = read("app.js");
-  assert.match(app, /on: streamEvents\(m\.id \? m : null, \{/, "app.js uses it for every machine's stream");
-  assert.match(app, /fromMerged\(/, "the other machines' merged stream goes through the filter that drops approvals");
-});
-
-test("an approval card keeps the machine in the title, whenever it renders", () => {
-  setMachine(ID, { name: "Ubuntu" });
-  class Node { constructor() { this.children = []; this.dataset = {}; } appendChild() {} setAttribute() {} querySelectorAll() { return []; } }
-  const box = new Node();
-  const fake = { title: "stale", querySelector: () => box, createElement: () => new Node(), hidden: false };
-  const real = globalThis.document;
-  globalThis.document = fake;
-  try {
-    const remote = createRemote({ api: async () => ({}), toast: () => {} });
-    fake.title = "[Ubuntu] A chat · Omni Agent";
-    remote.setApprovals([{ id: "a", ip: "1.2.3.4", title: "t", path: "/x", method: "POST", expiresAt: Date.now() + 1000 }]);
-    assert.match(fake.title, /^\(1\) Approve\? · \[Ubuntu\] /);
-    remote.setApprovals([]);
-    assert.equal(fake.title, machineTitle());
-    assert.equal(fake.title, "[Ubuntu] Omni Agent");
-  } finally { globalThis.document = real; clearInterval(0); }
+  assert.match(app, /on: \{ resync: \(msg\) => resyncMachine\(key, msg\.data\) \}/, "every machine's own stream");
+  assert.match(app, /fromMerged\(/, "the other machines' merged stream goes through its filter");
+  assert.doesNotMatch(app, /approvals|createRemote|\/api\/remote\//);
 });
 
 test("a banner does not say the same thing twice", () => {
