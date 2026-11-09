@@ -172,6 +172,101 @@ async function relay(req, res, response, { slowReaderMs, send, hasBody }) {
   return undefined;
 }
 
+const MAX_MERGED = 64;
+const MERGED_CAP = 4 * 1024 * 1024; // a window that stops reading is let go of, as /events does
+const sseEvent = (name, data) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`;
+
+/**
+ * /remote/~events?m=[{id, since, boot}]: every other machine's /events in one stream, for the desktop window. A browser holds
+ * six connections to a host, and one stream per machine would spend them all. Each machine's stream runs on its own, so a slow
+ * or silent one holds up none of the others. Each of its events goes out whole, as
+ *   event: m     {id, name, data}       name is the far stream's event name ("message", "resync"), data its text
+ *   event: link  {id, up, error, code}  its stream came up, or was lost, naming why
+ * A lost stream is tried again from the last seq it gave. The caller has checked the window cookie and the Origin.
+ */
+export async function mergedEvents(req, res, { links, send, retryMs = 1000, kaMs = 20_000 }) {
+  const site = req.headers["sec-fetch-site"];
+  if (site !== undefined && site !== "same-origin" && site !== "none") return send(res, 403, { error: "that request did not come from the Omni window" });
+  let list;
+  try { list = JSON.parse(new URL(req.url, "http://x").searchParams.get("m") ?? ""); } catch { list = null; }
+  const valid = Array.isArray(list) && list.length <= MAX_MERGED && list.every((x) => x && typeof x.id === "string" && x.id && x.id.length <= 256 && (x.since === undefined || Number.isSafeInteger(x.since)) && (x.boot === undefined || (typeof x.boot === "string" && x.boot.length <= 64)));
+  if (!valid) return send(res, 400, { error: `m must be a list of up to ${MAX_MERGED} machines: [{id, since, boot}]` });
+
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  res.write(": open\n\n");
+  const gone = new AbortController();
+  const write = (text) => {
+    if (gone.signal.aborted) return;
+    if ((res.writableLength || 0) > MERGED_CAP) { gone.abort(); res.destroy(); return; }
+    try { res.write(text); } catch { gone.abort(); }
+  };
+  res.once("close", () => gone.abort());
+  const ka = setInterval(() => write(sseEvent("ka", {})), kaMs);
+  ka.unref?.();
+  gone.signal.addEventListener("abort", () => clearInterval(ka), { once: true });
+  const seen = new Set();
+  for (const x of list) {
+    if (seen.has(x.id)) continue;
+    seen.add(x.id);
+    follow(x.id, x.since ?? 0, x.boot ?? "");
+  }
+  return undefined;
+
+  async function follow(id, since, boot) {
+    let attempt = 0;
+    while (!gone.signal.aborted) {
+      let response = null;
+      try {
+        response = await links.request(id, { method: "GET", path: `/events?since=${since}${boot ? `&boot=${encodeURIComponent(boot)}` : ""}`, headers: { accept: "text/event-stream" }, signal: gone.signal });
+        if (gone.signal.aborted) { response.abort?.(); return; }
+        if (response.status !== 200) { response.abort?.(); throw new MachineError(response.status, "machine-refused", `the machine answered ${response.status}`); }
+        write(sseEvent("link", { id, up: true }));
+        attempt = 0;
+        const decoder = new TextDecoder();
+        let buffer = "", name = "message", data = [];
+        const line = (text) => {
+          if (text === "") {
+            if (data.length && name !== "ka") {
+              const joined = data.join("\n");
+              if (name === "resync") { try { const r = JSON.parse(joined); boot = typeof r.boot === "string" ? r.boot.slice(0, 64) : boot; since = 0; } catch { /* its own reader says so */ } }
+              else if (name === "message") { try { const seq = JSON.parse(joined).seq; if (Number.isSafeInteger(seq) && seq > since) since = seq; } catch { /* passed on as it is */ } }
+              write(sseEvent("m", { id, name, data: joined }));
+            }
+            name = "message";
+            data = [];
+            return;
+          }
+          if (text.startsWith(":")) return;
+          const at = text.indexOf(":");
+          const field = at < 0 ? text : text.slice(0, at);
+          const value = at < 0 ? "" : text.slice(at + 1).replace(/^ /, "");
+          if (field === "event") name = value;
+          else if (field === "data") data.push(value);
+        };
+        for await (const chunk of response.body) {
+          buffer += decoder.decode(chunk, { stream: true });
+          if (buffer.length > MERGED_CAP) throw new Error("an event with no end");
+          const parts = buffer.split(/\r\n|\n|\r(?!$)/);
+          buffer = parts.pop();
+          for (const text of parts) line(text);
+          if (gone.signal.aborted) return;
+        }
+        throw new Error("the stream ended");
+      } catch (error) {
+        response?.abort?.();
+        if (gone.signal.aborted) return;
+        write(sseEvent("link", { id, up: false, error: String(error.message ?? error), code: error.code ?? null }));
+      }
+      const wait = Math.min(30_000, retryMs * 2 ** Math.min(attempt++, 5));
+      await new Promise((resolve) => {
+        const t = setTimeout(resolve, wait);
+        t.unref?.();
+        gone.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+      });
+    }
+  }
+}
+
 function drained(res, ms) {
   return new Promise((resolve, reject) => {
     const done = (error) => {
