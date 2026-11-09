@@ -21,6 +21,29 @@ test("desktop launcher --plan prints node args with --lan and --cwd", { skip: !h
   assert.ok(!plan.args.includes("--plan"));
 });
 
+test("desktop launcher hands the logo to pywebview on Windows, or the window gets Python's icon", { skip: (!havePython && "python not on PATH") || (process.platform !== "win32" && "Windows only") }, () => {
+  const code = `
+import importlib.machinery, importlib.util, json, os, sys, types
+seen = {}
+fake = types.ModuleType("webview")
+class Win:
+    def evaluate_js(self, _): raise SystemExit
+fake.create_window = lambda *a, **k: Win()
+fake.start = lambda **k: seen.update(k)
+sys.modules["webview"] = fake
+loader = importlib.machinery.SourceFileLoader("omni_desktop", sys.argv[1])
+spec = importlib.util.spec_from_loader("omni_desktop", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+m.open_window("http://x/")
+print(json.dumps({"icon": seen.get("icon"), "exists": os.path.isfile(seen.get("icon") or "")}))
+`;
+  const r = spawnSync(PY, ["-c", code, script], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const got = JSON.parse(r.stdout);
+  assert.match(got.icon, /omni\.ico$/);
+  assert.equal(got.exists, true, "the logo file ships with the launcher");
+});
+
 test("desktop launcher defaults cwd to the Desktop", { skip: !havePython && "python not on PATH" }, () => {
   const r = run("--plan");
   const plan = JSON.parse(r.stdout);
