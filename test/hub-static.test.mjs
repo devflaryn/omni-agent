@@ -62,7 +62,7 @@ test("the policy is the one asked for: nothing inline, blob only for images and 
   assert.deepEqual(page_.body, built("web.html"));
   const csp = Object.fromEntries(page_.headers["content-security-policy"].split("; ").map((d) => { const [k, ...v] = d.split(" "); return [k, v.join(" ")]; }));
   assert.deepEqual(csp, {
-    "default-src": "'none'", "script-src": "'self'", "worker-src": "'self'", "style-src": "'self'", "img-src": "'self' blob: data:", "media-src": "'self' blob:",
+    "default-src": "'none'", "script-src": "'self'", "worker-src": "'self'", "style-src": "'self'", "img-src": "'self' blob: data:", "media-src": "'self' blob:", "manifest-src": "'self'",
     "connect-src": "'self' wss://tomcamp.tech", "frame-ancestors": "'none'", "base-uri": "'none'", "form-action": "'none'",
   });
   assert.doesNotMatch(page_.headers["content-security-policy"], /unsafe/);

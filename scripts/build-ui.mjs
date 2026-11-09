@@ -29,7 +29,9 @@ const SELF = "scripts/build-ui.mjs";
 const PAGES = ["index.html", "web.html", "phone.html"].filter((page) => existsSync(join(UI, page)));
 const TARGET = ["es2022", "chrome111", "safari16.4", "firefox128"];
 const WORKER = /new URL\("\.\/([\w.-]+\.js)", import\.meta\.url\)/g;
-const ASSET = /\b(href|src)="(\/?)([\w.-]+\.(?:css|js|svg|png))"/g;
+const ASSET = /\b(href|src)="(\/?)([\w.-]+\.(?:css|js|svg|png|webmanifest))"/g;
+/** The icons a web manifest names: "src": "icon-192.png". They are built (hashed) like any image, and the manifest names the built ones. */
+const MANIFEST_ICON = /("src"\s*:\s*")([\w.-]+\.png)(")/g;
 
 const posix = (p) => p.replace(/\\/g, "/");
 const lf = (text) => text.replace(/\r\n/g, "\n");
@@ -80,7 +82,10 @@ async function build() {
   });
   const scripts = [...new Set(pages.flatMap((p) => p.named.filter((n) => n.endsWith(".js"))))];
   const styles = [...new Set(pages.flatMap((p) => p.named.filter((n) => n.endsWith(".css"))))];
-  const images = [...new Set(pages.flatMap((p) => p.named.filter((n) => /\.(svg|png)$/.test(n))))];
+  const manifests = [...new Set(pages.flatMap((p) => p.named.filter((n) => n.endsWith(".webmanifest"))))];
+  const manifestIcons = manifests.flatMap((n) => [...lf(readFileSync(join(UI, n), "utf8")).matchAll(MANIFEST_ICON)].map((m) => m[2]));
+  for (const name of manifestIcons) if (!existsSync(join(UI, name))) fail(`a manifest names ${name}, which is not in ui/`);
+  const images = [...new Set([...pages.flatMap((p) => p.named.filter((n) => /\.(svg|png)$/.test(n))), ...manifestIcons])];
 
   // A first look through the imports, for the workers the code starts. Each is built whole, on its own: it shares nothing with a page.
   const found = new Set();
@@ -121,6 +126,16 @@ async function build() {
     inputs.add(`ui/${name}`);
   }
 
+  // The web manifests: after the images, since they name the built icons.
+  for (const name of manifests) {
+    const text = Buffer.from(lf(readFileSync(join(UI, name), "utf8")).replace(MANIFEST_ICON, (_, a, icon, b) => `${a}${builtName.get(icon)}${b}`));
+    const dot = name.lastIndexOf(".");
+    const hashed = `${name.slice(0, dot)}-${sha256(text).slice(0, 8)}${name.slice(dot)}`;
+    outputs.set(hashed, text);
+    builtName.set(name, hashed);
+    inputs.add(`ui/${name}`);
+  }
+
   // The pages, last: their content names everything else.
   const staticImports = (name, seen = new Set()) => { for (const dep of imports[name] ?? []) if (!seen.has(dep)) { seen.add(dep); staticImports(dep, seen); } return seen; };
   for (const { page, html } of pages) {
@@ -154,7 +169,7 @@ async function build() {
     writeFileSync(join(DIST, name), bytes);
     const file = { sha256: sha256(bytes), integrity: integrity(bytes), immutable: !["index.html", "web.html", "phone.html", "sw.js"].includes(name) };
     totals.body += bytes.length;
-    if (/\.(html|js|css|svg)$/.test(name)) {
+    if (/\.(html|js|css|svg|webmanifest)$/.test(name)) {
       const br = brotliCompressSync(bytes, { params: { [zlib.BROTLI_PARAM_QUALITY]: 11, [zlib.BROTLI_PARAM_SIZE_HINT]: bytes.length } });
       const gz = gzipSync(bytes, { level: 9 });
       if (br.length < bytes.length) { writeFileSync(join(DIST, `${name}.br`), br); file.br = true; }
