@@ -1,5 +1,7 @@
 /* Renders omni events into turns. A turn = one user message followed by everything the model did until it stopped. */
-import { el, esc, md, showName, fmtN, fmtBytes, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, editDiff, diffCounts, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
+import { el, esc, showName, fmtN, fmtBytes, fmtDuration, rollingRate, groupToolRuns, splitAttachments, hookInfo, toolLabel, editDiff, diffCounts, workSummary, isDuplicateUserMessage, agentResultInfo, agentTone, agentKindLabel } from "./lib.js";
+import { mdBlocks, closeOpen, fenceLang } from "./markdown.js";
+import { planBlocks, meterLabel, jumpShown, paintGap } from "./chat-live.js";
 
 /** ui/highlight.js, once loaded. One import for every diff waiting on it. */
 let highlighter = null, highlighterLoading = null;
@@ -7,6 +9,63 @@ const loadHighlighter = () => highlighterLoading ??= import("./highlight.js").th
 /** Escaped text either way: plain until the highlighter is here. */
 const highlight = (text, lang) => (highlighter ? highlighter.highlight(text, lang) : esc(text));
 const languageFor = (path) => (highlighter ? highlighter.languageFor(path) : "plain");
+
+// ------------------------------------------------------------- markdown on screen
+let tplDoc = null, tpl = null;
+/** A <template> of the current document, or null where there is none to parse with (the tests' small fake DOM). */
+function template() {
+  if (tplDoc !== globalThis.document) { tplDoc = globalThis.document; tpl = tplDoc?.createElement("template"); if (!tpl?.content) tpl = null; }
+  return tpl;
+}
+const fromHtml = (html) => { const t = template(); t.innerHTML = html; return t.content.firstElementChild || document.createTextNode(""); };
+/** Colours each code block of `root` with its fence's language, once the highlighter is here (it is not the first screen's). */
+function colorCode(root) {
+  if (!root.querySelectorAll) return;
+  const todo = [...root.querySelectorAll("figure.code > pre > code:not(.hl)")];
+  if (!todo.length) return;
+  if (!highlighter) { loadHighlighter().then(() => { if (highlighter && root.isConnected) colorCode(root); }); return; }
+  for (const code of todo) {
+    code.classList.add("hl");
+    const lang = fenceLang(code.dataset.lang);
+    if (lang !== "plain") code.innerHTML = highlighter.highlight(code.textContent, lang);
+  }
+}
+/**
+ * Markdown into `box`, one element per top-level block. Blocks that did not change keep their DOM (a selection in them,
+ * their colours); a live message is first closed off (closeOpen) so no raw syntax shows, and its new blocks fade in.
+ */
+function paint(box, text, live = false) {
+  const next = mdBlocks(live ? closeOpen(text) : text);
+  const old = box.mdBlocks || [];
+  if (!template() || (!old.length && !live)) {
+    // Drawn whole: a message that is not streaming, or no parser for blocks one by one.
+    box.innerHTML = next.join("");
+    box.mdBlocks = next; box.mdSource = text;
+    colorCode(box);
+    return;
+  }
+  const plan = planBlocks(old, next);
+  const kids = box.children;
+  for (const i of plan.replace) kids[i].replaceWith(fromHtml(next[i]));
+  for (const i of plan.append) { const n = fromHtml(next[i]); if (live && n.classList) n.classList.add("md-in"); box.appendChild(n); }
+  for (let r = 0; r < plan.remove; r++) box.lastElementChild?.remove();
+  box.mdBlocks = next;
+  box.mdSource = text;
+  colorCode(box);
+}
+const COPIED_MS = 1500;
+/** Copy on a code block: the code itself, and the button says so for a moment (no toast). One listener for every block. */
+globalThis.document?.addEventListener("click", (e) => {
+  const b = e.target.closest?.(".code-copy");
+  if (!b) return;
+  const code = b.closest("figure.code")?.querySelector("pre > code");
+  if (!code) return;
+  navigator.clipboard?.writeText(code.textContent).then(() => {
+    b.classList.add("copied"); b.textContent = "Copied";
+    clearTimeout(b.copiedTimer);
+    b.copiedTimer = setTimeout(() => { b.classList.remove("copied"); b.textContent = "Copy"; }, COPIED_MS);
+  }).catch(() => {});
+});
 
 const active = { view: null, timer: null };
 const THINK_KEY = "omni.thinking.open";
@@ -30,6 +89,8 @@ const ICONS = {
   chev: `<svg viewBox="0 0 16 16"><path d="m6 4 4 4-4 4"/></svg>`,
   copy: `<svg viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2A1 1 0 0 0 9.5 2.5h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>`,
   close: `<svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg>`,
+  check: `<svg viewBox="0 0 16 16"><path d="m3.5 8.5 3 3 6-7"/></svg>`,
+  down: `<svg viewBox="0 0 16 16"><path d="M8 3v10M3.5 8.5 8 13l4.5-4.5"/></svg>`,
 };
 const icon = (kind, cls = "ico") => `<span class="${cls}">${ICONS[kind] || ICONS.other}</span>`;
 
@@ -69,7 +130,7 @@ export function setOlder(view, state, onLoad) {
     if (notes.length) notes[notes.length - 1].after(view.older); else view.root.prepend(view.older);
   }
   view.older.disabled = state === "loading";
-  view.older.textContent = state === "loading" ? "Loading earlier messages…" : state === "error" ? "Could not load earlier messages · retry" : "Load earlier messages";
+  view.older.textContent = state === "loading" ? "Loading earlier messages…" : state === "error" ? "Could not load earlier messages. Retry" : "Load earlier messages";
   view.older.onclick = state === "loading" ? null : onLoad || null;
 }
 
@@ -117,33 +178,101 @@ function followOf(w) {
   if (!w?.addEventListener) return null;
   let f = follows.get(w);
   if (f) return f;
-  f = { on: true, held: false, lastTop: w.scrollTop };
+  f = { on: true, held: false, lastTop: w.scrollTop, jump: null };
   follows.set(w, f);
-  w.addEventListener("scroll", () => { f.on = nextFollow(f.on, { top: w.scrollTop, lastTop: f.lastTop, gap: w.scrollHeight - w.scrollTop - w.clientHeight }); f.lastTop = w.scrollTop; }, { passive: true });
+  w.addEventListener("scroll", () => { f.on = nextFollow(f.on, { top: w.scrollTop, lastTop: f.lastTop, gap: w.scrollHeight - w.scrollTop - w.clientHeight }); f.lastTop = w.scrollTop; updateJump(w); }, { passive: true });
   // The intent arrives before the position moves: a stream's next word must not undo it.
   w.addEventListener("wheel", (e) => { if (e.deltaY < 0 && w.scrollTop > 0) f.on = false; }, { passive: true });
   w.addEventListener("touchstart", () => { f.held = true; }, { passive: true });
   for (const n of ["touchend", "touchcancel"]) w.addEventListener(n, () => { f.held = false; }, { passive: true });
   w.addEventListener("pointerdown", (e) => { if (e.target === w) f.held = true; }); // the scrollbar
   globalThis.window?.addEventListener("pointerup", () => { f.held = false; });
+  // A smooth scroll can land a few pixels short of a bottom that moved while it ran: following, it finishes the job.
+  w.addEventListener("scrollend", () => { if (f.on && !f.held) stick(w, f); });
+  // Following survives anything that changes the scroller's size or its content's (the composer growing, a caption, an image,
+  // code colouring in): the newest line stays in view. Scrolled up, only the button is updated.
+  // Growth the reader caused (opening a tool row) is theirs to look at: it is not followed.
+  for (const n of ["pointerdown", "keydown"]) w.addEventListener(n, () => { f.userAt = Date.now(); }, { passive: true });
+  if (globalThis.ResizeObserver) {
+    const ro = new ResizeObserver(() => { if (f.on && !f.held && Date.now() - (f.userAt || 0) > 600) stick(w, f); updateJump(w); });
+    ro.observe(w);
+    if (w.firstElementChild) ro.observe(w.firstElementChild);
+  }
+  jumpButton(w, f);
   return f;
+}
+function stick(w, f) {
+  const bottom = w.scrollHeight - w.clientHeight;
+  if (Math.abs(w.scrollTop - bottom) > 1) w.scrollTop = bottom;
+  f.lastTop = w.scrollTop;
+}
+const reducedMotion = () => { try { return globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches; } catch { return false; } };
+/**
+ * "Jump to latest": a round button over the bottom of the transcript, shown while the reader is more than 150 px up.
+ * It lives in a zero-height sticky dock at the end of the scroller, so it sits over the transcript column whatever the layout.
+ */
+function jumpButton(w, f) {
+  if (!globalThis.document || f.jump) return;
+  const dock = el("div", "jump-dock");
+  const b = el("button", "jump-latest");
+  b.type = "button";
+  b.title = "Jump to latest";
+  b.setAttribute("aria-label", "Jump to latest");
+  b.tabIndex = -1;
+  b.innerHTML = `${ICONS.down}<span class="jump-dot"></span>`;
+  b.onclick = () => {
+    f.on = true;
+    // A long way up is mostly skipped: only the last screen and a half glides, so the jump takes a moment, not seconds.
+    const far = w.scrollHeight - w.clientHeight - w.scrollTop - w.clientHeight * 1.5;
+    if (far > 0) w.scrollTop += far;
+    f.lastTop = w.scrollTop;
+    w.scrollTo({ top: w.scrollHeight, behavior: reducedMotion() ? "auto" : "smooth" });
+  };
+  dock.appendChild(b);
+  w.appendChild(dock);
+  f.jump = b;
+}
+function updateJump(w) {
+  const f = follows.get(w);
+  if (!f?.jump) return;
+  const show = jumpShown(w.scrollHeight - w.scrollTop - w.clientHeight);
+  if (f.jump.classList.contains("show") !== show) {
+    f.jump.classList.toggle("show", show);
+    f.jump.tabIndex = show ? 0 : -1;
+    f.jump.setAttribute("aria-hidden", String(!show));
+  }
+  const t = active.view?.wrap === w ? active.view.turn : null;
+  f.jump.classList.toggle("live", !!t && !t.done && t.live);
 }
 function scrollBottom(view) {
   const w = view.wrap, f = followOf(w);
-  if (f && (!f.on || f.held)) return;
+  if (f && (!f.on || f.held)) { updateJump(w); return; }
   w.scrollTop = w.scrollHeight;
-  if (f) f.lastTop = w.scrollTop;
+  if (f) { f.lastTop = w.scrollTop; updateJump(w); }
 }
 /** Is this chat following its newest line? (app.js, when it reloads a chat in place.) */
 export const isFollowing = (wrap) => followOf(wrap)?.on ?? true;
+/** The reader sent a message: whatever they were reading, the chat goes to its newest line and follows it again. */
+export function followLatest(wrap) {
+  const f = followOf(wrap);
+  if (f) { f.on = true; f.held = false; }
+  wrap.scrollTop = wrap.scrollHeight;
+  if (f) { f.lastTop = wrap.scrollTop; updateJump(wrap); }
+}
 
 // ------------------------------------------------------------- turns
 function openTurn(view, ts, live) {
   closeTurn(view);
   const t = { el: el("div", "turn"), meter: el("button", "meter"), reason: el("div", "reason"), body: el("div", "tbody"), startTs: ts || Date.now(), started: false, live: !!live, done: false, endTs: 0, lastMsgTs: 0,
-    items: [], workEls: [], curWork: null, cards: [], rblocks: [], reasonOpen: thinkOpen, committedOut: 0, currentOut: 0, estChars: 0, reported: false, lastGroup: null, sawThinking: false, sawTool: false, samples: [] };
+    items: [], workEls: [], curWork: null, cards: [], rblocks: [], reasonOpen: thinkOpen, committedOut: 0, currentOut: 0, estChars: 0, reported: false, lastGroup: null, sawThinking: false, sawTool: false, samples: [], phase: "wait", lastDeltaTs: 0 };
   t.meter.hidden = true;
-  t.meter.innerHTML = `<span class="dot"></span><span class="mtext"></span>${icon("chev", "chev")}`;
+  t.mlabel = el("span", "mlabel"); t.mstats = el("span", "mstats");
+  const mtext = el("span", "mtext");
+  mtext.append(t.mlabel, t.mstats);
+  t.meter.append(el("span", "dot"), mtext);
+  t.meter.insertAdjacentHTML("beforeend", icon("chev", "chev"));
+  // Only the words are announced (Writing…, Replied in 4s), not the seconds ticking beside them.
+  t.mlabel.setAttribute("aria-live", "polite");
   t.reason.hidden = true;
   t.meter.onclick = () => { if (!t.rblocks.length) return; thinkOpen = t.reasonOpen = !t.reasonOpen; try { localStorage.setItem(THINK_KEY, thinkOpen ? "1" : "0"); } catch { /* ignore */ } applyReason(t); if (t.reasonOpen) t.reason.scrollTop = t.reason.scrollHeight; };
   // The status line and its reasoning drawer always sit below everything the model produced this turn.
@@ -176,23 +305,21 @@ function markStarted(t) {
 }
 
 // ------------------------------------------------------------- meter
+/** A gap this long in the deltas reads as waiting: the label shimmers until words flow again. */
+const QUIET_MS = 1500;
 function renderMeter(t) {
   if (!t.started) return;
   const tokens = t.committedOut + (t.currentOut || Math.ceil(t.estChars / 4));
   const now = Date.now();
   const ms = (t.done ? t.endTs : now) - t.startTs;
-  let text;
-  if (!t.done) {
-    text = `Thinking… ${fmtDuration(ms)} · ${fmtN(tokens)} tokens`;
-    // Rate over the last 5 s of streamed output only; while the model waits on a tool there is no rate to show.
-    const rate = rollingRate(t.samples, now);
-    if (rate) text += ` · ${rate} tok/sec`;
-  }
-  else if (!t.live) text = `Replied in ${fmtDuration(ms)}${tokens ? ` · ${fmtN(tokens)} tokens` : ""}`;
-  else text = `${t.sawThinking || !t.sawTool ? "Thought" : "Worked"} for ${fmtDuration(ms)}${tokens ? ` · ${fmtN(tokens)} tokens` : ""}`;
-  t.meter.querySelector(".mtext").textContent = text;
+  const run = t.done ? null : [...t.cards].reverse().find((c) => c.el.classList.contains("running"));
+  // Rate over the last 5 s of streamed output only; while the model waits on a tool there is no rate to show.
+  const m = meterLabel({ done: t.done, live: t.live, phase: t.phase, quiet: now - t.lastDeltaTs > QUIET_MS, running: run ? workSummary([run.label], true) : "", sawThinking: t.sawThinking, sawTool: t.sawTool, ms, tokens, rate: t.done ? 0 : rollingRate(t.samples, now) });
+  if (t.mlabel.textContent !== m.label) t.mlabel.textContent = m.label;
+  if (t.mstats.textContent !== m.stats) t.mstats.textContent = m.stats;
+  t.meter.classList.toggle("waiting", m.waiting);
   const has = t.rblocks.length > 0;
-  t.meter.title = `${t.reported ? "Tokens reported by the provider" : "Tokens estimated from streamed text (chars ÷ 4)"}${has ? ` · click to ${t.reasonOpen ? "hide" : "show"} reasoning` : t.done ? " · no reasoning was returned this turn" : ""}`;
+  t.meter.title = `${t.reported ? "Tokens reported by the provider" : "Tokens estimated from streamed text (chars ÷ 4)"}${has ? `. Click to ${t.reasonOpen ? "hide" : "show"} the reasoning` : t.done ? ". No reasoning came back this turn" : ""}`;
   t.meter.classList.toggle("live", !t.done);
   t.meter.disabled = !has;
   t.meter.hidden = false;
@@ -223,7 +350,7 @@ function addImages(c, images) {
   if (!w.imgs) { w.imgs = el("div", "imgs"); w.el.insertAdjacentElement("afterend", w.imgs); }
   for (const im of images) {
     const b = el("button", "thumb");
-    b.title = `${c.label.text} · click to preview`;
+    b.title = `${c.label.text}. Click to preview`;
     const i = el("img");
     i.src = `data:${im.mimeType};base64,${im.data}`;
     i.alt = c.label.text;
@@ -254,7 +381,7 @@ function updateWorkLabels(t, final) {
     // A lone tool reads as its own row when collapsed; several fold into a verb summary.
     const single = w.cards.length === 1 && !live;
     if (single) fillLabel(w.lbl, w.diff, w.cards[0].label);
-    else { w.lbl.textContent = workSummary(kinds, live); w.lbl.removeAttribute("title"); w.diff.hidden = true; }
+    else { w.lbl.textContent = workSummary(w.cards.map((c) => c.label), live); w.lbl.removeAttribute("title"); w.diff.hidden = true; }
     w.ico.innerHTML = ICONS[single ? w.cards[0].label.kind : kinds.length === 1 ? kinds[0] : "work"] || ICONS.work;
     w.el.classList.toggle("on", live);
     w.el.classList.toggle("err", w.cards.some((c) => c.el.classList.contains("err")));
@@ -372,6 +499,8 @@ function setToolResult(c, r, ts) {
     if (c.el.open) loadOutput(c);
   } else { c.pending = null; showOutput(c, text || "", isError); }
   c.el.classList.remove("running"); c.el.classList.add(isError ? "err" : "ok");
+  // The tool is done: the model has the turn again, and nothing has come from it yet.
+  if (c.turn && !c.turn.done) c.turn.phase = "wait";
   if (images?.length && !c.gotImages) { c.gotImages = true; addImages(c, images); }
   if (c.item.endTs == null) c.item.endTs = ts || Date.now();
   updateWorkLabels(c.turn, false);
@@ -390,7 +519,7 @@ function reasonBlock(t) {
 }
 function renderBlocks(view, t, blocks, ts) {
   for (const b of blocks) {
-    if (b.type === "text") { breakWork(t); const d = el("div", "text"); d.innerHTML = md(b.text); t.body.appendChild(d); markStarted(t); }
+    if (b.type === "text") { breakWork(t); const d = el("div", "text"); paint(d, b.text); t.body.appendChild(d); markStarted(t); }
     else if (b.type === "thinking") { if (String(b.text || "").trim()) reasonBlock(t).textContent = b.text; markStarted(t); }
     else if (b.type === "tool_call") { const c = toolCard(view, t, { ...b, ts }); if (b.args !== undefined) setToolArgs(c, b.args); }
     else if (b.type === "tool_result") { const c = view.tools.get(b.toolId) || toolCard(view, t, { toolId: b.toolId, name: b.name || "result", ts }); setToolResult(c, b, ts); }
@@ -408,16 +537,43 @@ function streamPart(view, index, part, meta = {}) {
   markStarted(t);
   if (part === "tool_call" || part === "tool_args") p = { part: "tool_call", card: toolCard(view, t, { toolId: meta.toolId, name: meta.name }), text: "" };
   else if (part === "thinking") { const d = reasonBlock(t); d.classList.add("on"); p = { part, el: d, stream: d, text: "", turn: t }; }
-  else { breakWork(t); const d = el("div", "text stream on"); t.body.appendChild(d); p = { part: "text", el: d, stream: d, text: "" }; }
+  // The live text is markdown from its first word: rendered, closed off, and repainted at most once a frame.
+  else { breakWork(t); const d = el("div", "text live"); t.body.appendChild(d); p = { part: "text", el: d, stream: d, text: "", turn: t }; }
   view.stream.parts.set(index, p);
   return p;
+}
+/** A delta only marks its part dirty; the next animation frame paints every dirty part once. */
+function queuePaint(view, p) {
+  (view.dirty ??= new Set()).add(p);
+  if (view.frame) return;
+  const raf = globalThis.requestAnimationFrame;
+  if (!raf) { flushPaints(view); return; }
+  view.frame = raf(() => { view.frame = 0; flushPaints(view); });
+}
+function flushPaints(view) {
+  const now = globalThis.performance?.now() ?? Date.now();
+  let later = false;
+  for (const p of view.dirty) {
+    if (p.done) { view.dirty.delete(p); continue; }
+    // A long message whose render got slow repaints less often (paintGap), never so rarely that it looks stuck.
+    if (now - (p.lastPaint || 0) < (p.gap || 0)) { later = true; continue; }
+    view.dirty.delete(p);
+    const t0 = globalThis.performance?.now() ?? Date.now();
+    if (p.part === "text") paint(p.el, p.text, true);
+    else { p.el.textContent = p.text; if (!p.turn.reason.hidden) p.turn.reason.scrollTop = p.turn.reason.scrollHeight; }
+    p.lastPaint = globalThis.performance?.now() ?? Date.now();
+    p.gap = paintGap(p.lastPaint - t0);
+  }
+  if (active.view === view) scrollBottom(view);
+  if (later) view.frame = globalThis.requestAnimationFrame(() => { view.frame = 0; flushPaints(view); });
 }
 function finishPart(p, finalText) {
   if (!p || p.done) return;
   if (p.part === "tool_call") { try { setToolArgs(p.card, JSON.parse(p.card.argText || "{}")); } catch { p.card.args.textContent = p.card.argText; } p.done = true; return; }
   p.stream.classList.remove("on");
   const text = finalText ?? p.text;
-  if (p.part === "text") { p.stream.innerHTML = md(text); p.stream.classList.remove("stream"); }
+  // The same renderer as every frame before it: blocks that did not change stay, so the message does not jump as it ends.
+  if (p.part === "text") { paint(p.stream, text); p.stream.classList.remove("live"); }
   else {
     p.stream.textContent = text;
     // A provider that streams an empty reasoning part (distilled models, hidden reasoning) leaves nothing to expand.
@@ -435,7 +591,15 @@ function closeStream(view) {
 function actionRow(t) {
   const row = el("div", "actions");
   const copy = el("button", "icon-btn"); copy.innerHTML = ICONS.copy; copy.title = "Copy reply";
-  copy.onclick = () => { const text = [...t.body.querySelectorAll(".text")].map((d) => d.innerText).join("\n\n"); navigator.clipboard?.writeText(text).catch(() => {}); };
+  // The reply as it was written (markdown), not the screen's text with its code headers and Copy buttons in it.
+  copy.onclick = () => {
+    const text = [...t.body.querySelectorAll(".text")].map((d) => d.mdSource ?? d.innerText).join("\n\n");
+    navigator.clipboard?.writeText(text).then(() => {
+      copy.innerHTML = ICONS.check; copy.classList.add("copied");
+      clearTimeout(copy.copiedTimer);
+      copy.copiedTimer = setTimeout(() => { copy.innerHTML = ICONS.copy; copy.classList.remove("copied"); }, COPIED_MS);
+    }).catch(() => {});
+  };
   row.appendChild(copy);
   return row;
 }
@@ -462,7 +626,7 @@ function agentResultCard(view, info, animate) {
   }
   sum.insertAdjacentHTML("beforeend", icon("chev", "chev"));
   const body = el("div", "ar-body text");
-  body.innerHTML = md(info.body);
+  paint(body, info.body);
   d.append(sum, body);
   view.root.appendChild(d);
 }
@@ -473,7 +637,7 @@ export function applyEvent(view, ev) {
   if (view.empty && !["session", "status", "usage", "keeper"].includes(ev.kind)) { view.empty.remove(); view.empty = null; }
   switch (ev.kind) {
     case "block": {
-      if (ev.phase === "message_start") { const t = turnOf(view, Date.now(), true); closeStream(view); openStream(view, t); markStarted(t); }
+      if (ev.phase === "message_start") { const t = turnOf(view, Date.now(), true); closeStream(view); openStream(view, t); markStarted(t); t.phase = "wait"; renderMeter(t); }
       else if (ev.phase === "start") streamPart(view, ev.index, ev.part, ev);
       else if (ev.phase === "end") { const p = view.stream?.parts.get(ev.index); if (p) { finishPart(p, ev.text); if (p.part === "tool_call" && ev.args !== undefined) setToolArgs(p.card, ev.args); } }
       break;
@@ -484,12 +648,11 @@ export function applyEvent(view, ev) {
       t.estChars += (ev.delta || "").length;
       t.samples.push({ ts: Date.now(), chars: (ev.delta || "").length });
       if (t.samples.length > 2000) t.samples.splice(0, t.samples.length - 1000);
-      if (p.part === "tool_call") { p.card.argText += ev.delta; p.card.args.textContent = p.card.argText; }
-      else {
-        p.text += ev.delta; p.stream.appendChild(el("span", "tok", ev.delta));
-        if (p.part === "thinking" && !t.reason.hidden) t.reason.scrollTop = t.reason.scrollHeight;
-      }
-      scrollBottom(view);
+      t.lastDeltaTs = Date.now();
+      const phase = p.part === "tool_call" ? "tool" : p.part === "thinking" ? "think" : "write";
+      if (phase !== t.phase) { t.phase = phase; renderMeter(t); }
+      if (p.part === "tool_call") { p.card.argText += ev.delta; p.card.args.textContent = p.card.argText; scrollBottom(view); }
+      else { p.text += ev.delta; queuePaint(view, p); }
       break;
     }
     case "usage": if (ev.usage && view.turn) { view.turn.currentOut = ev.usage.output || 0; view.turn.reported = true; markStarted(view.turn); } break;
@@ -533,7 +696,9 @@ export function applyEvent(view, ev) {
           m.appendChild(attach);
         }
         view.root.appendChild(m);
-        openTurn(view, ev.ts, !!ev.live);
+        const t = openTurn(view, ev.ts, !!ev.live);
+        // A message just sent: the status line shows at once (a shimmering "Working…") instead of nothing until the first word.
+        if (ev.live) { markStarted(t); renderMeter(t); }
       } else {
         const text = ev.blocks.map((b) => b.text || "").join("\n");
         // An agent's report starts the parent's next turn (it is delivered as a follow-up), like a hook notice.

@@ -6,7 +6,7 @@ const SEND_ICON = `<svg viewBox="0 0 16 16"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5
 export function createComposer(root, h) {
   root.innerHTML = `
   <div class="composer">
-    <textarea rows="1" placeholder="${esc(h.placeholder || "Do anything")}"></textarea>
+    <textarea rows="1" placeholder="${esc(h.placeholder || "")}"></textarea>
     <div class="composer-bar">
       <div class="menu-wrap">
         <button class="cbtn round" data-role="plus" title="Attach"><svg viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></svg></button>
@@ -55,6 +55,13 @@ export function createComposer(root, h) {
   }
   function renderModelMenu() {
     modelMenu.innerHTML = "";
+    if (!st.models.length) {
+      // Nothing to pick, so nothing to tune either: one way forward.
+      const add = el("button", "menu-add", "Add a provider");
+      add.onclick = () => { closeMenus(); h.onManageProviders?.(); };
+      modelMenu.appendChild(add);
+      return;
+    }
     const { levels, labels } = modelThinking();
     if (levels.length) {
       modelMenu.appendChild(el("div", "mh", "Thinking"));
@@ -73,7 +80,7 @@ export function createComposer(root, h) {
         b.onclick = () => { st.piModel = { provider: m.provider, id: m.id }; h.onPiModel?.(m.provider, m.id); render(); closeMenus(); };
         modelMenu.appendChild(b);
       }
-    } else modelMenu.appendChild(el("div", "menu-empty", "No models yet. Add a provider and type the model ids you want."));
+    }
     if (st.hook) renderHookSection();
     const manage = el("button", "manage", "Manage providers…");
     manage.onclick = () => { closeMenus(); h.onManageProviders?.(); };
@@ -108,17 +115,25 @@ export function createComposer(root, h) {
     const m = st.piModel && st.models.find((x) => x.provider === st.piModel.provider && x.id === st.piModel.id);
     return m?.thinking?.length ? { levels: m.thinking, labels: m.thinkingLabels || {} } : { levels: st.levels, labels: st.levelLabels || {} };
   }
+  /** Send greys out while the box is empty (a run's Stop never does); the button follows every keystroke, nothing else does. */
+  function syncSend() {
+    const empty = !st.streaming && !ta.value.trim();
+    send.disabled = st.disabled || empty;
+    send.classList.toggle("empty", empty && !st.disabled);
+  }
   function render() {
     const lbl = modelBtn.querySelector(".lbl");
     const think = st.piThinking && (modelThinking().labels[st.piThinking] ? `thinking ${modelThinking().labels[st.piThinking]}` : st.piThinking);
-    lbl.innerHTML = `<b>${esc(st.piModel?.id || "Pick a model")}</b>${think ? ` <span>${esc(think)}</span>` : ""}${st.hook?.enabled ? ` <span title="Goal hook on">hook</span>` : ""}`;
+    if (st.placeholder !== undefined) ta.placeholder = st.placeholder || "";
+    lbl.innerHTML = `<b>${esc(st.piModel?.id || (st.models.length ? "Pick a model" : "Add a model"))}</b>${think ? ` <span>${esc(think)}</span>` : ""}${st.hook?.enabled ? ` <span title="Goal hook on">hook</span>` : ""}`;
     caption.textContent = st.caption;
     caption.title = st.caption;
-    send.disabled = st.disabled;
     ta.disabled = st.disabled && !!st.lock;
     send.className = `send-btn${st.streaming ? " stop" : ""}`;
     send.innerHTML = st.streaming ? "" : SEND_ICON;
-    send.title = st.streaming ? "Stop" : "Send (Enter)";
+    send.title = st.streaming ? "Stop (Esc)" : "Send (Enter)";
+    send.setAttribute("aria-label", st.streaming ? "Stop" : "Send");
+    syncSend();
     renderPills();
     // Never rebuild while open: a mid-open rebuild destroys the button the user is about to click.
     if (menuDirty && modelMenu.hidden) { renderModelMenu(); menuDirty = false; }
@@ -130,6 +145,8 @@ export function createComposer(root, h) {
     if (!text) return;
     h.onSend?.(text, getOptions());
   }
+  /** On a desktop pointer the box takes the focus by itself; on a touch screen that would throw the keyboard up unasked. */
+  const finePointer = () => { try { return globalThis.matchMedia?.("(pointer: fine)").matches ?? true; } catch { return true; } };
 
   plus.onclick = (e) => { e.stopPropagation(); modelMenu.hidden = true; plusMenu.hidden = !plusMenu.hidden; };
   plusMenu.querySelector('[data-act="file"]').onclick = () => { closeMenus(); h.onPickFile?.(); };
@@ -143,8 +160,14 @@ export function createComposer(root, h) {
     modelMenu.hidden = !modelMenu.hidden;
   };
   send.onclick = submit;
-  ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); } });
-  ta.addEventListener("input", autosize);
+  ta.addEventListener("keydown", (e) => {
+    // An IME still composing (Japanese, Chinese, Korean, the Windows emoji panel) owns Enter: it confirms the word, it never sends.
+    // Safari clears isComposing before the confirming keydown, so keyCode 229 is checked too.
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); submit(); return; }
+    if (e.key === "Escape" && st.streaming && !st.disabled) { e.preventDefault(); closeMenus(); h.onStop?.(); }
+  });
+  ta.addEventListener("input", () => { autosize(); syncSend(); h.onDraft?.(ta.value); });
   render();
 
   return {
@@ -158,11 +181,14 @@ export function createComposer(root, h) {
     setPiChoices({ models, levels, labels }) { if (models) st.models = models; if (levels) { st.levels = levels; st.levelLabels = labels || {}; } menuDirty = true; render(); },
     getOptions,
     reloadOptions() { loadOptions(); renderPills(); },
-    insert(text) { ta.value += `${ta.value && !/\s$/.test(ta.value) ? " " : ""}${text}`; autosize(); ta.focus(); },
+    insert(text) { ta.value += `${ta.value && !/\s$/.test(ta.value) ? " " : ""}${text}`; autosize(); syncSend(); h.onDraft?.(ta.value); ta.focus(); },
     focus() { ta.focus(); },
-    clear() { ta.value = ""; autosize(); },
+    /** The focus a screen gives the box when it opens: desktop only. */
+    autoFocus() { if (finePointer() && !ta.disabled) ta.focus({ preventScroll: true }); },
+    clear() { ta.value = ""; autosize(); syncSend(); h.onDraft?.(""); },
     /** A draft put back: the box holds exactly this. */
-    setValue(text) { ta.value = text || ""; autosize(); },
+    setValue(text) { ta.value = text || ""; autosize(); syncSend(); },
     get value() { return ta.value; },
+    get streaming() { return !!st.streaming && !st.disabled; },
   };
 }

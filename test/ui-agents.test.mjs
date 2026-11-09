@@ -349,7 +349,7 @@ test("transcript renders a report as a card with Open, and other notices as plai
     assert.ok(hasClass("ok")(card), "done reads as ok");
     assert.equal(card.find(hasClass("ar-title")).text, "Find the flaky test");
     assert.equal(card.find(hasClass("ar-meta")).text, "OpenCode agent · done · 2m 0s");
-    assert.match(card.find(hasClass("ar-body")).innerHTML, /<b>fix<\/b>/);
+    assert.match(card.find(hasClass("ar-body")).innerHTML, /<strong>fix<\/strong>/);
     const open = card.find(hasClass("ar-open"));
     open.onclick({ preventDefault() {}, stopPropagation() {} });
     assert.deepEqual(opened, ["a-12345678"]);

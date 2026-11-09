@@ -128,12 +128,36 @@ export function fromMerged(text, known) {
   return { id: x.id, name: x.name, data: x.data };
 }
 
-/** Half-typed messages, per chat per machine. Taken once: what is restored to the box is the box's again. */
-export function createDrafts() {
+/**
+ * Half-typed messages, per chat per machine. Taken once: what is restored to the box is the box's again (it is saved
+ * back as it is typed, and when the page goes). With `storage` (localStorage) they outlive a reload or a closed window,
+ * at most `max` of them, the oldest dropped first; storage that refuses is ignored and memory still holds them.
+ */
+const DRAFT_PREFIX = "omni.draft.";
+export function createDrafts({ storage = null, max = 50, now = Date.now } = {}) {
   const kept = new Map();
   const key = (machineKey, sid) => `${machineKey}\u0000${sid}`;
+  const store = (fn) => { try { return storage ? fn(storage) : undefined; } catch { return undefined; } };
+  const stored = (k) => store((s) => { const raw = s.getItem(DRAFT_PREFIX + k); if (!raw) return null; const v = JSON.parse(raw); return typeof v?.v === "string" ? v : null; });
+  function prune(s) {
+    const mine = [];
+    for (let i = 0; i < s.length; i++) { const k = s.key(i); if (k?.startsWith(DRAFT_PREFIX)) { let t = 0; try { t = JSON.parse(s.getItem(k))?.t || 0; } catch { /* */ } mine.push([k, t]); } }
+    mine.sort((a, b) => a[1] - b[1]);
+    for (const [k] of mine.slice(0, Math.max(0, mine.length - max))) s.removeItem(k);
+  }
   return {
-    save(machineKey, sid, text) { if (!sid) return; if (text) kept.set(key(machineKey, sid), text); else kept.delete(key(machineKey, sid)); },
-    take(machineKey, sid) { const k = key(machineKey, sid); const t = kept.get(k) ?? ""; kept.delete(k); return t; },
+    save(machineKey, sid, text) {
+      if (!sid) return;
+      const k = key(machineKey, sid);
+      if (text) kept.set(k, text); else kept.delete(k);
+      store((s) => { if (text) { s.setItem(DRAFT_PREFIX + k, JSON.stringify({ v: text, t: now() })); prune(s); } else s.removeItem(DRAFT_PREFIX + k); });
+    },
+    take(machineKey, sid) {
+      const k = key(machineKey, sid);
+      const t = kept.get(k) ?? stored(k)?.v ?? "";
+      kept.delete(k);
+      store((s) => s.removeItem(DRAFT_PREFIX + k));
+      return t;
+    },
   };
 }
